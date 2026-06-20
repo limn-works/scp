@@ -463,11 +463,11 @@ export async function evaluateTrust(
         // by the [SCP-PERM-NNNN] code prefix in the message instead of
         // instanceof.
         const msg = error instanceof Error ? error.message : String(error);
-        if (!/\[SCP-PERM-\d+\]/.test(msg)) {
+        if (!/^\[SCP-PERM-\d+\]/.test(msg)) {
           throw error;
         }
         // Re-raise handle-affinity errors — these are caller misuse, not UCAN failures.
-        if (/\[SCP-PERM-3030\]/.test(msg)) throw error;
+        if (/^\[SCP-PERM-3030\]/.test(msg)) throw error;
         const failed = __classifyUcanError(msg);
         const passed = __PASSED_BEFORE[failed];
         capabilityValidation.tokensValid = passed.has("tokensValid");
@@ -513,7 +513,7 @@ export async function evaluateTrust(
     // eventLogQuery bypasses mapBridgeError. We detect context errors by the
     // [SCP-CTX-NNNN] code prefix in the message instead of instanceof.
     const msg = error instanceof Error ? error.message : String(error);
-    if (!/\[SCP-CTX-\d+\]/.test(msg)) {
+    if (!/^\[SCP-CTX-\d+\]/.test(msg)) {
       throw error;
     }
   }

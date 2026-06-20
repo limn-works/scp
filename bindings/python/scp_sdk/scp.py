@@ -855,10 +855,10 @@ class SCP:
         """Delegate to ``_scp_core.SCP.identity_migrate``.
 
         The bridge returns a tuple ``(PyIdentity, rotation_event_json)``
-        — the JSON-serialized ``DidRotationEvent`` (spec §3.2.1,
+        — the JSON-serialized ``DidRotationEvent`` (spec §9.12,
         ADR-003 §4b) is attached to the returned :class:`Identity`
         wrapper as ``identity.rotation_event_json`` so SDK callers can
-        distribute the event to active context members (spec §3.2.1,
+        distribute the event to active context members (spec §9.12,
         ADR-003 §4b).
         """
         from scp_sdk.identity import Identity
