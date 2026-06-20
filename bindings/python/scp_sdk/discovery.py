@@ -98,7 +98,7 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
-async def discover_contexts(scp: Any, query: str) -> list[dict[str, Any]]:
+async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
     """Discover contexts advertised by a DID or named by an ``scp://`` URI.
 
     For an ``scp://`` URI the lookup is a synchronous parse. For a ``did:``
