@@ -1089,12 +1089,29 @@ def main() -> int:
     all_exempted_ops = 0
 
     sdks = ("python", "typescript", "kotlin", "swift")
+    expected_sdks = frozenset(sdks)
 
     for domain_entry in matrix.get("capabilities", []):
         domain = domain_entry.get("domain", "?")
         for op in domain_entry.get("operations", []):
             op_name = op.get("name", "?")
             total_ops += 1
+
+            # Fail if any expected SDK key is absent entirely from this entry.
+            # A missing key is structurally different from false/null: it means
+            # the operation was never evaluated for that SDK, which is always
+            # an authoring gap (not a deliberate exemption).
+            present_sdks = expected_sdks.intersection(op.keys())
+            missing_sdks = expected_sdks - present_sdks
+            if missing_sdks:
+                for missing_sdk in sorted(missing_sdks):
+                    print(
+                        f"  ERROR: {domain}/{op_name} is missing SDK key "
+                        f"'{missing_sdk}' entirely — add a true/false entry "
+                        f"(and an exemption if false)."
+                    )
+                    errors += 1
+
             exemptions = op.get("exemptions", {})
             coverage_exemptions = op.get("coverage_exemptions", {})
 
