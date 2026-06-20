@@ -173,11 +173,12 @@ try {
   if (typeof (probe as unknown as Record<string, unknown>).identityRotateKey !== "function") {
     skipReason = "SCP missing identityRotateKey — rebuild with the parity changes";
   } else {
+    await probe.identityCreate("in_memory");
     napiAvailable = true;
   }
-  probe.shutdown(1).catch(() => {});
+  await probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `Native NAPI bridge not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = `Native NAPI bridge not available or not custody-capable: ${e instanceof Error ? e.message : String(e)}`;
 }
 
 if (!napiAvailable) {
