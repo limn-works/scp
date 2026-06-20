@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Branch `fix/sdk-coverage-fail-closed-and-parity` (HEAD 1f4da9f3b as of 2026-06-20 review).
+Branch `fix/sdk-coverage-fail-closed-and-parity` (HEAD 681de196a as of 2026-06-20 re-review, post-rebase).
 
 **What this branch actually authored** (vs `0c8f0b065`, the true merge-base) — only 3 `.docs/` files:
 - ADR-051 (new, +100): pre-rotation custody substrate isolation, Status: Proposed. Closes the FFI callback-custody gap where pre-rotation key lands in `InMemoryPreRotationCustody` (same process memory) violating spec §9.7.4.1 §3 substrate isolation, plus the `import_ed25519_signing_key` Unsupported block that makes callback-custody migration unreachable. All spec/ADR/code refs verified accurate.
@@ -15,4 +15,4 @@ Branch `fix/sdk-coverage-fail-closed-and-parity` (HEAD 1f4da9f3b as of 2026-06-2
 
 **Why:** SDK parity gaps + a coverage gate that string-matched too loosely.
 
-**How to apply:** **CRITICAL — branch is 32 commits behind origin/main; merge-base is 0c8f0b065.** `git diff origin/main..HEAD` is MISLEADING: it shows huge deletions (reconnect.rs, heartbeat, saga handlers, OwnedIdentityDid AST-gate text in ADR-049 §5) that are STALE-BASE artifacts, NOT this branch's work. In particular origin/main #1826 already DROPPED the OwnedIdentityDid AST gate for compiler enforcement; this branch predates it and would appear to "revert" it. MUST `git rebase origin/main` before any merge, then re-diff with the two-dot against the new base. Use `git diff 0c8f0b065..HEAD -- <path>` to see only branch-authored changes. This matches the repo lesson [[lesson-rebase-before-merge]] (worktree branches cut before other PRs land revert them on squash).
+**How to apply:** RESOLVED 2026-06-20 — branch is now **REBASED onto origin/main**: merge-base = `dabf13364` (== origin/main HEAD), `HEAD..origin/main` = 0 commits behind, two-dot and three-dot diffs are IDENTICAL (57 files, +3954/-462, no stale-base deletions). The earlier stale-base trap (huge phantom deletions of reconnect.rs/heartbeat/saga handlers/OwnedIdentityDid AST-gate text from predating #1826) is GONE. `git diff origin/main...HEAD` is now safe to read directly. Diff also (correctly) includes `crates/scp-runtime/src/crypto/mls/provider.rs` (14 stale MlsCryptoProvider doc-comments corrected — no crypto trait exists post-actor-refactor) and `.github/workflows/ci.yml` (+2: runs `scripts/test_check_sdk_coverage.py` gate self-tests before the gate). Repo lesson [[lesson-rebase-before-merge]] held (rebase before merge avoids squash-revert).
