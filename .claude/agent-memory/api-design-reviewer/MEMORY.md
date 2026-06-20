@@ -1,5 +1,7 @@
 # API Design Reviewer Memory
 
+- [Event-Log Substrate Phase-2 Final Review](eventlog_substrate_phase2_final.md) — APPROVED; provider trait typed EventType+timestamp_secs, anchored fields cross-binding consistent, PaymentReceived mirrors sibling, WASM shares taxonomy/merge by construction
+
 ## SCP SDK Standards Review (2026-02-22)
 - Reviewed all 10 files in `.docs/standards/` (sdk-common.md + 8 language files + conventions.md)
 - Key blocking issues found:

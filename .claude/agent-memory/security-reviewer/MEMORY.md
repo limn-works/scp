@@ -2,6 +2,11 @@
 
 ## SCP Codebase Security Patterns
 
+### Event-Log Phase-2 Substrate Swap FINAL (16a2cd42b) -- 2026-06-20
+- See `eventlog-phase2-final-16a2cd42b.md`. ONE HIGH: bf9266777 made econ-policy/ceiling effective_at = proposal.created_at (PROPOSER-backdatable) + PERIOD; no clamp; breaks §19 commit-anchored 24h MUST; pre-Phase-2 used applying member's now() -> NEW regression. Rest CLEAN (merkle_root mirror removal neutral-or-stronger; committer-ts signed-bound).
+- FIX RE-VERIFIED (f234988bc) -- see `notification-window-backdating-fix-f234988bc.md`. Canonical import observed_at re-pin to local clock. Bypass CLOSED, no new regression. RESTORE-verbatim correct (self-respawn). WASM gov-leaf b"" parity + dedup contiguous-seq + convergent_consequence_timestamp move all clean. MERGE-GATING CONFIRMED.
+- FIX VERIFIED (4cad781e5) -- see `notification-window-backdating-fix-4cad781e5.md`. HIGH RESOLVED, no new regression. Added per-member observed_at floor: is_effective = current>=max(effective_at, observed_at+PERIOD); leaf still effective_at (convergent); observed_at self-attested only (Full export = creator self-sig, never cross-member compared); freeze residual sound (expiry removes BOTH proposals, no authz grant).
+
 ### PyO3 Passphrase Storage + Redacting Debug (ed6290851, actor-per-context) -- 2026-06-04
 - See `pyo3-passphrase-storage-ed6290851.md`. CLEAN, no findings. Fail-closed passphrase path,
   exactly-one-of key/passphrase, hand-written redacting Debug on all 3 bridges, dev-affordance

@@ -1,5 +1,8 @@
 # Alignment Reviewer Memory
 
+## Event-Log Phase-2 Substrate Final Gate @ `3d96058f5` (2026-06-20) — ALIGNED
+See [eventlog_phase2_final_gate_3d96058f5.md](eventlog_phase2_final_gate_3d96058f5.md). Incremental over prior 4cad781e5 ALIGNED; review ONLY diff `4cad781e5...3d96058f5` (10 files +526/-48), NOT merge-base range. 0 findings. 5 items verified: WASM gov empty-leaf `b""` parity (matches native append_context_event/EventPayload::default), real-handler parity test, dedup convergent_consequence_timestamp into scp-protocol, dense sequence (evidence-only metadata), now_ms native cfg fallback (wasm32 hardened clock preserved). Bonus: import_context observed_at re-pin closes §5.3.2/§19.3 backdate bypass (restore keeps verbatim — sound asymmetry). All spec cites present; no #NNNN; clippy+wasm32 build+all tests clean.
+
 ## ADR-051 Clockless Reframe Re-Review (2026-06-19) — CHANGES-NEEDED
 See [adr051_clockless_reframe_review.md](adr051_clockless_reframe_review.md). Same edit set as 06-18 but velocity CLOCK CUT entirely; ADR retitled clockless. ONE stale ref: phase-2.md:912 "(causal-DAG application-event ordering + median clock)" contradicts ADR title/§6/rejected-alt/specs — self-contradicts within same sentence; FIX=delete "+ median clock". Else CLEAN: all other median/quorum/beacon confined to REJECTED-alt or negating "no convergent clock" framing; frontierRoot retained (DAG-frontier, not clock); CHECKPOINT-V1-interim/V2-end-state coherent; anchored coherent; taxonomy=75; no new #NNNN; cross-refs resolve. POSITIVE: prior 19:593 paymentHistory residual NOW FIXED (19:594). GOTCHA: review target=worktree file, not main repo (main has no "median").
 
