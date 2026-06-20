@@ -37,6 +37,7 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
+import type { PaymentReceiptVerificationResult } from "./economy";
 import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { getBridge } from "./internal/bridge";
@@ -2148,22 +2149,26 @@ export class SCP {
    * Verifies a batch of payment receipts against the configured payment
    * adapter. Maximum 10,000 receipts per call.
    *
-   * Returns a JSON object `{"all_valid": <bool>, "results": [...]}`.
-   * `all_valid` is `true` iff every entry both reached the adapter
-   * (`ok === true`) and the adapter reported the receipt valid
-   * (`result.valid === true`); it is vacuously `true` for an empty batch.
-   * Each `results` entry is either `{"receipt_id", "ok": true, "valid",
-   * "result": <structured VerificationResult>}` on success or
-   * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
-   * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
+   * `all_valid` is `true` iff every entry both reached the adapter and the
+   * adapter reported the receipt valid; it is vacuously `true` for an empty
+   * batch. `ok` means the adapter *responded* — NOT that the payment is valid;
+   * check `valid` / `all_valid` for validity.
    *
+   * @param receipts Array of receipt objects to verify. Each object shape is
+   *   adapter-specific; the bridge serializes the array to JSON internally.
+   * @returns Typed {@link PaymentReceiptVerificationResult} with `ok`,
+   *   `all_valid`, and per-receipt `results`.
    * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
    *   verification requires a native client whose bridge runs the payment
    *   adapter (ADR-034).
    */
-  economyVerifyPaymentReceipts(receiptsJson: string): unknown {
-    const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
-    return JSON.parse(raw) as unknown;
+  economyVerifyPaymentReceipts(
+    receipts: readonly Record<string, unknown>[],
+  ): PaymentReceiptVerificationResult {
+    const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(
+      JSON.stringify(receipts),
+    );
+    return JSON.parse(raw) as PaymentReceiptVerificationResult;
   }
 
   // ───────────────────────────────────────────────────────────────────────
