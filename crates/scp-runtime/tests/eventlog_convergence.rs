@@ -308,3 +308,41 @@ fn negative_control_per_member_local_timestamps_break_convergence() {
          timestamps eliminate"
     );
 }
+
+/// Honesty pin for the gap between what these convergence tests prove and what
+/// a fully end-to-end test would prove.
+///
+/// Every convergence test in this file establishes the §9.9.3 property by
+/// HAND-FEEDING both members the SAME committer-assigned leaf values (the
+/// `TS_*` constants via `append_convergent_stream`) directly into each member's
+/// local `MerkleEventLogProvider`. That isolates the leaf-construction rule
+/// (committer-assigned, not per-member-now) and proves identical inputs yield
+/// identical roots — but it does NOT drive two real members through an actual
+/// commit exchange where member B RECEIVES member A's signed commit envelope
+/// and COPIES the committer-assigned timestamp off the wire.
+///
+/// A test that exercises that real path is pending **cross-member leaf
+/// replication** — the ADR-051 forward step in which application/commit events
+/// re-enter the canonical log via the causal DAG so a receiving member
+/// reconstructs the identical leaf set from inbound envelopes rather than from
+/// a locally-seeded fixture. Until that lands there is no machinery to make
+/// member B's log a function of member A's commits, so this test is `#[ignore]`d
+/// to keep the gap mechanically visible rather than silently absent.
+#[test]
+#[ignore = "pending cross-member leaf replication (ADR-051 forward step); current \
+            convergence tests hand-feed identical committer-assigned timestamps"]
+fn two_real_members_converge_pending_cross_member_replication() {
+    // Intentionally not the real cross-member driver: see the doc comment above.
+    // When cross-member leaf replication exists, replace this body with a driver
+    // that (1) has member A commit a convergent stream, (2) delivers A's signed
+    // commit envelopes to member B, (3) lets B reconstruct its log purely from
+    // those envelopes, and (4) asserts
+    // `log_a.event_log_merkle_root(&CTX) == log_b.event_log_merkle_root(&CTX)`
+    // WITHOUT either side being seeded from a shared fixture.
+    let log = MerkleEventLogProvider::new();
+    log.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log, 0);
+    // Placeholder assertion so the (ignored) test is a valid, type-checked body
+    // and does not bit-rot; it does NOT exercise the cross-member path.
+    assert_ne!(log.event_log_merkle_root(&CTX).unwrap(), [0u8; 32]);
+}

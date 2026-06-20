@@ -345,8 +345,8 @@ async fn spawn_ttl_timer(
     // the `ContextExpired`/`ContextClosed` leaf. A `deadline_override` is the
     // CONVERGENT value (see the parameter doc); only when it is absent do we
     // fall back to local arm-time `now + duration`.
-    let deadline_secs =
-        deadline_override.unwrap_or_else(|| deps.clock.now_secs().saturating_add(duration.as_secs()));
+    let deadline_secs = deadline_override
+        .unwrap_or_else(|| deps.clock.now_secs().saturating_add(duration.as_secs()));
     state.ttl.timer.deadline_unix_secs = Some(deadline_secs);
 
     // Clone the cross-actor providers the FireTimer pipeline needs. The

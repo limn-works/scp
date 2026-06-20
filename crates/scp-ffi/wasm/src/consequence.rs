@@ -102,170 +102,25 @@ pub fn dispatch_consequences_for_subject(
     )
 }
 
-/// Maximum age (seconds) for receive-buffer events used in consequence
-/// evaluation. Events estimated older than this are discarded as stale,
-/// preventing manipulation via timestamp back-dating. Mirrors the native
-/// runtime's `MAX_BUFFER_EVENT_AGE_SECS`.
-const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600;
-
-/// Maximum clock-skew tolerance (seconds) for buffer-event timestamps. Events
-/// estimated more than this far in the future are discarded. Mirrors the
-/// native runtime's `MAX_FUTURE_TOLERANCE_SECS`.
-const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
-
-/// Maximum number of receive-buffer events consumed per consequence-evaluation
-/// cycle. Caps evaluation cost and prevents an attacker from flooding the
-/// buffer to drive synthetic high counts (e.g. inflating a `WarningCount`
-/// trigger). Mirrors the native runtime's `MAX_BUFFER_EVENTS_FOR_EVAL`.
-const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
-
 /// Collects the event history for consequence evaluation, merging the durable
-/// Merkle log with the recent receive buffer — the WASM analogue of the native
-/// runtime's `event_log_entries_for_consequences`.
+/// Merkle log with the recent receive buffer — the WASM adapter over the
+/// shared, convergence-critical
+/// [`scp_protocol::trust::consequence::merge_consequence_events`].
 ///
-/// Two sources are combined:
-///
-/// 1. **Durable log** ([`PerContextState::event_log_events`]) — convergent,
-///    commit-ordered events with real timestamps and `actor_did` (governance,
-///    membership, lifecycle, consequence-enforcement records). Per the ADR-011
-///    amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2) this no longer
-///    contains the per-author `MessageSent` / `ToolInvoked` leaves.
-///
-/// 2. **Receive buffer** ([`PerContextState::event_buffer_events`]) — recent
-///    local `ContextEvent`s, including the per-author `MessageSent` that
-///    velocity triggers need. Buffer events use estimated timestamps spaced one
-///    second apart backwards from `now`, and are bounded by
-///    [`MAX_BUFFER_EVENTS_FOR_EVAL`], [`MAX_BUFFER_EVENT_AGE_SECS`], and
-///    [`MAX_FUTURE_TOLERANCE_SECS`] to cap cost and resist back-dating /
-///    flooding manipulation.
-///
-/// Event types are projected onto the coarse trigger buckets the shared
-/// `matches_trigger` understands (governance / consequence variants collapse to
-/// [`scp_event_log::EventType::GovernanceAction`]).
+/// It acquires the two sources from the WASM-local `PerContextState`
+/// ([`PerContextState::event_log_events`] for Source 1,
+/// [`PerContextState::event_buffer_events`] for Source 2) and delegates the
+/// `EventType` projection + buffer-gate merge to the shared function so the
+/// WASM bridge and the native runtime produce byte-identical merged event sets
+/// (§9.9.3 equivocation detection). All constants, the projection match, the
+/// buffer gates, and the CONVERGENCE INVARIANT documentation live in that
+/// shared function — see it for the rationale.
 fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_event_log::Event> {
-    use scp_event_log::{Event, EventPayload, EventType};
-    use scp_protocol::context::membership::ContextEvent;
-
-    let mut events: Vec<Event> = Vec::new();
-
-    // Source 1: durable Merkle log. Project each entry's typed `EventType`
-    // onto the bucket `matches_trigger` understands. Governance and
-    // consequence-enforcement variants collapse to `GovernanceAction` so that
-    // `WarningCount` / `Custom` triggers (and recursive consequence rules) can
-    // observe prior governance and prior enforcement.
-    for entry in ctx.event_log_events() {
-        let event_type = match entry.event_type {
-            EventType::MessageSent => EventType::MessageSent,
-            EventType::MemberJoined => EventType::MemberJoined,
-            EventType::MemberLeft => EventType::MemberLeft,
-            EventType::RoleAssigned => EventType::RoleAssigned,
-            EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
-                EventType::ToolInvoked
-            }
-            EventType::GovernanceAction
-            | EventType::GovernanceProposalCreated
-            | EventType::GovernanceVoteCast
-            | EventType::GovernanceVoteWithdrawn
-            | EventType::GovernanceProposalResolved
-            | EventType::GovernanceDeadlockRecovery
-            | EventType::GovernanceConflictDetected
-            | EventType::GovernanceConflictResolved
-            | EventType::GovernanceActionExecuted
-            | EventType::AccessRevoked
-            | EventType::ConsequenceTriggered
-            | EventType::ConsequenceEnforced
-            | EventType::ConsequenceEnforcementFailed
-            | EventType::ConsequenceEscalatedToSuspendAll => EventType::GovernanceAction,
-            _ => continue,
-        };
-        events.push(Event {
-            event_type,
-            actor_did: entry.actor_did.clone(),
-            timestamp: entry.timestamp,
-            sequence: events.len() as u64,
-            payload: entry.payload.clone(),
-            prev_hash: [0u8; 32],
-            signature: Vec::new(),
-        });
-    }
-
-    // Source 2: receive buffer (recent local `ContextEvent`s).
-    //
-    // CONVERGENCE INVARIANT (ADR-051 §6 / phase-2.md ADR-011 amendment §2 /
-    // spec §9.9.3 equivocation detection): the buffer may ONLY contribute
-    // per-author / velocity-class event types that are NOT in the durable
-    // log — i.e. `MessageSent` alone. `MessageSent` is per-author and is
-    // excluded from the canonical Merkle log (Source 1), so the receive
-    // buffer is its only source; velocity / rate triggers legitimately need
-    // it, and per-member variation is by-design local flow control that
-    // never feeds a convergent or durable leaf.
-    //
-    // Convergent events (membership, governance, consequence) are durably
-    // logged BEFORE being pushed to the receive buffer, so they ALWAYS appear
-    // in Source 1 on every honest member identically. Sourcing them ALSO from
-    // the per-member buffer here would double-count them on quiet members and
-    // skip them on busy ones (the dedup below is keyed on the member-local
-    // `buffer_len`), producing divergent `WarningCount` / `Custom` counts and
-    // therefore a divergent durable `ConsequenceTriggered` leaf — a
-    // false-positive equivocation that defeats the convergence guarantee.
-    // Those events MUST come exclusively from Source 1, so the match below
-    // omits them (they fall through to `_ => continue`).
-    let last_log_ts = events.last().map_or(0, |e| e.timestamp);
-    let buffer = ctx.event_buffer_events();
-    let buffer_len = buffer.len() as u64;
-    let next_seq = events.len() as u64;
-    let mut buffer_events_accepted: usize = 0;
-
-    for (idx, ctx_event) in buffer.iter().enumerate() {
-        let (event_type, actor_did, payload_data) = match ctx_event {
-            // Only per-author / velocity-class events are sourced from the
-            // buffer (see the CONVERGENCE INVARIANT comment above).
-            // `MessageSent` is excluded from the durable log, so the buffer is
-            // its only source. All convergent events (MemberJoined/MemberLeft/
-            // GovernanceActionExecuted/consequence) are intentionally NOT
-            // matched here — they come exclusively from Source 1 to preserve
-            // durable-leaf convergence — and fall through to `_ => continue`.
-            ContextEvent::MessageSent { sender_did, .. }
-            | ContextEvent::MessageReceived { sender_did, .. } => {
-                (EventType::MessageSent, sender_did.clone(), Vec::new())
-            }
-            _ => continue,
-        };
-
-        // Oldest buffer event gets `now - (buffer_len - 1)`, newest gets `now`.
-        let estimated_ts =
-            now_secs.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(idx as u64));
-
-        // Skip buffer events likely already covered by the durable log.
-        if estimated_ts <= last_log_ts && last_log_ts > 0 {
-            continue;
-        }
-        // Reject implausibly-future estimates (defense in depth).
-        if estimated_ts > now_secs.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
-            continue;
-        }
-        // Reject stale estimates (back-dating defense).
-        if now_secs.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
-            continue;
-        }
-        // Cap the number of buffer events fed to the evaluator (flood defense).
-        if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
-            break;
-        }
-        buffer_events_accepted += 1;
-
-        events.push(Event {
-            event_type,
-            actor_did,
-            timestamp: estimated_ts,
-            sequence: next_seq + idx as u64,
-            payload: EventPayload { data: payload_data },
-            prev_hash: [0u8; 32],
-            signature: Vec::new(),
-        });
-    }
-
-    events
+    scp_protocol::trust::consequence::merge_consequence_events(
+        ctx.event_log_events(),
+        ctx.event_buffer_events(),
+        now_secs,
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -173,9 +173,6 @@ pub const CONTEXT_EXPORT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-EXPORT-V1:";
 ///   `snapshot.role_state.creator_did` (step 2); a mismatch is rejected, and
 ///   the verifying key is resolved from the signed `creator_did`, never from
 ///   this field.
-/// - `merkle_root` — defense-in-depth only; step 6 requires it to equal the
-///   **signed** `snapshot.event_log_merkle_root`, and the authoritative event-
-///   log binding (step 5) compares the recomputed root to the signed value.
 /// - `scope` — the export-scope discriminant is now bound INTO the signed
 ///   preimage (via [`ExportScope::tag_byte`], placed immediately after the
 ///   domain separator and before the JCS bytes), so ANY scope flip changes the
@@ -196,9 +193,8 @@ pub const CONTEXT_EXPORT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-EXPORT-V1:";
 /// On import, the Merkle chain of `event_log_data` is verified: each entry's
 /// `prev_hash` must match the preceding entry's `hash`, and each entry's
 /// `hash` must be correctly computed. The recomputed Merkle root is compared
-/// (constant-time) against the SIGNED `snapshot.event_log_merkle_root`; the
-/// unsigned envelope `merkle_root` is an observability mirror cross-checked for
-/// agreement (defense in depth).
+/// (constant-time) against the SIGNED `snapshot.event_log_merkle_root`, which is
+/// the sole authoritative binding.
 ///
 /// # Privacy
 ///
@@ -233,9 +229,6 @@ pub struct ContextExport {
     pub exported_at: u64,
     /// DID of the identity that performed the export.
     pub exporter_did: DID,
-    /// Merkle root hash of the event log at export time.
-    /// All zeros if the event log is empty or not included.
-    pub merkle_root: [u8; 32],
     /// The scope of data included in this export.
     pub scope: ExportScope,
     /// Ed25519 signature over [`ContextExport::canonical_snapshot_hash`],
@@ -468,7 +461,7 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 ///
 /// Returns [`ContextError::EventLogFailed`] if deserialization fails or the
 /// replay's sequence / `prev_hash` chain validation fails.
-pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
+pub fn recompute_event_log_root(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
     use scp_event_log::{Event, EventLog};
 
     if event_log_data.is_empty() {
@@ -539,10 +532,6 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 /// 5. The recomputed event-log root matches the SIGNED
 ///    `snapshot.event_log_merkle_root` (the authoritative binding). A mismatch
 ///    yields the distinct `"signed snapshot root mismatch"` error.
-/// 6. Defense in depth: the unsigned envelope `merkle_root` agrees with the
-///    signed snapshot root. A mismatch yields the distinct
-///    `"envelope merkle_root mismatch"` error (separate from step 5 so a test
-///    can drive each independently).
 ///
 /// Verification happens entirely before any caller reads a field of the
 /// snapshot into authoritative state (the `lifecycle_helpers::import_context`
@@ -556,8 +545,7 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 /// # Errors
 ///
 /// - [`ContextError::EventLogFailed`] — unsupported/sub-current version,
-///   broken Merkle chain, signed-snapshot root mismatch (step 5), or envelope
-///   root mismatch (step 6).
+///   broken Merkle chain, or signed-snapshot root mismatch (step 5).
 /// - [`ContextError::SnapshotSignatureInvalid`] — `exporter_did` does not
 ///   match the snapshot `creator_did`, the snapshot could not be
 ///   canonicalized, or the signature does not authenticate the embedded
@@ -612,21 +600,22 @@ pub fn validate_export_for_import(
         })?;
 
     // 4. Merkle chain verification.
-    let computed_root = verify_merkle_chain(&export.event_log_data)?;
+    let computed_root = recompute_event_log_root(&export.event_log_data)?;
 
     // 5. Root hash comparison against the SIGNED snapshot field
     //    (constant-time to avoid timing side-channels).
     //
     //    The authoritative root is `snapshot.event_log_merkle_root`, which is
     //    inside the signed preimage verified in step 3. Comparing the
-    //    recomputed root to THIS value (not the unsigned envelope
-    //    `export.merkle_root`) binds the event log to the creator's signature:
-    //    an attacker holding a valid signed snapshot cannot substitute a
-    //    different internally-consistent event log, because its recomputed
-    //    root would not match the signed value. See §23.16.4 / §23.16.8.
+    //    recomputed root to THIS signed value binds the event log to the
+    //    creator's signature: an attacker holding a valid signed snapshot cannot
+    //    substitute a different internally-consistent event log, because its
+    //    recomputed root would not match the signed value. There is no separate
+    //    unsigned envelope mirror of the root — the signed snapshot field is the
+    //    single source of truth. See §23.16.4 / §23.16.8.
     //
     //    Security scope: the signed root is the RFC 6962 `tree::root` over ALL
-    //    entries (ADR-050), not a hash-chain head. `verify_merkle_chain`
+    //    entries (ADR-050), not a hash-chain head. `recompute_event_log_root`
     //    recomputes it by replaying every entry through
     //    `append_unsigned_event`, which validates each leaf's `sequence` against
     //    the running count and its `prev_hash` against the prior leaf (genesis
@@ -651,23 +640,6 @@ pub fn validate_export_for_import(
             "signed snapshot root mismatch: recomputed event-log root does not \
              match the signed snapshot.event_log_merkle_root — event log data \
              may have been tampered with or substituted"
-                .to_owned(),
-        ));
-    }
-
-    // 6. Defense in depth: the unsigned envelope `merkle_root` must agree with
-    //    the signed snapshot root. A mismatch indicates envelope tampering
-    //    (the producer always sets them equal in `create_export`); reject it
-    //    distinctly rather than silently trusting the signed value alone.
-    if !bool::from(
-        export
-            .merkle_root
-            .ct_eq(&export.snapshot.event_log_merkle_root),
-    ) {
-        return Err(ContextError::EventLogFailed(
-            "envelope merkle_root mismatch: unsigned envelope merkle_root does \
-             not match the signed snapshot root — export envelope may have been \
-             tampered with"
                 .to_owned(),
         ));
     }
@@ -883,7 +855,7 @@ where
 
     let (mut final_snapshot, event_log_data, merkle_root) = match scope {
         ExportScope::Full => {
-            let merkle_root = verify_merkle_chain(&event_log_data)?;
+            let merkle_root = recompute_event_log_root(&event_log_data)?;
             (snapshot, event_log_data, merkle_root)
         }
         ExportScope::Public => {
@@ -900,7 +872,7 @@ where
     // internally-consistent event log and have it accepted on import. The
     // importer recomputes the root over the received `event_log_data` and
     // compares it to this SIGNED value. Always `[0u8; 32]` for `Public`
-    // (no event log included), matching `verify_merkle_chain(&[])`.
+    // (no event log included), matching `recompute_event_log_root(&[])`.
     final_snapshot.event_log_merkle_root = merkle_root;
 
     // Build the export with a placeholder signature so the canonical hash can
@@ -912,7 +884,6 @@ where
         version: CURRENT_EXPORT_VERSION,
         exported_at,
         exporter_did,
-        merkle_root,
         scope,
         snapshot_signature: [0u8; 64],
     };
@@ -1214,7 +1185,7 @@ mod tests {
         assert_eq!(decoded.snapshot.context_id, "ctx-roundtrip-1");
         assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
         assert_eq!(decoded.exporter_did.as_ref(), TEST_CREATOR_DID);
-        assert_eq!(decoded.merkle_root, [0u8; 32]);
+        assert_eq!(decoded.snapshot.event_log_merkle_root, [0u8; 32]);
         assert!(decoded.event_log_data.is_empty());
         // MLS group state, when present, rides inside the signed snapshot
         // (`mls_crypto_state`), not on the envelope. The portable export path
@@ -1244,13 +1215,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(export.merkle_root, [0u8; 32]);
+        assert_ne!(export.snapshot.event_log_merkle_root, [0u8; 32]);
 
         let bytes = serialize_export(&export).unwrap();
         let decoded = deserialize_export(&bytes).unwrap();
 
         assert_eq!(decoded.snapshot.context_id, "ctx-roundtrip-2");
-        assert_eq!(decoded.merkle_root, export.merkle_root);
+        assert_eq!(
+            decoded.snapshot.event_log_merkle_root,
+            export.snapshot.event_log_merkle_root
+        );
         assert_eq!(decoded.snapshot.mls_crypto_state, vec![0xDE, 0xAD]);
         assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
         assert!(!decoded.event_log_data.is_empty());
@@ -1289,25 +1263,25 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn verify_merkle_chain_empty_data() {
-        let root = verify_merkle_chain(&[]).unwrap();
+    fn recompute_event_log_root_empty_data() {
+        let root = recompute_event_log_root(&[]).unwrap();
         assert_eq!(root, [0u8; 32]);
     }
 
     #[test]
-    fn verify_merkle_chain_valid_entries() {
+    fn recompute_event_log_root_valid_entries() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-1");
         let data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
         );
 
-        let root = verify_merkle_chain(&data).unwrap();
+        let root = recompute_event_log_root(&data).unwrap();
         assert_ne!(root, [0u8; 32]);
     }
 
     #[test]
-    fn verify_merkle_chain_detects_tampered_chain_link() {
+    fn recompute_event_log_root_detects_tampered_chain_link() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
@@ -1320,7 +1294,7 @@ mod tests {
         entries[1].prev_hash = [0xFF; 32];
 
         let tampered_data = rmp_serde::to_vec_named(&entries).unwrap();
-        let result = verify_merkle_chain(&tampered_data);
+        let result = recompute_event_log_root(&tampered_data);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -1330,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_merkle_chain_detects_removed_entry() {
+    fn recompute_event_log_root_detects_removed_entry() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
@@ -1345,14 +1319,14 @@ mod tests {
         entries.remove(1);
 
         let tampered_data = rmp_serde::to_vec_named(&entries).unwrap();
-        let result = verify_merkle_chain(&tampered_data);
+        let result = recompute_event_log_root(&tampered_data);
         assert!(result.is_err());
     }
 
     #[test]
-    fn verify_merkle_chain_rejects_suffix_truncated_log() {
+    fn recompute_event_log_root_rejects_suffix_truncated_log() {
         // Truncation-forgery-closed property: dropping trailing events from a
-        // signed export must be detected. `verify_merkle_chain` recomputes the
+        // signed export must be detected. `recompute_event_log_root` recomputes the
         // RFC 6962 root over whatever events it receives; a suffix-truncated
         // log replays cleanly (it is a valid prefix) but yields a DIFFERENT
         // root than the full log, so `import_context`'s constant-time compare
@@ -1367,7 +1341,7 @@ mod tests {
         let full_root = provider.merkle_root(&ctx_id_bytes).unwrap();
         let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         // Sanity: the untruncated export recomputes to the signed root.
-        assert_eq!(verify_merkle_chain(&full_data).unwrap(), full_root);
+        assert_eq!(recompute_event_log_root(&full_data).unwrap(), full_root);
 
         // Drop the trailing event (suffix truncation).
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
@@ -1375,7 +1349,7 @@ mod tests {
         let truncated_data = rmp_serde::to_vec_named(&entries).unwrap();
 
         // The truncated log still replays cleanly (valid prefix)...
-        let truncated_root = verify_merkle_chain(&truncated_data).unwrap();
+        let truncated_root = recompute_event_log_root(&truncated_data).unwrap();
         // ...but its recomputed root no longer matches the full (signed) root,
         // so a verifier comparing against the signed root rejects it.
         assert_ne!(
@@ -1385,10 +1359,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_merkle_chain_rejects_prefix_truncated_log() {
+    fn recompute_event_log_root_rejects_prefix_truncated_log() {
         // Prefix truncation (dropping leading events) is rejected outright:
         // the new first event carries a non-zero `sequence`, so the substrate
-        // replay's sequence check fails closed inside `verify_merkle_chain`.
+        // replay's sequence check fails closed inside `recompute_event_log_root`.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-prefix");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
@@ -1401,7 +1375,7 @@ mod tests {
         entries.remove(0);
         let truncated_data = rmp_serde::to_vec_named(&entries).unwrap();
 
-        let result = verify_merkle_chain(&truncated_data);
+        let result = recompute_event_log_root(&truncated_data);
         assert!(
             result.is_err(),
             "prefix-truncated log must be rejected by the sequence check"
@@ -1441,7 +1415,6 @@ mod tests {
             version: 99,
             exported_at: 1_000_000,
             exporter_did: DID::from(TEST_CREATOR_DID),
-            merkle_root: [0u8; 32],
             scope: ExportScope::Full,
             snapshot_signature: [0u8; 64],
         };
@@ -1453,53 +1426,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_export_rejects_merkle_root_mismatch() {
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-3");
-        let event_log_data =
-            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
-
-        let snapshot = test_snapshot("ctx-validate-3");
-        let mut export = create_export(
-            snapshot,
-            event_log_data,
-            DID::from(TEST_CREATOR_DID),
-            ExportScope::Full,
-            &scp_primitives::SystemClock,
-            sign_with_test_key,
-        )
-        .unwrap();
-
-        // Tamper with the UNSIGNED envelope Merkle root. Re-signing does not
-        // help the attacker: the signed snapshot's `event_log_merkle_root`
-        // still holds the true root, so the envelope/signed-snapshot agreement
-        // check (step 6) rejects the mismatch. This isolates the root
-        // comparison from the signature check (step 3).
-        export.merkle_root = [0xAB; 32];
-        export.snapshot_signature =
-            sign_with_test_key(&export.canonical_snapshot_hash().unwrap()).unwrap();
-
-        let result = validate_export_for_import(&export, &test_verifying_key());
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        // Only the unsigned envelope root was tampered; the recomputed root
-        // still matches the signed snapshot root (step 5 passes), so step 6
-        // (envelope-vs-signed agreement) is the rejecting check.
-        assert!(
-            err_msg.contains("envelope merkle_root mismatch"),
-            "expected step-6 envelope-root mismatch, got: {err_msg}"
-        );
-    }
-
-    #[test]
     fn validate_export_rejects_substituted_event_log() {
         // The signature-coverage attack the signed merkle-root binding closes:
         // an attacker holds a VALID signed snapshot but swaps in a DIFFERENT,
-        // internally-consistent event log (and matching envelope merkle_root).
-        // Because the true root is bound into the SIGNED snapshot, the
-        // recomputed root over the substituted log no longer matches the
-        // signed value and the import is rejected — even though the substitute
-        // log is itself a valid Merkle chain and the envelope merkle_root
-        // matches it.
+        // internally-consistent event log. Because the true root is bound into
+        // the SIGNED snapshot, the recomputed root over the substituted log no
+        // longer matches the signed value and the import is rejected — even
+        // though the substitute log is itself a valid Merkle chain.
         let ctx_id = "ctx-validate-substitute";
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
 
@@ -1517,91 +1450,25 @@ mod tests {
 
         // Build a DIFFERENT but internally-consistent event log and its root.
         let substitute_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]);
-        let substitute_root = verify_merkle_chain(&substitute_log).unwrap();
+        let substitute_root = recompute_event_log_root(&substitute_log).unwrap();
         assert_ne!(
             substitute_root, export.snapshot.event_log_merkle_root,
             "substitute log must have a different root for the test to be meaningful"
         );
 
-        // Attacker swaps the event log AND the envelope root to match it, but
-        // CANNOT touch the signed snapshot field without invalidating the
-        // creator signature.
+        // Attacker swaps the event log, but CANNOT touch the signed snapshot
+        // field without invalidating the creator signature.
         let mut attacked = export;
         attacked.event_log_data = substitute_log;
-        attacked.merkle_root = substitute_root;
 
         let result = validate_export_for_import(&attacked, &test_verifying_key());
         assert!(result.is_err(), "substituted event log must be rejected");
         let err_msg = format!("{}", result.unwrap_err());
-        // The substitute log's root matches the (also-substituted) envelope
-        // root, so step 6 would pass; the rejecting check is step 5, comparing
-        // the recomputed root against the SIGNED snapshot root.
+        // The rejecting check is step 5, comparing the recomputed root over the
+        // substituted log against the SIGNED snapshot root (the sole authority).
         assert!(
             err_msg.contains("signed snapshot root mismatch"),
             "expected step-5 signed-root mismatch, got: {err_msg}"
-        );
-    }
-
-    /// Isolates step 5 (recomputed-root vs SIGNED `snapshot.event_log_merkle_root`)
-    /// from step 6 (recomputed-root vs unsigned envelope `merkle_root`).
-    ///
-    /// Unlike [`validate_export_rejects_substituted_event_log`], which also
-    /// rewrites the envelope `merkle_root`, this test mutates ONLY
-    /// `event_log_data` and LEAVES the envelope `merkle_root` at its signed
-    /// value. With the envelope root untouched, step 6's envelope-vs-signed
-    /// comparison can never fire (both still equal the signed root); the ONLY
-    /// check that can reject is step 5, comparing the recomputed root over the
-    /// substituted log against the signed snapshot root. This is the test that
-    /// would pass (false-negative) if step 5 were removed — a mutation check.
-    #[test]
-    fn validate_export_step5_rejects_event_log_with_envelope_root_untouched() {
-        let ctx_id = "ctx-validate-step5-only";
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
-
-        let real_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
-        let export = create_export(
-            test_snapshot(ctx_id),
-            real_log,
-            DID::from(TEST_CREATOR_DID),
-            ExportScope::Full,
-            &scp_primitives::SystemClock,
-            sign_with_test_key,
-        )
-        .unwrap();
-
-        // A different but internally-consistent event log.
-        let substitute_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]);
-        let substitute_root = verify_merkle_chain(&substitute_log).unwrap();
-        assert_ne!(
-            substitute_root, export.snapshot.event_log_merkle_root,
-            "substitute log must have a different root for the test to be meaningful"
-        );
-
-        // Swap ONLY the event log. The envelope `merkle_root` stays at the
-        // signed value (it was set equal to the signed snapshot root by
-        // `create_export`), so step 6 cannot fire — step 5 must catch this.
-        let mut attacked = export;
-        attacked.event_log_data = substitute_log;
-        // Precondition: envelope root still equals the signed snapshot root.
-        assert_eq!(
-            attacked.merkle_root, attacked.snapshot.event_log_merkle_root,
-            "envelope merkle_root must remain at the signed value for this to isolate step 5"
-        );
-
-        let result = validate_export_for_import(&attacked, &test_verifying_key());
-        assert!(
-            result.is_err(),
-            "step 5 must reject the substituted event log"
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("signed snapshot root mismatch"),
-            "expected the step-5 message, got: {err_msg}"
-        );
-        // And NOT the step-6 message — proving step 5 is what fired.
-        assert!(
-            !err_msg.contains("envelope merkle_root mismatch"),
-            "step 6 must not be the rejecting check here, got: {err_msg}"
         );
     }
 
@@ -1750,7 +1617,6 @@ mod tests {
                 version: CURRENT_EXPORT_VERSION,
                 exported_at: 1_000_000,
                 exporter_did: DID::from(TEST_CREATOR_DID),
-                merkle_root: [0u8; 32],
                 scope: ExportScope::Full,
                 snapshot_signature: [0u8; 64],
             };
@@ -1776,7 +1642,6 @@ mod tests {
         append_test_event(&provider, &ctx_id_bytes, "Event3");
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
-        let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
 
         // Tamper: remove one event from the entries.
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
@@ -1790,7 +1655,6 @@ mod tests {
             version: CURRENT_EXPORT_VERSION,
             exported_at: 1_000_000,
             exporter_did: DID::from(TEST_CREATOR_DID),
-            merkle_root,
             scope: ExportScope::Full,
             // Sign over the tampered contents so the signature check (step 2)
             // passes and validation reaches the Merkle chain check (step 3).
@@ -1882,7 +1746,7 @@ mod tests {
         assert!(export.event_log_data.is_empty());
         // Public scope strips the signed MLS group blob.
         assert!(export.snapshot.mls_crypto_state.is_empty());
-        assert_eq!(export.merkle_root, [0u8; 32]);
+        assert_eq!(export.snapshot.event_log_merkle_root, [0u8; 32]);
         assert_eq!(export.snapshot.context_id, "ctx-public-1");
         // Membership should be empty.
         assert_eq!(export.snapshot.membership.count(), 0);
@@ -1909,7 +1773,7 @@ mod tests {
         assert_eq!(export.scope, ExportScope::Full);
         assert!(!export.event_log_data.is_empty());
         assert_eq!(export.snapshot.mls_crypto_state, vec![0xFF]);
-        assert_ne!(export.merkle_root, [0u8; 32]);
+        assert_ne!(export.snapshot.event_log_merkle_root, [0u8; 32]);
     }
 
     // -------------------------------------------------------------------
@@ -1954,7 +1818,10 @@ mod tests {
         // All fields should match.
         assert_eq!(decoded.snapshot.context_id, "ctx-pipeline-1");
         assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
-        assert_eq!(decoded.merkle_root, export.merkle_root);
+        assert_eq!(
+            decoded.snapshot.event_log_merkle_root,
+            export.snapshot.event_log_merkle_root
+        );
     }
 
     #[test]
@@ -2069,7 +1936,6 @@ mod tests {
         // The failure is NOT a root-mismatch error — the event log is untouched.
         let msg = format!("{err}");
         assert!(!msg.contains("signed snapshot root mismatch"));
-        assert!(!msg.contains("envelope merkle_root mismatch"));
     }
 
     /// §23.16.8 / ADR-050 scope-binding: flipping the envelope `scope` on a
@@ -2234,7 +2100,10 @@ mod tests {
         let reexported = new_provider
             .export_event_log_entries(&ctx_id_bytes)
             .unwrap();
-        assert_eq!(verify_merkle_chain(&reexported).unwrap(), original_root);
+        assert_eq!(
+            recompute_event_log_root(&reexported).unwrap(),
+            original_root
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2276,8 +2145,8 @@ mod tests {
         let data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
 
-        // verify_merkle_chain must accept the pruned log.
-        let computed_root = verify_merkle_chain(&data).unwrap();
+        // recompute_event_log_root must accept the pruned log.
+        let computed_root = recompute_event_log_root(&data).unwrap();
         assert_eq!(computed_root, merkle_root);
 
         // Full export/import pipeline with pruned data.
@@ -2310,7 +2179,7 @@ mod tests {
         // The imported log's chain verified on import; re-exporting recomputes
         // to the same root as the source provider.
         assert_eq!(
-            verify_merkle_chain(
+            recompute_event_log_root(
                 &new_provider
                     .export_event_log_entries(&ctx_id_bytes)
                     .unwrap()
@@ -2330,7 +2199,7 @@ mod tests {
         );
         // Re-export still recomputes to a valid (non-error) root.
         assert!(
-            verify_merkle_chain(
+            recompute_event_log_root(
                 &new_provider
                     .export_event_log_entries(&ctx_id_bytes)
                     .unwrap()
@@ -2380,7 +2249,6 @@ mod tests {
         );
         let msg = format!("{err}");
         assert!(!msg.contains("signed snapshot root mismatch"));
-        assert!(!msg.contains("envelope merkle_root mismatch"));
     }
 
     /// Tampering a role's capability ceiling — also unsigned under the old
@@ -2617,7 +2485,6 @@ mod tests {
             version,
             exported_at,
             exporter_did,
-            merkle_root,
             scope,
             snapshot_signature,
         } = &export;
@@ -2628,7 +2495,9 @@ mod tests {
         assert_eq!(*version, CURRENT_EXPORT_VERSION);
         let _ = exported_at;
         assert_eq!(exporter_did.as_ref(), TEST_CREATOR_DID);
-        assert_eq!(*merkle_root, [0u8; 32]);
+        // The Merkle root lives solely on the SIGNED snapshot field; the
+        // envelope no longer mirrors it.
+        assert_eq!(snapshot.event_log_merkle_root, [0u8; 32]);
         assert_eq!(*scope, ExportScope::Full);
         assert_eq!(snapshot_signature.len(), 64);
     }

@@ -518,7 +518,7 @@ pub struct ContextSnapshot {
     ///
     /// **Security scope — full-history completeness AND integrity.** This root
     /// is the RFC 6962 `tree::root` over ALL event-log entries (ADR-050), not a
-    /// hash-chain head. `verify_merkle_chain` recomputes it by replaying every
+    /// hash-chain head. `recompute_event_log_root` recomputes it by replaying every
     /// entry through `append_unsigned_event`, validating each leaf's `sequence`
     /// against the running count and its `prev_hash` against the prior leaf
     /// (genesis for the first entry). A PREFIX-truncated log (oldest entries

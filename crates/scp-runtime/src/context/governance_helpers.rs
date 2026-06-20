@@ -590,8 +590,7 @@ pub fn detect_and_handle_conflicts(
                 // `GovernanceFreezeExpired` leaf (`freeze_start + FREEZE_TIMEOUT`)
                 // is thus convergent-by-construction (§7.3.1, §9.9.3), matching the
                 // committer-assigned-timestamp treatment of other governance leaves.
-                let freeze_start =
-                    new_proposal.created_at.max(conflicting_proposal.created_at);
+                let freeze_start = new_proposal.created_at.max(conflicting_proposal.created_at);
                 state.governance.freeze =
                     Some((new_proposal.proposal_id, conflicting_id, freeze_start));
                 events.push(GovernanceEvent::ConflictDetected {
