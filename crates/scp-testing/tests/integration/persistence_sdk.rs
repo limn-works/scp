@@ -89,7 +89,7 @@ const SQLITE_KEY: [u8; 32] = [0x42; 32];
 /// lifecycle — we only need the `ContextManager` to be constructible.
 #[cfg(feature = "sqlite")]
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &DID| None)
+    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None)
 }
 
 /// Returns `ContextParams` for an encrypted context with the capability

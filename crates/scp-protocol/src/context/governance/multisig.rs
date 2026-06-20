@@ -29,7 +29,7 @@ use super::{
     KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
     sign_vote, verify_vote,
 };
-use scp_primitives::DID;
+use scp_primitives::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // ThresholdEngine
@@ -265,8 +265,10 @@ impl GovernanceEngine for ThresholdEngine {
 
         // Verify the proposer's vote signature against their DID-resolved key.
         let resolved_key =
-            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
-                did: proposer.to_string(),
+            (self.key_resolver)(proposer, SigningKeyId::Active).ok_or_else(|| {
+                GovernanceError::UnknownVoter {
+                    did: proposer.to_string(),
+                }
             })?;
         verify_vote(&proposal_id, &proposer_vote, &resolved_key).map_err(|_| {
             GovernanceError::InvalidSignature {
@@ -375,10 +377,11 @@ impl GovernanceEngine for ThresholdEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
-        let resolved_key =
-            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
+            GovernanceError::UnknownVoter {
                 did: voter.to_string(),
-            })?;
+            }
+        })?;
         verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
             GovernanceError::InvalidSignature {
                 voter_did: voter.to_string(),
@@ -454,10 +457,11 @@ impl GovernanceEngine for ThresholdEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
-        let resolved_key =
-            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
+            GovernanceError::UnknownVoter {
                 did: voter.to_string(),
-            })?;
+            }
+        })?;
         verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
             GovernanceError::InvalidSignature {
                 voter_did: voter.to_string(),
@@ -654,7 +658,8 @@ impl GovernanceEngine for ThresholdEngine {
             }
 
             // Get public key for this signer
-            let Some(verifying_key) = (self.key_resolver)(&cosig.signer_did) else {
+            let Some(verifying_key) = (self.key_resolver)(&cosig.signer_did, SigningKeyId::Active)
+            else {
                 return Err(GovernanceError::NotEligible(format!(
                     "Cannot resolve public key for cosigner {}",
                     cosig.signer_did
@@ -723,7 +728,7 @@ mod tests {
     /// key's verifying key.
     fn mock_resolver() -> KeyResolver {
         use std::sync::Arc;
-        Arc::new(|did: &DID| {
+        Arc::new(|did: &DID, _kid: SigningKeyId| {
             let did_str: &str = did.as_ref();
             match did_str {
                 "did:dht:z6MkAlice" => {
@@ -1630,7 +1635,7 @@ mod tests {
         // Dave is in the signer set but NOT in the resolver.
         let resolver_without_dave: KeyResolver = {
             use std::sync::Arc;
-            Arc::new(|did: &DID| {
+            Arc::new(|did: &DID, _kid: SigningKeyId| {
                 let did_str: &str = did.as_ref();
                 match did_str {
                     "did:dht:z6MkAlice" => {

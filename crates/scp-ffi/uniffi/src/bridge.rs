@@ -9359,6 +9359,11 @@ impl Scp {
                         &sender_did,
                         &payload,
                         resolved_signing_key.as_ref(),
+                        // ADR-039: UniFFI bridge sends under the human `#active`
+                        // key today; per-message persona selection is out of
+                        // scope for this runtime-pipeline wiring (FFI is
+                        // mechanically widened only).
+                        scp_identity::SigningKeyId::Active,
                         None,
                         spending_ucan.as_ref(),
                     )

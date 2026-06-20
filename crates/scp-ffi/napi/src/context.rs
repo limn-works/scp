@@ -1152,6 +1152,10 @@ pub(crate) async fn context_send_on(
             sender_did: did,
             payload: payload.clone(),
             signing_key: signing_key_bytes,
+            // ADR-039: NAPI bridge sends under the human `#active` key today;
+            // per-message persona selection is out of scope for this
+            // runtime-pipeline wiring (FFI is mechanically widened only).
+            signing_key_id: scp_identity::SigningKeyId::Active,
             source_provenance: None,
             spending_ucan,
         }),

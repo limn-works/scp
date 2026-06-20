@@ -442,6 +442,7 @@ impl FullStackNode {
                 &self.did,
                 payload,
                 Some(&self.signing_key),
+                scp_identity::SigningKeyId::Active,
                 None,
                 None,
             )

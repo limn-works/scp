@@ -449,7 +449,8 @@ where
     ));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
-    let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+    let key_resolver: scp_core::context::governance::KeyResolver =
+        Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
     let supervisor = scp_core::context::supervisor::Supervisor::with_providers(

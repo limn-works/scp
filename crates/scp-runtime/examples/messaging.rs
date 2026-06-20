@@ -23,7 +23,7 @@ mod support;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build a Supervisor with mock providers.
-    let key_resolver: KeyResolver = Arc::new(|_did| None);
+    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None);
     let manager = Supervisor::with_providers(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
@@ -78,14 +78,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Alice sends a message.
     let alice_sk = support::signing_key_for(&alice);
     manager
-        .send_message(&handle, &alice, b"Hello Bob!", Some(&alice_sk), None, None)
+        .send_message(
+            &handle,
+            &alice,
+            b"Hello Bob!",
+            Some(&alice_sk),
+            scp_identity::SigningKeyId::Active,
+            None,
+            None,
+        )
         .await?;
     println!("\nAlice: Hello Bob!");
 
     // 6. Bob sends a reply.
     let bob_sk = support::signing_key_for(&bob);
     manager
-        .send_message(&handle, &bob, b"Hi Alice!", Some(&bob_sk), None, None)
+        .send_message(
+            &handle,
+            &bob,
+            b"Hi Alice!",
+            Some(&bob_sk),
+            scp_identity::SigningKeyId::Active,
+            None,
+            None,
+        )
         .await?;
     println!("Bob: Hi Alice!");
 

@@ -6687,6 +6687,17 @@ impl Supervisor {
     /// Encrypts and broadcasts a payload through the context's MLS
     /// group via the actor mailbox.
     ///
+    /// `signing_key_id` selects which verification method the message is
+    /// signed under (ADR-039): [`SigningKeyId::Active`] for human-originated
+    /// sends, [`SigningKeyId::Agent`] for agent-autonomous sends. It is
+    /// stamped into the inner envelope's `signing_key_id` so the recipient
+    /// resolves the matching public key (`#active` / `#agent`) from the
+    /// sender's DID document, and MUST agree with the key material in
+    /// `signing_key`.
+    ///
+    /// [`SigningKeyId::Active`]: scp_protocol::identity::SigningKeyId::Active
+    /// [`SigningKeyId::Agent`]: scp_protocol::identity::SigningKeyId::Agent
+    ///
     /// Phase 2A finalization — every per-context method on `Supervisor`
     /// builds a typed `ContextCommand` carrying an embedded reply
     /// oneshot, enqueues it via [`Self::dispatch_command`], and awaits
@@ -6706,12 +6717,14 @@ impl Supervisor {
     /// - [`ContextError::TransportFailed`] if the mailbox reply channel
     ///   is dropped before the handler completes (handler crash /
     ///   actor shutdown).
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
         handle: &crate::context::ContextHandle,
         sender_did: &DID,
         payload: &[u8],
         signing_key: Option<&ed25519_dalek::SigningKey>,
+        signing_key_id: scp_protocol::identity::SigningKeyId,
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
@@ -6723,6 +6736,7 @@ impl Supervisor {
             payload: payload.to_vec(),
             signing_key: signing_key
                 .map(crate::context::actor::commands::SigningKeyBytes::from_signing_key),
+            signing_key_id,
             source_provenance: source_provenance.cloned(),
             spending_ucan: spending_ucan.cloned(),
         });
@@ -8144,7 +8158,8 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let key_resolver: KeyResolver =
+            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -9124,13 +9139,14 @@ mod tests {
             Box::new(TestEventLog);
         // Resolver returns Some for every DID — witnesses key_resolver
         // propagation.
-        let key_resolver: KeyResolver = Arc::new(|did: &DID| {
-            let mut seed = [0u8; 32];
-            for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
-                seed[i % 32] ^= *b;
-            }
-            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
-        });
+        let key_resolver: KeyResolver =
+            Arc::new(|did: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+                let mut seed = [0u8; 32];
+                for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+                    seed[i % 32] ^= *b;
+                }
+                Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+            });
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -9175,7 +9191,11 @@ mod tests {
             "mls_storage must be the exact Arc threaded into with_providers"
         );
         assert!(
-            (deps.key_resolver)(&DID("did:example:alice".to_owned())).is_some(),
+            (deps.key_resolver)(
+                &DID("did:example:alice".to_owned()),
+                scp_protocol::identity::SigningKeyId::Active
+            )
+            .is_some(),
             "key_resolver must populate from the supervisor"
         );
         assert!(
@@ -9673,7 +9693,8 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let key_resolver: KeyResolver =
+            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(

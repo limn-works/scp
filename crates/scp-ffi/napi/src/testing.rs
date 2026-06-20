@@ -62,7 +62,7 @@ where
 ///
 /// Full-stack E2E tests verify crypto, not governance vote signatures.
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did| None)
+    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------

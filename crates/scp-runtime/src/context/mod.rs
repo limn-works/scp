@@ -28,6 +28,8 @@
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
 pub mod actor;
+#[cfg(test)]
+mod agent_binding_pipeline_tests;
 pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;

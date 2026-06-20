@@ -2789,7 +2789,7 @@ mod restore_reconcile_tests {
             crypto,
             Box::new(OkTransport),
             Box::new(OkEventLog),
-            Arc::new(|_: &DID| None),
+            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None),
             Some(persistence),
             None,
             None,
@@ -3194,7 +3194,11 @@ mod restore_reconcile_tests {
         let key_resolver: scp_protocol::context::governance::KeyResolver = {
             let did = joiner_for_resolver;
             let vk = joiner_vk;
-            Arc::new(move |q: &DID| if *q == did { Some(vk) } else { None })
+            Arc::new(
+                move |q: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+                    if *q == did { Some(vk) } else { None }
+                },
+            )
         };
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3388,7 +3392,7 @@ mod restore_reconcile_tests {
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_q: &DID| None);
+            Arc::new(|_q: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
 
         // Working persistence (CapturingPersistence) + FAILING event-log append.
         let sup = Supervisor::with_providers(

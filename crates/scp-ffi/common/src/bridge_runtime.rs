@@ -56,7 +56,9 @@ use crate::bridge_instance::CoreFields;
 #[must_use]
 pub fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     Arc::new(
-        |_did: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
+        |_did: &scp_identity::DID,
+         _kid: scp_identity::SigningKeyId|
+         -> Option<ed25519_dalek::VerifyingKey> {
             static LOG_ONCE: std::sync::Once = std::sync::Once::new();
             LOG_ONCE.call_once(|| {
                 tracing::error!(

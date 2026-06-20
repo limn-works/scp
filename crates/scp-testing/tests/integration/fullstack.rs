@@ -44,7 +44,7 @@ const CAROL_DID: &str = "did:dht:z6MkCarolFullStack";
 /// Returns a key resolver that always resolves (tests don't verify governance
 /// vote signatures — that's covered by `governance_integration.rs`).
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did| {
+    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| {
         // Return a deterministic key derived from the DID string so
         // governance operations that require signature verification can
         // proceed (even though we don't exercise that path here).

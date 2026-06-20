@@ -61,7 +61,16 @@ assert_eq!(handle.state().await, ContextState::Active);
 
 ```rust,ignore
 manager
-    .send_message(&handle, &"did:dht:z6Mk...sender".into(), b"hello world", None)
+    .send_message(
+        &handle,
+        &"did:dht:z6Mk...sender".into(),
+        b"hello world",
+        Some(&signing_key),
+        // ADR-039: sign under `#active` (human) or `#agent` (agent).
+        scp_core::identity::SigningKeyId::Active,
+        None, // source provenance
+        None, // spending UCAN
+    )
     .await?;
 ```
 
@@ -109,8 +118,10 @@ raw constructors instead of the builder:
 use scp_core::context::ContextManager;
 use scp_core::context::governance::KeyResolver;
 
-let key_resolver: KeyResolver = Arc::new(|did| {
-    // Map DID to Ed25519 verifying key for governance vote verification.
+let key_resolver: KeyResolver = Arc::new(|did, signing_key_id| {
+    // Map (DID, verification method) to the Ed25519 verifying key.
+    // `signing_key_id` selects `#active` (human) vs `#agent` (agent) per
+    // ADR-039 — resolve the key for the requested verification method.
     None
 });
 

@@ -120,6 +120,7 @@ pub fn build_encrypted_envelope(
     sender_did: &DID,
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
+    signing_key_id: SigningKeyId,
     recipients_data: &std::collections::HashMap<String, AccessKey>,
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
@@ -174,7 +175,11 @@ pub fn build_encrypted_envelope(
         message_type,
         payload: &wrapped_bytes,
         provenance,
-        signing_key_id: SigningKeyId::Active,
+        // ADR-039: stamp the verification method this message is signed under
+        // (`#active` or `#agent`) so the recipient resolves the matching public
+        // key from the sender's DID document. Threaded from the send call —
+        // no longer hardcoded to `#active`.
+        signing_key_id,
     };
 
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
@@ -296,8 +301,16 @@ pub fn verify_and_unwrap(
     access_key: &AccessKey,
     sender_is_admin: bool,
 ) -> Result<Vec<u8>, ContextError> {
-    let public_key = (key_resolver)(&DID(sender_did.to_owned())).ok_or_else(|| {
-        ContextError::CryptoFailed(format!("cannot resolve public key for sender {sender_did}"))
+    // ADR-039: resolve the verification method the sender declared in the
+    // inner envelope (`#active` or `#agent`), so an `#agent`-signed message is
+    // verified against the agent key and an `#active`-signed one against the
+    // human key. The resolver returns `None` when that specific VM is absent
+    // from the sender's DID document (e.g. `#agent` requested but never added).
+    let signing_key_id = inner.signing_key_id;
+    let public_key = (key_resolver)(&DID(sender_did.to_owned()), signing_key_id).ok_or_else(|| {
+        ContextError::CryptoFailed(format!(
+            "cannot resolve public key for sender {sender_did} verification method {signing_key_id}"
+        ))
     })?;
     let valid = scp_protocol::envelope::inner::verify_inner_signature(inner, public_key.as_bytes())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -673,6 +686,7 @@ pub async fn send_message(
     sender_did: &DID,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
+    signing_key_id: SigningKeyId,
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
@@ -904,6 +918,7 @@ pub async fn send_message(
         deps,
         broadcast_envelope,
         signing_key,
+        signing_key_id,
         &context_id,
         sender_did,
         payload,
@@ -1237,6 +1252,7 @@ pub fn encrypt_and_send(
     deps: &ActorDeps,
     broadcast_envelope: Option<BroadcastEnvelope>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
+    signing_key_id: SigningKeyId,
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],
@@ -1261,6 +1277,7 @@ pub fn encrypt_and_send(
             sender_did,
             payload,
             sk,
+            signing_key_id,
             recipients_data,
             sequence,
             source_provenance,
@@ -1377,6 +1394,9 @@ pub fn send_checkpoint(
         deps,
         broadcast_envelope,
         Some(signing_key),
+        // Consistency checkpoints are device/human-originated signals, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        SigningKeyId::Active,
         context_id,
         sender_did,
         &payload,
@@ -1486,6 +1506,9 @@ pub fn send_heartbeat(
         deps,
         broadcast_envelope,
         Some(signing_key),
+        // Heartbeats are device/human-originated liveness beacons, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        SigningKeyId::Active,
         context_id,
         sender_did,
         // Heartbeats carry NO user content — the empty payload is the whole
@@ -2627,6 +2650,9 @@ pub async fn send_pseudonym_announcement(
         sender_did,
         &payload,
         Some(signing_key),
+        // Pseudonym announcements are protocol-level membership signals from
+        // the local member, signed under `#active` (ADR-039).
+        SigningKeyId::Active,
         None,
         None,
     )

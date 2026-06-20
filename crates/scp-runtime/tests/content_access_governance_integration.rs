@@ -112,7 +112,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -455,6 +455,7 @@ async fn revoke_write_access_full_blocks_publishing() {
             &dave(),
             b"should fail",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -509,6 +510,7 @@ async fn revoke_write_access_future_only() {
             &dave(),
             b"future message",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -587,6 +589,7 @@ async fn restore_write_access_forward_only() {
             &dave(),
             b"after restore",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -1216,6 +1219,7 @@ async fn full_content_access_lifecycle() {
             &dave(),
             b"blocked",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -1247,6 +1251,7 @@ async fn full_content_access_lifecycle() {
             &dave(),
             b"restored",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )

@@ -1178,7 +1178,8 @@ impl GovernanceState {
         admin_did: DID,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_did: &DID| None);
+        let resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_did: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
         let engine: Box<dyn GovernanceEngine> =
             Box::new(SingleAdminEngine::new(admin_did, resolver));
         Self {

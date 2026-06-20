@@ -121,7 +121,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -233,7 +233,15 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
 
     let handle = ContextHandle::new(ctx_id.to_owned(), encrypted_params());
     manager
-        .send_message(&handle, &alice(), b"hello", Some(&sk_alice), None, None)
+        .send_message(
+            &handle,
+            &alice(),
+            b"hello",
+            Some(&sk_alice),
+            scp_identity::SigningKeyId::Active,
+            None,
+            None,
+        )
         .await
         .expect("encrypted send should succeed with a seeded peer pseudonym");
 
@@ -288,7 +296,15 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
     let handle = ContextHandle::new(ctx_id.to_owned(), encrypted_params());
     // No pseudonyms seeded → the registry is empty.
     let result = manager
-        .send_message(&handle, &alice(), b"hello", Some(&sk_alice), None, None)
+        .send_message(
+            &handle,
+            &alice(),
+            b"hello",
+            Some(&sk_alice),
+            scp_identity::SigningKeyId::Active,
+            None,
+            None,
+        )
         .await;
     assert!(
         matches!(result, Err(ContextError::PseudonymRegistryEmpty { member_count, .. }) if member_count == 2),
@@ -313,6 +329,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &alice(),
             b"hello-again",
             Some(&sk_alice),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -356,6 +373,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &alice(),
             b"hello-nobody",
             Some(&sk_alice),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -409,7 +427,15 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
     transport.routing_ids.lock().unwrap().clear();
 
     manager
-        .send_message(&handle, &alice(), b"hello-bob", Some(&sk_alice), None, None)
+        .send_message(
+            &handle,
+            &alice(),
+            b"hello-bob",
+            Some(&sk_alice),
+            scp_identity::SigningKeyId::Active,
+            None,
+            None,
+        )
         .await
         .expect("send after a peer joins + announces must succeed");
     assert!(

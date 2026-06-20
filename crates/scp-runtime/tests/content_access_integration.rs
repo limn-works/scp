@@ -161,7 +161,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -787,6 +787,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &author_did(),
             b"blocked message",
             Some(&signing_key_for_did(&author_did())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -842,6 +843,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &author_did(),
             b"restored message",
             Some(&signing_key_for_did(&author_did())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -1507,6 +1509,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"should fail",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -1535,6 +1538,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"still blocked",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
@@ -1561,6 +1565,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"success",
             Some(&signing_key_for_did(&dave())),
+            scp_identity::SigningKeyId::Active,
             None,
             None,
         )
