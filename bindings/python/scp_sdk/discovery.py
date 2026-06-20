@@ -10,7 +10,7 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 from scp_sdk.errors import ScpError
 
@@ -198,7 +198,7 @@ async def discover_contexts(query: str) -> list[DiscoveryResult]:
 
     bridge = _bridge()
     results = await asyncio.to_thread(bridge.context_discover, query)
-    return [DiscoveryResult(**dict(item)) for item in results]  # type: ignore[misc]
+    return [cast(DiscoveryResult, dict(item)) for item in results]
 
 
 __all__ = [

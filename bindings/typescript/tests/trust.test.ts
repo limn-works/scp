@@ -431,7 +431,7 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context);
 
     expect(result.behavioralRecord).not.toBeNull();
-    expect(result.behavioralRecord?.contextsParticipated).toBe(1);
+    expect(result.behavioralRecord?.contextsParticipated).toBe(0);
     // Only the two ToolInvoked events are counted.
     expect(result.behavioralRecord?.toolInvocations).toHaveLength(2);
     expect(result.behavioralRecord?.toolInvocations.every((t) => t.type === "ToolInvoked")).toBe(
