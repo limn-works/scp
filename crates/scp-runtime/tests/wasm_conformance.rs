@@ -2504,8 +2504,7 @@ fn serde_json_emits_sorted_keys_preserve_order_must_stay_off() {
     });
     let bytes = serde_json::to_vec(&value).expect("json must serialize");
     assert_eq!(
-        bytes,
-        br#"{"a":3,"m":2,"z":1}"#,
+        bytes, br#"{"a":3,"m":2,"z":1}"#,
         "serde_json must emit SORTED keys — a `preserve_order` (insertion-order) \
          flip would silently shift convergent leaf bytes (consequence / \
          TokenRevoked payloads) and break the §25 Merkle-root KATs. Keep the \

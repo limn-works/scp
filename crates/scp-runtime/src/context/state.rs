@@ -1914,9 +1914,7 @@ mod notification_window_backdating_tests {
         CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
         PendingCeilingModification, PendingEconomicPolicyChange,
     };
-    use scp_protocol::economy::types::{
-        Amount, CostSchedule, CurrencyCode, EconomicPolicy,
-    };
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     /// Minimal valid economic policy for gate tests (values are irrelevant to
     /// the timing gate under test).

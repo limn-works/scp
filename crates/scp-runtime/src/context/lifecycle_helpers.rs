@@ -1787,13 +1787,19 @@ pub async fn import_context(
     // above. The RESTORE path (trusted self-respawn) keeps `observed_at`
     // verbatim — re-pinning there would let a crash-loop re-arm the window
     // forever.
-    let sanitized_pending_ceiling_modification =
-        export.snapshot.pending_ceiling_modification.clone().map(|mut p| {
+    let sanitized_pending_ceiling_modification = export
+        .snapshot
+        .pending_ceiling_modification
+        .clone()
+        .map(|mut p| {
             p.observed_at = now_for_validation;
             p
         });
-    let sanitized_pending_economic_policy_change =
-        export.snapshot.pending_economic_policy_change.clone().map(|mut p| {
+    let sanitized_pending_economic_policy_change = export
+        .snapshot
+        .pending_economic_policy_change
+        .clone()
+        .map(|mut p| {
             p.observed_at = now_for_validation;
             p
         });
