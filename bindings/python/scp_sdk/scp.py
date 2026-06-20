@@ -1753,7 +1753,9 @@ class SCP:
         """Delegate to ``_scp_core.SCP.economy_budget_remaining``."""
         return await asyncio.to_thread(self._native.economy_budget_remaining, context_id, did)
 
-    async def economy_verify_payment_receipts(self, receipts_json: str) -> dict[str, Any]:
+    async def economy_verify_payment_receipts(
+        self, receipts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
 
         Verifies a batch of payment receipts against this instance's economy
@@ -1763,18 +1765,19 @@ class SCP:
         scanning for failures MUST inspect ``valid``/``all_valid``, not ``ok``.
 
         Args:
-            receipts_json: JSON-encoded array of payment receipts.
+            receipts: List of payment receipt dicts to verify.
 
         Returns:
             The parsed verification result (a dict with ``all_valid`` and a
             list of per-receipt records carrying ``valid``/``ok``).
 
         Raises:
-            ScpError: If the receipts JSON is invalid or the supervisor is
+            ScpError: If the receipts are invalid or the supervisor is
                 not initialized.
         """
         import json
 
+        receipts_json = json.dumps(receipts)
         raw = await asyncio.to_thread(self._native.economy_verify_payment_receipts, receipts_json)
         return json.loads(raw)
 

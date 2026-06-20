@@ -2161,8 +2161,9 @@ export class SCP {
    *   verification requires a native client whose bridge runs the payment
    *   adapter (ADR-034).
    */
-  economyVerifyPaymentReceipts(receiptsJson: string): string {
-    return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+  economyVerifyPaymentReceipts(receiptsJson: string): unknown {
+    const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+    return JSON.parse(raw) as unknown;
   }
 
   // ───────────────────────────────────────────────────────────────────────

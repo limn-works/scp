@@ -46,7 +46,7 @@ export interface ContextParams {
   /** Per-caller session cap (§6.2.1). Default 1000. */
   readonly sessionCap?: number;
   /**
-   * Consequence rules for automated governance enforcement (ADR-017, §9.3, #1531).
+   * Consequence rules for automated governance enforcement (ADR-017, §9.3).
    *
    * Each rule is a typed {@link ConsequenceRule} discriminated union (no
    * stringly-typed JSON). The SDK serializes the array to JSON at the bridge
@@ -56,7 +56,7 @@ export interface ContextParams {
   readonly consequenceRules?: readonly ConsequenceRule[];
   /**
    * Per-context consequence config governing which enforcement severities
-   * the rules may reference (ADR-017, #1531).
+   * the rules may reference (ADR-017).
    *
    * When omitted, the protocol default applies
    * (`allow_automatic_access_revocation = false`). Must opt in explicitly to
@@ -66,7 +66,7 @@ export interface ContextParams {
 }
 
 // ---------------------------------------------------------------------------
-// Consequence rules (ADR-017, §9.3, #1531)
+// Consequence rules (ADR-017, §9.3)
 // ---------------------------------------------------------------------------
 
 /**
@@ -782,7 +782,7 @@ export interface EventClaim {
 //
 // `TrustEvaluation`, `BehavioralRecord`, and `AttestationSummary` moved to
 // `./trust` to mirror the Python SDK's four-layer `TrustEvaluation` model
-// (spec §9.3, ADR-017). The prior stale shapes here had no consumers and did
+// (spec §7.2–7.5, ADR-017). The prior stale shapes here had no consumers and did
 // not match the cross-SDK trust contract; `./trust` is now the authority.
 
 // ---------------------------------------------------------------------------
