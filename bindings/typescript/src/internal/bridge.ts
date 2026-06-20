@@ -941,10 +941,7 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  */
 export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
   const env = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
-  const isTesting =
-    env === "test" ||
-    env === "development" ||
-    (globalThis as { BUN_TEST?: boolean }).BUN_TEST !== undefined;
+  const isTesting = env === "test" || env === "development" || process.env.BUN_TEST !== undefined;
   if (!isTesting) {
     throw new Error(
       "__setBridgeForTests is a test-only hook. It must only be called in test or development " +

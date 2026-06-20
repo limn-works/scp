@@ -608,13 +608,13 @@ class SCP:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        del exc_type, exc, tb
         """Shut down synchronously on ``with``-scope exit.
 
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
         """
+        del exc_type, exc, tb
         self._native.shutdown(self._shutdown_millis(5.0))
 
     async def __aenter__(self) -> SCP:
@@ -627,12 +627,12 @@ class SCP:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        del exc_type, exc, tb
         """Shut down asynchronously on ``async with`` scope exit.
 
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
         """
+        del exc_type, exc, tb
         await self.shutdown()
 
     # ------------------------------------------------------------------
