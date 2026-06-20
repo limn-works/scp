@@ -170,35 +170,51 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// A governance proposal was created (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `proposer_did`, `action`,
-    /// `voting_deadline`.
+    /// Durable leaf payload: EMPTY. Both native (`append_context_event`,
+    /// `EventPayload::default()`) and WASM append this leaf with no payload so
+    /// the leaf preimage is byte-identical across platforms (§9.9.3
+    /// native↔WASM parity). The associated data (`proposal_id`,
+    /// `proposer_did`, `action`, `voting_deadline`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceProposalCreated,
     /// A vote was cast on a governance proposal (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `voter_did`, `vote`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `voter_did`, `vote`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteCast,
     /// A vote was withdrawn from a governance proposal (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `voter_did`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `voter_did`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteWithdrawn,
     /// A governance proposal was resolved (approved, rejected, expired)
     /// (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `status`, `executor_did`,
-    /// `resulting_epoch`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `status`, `executor_did`,
+    /// `resulting_epoch`) rides only on the buffer-only `ContextEvent`, never
+    /// in the canonical Merkle leaf.
     GovernanceProposalResolved,
     /// A governance conflict was detected (two proposals landed at the
     /// same event log sequence) (ADR-031 §7).
     ///
-    /// Payload fields: `proposal_a`, `proposal_b`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_a`, `proposal_b`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictDetected,
     /// A governance conflict was resolved (ADR-031 §7).
     ///
-    /// Payload fields: `winner_id`, `resolution`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`winner_id`, `resolution`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictResolved,
     /// A deadlock recovery was performed (ADR-031 §10).
     ///
-    /// Payload fields: `justification`, `changes`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`justification`, `changes`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceDeadlockRecovery,
     /// A governance action was executed from an approved proposal
     /// (ADR-031 §8).

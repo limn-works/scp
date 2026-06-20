@@ -1021,4 +1021,105 @@ mod cross_impl_leaf_parity {
              false-positive equivocation across platforms"
         );
     }
+
+    /// Drives the REAL WASM governance production handlers end-to-end and
+    /// asserts the durable Merkle leaves they append carry an EMPTY payload.
+    ///
+    /// The sibling test `cross_impl_governance_proposal_vote_leaf_is_empty_wasm`
+    /// feeds a hand-written `b""` through the test-only append path, so it
+    /// cannot catch a regression at the production call sites
+    /// (`WasmContextManager::propose_governance_action`,
+    /// `approve_governance_proposal`, `withdraw_governance_vote`) where the
+    /// `b""` argument actually lives. This test calls those handlers directly
+    /// so that flipping any of them back to `proposal_id.as_bytes()` (the
+    /// pre-fix WASM behavior that bit native↔WASM parity twice) fails the
+    /// build instead of leaving the synthetic test green.
+    ///
+    /// A 4-member `majority` context has quorum 3. The proposer's own vote is
+    /// approval #1 and a single additional approval is #2 — both below quorum —
+    /// so the proposal stays `Pending` and no `execute_governance_action`
+    /// fires, keeping all three append sites (`GovernanceProposalCreated`,
+    /// `GovernanceVoteCast`, `GovernanceVoteWithdrawn`) reachable for real on
+    /// the native test target.
+    #[test]
+    fn real_governance_handlers_append_empty_leaves_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+        // `scp_event_log::DID` (re-exported from `scp_primitives`) is the same
+        // type `GovernanceAction::AddSigner.did` expects.
+
+        let context_id = "ctx-gov-real";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // Build a 4-member majority context (quorum = 3) so neither the
+        // proposer's vote nor one extra approval reaches quorum: the proposal
+        // stays Pending and no execution fires.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberD", "admin");
+        // Admins resolve capabilities through the ceiling — admit the
+        // governance propose/vote capabilities the handlers gate on.
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // "deadbeef" is valid hex (the handler hex-decodes proposal_id into a
+        // [u8; 32]) and is used verbatim as the pending-proposal map key.
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::AddSigner {
+            did: DID::from("did:dht:z6MkNewSigner".to_owned()),
+        };
+
+        // 1. Real propose handler → GovernanceProposalCreated leaf (b"").
+        let propose_result = mgr
+            .propose_governance_action(context_id, proposer, proposal_id, &action)
+            .unwrap();
+        assert_eq!(
+            propose_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1-of-3 quorum must leave the proposal Pending so no execution fires"
+        );
+
+        // 2. Real vote-cast handler → GovernanceVoteCast leaf (b"").
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .unwrap();
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2-of-3 quorum must still leave the proposal Pending"
+        );
+
+        // 3. Real vote-withdraw handler → GovernanceVoteWithdrawn leaf (b"").
+        mgr.withdraw_governance_vote(context_id, proposal_id, voter)
+            .unwrap();
+
+        // Every durable governance leaf the real handlers appended must carry
+        // an EMPTY payload — byte-parity with native's `append_context_event`
+        // (§9.9.3). A regression that stamps `proposal_id.as_bytes()` at any of
+        // the three call sites fails this assertion.
+        let logged = mgr.test_context_event_log_events(context_id);
+        for event_type in [
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+        ] {
+            let leaf = logged.iter().find(|e| e.event_type == event_type);
+            assert!(
+                leaf.is_some_and(|e| e.payload.data.is_empty()),
+                "{event_type:?} durable leaf from the REAL handler MUST be present \
+                 with an EMPTY payload (§9.9.3 native↔WASM parity)"
+            );
+        }
+    }
 }

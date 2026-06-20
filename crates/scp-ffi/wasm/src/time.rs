@@ -10,8 +10,10 @@
 //! later `Date.now` overrides, significantly narrowing the attack window to
 //! code that executes *before* the WASM module is instantiated.
 
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
 const _dateNow = Date.now.bind(Date);
 export function captured_date_now() { return _dateNow(); }
@@ -27,9 +29,30 @@ extern "C" {
 ///
 /// Uses the captured `Date.now` reference (see module docs). All WASM bridge
 /// code should use this instead of `js_sys::Date::now()`.
+///
+/// On non-`wasm32` targets (native host test builds) the `inline_js` extern
+/// does not exist — calling it panics with "cannot call wasm-bindgen imported
+/// functions on non-wasm targets". So native builds fall back to `SystemTime`,
+/// letting tests drive real WASM-bridge code paths (e.g. governance
+/// proposal/vote handlers) that need a clock without a JS runtime. This branch
+/// is compiled out of the real `wasm32-unknown-unknown` browser build and
+/// therefore cannot weaken the hardened-clock security property in production.
 #[must_use]
+#[cfg(target_arch = "wasm32")]
 pub fn now_ms() -> f64 {
     captured_date_now()
+}
+
+/// Native-host fallback for [`now_ms`] (see the `wasm32` variant's docs).
+#[must_use]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // `as_secs_f64() * 1000.0` mirrors JS `Date.now()`'s millisecond `f64`
+    // without an int→float cast (so no `cast_precision_loss`).
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 /// Returns the current time in milliseconds since Unix epoch as `u64`.

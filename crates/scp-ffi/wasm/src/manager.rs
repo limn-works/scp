@@ -773,6 +773,13 @@ impl PerContextState {
         self.ceiling_strings.insert(capability.to_owned());
     }
 
+    /// Test-only: set the governance model string (e.g. `"majority"`), so
+    /// sibling-module tests can drive multi-admin proposal/vote flows.
+    #[cfg(test)]
+    pub(crate) fn test_set_governance(&mut self, model: &str) {
+        self.governance = model.to_owned();
+    }
+
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
     /// at [`WASM_RESOLVED_PROPOSAL_CAP`].
     fn insert_resolved_proposal(&mut self, id: String, proposal: GovernanceProposal) {
@@ -1204,6 +1211,29 @@ impl WasmContextManager {
             contexts: HashMap::new(),
             pending_key_packages: HashMap::new(),
         }
+    }
+
+    /// Test-only: register a pre-built `PerContextState` under `context_id`.
+    /// Lets tests in sibling modules (e.g. `crate::consequence`) drive the
+    /// real lifecycle/governance handlers without reaching into the private
+    /// `contexts` field.
+    #[cfg(test)]
+    pub(crate) fn test_insert_context(&mut self, context_id: &str, ctx: PerContextState) {
+        self.contexts.insert(context_id.to_owned(), ctx);
+    }
+
+    /// Test-only: clone the durable event-log leaves for `context_id`. Lets
+    /// sibling-module tests assert on leaves the real handlers appended
+    /// without exposing the private `contexts` field.
+    #[cfg(test)]
+    pub(crate) fn test_context_event_log_events(
+        &self,
+        context_id: &str,
+    ) -> Vec<scp_event_log::Event> {
+        self.contexts
+            .get(context_id)
+            .map(|ctx| ctx.event_log_events().to_vec())
+            .unwrap_or_default()
     }
 
     /// Returns `true` if the context's stored economic policy requires payment.
