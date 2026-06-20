@@ -386,6 +386,47 @@ impl IdentityBackedDidResolver {
             ))
         })
     }
+
+    /// Resolves the Ed25519 verifying key for a specific verification method on
+    /// a DID, used by governance vote-signature verification (ADR-039).
+    ///
+    /// Drives the same validated resolution pipeline as the trait
+    /// implementations — live (cache-backed) DID document resolution with BEP44
+    /// signature verification and self-certification, sequence-number rotation
+    /// tracking / downgrade prevention — then extracts the requested
+    /// verification method (`#active` or `#agent`, via
+    /// [`SigningKeyId::fragment`](scp_identity::SigningKeyId::fragment)) and
+    /// parses the public key bytes into an [`ed25519_dalek::VerifyingKey`].
+    ///
+    /// This is the VM-aware accessor the FFI `KeyResolver` closure wraps so the
+    /// governance engine verifies votes against the voter's *document-derived*
+    /// key for the exact signing key they claimed — not a caller-supplied key.
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolutionError::NotFound`] — the DID could not be resolved.
+    /// - [`ResolutionError::InvalidDocument`] — the document failed validation,
+    ///   the requested verification method is absent, the key bytes could not be
+    ///   decoded, or the bytes are not a valid Ed25519 curve point.
+    /// - [`ResolutionError::NetworkUnavailable`] — all resolution layers were
+    ///   unreachable.
+    /// - [`ResolutionError::Revoked`] — the document carried a stale sequence
+    ///   number (possible downgrade attack).
+    pub fn verifying_key_for(
+        &self,
+        did: &str,
+        key_id: scp_identity::SigningKeyId,
+    ) -> Result<ed25519_dalek::VerifyingKey, ResolutionError> {
+        let resolved = self.resolve_sync(did)?;
+        self.check_sequence(did, resolved.seq)?;
+        let bytes = Self::extract_public_key(&resolved, key_id.fragment())?;
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|e| {
+            ResolutionError::InvalidDocument(format!(
+                "verification method '#{}' for {did} is not a valid Ed25519 public key: {e}",
+                key_id.fragment()
+            ))
+        })
+    }
 }
 
 /// Implements `scp_core::crypto::ucan::validate::DidResolver` for production
@@ -924,6 +965,172 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error for unknown DID via attestation resolver"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // document_vm_key_resolver — VM-aware, document-derived governance resolver
+    // -----------------------------------------------------------------------
+
+    /// A resolvable identity seeded into a real DHT: the DID, the document's
+    /// `#active` and `#agent` verifying keys (the latter present only when the
+    /// document carries an `#agent` verification method).
+    struct SeededIdentity {
+        did: String,
+        active_vk: ed25519_dalek::VerifyingKey,
+        agent_vk: Option<ed25519_dalek::VerifyingKey>,
+    }
+
+    /// Builds a self-certifying, BEP44-signed DID document with `#active`
+    /// (always) and `#agent` (optional) verification methods, and publishes it
+    /// into `dht` so a [`DualLayerResolver`] can resolve and validate it.
+    ///
+    /// The DID is derived from the identity key, which also BEP44-signs the
+    /// document — exactly the production self-certification invariant
+    /// (`verify_self_certification`) the real resolver enforces.
+    #[allow(clippy::similar_names)]
+    async fn seed_identity(dht: &InMemoryDhtClient, with_agent: bool) -> SeededIdentity {
+        use scp_identity::DhtClient;
+
+        // All RNG-bound key generation and signing happens synchronously and is
+        // scoped into this block so the non-`Send` `ThreadRng` is dropped before
+        // the `.await` below (clippy::future_not_send).
+        let (did, identity_pk, active_vk, agent_vk, value, signature) = {
+            use ed25519_dalek::{Signer, SigningKey};
+
+            let mut rng = rand::thread_rng();
+            let identity_sk = SigningKey::generate(&mut rng);
+            let active_sk = SigningKey::generate(&mut rng);
+            let agent_sk = SigningKey::generate(&mut rng);
+
+            let identity_vk = identity_sk.verifying_key();
+            let active_vk = active_sk.verifying_key();
+            let agent_vk = agent_sk.verifying_key();
+
+            let did = format!("did:dht:z{}", zbase32::encode(identity_vk.as_bytes()));
+
+            // Pre-rotation commitment: SHA-256 of a random next identity key.
+            let pre_rotation_commitment: [u8; 32] = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(SigningKey::generate(&mut rng).verifying_key().as_bytes()).into()
+            };
+
+            let agent_key_bytes = with_agent.then(|| *agent_vk.as_bytes());
+            let doc = DidDocument::new_with_agent_key(
+                &did,
+                identity_vk.as_bytes(),
+                active_vk.as_bytes(),
+                &pre_rotation_commitment,
+                agent_key_bytes.as_ref().map(<[u8; 32]>::as_slice),
+            );
+
+            // BEP44-sign the serialized document with the identity key (seq = 1),
+            // matching DidDht::publish_document.
+            let value = doc.to_json().unwrap().into_bytes();
+            let signable = scp_identity::dht::bep44_signable(&value, 1);
+            let signature: [u8; 64] = identity_sk.sign(&signable).to_bytes();
+
+            (
+                did,
+                *identity_vk.as_bytes(),
+                active_vk,
+                agent_vk,
+                value,
+                signature,
+            )
+        };
+
+        // Publish under the identity public key.
+        dht.publish(&identity_pk, &signature, &value, 1)
+            .await
+            .unwrap();
+
+        SeededIdentity {
+            did,
+            active_vk,
+            agent_vk: with_agent.then_some(agent_vk),
+        }
+    }
+
+    /// Constructs an `IdentityBackedDidResolver` over a `DualLayerResolver`
+    /// backed by `dht`, wrapped for use as a governance key resolver.
+    fn identity_resolver_over(
+        dht: Arc<InMemoryDhtClient>,
+        handle: tokio::runtime::Handle,
+    ) -> Arc<IdentityBackedDidResolver> {
+        let relay = Arc::new(NoOpRelayQuerier);
+        let cache = Arc::new(DidCache::new());
+        let resolver = Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()));
+        Arc::new(IdentityBackedDidResolver::new(resolver, handle))
+    }
+
+    #[test]
+    fn document_vm_key_resolver_is_document_derived_and_vm_aware() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+
+        // Seed one identity WITH an #agent key, and one WITHOUT.
+        let (with_agent, no_agent) = rt.block_on(async {
+            let with_agent = seed_identity(&dht, true).await;
+            let no_agent = seed_identity(&dht, false).await;
+            (with_agent, no_agent)
+        });
+
+        // Build the production VM-aware governance key resolver over the seeded DHT.
+        let did_resolver = identity_resolver_over(Arc::clone(&dht), rt.handle().clone());
+        let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
+
+        // (DID, Active) → Some(vk) equal to the document's #active key.
+        let with_agent_did = scp_identity::DID::from(with_agent.did.clone());
+        let active = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Active);
+        assert_eq!(
+            active,
+            Some(with_agent.active_vk),
+            "Active VM must resolve to the document's #active key"
+        );
+
+        // (DID, Agent) → Some(vk) equal to the document's #agent key, distinct
+        // from #active.
+        let agent = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Agent);
+        assert_eq!(
+            agent,
+            with_agent.agent_vk,
+            "Agent VM must resolve to the document's #agent key"
+        );
+        assert_ne!(
+            agent,
+            Some(with_agent.active_vk),
+            "Agent and active keys must be distinct (proves VM-awareness)"
+        );
+
+        // (DID with no #agent VM, Agent) → None.
+        let no_agent_did = scp_identity::DID::from(no_agent.did.clone());
+        assert!(
+            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Agent).is_none(),
+            "Agent VM lookup must fail closed when the document has no #agent key"
+        );
+        // Sanity: the no-agent identity still resolves its #active key.
+        assert_eq!(
+            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Active),
+            Some(no_agent.active_vk),
+            "the no-agent identity must still resolve its #active key"
+        );
+
+        // (unknown DID, either VM) → None.
+        let unknown_pk: [u8; 32] = [0x11; 32];
+        let unknown_did =
+            scp_identity::DID::from(format!("did:dht:z{}", zbase32::encode(&unknown_pk)));
+        assert!(
+            key_resolver(&unknown_did, scp_identity::SigningKeyId::Active).is_none(),
+            "unknown DID (Active) must resolve to None"
+        );
+        assert!(
+            key_resolver(&unknown_did, scp_identity::SigningKeyId::Agent).is_none(),
+            "unknown DID (Agent) must resolve to None"
         );
     }
 }

@@ -760,6 +760,15 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
+/// Builds the production VM-aware governance key resolver from a DID resolver.
+///
+/// Delegates to [`scp_ffi_common::bridge_runtime::document_vm_key_resolver`].
+fn document_vm_key_resolver(
+    did_resolver: Arc<scp_ffi_common::IdentityBackedDidResolver>,
+) -> scp_core::context::governance::KeyResolver {
+    scp_ffi_common::bridge_runtime::document_vm_key_resolver(did_resolver)
+}
+
 /// Returns the per-instance
 /// [`Supervisor`](scp_core::context::supervisor::Supervisor) on the given
 /// bridge instance.
@@ -927,7 +936,14 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         return;
     };
     let supervisor_arc =
-        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
+        build_supervisor_arc(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for(bi),
+        );
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -983,6 +999,7 @@ fn build_supervisor_arc(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Box<dyn ContextPersistence>,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
@@ -992,13 +1009,25 @@ fn build_supervisor_arc(
         crypto,
         transport,
         event_log,
-        not_configured_key_resolver(),
+        key_resolver,
         Some(persistence),
         None,
         Some(event_tx),
         None,
         mls_storage,
     )
+}
+
+/// Selects the governance key resolver for this bridge instance.
+///
+/// Wires the production VM-aware document resolver when a DID resolver is
+/// configured; otherwise fails closed with the always-`None`
+/// [`not_configured_key_resolver`] so vote-signature verification is never
+/// silently permissive.
+fn key_resolver_for(bi: &NapiBridgeInstance) -> scp_core::context::governance::KeyResolver {
+    bi.core.did_resolver().map_or_else(not_configured_key_resolver, |r| {
+        document_vm_key_resolver(Arc::clone(r))
+    })
 }
 
 /// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.
@@ -1054,7 +1083,14 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         return;
     };
     let supervisor_arc =
-        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
+        build_supervisor_arc(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for(bi),
+        );
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1109,7 +1145,14 @@ pub fn init_supervisor_with_relay_transport(
         return;
     };
     let supervisor_arc =
-        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
+        build_supervisor_arc(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for(bi),
+        );
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1236,6 +1279,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         event_log,
         Box::new(NapiBridgePersistence::new()),
         mls_storage,
+        key_resolver_for(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);
