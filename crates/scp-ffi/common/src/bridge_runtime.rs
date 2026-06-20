@@ -97,7 +97,7 @@ pub fn document_vm_key_resolver(
 ) -> scp_core::context::governance::KeyResolver {
     std::sync::Arc::new(
         move |did: &scp_identity::DID, kid: scp_identity::SigningKeyId| {
-            did_resolver.verifying_key_for(did.as_ref(), kid).ok()
+            did_resolver.verifying_key_for(did, kid).ok()
         },
     )
 }

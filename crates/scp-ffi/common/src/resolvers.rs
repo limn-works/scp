@@ -402,6 +402,34 @@ impl IdentityBackedDidResolver {
     /// governance engine verifies votes against the voter's *document-derived*
     /// key for the exact signing key they claimed — not a caller-supplied key.
     ///
+    /// Unlike the `DidResolver`/`DidPublicKeyResolver` trait-impl siblings
+    /// ([`resolve_public_key`](DidResolver::resolve_public_key) /
+    /// [`resolve_public_key_by_kid`](DidResolver::resolve_public_key_by_kid)),
+    /// which flatten failures into the foreign error types those traits require
+    /// ([`CoreUcanError`] / [`TrustError`]), this accessor returns the
+    /// structured, internal [`ResolutionError`] directly. It is the VM-aware
+    /// entry point for callers that want to branch on the *kind* of failure;
+    /// the [`document_vm_key_resolver`](crate::bridge_runtime::document_vm_key_resolver)
+    /// governance helper collapses every error variant to `None`.
+    ///
+    /// # Side effects
+    ///
+    /// This is **not** a pure read. [`check_sequence`](Self::check_sequence)
+    /// advances this resolver instance's per-DID rotation state
+    /// (`seen_sequences`) and may emit a [`DidRotatedEvent`] into
+    /// `rotation_events` when a higher sequence number is observed.
+    ///
+    /// # Downgrade protection
+    ///
+    /// The `check_sequence`/`seen_sequences` ratchet here is **per-resolver-
+    /// instance defense-in-depth**, not the load-bearing anti-rollback guard.
+    /// The authoritative, cross-consumer (in-process) anti-rollback guard is the
+    /// shared `DualLayerResolver`/`DidCache::cached_sequence` check performed
+    /// during document resolution. A future refactor MUST NOT delete the
+    /// cache-level guard on the assumption that this per-instance ratchet covers
+    /// it — it does not (it sees only the DIDs this one resolver instance has
+    /// observed).
+    ///
     /// # Errors
     ///
     /// - [`ResolutionError::NotFound`] — the DID could not be resolved.
@@ -414,10 +442,13 @@ impl IdentityBackedDidResolver {
     ///   number (possible downgrade attack).
     pub fn verifying_key_for(
         &self,
-        did: &str,
+        did: &scp_identity::DID,
         key_id: scp_identity::SigningKeyId,
     ) -> Result<ed25519_dalek::VerifyingKey, ResolutionError> {
+        let did = did.as_ref();
         let resolved = self.resolve_sync(did)?;
+        // Per-instance anti-rollback ratchet (defense-in-depth — see the
+        // "Downgrade protection" note above; the cache-level guard is load-bearing).
         self.check_sequence(did, resolved.seq)?;
         let bytes = Self::extract_public_key(&resolved, key_id.fragment())?;
         ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|e| {
