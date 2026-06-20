@@ -1178,7 +1178,7 @@ def main() -> int:
                         unmatched_true += 1
                         errors += 1
                 elif expected is False:
-                    # Must have an exemption
+                    # Must have an exemption with a non-empty reason string
                     if sdk not in exemptions:
                         print(
                             f"  ERROR: {domain}/{op_name} marked false for "
@@ -1186,6 +1186,14 @@ def main() -> int:
                         )
                         missing_exemptions += 1
                         errors += 1
+                    else:
+                        reason = exemptions.get(sdk, "")
+                        if not isinstance(reason, str) or not reason.strip():
+                            print(
+                                f"  ERROR: 'exemptions.{sdk}' for op '{domain}/{op_name}' "
+                                f"must be a non-empty string"
+                            )
+                            errors += 1
 
             # All-exempted check: if every SDK that claims coverage for this
             # operation has a coverage_exemption (and none was statically

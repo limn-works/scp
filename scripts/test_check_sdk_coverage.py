@@ -278,8 +278,8 @@ def test_gate_passes_with_valid_coverage_exemption(tmp_path: Path) -> None:
                         "kotlin": False,
                         "swift": False,
                         "exemptions": {
-                            "kotlin": {"reason": "Not implemented"},
-                            "swift": {"reason": "Not implemented"},
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
                         },
                         "coverage_exemptions": {
                             "python": "Symbol is generated at runtime by the PyO3 bridge — not statically extractable",
@@ -341,8 +341,8 @@ def test_gate_fails_on_all_exempted_with_none_verified(tmp_path: Path) -> None:
                         "kotlin": False,
                         "swift": False,
                         "exemptions": {
-                            "kotlin": {"reason": "Not implemented"},
-                            "swift": {"reason": "Not implemented"},
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
                         },
                         "coverage_exemptions": {
                             "python": "Generated binding — not statically extractable",
@@ -371,4 +371,74 @@ def test_gate_fails_on_all_exempted_with_none_verified(tmp_path: Path) -> None:
     # Verify the all-exempted guard fired (not a different error).
     assert "all SDKs claiming coverage" in result.stdout.lower() or "all-exempted" in result.stdout.lower(), (
         f"Expected all-exempted guard error phrase in stdout.\nstdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Gate exits 1 when a false entry's exemption reason is a non-string
+#          (e.g. a dict) or an empty/blank string.
+#
+# Setup:
+#   - python=True  — valid, a symbol IS present.
+#   - typescript=False — exemption value is a dict object (invalid format).
+#   - kotlin=False — exemption is an empty string (invalid).
+#   - swift=False — valid exemption string.
+#
+# The gate must reject the dict and blank exemption reasons.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_invalid_false_entry_exemption_reason(tmp_path: Path) -> None:
+    """Gate exits 1 when a false entry has a non-string or blank exemption reason."""
+    ts_src_dir = tmp_path / "ts_src"
+    ts_src_dir.mkdir()
+    ts_file = ts_src_dir / "index.ts"
+    # Provide a real symbol so python=True is statically verified.
+    ts_file.write_text(
+        "export function invalidExemptOpZzz(): void {}\n",
+        encoding="utf-8",
+    )
+
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "invalid_exempt_op_zzz",
+                        "python": False,
+                        # typescript=True with symbol present (static verification)
+                        "typescript": True,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            # dict object — invalid, must be a string
+                            "python": {"reason": "Not implemented"},
+                            # blank string — invalid
+                            "kotlin": "   ",
+                            # valid string
+                            "swift": "Not yet implemented in Swift SDK",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(
+        tmp_path,
+        matrix_file,
+        sdk_paths={"typescript": ts_src_dir},
+    )
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for invalid exemption reasons, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "must be a non-empty string" in result.stdout, (
+        f"Expected 'must be a non-empty string' in stdout.\nstdout:\n{result.stdout}"
     )
