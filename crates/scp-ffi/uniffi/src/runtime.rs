@@ -834,15 +834,14 @@ impl UniffiBridgeInstance {
             );
             return;
         };
-        let supervisor_arc =
-            build_supervisor(
-                crypto,
-                transport,
-                event_log,
-                persistence,
-                mls_storage,
-                key_resolver_for_core(&self.core),
-            );
+        let supervisor_arc = build_supervisor(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for_core(&self.core),
+        );
 
         self.core.set_supervisor(supervisor_arc);
     }
@@ -876,15 +875,14 @@ impl UniffiBridgeInstance {
             );
             return;
         };
-        let supervisor_arc =
-            build_supervisor(
-                crypto,
-                transport,
-                event_log,
-                persistence,
-                mls_storage,
-                key_resolver_for_core(&self.core),
-            );
+        let supervisor_arc = build_supervisor(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for_core(&self.core),
+        );
 
         self.core.set_supervisor(supervisor_arc);
     }
@@ -1326,9 +1324,10 @@ fn build_supervisor(
 /// [`not_configured_key_resolver`] so vote-signature verification is never
 /// silently permissive.
 fn key_resolver_for_core(core: &CoreFields) -> scp_core::context::governance::KeyResolver {
-    core.did_resolver().map_or_else(not_configured_key_resolver, |r| {
-        document_vm_key_resolver(Arc::clone(r))
-    })
+    core.did_resolver()
+        .map_or_else(not_configured_key_resolver, |r| {
+            document_vm_key_resolver(Arc::clone(r))
+        })
 }
 
 // Phase D (#1695): module-level `context_manager`, `context_manager_expect`,

@@ -935,15 +935,14 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         );
         return;
     };
-    let supervisor_arc =
-        build_supervisor_arc(
-            crypto,
-            transport,
-            event_log,
-            persistence,
-            mls_storage,
-            key_resolver_for(bi),
-        );
+    let supervisor_arc = build_supervisor_arc(
+        crypto,
+        transport,
+        event_log,
+        persistence,
+        mls_storage,
+        key_resolver_for(bi),
+    );
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1025,9 +1024,11 @@ fn build_supervisor_arc(
 /// [`not_configured_key_resolver`] so vote-signature verification is never
 /// silently permissive.
 fn key_resolver_for(bi: &NapiBridgeInstance) -> scp_core::context::governance::KeyResolver {
-    bi.core.did_resolver().map_or_else(not_configured_key_resolver, |r| {
-        document_vm_key_resolver(Arc::clone(r))
-    })
+    bi.core
+        .did_resolver()
+        .map_or_else(not_configured_key_resolver, |r| {
+            document_vm_key_resolver(Arc::clone(r))
+        })
 }
 
 /// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.
@@ -1082,15 +1083,14 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         );
         return;
     };
-    let supervisor_arc =
-        build_supervisor_arc(
-            crypto,
-            transport,
-            event_log,
-            persistence,
-            mls_storage,
-            key_resolver_for(bi),
-        );
+    let supervisor_arc = build_supervisor_arc(
+        crypto,
+        transport,
+        event_log,
+        persistence,
+        mls_storage,
+        key_resolver_for(bi),
+    );
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1144,15 +1144,14 @@ pub fn init_supervisor_with_relay_transport(
         );
         return;
     };
-    let supervisor_arc =
-        build_supervisor_arc(
-            crypto,
-            transport,
-            event_log,
-            persistence,
-            mls_storage,
-            key_resolver_for(bi),
-        );
+    let supervisor_arc = build_supervisor_arc(
+        crypto,
+        transport,
+        event_log,
+        persistence,
+        mls_storage,
+        key_resolver_for(bi),
+    );
 
     bi.core.set_supervisor(supervisor_arc);
 }

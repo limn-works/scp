@@ -1128,8 +1128,7 @@ mod tests {
         // from #active.
         let agent = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Agent);
         assert_eq!(
-            agent,
-            with_agent.agent_vk,
+            agent, with_agent.agent_vk,
             "Agent VM must resolve to the document's #agent key"
         );
         assert_ne!(

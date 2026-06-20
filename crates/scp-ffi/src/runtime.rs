@@ -1208,10 +1208,12 @@ fn build_supervisor(
     // Wire the production VM-aware governance key resolver when a DID resolver
     // is configured; otherwise fail closed with the always-`None` resolver so
     // governance vote-signature verification is never silently permissive.
-    let key_resolver = bi.core.did_resolver().map_or_else(
-        not_configured_key_resolver,
-        |r| document_vm_key_resolver(std::sync::Arc::clone(r)),
-    );
+    let key_resolver = bi
+        .core
+        .did_resolver()
+        .map_or_else(not_configured_key_resolver, |r| {
+            document_vm_key_resolver(std::sync::Arc::clone(r))
+        });
     Ok(scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
         transport,

@@ -787,22 +787,18 @@ pub async fn send_message(
             // `signer` was validated non-`None` at the top of the function; the
             // broadcast envelope is signed with the same key the encrypted path
             // would stamp, sourced from the one `MessageSigner`.
-            let env = match build_broadcast_envelope(
-                &*deps.clock,
-                bc,
-                sender_did,
-                payload,
-                signer.key(),
-            ) {
-                Ok(env) => env,
-                Err(e) => {
-                    crate::context::economy_logic::rollback_economy_ticket_inline(
-                        &mut state.governance,
-                        ticket,
-                    );
-                    return Err(e);
-                }
-            };
+            let env =
+                match build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key())
+                {
+                    Ok(env) => env,
+                    Err(e) => {
+                        crate::context::economy_logic::rollback_economy_ticket_inline(
+                            &mut state.governance,
+                            ticket,
+                        );
+                        return Err(e);
+                    }
+                };
             // Broadcast: SHA-256(context_id) per spec §5.14.
             let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
             (

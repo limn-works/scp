@@ -249,7 +249,11 @@ fn receive_via_verify_and_unwrap(
 ) -> Result<Vec<u8>, ContextError> {
     let opened = match bob_provider.open(ctx_bytes, blob)? {
         scp_protocol::context::builder::OpenResult::Application(env) => *env,
-        other => panic!("expected an Application open result, got {other:?}"),
+        other => {
+            return Err(ContextError::CryptoFailed(format!(
+                "expected an Application open result, got {other:?}"
+            )));
+        }
     };
     let inner: InnerEnvelope = opened.inner;
     verify_and_unwrap(
@@ -340,15 +344,11 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
     // and succeeds (MLS open + access-key unwrap all work), so the only changed
     // variable here is the resolved #agent key — the failure must be the inner
     // Ed25519 signature check inside `verify_and_unwrap`.
-    match result {
-        Err(ContextError::CryptoFailed(msg)) => {
-            assert!(
-                msg.contains("signature"),
-                "live rejection must be the inner-signature check, got CryptoFailed({msg:?})"
-            );
-        }
-        other => panic!("a wrong #agent key must make live verification fail, got {other:?}"),
-    }
+    assert!(
+        matches!(&result, Err(ContextError::CryptoFailed(msg)) if msg.contains("signature")),
+        "a wrong #agent key must make live verification fail with the inner-signature \
+         check, got {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
