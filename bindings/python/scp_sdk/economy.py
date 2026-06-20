@@ -10,12 +10,68 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from scp_sdk.errors import ScpError
 
 if TYPE_CHECKING:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Payment receipt verification types
+# ---------------------------------------------------------------------------
+
+
+class _PaymentReceiptVerificationEntryRequired(TypedDict):
+    """Required fields present on every PaymentReceiptVerificationEntry."""
+
+    ok: bool
+    """Whether the adapter successfully processed this receipt.
+
+    ``True`` means the adapter responded — NOT that the payment is valid.
+    Inspect ``valid`` / :attr:`PaymentReceiptVerificationResult.all_valid`
+    for actual validity.
+    """
+
+
+class PaymentReceiptVerificationEntry(_PaymentReceiptVerificationEntryRequired, total=False):
+    """One entry in a :class:`PaymentReceiptVerificationResult` results list.
+
+    ``ok`` is always present. All other keys are optional and only populated
+    when the adapter responded (``ok == True``), except ``error`` which is
+    set when the adapter failed (``ok == False``).
+
+    Mirrors the TypeScript ``PaymentReceiptVerificationEntry`` interface and
+    the wire shape produced by ``verification_results_to_json`` in
+    ``scp-runtime/economy/receipt.rs``.
+    """
+
+    receipt_id: str
+    """Receipt identifier — present only when ``ok`` is ``True``."""
+    valid: bool
+    """Whether the receipt was cryptographically valid — present only when ``ok`` is ``True``."""
+    result: dict[str, object]
+    """Structured verification detail — present only when ``ok`` is ``True``."""
+    error: str
+    """Error message — present only when ``ok`` is ``False``."""
+
+
+class PaymentReceiptVerificationResult(TypedDict):
+    """Result of verifying a batch of payment receipts.
+
+    Returned by :meth:`~scp_sdk.SCP.economy_verify_payment_receipts`.
+
+    ``all_valid`` is ``True`` iff every receipt both reached the adapter
+    and the adapter reported it valid. Vacuously ``True`` for an empty batch.
+    Mirrors the TypeScript ``PaymentReceiptVerificationResult`` interface.
+    """
+
+    all_valid: bool
+    """``True`` iff every receipt reached the adapter and was reported valid."""
+    results: list[PaymentReceiptVerificationEntry]
+    """Per-receipt verification outcomes."""
+
 
 logger = logging.getLogger("scp_sdk")
 
@@ -164,6 +220,8 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 
 
 __all__ = [
+    "PaymentReceiptVerificationEntry",
+    "PaymentReceiptVerificationResult",
     "auto_accept_blocked",
     "check_policy_lock",
     "estimate_cost",

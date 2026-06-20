@@ -64,6 +64,8 @@ from scp_sdk.context import (
 )
 from scp_sdk.discovery import create_query, discover_contexts, normalize_address, parse_address
 from scp_sdk.economy import (
+    PaymentReceiptVerificationEntry,
+    PaymentReceiptVerificationResult,
     auto_accept_blocked,
     check_policy_lock,
     estimate_cost,
@@ -219,6 +221,8 @@ __all__ = [
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
+    "PaymentReceiptVerificationEntry",
+    "PaymentReceiptVerificationResult",
     "PromotionPolicy",
     "Proof",
     "Provenance",

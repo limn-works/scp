@@ -110,7 +110,8 @@ async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
     ``discoverContexts(scp, query)`` in TypeScript and other SDK bindings.
 
     Args:
-        scp: An active :class:`~scp_sdk.SCP` instance.
+        _scp: An active :class:`~scp_sdk.SCP` instance (required for
+            cross-SDK parity with TypeScript; not used in the implementation).
         query: A ``did:`` identifier or an ``scp://`` context URI.
 
     Returns:
