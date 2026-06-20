@@ -381,3 +381,463 @@ fn active_signed_message_still_verifies_through_live_pipeline() {
         "decrypted plaintext must match what Alice's #active persona sent"
     );
 }
+
+// ===========================================================================
+// (d) PUBLIC SEND API: drive the real `Supervisor::send_message` end to end.
+//
+// Tests (a)-(c) above drive `build_encrypted_envelope` directly — the helper
+// the Supervisor send path bottoms out in. They prove the *helper* stamps the
+// caller's `SigningKeyId`, but they do NOT exercise the parameter threading
+// through the public seam:
+//
+//     Supervisor::send_message(signing_key_id)
+//       → SendMessagePayload.signing_key_id
+//       → MessagingCommand::SendMessage
+//       → handle_send_message
+//       → messaging_helpers::send_message
+//       → encrypt_and_send
+//       → build_encrypted_envelope (the stamp)
+//
+// That threading was previously verified only by compilation — the exact
+// "bypass the Supervisor" gap that let the agent-persona wiring be falsely
+// marked complete once before. This module closes it for the SEND side (the
+// side the sender's own context actor genuinely owns): it constructs a real
+// `Supervisor`, creates an encrypted context, runs the real governance
+// add-member path so Bob is a true MLS member with an access key, seeds Bob's
+// per-context pseudonym (§9.10.4) so the encrypted send fans out, then calls
+// the *public* `Supervisor::send_message` with the chosen persona. The
+// outgoing wire blob is captured off a recording transport, MLS-opened on
+// Bob's provider, and its recovered inner-envelope `signing_key_id` is
+// asserted — proving the persona threaded from the public API all the way to
+// the wire.
+//
+// The RECEIVE side cannot likewise go through a second `Supervisor` (a
+// Welcome-joined node spawns no per-context actor — see the Harness notes at
+// the top of this file), so this module asserts the receive contract by
+// MLS-opening the captured blob directly on Bob's provider, exactly as
+// tests (a)-(c) do.
+//
+// Gated behind `feature = "testing"` because the per-context pseudonym seed
+// (`Supervisor::seed_peer_pseudonym`) — the §9.10.4 stand-in for a delivered
+// `PseudonymAnnouncement` — is only compiled under that feature.
+// ===========================================================================
+
+#[cfg(feature = "testing")]
+mod live_supervisor_send {
+    // Test-only recording transport: the `Mutex<Vec<...>>` capture buffer is
+    // written/read exclusively from the synchronous `ContextTransportProvider`
+    // trait methods (and the test body), never held across an `.await`, so a
+    // plain `std::sync::Mutex` is the correct tool. The runtime's actor path
+    // bans it (ADR-049); test fixtures are explicitly exempt — same exemption
+    // the `CapturingPersistence` fixture takes. See crates/scp-runtime/clippy.toml.
+    #![allow(clippy::disallowed_types)]
+
+    use std::sync::{Arc, Mutex};
+
+    use ed25519_dalek::SigningKey;
+    use scp_identity::{DID, SigningKeyId};
+    use scp_protocol::context::builder::{ContextCreationError, OpenResult};
+    use scp_protocol::context::membership::{ContextEvent, KeyPackage};
+    use scp_protocol::context::params::{ContextMode, ContextParams};
+    use scp_protocol::context::roles::Capability;
+    use scp_protocol::context::{ContextError, context_id_bytes};
+
+    use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
+    use crate::context::ContextHandle;
+    use crate::context::builder::ContextTransportProvider;
+    use crate::context::supervisor::Supervisor;
+    use crate::crypto::mls::provider::MlsCryptoProvider;
+
+    /// Shared buffer of `(routing_id, payload)` pairs the recording transport
+    /// captures. Mirrors the `scp-testing` `CapturingTransport` (which lives in
+    /// a different crate and cannot be reached from this in-crate module).
+    type SentBuffer = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
+
+    /// Minimal `ContextTransportProvider` that records every outgoing
+    /// `(routing_id, payload)` instead of putting it on a wire — so the test can
+    /// recover the exact bytes the Supervisor's send path produced and open them
+    /// on Bob's provider.
+    #[derive(Clone)]
+    struct CapturingTransport {
+        sent: SentBuffer,
+    }
+
+    impl CapturingTransport {
+        const fn new(sent: SentBuffer) -> Self {
+            Self { sent }
+        }
+    }
+
+    impl ContextTransportProvider for CapturingTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn publish_context(
+            &self,
+            _context_id: &[u8; 32],
+            _params: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            context_id: &[u8; 32],
+            encrypted_payload: &[u8],
+        ) -> Result<(), ContextError> {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((*context_id, encrypted_payload.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// Drains the capture buffer, recovering from poisoning.
+    fn drain_sent(sent: &SentBuffer) -> Vec<([u8; 32], Vec<u8>)> {
+        std::mem::take(
+            &mut *sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Encrypted `ContextParams` whose ceiling permits create + add-member +
+    /// send (the creator auto-holds admin; `MemberInvite` lets the add-member
+    /// path auto-accept Bob without a separate governance vote — mirrors the
+    /// `scp-testing` `encrypted_params()` recipe `FullStackNode::add_member`
+    /// relies on).
+    fn encrypted_params() -> ContextParams {
+        ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+                Capability::MemberInvite,
+                Capability::MemberRemove,
+                Capability::GovernancePropose,
+                Capability::GovernanceVote,
+                Capability::ContextClose,
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    /// Builds Alice's real `Supervisor` (real MLS crypto + recording transport +
+    /// in-memory event log / MLS storage via `test_supervisor`) and returns it
+    /// alongside the shared capture buffer.
+    fn alice_supervisor(sent: SentBuffer) -> Arc<Supervisor> {
+        let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+        let (_active_sk, _agent_sk, alice_doc) = alice_identity();
+        let resolver = document_backed_resolver(&alice_doc, None);
+        let transport: Box<dyn ContextTransportProvider> = Box::new(CapturingTransport::new(sent));
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
+        crate::context::test_supervisor(crypto, transport, event_log, resolver)
+    }
+
+    /// Reads Bob's actor-minted `AccessKey` from Alice's context actor via the
+    /// `GetAllAccessKeys` mailbox query (the same query
+    /// `FullStackNode::get_all_access_keys` uses). The actor mints each member's
+    /// key with `generate_access_key`, which draws fresh `OsRng` bytes — so the
+    /// recipient key MUST be read back from the actor, never re-derived.
+    async fn bob_access_key_from_actor(
+        sup: &Arc<Supervisor>,
+        ctx_id: &str,
+    ) -> scp_protocol::crypto::access_keys::AccessKey {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = crate::context::actor::QueriesCommand::GetAllAccessKeys {
+            context_id: ctx_id.to_owned(),
+            reply: tx,
+        };
+        sup.dispatch_query(cmd)
+            .await
+            .expect("dispatch GetAllAccessKeys");
+        let keys = rx
+            .await
+            .expect("GetAllAccessKeys reply channel open")
+            .expect("GetAllAccessKeys succeeds");
+        keys.get(BOB_DID)
+            .cloned()
+            .expect("actor minted an access key for Bob during add-member")
+    }
+
+    /// Runs the real governance add-member path so Bob becomes a true MLS member
+    /// of Alice's actor-owned group, then bootstraps Bob's standalone provider
+    /// (Welcome join + sender-key processing) so it can open Alice's later
+    /// application send.
+    ///
+    /// Returns Bob's provider, Bob's per-context pseudonym (already seeded into
+    /// Alice's actor), and Bob's actor-minted access key.
+    async fn add_and_bootstrap_bob(
+        sup: &Arc<Supervisor>,
+        handle: &ContextHandle,
+        ctx_id: &str,
+        sent: &SentBuffer,
+    ) -> (
+        Arc<MlsCryptoProvider>,
+        [u8; 32],
+        scp_protocol::crypto::access_keys::AccessKey,
+    ) {
+        let ctx_bytes = context_id_bytes(ctx_id);
+
+        // Bob mints a real MLS key package (his provider keeps the matching
+        // signer state for the later Welcome join).
+        let bob = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
+        let bob_kp_bytes = bob
+            .prepare_key_package_for_join()
+            .expect("bob prepares key package");
+
+        // Real add-member through the actor: real MLS add → real Welcome → real
+        // HPKE sender-key distribution → minted access keys.
+        sup.join_context(
+            handle,
+            KeyPackage {
+                owner_did: DID::from(BOB_DID),
+                mls_key_package_bytes: Some(bob_kp_bytes),
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("actor add-member (join_context) succeeds");
+
+        // The actor MLS-wrapped the sender-key distribution and "sent" it over
+        // the recording transport. Drain those management blobs and feed them to
+        // Bob so his provider learns Alice's sender key (mirrors
+        // `FullStackNode::add_member` draining the buffer post-join). Keeps the
+        // buffer clean for the application ciphertext the test sends later.
+        let bootstrap_blobs = drain_sent(sent);
+
+        // Bob forms his group from the Welcome the actor emitted.
+        let welcome_bytes = {
+            let mut welcome = None;
+            for event in sup.drain_events(ctx_id).await {
+                if let ContextEvent::WelcomeGenerated { welcome_bytes, .. } = event {
+                    welcome = Some(welcome_bytes.0);
+                }
+            }
+            welcome.expect("actor emitted a WelcomeGenerated event for Bob")
+        };
+        bob.join_from_welcome(&ctx_bytes, &welcome_bytes)
+            .expect("bob joins from Welcome");
+        bob.generate_sender_key(&ctx_bytes)
+            .expect("bob generates his sender key");
+
+        // Process the captured sender-key distribution: each blob is a sealed
+        // management OuterEnvelope — open it, then feed the inner MLS payload to
+        // `process_incoming_sender_key` (exactly the `Management` arm of
+        // `FullStackNode::decrypt_message`).
+        for (_routing_id, blob) in bootstrap_blobs {
+            match bob
+                .open(&ctx_bytes, &blob)
+                .expect("bob opens bootstrap blob")
+            {
+                OpenResult::Management {
+                    sender_did,
+                    payload,
+                } => {
+                    bob.process_incoming_sender_key(&ctx_bytes, &sender_did, &payload)
+                        .expect("bob processes Alice's sender key");
+                }
+                OpenResult::Control => {}
+                OpenResult::Application(_) => {
+                    panic!("bootstrap blob must be management/control, not application")
+                }
+            }
+        }
+
+        // Seed Bob's per-member pseudonym (§9.10.4): the encrypted send fans out
+        // to known peer pseudonyms only, so without this seed the send fails
+        // closed with `PseudonymRegistryEmpty`.
+        let bob_pseudonym = [0x42u8; 32];
+        sup.seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+            .await
+            .expect("seed Bob's per-context pseudonym");
+
+        let bob_access_key = bob_access_key_from_actor(sup, ctx_id).await;
+
+        (bob, bob_pseudonym, bob_access_key)
+    }
+
+    /// Drives the public `Supervisor::send_message` for `ctx_id` under
+    /// `signing_key_id`, captures the single application ciphertext, opens it on
+    /// Bob's provider, and returns the recovered inner envelope's
+    /// `signing_key_id`, the recovered inner-envelope payload (still
+    /// access-key-wrapped), and Bob's actor-minted access key (so the caller can
+    /// optionally unwrap the content layer and assert on the plaintext).
+    ///
+    /// This is the assertion that closes the gap: the persona stamped on the
+    /// wire is read back straight off the bytes the public send API produced.
+    async fn send_via_public_api_and_recover(
+        signing_key: &SigningKey,
+        signing_key_id: SigningKeyId,
+        payload: &[u8],
+    ) -> (
+        SigningKeyId,
+        Vec<u8>,
+        scp_protocol::crypto::access_keys::AccessKey,
+    ) {
+        let ctx_id = match signing_key_id {
+            SigningKeyId::Agent => "ctx-live-supervisor-send-agent",
+            SigningKeyId::Active => "ctx-live-supervisor-send-active",
+        };
+        let ctx_bytes = context_id_bytes(ctx_id);
+        let sent: SentBuffer = Arc::new(Mutex::new(Vec::new()));
+        let sup = alice_supervisor(Arc::clone(&sent));
+
+        let handle = sup
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                DID::from(ALICE_DID),
+                None,
+            )
+            .await
+            .expect("create encrypted context");
+
+        let (bob, bob_pseudonym, bob_access_key) =
+            add_and_bootstrap_bob(&sup, &handle, ctx_id, &sent).await;
+
+        // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
+        // is Alice's matching (#agent or #active) key.
+        sup.send_message(
+            &handle,
+            &DID::from(ALICE_DID),
+            payload,
+            Some(signing_key),
+            signing_key_id,
+            None,
+            None,
+        )
+        .await
+        .expect("Supervisor::send_message (public API) succeeds");
+
+        // Exactly one application ciphertext, addressed to Bob's pseudonym
+        // (§9.10.4 — never the shared context routing id).
+        let captured = drain_sent(&sent);
+        assert_eq!(
+            captured.len(),
+            1,
+            "the public send must produce exactly one application ciphertext"
+        );
+        let (routing_id, ciphertext) = &captured[0];
+        assert_eq!(
+            routing_id, &bob_pseudonym,
+            "app-data must be addressed to Bob's per-member pseudonym (§9.10.4)"
+        );
+        assert_ne!(
+            ciphertext.as_slice(),
+            payload,
+            "ciphertext must differ from plaintext"
+        );
+
+        // Open the captured wire blob on Bob's provider and read the persona
+        // straight off the recovered inner envelope.
+        match bob
+            .open(&ctx_bytes, ciphertext)
+            .expect("bob opens the app blob")
+        {
+            OpenResult::Application(env) => {
+                let inner = env.inner;
+                (inner.signing_key_id, inner.payload, bob_access_key)
+            }
+            other => panic!("expected an Application open result, got {other:?}"),
+        }
+    }
+
+    /// Unwraps the access-key content layer of a recovered inner-envelope
+    /// payload so the test can assert on the original plaintext Alice sent.
+    fn unwrap_app_payload(
+        inner_payload: &[u8],
+        ctx_id: &str,
+        bob_access_key: &scp_protocol::crypto::access_keys::AccessKey,
+    ) -> Vec<u8> {
+        let stripped = scp_protocol::envelope::strip_padding(inner_payload)
+            .expect("strip inner-envelope padding");
+        let wrapped: scp_protocol::crypto::access_keys::WrappedContent =
+            rmp_serde::from_slice(&stripped).expect("deserialize WrappedContent");
+        scp_protocol::crypto::access_keys::wrapping::unwrap_content(
+            &wrapped,
+            BOB_DID,
+            bob_access_key,
+            ctx_id,
+            ALICE_DID,
+            0,
+            0,
+        )
+        .expect("unwrap access-key content layer")
+    }
+
+    // -----------------------------------------------------------------------
+    // (d) #agent persona threads from `Supervisor::send_message` to the wire.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn supervisor_send_stamps_agent_persona_on_the_wire() {
+        let (_active_sk, agent_sk, _doc) = alice_identity();
+        let ctx_id = "ctx-live-supervisor-send-agent";
+        let payload = b"agent persona through the public Supervisor send API";
+
+        let (wire_persona, inner_payload, bob_access_key) =
+            send_via_public_api_and_recover(&agent_sk, SigningKeyId::Agent, payload).await;
+
+        assert_eq!(
+            wire_persona,
+            SigningKeyId::Agent,
+            "the wire envelope produced by Supervisor::send_message(SigningKeyId::Agent) \
+             must carry signing_key_id == Agent — proving the #agent persona threads \
+             from the public send API through to the wire (not just the helper)"
+        );
+
+        // Symmetric end-to-end content check (mirrors the #active test): the
+        // recovered payload decrypts to exactly what Alice's #agent persona
+        // sent, confirming this is a real send and not just a header inspection.
+        let recovered = unwrap_app_payload(&inner_payload, ctx_id, &bob_access_key);
+        assert_eq!(
+            recovered.as_slice(),
+            payload,
+            "decrypted plaintext must match what Alice's #agent persona sent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (e) #active regression guard: the same public seam stamps #active when
+    //     asked, so the agent wiring did not hijack the human-key default.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn supervisor_send_stamps_active_persona_on_the_wire() {
+        let (active_sk, _agent_sk, _doc) = alice_identity();
+        let ctx_id = "ctx-live-supervisor-send-active";
+        let payload = b"active persona through the public Supervisor send API";
+
+        let (wire_persona, inner_payload, bob_access_key) =
+            send_via_public_api_and_recover(&active_sk, SigningKeyId::Active, payload).await;
+
+        assert_eq!(
+            wire_persona,
+            SigningKeyId::Active,
+            "the wire envelope produced by Supervisor::send_message(SigningKeyId::Active) \
+             must carry signing_key_id == Active"
+        );
+
+        // Bonus: the recovered payload decrypts to exactly what Alice sent —
+        // confirming this is a real end-to-end send, not just a header check.
+        // Bob's access key is the actual key the actor minted (read back via
+        // `GetAllAccessKeys`); the actor draws it from `OsRng`, so it cannot be
+        // re-derived and MUST be threaded through from the bootstrap.
+        let recovered = unwrap_app_payload(&inner_payload, ctx_id, &bob_access_key);
+        assert_eq!(
+            recovered.as_slice(),
+            payload,
+            "decrypted plaintext must match what Alice's #active persona sent"
+        );
+    }
+}
