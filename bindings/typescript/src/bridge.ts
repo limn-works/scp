@@ -26,6 +26,17 @@ import type { SCP } from "./scp";
 /** Bridge operating mode (spec §12). */
 export type BridgeMode = "relay" | "puppet" | "api" | "cooperative";
 
+/**
+ * Bridge trust tier returned by {@link evaluateTrust} (spec §12).
+ *
+ * Integer discriminants mirror the Rust `BridgeTrustLevel` enum:
+ * - `0` — `ShadowBridged` (weakest): bridged, unclaimed shadow identity.
+ * - `1` — `ClaimedBridged`: bridged, shadow identity was claimed.
+ * - `2` — `NativeBridged`: bridged action over native SCP transport.
+ * - `3` — `NativeNative` (strongest): native action over native transport.
+ */
+export type BridgeTrustLevel = 0 | 1 | 2 | 3;
+
 /** Shadow identity provenance status. */
 export type ShadowStatus = "shadow" | "claimed";
 
@@ -141,12 +152,15 @@ export interface BridgeTrustOptions {
  * @param scp The {@link SCP} instance whose bridge dispatches the call.
  * @param options Provenance inputs; each field defaults per the Python SDK
  *   (`isBridged=false`, `isNativeTransport=true`, `shadowStatus="shadow"`).
- * @returns The trust tier as an integer (0–3).
+ * @returns The trust tier as a {@link BridgeTrustLevel} integer (0–3).
  */
-export async function evaluateTrust(scp: SCP, options: BridgeTrustOptions = {}): Promise<number> {
+export async function evaluateTrust(
+  scp: SCP,
+  options: BridgeTrustOptions = {},
+): Promise<BridgeTrustLevel> {
   const bridge = await getBridge(scp);
   const isBridged = options.isBridged ?? false;
   const isNativeTransport = options.isNativeTransport ?? true;
   const shadowStatus = options.shadowStatus ?? "shadow";
-  return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus);
+  return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus) as BridgeTrustLevel;
 }

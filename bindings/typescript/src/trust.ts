@@ -489,15 +489,18 @@ export async function evaluateTrust(
     // uses snake_case `actor_did`, the key the bridge's filter parser expects.
     const raw = await scp.eventLogQuery(handle, JSON.stringify({ actor_did: subjectDid }));
     const events = raw as readonly { readonly eventType: string }[];
-    // Placeholder values — not computed by this thin facade; mirrors Python SDK.
-    // Callers MUST NOT interpret 0/[] as "none found" — use the Python SDK for
-    // full behavioral analysis or await a future native TS implementation.
+    // This thin facade only computes toolInvocations from the raw event stream.
+    // contextsParticipated, totalDuration, and governanceActionsAgainst are not
+    // computable from the NAPI event objects returned by eventLogQuery — they
+    // require aggregate queries not yet exposed over the bridge. Values are set
+    // to 0 (not computed) rather than fabricated. Use the Python SDK for full
+    // behavioral analysis, or await a future native TS aggregate endpoint.
     behavioralRecord = {
-      contextsParticipated: 1,
+      contextsParticipated: 0,
       totalDuration: 0,
       governanceActionsAgainst: 0,
-      // Mirrors Python SDK: each ToolInvoked event becomes one entry with
-      // count: 1. No aggregation by tool ID — thin facade over the bridge.
+      // Each ToolInvoked event becomes one entry with count: 1.
+      // No aggregation by tool ID — thin facade over the bridge.
       toolInvocations: events
         .filter((e) => e.eventType === "ToolInvoked")
         .map((e) => ({ type: e.eventType, count: 1 })),
