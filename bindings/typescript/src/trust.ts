@@ -457,6 +457,8 @@ export async function evaluateTrust(
         if (!/\[SCP-PERM-\d+\]/.test(msg)) {
           throw error;
         }
+        // Re-raise handle-affinity errors — these are caller misuse, not UCAN failures.
+        if (/\[SCP-PERM-3030\]/.test(msg)) throw error;
         const failed = __classifyUcanError(msg);
         const passed = __PASSED_BEFORE[failed];
         capabilityValidation.tokensValid = passed.has("tokensValid");
@@ -478,6 +480,9 @@ export async function evaluateTrust(
     // uses snake_case `actor_did`, the key the bridge's filter parser expects.
     const raw = await scp.eventLogQuery(handle, JSON.stringify({ actor_did: subjectDid }));
     const events = raw as readonly { readonly eventType: string }[];
+    // Placeholder values — not computed by this thin facade; mirrors Python SDK.
+    // Callers MUST NOT interpret 0/[] as "none found" — use the Python SDK for
+    // full behavioral analysis or await a future native TS implementation.
     behavioralRecord = {
       contextsParticipated: 1,
       totalDuration: 0,

@@ -1,9 +1,5 @@
-/**
- * Returns true when the runtime is in a test or development environment.
- * Fail-closed: returns false if process is unavailable (browser, Deno) or
- * when NODE_ENV is absent, "production", "staging", or any other value.
- */
-export function isTestEnvironment(): boolean {
+// Evaluated once at import time — runtime mutations to process.env cannot flip this.
+const _IS_TEST_ENVIRONMENT: boolean = (() => {
   try {
     const proc = (globalThis as { process?: { env?: { NODE_ENV?: string; BUN_TEST?: string } } })
       .process;
@@ -12,6 +8,18 @@ export function isTestEnvironment(): boolean {
   } catch {
     return false;
   }
+})();
+
+/**
+ * Returns true when the runtime is in a test or development environment.
+ * Fail-closed: returns false if process is unavailable (browser, Deno) or
+ * when NODE_ENV is absent, "production", "staging", or any other value.
+ *
+ * The decision is frozen at module load time — runtime mutations to
+ * `process.env` cannot flip this after import.
+ */
+export function isTestEnvironment(): boolean {
+  return _IS_TEST_ENVIRONMENT;
 }
 
 /**
