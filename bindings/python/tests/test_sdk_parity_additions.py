@@ -97,3 +97,38 @@ async def test_economy_verify_payment_receipts_propagates_scperror() -> None:
 
     with pytest.raises(ScpError, match="receipt verification failed"):
         await scp.economy_verify_payment_receipts([])
+
+
+@pytest.mark.asyncio
+async def test_evaluate_trust_reraises_perm_3030_handle_affinity_error() -> None:
+    """evaluate_trust must re-raise PERM-3030 rather than collapsing it to a
+    false all-False CapabilityValidation.  PERM-3030 is a programmer error
+    (handle belongs to a different SCP instance) that must be visible to the
+    caller — not silently absorbed.  Mirrors TypeScript trust.ts behaviour:
+    ``if (/^\\[SCP-PERM-3030\\]/.test(msg)) throw error;``
+    """
+    from scp_sdk.trust import evaluate_trust
+
+    # Construct the error message in the format emitted by the Rust bridge:
+    # "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance — ..."
+    perm3030_msg = "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance"
+
+    mock_bridge = MagicMock()
+    # UcanError must be a real exception class so `except bridge.UcanError`
+    # catches it and the `raise` re-raises it.
+    mock_bridge.UcanError = type("UcanError", (Exception,), {})
+    mock_bridge.ucan_validate.side_effect = mock_bridge.UcanError(perm3030_msg)
+    # Mark as mock so the test seam routes through mock_bridge directly.
+    mock_bridge._mock_name = "mock_bridge"
+
+    scp = SCP.__new__(SCP)
+    scp._native = MagicMock()
+
+    with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+        with pytest.raises(Exception, match=r"\[SCP-PERM-3030\]"):
+            await evaluate_trust(
+                scp,
+                subject_did="did:dht:z6Mkexample",
+                context_id="ctx-1",
+                capability_tokens=["token.a.b"],
+            )
