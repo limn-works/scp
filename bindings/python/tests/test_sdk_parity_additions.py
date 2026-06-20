@@ -5,10 +5,9 @@ gaps surfaced by ``scripts/check-sdk-coverage.py``:
 
   * ``scp_sdk.discovery.discover_contexts`` — wraps the module-level
     ``_bridge().context_discover`` bridge function (Discovery/discover).
-    Takes an explicit ``scp`` argument for cross-SDK consistency with
-    ``discoverContexts(scp, query)`` in TypeScript, but dispatches through
-    the module singleton (not the instance), matching the pattern used by
-    all other discovery helpers in the same module.
+    Unlike the TypeScript counterpart ``discoverContexts(scp, query)``,
+    this function takes no SCP instance — ``context_discover`` is a
+    module-level ``#[pyfunction]`` that requires no per-instance bridge.
   * ``SCP.economy_verify_payment_receipts`` — wraps the per-instance
     ``economy_verify_payment_receipts`` bridge method (Economy/...).
 
@@ -30,10 +29,9 @@ from scp_sdk.errors import ScpError
 async def test_discover_contexts_dispatches_and_wraps_results_as_dicts() -> None:
     mock_bridge = MagicMock()
     mock_bridge.context_discover.return_value = [{"context_id": "abc", "name": "cooking"}]
-    mock_scp = MagicMock()
 
     with patch("scp_sdk.discovery._bridge", return_value=mock_bridge):
-        result = await discovery.discover_contexts(mock_scp, "did:dht:z6Mkexample")
+        result = await discovery.discover_contexts("did:dht:z6Mkexample")
 
     assert result == [{"context_id": "abc", "name": "cooking"}]
     mock_bridge.context_discover.assert_called_once_with("did:dht:z6Mkexample")
@@ -43,10 +41,9 @@ async def test_discover_contexts_dispatches_and_wraps_results_as_dicts() -> None
 async def test_discover_contexts_returns_empty_list_when_nothing_advertised() -> None:
     mock_bridge = MagicMock()
     mock_bridge.context_discover.return_value = []
-    mock_scp = MagicMock()
 
     with patch("scp_sdk.discovery._bridge", return_value=mock_bridge):
-        result = await discovery.discover_contexts(mock_scp, "scp://example/ctx")
+        result = await discovery.discover_contexts("scp://example/ctx")
 
     assert result == []
 

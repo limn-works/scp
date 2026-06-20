@@ -11,13 +11,28 @@ See spec section 12 (Bridge System) and ADR-023.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import BridgeMode, ShadowStatus
 
 if TYPE_CHECKING:
     pass
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+BridgeTrustLevel = Literal[0, 1, 2, 3]
+"""Bridge trust tier returned by :func:`evaluate_trust` (spec §12).
+
+Integer discriminants mirror the Rust ``BridgeTrustLevel`` enum:
+
+- ``0`` — ``ShadowBridged`` (weakest): bridged, unclaimed shadow identity.
+- ``1`` — ``ClaimedBridged``: bridged, shadow identity was claimed.
+- ``2`` — ``NativeBridged``: bridged action over native SCP transport.
+- ``3`` — ``NativeNative`` (strongest): native action over native transport.
+"""
 
 
 def _bridge() -> Any:
@@ -83,7 +98,7 @@ def evaluate_trust(
     is_bridged: bool = False,
     is_native_transport: bool = True,
     shadow_status: ShadowStatus | str = ShadowStatus.SHADOW,
-) -> int:
+) -> BridgeTrustLevel:
     """Evaluate the trust level for an action based on bridge provenance.
 
     Returns an integer (0--3) representing the trust tier:
@@ -102,7 +117,7 @@ def evaluate_trust(
             when *is_bridged* is ``True``.
 
     Returns:
-        Trust tier as an integer (0--3).
+        Trust tier as a :data:`BridgeTrustLevel` integer (0--3).
 
     Raises:
         ValidationError: If *shadow_status* is invalid.
@@ -113,6 +128,7 @@ def evaluate_trust(
 
 
 __all__ = [
+    "BridgeTrustLevel",
     "evaluate_trust",
     "register",
 ]

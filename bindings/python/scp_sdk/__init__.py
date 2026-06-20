@@ -46,6 +46,7 @@ from scp_sdk.auth import (
     ScpIdChallenge,
     ScpIdResponse,
 )
+from scp_sdk.bridge import BridgeTrustLevel
 from scp_sdk.bridge import (
     evaluate_trust as bridge_evaluate_trust,
 )
@@ -62,7 +63,13 @@ from scp_sdk.context import (
     validate_admission,
     validate_broadcast_key_hex,
 )
-from scp_sdk.discovery import create_query, discover_contexts, normalize_address, parse_address
+from scp_sdk.discovery import (
+    DiscoveryResult,
+    create_query,
+    discover_contexts,
+    normalize_address,
+    parse_address,
+)
 from scp_sdk.economy import (
     PaymentReceiptVerificationEntry,
     PaymentReceiptVerificationResult,
@@ -188,6 +195,7 @@ __all__ = [
     "BatchPublishResult",
     "BehavioralRecord",
     "BridgeMode",
+    "BridgeTrustLevel",
     "Capability",
     "CapabilityValidation",
     "CeilingPolicy",
@@ -200,6 +208,7 @@ __all__ = [
     "CustodyType",
     "DIDDocument",
     "DiscoveryMethod",
+    "DiscoveryResult",
     "Endorsement",
     "Event",
     "GovernanceActionResult",

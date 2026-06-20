@@ -10,9 +10,80 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
 from scp_sdk.errors import ScpError
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+
+class _ResolutionPathDict(TypedDict, total=False):
+    """Structured metadata recording which layer resolved an address (§22.7)."""
+
+    layer: str
+    """The resolution layer.
+
+    One of ``Petname``, ``HandleRegistry``, ``Attestation``, ``Domain``,
+    or ``MultiLayerCorroborated``.
+    """
+    source: str
+    """Human-readable source identifier (context name, domain, platform)."""
+    source_id: str | None
+    """Context ID (hex), present only for the ``HandleRegistry`` layer."""
+    resolved_at: int
+    """Unix timestamp (seconds) when resolution occurred."""
+
+
+class _TrustLevelDict(TypedDict, total=False):
+    """Trust level of a discovery result (§22.7).
+
+    The ``kind`` field discriminates among:
+    ``DirectExchange``, ``LocalPetname``, ``DomainVerified``,
+    ``AttestationVerified``, ``HandleRegistryVerified``,
+    ``MultiLayerCorroborated``.
+    """
+
+    kind: str
+    sources: list[_ResolutionPathDict]
+    """Only present when ``kind == "MultiLayerCorroborated"``."""
+
+
+class DiscoveryResult(TypedDict, total=False):
+    """A context discovery result (§22.2.1 ``AddressResolution``).
+
+    Matches the shape of ``DiscoveryResult`` in the TypeScript SDK but uses
+    snake_case per Python conventions.
+
+    Fields
+    ------
+    context_id:
+        Hex-encoded context ID.
+    relay_urls:
+        Relay URLs for reaching this context.
+    publisher_did:
+        DID of the context publisher.
+    discovery_source:
+        Source label for this result.
+    mode:
+        Context operating mode, or ``None`` if unknown.
+    metadata_summary:
+        Human-readable summary, or ``None`` if unavailable.
+    trust_level:
+        Trust level of this result (§22.7).
+    resolution_path:
+        Which resolution layer produced this result (§22.7).
+    """
+
+    context_id: str
+    relay_urls: list[str]
+    publisher_did: str
+    discovery_source: str
+    mode: str | None
+    metadata_summary: str | None
+    trust_level: _TrustLevelDict
+    resolution_path: _ResolutionPathDict
 
 
 def _bridge() -> Any:
@@ -98,7 +169,7 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
-async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
+async def discover_contexts(query: str) -> list[DiscoveryResult]:
     """Discover contexts advertised by a DID or named by an ``scp://`` URI.
 
     For a ``did:`` query the bridge resolves the DID document and projects its
@@ -107,21 +178,16 @@ async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
     to a worker thread via :func:`asyncio.to_thread` to keep the event loop
     free regardless of bridge implementation.
 
-    Takes an explicit ``scp`` instance for cross-SDK consistency with
-    ``discoverContexts(scp, query)`` in TypeScript and other SDK bindings.
+    Unlike the TypeScript counterpart ``discoverContexts(scp, query)``, this
+    function does not take an SCP instance — Python's ``context_discover`` is a
+    module-level ``#[pyfunction]`` that does not require per-instance bridge
+    access (unlike TypeScript's ``getBridge(scp)`` dispatch path).
 
     Args:
-        _scp: An active :class:`~scp_sdk.SCP` instance. Accepted for
-            cross-SDK parity with TypeScript's ``discoverContexts(scp, query)``,
-            which dispatches per-instance via ``getBridge(scp)``. In Python,
-            ``context_discover`` is a module-level ``#[pyfunction]`` rather than
-            an instance method, so dispatch goes through the module bridge
-            (``_bridge().context_discover(query)``). The parameter is intentionally
-            unused — the leading underscore signals this.
         query: A ``did:`` identifier or an ``scp://`` context URI.
 
     Returns:
-        A list of discovery-result dicts, each describing a discoverable
+        A list of :class:`DiscoveryResult` dicts, each describing a discoverable
         context. May be empty if the target advertises none.
 
     Raises:
@@ -132,10 +198,11 @@ async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
 
     bridge = _bridge()
     results = await asyncio.to_thread(bridge.context_discover, query)
-    return [dict(item) for item in results]
+    return [DiscoveryResult(**dict(item)) for item in results]  # type: ignore[misc]
 
 
 __all__ = [
+    "DiscoveryResult",
     "create_query",
     "discover_contexts",
     "normalize_address",

@@ -781,8 +781,12 @@ async def evaluate_trust(
             context_id,
             {"actor_did": subject_did},
         )
+        # contexts_participated and total_duration are not computable from the
+        # raw event objects returned by event_log_query — they require aggregate
+        # queries not yet exposed over the bridge. Values are left at their
+        # defaults (0) rather than hardcoded. Use the full trust engine for
+        # aggregate behavioral analysis.
         behavioral = BehavioralRecord(
-            contexts_participated=1,
             tool_invocations=[
                 {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
             ],
