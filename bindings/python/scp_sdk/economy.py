@@ -19,7 +19,6 @@ from scp_sdk.errors import ScpError
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
 
-
 # ---------------------------------------------------------------------------
 # Payment receipt verification types
 # ---------------------------------------------------------------------------
@@ -303,6 +302,7 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
     return bridge.economy_evaluate_formula(formula_json, m)
 
 
+
 # ---------------------------------------------------------------------------
 # Payment receipt verification
 # ---------------------------------------------------------------------------
@@ -351,15 +351,6 @@ async def verify_payment_receipts(
         return json.loads(result)
     return result
 
-
-# ---------------------------------------------------------------------------
-# Budget tracking
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Antispam velocity tracking
-# ---------------------------------------------------------------------------
 
 
 __all__ = [
