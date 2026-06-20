@@ -111,7 +111,7 @@ export class Identity {
    * `identityMigrate`; `undefined` for all other operations.
    *
    * Callers **MUST** distribute this rotation event to all active context
-   * members per spec §3.2.1 step 4b so peers can update their routing
+   * members per spec §3.2.1 (Identity Key migration) so peers can update their routing
    * tables.
    */
   get rotationEventJson(): string | undefined {

@@ -6,18 +6,16 @@
  * These verify the public SCP wrappers added to restore cross-SDK parity with
  * the Python (`identity_rotate_key`, …) and Swift surfaces. Each takes an
  * {@link Identity}, extracts its native handle (`identity._rawHandle`), routes
- * through the per-instance `Bridge` (`getBridge(this)` — because these are
- * methods on the identity HANDLE, e.g. `handle.rotateKey()`, not on the `Scp`
- * class), and re-wraps the returned `BridgeIdentityHandle` into an
- * {@link Identity}.
+ * through the per-instance `Bridge` (`getBridge(this)`), and re-wraps the
+ * returned `BridgeIdentityHandle` into an {@link Identity}.
  *
  * Two groups:
  *
  * 1. **Surface/routing checks** — confirm each method exists with the right
- *    arity and routes through the bridge (no addon required). Because the
- *    bridge loads the platform addon, calling a wrapper without an addon
- *    surfaces the addon-unavailable error, proving the wrapper does NOT
- *    dispatch to a fabricated `Scp`-class method.
+ *    arity and routes through the injected bridge spy. Each test injects a
+ *    spy `Bridge` via `__setBridgeForTests`, calls the wrapper, and asserts
+ *    the spy was invoked with the identity's raw handle — proving the wrapper
+ *    dispatches to the bridge rather than to a fabricated `Scp`-class method.
  * 2. **Real NAPI bridge** — round-trips the methods against a live addon when
  *    one is installed, and skips gracefully otherwise.
  *
@@ -27,6 +25,8 @@
 import { describe, expect, it, test } from "bun:test";
 import { IdentityError } from "../src/errors";
 import { Identity } from "../src/identity";
+import type { Bridge, BridgeIdentityHandle } from "../src/internal/bridge";
+import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
 import { mountMockScp } from "./mock-bridge";
 
@@ -37,6 +37,15 @@ const LIFECYCLE_METHODS = [
   "identityRotateAgentKey",
   "identityRemoveAgentKey",
 ] as const;
+
+/** Bridge method names on the `Bridge` interface for each lifecycle wrapper. */
+const BRIDGE_METHOD: Record<(typeof LIFECYCLE_METHODS)[number], keyof Bridge> = {
+  identityRotateKey: "identityRotateKey",
+  identityMigrate: "identityMigrate",
+  identityAddAgentKey: "identityAddAgentKey",
+  identityRotateAgentKey: "identityRotateAgentKey",
+  identityRemoveAgentKey: "identityRemoveAgentKey",
+} as const;
 
 // ---------------------------------------------------------------------------
 // Surface / routing checks (no addon required)
@@ -53,32 +62,53 @@ describe("SCP identity-lifecycle surface", () => {
   });
 
   for (const method of LIFECYCLE_METHODS) {
-    it(`${method} routes through the bridge (not a fabricated Scp-class method)`, async () => {
-      // A mock-mounted SCP has no real platform addon. These methods route
-      // through `getBridge(this)`, which loads the addon and therefore
-      // rejects when none is installed. The key assertion is that the call
-      // REACHES the bridge-load path — i.e. it does not silently resolve via a
-      // (non-existent) `this.#native.identityRotateKey`, which would throw a
-      // TypeError ("undefined is not a function") instead. We accept either a
-      // clean rejection (addon missing) or a clean resolution (addon present),
-      // but never a synchronous TypeError from calling `undefined`.
-      const { scp } = mountMockScp();
-      const identity = Identity._fromHandle(scp, {
-        did: "did:dht:z6MkRoute",
+    it(`${method} routes through the injected bridge spy`, async () => {
+      // Build a spy bridge that records calls to the specific lifecycle method
+      // and returns a valid BridgeIdentityHandle so the wrapper can wrap the result.
+      const spyHandle: BridgeIdentityHandle = {
+        did: "did:dht:zSpy",
         custodyType: "in_memory",
+      };
+      const spyCalls: BridgeIdentityHandle[] = [];
+
+      const PROBE_PROPS = new Set<string | symbol>([
+        "then",
+        "catch",
+        "finally",
+        Symbol.toPrimitive,
+        Symbol.toStringTag,
+        Symbol.iterator,
+        Symbol.asyncIterator,
+      ]);
+
+      const bridgeMethod = BRIDGE_METHOD[method];
+      const spyBridge = new Proxy({} as Bridge, {
+        get(_t, prop) {
+          if (PROBE_PROPS.has(prop)) return undefined;
+          if (prop === bridgeMethod) {
+            return (handle: BridgeIdentityHandle) => {
+              spyCalls.push(handle);
+              return Promise.resolve(spyHandle);
+            };
+          }
+          throw new Error(`Spy bridge: unexpected call to Bridge.${String(prop)}`);
+        },
       });
 
-      let threwTypeError = false;
-      try {
-        await (scp[method] as (i: Identity) => Promise<Identity>)(identity);
-      } catch (err) {
-        // A TypeError here would mean the wrapper tried to invoke a missing
-        // `this.#native.<method>` — the regression this test guards against.
-        if (err instanceof TypeError) {
-          threwTypeError = true;
-        }
-      }
-      expect(threwTypeError).toBe(false);
+      const { scp } = mountMockScp();
+      __setBridgeForTests(scp, spyBridge);
+
+      const rawHandle: BridgeIdentityHandle = { did: "did:dht:zInput", custodyType: "in_memory" };
+      const identity = Identity._fromHandle(scp, rawHandle);
+
+      const result = await (scp[method] as (i: Identity) => Promise<Identity>)(identity);
+
+      // The spy was called exactly once with the identity's raw handle.
+      expect(spyCalls).toHaveLength(1);
+      expect(spyCalls[0]).toBe(rawHandle);
+      // The wrapper returned an Identity wrapping the spy's returned handle.
+      expect(result).toBeInstanceOf(Identity);
+      expect(result.did).toBe("did:dht:zSpy");
     });
   }
 });

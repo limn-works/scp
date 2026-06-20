@@ -1940,7 +1940,7 @@
         {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
          "exemptions": {},
-         "coverage_exemptions": {"kotlin": "Present as TransportManagerInterface.addRelay in the generated UniFFI bindings (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt), reachable publicly via SCP.transportConnect(...).addRelay(...). The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched. Verified present manually."}}
+         "coverage_exemptions": {"kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` \u2014 the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."}}
       ]
     }
   ],

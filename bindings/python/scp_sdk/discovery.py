@@ -109,8 +109,9 @@ async def discover_contexts(query: str) -> list[dict[str, Any]]:
     which may involve network (DHT) resolution — so the call is dispatched to
     a worker thread to avoid blocking the event loop.
 
-    Mirrors ``discoverContexts`` in the TypeScript SDK and ``discover`` in the
-    Kotlin SDK (spec sections 5.14.11, 18.2.2, and 18.4).
+    Uses the module-level bridge singleton for stateless discovery queries,
+    consistent with the other discovery helpers in this module that do not
+    require an explicit SCP instance (spec sections 5.14.11, 18.2.2, and 18.4).
 
     Args:
         query: A ``did:`` identifier or an ``scp://`` context URI.
