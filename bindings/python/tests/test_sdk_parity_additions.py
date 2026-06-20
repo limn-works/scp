@@ -70,6 +70,6 @@ async def test_economy_verify_payment_receipts_parses_json_result() -> None:
 
     assert result["all_valid"] is False
     # An invalid-but-reachable receipt keeps ok==true; callers must read valid.
-    assert result["results"][0]["valid"] is False
+    assert result["results"][0].get("valid") is False
     assert result["results"][0]["ok"] is True
     scp._native.economy_verify_payment_receipts.assert_called_once_with("[]")
