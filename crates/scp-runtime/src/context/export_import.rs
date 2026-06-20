@@ -461,7 +461,7 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 ///
 /// Returns [`ContextError::EventLogFailed`] if deserialization fails or the
 /// replay's sequence / `prev_hash` chain validation fails.
-pub fn recompute_event_log_root(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
+pub(crate) fn recompute_event_log_root(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
     use scp_event_log::{Event, EventLog};
 
     if event_log_data.is_empty() {

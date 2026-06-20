@@ -1657,7 +1657,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(typeof first.actorDid).toBe("string");
     });
 
-    it("scp.eventLogQuery with a MessageSent filter (snake_case key) finds the sent event", async () => {
+    it("a MessageSent send surfaces on the ContextEvent buffer but is excluded from the durable log", async () => {
       const identity = await scp.identityCreate("in_memory");
       const bob = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
@@ -1668,20 +1668,31 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       // §9.10.4: a lone-member encrypted send is a no-op that records no
       // MessageSent event. Add a peer and seed its per-member pseudonym so the
-      // send actually fans out and the MessageSent event is recorded.
+      // send actually fans out and the MessageSent event is emitted.
       await scp.contextJoin(ctx._rawHandle, bob.did);
       await scp.contextSeedPeerPseudonym(ctx._rawHandle, bob.did, new Uint8Array(32).fill(0x42));
+      // Clear the join/create ContextEvents so the only event observed below is
+      // the one produced by the send.
+      await scp.contextDrainEvents(ctx._rawHandle);
+
       await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("one"));
-      // The SCP surface dispatches the filter JSON verbatim; the Rust
-      // bridge deserializes with snake_case so we supply `event_type`.
-      // (`internal/native.ts`'s Bridge wrapper is what does the
-      // camelCase→snake_case rename for `napi.eventLogQuery`.)
-      const events = await scp.eventLogQuery(
+
+      // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
+      // non-convergent application activity surfaced only as a local
+      // `ContextEvent::MessageSent` on the in-process buffer (drained here as a
+      // Debug-formatted string) — never a durable Merkle leaf.
+      const drained = await scp.contextDrainEvents(ctx._rawHandle);
+      expect(drained.some((e) => e.includes("MessageSent"))).toBe(true);
+
+      // The durable event log (read by eventLogQuery) deliberately excludes
+      // MessageSent so two honest members derive the same merkle_root (§9.9.3).
+      // The SCP surface dispatches the filter JSON verbatim; the Rust bridge
+      // deserializes with snake_case, so we supply `event_type`.
+      const durable = await scp.eventLogQuery(
         ctx._rawHandle,
         JSON.stringify({ event_type: "MessageSent" }),
       );
-      expect(events.length).toBeGreaterThanOrEqual(1);
-      expect((events[0] as { eventType: string }).eventType).toBe("MessageSent");
+      expect(durable.length).toBe(0);
     });
 
     it("scp.eventLogVerify confirms an inclusion proof against leaf 0 (snake_case key)", async () => {

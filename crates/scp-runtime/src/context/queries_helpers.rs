@@ -314,7 +314,7 @@ pub fn commit_fault(state: &PerContextState) -> Option<CommitFaultMarker> {
 /// excluded from the canonical log (ADR-011 amendment exclusion taxonomy §2),
 /// so surfacing it from the local buffer is what keeps `event_log_merkle_root`
 /// convergent across honest members (§9.9.3).
-pub fn payment_history(
+pub(super) fn payment_history(
     state: &PerContextState,
     filter: Option<&crate::economy::receipt::ReceiptFilter>,
 ) -> Vec<crate::economy::adapter::PaymentReceipt> {
