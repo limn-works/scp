@@ -326,6 +326,40 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(cv.timeBoundsValid).toBe(false);
   });
 
+  it("multiple tokens — first valid, second revoked — returns notRevoked: false with prior fields true", async () => {
+    const { scp, native, context } = mountWithContext();
+    let callCount = 0;
+    native.__stub("ucanValidate", () => {
+      callCount += 1;
+      if (callCount === 1) {
+        // First token passes.
+        return Promise.resolve(undefined);
+      }
+      // Second token is revoked.
+      return Promise.reject(
+        new Error(
+          "[SCP-PERM-3001] permission error: token revoked: tok2" +
+            " — check token format, signatures, time bounds, and capability chain",
+        ),
+      );
+    });
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, ["token1", "token2"]);
+    const cv = result.capabilityValidation;
+    // Stages that passed before the revocation failure.
+    expect(cv.tokensValid).toBe(true);
+    expect(cv.signaturesValid).toBe(true);
+    expect(cv.withinCeiling).toBe(true);
+    expect(cv.nonceValid).toBe(true);
+    // Revocation stage — failed on the second token.
+    expect(cv.notRevoked).toBe(false);
+    // timeBoundsValid is after revocation in the pipeline — also false.
+    expect(cv.timeBoundsValid).toBe(false);
+    // Both tokens were presented to ucanValidate.
+    expect(native.__calls("ucanValidate")).toHaveLength(2);
+  });
+
   it("no tokens: all fields stay default false", async () => {
     const { scp, native, context } = mountWithContext();
     native.__stub("eventLogQuery", () => Promise.resolve([]));
@@ -369,21 +403,21 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
           eventType: "ToolInvoked",
           actorDid: "did:dht:z6MkBob",
           timestamp: 1,
-          payload: {},
+          payloadJson: "{}",
           sequence: 1,
         },
         {
           eventType: "MessageSent",
           actorDid: "did:dht:z6MkBob",
           timestamp: 2,
-          payload: {},
+          payloadJson: "{}",
           sequence: 2,
         },
         {
           eventType: "ToolInvoked",
           actorDid: "did:dht:z6MkBob",
           timestamp: 3,
-          payload: {},
+          payloadJson: "{}",
           sequence: 3,
         },
       ]),

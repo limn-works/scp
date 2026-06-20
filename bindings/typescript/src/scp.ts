@@ -2855,17 +2855,16 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
 
 /**
  * Production guard for the two test-only native-handle mutators.
- * Throws when the current runtime looks like a production build so
- * that even if a supply-chain attacker deep-imports `dist/scp.js` and
- * reaches these helpers they cannot swap the native bridge behind a
- * user's back (round-3 red-hat RED-PR5-001/007).
+ * Throws unless the current runtime is an explicitly allowed non-production
+ * environment. The gate uses a positive allowlist — only `NODE_ENV=test`,
+ * `NODE_ENV=development`, or Bun's test runner (detected via `BUN_TEST`) are
+ * permitted. All other values (including `undefined`, `staging`, etc.) are
+ * blocked so that misconfigured deployments and supply-chain attackers cannot
+ * reach these hooks (round-3 red-hat RED-PR5-001/007).
  *
- * The gate uses `process.env.NODE_ENV === "production"` — the widely-
- * honoured React/Node build-flag. Apps that ship with
- * `NODE_ENV=production` get the guard; tests run with `NODE_ENV=test`
- * or unset, which passes through. `process` may be undefined in
- * browser/Deno contexts — we treat that as "not production" since the
- * WASM bridge has no `SCP` class at all.
+ * `process` may be undefined in browser/Deno contexts — those runtimes have
+ * no `SCP` class at all (they load the WASM bridge instead), so a missing
+ * `process` is treated as blocked.
  */
 function assertTestHookAllowed(hookName: string): void {
   const env: string | undefined = (() => {
@@ -2875,11 +2874,24 @@ function assertTestHookAllowed(hookName: string): void {
       return undefined;
     }
   })();
-  if (env === "production") {
+  const isBunTest: boolean = (() => {
+    try {
+      return (
+        (globalThis as { process?: { env?: { BUN_TEST?: string } } }).process?.env?.BUN_TEST !==
+        undefined
+      );
+    } catch {
+      return false;
+    }
+  })();
+  const allowed = env === "test" || env === "development" || isBunTest;
+  if (!allowed) {
     throw new Error(
-      `${hookName} is a test-only hook and must not be called in a production build ` +
-        `(NODE_ENV=production). If you're seeing this in legitimate code, your build is ` +
-        `mis-configured or a dependency is attempting to swap the SCP native bridge.`,
+      `${hookName} is a test-only hook and may only be called in test or development ` +
+        `environments (NODE_ENV=test|development, or BUN_TEST is set). ` +
+        `Current NODE_ENV=${String(env)}. If you're seeing this in legitimate code, ` +
+        `your build is mis-configured or a dependency is attempting to swap the SCP ` +
+        `native bridge.`,
     );
   }
 }

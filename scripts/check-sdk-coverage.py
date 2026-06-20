@@ -1103,6 +1103,15 @@ def main() -> int:
             op_exempted_sdks: list[str] = []
             op_verified_sdks: list[str] = []
 
+            # Validate that all coverage_exemptions reasons are non-empty strings.
+            for sdk, reason in coverage_exemptions.items():
+                if not isinstance(reason, str) or not reason.strip():
+                    print(
+                        f"  ERROR: {domain}/{op_name}: coverage_exemptions[{sdk}] has an "
+                        f"empty or blank reason — must cite a symbol name or ADR section."
+                    )
+                    errors += 1
+
             for sdk in sdks:
                 expected = op.get(sdk)
                 if expected is None:

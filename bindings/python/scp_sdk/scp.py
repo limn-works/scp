@@ -478,9 +478,9 @@ class SCP:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
     ) -> None:
         """Shut down synchronously on ``with``-scope exit.
 
@@ -496,9 +496,9 @@ class SCP:
 
     async def __aexit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
     ) -> None:
         """Shut down asynchronously on ``async with`` scope exit.
 
