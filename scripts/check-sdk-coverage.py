@@ -74,19 +74,27 @@ SDK_EXTENSIONS: dict[str, str] = {
 
 # Explicit alias table: (domain, operation) -> {sdk: [search_strings]}
 # Only needed when the auto-generated patterns fail to match the actual code.
+# Every entry has been verified against actual SDK source: the named symbol
+# exists and implements the capability.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
-    # Identity attestations use different names across SDKs
+    # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
+        "python": ["create_identity_link_attestation"],
+        "typescript": ["identityCreateLinkAttestation"],
         "kotlin": ["createLinkAttestation"],
-        "swift": ["createIdentityAttestation"],
+        "swift": ["identityCreateLinkAttestation", "createLinkAttestation"],
     },
     ("Identity", "list_attestations"): {
+        "python": ["identity_link_attestations"],
+        "typescript": ["identityLinkAttestations"],
         "kotlin": ["linkAttestations"],
-        "swift": ["listIdentityAttestations"],
+        "swift": ["identityLinkAttestations", "listLinkAttestations"],
     },
     ("Identity", "remove_attestation"): {
+        "python": ["remove_identity_link_attestation"],
+        "typescript": ["identityRemoveLinkAttestation"],
         "kotlin": ["removeLinkAttestation"],
-        "swift": ["removeIdentityAttestation"],
+        "swift": ["identityRemoveLinkAttestation"],
     },
     # Note: renew_attestation is missing from TypeScript SDK entirely.
     # The matrix should mark it false with exemption, not alias it.
@@ -113,15 +121,15 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     # Messaging -- send_message maps to send() or contextSend() depending on SDK
     ("Messaging", "send_message"): {
-        "python": ["send"],
-        "typescript": ["send"],
+        "python": ["send", "context_send"],
+        "typescript": ["send", "contextSend"],
         "kotlin": ["contextSend"],
         "swift": ["send"],
     },
     # Messaging -- subscribe maps to receive() or contextSubscribe()
     ("Messaging", "subscribe"): {
-        "python": ["receive"],
-        "typescript": ["receive"],
+        "python": ["receive", "context_receive"],
+        "typescript": ["receive", "contextSubscribe"],
     },
     # Messaging -- validate_broadcast_key has _hex suffix in some SDKs
     ("Messaging", "validate_broadcast_key"): {
@@ -130,109 +138,194 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["validateBroadcastKeyHex"],
         "swift": ["validateBroadcastKeyHex"],
     },
-    # Tools -- TypeScript uses domain-prefixed naming
+    # Tools -- TypeScript uses domain-prefixed naming (toolXxx on SCP class)
     ("Tools", "register"): {
-        "typescript": ["registerTool"],
+        "typescript": ["toolRegister"],
     },
     ("Tools", "invoke"): {
-        "python": ["invoke"],
-        "typescript": ["invokeTool"],
+        "python": ["tool_invoke"],
+        "typescript": ["toolInvoke"],
     },
     ("Tools", "verify"): {
-        "python": ["verify"],
-        "typescript": ["verifyTool"],
+        "python": ["tool_verify"],
+        "typescript": ["toolVerify"],
     },
     ("Tools", "invoke_cross_context"): {
+        "python": ["tool_invoke_cross_context"],
         "typescript": ["toolInvokeCrossContext"],
         "swift": ["toolInvokeCrossContext"],
     },
     ("Tools", "session_create"): {
+        "python": ["tool_session_create"],
         "typescript": ["toolSessionCreate"],
         "swift": ["toolSessionCreate"],
     },
     ("Tools", "session_invoke"): {
+        "python": ["tool_session_invoke"],
         "typescript": ["toolSessionInvoke"],
         "swift": ["toolSessionInvoke"],
     },
     ("Tools", "session_close"): {
+        "python": ["tool_session_close"],
         "typescript": ["toolSessionClose"],
         "swift": ["toolSessionClose"],
     },
     ("Tools", "interface_expose"): {
-        "typescript": ["exposeToolInterface"],
+        "python": ["tool_interface_expose"],
+        "typescript": ["toolInterfaceExpose"],
         "swift": ["exposeToolInterface"],
     },
     ("Tools", "interface_accept"): {
-        "typescript": ["acceptToolInterface"],
+        "python": ["tool_interface_accept"],
+        "typescript": ["toolInterfaceAccept"],
         "swift": ["acceptToolInterface"],
     },
     ("Tools", "interface_revoke"): {
-        "typescript": ["revokeToolInterface"],
+        "python": ["tool_interface_revoke"],
+        "typescript": ["toolInterfaceRevoke"],
         "swift": ["revokeToolInterface"],
     },
-    # Governance -- uses different naming in all SDKs
+    # Governance -- uses different naming in all SDKs.
+    # Per-action variants dispatch through one generic method; there is no
+    # per-variant symbol in any SDK (Python reference included).
     ("Governance", "execute_action"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
         "kotlin": ["governanceExecute"],
         "swift": ["executeGovernanceAction"],
     },
     ("Governance", "propose_action"): {
-        "python": ["propose_governance_action"],
-        "typescript": ["proposeGovernanceAction"],
+        "python": ["propose_governance_action", "governance_propose"],
+        "typescript": ["proposeGovernanceAction", "contextGovernancePropose"],
         "kotlin": ["governancePropose"],
         "swift": ["proposeGovernanceAction"],
     },
     ("Governance", "approve_proposal"): {
-        "python": ["approve_governance_proposal"],
-        "typescript": ["approveGovernanceProposal"],
+        "python": ["approve_governance_proposal", "governance_approve"],
+        "typescript": ["approveGovernanceProposal", "contextGovernanceApprove"],
         "kotlin": ["governanceApprove"],
         "swift": ["approveGovernanceProposal"],
     },
     ("Governance", "reject_proposal"): {
-        "python": ["reject_governance_proposal"],
-        "typescript": ["rejectGovernanceProposal"],
+        "python": ["reject_governance_proposal", "governance_reject"],
+        "typescript": ["rejectGovernanceProposal", "contextGovernanceReject"],
         "kotlin": ["governanceReject"],
         "swift": ["rejectGovernanceProposal"],
     },
     ("Governance", "withdraw_vote"): {
-        "python": ["withdraw_governance_vote"],
-        "typescript": ["withdrawGovernanceVote"],
+        "python": ["withdraw_governance_vote", "governance_withdraw"],
+        "typescript": ["withdrawGovernanceVote", "contextGovernanceWithdraw"],
         "kotlin": ["governanceWithdraw"],
         "swift": ["withdrawGovernanceVote"],
     },
     ("Governance", "get_proposal"): {
         "python": ["get_governance_proposal"],
-        "typescript": ["getGovernanceProposal"],
+        "typescript": ["contextGovernanceGetProposal"],
     },
     ("Governance", "list_proposals"): {
         "python": ["list_governance_proposals"],
-        "typescript": ["listGovernanceProposals"],
+        "typescript": ["contextGovernanceListProposals"],
+    },
+    ("Governance", "apply_pending_ceiling_modification"): {
+        "typescript": ["contextApplyPendingCeilingModification"],
+    },
+    ("Governance", "finalize_close"): {
+        "typescript": ["contextFinalizeClose"],
+    },
+    ("Governance", "create_governance_checkpoint"): {
+        "typescript": ["contextCreateGovernanceCheckpoint"],
+    },
+    ("Governance", "add_checkpoint_cosignature"): {
+        "typescript": ["contextAddCheckpointCosignature"],
     },
     ("Governance", "member_count"): {
-        "python": ["member_count"],
+        "python": ["member_count", "context_member_count"],
+        "typescript": ["contextMemberCount"],
         "swift": ["memberCount"],
     },
     ("Governance", "is_member"): {
-        "python": ["is_member"],
+        "python": ["is_member", "context_is_member"],
+        "typescript": ["contextIsMember"],
         "swift": ["isMember"],
     },
     ("Governance", "member_role"): {
         "swift": ["memberRole"],
     },
-    # EventLog
+    # Governance rows whose method lives under context_* in Python / TypeScript.
+    ("Governance", "handle_ttl_expiry"): {
+        "python": ["context_handle_ttl_expiry"],
+        "typescript": ["contextHandleTtlExpiry"],
+    },
+    ("Governance", "propose_ttl_extension"): {
+        "python": ["context_propose_ttl_extension"],
+        "typescript": ["contextProposeTtlExtension"],
+    },
+    # Governance -- new GovernanceAction variants dispatched via the existing
+    # execute_action / propose_action entry points.
+    ("Governance", "execute_suspend_capability"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_suspend_access"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_revoke_access"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_restore_access"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_remove_member"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_rotate_content_keys"): {
+        "python": ["execute_governance_action", "governance_execute"],
+        "typescript": ["executeGovernanceAction", "contextExecuteGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "propose_governance_action_checked"): {
+        "python": ["propose_governance_action", "governance_propose"],
+        "typescript": ["proposeGovernanceAction", "contextGovernancePropose"],
+        "kotlin": ["governancePropose"],
+        "swift": ["proposeGovernanceAction"],
+    },
+    # EventLog — all operations live on the SCP class under eventLog* prefix in TS
     ("EventLog", "query"): {
-        "python": ["query"],
+        "python": ["event_log_query"],
+        "typescript": ["eventLogQuery"],
         "kotlin": ["eventLogQuery"],
     },
     ("EventLog", "verify"): {
-        "python": ["verify"],
+        "python": ["event_log_verify"],
+        "typescript": ["eventLogVerify"],
     },
     ("EventLog", "checkpoint"): {
+        "typescript": ["eventLogCheckpoint"],
         "kotlin": ["eventLogCheckpoint"],
     },
+    ("EventLog", "checkpoint_by_did"): {
+        "python": ["event_log_checkpoint_by_did"],
+        "typescript": ["eventLogCheckpointByDid"],
+        "kotlin": ["eventLogCheckpointByDid"],
+        "swift": ["eventLogCheckpointByDid"],
+    },
     ("EventLog", "signed_checkpoint"): {
-        "typescript": ["checkpoint"],
+        "typescript": ["eventLogCheckpoint"],
         "kotlin": ["eventLogCheckpoint"],
         "swift": ["generateEventLogCheckpoint"],
     },
@@ -247,9 +340,13 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Media", "check_capability"): {
         "python": ["check_media_capability"],
     },
-    # Discovery
+    # Discovery -- discover is `discoverContexts` in TS, `discover` in Kotlin,
+    # and `contextDiscover` in Swift (generated UniFFI binding)
     ("Discovery", "discover"): {
+        "python": ["discover_contexts"],
         "typescript": ["discoverContexts"],
+        "kotlin": ["discover", "contextDiscover"],
+        "swift": ["contextDiscover"],
     },
     ("Discovery", "scope_register"): {
         "swift": ["registerScope"],
@@ -283,6 +380,11 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("UCAN", "delegate"): {
         "typescript": ["delegateUcan"],
     },
+    # Bridge -- register is surfaced as BridgeRegistration type in TS and
+    # `register` function in Python/Swift/Kotlin bridge modules.
+    ("Bridge", "register"): {
+        "typescript": ["BridgeRegistration", "createNativeBridge", "createWasmBridge"],
+    },
     # MCP
     ("MCP", "serve"): {
         "python": ["serve_mcp", "McpServer"],
@@ -290,7 +392,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("MCP", "connect_client"): {
         "python": ["McpClient"],
         "typescript": ["connectMcp", "McpClient"],
-        "swift": ["McpClientHandle"],
+        "swift": ["McpClient", "connect"],
     },
     # Server -- methods live on Relay/Node classes
     ("Server", "relay_start_in_memory"): {
@@ -345,20 +447,30 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     # Context -- receive needs mapping in Kotlin
     ("Context", "receive"): {
+        "typescript": ["contextSubscribe"],
         "kotlin": ["contextSubscribe"],
     },
     # Context -- consequence_rules surfaced via the existing create() and
     # context_create wrappers (parameter, not a separate function).
     ("Context", "create_with_consequence_rules"): {
-        "python": ["create"],
-        "typescript": ["create"],
+        "python": ["create", "context_create"],
+        "typescript": ["create", "contextCreate"],
         "swift": ["contextCreate"],
+    },
+    ("Context", "restore_context"): {
+        "typescript": ["contextRestore"],
+    },
+    ("Context", "restore_all_contexts"): {
+        "typescript": ["contextRestoreAll"],
+    },
+    ("Context", "import_context"): {
+        "swift": ["contextImport"],
     },
     # Messaging -- spending_ucan_jwt is a parameter on send() / context_send
     # exposed via existing wrappers in all four SDKs.
     ("Messaging", "send_with_spending_ucan"): {
-        "python": ["send"],
-        "typescript": ["send"],
+        "python": ["send", "context_send"],
+        "typescript": ["send", "contextSend"],
         "kotlin": ["contextSend"],
         "swift": ["send"],
     },
@@ -366,8 +478,8 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # Bridge drift documented in matrix notes; tree-sitter sees the wrapper
     # signature in PyO3, NAPI TS, and Swift surfaces.
     ("Messaging", "join_with_spending_ucan"): {
-        "python": ["join"],
-        "typescript": ["join"],
+        "python": ["join", "context_join"],
+        "typescript": ["join", "contextJoin"],
         "swift": ["joinContext"],
     },
     # Trust -- consequence rule validation is exercised via aggregate_trust_input
@@ -384,174 +496,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["aggregateTrustInput"],
         "swift": ["aggregateTrustInput"],
     },
-    # Governance -- new GovernanceAction variants dispatched via the existing
-    # execute_action / propose_action entry points.
-    ("Governance", "execute_suspend_capability"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "execute_suspend_access"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "execute_revoke_access"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "execute_restore_access"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "execute_remove_member"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "execute_rotate_content_keys"): {
-        "python": ["execute_governance_action"],
-        "typescript": ["executeGovernanceAction"],
-        "kotlin": ["governanceExecute"],
-        "swift": ["executeGovernanceAction"],
-    },
-    ("Governance", "propose_governance_action_checked"): {
-        "python": ["propose_governance_action"],
-        "typescript": ["proposeGovernanceAction"],
-        "kotlin": ["governancePropose"],
-        "swift": ["proposeGovernanceAction"],
-    },
-}
-
-
-# Supplementary aliases. Every entry below was verified against actual SDK
-# source: the named symbol exists and implements the capability. These cover
-# the recurring divergence classes the auto-derived candidates miss:
-#   * generic dispatchers — per-action Governance rows ride in the action JSON
-#     of one `governance_execute` / `contextExecuteGovernanceAction` method;
-#     there is no per-variant symbol in ANY SDK (Python reference included).
-#   * cross-domain naming — `Governance/is_member` lives as `context_is_member`.
-#   * idiomatic surface — constructors (`scp_new` -> the `SCP` class),
-#     properties (`scp_instance_id` -> `instanceId`), param-bearing methods
-#     (`shutdown_timeout` -> `shutdown`), and factory names (`with_storage_sqlite`
-#     -> Kotlin `withSqlite`).
-# Merged (not overriding) into ALIASES so existing entries keep their names and
-# these add the missing/corrected ones.
-_EXTRA_ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
-    # Governance: per-action variants dispatch through one generic method.
-    ("Governance", "approve_proposal"): {
-        "python": ["governance_approve"],
-        "typescript": ["contextGovernanceApprove"],
-    },
-    ("Governance", "reject_proposal"): {
-        "python": ["governance_reject"],
-        "typescript": ["contextGovernanceReject"],
-    },
-    ("Governance", "withdraw_vote"): {
-        "python": ["governance_withdraw"],
-        "typescript": ["contextGovernanceWithdraw"],
-    },
-    ("Governance", "propose_action"): {
-        "python": ["governance_propose"],
-        "typescript": ["contextGovernancePropose"],
-    },
-    ("Governance", "propose_governance_action_checked"): {
-        "python": ["governance_propose"],
-        "typescript": ["contextGovernancePropose"],
-    },
-    ("Governance", "execute_action"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_remove_member"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_restore_access"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_revoke_access"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_rotate_content_keys"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_suspend_access"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    ("Governance", "execute_suspend_capability"): {
-        "python": ["governance_execute"],
-        "typescript": ["contextExecuteGovernanceAction"],
-    },
-    # Governance rows whose method lives under context_* in Python.
-    ("Governance", "handle_ttl_expiry"): {"python": ["context_handle_ttl_expiry"]},
-    ("Governance", "is_member"): {"python": ["context_is_member"]},
-    ("Governance", "member_count"): {"python": ["context_member_count"]},
-    ("Governance", "propose_ttl_extension"): {
-        "python": ["context_propose_ttl_extension"]
-    },
-    # Identity attestations carry the "Link" infix (corrects stale Swift aliases).
-    ("Identity", "create_attestation"): {
-        "python": ["create_identity_link_attestation"],
-        "typescript": ["identityCreateLinkAttestation"],
-        "swift": ["identityCreateLinkAttestation", "createLinkAttestation"],
-        "kotlin": ["createLinkAttestation"],
-    },
-    ("Identity", "list_attestations"): {
-        "python": ["identity_link_attestations"],
-        "typescript": ["identityLinkAttestations"],
-        "swift": ["identityLinkAttestations", "listLinkAttestations"],
-        "kotlin": ["linkAttestations"],
-    },
-    ("Identity", "remove_attestation"): {
-        "python": ["remove_identity_link_attestation"],
-        "typescript": ["identityRemoveLinkAttestation"],
-        "swift": ["identityRemoveLinkAttestation"],
-        "kotlin": ["removeLinkAttestation"],
-    },
-    # Context.
-    ("Context", "create_with_consequence_rules"): {
-        "python": ["context_create"],
-        "typescript": ["contextCreate"],
-    },
-    ("Context", "receive"): {"typescript": ["contextSubscribe"]},
-    ("Context", "restore_context"): {"typescript": ["contextRestore"]},
-    ("Context", "restore_all_contexts"): {"typescript": ["contextRestoreAll"]},
-    ("Context", "import_context"): {"swift": ["contextImport"]},
-    # Event log.
-    ("EventLog", "checkpoint_by_did"): {"python": ["event_log_checkpoint_by_did"]},
-    ("EventLog", "signed_checkpoint"): {"typescript": ["eventLogCheckpoint"]},
-    # Messaging: spending-UCAN variants ride as optional params on send/join.
-    ("Messaging", "send_message"): {"python": ["context_send"]},
-    ("Messaging", "send_with_spending_ucan"): {
-        "python": ["context_send"],
-        "typescript": ["contextSend"],
-    },
-    ("Messaging", "join_with_spending_ucan"): {
-        "python": ["context_join"],
-        "typescript": ["contextJoin"],
-    },
-    # Tools: Python uses the tool_* prefix (existing entries cover ts/swift).
-    ("Tools", "interface_accept"): {"python": ["tool_interface_accept"]},
-    ("Tools", "interface_expose"): {"python": ["tool_interface_expose"]},
-    ("Tools", "interface_revoke"): {"python": ["tool_interface_revoke"]},
-    ("Tools", "invoke_cross_context"): {"python": ["tool_invoke_cross_context"]},
-    ("Tools", "session_create"): {"python": ["tool_session_create"]},
-    ("Tools", "session_invoke"): {"python": ["tool_session_invoke"]},
-    ("Tools", "session_close"): {"python": ["tool_session_close"]},
-    # MCP: corrects stale `McpClientHandle` alias (the actor is `McpClient`).
-    ("MCP", "connect_client"): {"swift": ["McpClient", "connect"]},
     # Lifecycle: constructor / property / factory naming across SDKs.
     ("Lifecycle", "scp_new"): {
         "python": ["SCP"],
@@ -589,17 +533,10 @@ _EXTRA_ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["addRelay"],
         "kotlin": ["addRelay"],
     },
-    ("Lifecycle", "suspend"): {"kotlin": ["suspendInstance"]},
+    ("Lifecycle", "suspend"): {
+        "kotlin": ["suspendInstance"],
+    },
 }
-
-# Deep-merge _EXTRA_ALIASES into ALIASES (append names, never override).
-for _key, _sdkmap in _EXTRA_ALIASES.items():
-    _existing = ALIASES.setdefault(_key, {})
-    for _sdk, _names in _sdkmap.items():
-        _slot = _existing.setdefault(_sdk, [])
-        for _name in _names:
-            if _name not in _slot:
-                _slot.append(_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,11 +1014,12 @@ def _check_operation_in_sdk(
       1. Explicit aliases from the ALIASES table
       2. Exact match against auto-generated name variants
          (snake_case, camelCase, PascalCase, domain-prefixed)
-      3. Substring match: check if any symbol contains the operation name
-         as a component (handles cases like registerTool matching "register",
-         broadcastSubscribe matching "subscribe")
 
     Returns True if any check succeeds.
+
+    Note: suffix/substring matching was intentionally removed. It allowed
+    ~23 fabricated operation names to pass via suffix collision with common
+    verbs. All legitimate cross-SDK name mappings must be explicit in ALIASES.
     """
     # 1. Check explicit aliases first
     alias_key = (domain, op_name)
@@ -1120,18 +1058,6 @@ def _check_operation_in_sdk(
         if candidate in sdk_symbols:
             return True
 
-    # 3. Suffix match: check if any extracted symbol ENDS WITH the
-    #    operation's camelCase name. This handles domain-prefixed names
-    #    (e.g., registerTool for Tools/register) without matching across
-    #    domains (scopeRegister should NOT match Tools/register).
-    camel_lower = camel.lower()
-    for symbol in sdk_symbols:
-        if "." in symbol:
-            continue
-        sym_lower = symbol.lower()
-        if sym_lower.endswith(camel_lower):
-            return True
-
     return False
 
 
@@ -1160,6 +1086,7 @@ def main() -> int:
     missing_exemptions = 0
     unmatched_true = 0
     coverage_exempted = 0
+    all_exempted_ops = 0
 
     sdks = ("python", "typescript", "kotlin", "swift")
 
@@ -1171,17 +1098,24 @@ def main() -> int:
             exemptions = op.get("exemptions", {})
             coverage_exemptions = op.get("coverage_exemptions", {})
 
+            # Track per-op coverage state for the all-exempted check below.
+            op_true_sdks: list[str] = []
+            op_exempted_sdks: list[str] = []
+            op_verified_sdks: list[str] = []
+
             for sdk in sdks:
                 expected = op.get(sdk)
                 if expected is None:
                     continue
 
                 if expected is True:
+                    op_true_sdks.append(sdk)
                     # AST check: does the SDK have a symbol for this?
                     found = _check_operation_in_sdk(
                         sdk_symbols[sdk], sdk, domain, op_name
                     )
                     if found:
+                        op_verified_sdks.append(sdk)
                         continue
                     # Fail-closed: a capability marked present whose SDK symbol
                     # cannot be located is a real gap (or a stale matrix entry)
@@ -1197,6 +1131,7 @@ def main() -> int:
                             f"  NOTE: {domain}/{op_name} ({sdk}) coverage-exempt: "
                             f"{coverage_exemptions[sdk]}"
                         )
+                        op_exempted_sdks.append(sdk)
                         coverage_exempted += 1
                     else:
                         print(
@@ -1218,6 +1153,27 @@ def main() -> int:
                         missing_exemptions += 1
                         errors += 1
 
+            # All-exempted check: if every SDK that claims coverage for this
+            # operation has a coverage_exemption (and none was statically
+            # verified), there is no ground-truth verified implementation.
+            # This prevents a coverage_exemptions entry from acting as an
+            # unbounded prose bypass when ALL SDKs use one simultaneously.
+            # At least one SDK must have its symbol verified by static
+            # extraction for the exemptions to be legitimate.
+            if (
+                op_true_sdks
+                and not op_verified_sdks
+                and set(op_exempted_sdks) == set(op_true_sdks)
+            ):
+                print(
+                    f"  ERROR: All SDKs claiming coverage for {domain}/{op_name} "
+                    f"have coverage_exemptions with no statically-verified SDK — "
+                    f"coverage cannot be verified. Add an ALIASES entry or add the "
+                    f"missing wrapper so at least one SDK is statically confirmed."
+                )
+                all_exempted_ops += 1
+                errors += 1
+
     # Summary
     print()
     print("=" * 60)
@@ -1233,12 +1189,16 @@ def main() -> int:
         f"    unmatched true:   {unmatched_true} (true but no symbol and no coverage exemption)"
     )
     print(f"    false w/o exempt: {missing_exemptions}")
+    print(
+        f"    all-exempted ops: {all_exempted_ops} (all true SDKs have exemptions, none verified)"
+    )
     print("=" * 60)
 
     if errors > 0:
         print(
             f"\nFAIL: {errors} error(s) — {unmatched_true} unmatched true entr(ies), "
-            f"{missing_exemptions} false entr(ies) lacking exemptions."
+            f"{missing_exemptions} false entr(ies) lacking exemptions, "
+            f"{all_exempted_ops} op(s) with all-exempted coverage (unverifiable)."
         )
         return 1
 

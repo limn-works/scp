@@ -812,3 +812,31 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
   }
   return _wasmBridge;
 }
+
+/**
+ * **Test-only.** Injects a pre-built `Bridge` into the per-instance WeakMap
+ * so that `getBridge(scp)` returns it without loading any platform addon.
+ *
+ * Guarded by `NODE_ENV !== "production"` — the same pattern as
+ * `__constructScpWithNativeForTests` in `scp.ts`. Production builds keep this
+ * helper, but any call site in a production environment throws immediately so
+ * the seam cannot be abused at runtime.
+ *
+ * Intended use: construct a mock `Bridge` with spy stubs for specific
+ * operations (e.g. `bridgeEvaluateTrust`), then call
+ * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
+ * (`evaluateTrust`, `bridgeCreateShadow`, …) under test.
+ *
+ * @internal Phase 4 PR 4 — used by `bridge-trust.test.ts` default-options tests.
+ */
+export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
+  const env = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
+  if (env === "production") {
+    throw new Error(
+      "__setBridgeForTests is a test-only hook and must not be called in production " +
+        "(NODE_ENV=production). If you're seeing this in legitimate code, your build is " +
+        "including test helpers that should be excluded.",
+    );
+  }
+  _nativeBridgeForScp.set(scp, bridge);
+}

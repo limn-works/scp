@@ -25,6 +25,7 @@
  */
 
 import { describe, expect, it, test } from "bun:test";
+import { IdentityError } from "../src/errors";
 import { Identity } from "../src/identity";
 import { SCP } from "../src/scp";
 import { mountMockScp } from "./mock-bridge";
@@ -134,13 +135,31 @@ if (!napiAvailable) {
       }
     });
 
-    test("migrate returns an Identity preserving the DID", async () => {
+    test("migrate returns an Identity with a NEW DID (spec §3.2.1)", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreate("in_memory");
         const migrated = await scp.identityMigrate(identity);
         expect(migrated).toBeInstanceOf(Identity);
-        expect(migrated.did).toBe(identity.did);
+        // Migration creates a new DID — it does NOT preserve the old one.
+        // Use identityRotateKey() if the same DID with a new key is needed.
+        expect(migrated.did).not.toBe(identity.did);
+      } finally {
+        await scp.shutdown(1);
+      }
+    });
+
+    test("migrate drops the #agent key — identityRemoveAgentKey throws on migrated identity", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        // Start with an identity that has an #agent key.
+        const identity = await scp.identityAddAgentKey(await scp.identityCreate("in_memory"));
+        const migrated = await scp.identityMigrate(identity);
+        expect(migrated).toBeInstanceOf(Identity);
+        // Migration MUST have dropped the #agent key from the new DID document
+        // (spec §3.2.1). Attempting to remove a non-existent agent key produces
+        // IdentityError (Rust: IdentityError::AgentKeyNotFound).
+        await expect(scp.identityRemoveAgentKey(migrated)).rejects.toBeInstanceOf(IdentityError);
       } finally {
         await scp.shutdown(1);
       }

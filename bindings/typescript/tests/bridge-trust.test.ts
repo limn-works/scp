@@ -22,9 +22,12 @@
  */
 
 import { describe, expect, it, test } from "bun:test";
-import type { BridgeTrustOptions } from "../src/bridge";
+import type { ShadowStatus } from "../src/bridge";
 import { evaluateTrust } from "../src/bridge";
+import type { Bridge } from "../src/internal/bridge";
+import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
+import { mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
 // Default-shape unit test (no addon required)
@@ -32,38 +35,95 @@ import { SCP } from "../src/scp";
 //
 // `evaluateTrust` must apply the same defaults the Python keyword-only
 // arguments do: isBridged=false, isNativeTransport=true, shadowStatus="shadow".
-// We assert the resolution logic in isolation by replaying the same `??`
-// chain the implementation uses — this guards the documented defaults against
-// silent drift without needing a live bridge.
+//
+// We verify the actual `evaluateTrust` implementation by injecting a mock
+// bridge via `__setBridgeForTests` and spying on which arguments reach
+// `bridgeEvaluateTrust`. This catches silent drift in the `??` chains inside
+// `evaluateTrust` itself — a local copy of the same chains would be a
+// tautology (it could drift identically with the implementation and the test
+// would still pass).
 describe("evaluateTrust option defaults", () => {
-  function resolve(options: BridgeTrustOptions = {}): {
-    isBridged: boolean;
-    isNativeTransport: boolean;
-    shadowStatus: string;
+  /**
+   * Builds a stub `Bridge` whose `bridgeEvaluateTrust` records its call
+   * arguments and returns the supplied tier value. All other operations
+   * throw so accidental delegation is immediately visible.
+   */
+  function makeSpyBridge(returnTier: number = 3): {
+    bridge: Bridge;
+    calls: Array<[boolean, boolean, ShadowStatus]>;
   } {
-    return {
-      isBridged: options.isBridged ?? false,
-      isNativeTransport: options.isNativeTransport ?? true,
-      shadowStatus: options.shadowStatus ?? "shadow",
-    };
+    const calls: Array<[boolean, boolean, ShadowStatus]> = [];
+    // Runtime-introspection symbols that JS probes on every object (e.g.
+    // `await` probes `.then` to detect thenables). These must return `undefined`
+    // so the bridge is not mistakenly treated as a Promise.
+    const PROBE_PROPS = new Set<string | symbol>([
+      "then",
+      "catch",
+      "finally",
+      Symbol.toPrimitive,
+      Symbol.toStringTag,
+      Symbol.iterator,
+      Symbol.asyncIterator,
+    ]);
+    const bridge = new Proxy({} as Bridge, {
+      get(_t, prop) {
+        if (PROBE_PROPS.has(prop)) {
+          return undefined;
+        }
+        if (prop === "bridgeEvaluateTrust") {
+          return (isBridged: boolean, isNativeTransport: boolean, shadowStatus: ShadowStatus) => {
+            calls.push([isBridged, isNativeTransport, shadowStatus]);
+            return returnTier;
+          };
+        }
+        throw new Error(`Spy bridge: unexpected call to Bridge.${String(prop)}`);
+      },
+    });
+    return { bridge, calls };
   }
 
-  it("defaults to not-bridged, native transport, shadow status", () => {
-    expect(resolve()).toEqual({
-      isBridged: false,
-      isNativeTransport: true,
-      shadowStatus: "shadow",
+  it("defaults to not-bridged, native transport, shadow status", async () => {
+    const { scp } = mountMockScp();
+    const { bridge, calls } = makeSpyBridge(3);
+    __setBridgeForTests(scp, bridge);
+
+    await evaluateTrust(scp);
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as [boolean, boolean, ShadowStatus];
+    expect(call[0]).toBe(false);
+    expect(call[1]).toBe(true);
+    expect(call[2]).toBe("shadow");
+  });
+
+  it("honours explicitly provided values", async () => {
+    const { scp } = mountMockScp();
+    const { bridge, calls } = makeSpyBridge(0);
+    __setBridgeForTests(scp, bridge);
+
+    await evaluateTrust(scp, {
+      isBridged: true,
+      isNativeTransport: false,
+      shadowStatus: "claimed",
     });
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as [boolean, boolean, ShadowStatus];
+    expect(call[0]).toBe(true);
+    expect(call[1]).toBe(false);
+    expect(call[2]).toBe("claimed");
   });
 
-  it("honours explicitly provided values", () => {
-    expect(resolve({ isBridged: true, isNativeTransport: false, shadowStatus: "claimed" })).toEqual(
-      { isBridged: true, isNativeTransport: false, shadowStatus: "claimed" },
-    );
-  });
+  it("preserves false isNativeTransport (does not fall back to true)", async () => {
+    const { scp } = mountMockScp();
+    const { bridge, calls } = makeSpyBridge(2);
+    __setBridgeForTests(scp, bridge);
 
-  it("preserves false isNativeTransport (does not fall back to true)", () => {
-    expect(resolve({ isNativeTransport: false }).isNativeTransport).toBe(false);
+    await evaluateTrust(scp, { isNativeTransport: false });
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as [boolean, boolean, ShadowStatus];
+    expect(call[1]).toBe(false);
   });
 
   it("evaluateTrust is an async function", () => {
