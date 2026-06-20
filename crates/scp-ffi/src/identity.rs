@@ -1615,8 +1615,8 @@ impl crate::scp::PyScp {
     /// Returns `(new_identity, rotation_event_json)`. The JSON shape is
     /// `serde_json::to_string(&scp_identity::DidRotationEvent)` so JS-,
     /// Python-, Swift-, or Kotlin-side consumers parse it directly. The
-    /// SDK distributes the event to context members (spec §9.12
-    /// step 4b).
+    /// SDK distributes the event to context members (spec §9.12,
+    /// ADR-003 §4b).
     pub fn identity_migrate(
         &self,
         py: Python<'_>,
@@ -2343,7 +2343,7 @@ mod tests {
 
             // Rotation event JSON deserializes into the canonical
             // `DidRotationEvent` shape (spec §9.12, ADR-003 §4b/4c) so the
-            // SDK can distribute it to context members per §9.12 step 4b.
+            // SDK can distribute it to context members per spec §9.12, ADR-003 §4b.
             let event: scp_identity::DidRotationEvent =
                 serde_json::from_str(&rotation_event_json).unwrap();
             assert_eq!(event.old_did, old_did);

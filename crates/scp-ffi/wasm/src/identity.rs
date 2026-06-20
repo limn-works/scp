@@ -2451,7 +2451,7 @@ const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
 /// fresh pre-rotation key are minted for the new DID. The function
 /// returns a [`WasmIdentityMigrationResult`] containing the new
 /// `WasmIdentity` and a `DidRotationEvent` JSON that the SDK MUST
-/// distribute to all active contexts (spec §3.2.1 step 4b).
+/// distribute to all active contexts (spec §3.2.1, ADR-003 §4b).
 ///
 /// `MigrationProof` is the old `#0`'s signature over
 /// `SHA-256("SCP-MIGRATION-V1:" || u32(len(old_did)) || old_did
