@@ -677,18 +677,34 @@ pub fn builtin_broadcast_roles(ceiling: &CapabilityCeiling) -> Vec<RoleDefinitio
 // UcanToken
 // ---------------------------------------------------------------------------
 
-/// Lightweight UCAN token representation for role-based access control
-/// in broadcast contexts.
+/// Lightweight role-capability token used to populate the local
+/// `member_capabilities` cache (spec §7.2.2 Tier 2).
 ///
-/// Contains the core UCAN fields specified by ADR-009: issuer DID,
-/// audience DID, capability attestations, and a unique nonce. Full
-/// cryptographic UCAN validation (Ed25519 signatures, delegation chains,
-/// nonce tracking) is implemented in `scp-core/ucan/` (see ADR-016).
+/// This is a deliberately distinct type from the JWT-encoded
+/// [`crate::crypto::ucan::UcanToken`] (`header`/`payload`/`signature`/
+/// `encoded`) that the Tier-1 11-step pipeline consumes. It carries the core
+/// UCAN claim fields — `iss` (context creator), `aud` (member), `att`
+/// (capability attestations), `nnc` (nonce) — and **intentionally carries no
+/// signature.**
 ///
-/// Each token: `iss` = context creator DID, `aud` = member DID,
-/// `att` = capability attestations, `nnc` = unique nonce.
+/// The missing signature is a complete design decision, **not a stub or a
+/// deferral.** These tokens are never serialized as bearer credentials (the
+/// MLS leaf credential's `ucan_token` is `None` in all production paths),
+/// never cross a trust boundary, and are structurally incapable of entering
+/// the Tier-1 pipeline — there is no conversion from this type into the JWT
+/// `crypto::ucan::UcanToken`, so a role token can never anchor a delegation
+/// chain or be presented at a token-presentation boundary. Their authority is
+/// grounded in the *signed governance action* that performs the role
+/// assignment (context creation for the creator's admin role; the signed
+/// `AddMember`/`AssignRole` governance action thereafter) and in the signed
+/// context snapshot (ADR-050) when role state is synced. Each member derives
+/// its own cache locally from those signed events, so a capability cannot be
+/// forged by presenting a token; a per-token signature would be redundant.
 ///
-/// See ADR-009 acceptance criterion 3.
+/// Do NOT "complete" this by adding an Ed25519 signature: it would duplicate
+/// the governance signature that already authorizes the assignment and serve
+/// no validation path. See spec §7.2.1–§7.2.2 and ADR-009 acceptance
+/// criterion 3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UcanToken {
     /// Issuer DID -- the context creator who delegates the capability.

@@ -39,7 +39,7 @@ use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::state::ProposalOutcome;
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
@@ -161,7 +161,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -786,7 +786,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"blocked message",
-            Some(&signing_key_for_did(&author_did())),
+            MessageSigner::Active(&signing_key_for_did(&author_did())),
             None,
             None,
         )
@@ -841,7 +841,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"restored message",
-            Some(&signing_key_for_did(&author_did())),
+            MessageSigner::Active(&signing_key_for_did(&author_did())),
             None,
             None,
         )
@@ -1506,7 +1506,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"should fail",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -1534,7 +1534,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"still blocked",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -1560,7 +1560,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"success",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )

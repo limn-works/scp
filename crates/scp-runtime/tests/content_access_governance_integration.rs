@@ -38,7 +38,7 @@ use scp_protocol::context::governance::{
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -454,7 +454,7 @@ async fn revoke_write_access_full_blocks_publishing() {
             &handle,
             &dave(),
             b"should fail",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -508,7 +508,7 @@ async fn revoke_write_access_future_only() {
             &handle,
             &dave(),
             b"future message",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -586,7 +586,7 @@ async fn restore_write_access_forward_only() {
             &handle,
             &dave(),
             b"after restore",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -1215,7 +1215,7 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"blocked",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )
@@ -1246,7 +1246,7 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"restored",
-            Some(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&signing_key_for_did(&dave())),
             None,
             None,
         )

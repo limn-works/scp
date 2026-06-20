@@ -79,6 +79,7 @@ use crate::context::state::{
     self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, PSEUDONYM_ANNOUNCEMENT_TAG,
     PseudonymAnnouncement, emit_event_into,
 };
+use crate::context::supervisor::MessageSigner;
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
@@ -119,7 +120,7 @@ pub fn build_encrypted_envelope(
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: MessageSigner<'_>,
     recipients_data: &std::collections::HashMap<String, AccessKey>,
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
@@ -174,10 +175,15 @@ pub fn build_encrypted_envelope(
         message_type,
         payload: &wrapped_bytes,
         provenance,
-        signing_key_id: SigningKeyId::Active,
+        // ADR-039: stamp the verification method this message is signed under
+        // (`#active` or `#agent`) so the recipient resolves the matching public
+        // key from the sender's DID document. The stamped persona and the
+        // signing key both come from the single `MessageSigner` below, so they
+        // cannot disagree — no longer hardcoded to `#active`.
+        signing_key_id: signer.signing_key_id(),
     };
 
-    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
+    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signer.key())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
     // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
@@ -296,8 +302,16 @@ pub fn verify_and_unwrap(
     access_key: &AccessKey,
     sender_is_admin: bool,
 ) -> Result<Vec<u8>, ContextError> {
-    let public_key = (key_resolver)(&DID(sender_did.to_owned())).ok_or_else(|| {
-        ContextError::CryptoFailed(format!("cannot resolve public key for sender {sender_did}"))
+    // ADR-039: resolve the verification method the sender declared in the
+    // inner envelope (`#active` or `#agent`), so an `#agent`-signed message is
+    // verified against the agent key and an `#active`-signed one against the
+    // human key. The resolver returns `None` when that specific VM is absent
+    // from the sender's DID document (e.g. `#agent` requested but never added).
+    let signing_key_id = inner.signing_key_id;
+    let public_key = (key_resolver)(&DID(sender_did.to_owned()), signing_key_id).ok_or_else(|| {
+        ContextError::CryptoFailed(format!(
+            "cannot resolve public key for sender {sender_did} verification method {signing_key_id}"
+        ))
     })?;
     let valid = scp_protocol::envelope::inner::verify_inner_signature(inner, public_key.as_bytes())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -673,6 +687,7 @@ pub async fn send_message(
     sender_did: &DID,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
+    signing_key_id: SigningKeyId,
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
@@ -682,6 +697,25 @@ pub async fn send_message(
     state::require_active(&state.handle)?;
     // Fail-close on commit fault.
     governance_helpers::check_commit_fault_marker(state.commit_fault.as_ref())?;
+    // ADR-039: pair the signing key with its persona into a single
+    // `MessageSigner` up front — both the broadcast envelope build and the
+    // encrypted stamp+sign site below read the key and the stamped
+    // verification method from this one value, so they cannot disagree. Every
+    // send path requires a key; a missing one is rejected here, fail-closed,
+    // BEFORE any rate-limit / velocity / economy state is mutated (so no
+    // rollback is needed). Both encrypted and broadcast sends previously
+    // re-checked `None` downstream; this single check subsumes them.
+    let signer = match signing_key {
+        Some(sk) => match signing_key_id {
+            SigningKeyId::Active => MessageSigner::Active(sk),
+            SigningKeyId::Agent => MessageSigner::Agent(sk),
+        },
+        None => {
+            return Err(ContextError::CryptoFailed(
+                "signing key required for send".into(),
+            ));
+        }
+    };
     // H7: capability check BEFORE budget deduction.
     if state.broadcast_context.is_none()
         && !state
@@ -750,25 +784,21 @@ pub async fn send_message(
 
     let (broadcast_envelope, recipients_data, sequence, is_broadcast, send_routing_ids) =
         if let Some(ref mut bc) = state.broadcast_context {
-            let Some(sk) = signing_key else {
-                crate::context::economy_logic::rollback_economy_ticket_inline(
-                    &mut state.governance,
-                    ticket,
-                );
-                return Err(ContextError::CryptoFailed(
-                    "signing key required for broadcast publish".into(),
-                ));
-            };
-            let env = match build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, sk) {
-                Ok(env) => env,
-                Err(e) => {
-                    crate::context::economy_logic::rollback_economy_ticket_inline(
-                        &mut state.governance,
-                        ticket,
-                    );
-                    return Err(e);
-                }
-            };
+            // `signer` was validated non-`None` at the top of the function; the
+            // broadcast envelope is signed with the same key the encrypted path
+            // would stamp, sourced from the one `MessageSigner`.
+            let env =
+                match build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key())
+                {
+                    Ok(env) => env,
+                    Err(e) => {
+                        crate::context::economy_logic::rollback_economy_ticket_inline(
+                            &mut state.governance,
+                            ticket,
+                        );
+                        return Err(e);
+                    }
+                };
             // Broadcast: SHA-256(context_id) per spec §5.14.
             let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
             (
@@ -903,7 +933,7 @@ pub async fn send_message(
     let phase2_result = encrypt_and_send(
         deps,
         broadcast_envelope,
-        signing_key,
+        signer,
         &context_id,
         sender_did,
         payload,
@@ -958,7 +988,10 @@ pub async fn send_message(
         sender_did,
         sequence,
         payload,
-        signing_key,
+        // Periodic checkpoints broadcast from `finalize_send` are always
+        // human/device-originated `#active` signals; they need only the raw
+        // key, which we hand over from the one `MessageSigner`.
+        Some(signer.key()),
         spending_nonce_committed,
         is_broadcast,
     ) {
@@ -1236,7 +1269,7 @@ fn deliver_checkpoint_message(
 pub fn encrypt_and_send(
     deps: &ActorDeps,
     broadcast_envelope: Option<BroadcastEnvelope>,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: MessageSigner<'_>,
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],
@@ -1247,20 +1280,22 @@ pub fn encrypt_and_send(
     message_type: MessageType,
 ) -> Result<(), ContextError> {
     let encrypted = if let Some(envelope) = broadcast_envelope {
+        // Broadcast: the envelope was already built and signed by
+        // `build_broadcast_envelope` (which used `signer.key()`); the persona is
+        // not part of the broadcast wire shape, so the signer is unused here.
         rmp_serde::to_vec_named(&envelope)
             .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
     } else {
         let encrypt_start = std::time::Instant::now();
-        let sk = signing_key.ok_or_else(|| {
-            ContextError::CryptoFailed("signing key required for encrypted send".into())
-        })?;
+        // The key and stamped persona travel together in the one `MessageSigner`
+        // straight into the single stamp+sign site, so they cannot diverge.
         let result = build_encrypted_envelope(
             &deps.clock,
             &deps.crypto,
             context_id,
             sender_did,
             payload,
-            sk,
+            signer,
             recipients_data,
             sequence,
             source_provenance,
@@ -1376,7 +1411,9 @@ pub fn send_checkpoint(
     encrypt_and_send(
         deps,
         broadcast_envelope,
-        Some(signing_key),
+        // Consistency checkpoints are device/human-originated signals, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
         context_id,
         sender_did,
         &payload,
@@ -1485,7 +1522,9 @@ pub fn send_heartbeat(
     encrypt_and_send(
         deps,
         broadcast_envelope,
-        Some(signing_key),
+        // Heartbeats are device/human-originated liveness beacons, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
         context_id,
         sender_did,
         // Heartbeats carry NO user content — the empty payload is the whole
@@ -2743,6 +2782,9 @@ pub async fn send_pseudonym_announcement(
         sender_did,
         &payload,
         Some(signing_key),
+        // Pseudonym announcements are protocol-level membership signals from
+        // the local member, signed under `#active` (ADR-039).
+        SigningKeyId::Active,
         None,
         None,
     )

@@ -30,7 +30,7 @@ use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did| {
+    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -225,7 +225,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
             &send_handle,
             &alice(),
             plaintext,
-            Some(&signing_key_for_did(&alice())),
+            MessageSigner::Active(&signing_key_for_did(&alice())),
             None,
             None,
         )

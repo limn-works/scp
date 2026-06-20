@@ -344,22 +344,29 @@ mod tests {
         let third_vk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]).verifying_key();
         #[allow(clippy::type_complexity)]
         let resolver: std::sync::Arc<
-            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+            dyn Fn(
+                    &scp_identity::DID,
+                    scp_identity::SigningKeyId,
+                ) -> Option<ed25519_dalek::VerifyingKey>
+                + Send
+                + Sync,
         > = {
             let admin_d = admin_did.clone();
             let voter_d = voter_did.clone();
             let third_d = third_did.clone();
-            std::sync::Arc::new(move |did: &scp_identity::DID| {
-                if *did == admin_d {
-                    Some(admin_vk)
-                } else if *did == voter_d {
-                    Some(voter_vk)
-                } else if *did == third_d {
-                    Some(third_vk)
-                } else {
-                    None
-                }
-            })
+            std::sync::Arc::new(
+                move |did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| {
+                    if *did == admin_d {
+                        Some(admin_vk)
+                    } else if *did == voter_d {
+                        Some(voter_vk)
+                    } else if *did == third_d {
+                        Some(third_vk)
+                    } else {
+                        None
+                    }
+                },
+            )
         };
         let mut engine = MajorityVoteEngine::new(
             eligible_voters,

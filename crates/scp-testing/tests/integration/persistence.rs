@@ -1139,7 +1139,7 @@ mod mock_providers {
 
 /// Creates a mock key resolver that maps known test DIDs to verifying keys.
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID| {
+    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
         let did_str: &str = did.as_ref();
         match did_str {
             "did:dht:z6MkAuthor1" => {

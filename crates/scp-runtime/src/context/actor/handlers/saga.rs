@@ -2489,7 +2489,7 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
                 Some(issuer_key)
             } else {
@@ -2533,7 +2533,7 @@ mod tests {
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
                 Some(issuer_key)
             } else {
@@ -4739,7 +4739,7 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
             if did.as_ref() == issuer_did {
                 Some(issuer_key)
             } else {

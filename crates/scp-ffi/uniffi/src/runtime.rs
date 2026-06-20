@@ -798,6 +798,7 @@ impl UniffiBridgeInstance {
             event_log,
             persistence,
             mls_storage,
+            key_resolver_for_core(&self.core),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -833,8 +834,14 @@ impl UniffiBridgeInstance {
             );
             return;
         };
-        let supervisor_arc =
-            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
+        let supervisor_arc = build_supervisor(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for_core(&self.core),
+        );
 
         self.core.set_supervisor(supervisor_arc);
     }
@@ -868,8 +875,14 @@ impl UniffiBridgeInstance {
             );
             return;
         };
-        let supervisor_arc =
-            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
+        let supervisor_arc = build_supervisor(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            mls_storage,
+            key_resolver_for_core(&self.core),
+        );
 
         self.core.set_supervisor(supervisor_arc);
     }
@@ -1154,6 +1167,15 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
+/// Builds the production VM-aware governance key resolver from a DID resolver.
+///
+/// Delegates to [`scp_ffi_common::bridge_runtime::document_vm_key_resolver`].
+fn document_vm_key_resolver(
+    did_resolver: Arc<scp_ffi_common::IdentityBackedDidResolver>,
+) -> scp_core::context::governance::KeyResolver {
+    scp_ffi_common::bridge_runtime::document_vm_key_resolver(did_resolver)
+}
+
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
 /// consumed by `ContextManager::with_persistence` which requires a `Box`.
 ///
@@ -1268,6 +1290,7 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
         persistence.map(|shared| {
@@ -1285,13 +1308,26 @@ fn build_supervisor(
         crypto,
         transport,
         event_log,
-        not_configured_key_resolver(),
+        key_resolver,
         persistence_box,
         None,
         Some(event_tx),
         None,
         mls_storage,
     )
+}
+
+/// Selects the governance key resolver for a bridge instance core.
+///
+/// Wires the production VM-aware document resolver when a DID resolver is
+/// configured; otherwise fails closed with the always-`None`
+/// [`not_configured_key_resolver`] so vote-signature verification is never
+/// silently permissive.
+fn key_resolver_for_core(core: &CoreFields) -> scp_core::context::governance::KeyResolver {
+    core.did_resolver()
+        .map_or_else(not_configured_key_resolver, |r| {
+            document_vm_key_resolver(Arc::clone(r))
+        })
 }
 
 // Phase D (#1695): module-level `context_manager`, `context_manager_expect`,

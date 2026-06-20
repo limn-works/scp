@@ -196,7 +196,7 @@ impl ContextEventLogProvider for MockEventLog {
 }
 
 fn noop_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|_did: &DID| None)
+    std::sync::Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None)
 }
 
 /// Derives a deterministic Ed25519 seed from a DID string by XOR-folding
@@ -214,7 +214,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 /// Mock key resolver that returns a deterministic verifying key derived from
 /// the DID string. Used by happy-path tests that need real signature verification.
 fn mock_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|did| {
+    std::sync::Arc::new(|did, _kid: scp_identity::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })

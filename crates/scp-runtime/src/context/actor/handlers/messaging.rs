@@ -77,6 +77,7 @@ pub async fn dispatch(
                 &p.sender_did,
                 &p.payload,
                 p.signing_key.as_ref(),
+                p.signing_key_id,
                 p.source_provenance.as_ref(),
                 p.spending_ucan.as_ref(),
                 reply,
@@ -200,6 +201,7 @@ async fn handle_send_message(
     sender_did: &scp_identity::DID,
     payload: &[u8],
     signing_key: Option<&crate::context::actor::commands::SigningKeyBytes>,
+    signing_key_id: scp_protocol::identity::SigningKeyId,
     source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -249,6 +251,7 @@ async fn handle_send_message(
         sender_did,
         payload,
         sk_ref,
+        signing_key_id,
         source_provenance,
         spending_ucan,
     );

@@ -638,7 +638,7 @@ mod tests {
     }
 
     fn mock_resolver() -> KeyResolver {
-        Arc::new(|did: &DID| {
+        Arc::new(|did: &DID, _kid: scp_protocol::identity::SigningKeyId| {
             let did_str: &str = did.as_ref();
             match did_str {
                 "did:dht:z6MkAlice" => {

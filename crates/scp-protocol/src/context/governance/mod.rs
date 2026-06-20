@@ -61,22 +61,32 @@ use super::tools::interface::ToolInterface;
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
 use scp_event_log::{ContextId, Ed25519Signature};
-use scp_primitives::DID;
+use scp_primitives::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // KeyResolver
 // ---------------------------------------------------------------------------
 
-/// Resolves a voter's DID to their Ed25519 verifying key.
+/// Resolves a `(DID, verification method)` pair to its Ed25519 verifying key.
+///
+/// The second argument selects which verification method to resolve per
+/// ADR-039's shared-DID model: [`SigningKeyId::Active`] (`#active`, the human
+/// signing key) or [`SigningKeyId::Agent`] (`#agent`, the agent signing key).
+/// A single DID document carries distinct keys for each, so resolvers must
+/// return the key matching the requested verification method — not a single
+/// collapsed key. This lets the receive path verify `#agent`-signed messages
+/// against the agent key and `#active`-signed messages against the human key.
 ///
 /// Governance engines use this to verify vote signatures against the voter's
 /// actual public key (derived from their DID), rather than trusting the
 /// signing key provided by the caller. This prevents forged votes where an
 /// attacker supplies a valid DID but signs with a different key.
 ///
-/// Returns `None` if the DID cannot be resolved (e.g., non-did:dht method
-/// with no fallback, or unknown DID).
-pub type KeyResolver = Arc<dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync>;
+/// Returns `None` if the DID or the requested verification method cannot be
+/// resolved (e.g., non-did:dht method with no fallback, unknown DID, or a DID
+/// document that carries no `#agent` key when one is requested).
+pub type KeyResolver =
+    Arc<dyn Fn(&DID, SigningKeyId) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // ProposalId
@@ -1573,9 +1583,17 @@ impl GovernanceEngine for SingleAdminEngine {
         )?;
 
         // Verify the admin's vote signature against their DID-resolved key.
+        // Votes resolve `#active` (the human signing key) today: governance is
+        // a human-accountability surface and ADR-039 scopes one-DID-one-vote to
+        // the person, not the agent key. Per-VM vote signing (`#agent` casting
+        // votes within permission scope) is deferred per ADR-039 §Governance;
+        // when it lands, this and the other vote-resolution sites switch to the
+        // envelope/credential-declared `SigningKeyId`.
         let resolved_key =
-            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
-                did: proposer.to_string(),
+            (self.key_resolver)(proposer, SigningKeyId::Active).ok_or_else(|| {
+                GovernanceError::UnknownVoter {
+                    did: proposer.to_string(),
+                }
             })?;
         verify_vote(&proposal_id, &admin_vote, &resolved_key).map_err(|_| {
             GovernanceError::InvalidSignature {
@@ -1934,7 +1952,7 @@ mod tests {
     /// Mock key resolver that maps test DIDs to their corresponding signing
     /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32], etc.
     fn mock_resolver() -> KeyResolver {
-        Arc::new(|did: &DID| {
+        Arc::new(|did: &DID, _kid: SigningKeyId| {
             let did_str: &str = did.as_ref();
             match did_str {
                 "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),

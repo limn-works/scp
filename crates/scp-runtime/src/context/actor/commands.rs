@@ -150,6 +150,12 @@ pub struct SendMessagePayload {
     /// it. Wrapped in [`SigningKeyBytes`] so the private key bytes
     /// zeroize on drop.
     pub signing_key: Option<SigningKeyBytes>,
+    /// Which verification method this message is signed under
+    /// (`#active` or `#agent`, ADR-039). Stamped into the inner
+    /// envelope's `signing_key_id` so the recipient resolves the
+    /// matching public key from the sender's DID document. Must agree
+    /// with the key material in `signing_key`.
+    pub signing_key_id: scp_protocol::identity::SigningKeyId,
     /// Optional cross-context provenance metadata — attaches a
     /// signed `DataProvenance` envelope to the inner message.
     pub source_provenance: Option<scp_protocol::provenance::attach::SourceContextInfo>,

@@ -19,6 +19,13 @@
 - CRITICAL: claiming.rs:267 uses to_be_bytes + SHA-256 prehash; trust/attestation.rs:431 uses to_le_bytes + raw bytes -- INCOMPATIBLE attestation verification
 - See PR #76 review for full details
 
+### ADR-039 Shared-DID Persona Binding (#active/#agent)
+- `signing_key_id` (SigningKeyId enum, #active/#agent) IS in the SIGNED canonical preimage of InnerEnvelope — envelope/inner/mod.rs compute_canonical_hash ~L557, final VarBytes (length-prefixed) field. verify recomputes with inner.signing_key_id (~L370). Persona cannot be flipped post-sign without breaking sig. SOUND.
+- KeyResolver widened DID-only → `Fn(&DID, SigningKeyId) -> Option<VerifyingKey>`. verify_and_unwrap (messaging_helpers.rs:309) resolves by inner.signing_key_id. verify-before-unwrap correct; payload_hash via ct_eq.
+- SigningKeyId::from_fragment strict: only "#active"/"#agent"; rejects "#0","active","". economy_logic resolve_public_key_by_kid fails CLOSED on unknown kid. No-kid resolve_public_key defaults #active (only on no-kid UCAN path).
+- Governance votes all pass SigningKeyId::Active; SignedVote has NO kid field so votes are always #active by construction — no wrong-key-accept. Per-VM votes deferred (documented).
+- GAP (not a regression): only prod KeyResolver wiring (scp-node/self_host.rs:453) returns None for ALL (DID,kid); FFI bridges hardcode signing_key_id=Active + not_configured_key_resolver→None. #agent end-to-end still non-functional outside in-crate tests despite "wired into live pipeline" claim. Receive path correct GIVEN real document-derived resolver (only in agent_binding_pipeline_tests.rs).
+
 ### Signature Verification
 - claim_shadow() verifies attestation sig then claim sig before state transition
 - Ed25519 via ed25519_dalek, signatures over SHA-256 canonical hashes (claiming.rs)

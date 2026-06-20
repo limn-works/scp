@@ -43,7 +43,7 @@ use scp_core::context::builder::{
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::{ContextEvent, KeyPackage};
 use scp_core::context::providers::event_log::MerkleEventLogProvider;
-use scp_core::context::supervisor::Supervisor;
+use scp_core::context::supervisor::{MessageSigner, Supervisor};
 use scp_core::context::{ContextError, ContextHandle, ContextParams, context_routing_id};
 use scp_identity::DID;
 
@@ -441,7 +441,7 @@ impl FullStackNode {
                 handle,
                 &self.did,
                 payload,
-                Some(&self.signing_key),
+                MessageSigner::Active(&self.signing_key),
                 None,
                 None,
             )
