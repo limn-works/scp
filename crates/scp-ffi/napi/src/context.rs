@@ -1138,12 +1138,29 @@ pub(crate) async fn context_send_on(
     use scp_core::context::actor::commands::{
         MessagingCommand, SendMessagePayload, SigningKeyBytes,
     };
+    use scp_core::context::supervisor::MessageSigner;
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = core_handle.context_id().to_owned();
     let params = core_handle.params().clone();
-    let signing_key_bytes = resolved_signing_key
-        .as_ref()
-        .map(SigningKeyBytes::from_signing_key);
+    // Every send path requires a signing key. Fail closed when the key cannot
+    // be resolved rather than enqueueing a `None` the handler would only
+    // reject downstream.
+    let signing_key = resolved_signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Crypto {
+            message: "signing key required for send: could not resolve the sender's signing key \
+                      from retained custody"
+                .to_owned(),
+            code: codes::CRYPTO_4001.to_owned(),
+        })
+    })?;
+    // ADR-039: NAPI bridge sends under the human `#active` key today;
+    // per-message persona selection is out of scope for this runtime-pipeline
+    // wiring (FFI is mechanically widened only). Derive BOTH payload fields
+    // from a single `MessageSigner` so the stamped persona and the key bytes
+    // cannot diverge.
+    let signer = MessageSigner::Active(&signing_key);
+    let signing_key_bytes = SigningKeyBytes::from_signing_key(signer.key());
+    let signing_key_id = signer.signing_key_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = MessagingCommand::SendMessage {
         payload: Box::new(SendMessagePayload {
@@ -1151,11 +1168,8 @@ pub(crate) async fn context_send_on(
             params,
             sender_did: did,
             payload: payload.clone(),
-            signing_key: signing_key_bytes,
-            // ADR-039: NAPI bridge sends under the human `#active` key today;
-            // per-message persona selection is out of scope for this
-            // runtime-pipeline wiring (FFI is mechanically widened only).
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key: Some(signing_key_bytes),
+            signing_key_id,
             source_provenance: None,
             spending_ucan,
         }),

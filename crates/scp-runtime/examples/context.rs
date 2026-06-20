@@ -14,7 +14,7 @@ use std::sync::Arc;
 use scp_identity::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::{Capability, ContextMode, ContextParams, ContextState};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 
 mod support;
 
@@ -80,8 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &handle,
             &alice,
             b"Hello, context!",
-            Some(&alice_sk),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&alice_sk),
             None,
             None,
         )

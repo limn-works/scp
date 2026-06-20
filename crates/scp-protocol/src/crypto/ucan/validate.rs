@@ -697,16 +697,14 @@ fn enforce_ucan_category_a(
 ) -> Result<(), UcanError> {
     let kid_str = token.header.kid.as_deref().unwrap_or("#active");
 
-    // Parse kid to SigningKeyId. Only #active and #agent are valid UCAN signing
-    // keys. Unknown kid values are rejected fail-closed.
-    let signing_key_id = match kid_str {
-        "#active" => SigningKeyId::Active,
-        "#agent" => SigningKeyId::Agent,
-        _ => {
-            return Err(UcanError::MalformedToken(format!(
-                "unrecognized signing key ID (kid): {kid_str}"
-            )));
-        }
+    // Parse kid to SigningKeyId via the canonical fragment decoder. Only
+    // #active and #agent are valid UCAN signing keys; `from_fragment` returns
+    // `None` for anything else, which we reject fail-closed (identical behavior
+    // to the prior hand-rolled match).
+    let Some(signing_key_id) = SigningKeyId::from_fragment(kid_str) else {
+        return Err(UcanError::MalformedToken(format!(
+            "unrecognized signing key ID (kid): {kid_str}"
+        )));
     };
 
     if signing_key_id != SigningKeyId::Agent {

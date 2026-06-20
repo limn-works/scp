@@ -30,7 +30,7 @@ use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -225,8 +225,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
             &send_handle,
             &alice(),
             plaintext,
-            Some(&signing_key_for_did(&alice())),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&signing_key_for_did(&alice())),
             None,
             None,
         )

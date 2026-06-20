@@ -77,6 +77,7 @@ use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
 use crate::context::messaging_helpers::{build_encrypted_envelope, verify_and_unwrap};
+use crate::context::supervisor::MessageSigner;
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
 const ALICE_DID: &str = "did:dht:z6MkAgentBindingPipelineAliceAliceAliceA";
@@ -213,14 +214,21 @@ fn build_send_blob(
     );
     recipients.insert(BOB_DID.to_owned(), bob_access_key.clone());
 
+    // Pair the chosen persona with the signing key so the stamped
+    // `signing_key_id` and the key that signs come from one source — this is
+    // exactly the invariant the #agent-persona slice asserts.
+    let signer = match signing_key_id {
+        SigningKeyId::Active => MessageSigner::Active(signing_key),
+        SigningKeyId::Agent => MessageSigner::Agent(signing_key),
+    };
+
     build_encrypted_envelope(
         &clock,
         alice_provider,
         ctx_str,
         &sender,
         payload,
-        signing_key,
-        signing_key_id,
+        signer,
         &recipients,
         0,
         None,
@@ -445,7 +453,7 @@ mod live_supervisor_send {
     use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
     use crate::context::ContextHandle;
     use crate::context::builder::ContextTransportProvider;
-    use crate::context::supervisor::Supervisor;
+    use crate::context::supervisor::{MessageSigner, Supervisor};
     use crate::crypto::mls::provider::MlsCryptoProvider;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
@@ -706,18 +714,15 @@ mod live_supervisor_send {
             add_and_bootstrap_bob(&sup, &handle, ctx_id, &sent).await;
 
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
-        // is Alice's matching (#agent or #active) key.
-        sup.send_message(
-            &handle,
-            &DID::from(ALICE_DID),
-            payload,
-            Some(signing_key),
-            signing_key_id,
-            None,
-            None,
-        )
-        .await
-        .expect("Supervisor::send_message (public API) succeeds");
+        // is Alice's matching (#agent or #active) key. `MessageSigner` pairs the
+        // two so the stamped persona cannot disagree with the key that signs.
+        let signer = match signing_key_id {
+            SigningKeyId::Active => MessageSigner::Active(signing_key),
+            SigningKeyId::Agent => MessageSigner::Agent(signing_key),
+        };
+        sup.send_message(&handle, &DID::from(ALICE_DID), payload, signer, None, None)
+            .await
+            .expect("Supervisor::send_message (public API) succeeds");
 
         // Exactly one application ciphertext, addressed to Bob's pseudonym
         // (§9.10.4 — never the shared context routing id).

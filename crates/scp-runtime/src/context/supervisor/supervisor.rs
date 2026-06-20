@@ -393,6 +393,53 @@ pub struct PendingSagaProjection {
 }
 
 // ---------------------------------------------------------------------------
+// MessageSigner (ADR-039)
+// ---------------------------------------------------------------------------
+
+/// Pairs the signing key with its verification method so the persona stamped on
+/// the wire cannot disagree with the key that signed. Every send path requires a
+/// key, so this is non-optional.
+///
+/// ADR-039 — the inner envelope's `signing_key_id` (`#active` / `#agent`)
+/// selects which DID-document verification method the recipient resolves to
+/// check the signature. Carrying the key and its persona as two independent
+/// arguments let a caller stamp `#agent` while signing with the `#active` key
+/// (or vice versa), producing a message the recipient cannot verify. This enum
+/// binds the two together: [`Self::signing_key_id`] is derived from the same
+/// variant that carries the key, so the stamp and the key are one source of
+/// truth. The single stamp+sign site
+/// ([`build_encrypted_envelope`](crate::context::messaging_helpers::build_encrypted_envelope))
+/// takes the `MessageSigner` directly.
+#[derive(Clone, Copy)]
+pub enum MessageSigner<'a> {
+    /// Sign under the human `#active` verification method.
+    Active(&'a ed25519_dalek::SigningKey),
+    /// Sign under the autonomous `#agent` verification method (ADR-039).
+    Agent(&'a ed25519_dalek::SigningKey),
+}
+
+impl<'a> MessageSigner<'a> {
+    /// The Ed25519 signing key, regardless of persona.
+    #[must_use]
+    pub const fn key(&self) -> &'a ed25519_dalek::SigningKey {
+        match self {
+            Self::Active(k) | Self::Agent(k) => k,
+        }
+    }
+
+    /// The verification method (`#active` / `#agent`) this signer stamps —
+    /// derived from the same variant that carries the key, so the stamped
+    /// persona and the signing key can never disagree.
+    #[must_use]
+    pub const fn signing_key_id(&self) -> scp_protocol::identity::SigningKeyId {
+        match self {
+            Self::Active(_) => scp_protocol::identity::SigningKeyId::Active,
+            Self::Agent(_) => scp_protocol::identity::SigningKeyId::Agent,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor
 // ---------------------------------------------------------------------------
 
@@ -6687,16 +6734,15 @@ impl Supervisor {
     /// Encrypts and broadcasts a payload through the context's MLS
     /// group via the actor mailbox.
     ///
-    /// `signing_key_id` selects which verification method the message is
-    /// signed under (ADR-039): [`SigningKeyId::Active`] for human-originated
-    /// sends, [`SigningKeyId::Agent`] for agent-autonomous sends. It is
-    /// stamped into the inner envelope's `signing_key_id` so the recipient
-    /// resolves the matching public key (`#active` / `#agent`) from the
-    /// sender's DID document, and MUST agree with the key material in
-    /// `signing_key`.
-    ///
-    /// [`SigningKeyId::Active`]: scp_protocol::identity::SigningKeyId::Active
-    /// [`SigningKeyId::Agent`]: scp_protocol::identity::SigningKeyId::Agent
+    /// `signer` ([`MessageSigner`]) pairs the Ed25519 signing key with the
+    /// verification method it is signed under (ADR-039):
+    /// [`MessageSigner::Active`] for human-originated sends,
+    /// [`MessageSigner::Agent`] for agent-autonomous sends. The persona is
+    /// stamped into the inner envelope's `signing_key_id` from the same enum
+    /// variant that carries the key, so the recipient resolves the matching
+    /// public key (`#active` / `#agent`) from the sender's DID document and the
+    /// stamp can never disagree with the key that signed. Every send path
+    /// requires a key, so the signer is non-optional.
     ///
     /// Phase 2A finalization — every per-context method on `Supervisor`
     /// builds a typed `ContextCommand` carrying an embedded reply
@@ -6717,26 +6763,31 @@ impl Supervisor {
     /// - [`ContextError::TransportFailed`] if the mailbox reply channel
     ///   is dropped before the handler completes (handler crash /
     ///   actor shutdown).
-    #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
         handle: &crate::context::ContextHandle,
         sender_did: &DID,
         payload: &[u8],
-        signing_key: Option<&ed25519_dalek::SigningKey>,
-        signing_key_id: scp_protocol::identity::SigningKeyId,
+        signer: MessageSigner<'_>,
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Single construction point: both `signing_key` and `signing_key_id`
+        // are derived from the one `MessageSigner` so the persona stamped on the
+        // wire cannot diverge from the key that signs (ADR-039). The owned
+        // payload keeps two fields to cross the actor mailbox, but they are set
+        // together here — there is no cross-crate seam to set them
+        // inconsistently.
         let payload_box = Box::new(crate::context::actor::commands::SendMessagePayload {
             context_id: handle.context_id().to_owned(),
             params: handle.params().clone(),
             sender_did: sender_did.clone(),
             payload: payload.to_vec(),
-            signing_key: signing_key
-                .map(crate::context::actor::commands::SigningKeyBytes::from_signing_key),
-            signing_key_id,
+            signing_key: Some(
+                crate::context::actor::commands::SigningKeyBytes::from_signing_key(signer.key()),
+            ),
+            signing_key_id: signer.signing_key_id(),
             source_provenance: source_provenance.cloned(),
             spending_ucan: spending_ucan.cloned(),
         });

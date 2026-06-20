@@ -1219,8 +1219,7 @@ async fn application_layer_demo() {
             &handle,
             &alice,
             msg1,
-            Some(&alice_sk),
-            SigningKeyId::Active,
+            scp_core::context::supervisor::MessageSigner::Active(&alice_sk),
             None,
             None,
         )
@@ -1234,8 +1233,7 @@ async fn application_layer_demo() {
             &handle,
             &bob,
             msg2,
-            Some(&bob_sk),
-            SigningKeyId::Active,
+            scp_core::context::supervisor::MessageSigner::Active(&bob_sk),
             None,
             None,
         )
@@ -1249,8 +1247,7 @@ async fn application_layer_demo() {
             &handle,
             &charlie,
             msg3,
-            Some(&charlie_sk),
-            SigningKeyId::Active,
+            scp_core::context::supervisor::MessageSigner::Active(&charlie_sk),
             None,
             None,
         )

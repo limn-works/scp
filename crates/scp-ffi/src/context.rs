@@ -2632,12 +2632,12 @@ impl crate::scp::PyScp {
                     &temp_handle,
                     &sender_did,
                     &payload_bytes,
-                    Some(&signing_key),
                     // ADR-039: the PyO3 bridge sends under the human `#active`
                     // key today; per-message persona selection is out of scope
                     // for this runtime-pipeline wiring (FFI is mechanically
-                    // widened only).
-                    scp_identity::SigningKeyId::Active,
+                    // widened only). `MessageSigner` pairs key + persona so they
+                    // cannot diverge.
+                    scp_core::context::supervisor::MessageSigner::Active(&signing_key),
                     None,
                     spending_ucan.as_ref(),
                 )

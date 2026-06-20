@@ -16,7 +16,7 @@ use scp_identity::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::KeyPackage;
 use scp_protocol::context::{Capability, ContextMode, ContextParams};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 
 mod support;
 
@@ -82,8 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &handle,
             &alice,
             b"Hello Bob!",
-            Some(&alice_sk),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&alice_sk),
             None,
             None,
         )
@@ -97,8 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &handle,
             &bob,
             b"Hi Alice!",
-            Some(&bob_sk),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&bob_sk),
             None,
             None,
         )

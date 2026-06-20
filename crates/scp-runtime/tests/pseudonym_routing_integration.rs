@@ -39,7 +39,7 @@ use scp_protocol::context::params::{
 };
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 const ALICE: &str = "did:dht:z6MkAlice";
@@ -237,8 +237,7 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
             &handle,
             &alice(),
             b"hello",
-            Some(&sk_alice),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&sk_alice),
             None,
             None,
         )
@@ -300,8 +299,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello",
-            Some(&sk_alice),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&sk_alice),
             None,
             None,
         )
@@ -328,8 +326,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello-again",
-            Some(&sk_alice),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&sk_alice),
             None,
             None,
         )
@@ -372,8 +369,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-nobody",
-            Some(&sk_alice),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&sk_alice),
             None,
             None,
         )
@@ -431,8 +427,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-bob",
-            Some(&sk_alice),
-            scp_identity::SigningKeyId::Active,
+            MessageSigner::Active(&sk_alice),
             None,
             None,
         )
