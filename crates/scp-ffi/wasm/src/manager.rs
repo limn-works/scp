@@ -4653,23 +4653,25 @@ impl WasmContextManager {
 
     /// Handles a broadcast key request.
     ///
-    /// Validates that the requester is a non-blocked subscriber (or author) and
-    /// returns a grant/deny decision. In the WASM bridge, key material is managed
-    /// by `WebCrypto` — the grant decision carries no actual key bytes.
+    /// Validates that the requester is a non-blocked subscriber (or author) and,
+    /// on grant, HPKE-seals the author's current broadcast key to the
+    /// requester's X25519 `wrapping_pubkey` (§5.14.2). Returns `Some(json)` (a
+    /// serialized `SealedBroadcastKey`) on grant, or `None` on deny (§5.14.8 —
+    /// the author returns no key material to a denied requester). The raw
+    /// broadcast key never crosses the JS boundary — only the sealed material.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active or not a broadcast context.
+    /// Returns an error if the context is not active, not a broadcast context,
+    /// or if sealed-key serialization fails.
     pub fn handle_broadcast_key_request(
         &self,
         context_id: &str,
         author_did: &str,
         requester_did: &str,
-    ) -> Result<String, ScpWasmError> {
-        use scp_protocol::context::broadcast::KeyRequestDecision;
-
-        // Use a uniform deny reason to prevent information leakage (§5.14.8).
-        const DENY_REASON: &str = "key request denied";
+        wrapping_pubkey: &[u8; 32],
+    ) -> Result<Option<String>, ScpWasmError> {
+        use scp_protocol::context::broadcast::{KeyRequestDecision, SealedBroadcastKey};
 
         let ctx = self
             .contexts
@@ -4687,15 +4689,36 @@ impl WasmContextManager {
                 code: codes::CTX_2001.to_owned(),
             })?;
 
+        // No local-DID-ownership guard here (unlike native
+        // `broadcast_helpers::handle_broadcast_key_request`, which rejects when
+        // `author_did` is not in the Supervisor's `local_dids` set). WASM is
+        // single-tenant in-process: there is no Supervisor, no `ActorDeps`, and
+        // no cross-instance `local_dids` registry — author authority is held by
+        // the JS caller that owns the identity and drives this manager directly.
+        // This mirrors the other author-side WASM broadcast ops
+        // (`publish_broadcast`, `block_subscriber`), which likewise gate only on
+        // broadcast-context authorship (`bc.is_author` / the protocol decision
+        // function below) and not on a locally-controlled-DID registry.
+        //
         // Delegate to BroadcastContext::handle_key_request which implements
-        // the full §5.14.8 decision logic (author check, block list, subscriber).
-        match bc.handle_key_request(author_did, requester_did) {
-            KeyRequestDecision::Grant { .. } => {
-                Ok(serde_json::json!({ "decision": "grant" }).to_string())
+        // the full §5.14.8 decision logic (author check, block list, subscriber)
+        // and seals the broadcast key to `wrapping_pubkey` on grant.
+        match bc.handle_key_request(author_did, requester_did, wrapping_pubkey) {
+            KeyRequestDecision::Grant { enc, ct, epoch } => {
+                let sealed = SealedBroadcastKey {
+                    enc,
+                    ct,
+                    epoch,
+                    author_did: author_did.to_owned(),
+                    context_id: context_id.to_owned(),
+                };
+                let json = serde_json::to_string(&sealed).map_err(|e| ScpWasmError::Context {
+                    message: format!("serialize sealed broadcast key: {e}"),
+                    code: codes::CTX_2023.to_owned(),
+                })?;
+                Ok(Some(json))
             }
-            KeyRequestDecision::Deny { .. } => {
-                Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string())
-            }
+            KeyRequestDecision::Deny { .. } => Ok(None),
         }
     }
 

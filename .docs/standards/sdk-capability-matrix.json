@@ -506,6 +506,14 @@
           "swift": true
         },
         {
+          "name": "broadcast_open_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "WASM coverage is satisfied via the TypeScript SDK's WASM backend path (the broadcast_open_key wasm export); the matrix tracks the four language SDKs, and the TypeScript SDK covers both the NAPI and WASM bridges."
+        },
+        {
           "name": "validate_broadcast_key",
           "python": true,
           "typescript": true,

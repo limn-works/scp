@@ -38,6 +38,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, test } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +56,22 @@ import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
+
+/**
+ * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
+ * broadcast key-distribution tests. Uses Node/Bun's WebCrypto-backed
+ * `generateKeyPairSync('x25519')` and extracts the raw scalars from the JWK
+ * `d` (private) and `x` (public) base64url fields — no third-party dependency.
+ */
+function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } {
+  const { publicKey: pub, privateKey: priv } = generateKeyPairSync("x25519");
+  const pubJwk = pub.export({ format: "jwk" }) as { x: string };
+  const privJwk = priv.export({ format: "jwk" }) as { d: string };
+  return {
+    publicKey: new Uint8Array(Buffer.from(pubJwk.x, "base64url")),
+    secret: new Uint8Array(Buffer.from(privJwk.d, "base64url")),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // 1. EconomicPolicy schema validation (§19.3, ADR-034)
@@ -1464,17 +1481,36 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(true);
     });
 
-    it("scp.broadcastHandleKeyRequest returns a decision string", async () => {
+    it("scp.broadcastHandleKeyRequest grants and scp.broadcastOpenKey opens the key", async () => {
       const { ctx, identity } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      const decision = await scp.broadcastHandleKeyRequest(
+      const { secret, publicKey } = generateX25519KeyPair();
+      const sealedJson = await scp.broadcastHandleKeyRequest(
         ctx._rawHandle,
         identity.did,
         subscriber.did,
+        publicKey,
       );
-      expect(typeof decision).toBe("string");
-      expect(decision.length).toBeGreaterThan(0);
+      expect(sealedJson).not.toBeNull();
+      expect(typeof sealedJson).toBe("string");
+      expect((sealedJson as string).length).toBeGreaterThan(0);
+      // Subscriber opens the sealed key with the matching X25519 secret.
+      const key = await scp.broadcastOpenKey(sealedJson as string, secret);
+      expect(key.length).toBe(32);
+    });
+
+    it("scp.broadcastHandleKeyRequest returns null for a non-subscriber", async () => {
+      const { ctx, identity } = await makeBroadcast();
+      const stranger = await scp.identityCreate("in_memory");
+      const { publicKey } = generateX25519KeyPair();
+      const decision = await scp.broadcastHandleKeyRequest(
+        ctx._rawHandle,
+        identity.did,
+        stranger.did,
+        publicKey,
+      );
+      expect(decision).toBeNull();
     });
 
     it("scp.contextBroadcastAdmission returns a policy for a broadcast context", async () => {

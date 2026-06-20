@@ -2255,6 +2255,23 @@
       ]
     },
     {
+      "canonical": "broadcast_open_key",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_open_key"
+      ],
+      "uniffi": [
+        "broadcast_open_key"
+      ],
+      "napi": [
+        "broadcast_open_key"
+      ],
+      "wasm": [
+        "broadcast_open_key"
+      ]
+    },
+    {
       "canonical": "broadcast_unblock",
       "category": "broadcast",
       "wasm_required": true,

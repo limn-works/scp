@@ -676,7 +676,8 @@ interface BroadcastBindings {
         contextHandle: Long,
         authorDid: String,
         requesterDid: String,
-    ): String
+        wrappingPubkey: ByteArray,
+    ): String?
 
     /**
      * Returns the number of active broadcast subscribers for a context.
@@ -2384,9 +2385,10 @@ class BroadcastBridgeOps internal constructor(
         contextHandle: Long,
         authorDid: String,
         requesterDid: String,
-    ): String =
+        wrappingPubkey: ByteArray,
+    ): String? =
         bridge.ffiCall {
-            bindings.broadcastHandleKeyRequest(contextHandle, authorDid, requesterDid)
+            bindings.broadcastHandleKeyRequest(contextHandle, authorDid, requesterDid, wrappingPubkey)
         }
 
     /**

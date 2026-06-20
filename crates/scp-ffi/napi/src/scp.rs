@@ -2389,19 +2389,26 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `broadcast_handle_key_request`.
+    ///
+    /// `wrapping_pubkey` is the requester's 32-byte X25519 public key; the
+    /// broadcast key is HPKE-sealed to it inside the protocol layer (§5.14.2).
+    /// Returns `Some(json)` (a serialized `SealedBroadcastKey`) on grant or
+    /// `None` on deny.
     #[napi(js_name = "broadcastHandleKeyRequest")]
     pub async fn broadcast_handle_key_request(
         &self,
         handle: &NapiContextHandle,
         author_did: String,
         requester_did: String,
-    ) -> napi::Result<String> {
+        wrapping_pubkey: Vec<u8>,
+    ) -> napi::Result<Option<String>> {
         crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_handle_key_request_on(
             &self.inner,
             handle,
             author_did,
             requester_did,
+            wrapping_pubkey,
         )
         .await
     }

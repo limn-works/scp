@@ -1656,6 +1656,10 @@ pub enum BroadcastCommand {
         author_did: scp_identity::DID,
         /// Requester DID.
         requester_did: scp_identity::DID,
+        /// Requester's X25519 wrapping public key. The broadcast key is
+        /// HPKE-sealed to this key inside the protocol handler (§5.14.2) — the
+        /// raw key never leaves the protocol layer.
+        wrapping_pubkey: [u8; 32],
         /// Oneshot reply channel. See
         /// [`HandleBroadcastKeyRequestReply`].
         reply: HandleBroadcastKeyRequestReply,
