@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn structural_events_classified_correctly() {
-        // The full closed `EventType` taxonomy (75 variants) paired with its
+        // The full closed `EventType` taxonomy (77 variants) paired with its
         // EXPECTED structural/operational classification. `true` = structural
         // (retained longer per ADR-030 §2c); `false` = operational. This pins
         // the CORRECT decision for every variant — not merely that a decision

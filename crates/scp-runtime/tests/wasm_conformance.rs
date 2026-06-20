@@ -1472,7 +1472,7 @@ fn provenance_hash_conformance_registry_with_payment() {
 }
 
 // ===========================================================================
-// Canonical event-type tag contract (closed 75-variant injection)
+// Canonical event-type tag contract (closed 77-variant injection)
 //
 // `event_type_tag` (`scp_event_log::tree`) is a protocol constant used in two
 // places: (a) the NATIVE signed-event canonical hash —

@@ -98,8 +98,9 @@ pub trait EventLogSigner: Send + Sync {
 /// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
-/// and app-sandbox-binding variants; the ADR-011 Amendment §6 cross-context-saga
-/// carve-out added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
+/// and app-sandbox-binding variants; the cross-context-saga event model
+/// (ADR-011 Amendment §6 for `CrossContextToolInvoked`; spec §6.2.4 for
+/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
