@@ -17,8 +17,8 @@
 //! non-convergent: every new way to alias a `&mut PerContextState`
 //! (extern-fn, `&mut`-alias, ref-mut-destructure, autoref-method) is a fresh
 //! evasion, and the gate must grow a new pattern to catch each one. The goal of
-//! the refactor this file begins is to make the invariant a **compile error** to
-//! violate, retiring the scanner.
+//! the refactor this file is part of is to make the invariant a **compile error**
+//! to violate, retiring the scanner.
 //!
 //! # The mechanism
 //!
@@ -30,37 +30,288 @@
 //!   the compile-time hook — a future migration step privatizes the fields so the
 //!   ONLY way to mutate Class-S state is through the combinators below, each of
 //!   which performs the fail-closed persist by construction.
-//! - **Mutation through a combinator** — [`ClassSCell::commit_class_s`] (with
-//!   rollback), [`ClassSCell::commit_class_s_no_rollback`], and
-//!   [`ClassSCell::commit_best_effort`]. The first two perform the fail-closed
-//!   persist; the third performs the best-effort persist (Class C).
+//! - **Mutation through a combinator** — every combinator hands `f` a *view*
+//!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
+//!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
+//!   The view chooses which slice of the state `f` can reach `&mut`. The
+//!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
+//!   [`commit_class_s_restore`](ClassSCell::commit_class_s_restore),
+//!   [`commit_class_s_compensating`](ClassSCell::commit_class_s_compensating),
+//!   [`commit_class_s_then_append`](ClassSCell::commit_class_s_then_append))
+//!   perform the fail-closed persist; [`commit_best_effort`](ClassSCell::commit_best_effort)
+//!   performs the best-effort persist (Class C).
 //!
-//! # PR1 scope — pure scaffolding, no behaviour change
+//! # View-typed combinators (this PR)
 //!
-//! This is step 1. The combinators exist and are unit-tested, but **no handler is
-//! migrated to them yet** and the [`PerContextState`] fields stay public. To keep
-//! every existing handler compiling unchanged, [`ClassSCell`] carries a
-//! **temporary** escape hatch, [`ClassSCell::state_mut`], that hands out the bare
-//! `&mut PerContextState` exactly as the actor owned it before. The source-text
-//! gate is UNCHANGED and still passes — because the handler bodies it scans are
-//! byte-for-byte identical (they receive `&mut PerContextState` via `state_mut`).
-//! The escape hatch is removed in the final migration step once every handler
-//! routes its mutations through the combinators.
+//! The combinators no longer take a caller-supplied `R: FnOnce(&mut …)` rollback
+//! closure. Instead the rollback strategy is encoded in the combinator NAME and
+//! implemented against the PR2a [`ClassSState`] / [`GovernanceClassS`] mirror
+//! (their `snapshot` / `restore` methods) — so the combinator, not the caller,
+//! owns the (correct, total) undo of the Class-S sub-structs. This removes the
+//! foot-gun where a caller could write a rollback that undoes the wrong field.
+//!
+//! - `*_keep` — persist fail-closed; on persist failure the in-memory mutation
+//!   STAYS (fail-closed direction: e.g. recording an accepted replay nonce that
+//!   must not be un-recorded).
+//! - `*_restore` — snapshot the Class-S sub-structs before `f`; on persist
+//!   failure restore them (rolling the mutation back), then return the error.
+//! - `*_compensating` — like `*_restore`, but after the in-state restore it runs
+//!   an async compensation for an EXTERNAL effect the mutation produced
+//!   (e.g. void an escrow).
+//! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
+//!   step (e.g. append a log record); if `after` fails, restore the snapshot and
+//!   RE-PERSIST, returning [`AppendOutcomeError`] so the caller learns whether
+//!   in-memory state was mutated.
+//!
+//! # Behaviour-neutral scaffolding
+//!
+//! No handler is migrated to these combinators yet (handlers still mutate through
+//! the temporary [`ClassSCell::state_mut`] escape hatch + nested field paths), so
+//! the combinators are `#[allow(dead_code)]` and exercised only by this module's
+//! unit tests. The source-text gate is UNCHANGED and still passes — the view
+//! `*_mut()` accessors return `&mut` to the sub-structs and carry no Class-S
+//! mutation MARKER tokens, and the combinators take closures (any marker appears
+//! in the caller's closure, where the later migration will route it through the
+//! persist-on-commit boundary). The escape hatch and these allows are removed in
+//! the final migration step.
 
 use std::ops::Deref;
 
 use super::deps::ActorDeps;
-use super::state::PerContextState;
+use super::state::{ClassSState, PerContextState};
 use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
+use crate::context::state::{GovernanceClassS, GovernanceState};
 use scp_protocol::context::ContextError;
+use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
+use scp_protocol::context::roles::ContextRoleState;
+
+/// Mutable view over a [`PerContextState`] that EXPOSES the Class-S sub-structs.
+///
+/// Handed to the Class-S-capable combinators
+/// ([`ClassSCell::commit_class_s_keep`] / `_restore` / `_compensating` /
+/// `_then_append`). Through it `f` can reach `&mut` to the actor's Class-S
+/// sub-structs ([`ClassSState`] via [`Self::class_s_mut`],
+/// [`GovernanceClassS`] via [`Self::governance_class_s_mut`]) as well as the
+/// rest of [`PerContextState`] (reads via [`Deref`], targeted `&mut` via the
+/// explicit accessors). The combinator that hands out the view owns the
+/// fail-closed persist, so any Class-S mutation `f` makes through this view is
+/// persisted (or rolled back) by construction.
+///
+/// # Token extension point (PR3)
+///
+/// A later PR threads a `ClassSCommitToken` through this view (issued by the
+/// combinator, consumed by the privatized Class-S mutators) so that the ONLY way
+/// to call a Class-S mutator is from inside a combinator that performs the
+/// persist. The token field is intentionally NOT added yet — this view keeps the
+/// same shape so the migration is additive. See the module docs.
+pub(crate) struct ClassSMut<'a> {
+    /// The borrowed actor state. Private so the only mutable reach into Class-S
+    /// is through [`Self::class_s_mut`] / [`Self::governance_class_s_mut`].
+    state: &'a mut PerContextState,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 scaffolding: the view accessors (`class_s_mut`, `governance_class_s_mut`, `rest_mut`) get their first PRODUCTION callers when handlers migrate onto the combinators. Exercised by this module's unit tests now."
+)]
+impl<'a> ClassSMut<'a> {
+    /// Wrap a borrowed [`PerContextState`]. Crate-internal: only the combinators
+    /// construct a view.
+    const fn new(state: &'a mut PerContextState) -> Self {
+        Self { state }
+    }
+
+    /// `&mut` access to the actor's Class-S sub-struct ([`ClassSState`]):
+    /// `saga_pending`, the B-owned `xctx_nonce_dedup`, and the three
+    /// committed/reservation witnesses (ADR-049 §9). Mutating these is the
+    /// fail-closed-persisted Class-S transition the owning combinator guards.
+    pub(crate) const fn class_s_mut(&mut self) -> &mut ClassSState {
+        &mut self.state.class_s
+    }
+
+    /// `&mut` access to the governance Class-S sub-struct ([`GovernanceClassS`]):
+    /// `executed_proposals`, `threshold_signers`, `threshold_value`, and the
+    /// `spending_nonce_tracker` (ADR-049 §9). Reached through the `governance`
+    /// field; the owning combinator persists fail-closed.
+    pub(crate) const fn governance_class_s_mut(&mut self) -> &mut GovernanceClassS {
+        &mut self.state.governance.class_s
+    }
+
+    /// `&mut` access to the rest of [`PerContextState`] (the NON-Class-S
+    /// portion). The Class-S sub-structs are still reachable through this bare
+    /// `&mut` while their fields stay `pub(crate)` this PR — the field-privatizing
+    /// PR is what makes [`Self::class_s_mut`] / [`Self::governance_class_s_mut`]
+    /// the *only* path. Until then this accessor exists so a migrated handler can
+    /// mutate the structural / Class-C portion of the state from inside a Class-S
+    /// combinator without a second borrow.
+    pub(crate) const fn rest_mut(&mut self) -> &mut PerContextState {
+        self.state
+    }
+}
+
+impl Deref for ClassSMut<'_> {
+    type Target = PerContextState;
+
+    /// Immutable reads of the whole state.
+    fn deref(&self) -> &PerContextState {
+        self.state
+    }
+}
+
+/// RESTRICTED mutable view over a [`PerContextState`] that exposes ONLY the
+/// Class-C / structural portion — there is **no** `class_s_mut` /
+/// `governance_class_s_mut` here.
+///
+/// Handed to [`ClassSCell::commit_best_effort`] (Class-C, best-effort persist)
+/// and to the async compensation closure of
+/// [`ClassSCell::commit_class_s_compensating`]. The compensation runs AFTER the
+/// Class-S in-state restore, so it must not be able to re-touch Class-S state —
+/// hence the restricted view.
+///
+/// # Class-S fields are still reachable this PR (by design)
+///
+/// The Class-S sub-struct fields (`class_s`, `governance.class_s`) are still
+/// `pub(crate)` this PR, so a determined caller could still name
+/// `view.rest().class_s` through the read [`Deref`] — but this view exposes NO
+/// `&mut` path that reaches them: [`Self::governance_mut`] returns
+/// `&mut GovernanceState` whose `class_s` field is `pub(crate)` and therefore
+/// nameable, but the LATER field-privatization PR makes `GovernanceState.class_s`
+/// unreachable from outside its module, at which point this view is airtight.
+/// The API surface is shaped now so that privatization is purely a visibility
+/// change with no view-API change.
+///
+/// # Disjoint-borrow support (`ConsequenceStateSplit`)
+///
+/// [`crate::context::governance_logic::ConsequenceStateSplit`] needs FIVE
+/// simultaneous disjoint borrows of distinct [`PerContextState`] fields
+/// (`&mut governance`, `&mut role_state`, `&membership`, `&mut receive_buffer`,
+/// `&mut checkpoint_events_since`). A single `&mut PerContextState` cannot be
+/// reborrowed five ways through method calls (each `&mut self` method borrows the
+/// WHOLE state), so [`Self::split_class_c`] destructures the underlying `&mut`
+/// ONCE into independent field references the borrow checker accepts in parallel.
+pub(crate) struct ClassCMut<'a> {
+    /// The borrowed actor state. Private; mutated only through the field
+    /// accessors / [`Self::split_class_c`], none of which reach Class-S.
+    state: &'a mut PerContextState,
+}
+
+/// Independent disjoint `&mut`/`&` borrows of the Class-C / structural fields of
+/// a [`PerContextState`], produced by [`ClassCMut::split_class_c`].
+///
+/// Each field is borrowed from a DISTINCT field of the underlying state, so the
+/// borrow checker accepts holding all of them at once — this is exactly the
+/// shape [`crate::context::governance_logic::ConsequenceStateSplit`] needs. The
+/// migration of `ConsequenceStateSplit` onto this is a LATER PR; this struct
+/// only makes the view CAPABLE of producing the borrows.
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 scaffolding: constructed by `ClassCMut::split_class_c`, whose first PRODUCTION caller is the `ConsequenceStateSplit` migration. Exercised by this module's unit test now."
+)]
+pub(crate) struct ClassCSplit<'a> {
+    /// `&mut` governance bucket. Note: its `class_s` sub-field is Class-S; the
+    /// consequence path does not touch it, and the later privatization makes it
+    /// unreachable from outside the governance module.
+    pub(crate) governance: &'a mut GovernanceState,
+    /// `&mut` role / ceiling / assignment state.
+    pub(crate) role_state: &'a mut ContextRoleState,
+    /// `&` membership (read-only in the consequence path).
+    pub(crate) membership: &'a MembershipState,
+    /// `&mut` receive buffer (consequence events are emitted here).
+    pub(crate) receive_buffer: &'a mut ReceiveBuffer,
+    /// `&mut` checkpoint counter (bumped by consequence enforcement).
+    pub(crate) checkpoint_events_since: &'a mut u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 scaffolding: the Class-C view accessors (`rest_mut`, `governance_mut`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+)]
+impl<'a> ClassCMut<'a> {
+    /// Wrap a borrowed [`PerContextState`]. Crate-internal: only the combinators
+    /// construct a view.
+    const fn new(state: &'a mut PerContextState) -> Self {
+        Self { state }
+    }
+
+    /// `&mut` access to the structural / Class-C portion of the state.
+    ///
+    /// Returns the whole `&mut PerContextState` (the Class-C combinator's `f`
+    /// mutates liveness / structural fields). This does NOT expose a Class-S
+    /// MUTATOR accessor — there is no `class_s_mut` on this view — so a Class-C
+    /// `f` has no view-API path that signals a Class-S transition. (The fields
+    /// themselves are privatized in a later PR.)
+    pub(crate) const fn rest_mut(&mut self) -> &mut PerContextState {
+        self.state
+    }
+
+    /// `&mut` access to the governance bucket (Class-C governance fields:
+    /// proposals, economic policy, velocity, cooldowns, …). Deliberately exposes
+    /// no Class-S accessor; the governance `class_s` sub-field is out of the
+    /// Class-C contract.
+    pub(crate) const fn governance_mut(&mut self) -> &mut GovernanceState {
+        &mut self.state.governance
+    }
+
+    /// Destructure into independent disjoint borrows of the Class-C structural
+    /// fields, for the [`crate::context::governance_logic::ConsequenceStateSplit`]
+    /// pattern. Borrows five DISTINCT fields of the underlying state so all five
+    /// references are live simultaneously (a single `&mut self` reborrow cannot
+    /// do this). None of the borrowed fields is Class-S.
+    pub(crate) const fn split_class_c(&mut self) -> ClassCSplit<'_> {
+        ClassCSplit {
+            governance: &mut self.state.governance,
+            role_state: &mut self.state.role_state,
+            membership: &self.state.membership,
+            receive_buffer: &mut self.state.receive_buffer,
+            checkpoint_events_since: &mut self.state.checkpoint_events_since,
+        }
+    }
+}
+
+impl Deref for ClassCMut<'_> {
+    type Target = PerContextState;
+
+    /// Immutable reads of the whole state.
+    fn deref(&self) -> &PerContextState {
+        self.state
+    }
+}
+
+/// Outcome of a [`ClassSCell::commit_class_s_then_append`] whose post-persist
+/// `after` step failed.
+///
+/// The Class-S mutation `f` made was persisted fail-closed (it durably landed)
+/// before `after` ran. When `after` then fails, the combinator restores the
+/// pre-`f` snapshot and RE-PERSISTS, so durable state matches the in-memory
+/// rollback. `mutated` records whether the *in-memory* state was changed away
+/// from the pre-`f` value at the moment the error is returned — the caller uses
+/// it to decide whether any caller-side bookkeeping (events already emitted, a
+/// reservation already echoed) needs unwinding.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9: returned only by `commit_class_s_then_append`, which has no production caller until the handler-migration PR. Exercised by this module's unit tests."
+)]
+pub(crate) struct AppendOutcomeError {
+    /// Whether the in-memory Class-S state was left mutated relative to the
+    /// pre-`f` snapshot when the error was raised. After a successful
+    /// restore+re-persist this is `false` (state matches pre-`f`); if the
+    /// restore's RE-PERSIST itself fails it is `true` (the rollback could not be
+    /// made durable, so in-memory and durable state may diverge — a hard fault
+    /// the caller must surface).
+    pub(crate) mutated: bool,
+    /// The error that terminated the operation (the `after` error, or the
+    /// re-persist error if the rollback could not be made durable).
+    pub(crate) err: ContextError,
+}
 
 /// Owns one [`PerContextState`] and gates every mutation behind a
 /// persistence combinator (ADR-049 §9 Class S).
 ///
 /// Reads go through [`Deref`]; there is intentionally no [`DerefMut`] (see the
-/// module docs). Mutations go through [`Self::commit_class_s`] /
-/// [`Self::commit_class_s_no_rollback`] (fail-closed persist) or
-/// [`Self::commit_best_effort`] (best-effort persist).
+/// module docs). Mutations go through the view-typed combinators
+/// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` / `_then_append`
+/// for fail-closed persist, [`Self::commit_best_effort`] for best-effort).
 pub(crate) struct ClassSCell {
     /// The wrapped state. Private — the only mutable access is through the
     /// combinators (or the PR1-temporary [`Self::state_mut`] escape hatch).
@@ -88,127 +339,279 @@ impl ClassSCell {
     /// hand-off boundaries (e.g. draining state out of the actor on shutdown /
     /// replace).
     ///
-    /// `dead_code` allow: PR1 is pure scaffolding — the first production caller
-    /// is the migration step that routes a state hand-off through the cell. The
-    /// method is exercised by this module's unit tests today.
+    /// `dead_code` allow: pure scaffolding — the first production caller is the
+    /// migration step that routes a state hand-off through the cell. The method
+    /// is exercised by this module's unit tests today.
     #[allow(dead_code)]
     pub(crate) fn into_inner(self) -> PerContextState {
         self.state
     }
 
-    /// **TEMPORARY — PR1 ONLY. Removed in the final migration step.**
+    /// **TEMPORARY — removed in the final migration step.**
     ///
     /// Hands out the bare `&mut PerContextState` so existing handlers keep
     /// working byte-for-byte unchanged while the combinators are introduced.
-    /// Once every handler routes its mutations through [`Self::commit_class_s`]
-    /// / [`Self::commit_best_effort`] and the [`PerContextState`] Class-S fields
-    /// are privatized, this method is deleted — at which point the only path to
-    /// a `&mut PerContextState` is through the persist-on-commit combinators,
-    /// making the Class-S fail-closed invariant a compile error to violate.
+    /// Once every handler routes its mutations through the combinators and the
+    /// [`PerContextState`] Class-S fields are privatized, this method is deleted —
+    /// at which point the only path to a `&mut PerContextState` is through the
+    /// persist-on-commit combinators, making the Class-S fail-closed invariant a
+    /// compile error to violate.
     pub(in crate::context) const fn state_mut(&mut self) -> &mut PerContextState {
         &mut self.state
     }
 
-    /// Mutate Class-S state and persist **fail-closed**, with rollback (ADR-049
-    /// §9). This is the actor-owned equivalent of the established
-    /// "mutate → [`persist_state_fail_closed`] → on-err undo" idiom (see
-    /// `handlers/saga.rs::prepare_b`).
+    /// Mutate Class-S state through a [`ClassSMut`] view and persist
+    /// **fail-closed**, KEEPING the mutation even if the persist fails
+    /// (ADR-049 §9).
     ///
-    /// `f` mutates the state and returns `Ok((value, rollback))`, where
-    /// `rollback` is a closure that undoes exactly the staged mutation. The
-    /// sequence is:
+    /// For fail-closed-direction mutations whose in-memory effect must STAY even
+    /// when the persist fails — e.g. recording an accepted replay nonce:
+    /// un-recording it would re-open the replay window the dedup cache exists to
+    /// close, so the durable-divergence is reported (the persist error
+    /// propagates) but the mutation is retained.
     ///
-    /// 1. Run `f(&mut state)`.
-    ///    - If `f` returns `Err(e)`, return `Err(e)` immediately. No persist runs
-    ///      (a rejected operation that made no durable-relevant mutation must not
-    ///      trigger a Class-S write).
-    /// 2. On `Ok((value, rollback))`, call [`persist_state_fail_closed`].
-    ///    - On persist **success**, return `Ok(value)`.
-    ///    - On persist **failure**, run `rollback(&mut state)` to undo the staged
-    ///      mutation, then return the persist error — so a caller NEVER observes
-    ///      success for a mutation that did not durably land.
-    ///
-    /// The caller decides what `rollback` undoes; the combinator only guarantees
-    /// it runs exactly when (and only when) the fail-closed persist fails.
+    /// Sequence:
+    /// 1. Run `f(view)`. If `f` returns `Err(e)`, return `Err(e)` immediately —
+    ///    no persist runs (a rejected operation that staged no durable-relevant
+    ///    mutation must not trigger a Class-S write).
+    /// 2. On `Ok(value)`, call [`persist_state_fail_closed`]. On success return
+    ///    `Ok(value)`; on failure return the persist error WITHOUT undoing the
+    ///    mutation.
     ///
     /// # Errors
     ///
-    /// Returns the error from `f`, or [`ContextError::PersistenceFailed`] from
-    /// [`persist_state_fail_closed`] (after running `rollback`).
+    /// Returns `f`'s error, or [`ContextError::PersistenceFailed`].
     ///
-    /// `dead_code` allow: PR1 is pure scaffolding — no handler is migrated to
-    /// the combinator yet. Exercised by this module's unit tests; the first
-    /// production caller lands with the handler migration step.
+    /// `dead_code` allow: scaffolding — no handler is migrated yet. Exercised by
+    /// this module's unit tests.
     #[allow(dead_code)]
-    pub(crate) fn commit_class_s<T, R>(
+    pub(crate) fn commit_class_s_keep<T>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
-        f: impl FnOnce(&mut PerContextState) -> Result<(T, R), ContextError>,
-    ) -> Result<T, ContextError>
-    where
-        R: FnOnce(&mut PerContextState),
-    {
-        let (value, rollback) = f(&mut self.state)?;
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+    ) -> Result<T, ContextError> {
+        let value = f(ClassSMut::new(&mut self.state))?;
+        persist_state_fail_closed(&self.state, deps, context_id).map(|()| value)
+    }
+
+    /// Mutate Class-S state through a [`ClassSMut`] view and persist
+    /// **fail-closed**, RESTORING the Class-S sub-structs on persist failure
+    /// (ADR-049 §9).
+    ///
+    /// For mutations that must be ROLLED BACK when the persist does not land —
+    /// the caller must never observe success for an undurable mutation, and the
+    /// in-memory state must match what a respawn would load. The rollback is the
+    /// combinator's own snapshot/restore of the Class-S sub-structs (via
+    /// [`ClassSState::snapshot`]/[`ClassSState::restore`] +
+    /// [`GovernanceClassS::snapshot`]/[`GovernanceClassS::restore`]) — there is no
+    /// caller-supplied rollback closure to get wrong.
+    ///
+    /// Sequence:
+    /// 1. SNAPSHOT both Class-S sub-structs.
+    /// 2. Run `f(view)`. If `f` errs, return the error (the snapshot is dropped;
+    ///    `f` is responsible for not leaving a partial mutation it cares about —
+    ///    same contract as the legacy "reject before mutate" handlers; no persist
+    ///    runs).
+    /// 3. On `Ok(value)`, persist fail-closed. On success return `Ok(value)`; on
+    ///    failure RESTORE both sub-structs from the snapshot, then return the
+    ///    persist error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after
+    /// restoring the snapshot).
+    ///
+    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
+    #[allow(dead_code)]
+    pub(crate) fn commit_class_s_restore<T>(
+        &mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+    ) -> Result<T, ContextError> {
+        let class_s_snap = self.state.class_s.snapshot();
+        let gov_snap = self.state.governance.class_s.snapshot();
+        let value = f(ClassSMut::new(&mut self.state))?;
         match persist_state_fail_closed(&self.state, deps, context_id) {
             Ok(()) => Ok(value),
             Err(persist_err) => {
-                rollback(&mut self.state);
+                self.restore_class_s(class_s_snap, gov_snap, deps);
                 Err(persist_err)
             }
         }
     }
 
-    /// Mutate Class-S state and persist **fail-closed**, with no rollback —
-    /// for fail-closed-direction mutations whose in-memory effect must STAY
-    /// even when the persist fails (e.g. recording an accepted replay nonce:
-    /// un-recording it would re-open the replay window the dedup cache exists to
-    /// close, so the durable-divergence is reported but the mutation is kept).
+    /// Mutate Class-S state through a [`ClassSMut`] view, persist **fail-closed**,
+    /// and on persist failure RESTORE the Class-S sub-structs AND run an async
+    /// `compensate` to undo an EXTERNAL effect the mutation produced
+    /// (ADR-049 §9).
     ///
-    /// Equivalent to [`Self::commit_class_s`] with an empty rollback closure.
-    /// `f` mutates the state and returns `Ok(value)`; on persist success returns
-    /// `Ok(value)`, on persist failure returns the persist error WITHOUT undoing
-    /// the mutation. If `f` returns `Err`, that error propagates and no persist
-    /// runs.
+    /// Like [`Self::commit_class_s_restore`] but for a mutation that also
+    /// produced an out-of-band side effect (e.g. an escrow authorization) that an
+    /// in-state restore alone cannot reverse. `f` returns `(value, external)`,
+    /// where `external` (`X`) is the handle the async `compensate` needs to undo
+    /// the effect. `compensate` receives a [`ClassCMut`] (NOT a `ClassSMut`): the
+    /// Class-S in-state restore has already run, so the compensation must not
+    /// re-touch Class-S state.
+    ///
+    /// Sequence:
+    /// 1. SNAPSHOT both Class-S sub-structs.
+    /// 2. Run `f(view)`. If `f` errs, return the error (no persist, no
+    ///    compensation — nothing durable or external happened that `f` did not
+    ///    itself unwind).
+    /// 3. On `Ok((value, external))`, persist fail-closed. On success return
+    ///    `Ok(value)`. On failure: RESTORE both Class-S sub-structs in memory,
+    ///    THEN run `compensate(external, ClassCMut, deps).await` to undo the
+    ///    external effect, then return the persist error.
     ///
     /// # Errors
     ///
-    /// Returns the error from `f`, or [`ContextError::PersistenceFailed`] from
-    /// [`persist_state_fail_closed`].
+    /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after the
+    /// in-state restore + async compensation).
     ///
-    /// `dead_code` allow: PR1 scaffolding — see [`Self::commit_class_s`].
+    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
     #[allow(dead_code)]
-    pub(crate) fn commit_class_s_no_rollback<T>(
+    pub(crate) async fn commit_class_s_compensating<T, X>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
-        f: impl FnOnce(&mut PerContextState) -> Result<T, ContextError>,
+        f: impl FnOnce(ClassSMut) -> Result<(T, X), ContextError>,
+        // An `AsyncFnOnce` (edition-2024 async closure) — written `async |..|`
+        // at the call site — so the returned future may BORROW the `ClassCMut`
+        // view and `&ActorDeps` for the call's lifetime. A named `Fut: Future`
+        // generic cannot express that (the future would outlive a borrow created
+        // in this body); a regular `FnOnce -> impl Future` closure also can't
+        // (its async block's future is not tied to the borrowed args). The view
+        // borrows `&mut self.state`, so the future is held only across the
+        // immediate `.await` below.
+        compensate: impl AsyncFnOnce(X, ClassCMut<'_>, &ActorDeps),
     ) -> Result<T, ContextError> {
-        self.commit_class_s(deps, context_id, |state| {
-            // Empty rollback: the persist failure keeps the in-memory mutation
-            // (fail-closed direction). The `|_state|` no-op closure is the `R`
-            // type parameter; it never runs unless persist fails, and even then
-            // it intentionally does nothing.
-            f(state).map(|value| (value, |_state: &mut PerContextState| {}))
-        })
+        let class_s_snap = self.state.class_s.snapshot();
+        let gov_snap = self.state.governance.class_s.snapshot();
+        let (value, external) = f(ClassSMut::new(&mut self.state))?;
+        match persist_state_fail_closed(&self.state, deps, context_id) {
+            Ok(()) => Ok(value),
+            Err(persist_err) => {
+                self.restore_class_s(class_s_snap, gov_snap, deps);
+                compensate(external, ClassCMut::new(&mut self.state), deps).await;
+                Err(persist_err)
+            }
+        }
     }
 
-    /// Mutate Class-C state and persist **best-effort** (ADR-049 §9). Runs `f`,
-    /// then [`persist_state_best_effort`] — a persist failure is logged + metered
-    /// but not surfaced (the ≤50 ms coalesce-window rollback is acceptable for
-    /// liveness / structural state). This is the actor-owned equivalent of the
-    /// "mutate → [`persist_state_best_effort`]" idiom.
+    /// Mutate Class-S state through a [`ClassSMut`] view, persist **fail-closed**,
+    /// THEN run an async `after` step (e.g. append a durable log record);
+    /// if `after` fails, RESTORE the snapshot + RE-PERSIST and report the outcome
+    /// (ADR-049 §9).
     ///
-    /// `dead_code` allow: PR1 scaffolding — see [`Self::commit_class_s`].
+    /// For a Class-S mutation that must be paired with a follow-on durable action
+    /// which can itself fail. The Class-S mutation is persisted first (so it is
+    /// durable before `after` observes it), then `after` runs against a fresh
+    /// [`ClassSMut`] view (it may read the just-persisted state and append a
+    /// derived record). If `after` errs, the combinator rolls the Class-S
+    /// mutation back from the snapshot and RE-PERSISTS so durable state matches
+    /// the rollback.
+    ///
+    /// Sequence:
+    /// 1. SNAPSHOT both Class-S sub-structs.
+    /// 2. Run `f(view)` → `(value, append_input)`. If `f` errs, return
+    ///    `AppendOutcomeError { mutated: false, err }` (no persist ran).
+    /// 3. Persist fail-closed. On failure return
+    ///    `AppendOutcomeError { mutated: true, err }` — `f`'s mutation is in
+    ///    memory but did not durably land (the restore is the caller's call; this
+    ///    matches `*_keep`'s "report divergence, keep mutation" and signals
+    ///    `mutated`).
+    /// 4. Run `after(&append_input, view, deps).await`. On `Ok` return
+    ///    `Ok(value)`. On `Err(after_err)`: RESTORE both sub-structs, RE-PERSIST.
+    ///    - re-persist OK → `AppendOutcomeError { mutated: false, err: after_err }`
+    ///      (state rolled back, durable matches).
+    ///    - re-persist Err → `AppendOutcomeError { mutated: true, err: <re-persist
+    ///      err> }` (could not make the rollback durable — in-memory/durable
+    ///      divergence the caller must surface).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppendOutcomeError`] carrying `f`'s error, the persist error, the
+    /// `after` error, or the re-persist error — with `mutated` set per the rules
+    /// above.
+    ///
+    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
+    #[allow(dead_code)]
+    pub(crate) async fn commit_class_s_then_append<T, A>(
+        &mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<(T, A), ContextError>,
+        // An `AsyncFnOnce` (see `commit_class_s_compensating`) — written
+        // `async |..|` at the call site — so the returned future may borrow the
+        // `&A`, `ClassSMut`, and `&ActorDeps` arguments.
+        after: impl AsyncFnOnce(&A, ClassSMut<'_>, &ActorDeps) -> Result<(), ContextError>,
+    ) -> Result<T, AppendOutcomeError> {
+        let class_s_snap = self.state.class_s.snapshot();
+        let gov_snap = self.state.governance.class_s.snapshot();
+        let (value, append_input) =
+            f(ClassSMut::new(&mut self.state)).map_err(|err| AppendOutcomeError {
+                mutated: false,
+                err,
+            })?;
+        persist_state_fail_closed(&self.state, deps, context_id).map_err(|err| {
+            AppendOutcomeError {
+                // `f`'s mutation is in memory but did not durably land.
+                mutated: true,
+                err,
+            }
+        })?;
+        match after(&append_input, ClassSMut::new(&mut self.state), deps).await {
+            Ok(()) => Ok(value),
+            Err(after_err) => {
+                self.state.class_s.restore(class_s_snap);
+                self.state.governance.class_s.restore(gov_snap, &deps.clock);
+                match persist_state_fail_closed(&self.state, deps, context_id) {
+                    // Rollback made durable: in-memory matches the pre-`f` value.
+                    Ok(()) => Err(AppendOutcomeError {
+                        mutated: false,
+                        err: after_err,
+                    }),
+                    // Could not make the rollback durable: hard divergence.
+                    Err(repersist_err) => Err(AppendOutcomeError {
+                        mutated: true,
+                        err: repersist_err,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Mutate Class-C state through a [`ClassCMut`] view and persist
+    /// **best-effort** (ADR-049 §9). Runs `f`, then [`persist_state_best_effort`] —
+    /// a persist failure is logged + metered but not surfaced (the ≤50 ms
+    /// coalesce-window rollback is acceptable for liveness / structural state).
+    /// The [`ClassCMut`] view exposes no Class-S mutator, so a best-effort `f`
+    /// cannot stage a Class-S transition.
+    ///
+    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
     #[allow(dead_code)]
     pub(crate) fn commit_best_effort(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
-        f: impl FnOnce(&mut PerContextState),
+        f: impl FnOnce(ClassCMut),
     ) {
-        f(&mut self.state);
+        f(ClassCMut::new(&mut self.state));
         persist_state_best_effort(&self.state, deps, context_id);
+    }
+
+    /// Restore both Class-S sub-structs from their snapshots. The governance
+    /// restore needs the clock from `deps` to rebuild the `spending_nonce_tracker`.
+    fn restore_class_s(
+        &mut self,
+        class_s_snap: super::state::ClassSStateSnapshot,
+        gov_snap: crate::context::state::GovernanceClassSSnapshot,
+        deps: &ActorDeps,
+    ) {
+        self.state.class_s.restore(class_s_snap);
+        self.state.governance.class_s.restore(gov_snap, &deps.clock);
     }
 }
 
@@ -356,6 +759,60 @@ mod tests {
         }
     }
 
+    /// Persistence that SUCCEEDS the first `persist_context` call then FAILS
+    /// every subsequent one — lets `then_append` exercise "post-f persist OK,
+    /// rollback re-persist FAILS" (the hard-divergence `mutated == true` path).
+    struct SucceedThenFail {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ContextPersistence for SucceedThenFail {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(())
+            } else {
+                Err("re-persist failure".into())
+            }
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Assemble an `ActorDeps` with the supplied persistence backend.
     async fn build_deps(persistence: Box<dyn ContextPersistence>) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
@@ -391,8 +848,7 @@ mod tests {
             .expect("build_actor_deps")
     }
 
-    /// A fresh encrypted test state. `members` is the field the tests mutate /
-    /// roll back — a plain observable `HashSet<DID>`.
+    /// A fresh encrypted test state.
     fn fresh_state(ctx_byte: u8) -> PerContextState {
         PerContextState::new_for_test_encrypted(
             [ctx_byte; 32],
@@ -410,78 +866,104 @@ mod tests {
         s
     }
 
-    /// (a) `commit_class_s` runs the mutation, persists fail-closed, and returns
-    /// `Ok(value)` on persist success — and the mutation is retained.
-    #[tokio::test]
-    async fn commit_class_s_persists_and_returns_ok_on_success() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x11));
-        let ctx = ctx_hex(0x11);
-        let member = DID("did:example:new-member".to_owned());
-
-        let returned = cell
-            .commit_class_s(&deps, &ctx, |state| {
-                state.members.insert(member.clone());
-                let member_for_rollback = member.clone();
-                Ok(("committed", move |state: &mut PerContextState| {
-                    state.members.remove(&member_for_rollback);
-                }))
-            })
-            .expect("persist succeeds ⇒ Ok");
-
-        assert_eq!(returned, "committed");
-        assert!(
-            cell.members.contains(&member),
-            "on persist success the mutation is retained"
-        );
+    fn saga(id: &str) -> crate::context::supervisor::saga_journal::SagaId {
+        crate::context::supervisor::saga_journal::SagaId(id.to_owned())
     }
 
-    /// (b) On a persistence that returns `Err`, the rollback closure runs and the
-    /// persist error propagates — the staged mutation is undone.
-    #[tokio::test]
-    async fn commit_class_s_runs_rollback_and_propagates_error_on_persist_failure() {
-        let deps = build_deps(Box::new(FailPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x22));
-        let ctx = ctx_hex(0x22);
-        let member = DID("did:example:doomed-member".to_owned());
-
-        let result = cell.commit_class_s(&deps, &ctx, |state| {
-            state.members.insert(member.clone());
-            let member_for_rollback = member.clone();
-            Ok(((), move |state: &mut PerContextState| {
-                state.members.remove(&member_for_rollback);
-            }))
-        });
-
-        assert!(
-            matches!(result, Err(ContextError::PersistenceFailed(_))),
-            "a fail-closed persist failure propagates PersistenceFailed; got {result:?}"
-        );
-        assert!(
-            !cell.members.contains(&member),
-            "the rollback closure undid the staged mutation"
-        );
+    /// Build a `CrossContextToolInvocation` prepared-state for `saga_pending`.
+    fn prepared_invocation() -> crate::context::supervisor::saga_prepared_state::SagaPreparedState {
+        use crate::context::supervisor::saga_prepared_state::{
+            CrossContextToolInvocationPrepared, SagaPreparedState,
+        };
+        SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+            caller_context_id: [0x1Au8; 32],
+            target_context_id: [0x2Bu8; 32],
+            caller_did: DID("did:example:caller".to_owned()),
+            tool_registration_id: "tool-v1".to_owned(),
+            ucan_proof_id: "ucan-1".to_owned(),
+            recorded_timestamp_ms: 1_700_000_000_123,
+            recorded_nonce: [0x3Cu8; 16],
+            recorded_chain_depth: 1,
+        })
     }
 
-    /// `commit_class_s` returns `f`'s error without persisting when `f` rejects.
-    #[tokio::test]
-    async fn commit_class_s_returns_f_error_without_persisting() {
-        // The rejecting closure below only ever returns `Err`, so the rollback
-        // type `R` is unconstrained by its body — this alias pins it to a
-        // concrete `fn(&mut PerContextState)` rollback shape. Declared first so
-        // it precedes all statements (clippy::items_after_statements).
-        type RejectingCommit = Result<((), fn(&mut PerContextState)), ContextError>;
+    // ------------------------------------------------------------------
+    // commit_class_s_keep
+    // ------------------------------------------------------------------
 
+    /// `*_keep` persists fail-closed and returns `Ok(value)` on persist success,
+    /// retaining the mutation.
+    #[tokio::test]
+    async fn keep_persists_and_returns_ok_on_success() {
         let persist_calls = Arc::new(AtomicUsize::new(0));
         let deps = build_deps(Box::new(SpyPersistence {
             persist_calls: Arc::clone(&persist_calls),
         }))
         .await;
-        let mut cell = ClassSCell::new(fresh_state(0x23));
-        let ctx = ctx_hex(0x23);
+        let mut cell = ClassSCell::new(fresh_state(0x11));
+        let ctx = ctx_hex(0x11);
 
-        let result: Result<(), ContextError> = cell.commit_class_s(&deps, &ctx, |_state| {
-            RejectingCommit::Err(ContextError::PermissionDenied("rejected".to_owned()))
+        let returned = cell
+            .commit_class_s_keep(&deps, &ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                Ok("kept")
+            })
+            .expect("persist succeeds ⇒ Ok");
+
+        assert_eq!(returned, "kept");
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "mutation retained on persist success"
+        );
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one persist"
+        );
+    }
+
+    /// `*_keep` KEEPS the mutation on persist failure (fail-closed direction) and
+    /// surfaces the persist error.
+    #[tokio::test]
+    async fn keep_retains_mutation_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x12));
+        let ctx = ctx_hex(0x12);
+
+        let result = cell.commit_class_s_keep(&deps, &ctx, |mut view| {
+            view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "persist failure surfaces; got {result:?}"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "keep variant retains the recorded nonce even on persist failure"
+        );
+    }
+
+    /// `*_keep` returns `f`'s error without persisting when `f` rejects.
+    #[tokio::test]
+    async fn keep_returns_f_error_without_persisting() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x13));
+        let ctx = ctx_hex(0x13);
+
+        let result: Result<(), ContextError> = cell.commit_class_s_keep(&deps, &ctx, |_view| {
+            Err(ContextError::PermissionDenied("rejected".to_owned()))
         });
 
         assert!(
@@ -495,17 +977,53 @@ mod tests {
         );
     }
 
-    /// `commit_class_s_no_rollback` keeps the mutation even when persist fails
-    /// (fail-closed direction) and returns the persist error.
-    #[tokio::test]
-    async fn commit_class_s_no_rollback_keeps_mutation_on_persist_failure() {
-        let deps = build_deps(Box::new(FailPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x24));
-        let ctx = ctx_hex(0x24);
-        let member = DID("did:example:kept-member".to_owned());
+    // ------------------------------------------------------------------
+    // commit_class_s_restore
+    // ------------------------------------------------------------------
 
-        let result = cell.commit_class_s_no_rollback(&deps, &ctx, |state| {
-            state.members.insert(member.clone());
+    /// `*_restore` persists fail-closed and returns `Ok` on success, retaining
+    /// the mutation.
+    #[tokio::test]
+    async fn restore_persists_and_returns_ok_on_success() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x21));
+        let ctx = ctx_hex(0x21);
+        let saga_a = saga("saga-restore-ok");
+
+        let value = cell
+            .commit_class_s_restore(&deps, &ctx, |mut view| {
+                view.class_s_mut()
+                    .saga_pending
+                    .insert(saga_a.clone(), prepared_invocation());
+                Ok(99u32)
+            })
+            .expect("persist succeeds ⇒ Ok");
+
+        assert_eq!(value, 99);
+        assert!(
+            cell.class_s.saga_pending.contains_key(&saga_a),
+            "mutation retained on persist success"
+        );
+    }
+
+    /// (key behaviour) `*_restore` ROLLS BACK the Class-S sub-structs on persist
+    /// failure — asserted via the mirror across BOTH `saga_pending` and the
+    /// nonce dedup cache, plus the governance Class-S sub-struct.
+    #[tokio::test]
+    async fn restore_rolls_back_class_s_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x22));
+        let ctx = ctx_hex(0x22);
+        let saga_a = saga("saga-restore-rollback");
+
+        let result = cell.commit_class_s_restore(&deps, &ctx, |mut view| {
+            // Mutate Class-S: saga_pending + nonce dedup …
+            let cs = view.class_s_mut();
+            cs.saga_pending
+                .insert(saga_a.clone(), prepared_invocation());
+            cs.xctx_nonce_dedup.record([0x3Cu8; 16], 1_700_000_000);
+            // … and governance Class-S (threshold).
+            view.governance_class_s_mut().threshold_value = 7;
             Ok(())
         });
 
@@ -514,46 +1032,348 @@ mod tests {
             "persist failure surfaces; got {result:?}"
         );
         assert!(
-            cell.members.contains(&member),
-            "no-rollback variant retains the mutation even on persist failure"
+            cell.class_s.saga_pending.is_empty(),
+            "saga_pending rolled back via the mirror"
+        );
+        assert!(
+            !cell
+                .class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "recorded nonce rolled back via the mirror"
+        );
+        assert_eq!(
+            cell.governance.class_s.threshold_value, 0,
+            "governance threshold rolled back via the mirror"
         );
     }
 
-    /// `commit_class_s_no_rollback` returns `Ok` and retains the mutation on
-    /// persist success.
+    /// `*_restore` returns `f`'s error without persisting when `f` rejects.
     #[tokio::test]
-    async fn commit_class_s_no_rollback_ok_on_success() {
-        let deps = build_deps(Box::new(OkPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x25));
-        let ctx = ctx_hex(0x25);
-        let member = DID("did:example:ok-member".to_owned());
-
-        let value = cell
-            .commit_class_s_no_rollback(&deps, &ctx, |state| {
-                state.members.insert(member.clone());
-                Ok(7u32)
-            })
-            .expect("persist succeeds ⇒ Ok");
-
-        assert_eq!(value, 7);
-        assert!(cell.members.contains(&member));
-    }
-
-    /// (c) `commit_best_effort` runs the mutation and calls the best-effort
-    /// persist path (asserted via the persist-call spy).
-    #[tokio::test]
-    async fn commit_best_effort_runs_mutation_and_persists() {
+    async fn restore_returns_f_error_without_persisting() {
         let persist_calls = Arc::new(AtomicUsize::new(0));
         let deps = build_deps(Box::new(SpyPersistence {
             persist_calls: Arc::clone(&persist_calls),
         }))
         .await;
-        let mut cell = ClassSCell::new(fresh_state(0x26));
-        let ctx = ctx_hex(0x26);
-        let member = DID("did:example:best-effort-member".to_owned());
+        let mut cell = ClassSCell::new(fresh_state(0x23));
+        let ctx = ctx_hex(0x23);
 
-        cell.commit_best_effort(&deps, &ctx, |state| {
-            state.members.insert(member.clone());
+        let result: Result<(), ContextError> = cell.commit_class_s_restore(&deps, &ctx, |_view| {
+            Err(ContextError::PermissionDenied("rejected".to_owned()))
+        });
+
+        assert!(matches!(result, Err(ContextError::PermissionDenied(_))));
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // commit_class_s_compensating
+    // ------------------------------------------------------------------
+
+    /// `*_compensating` on persist success returns `Ok` and does NOT run the
+    /// async compensation.
+    #[tokio::test]
+    async fn compensating_does_not_compensate_on_persist_success() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x31));
+        let ctx = ctx_hex(0x31);
+        let compensated = Arc::new(AtomicUsize::new(0));
+        let comp_for_closure = Arc::clone(&compensated);
+
+        let value = cell
+            .commit_class_s_compensating(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                    Ok((5u32, "escrow-handle"))
+                },
+                async move |_external, _classc: ClassCMut<'_>, _deps: &ActorDeps| {
+                    comp_for_closure.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+            .expect("persist succeeds ⇒ Ok");
+
+        assert_eq!(value, 5);
+        assert_eq!(
+            compensated.load(Ordering::SeqCst),
+            0,
+            "compensation does not run on persist success"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "mutation retained on success"
+        );
+    }
+
+    /// (key behaviour) `*_compensating` on persist FAILURE restores Class-S
+    /// IN-STATE first, then runs the async compensation exactly once.
+    #[tokio::test]
+    async fn compensating_restores_then_compensates_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x32));
+        let ctx = ctx_hex(0x32);
+        let saga_a = saga("saga-compensate");
+        // Compensation observes the post-restore Class-S state: it records
+        // whether saga_pending was already empty (i.e. restore ran BEFORE it).
+        let saw_empty_after_restore = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let comp_flag = Arc::clone(&saw_empty_after_restore);
+
+        let result = cell
+            .commit_class_s_compensating(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut()
+                        .saga_pending
+                        .insert(saga_a.clone(), prepared_invocation());
+                    Ok(((), "escrow-handle"))
+                },
+                async move |external, classc: ClassCMut<'_>, _deps: &ActorDeps| {
+                    assert_eq!(external, "escrow-handle");
+                    // The Class-S in-state restore has already run, so the
+                    // ClassCMut view reads an empty saga_pending.
+                    comp_flag.store(classc.saga_pending().is_empty(), Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(ContextError::PersistenceFailed(_))));
+        assert!(
+            saw_empty_after_restore.load(Ordering::SeqCst),
+            "compensation runs AFTER the in-state restore (saga_pending already empty)"
+        );
+        assert!(
+            cell.class_s.saga_pending.is_empty(),
+            "Class-S restored on persist failure"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // commit_class_s_then_append
+    // ------------------------------------------------------------------
+
+    /// `*_then_append` on persist-OK + after-OK returns `Ok(value)` and retains
+    /// both the mutation and whatever `after` did.
+    #[tokio::test]
+    async fn then_append_ok_when_persist_and_after_succeed() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x41));
+        let ctx = ctx_hex(0x41);
+        let saga_a = saga("saga-append-ok");
+
+        let value = cell
+            .commit_class_s_then_append(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut()
+                        .saga_pending
+                        .insert(saga_a.clone(), prepared_invocation());
+                    Ok((11u32, "append-input"))
+                },
+                async |input: &&str, _view: ClassSMut<'_>, _deps: &ActorDeps| {
+                    assert_eq!(*input, "append-input");
+                    Ok(())
+                },
+            )
+            .await
+            .expect("persist + after succeed ⇒ Ok");
+
+        assert_eq!(value, 11);
+        assert!(cell.class_s.saga_pending.contains_key(&saga_a));
+    }
+
+    /// (key behaviour) `*_then_append` when `after` fails RESTORES + RE-PERSISTS
+    /// the snapshot and reports `mutated == false` (rollback made durable).
+    #[tokio::test]
+    async fn then_append_restores_and_repersists_on_after_failure() {
+        // Persistence succeeds for the initial persist AND the re-persist.
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x42));
+        let ctx = ctx_hex(0x42);
+        let saga_a = saga("saga-append-fail");
+
+        let result = cell
+            .commit_class_s_then_append(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut()
+                        .saga_pending
+                        .insert(saga_a.clone(), prepared_invocation());
+                    Ok(((), "append-input"))
+                },
+                async |_input: &&str, _view: ClassSMut<'_>, _deps: &ActorDeps| {
+                    Err(ContextError::EventLogFailed("append failed".to_owned()))
+                },
+            )
+            .await;
+
+        match result {
+            Err(AppendOutcomeError { mutated, err }) => {
+                assert!(!mutated, "rollback re-persisted ⇒ mutated is false");
+                assert!(
+                    matches!(err, ContextError::EventLogFailed(_)),
+                    "carries the after error; got {err:?}"
+                );
+            }
+            Ok(()) => panic!("expected AppendOutcomeError"),
+        }
+        assert!(
+            cell.class_s.saga_pending.is_empty(),
+            "saga_pending rolled back after the after-failure"
+        );
+        // Two persists: the post-f fail-closed persist + the rollback re-persist.
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// `*_then_append` reports `mutated == true` when the post-`f` persist itself
+    /// fails (the mutation is in memory but did not durably land).
+    #[tokio::test]
+    async fn then_append_reports_mutated_on_initial_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x43));
+        let ctx = ctx_hex(0x43);
+        let saga_a = saga("saga-append-persistfail");
+        let after_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let after_flag = Arc::clone(&after_ran);
+
+        let result = cell
+            .commit_class_s_then_append(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut()
+                        .saga_pending
+                        .insert(saga_a.clone(), prepared_invocation());
+                    Ok(((), "append-input"))
+                },
+                async move |_input: &&str, _view: ClassSMut<'_>, _deps: &ActorDeps| {
+                    after_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+
+        match result {
+            Err(AppendOutcomeError { mutated, err }) => {
+                assert!(mutated, "initial persist failed ⇒ mutated is true");
+                assert!(matches!(err, ContextError::PersistenceFailed(_)));
+            }
+            Ok(()) => panic!("expected AppendOutcomeError"),
+        }
+        assert!(
+            !after_ran.load(Ordering::SeqCst),
+            "after never runs when the initial fail-closed persist fails"
+        );
+    }
+
+    /// `*_then_append` when `after` fails AND the rollback re-persist also fails:
+    /// reports `mutated == true` (could not make the rollback durable).
+    #[tokio::test]
+    async fn then_append_reports_mutated_when_repersist_fails() {
+        // Fail ONLY the second persist (the re-persist): succeed the first
+        // post-f persist, fail the rollback re-persist (see `SucceedThenFail`).
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SucceedThenFail {
+            calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x44));
+        let ctx = ctx_hex(0x44);
+        let saga_a = saga("saga-append-repersistfail");
+
+        let result = cell
+            .commit_class_s_then_append(
+                &deps,
+                &ctx,
+                |mut view| {
+                    view.class_s_mut()
+                        .saga_pending
+                        .insert(saga_a.clone(), prepared_invocation());
+                    Ok(((), "x"))
+                },
+                async |_input: &&str, _view: ClassSMut<'_>, _deps: &ActorDeps| {
+                    Err(ContextError::EventLogFailed("append failed".to_owned()))
+                },
+            )
+            .await;
+
+        match result {
+            Err(AppendOutcomeError { mutated, err }) => {
+                assert!(mutated, "re-persist failed ⇒ mutated is true");
+                assert!(
+                    matches!(err, ContextError::PersistenceFailed(_)),
+                    "carries the re-persist error; got {err:?}"
+                );
+            }
+            Ok(()) => panic!("expected AppendOutcomeError"),
+        }
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// `*_then_append` returns `AppendOutcomeError { mutated: false }` when `f`
+    /// itself rejects (no persist ran).
+    #[tokio::test]
+    async fn then_append_reports_not_mutated_when_f_rejects() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x45));
+        let ctx = ctx_hex(0x45);
+
+        let result: Result<(), AppendOutcomeError> = cell
+            .commit_class_s_then_append(
+                &deps,
+                &ctx,
+                |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
+                async |_input: &(), _view: ClassSMut<'_>, _deps: &ActorDeps| Ok(()),
+            )
+            .await;
+
+        match result {
+            Err(AppendOutcomeError { mutated, err }) => {
+                assert!(!mutated);
+                assert!(matches!(err, ContextError::PermissionDenied(_)));
+            }
+            Ok(()) => panic!("expected AppendOutcomeError"),
+        }
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // commit_best_effort
+    // ------------------------------------------------------------------
+
+    /// `commit_best_effort` runs the Class-C mutation and issues exactly one
+    /// best-effort persist.
+    #[tokio::test]
+    async fn best_effort_runs_mutation_and_persists() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x51));
+        let ctx = ctx_hex(0x51);
+        let member = DID("did:example:best-effort-member".to_owned());
+        let member_for_closure = member.clone();
+
+        cell.commit_best_effort(&deps, &ctx, move |mut view| {
+            view.rest_mut().members.insert(member_for_closure);
         });
 
         assert!(
@@ -567,24 +1387,61 @@ mod tests {
         );
     }
 
+    /// `ClassCMut::split_class_c` yields the five disjoint borrows the
+    /// `ConsequenceStateSplit` pattern needs, simultaneously.
+    #[tokio::test]
+    async fn best_effort_split_yields_disjoint_class_c_borrows() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x52));
+        let ctx = ctx_hex(0x52);
+
+        cell.commit_best_effort(&deps, &ctx, |mut view| {
+            let split = view.split_class_c();
+            // Hold all five borrows live at once; mutate two of them to prove
+            // they are independent mutable references.
+            *split.checkpoint_events_since += 3;
+            let _ = &split.governance;
+            let _ = &split.role_state;
+            let _ = split.membership.count();
+            let _ = split.receive_buffer.len();
+        });
+
+        assert_eq!(
+            cell.checkpoint_events_since, 3,
+            "the disjoint &mut checkpoint counter was mutated through the split"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // new / into_inner
+    // ------------------------------------------------------------------
+
     /// `into_inner` returns the wrapped state with mutations intact, and `Deref`
     /// reads see the same state.
     #[tokio::test]
     async fn into_inner_returns_wrapped_state() {
         let deps = build_deps(Box::new(OkPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x27));
-        let ctx = ctx_hex(0x27);
-        let member = DID("did:example:unwrap-member".to_owned());
+        let mut cell = ClassSCell::new(fresh_state(0x61));
+        let ctx = ctx_hex(0x61);
+        let saga_a = saga("saga-unwrap");
 
-        cell.commit_best_effort(&deps, &ctx, |state| {
-            state.members.insert(member.clone());
-        });
+        cell.commit_class_s_keep(&deps, &ctx, |mut view| {
+            view.class_s_mut()
+                .saga_pending
+                .insert(saga_a.clone(), prepared_invocation());
+            Ok(())
+        })
+        .expect("persist succeeds");
         // Read through Deref before unwrap.
-        assert!(cell.members.contains(&member));
+        assert!(cell.saga_pending().contains_key(&saga_a));
 
         let state = cell.into_inner();
         assert!(
-            state.members.contains(&member),
+            state.saga_pending().contains_key(&saga_a),
             "into_inner preserves the committed mutation"
         );
     }
