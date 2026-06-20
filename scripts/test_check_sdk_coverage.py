@@ -2,9 +2,14 @@
 
 Covers:
   1. Gate exits 0 (PASS) on the real matrix.
-  2. Gate exits 1 when a true entry has no matching symbol and no exemption.
+  2. Gate exits 1 when a true entry has no matching symbol and no exemption
+     (unmatched-true path, isolated from missing-SDK-key errors).
   3. _extract_python_symbols correctly extracts a function name via tree-sitter.
   4. _extract_python_symbols handles class with method names.
+  5. Gate exits 0 when a true entry has a valid coverage_exemption and at
+     least one other SDK is statically verified.
+  6. Gate exits 1 when every true cell for an op has a coverage_exemption but
+     none is statically verified (all-exempted guard).
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ import importlib.util
 import json
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -39,6 +43,71 @@ _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
 
 _extract_python_symbols = _mod._extract_python_symbols
 
+# ---------------------------------------------------------------------------
+# Wrapper-script builder
+#
+# All integration tests drive the gate via a subprocess wrapper so they can
+# patch module-level constants (MATRIX_PATH, SDK_PATHS) before calling main().
+# ---------------------------------------------------------------------------
+
+_SCRIPT_PATH_STR = str(SCRIPT)
+
+
+def _build_wrapper(
+    tmp_path: Path,
+    matrix_path: Path,
+    sdk_paths: dict[str, Path] | None = None,
+) -> Path:
+    """Write a wrapper script that patches MATRIX_PATH (and optionally
+    SDK_PATHS) before invoking main(), and return its path.
+
+    Parameters
+    ----------
+    tmp_path:
+        Directory in which to write the wrapper.
+    matrix_path:
+        Synthetic matrix JSON file to use.
+    sdk_paths:
+        Optional mapping of SDK name → directory to use instead of the real
+        SDK source trees. Only the keys listed here are replaced; omitted keys
+        retain the gate's built-in defaults (which point at the live source).
+    """
+    patch_sdk_paths_lines: list[str] = []
+    if sdk_paths:
+        patch_sdk_paths_lines.append("_mod.SDK_PATHS.update({")
+        for sdk, path in sdk_paths.items():
+            patch_sdk_paths_lines.append(f"    {sdk!r}: Path({str(path)!r}),")
+        patch_sdk_paths_lines.append("})")
+
+    # Build the wrapper body as a list of lines to avoid indentation issues
+    # when injecting the optional SDK_PATHS patch block.
+    body_lines = [
+        "import sys",
+        "import importlib.util",
+        "from pathlib import Path",
+        "",
+        f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
+        "_mod = importlib.util.module_from_spec(_spec)",
+        "_spec.loader.exec_module(_mod)",
+        "",
+        f"_mod.MATRIX_PATH = Path({str(matrix_path)!r})",
+    ]
+    if patch_sdk_paths_lines:
+        body_lines.extend(patch_sdk_paths_lines)
+    body_lines.append("sys.exit(_mod.main())")
+
+    wrapper = tmp_path / "run_with_matrix.py"
+    wrapper.write_text("\n".join(body_lines) + "\n", encoding="utf-8")
+    return wrapper
+
+
+def _run_wrapper(wrapper: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(wrapper)],
+        capture_output=True,
+        text=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Test 1: Gate passes on the real matrix
@@ -60,11 +129,25 @@ def test_gate_passes_on_real_matrix() -> None:
 
 # ---------------------------------------------------------------------------
 # Test 2: Gate exits 1 on a synthetic matrix with unmatched true entry
+#
+# Previous version: had only `python: True` and omitted typescript/kotlin/swift
+# entirely, producing 3 missing-SDK-key errors AND 1 unmatched-true error.
+# The test passed even when the unmatched-true branch was deleted (the
+# missing-SDK-key errors alone drove returncode=1).
+#
+# Fixed version: gives all 4 SDK keys.  python=True (no matching symbol, no
+# exemption).  The other three are false with valid exemptions.  The ONLY
+# error path that can fire is the unmatched-true check for python.
 # ---------------------------------------------------------------------------
 
 
 def test_gate_fails_on_unmatched_true_entry(tmp_path: Path) -> None:
-    """A `true` cell with no matching symbol and no coverage_exemption exits 1."""
+    """A `true` cell with no matching symbol and no coverage_exemption exits 1.
+
+    All four SDK keys are present so missing-SDK-key errors cannot mask the
+    property under test.  The three false cells each carry a valid exemption
+    so the only possible failure is the unmatched-true path for python.
+    """
     synthetic_matrix = {
         "capabilities": [
             {
@@ -72,7 +155,17 @@ def test_gate_fails_on_unmatched_true_entry(tmp_path: Path) -> None:
                 "operations": [
                     {
                         "name": "nonexistent_operation_zzzzzz",
+                        # python: true but the symbol won't exist anywhere
                         "python": True,
+                        # Other SDKs: false + valid exemption (no errors expected)
+                        "typescript": False,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "typescript": {"reason": "Not implemented"},
+                            "kotlin": {"reason": "Not implemented"},
+                            "swift": {"reason": "Not implemented"},
+                        },
                     }
                 ],
             }
@@ -81,39 +174,17 @@ def test_gate_fails_on_unmatched_true_entry(tmp_path: Path) -> None:
     matrix_file = tmp_path / "matrix.json"
     matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
 
-    # Point the gate at our synthetic matrix by monkey-patching MATRIX_PATH.
-    # The script reads it from a module-level constant, so we drive it via
-    # a small wrapper script that loads the gate module and patches the path
-    # before calling main().
-    script_path = str(SCRIPT)
-    matrix_path = str(matrix_file)
-    wrapper = tmp_path / "run_with_matrix.py"
-    wrapper.write_text(
-        textwrap.dedent(f"""\
-            import sys
-            import importlib.util
-            from pathlib import Path
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
 
-            _spec = importlib.util.spec_from_file_location("check_sdk_coverage", {script_path!r})
-            _mod = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_mod)
-
-            _mod.MATRIX_PATH = Path({matrix_path!r})
-            sys.exit(_mod.main())
-        """),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [sys.executable, str(wrapper)],
-        capture_output=True,
-        text=True,
-    )
     assert result.returncode == 1, (
         f"Gate should have exited 1 for unmatched true entry, got {result.returncode}.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert "ERROR" in result.stdout or "FAIL" in result.stdout
+    # The gate prints the specific error phrase for unmatched-true cells.
+    assert "no matching SDK symbol was found" in result.stdout or "unmatched true" in result.stdout, (
+        f"Expected unmatched-true error phrase in stdout.\nstdout:\n{result.stdout}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,3 +227,148 @@ def test_extract_python_symbols_class_method() -> None:
     assert "Foo" in symbols, f"Expected 'Foo' in symbols, got: {symbols}"
     assert "bar" in symbols, f"Expected 'bar' in symbols, got: {symbols}"
     assert "Foo.bar" in symbols, f"Expected 'Foo.bar' in symbols, got: {symbols}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Gate passes when a true entry has a valid coverage_exemption and
+#          at least one other SDK is statically verified.
+#
+# Setup:
+#   - python=True  — symbol NOT in the fake Python source; carries a
+#     coverage_exemptions entry with a non-empty reason.
+#   - typescript=True — symbol IS in the fake TypeScript source (statically
+#     verified); no exemption needed.
+#   - kotlin=False, swift=False — each with a valid exemption.
+#
+# The gate must exit 0: python's true cell is legitimately exempted, and
+# typescript provides the required ground-truth static verification, so the
+# all-exempted guard does not fire.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_passes_with_valid_coverage_exemption(tmp_path: Path) -> None:
+    """Gate exits 0 when a true cell has a valid coverage_exemption and
+    another SDK provides static verification."""
+    # Create a fake TypeScript source file that exports the operation symbol.
+    # The auto-generated camelCase variant of "verified_op_zzz" is
+    # "verifiedOpZzz" — the gate checks exact and auto-generated candidates.
+    ts_src_dir = tmp_path / "ts_src"
+    ts_src_dir.mkdir()
+    ts_file = ts_src_dir / "index.ts"
+    ts_file.write_text(
+        "export function verifiedOpZzz(): void {}\n",
+        encoding="utf-8",
+    )
+
+    # Create an empty Python source dir (python symbol will NOT be found).
+    py_src_dir = tmp_path / "py_src"
+    py_src_dir.mkdir()
+
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "verified_op_zzz",
+                        # python: true but symbol absent — covered by exemption
+                        "python": True,
+                        # typescript: true and symbol IS present in fake source
+                        "typescript": True,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "kotlin": {"reason": "Not implemented"},
+                            "swift": {"reason": "Not implemented"},
+                        },
+                        "coverage_exemptions": {
+                            "python": "Symbol is generated at runtime by the PyO3 bridge — not statically extractable",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(
+        tmp_path,
+        matrix_file,
+        sdk_paths={"python": py_src_dir, "typescript": ts_src_dir},
+    )
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 0, (
+        f"Gate should have exited 0 for a valid coverage_exemption + "
+        f"statically-verified typescript, got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Gate exits 1 when ALL true cells have coverage_exemptions and
+#          none is statically verified (all-exempted guard).
+#
+# Setup:
+#   - python=True  — symbol absent; carries a coverage_exemptions entry.
+#   - typescript=True — symbol also absent; carries a coverage_exemptions entry.
+#   - kotlin=False, swift=False — each with a valid exemption.
+#
+# No SDK is statically verified, so the all-exempted guard must fire
+# and the gate must exit 1.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_all_exempted_with_none_verified(tmp_path: Path) -> None:
+    """Gate exits 1 when every true cell carries a coverage_exemption but
+    none is statically verified."""
+    # Both Python and TypeScript source dirs are empty — no symbols extractable.
+    py_src_dir = tmp_path / "py_src"
+    py_src_dir.mkdir()
+    ts_src_dir = tmp_path / "ts_src"
+    ts_src_dir.mkdir()
+
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "all_exempted_op_zzz",
+                        "python": True,
+                        "typescript": True,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "kotlin": {"reason": "Not implemented"},
+                            "swift": {"reason": "Not implemented"},
+                        },
+                        "coverage_exemptions": {
+                            "python": "Generated binding — not statically extractable",
+                            "typescript": "Generated binding — not statically extractable",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(
+        tmp_path,
+        matrix_file,
+        sdk_paths={"python": py_src_dir, "typescript": ts_src_dir},
+    )
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for all-exempted op with no static verification, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    # Verify the all-exempted guard fired (not a different error).
+    assert "all SDKs claiming coverage" in result.stdout.lower() or "all-exempted" in result.stdout.lower(), (
+        f"Expected all-exempted guard error phrase in stdout.\nstdout:\n{result.stdout}"
+    )
