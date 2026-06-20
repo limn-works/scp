@@ -1423,9 +1423,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           operator: admin.did,
         }),
       );
-      await expect(
-        scp.toolInvoke(ctx._rawHandle, toolId, "{}", outsider.did, ""),
-      ).rejects.toThrow();
+      let threw = false;
+      try {
+        await scp.toolInvoke(ctx._rawHandle, toolId, "{}", outsider.did, "");
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
     });
 
     it("scp.toolVerify returns a verification summary", async () => {
@@ -1673,9 +1677,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      await expect(
-        scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json", admin.did),
-      ).rejects.toThrow();
+      let threw = false;
+      try {
+        await scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json", admin.did);
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
     });
 
     it("scp.contextGovernanceListProposals returns a JSON array (initially empty)", async () => {
@@ -1968,12 +1976,17 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         const identity = await scp.identityCreate("in_memory");
         // `identity` belongs to `scp`. Feeding it to `other.contextCreate`
         // must be rejected BEFORE any capability or state work runs.
-        await expect(
-          other.contextCreate(
+        let threw = false;
+        try {
+          await other.contextCreate(
             identity,
             JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
-          ),
-        ).rejects.toThrow(/SCP-PERM-3030/);
+          );
+        } catch (err) {
+          threw = true;
+          expect(String(err)).toMatch(/SCP-PERM-3030/);
+        }
+        expect(threw).toBe(true);
       } finally {
         await other.shutdown(1);
       }
@@ -1988,13 +2001,18 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
         );
         // Cross the handle into the other SCP.
-        await expect(
-          other.contextSend(
+        let threw = false;
+        try {
+          await other.contextSend(
             ourCtx._rawHandle,
             ours.did,
             new TextEncoder().encode("cross-instance"),
-          ),
-        ).rejects.toThrow(/SCP-PERM-3030/);
+          );
+        } catch (err) {
+          threw = true;
+          expect(String(err)).toMatch(/SCP-PERM-3030/);
+        }
+        expect(threw).toBe(true);
       } finally {
         await other.shutdown(1);
       }

@@ -3895,9 +3895,10 @@ function assertTestHookAllowed(hookName: string): void {
  * Proxy-backed mock without requiring `@limn-works/scp-ts-napi-*` to
  * be installed for the host platform.
  *
- * Guarded by `NODE_ENV === "production"` throw to close the
- * round-3 red-hat RED-PR5-007 attack chain (smuggled-native SCP
- * injection into a downstream library).
+ * Guarded: throws in production — only allowed when NODE_ENV is "test" or
+ * "development", or when BUN_TEST is set. Closes the round-3 red-hat
+ * RED-PR5-007 attack chain (smuggled-native SCP injection into a downstream
+ * library).
  *
  * @internal
  */
