@@ -2762,14 +2762,14 @@ export class SCP {
    * Verifies a batch of payment receipts against the configured payment
    * adapter. Maximum 10,000 receipts per call.
    *
-   * `all_valid` is `true` iff every entry both reached the adapter and the
+   * `allValid` is `true` iff every entry both reached the adapter and the
    * adapter reported the receipt valid; it is vacuously `true` for an empty
    * batch. `ok` means the adapter *responded* — NOT that the payment is valid;
-   * check `valid` / `all_valid` for validity.
+   * check `valid` / `allValid` for validity.
    *
    * @param receipts Array of receipt objects to verify. Each object shape is
    *   adapter-specific; the bridge serializes the array to JSON internally.
-   * @returns Typed {@link PaymentReceiptVerificationResult} with `all_valid`
+   * @returns Typed {@link PaymentReceiptVerificationResult} with `allValid`
    *   and per-receipt `results`.
    */
   economyVerifyPaymentReceipts(
@@ -2778,7 +2778,29 @@ export class SCP {
     const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(
       JSON.stringify(receipts),
     );
-    return JSON.parse(raw) as PaymentReceiptVerificationResult;
+    // The Rust bridge emits snake_case keys; map to the SDK's camelCase convention.
+    const parsed = JSON.parse(raw) as {
+      all_valid: boolean;
+      results: Array<{
+        ok: boolean;
+        receipt_id?: string;
+        valid?: boolean;
+        result?: unknown;
+        error?: string;
+      }>;
+    };
+    return {
+      allValid: parsed.all_valid,
+      results: parsed.results.map((entry) => {
+        const mapped: import("./economy").PaymentReceiptVerificationEntry = { ok: entry.ok };
+        if (entry.receipt_id !== undefined) mapped.receiptId = entry.receipt_id;
+        if (entry.valid !== undefined) mapped.valid = entry.valid;
+        if (entry.result !== undefined)
+          mapped.result = entry.result as Readonly<Record<string, unknown>>;
+        if (entry.error !== undefined) mapped.error = entry.error;
+        return mapped;
+      }),
+    };
   }
 
   // ───────────────────────────────────────────────────────────────────────

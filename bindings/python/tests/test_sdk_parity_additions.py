@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from scp_sdk import SCP, discovery
+from scp_sdk.errors import ScpError
 
 
 @pytest.mark.asyncio
@@ -73,3 +74,29 @@ async def test_economy_verify_payment_receipts_parses_json_result() -> None:
     assert result["results"][0].get("valid") is False
     assert result["results"][0]["ok"] is True
     scp._native.economy_verify_payment_receipts.assert_called_once_with("[]")
+
+
+@pytest.mark.asyncio
+async def test_identity_migrate_propagates_scperror() -> None:
+    """identity_migrate must propagate ScpError raised by the native bridge."""
+    scp = SCP.__new__(SCP)
+    scp._native = MagicMock()
+    scp._native.identity_migrate.side_effect = ScpError(
+        "custody migration failed", code="SCP-IDENTITY-0001"
+    )
+
+    with pytest.raises(ScpError, match="custody migration failed"):
+        await scp.identity_migrate(MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_economy_verify_payment_receipts_propagates_scperror() -> None:
+    """economy_verify_payment_receipts must propagate ScpError raised by the native bridge."""
+    scp = SCP.__new__(SCP)
+    scp._native = MagicMock()
+    scp._native.economy_verify_payment_receipts.side_effect = ScpError(
+        "receipt verification failed", code="SCP-ECONOMY-0001"
+    )
+
+    with pytest.raises(ScpError, match="receipt verification failed"):
+        await scp.economy_verify_payment_receipts([])
