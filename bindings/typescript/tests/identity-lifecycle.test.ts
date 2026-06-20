@@ -241,7 +241,14 @@ if (!napiAvailable) {
         // Migration MUST have dropped the #agent key from the new DID document
         // (spec §3.2.1). Attempting to remove a non-existent agent key produces
         // IdentityError (Rust: IdentityError::AgentKeyNotFound).
-        await expect(scp.identityRemoveAgentKey(migrated)).rejects.toBeInstanceOf(IdentityError);
+        let threw = false;
+        try {
+          await scp.identityRemoveAgentKey(migrated);
+        } catch (err) {
+          threw = true;
+          expect(err).toBeInstanceOf(IdentityError);
+        }
+        expect(threw).toBe(true);
       } finally {
         await scp.shutdown(1);
       }
