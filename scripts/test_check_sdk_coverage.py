@@ -1098,6 +1098,10 @@ def test_gate_fails_on_invalid_false_entry_exemption_reason(tmp_path: Path) -> N
         f"got {result.returncode}.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert "must be a non-empty string" in result.stdout, (
-        f"Expected 'must be a non-empty string' in stdout.\nstdout:\n{result.stdout}"
+    # Assert both invalid cases are independently flagged — not just one.
+    assert "exemptions.python" in result.stdout and "must be a non-empty string" in result.stdout, (
+        f"Expected error for dict-valued 'exemptions.python' in stdout.\nstdout:\n{result.stdout}"
+    )
+    assert "exemptions.kotlin" in result.stdout, (
+        f"Expected error for blank-string 'exemptions.kotlin' in stdout.\nstdout:\n{result.stdout}"
     )

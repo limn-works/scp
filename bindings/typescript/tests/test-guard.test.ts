@@ -46,6 +46,13 @@ describe("_evaluateTestEnv", () => {
     expect(_evaluateTestEnv({ BUN_TEST: "1" })).toBe(true);
   });
 
+  it("returns true when BUN_TEST is any non-empty string (e.g. 'false')", () => {
+    // BUN_TEST is checked for presence (non-empty), not for a specific value.
+    // "false" has length > 0, so it elevates trust. This is by design — only
+    // the bun test runner sets BUN_TEST, so any non-empty value is meaningful.
+    expect(_evaluateTestEnv({ BUN_TEST: "false" })).toBe(true);
+  });
+
   it("returns false when BUN_TEST is empty string (not set by the runner)", () => {
     expect(_evaluateTestEnv({ BUN_TEST: "" })).toBe(false);
   });
