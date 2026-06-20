@@ -584,7 +584,7 @@ def _get_func_name_from_definition(func_node: Node) -> str | None:
     """Extract the function/method name from a function_definition node."""
     for child in func_node.children:
         if child.type == "identifier":
-            return child.text.decode()
+            return (child.text or b"").decode("utf-8") or None
     return None
 
 
@@ -618,7 +618,7 @@ def _extract_python_class(class_node: Node, symbols: set[str]) -> None:
     class_name = None
     for child in class_node.children:
         if child.type == "identifier":
-            class_name = child.text.decode()
+            class_name = (child.text or b"").decode("utf-8") or None
             break
     if not class_name:
         return
@@ -682,14 +682,14 @@ def _extract_typescript_symbols(root_node: Node) -> set[str]:
             if sub.type == "function_declaration":
                 for fc in sub.children:
                     if fc.type == "identifier":
-                        symbols.add(fc.text.decode())
+                        symbols.add((fc.text or b"").decode("utf-8"))
                         break
 
             elif sub.type == "class_declaration":
                 class_name = None
                 for fc in sub.children:
                     if fc.type == "type_identifier":
-                        class_name = fc.text.decode()
+                        class_name = (fc.text or b"").decode("utf-8") or None
                         break
                 if class_name:
                     symbols.add(class_name)
@@ -700,7 +700,7 @@ def _extract_typescript_symbols(root_node: Node) -> set[str]:
                                 if member.type == "method_definition":
                                     for mc in member.children:
                                         if mc.type == "property_identifier":
-                                            method_name = mc.text.decode()
+                                            method_name = (mc.text or b"").decode("utf-8")
                                             symbols.add(f"{class_name}.{method_name}")
                                             symbols.add(method_name)
                                             break
@@ -709,7 +709,7 @@ def _extract_typescript_symbols(root_node: Node) -> set[str]:
                                     # properties)
                                     for mc in member.children:
                                         if mc.type == "property_identifier":
-                                            symbols.add(mc.text.decode())
+                                            symbols.add((mc.text or b"").decode("utf-8"))
                                             break
 
             elif sub.type == "lexical_declaration":
@@ -718,19 +718,19 @@ def _extract_typescript_symbols(root_node: Node) -> set[str]:
                     if decl.type == "variable_declarator":
                         for dc in decl.children:
                             if dc.type == "identifier":
-                                symbols.add(dc.text.decode())
+                                symbols.add((dc.text or b"").decode("utf-8"))
                                 break
 
             elif sub.type == "interface_declaration":
                 for fc in sub.children:
                     if fc.type == "type_identifier":
-                        symbols.add(fc.text.decode())
+                        symbols.add((fc.text or b"").decode("utf-8"))
                         break
 
             elif sub.type == "type_alias_declaration":
                 for fc in sub.children:
                     if fc.type == "type_identifier":
-                        symbols.add(fc.text.decode())
+                        symbols.add((fc.text or b"").decode("utf-8"))
                         break
 
             elif sub.type == "export_clause":
@@ -740,9 +740,9 @@ def _extract_typescript_symbols(root_node: Node) -> set[str]:
                         ids = [c for c in spec.children if c.type == "identifier"]
                         if len(ids) >= 2:
                             # export { X as Y } -- the exported name is Y
-                            symbols.add(ids[1].text.decode())
+                            symbols.add((ids[1].text or b"").decode("utf-8"))
                         elif len(ids) == 1:
-                            symbols.add(ids[0].text.decode())
+                            symbols.add((ids[0].text or b"").decode("utf-8"))
 
     return symbols
 
@@ -757,7 +757,7 @@ def _has_kotlin_visibility(node: Node, exclude: set[str]) -> bool:
         if child.type == "modifiers":
             for mod in child.children:
                 if mod.type == "visibility_modifier":
-                    vis_text = mod.text.decode().strip()
+                    vis_text = (mod.text or b"").decode("utf-8").strip()
                     if vis_text in exclude:
                         return True
     return False
@@ -784,7 +784,7 @@ def _extract_kotlin_symbols(root_node: Node) -> set[str]:
     def _first_ident(node: Node) -> str | None:
         for c in node.children:
             if c.type in id_types:
-                return c.text.decode().strip("`")
+                return (c.text or b"").decode("utf-8").strip("`") or None
         return None
 
     def _property_name(prop_node: Node) -> str | None:
@@ -796,7 +796,7 @@ def _extract_kotlin_symbols(root_node: Node) -> set[str]:
                 if name:
                     return name
             if c.type in id_types:
-                return c.text.decode().strip("`")
+                return (c.text or b"").decode("utf-8").strip("`") or None
         return None
 
     type_decls = ("class_declaration", "object_declaration", "interface_declaration")
@@ -861,7 +861,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
             if child.type == "modifiers":
                 for mod in child.children:
                     if mod.type == "visibility_modifier":
-                        if mod.text.decode().strip() == "public":
+                        if (mod.text or b"").decode("utf-8").strip() == "public":
                             return True
         return False
 
@@ -872,7 +872,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
             if child.type == "modifiers":
                 for mod in child.children:
                     if mod.type == "visibility_modifier":
-                        if mod.text.decode().strip() in restrictive:
+                        if (mod.text or b"").decode("utf-8").strip() in restrictive:
                             return True
         return False
 
@@ -880,12 +880,12 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
         """Get the name of a class/struct/enum/actor/extension declaration."""
         for child in node.children:
             if child.type == "type_identifier":
-                return child.text.decode()
+                return (child.text or b"").decode("utf-8") or None
             # Extensions use user_type > type_identifier
             if child.type == "user_type":
                 for uc in child.children:
                     if uc.type == "type_identifier":
-                        return uc.text.decode()
+                        return (uc.text or b"").decode("utf-8") or None
         return None
 
     def _extract_methods_from_body(
@@ -905,7 +905,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
                     continue
                 for mc in member.children:
                     if mc.type == "simple_identifier":
-                        method_name = mc.text.decode()
+                        method_name = (mc.text or b"").decode("utf-8")
                         symbols.add(f"{type_name}.{method_name}")
                         symbols.add(method_name)
                         break
@@ -916,7 +916,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
                 continue
             for fc in child.children:
                 if fc.type == "simple_identifier":
-                    symbols.add(fc.text.decode())
+                    symbols.add((fc.text or b"").decode("utf-8"))
                     break
 
         elif child.type == "class_declaration":
@@ -944,7 +944,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
             proto_name = None
             for fc in child.children:
                 if fc.type == "type_identifier":
-                    proto_name = fc.text.decode()
+                    proto_name = (fc.text or b"").decode("utf-8") or None
                     break
             if proto_name:
                 symbols.add(proto_name)
@@ -954,7 +954,7 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
                             if member.type == "protocol_function_declaration":
                                 for mc in member.children:
                                     if mc.type == "simple_identifier":
-                                        method_name = mc.text.decode()
+                                        method_name = (mc.text or b"").decode("utf-8")
                                         symbols.add(f"{proto_name}.{method_name}")
                                         symbols.add(method_name)
                                         break

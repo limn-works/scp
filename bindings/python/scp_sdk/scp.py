@@ -478,10 +478,11 @@ class SCP:
 
     def __exit__(
         self,
-        _exc_type: type[BaseException] | None,
-        _exc: BaseException | None,
-        _tb: TracebackType | None,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> None:
+        del exc_type, exc, tb
         """Shut down synchronously on ``with``-scope exit.
 
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
@@ -496,10 +497,11 @@ class SCP:
 
     async def __aexit__(
         self,
-        _exc_type: type[BaseException] | None,
-        _exc: BaseException | None,
-        _tb: TracebackType | None,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> None:
+        del exc_type, exc, tb
         """Shut down asynchronously on ``async with`` scope exit.
 
         Awaits :meth:`shutdown` so the event loop keeps running while
