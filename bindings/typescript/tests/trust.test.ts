@@ -388,9 +388,14 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     );
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
-    await expect(
-      evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]),
-    ).rejects.toBeInstanceOf(ValidationError);
+    let threw = false;
+    try {
+      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+    } catch (err) {
+      threw = true;
+      expect(err).toBeInstanceOf(ValidationError);
+    }
+    expect(threw).toBe(true);
   });
 });
 
@@ -463,7 +468,14 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
 
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
-    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toBe(networkError);
+    let threw = false;
+    try {
+      await evaluateTrust(scp, "did:dht:z6MkBob", context);
+    } catch (err) {
+      threw = true;
+      expect(err).toBe(networkError);
+    }
+    expect(threw).toBe(true);
   });
 });
 
