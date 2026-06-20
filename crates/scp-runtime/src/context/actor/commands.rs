@@ -2906,6 +2906,13 @@ pub enum SagaPhaseMessage {
         committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
         /// The committed-side event id.
         committed_event_id: String,
+        /// CONVERGENT committer-assigned leaf timestamp (seconds) for the
+        /// divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000` —
+        /// the same convergent instant the committed-side `ToolInvoked` leaf
+        /// carries (spec §6.2.4 *Recorded timestamp*). Passed per-call so the
+        /// marker leaf is byte-identical across honest members (§9.9.3), never a
+        /// per-member actor-local clock read.
+        committed_timestamp_secs: u64,
         /// The local (emitting) side's Active Signing Key. The actor holds no
         /// key (ADR-049); the FSM passes the key authorized for this context
         /// per-call. Zeroizes on drop.

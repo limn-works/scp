@@ -441,8 +441,9 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::ProvenanceReceived => 35,
         // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
         // are assigned in ADR declaration order, with tag 59 retired (see the
-        // PseudonymAnnounced removal note below). Tags 0-35 above are protocol
-        // constants and MUST NOT change.
+        // PseudonymAnnounced removal note below). Tags 76..=77 (below) are the
+        // ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above are
+        // protocol constants and MUST NOT change.
         EventType::AdminTransferred => 36,
         EventType::CeilingModified => 37,
         EventType::CeilingModificationPending => 38,
@@ -486,6 +487,11 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RecoveryEpochAdvanced => 73,
         EventType::AppBound => 74,
         EventType::AppUnbound => 75,
+        // Cross-context tool-call saga (ADR-011 Amendment §6 carve-out). Tags
+        // 76..=77 are the next free values after the current max (75); tag 59
+        // stays retired. These are convergent commit-ordered durable leaves.
+        EventType::CrossContextToolInvoked => 76,
+        EventType::CrossContextDivergenceMarker => 77,
     }
 }
 
@@ -1303,12 +1309,13 @@ mod tests {
     //   - tags 0-35 are protocol constants and MUST NOT change;
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
-    //   - all 75 tags are distinct.
+    //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
+    //   - all 77 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 75] = [
+    const ALL_EVENT_TYPES: [EventType; 77] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1384,18 +1391,20 @@ mod tests {
         EventType::RecoveryEpochAdvanced,
         EventType::AppBound,
         EventType::AppUnbound,
+        EventType::CrossContextToolInvoked,
+        EventType::CrossContextDivergenceMarker,
     ];
 
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 75, "taxonomy must enumerate all 75 variants");
+        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            75,
-            "all 75 EventType tags must be distinct (no two variants share a tag)"
+            77,
+            "all 77 EventType tags must be distinct (no two variants share a tag)"
         );
         // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
         // space is therefore 0..=75 minus {59}. This is the only gap.
@@ -1450,9 +1459,11 @@ mod tests {
     }
 
     #[test]
-    fn unification_variant_tags_occupy_36_through_75() {
+    fn unification_variant_tags_occupy_36_through_77() {
         // The 39 native↔WASM unification variants occupy tags 36..=75 in ADR
         // declaration order, with tag 59 retired (PseudonymAnnounced removed).
+        // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
+        // 76..=77.
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
         assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
         assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
@@ -1496,6 +1507,10 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::RecoveryEpochAdvanced), 73);
         assert_eq!(event_type_tag(&EventType::AppBound), 74);
         assert_eq!(event_type_tag(&EventType::AppUnbound), 75);
+        // Cross-context-saga carve-out (ADR-011 Amendment §6): the next free
+        // tags after 75 (tag 59 stays retired).
+        assert_eq!(event_type_tag(&EventType::CrossContextToolInvoked), 76);
+        assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
     }
 
     #[test]

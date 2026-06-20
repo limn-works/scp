@@ -342,6 +342,11 @@ type DivergenceMarkerPlan = (
         [u8; 32],
         crate::context::actor::commands::SigningKeyBytes,
     ); 2],
+    // CONVERGENT committer-assigned leaf-timestamp (seconds) for the
+    // divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000`, the
+    // same convergent instant the committed-side `ToolInvoked` leaf carries
+    // (spec §6.2.4 *Recorded timestamp*).
+    u64,
 );
 
 /// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
@@ -6985,7 +6990,7 @@ impl Supervisor {
         // `.await`s below (the ctx carries the non-`Sync` boxed executor, which
         // would otherwise poison this future's `Send` bound). The loop holds only
         // owned values.
-        let (committed_event_id, nonce, sides) = plan;
+        let (committed_event_id, nonce, sides, committed_timestamp_secs) = plan;
         let committed_side = CommittedSide::Target;
 
         for (label, context_id, signing_key_bytes) in sides {
@@ -7000,6 +7005,7 @@ impl Supervisor {
                             nonce,
                             committed_side,
                             committed_event_id: committed_event_id_for_send,
+                            committed_timestamp_secs,
                             signing_key: signing_key_bytes,
                             reply,
                         })
@@ -7103,7 +7109,27 @@ impl Supervisor {
             .prepared_b
             .as_ref()
             .map_or(ctx.asserted_nonce, |b| b.recorded_nonce);
-        Some((committed_event_id, marker_nonce, sides))
+        // CONVERGENT marker-leaf timestamp: B's staged `recorded_timestamp_ms`
+        // (the same value signed into the receipt and written into the
+        // committed-side `ToolInvoked` leaf), in SECONDS. A marker can only exist
+        // once Commit-B landed (`committed_event_id` is `Some`), which implies
+        // Prepare-B ran and `prepared_b` is set — so this is B's staged value in
+        // practice; the `asserted_timestamp_ms` fallback is defensive. Drawing
+        // the marker leaf's timestamp from this single convergent instant (rather
+        // than each emitting actor's local clock) keeps the marker leaf
+        // byte-identical across honest members (§7.3.1, §9.9.3, §6.2.4 *Recorded
+        // timestamp*).
+        let committed_timestamp_secs = ctx
+            .prepared_b
+            .as_ref()
+            .map_or(ctx.asserted_timestamp_ms, |b| b.recorded_timestamp_ms)
+            / 1000;
+        Some((
+            committed_event_id,
+            marker_nonce,
+            sides,
+            committed_timestamp_secs,
+        ))
     }
 
     /// Record a supervisor-level divergence repair witness for an UNREACHABLE
@@ -14969,8 +14995,9 @@ mod tests {
     const XCTX_TARGET: [u8; 32] = [0x22u8; 32];
     const XCTX_TOOL: &str = "calculator-v1";
 
-    /// A recorded event-log append: `(context_id, event_name, actor_did, payload)`.
-    type RecordedEvent = ([u8; 32], String, String, Option<serde_json::Value>);
+    /// A recorded event-log append:
+    /// `(context_id, event_type, actor_did, payload_bytes, timestamp_secs)`.
+    type RecordedEvent = ([u8; 32], scp_event_log::EventType, String, Vec<u8>, u64);
 
     /// An event-log provider that RECORDS every append so a test can assert
     /// the dual `ToolInvoked` / `CrossContextToolInvoked` records (§6.2.4
@@ -14989,14 +15016,21 @@ mod tests {
         fn append_event(
             &self,
             id: &[u8; 32],
-            event: &str,
+            event_type: scp_event_log::EventType,
             actor: &str,
-            payload: Option<&serde_json::Value>,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             self.events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((*id, event.to_owned(), actor.to_owned(), payload.cloned()));
+                .push((
+                    *id,
+                    event_type,
+                    actor.to_owned(),
+                    payload.data,
+                    timestamp_secs,
+                ));
             Ok(())
         }
         fn destroy_event_log(
@@ -15399,23 +15433,32 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let nonce_hex = hex::encode(nonce);
+        // The committer-assigned (convergent) leaf timestamp both records MUST
+        // carry: B's signed `recorded_timestamp_ms`, in seconds. The two
+        // `nonce`-joined records date the one provenance edge identically, and
+        // every honest member reconstructs the same leaf (§7.3.1, §9.9.3).
+        let expected_leaf_secs = receipt.timestamp_ms / 1000;
         let tool_invoked = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_TARGET && name.starts_with("ToolInvoked:"))
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET && *event_type == scp_event_log::EventType::ToolInvoked
+            })
             .expect("target log must carry a ToolInvoked record");
         // The target's record carries B's re-derived chain depth + the saga id.
-        let ti_payload = tool_invoked.3.as_ref().expect("ToolInvoked payload");
+        let ti_payload: serde_json::Value =
+            serde_json::from_slice(&tool_invoked.3).expect("ToolInvoked payload");
         assert_eq!(ti_payload["chain_depth"], serde_json::json!(3));
+        // Convergent leaf timestamp (NOT a per-member clock read).
+        assert_eq!(tool_invoked.4, expected_leaf_secs);
         let xctx_invoked = events
             .iter()
-            .find(|(id, name, _, _)| {
-                *id == XCTX_CALLER && name.starts_with("CrossContextToolInvoked:")
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_CALLER
+                    && *event_type == scp_event_log::EventType::CrossContextToolInvoked
             })
             .expect("caller log must carry a CrossContextToolInvoked record");
-        let cci_payload = xctx_invoked
-            .3
-            .as_ref()
-            .expect("CrossContextToolInvoked payload");
+        let cci_payload: serde_json::Value =
+            serde_json::from_slice(&xctx_invoked.3).expect("CrossContextToolInvoked payload");
         // The two records share the correlation nonce (the join key) and the
         // caller record references the target ctx id.
         assert_eq!(cci_payload["nonce"], serde_json::json!(nonce_hex));
@@ -15423,6 +15466,9 @@ mod tests {
             cci_payload["target_context_id"],
             serde_json::json!(hex::encode(XCTX_TARGET))
         );
+        // The caller-side leaf dates the SAME convergent instant as the
+        // target's `ToolInvoked` leaf (drawn from B's signed receipt).
+        assert_eq!(xctx_invoked.4, expected_leaf_secs);
     }
 
     /// Prepare-B reject (confused deputy): the caller references a UCAN proof in
@@ -15918,16 +15964,16 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
-
         // TARGET log carries a marker signed by the TARGET key.
-        let (_, _, _, target_payload) = events
+        let (_, _, _, target_payload, _) = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name)
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            })
             .expect("target log must carry a divergence marker");
         let target_marker: CrossContextDivergenceMarker =
-            serde_json::from_value(target_payload.clone().expect("marker payload"))
-                .expect("decode target marker");
+            serde_json::from_slice(target_payload).expect("decode target marker");
         assert_eq!(target_marker.committed_side, CommittedSide::Target);
         assert_eq!(target_marker.saga_id, saga_id.0);
         assert_eq!(target_marker.nonce, nonce);
@@ -15940,13 +15986,15 @@ mod tests {
         );
 
         // CALLER log carries a marker signed by the CALLER key.
-        let (_, _, _, caller_payload) = events
+        let (_, _, _, caller_payload, _) = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_CALLER && *name == marker_name)
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_CALLER
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            })
             .expect("caller log must carry a divergence marker");
         let caller_marker: CrossContextDivergenceMarker =
-            serde_json::from_value(caller_payload.clone().expect("marker payload"))
-                .expect("decode caller marker");
+            serde_json::from_slice(caller_payload).expect("decode caller marker");
         assert_eq!(caller_marker.committed_side, CommittedSide::Target);
         assert_eq!(caller_marker.saga_id, saga_id.0);
         assert_eq!(caller_marker.nonce, nonce);
@@ -16029,11 +16077,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
         assert!(
-            events
-                .iter()
-                .any(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name),
+            events.iter().any(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            }),
             "the reachable target side must still record its marker into its own log"
         );
     }

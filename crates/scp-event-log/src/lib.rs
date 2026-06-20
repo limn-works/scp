@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 75 event type variants.
+//! - [`EventType`] -- The 77 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -90,7 +90,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 75 event type variants for SCP context event logs.
+/// The 77 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -98,7 +98,8 @@ pub trait EventLogSigner: Send + Sync {
 /// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
-/// and app-sandbox-binding variants. This is a CLOSED set with no catch-all
+/// and app-sandbox-binding variants; the ADR-011 Amendment §6 cross-context-saga
+/// carve-out added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
@@ -405,6 +406,43 @@ pub enum EventType {
     /// Payload (positional `MessagePack`): `app_did: String`. See
     /// [`crate::payload`].
     AppUnbound,
+
+    // -------------------------------------------------------------------
+    // Cross-context tool-call saga event types (ADR-011 Amendment §6
+    // carve-out; `.docs/adrs/phase-2.md`). UNLIKE the intra-context,
+    // per-author `ToolInvoked` emission (excluded as non-convergent under
+    // the §2 per-author exclusion), the cross-context tool-call saga records
+    // these WITHIN the saga's MLS-Commit phase: they are commit-ordered,
+    // convergent, durable leaves — every honest member processing the same
+    // saga commit produces the byte-identical leaf (committer-assigned
+    // timestamp drawn from B's signed `CrossContextToolReceipt`). The
+    // committed-side event id is itself a signed receipt field, so the
+    // record is canonical by design. See spec §6.2.4 "Dual event-log
+    // recording".
+    // -------------------------------------------------------------------
+    /// A cross-context tool call was recorded on the CALLER side (spec
+    /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
+    ///
+    /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
+    /// event. Emitted by the caller-side actor at Commit-A referencing the
+    /// target context id and the same `nonce` as the target's
+    /// [`EventType::ToolInvoked`] record, so an auditor joins the two into one
+    /// provenance edge. The committer-assigned leaf timestamp is the target's
+    /// signed-receipt `timestamp_ms` (B's staged Prepare-B instant), so two
+    /// honest members reconstruct the identical leaf.
+    CrossContextToolInvoked,
+    /// A one-sided cross-context saga commit was made durably auditable (spec
+    /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
+    ///
+    /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
+    /// event. Emitted on a `NeedsRepair` outcome into each available side's
+    /// log, recording which side committed, the `SagaId`, the `nonce`, and the
+    /// committed-side event id (a signed `CrossContextDivergenceMarker`
+    /// payload). The committer-assigned leaf timestamp is the target's staged
+    /// `recorded_timestamp_ms` (the same convergent instant the committed-side
+    /// [`EventType::ToolInvoked`] leaf carries), so the marker leaf is
+    /// byte-identical across honest members.
+    CrossContextDivergenceMarker,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,8 +710,8 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 75-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_75_distinct_variants`.
+        // The 77-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -762,19 +800,21 @@ mod tests {
             EventType::RecoveryEpochAdvanced,
             EventType::AppBound,
             EventType::AppUnbound,
+            EventType::CrossContextToolInvoked,
+            EventType::CrossContextDivergenceMarker,
         ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_75_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            75,
-            "closed EventType taxonomy must enumerate exactly 75 variants"
+            77,
+            "closed EventType taxonomy must enumerate exactly 77 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -785,8 +825,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            75,
-            "all 75 EventType variants must serialize to distinct values"
+            77,
+            "all 77 EventType variants must serialize to distinct values"
         );
     }
 

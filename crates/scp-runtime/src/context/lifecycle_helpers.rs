@@ -3578,17 +3578,20 @@ mod restore_reconcile_tests {
         );
     }
 
-    /// ADR-049 §9 (round-9 leak fix) — BEHAVIORAL. `finalize_send` reserves a
-    /// per-sender sequence in its caller (`send_message`), and OWNS the sequence
-    /// rollback on every error exit. Its FIRST statement is the `MessageSent`
-    /// `append_context_event`; before this fix that `?` returned BEFORE the
-    /// relocated rollbacks, so an event-log append failure leaked the reserved
-    /// sequence → a per-sender gap → a receiver `SequenceGapForceClose`. This
-    /// test drives a WORKING persistence + a FAILING event-log append directly
-    /// through `finalize_send` and asserts the reserved sequence returns to its
-    /// pre-reservation baseline EXACTLY ONCE (no leak, no double-rollback).
+    /// M12 / ADR-051 §6 (phase-2.md ADR-011 amendment exclusion taxonomy §2) —
+    /// BEHAVIORAL. `MessageSent` is NO LONGER a durable Merkle leaf: it is a
+    /// per-author, non-convergent event surfaced only as the local
+    /// `ContextEvent::MessageSent`, so two honest members derive the same
+    /// `event_log_merkle_root` (§9.9.3). Because `finalize_send` no longer issues
+    /// a `MessageSent` `append_context_event`, a FAILING event-log append can no
+    /// longer make `finalize_send` return `Err` for a plain send, and there is no
+    /// append-failure sequence rollback. This test drives a WORKING persistence +
+    /// a FAILING event-log append directly through `finalize_send` and asserts the
+    /// send SUCCEEDS and the reserved sequence stays CONSUMED (the next
+    /// reservation reissues 2) — pinning that the durable `MessageSent` append
+    /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
-    async fn finalize_send_rolls_back_sequence_on_event_log_append_failure() {
+    async fn finalize_send_succeeds_without_durable_message_sent_append() {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
         ));
@@ -3639,9 +3642,10 @@ mod restore_reconcile_tests {
             .expect("sender is a member");
         assert_eq!(reserved, 1, "first reservation yields sequence 1");
 
-        // Encrypted (non-broadcast) send: the failing append must roll the
-        // reservation back. `signing_key = None` → the post-append checkpoint
-        // path is skipped, but the append fails first regardless.
+        // Encrypted (non-broadcast) send: with `MessageSent` no longer a durable
+        // leaf (M12), the FAILING event-log append is never invoked by
+        // `finalize_send` for this send, so it SUCCEEDS. `signing_key = None`
+        // skips the post-send checkpoint path.
         let result = crate::context::messaging_helpers::finalize_send(
             &mut state,
             &deps,
@@ -3656,23 +3660,21 @@ mod restore_reconcile_tests {
         );
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "a failing event-log append must surface as EventLogFailed: got {result:?}"
+            result.is_ok(),
+            "with MessageSent excluded from the durable log (M12), a failing \
+             event-log append must NOT fail finalize_send: got {result:?}"
         );
 
-        // The reservation must have been rolled back EXACTLY ONCE: the next
-        // reservation returns 1 again. A leak would make it return 2; a
-        // double-rollback (saturating_sub past the floor) would also return 1
-        // here but only because it underflowed — so additionally assert the
-        // pre-reservation reissue is stable across two calls.
-        let next_after_failure = state
+        // The reserved sequence stays CONSUMED — there is no append-failure
+        // rollback anymore — so the next reservation reissues 2.
+        let next_after_send = state
             .membership
             .next_sequence_number(sender.as_ref())
             .expect("sender is still a member");
         assert_eq!(
-            next_after_failure, 1,
-            "the reserved sequence must roll back to baseline exactly once, so the \
-             next reservation reissues 1 (a leak would reissue 2)"
+            next_after_send, 2,
+            "the reserved sequence stays consumed (no durable MessageSent append, \
+             no append-failure rollback), so the next reservation reissues 2"
         );
     }
 

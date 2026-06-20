@@ -328,6 +328,7 @@ async fn dispatch_commit_phase(
             nonce,
             committed_side,
             committed_event_id,
+            committed_timestamp_secs,
             signing_key,
             reply,
         } => emit_divergence_marker(
@@ -337,6 +338,7 @@ async fn dispatch_commit_phase(
             nonce,
             committed_side,
             &committed_event_id,
+            committed_timestamp_secs,
             &signing_key,
             reply,
         ),
@@ -1465,11 +1467,38 @@ fn commit_b_first_settle(
         "chain_depth": receipt.chain_depth,
         "timestamp_ms": receipt.timestamp_ms,
     });
+    // CONVERGENT committer-assigned leaf timestamp: the saga's `ToolInvoked` is a
+    // commit-ordered convergent durable leaf (ADR-011 Amendment §6 carve-out),
+    // NOT a per-author-excluded event. Draw the timestamp from B's signed
+    // `recorded_timestamp_ms` (the receipt's `timestamp_ms`, in ms) — the single
+    // staged value B also wrote into the receipt and that a replayed Commit
+    // reproduces byte-for-byte — never a fresh Commit-time `now()`, so two honest
+    // members reconstruct the identical leaf (§7.3.1, §9.9.3).
+    let tool_invoked_payload_bytes = match serde_json::to_vec(&tool_invoked_payload) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let err = ContextError::EventLogFailed(format!(
+                "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
+            ));
+            state.xctx_committed_outputs.remove(saga_id);
+            state.saga_pending.insert(
+                saga_id.clone(),
+                SagaPreparedState::CrossContextToolInvocation(prepared),
+            );
+            if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
+                return Err((true, persist_err));
+            }
+            return Err((false, err));
+        }
+    };
     if let Err(e) = deps.event_log.append_context_event_with_payload(
         &target_context_id,
-        &event_id,
+        scp_event_log::EventType::ToolInvoked,
         &caller_did_str,
-        Some(&tool_invoked_payload),
+        scp_event_log::EventPayload {
+            data: tool_invoked_payload_bytes,
+        },
+        receipt.timestamp_ms / 1000,
     ) {
         // The append failed AFTER the capture+persist landed. Roll the capture
         // back and re-stage the owned slot, then RE-PERSIST so the rolled-back
@@ -1575,6 +1604,60 @@ struct CommitARequest {
     output_bytes: Vec<u8>,
 }
 
+/// Builds the caller-side `CrossContextToolInvoked` leaf: its CONVERGENT
+/// committer-assigned timestamp (seconds) + its JSON payload bytes.
+///
+/// The caller-side record is a commit-ordered convergent durable leaf (ADR-011
+/// Amendment §6 carve-out), NOT a per-author-excluded event. It MUST hash the
+/// SAME instant as B's `ToolInvoked` leaf so the two `nonce`-joined records date
+/// the one provenance edge identically. That instant is B's signed
+/// `recorded_timestamp_ms`, carried in the forwarded, already-verified
+/// `CrossContextToolReceipt` (`timestamp_ms`, in ms). Re-deriving it from the
+/// receipt bytes rather than any local clock keeps every honest member's leaf
+/// byte-identical (§7.3.1, §9.9.3, §6.2.4 *Recorded timestamp*).
+///
+/// Every payload field is convergent committed data — `saga_id`, the target ctx
+/// id, B's staged `nonce`, the receipt output hash, and the JCS-canonical
+/// receipt's byte length — so no per-member value enters the leaf.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] if the receipt cannot be parsed for
+/// its timestamp or the payload cannot be serialized.
+//
+// Takes the individual fields rather than `&CommitARequest` because by this
+// point `req.reservation` has been partially moved (its ticket was consumed by
+// the settle path), so a whole-`req` borrow would not compile.
+fn cross_context_invoked_leaf(
+    receipt_bytes: &[u8],
+    saga_id: &str,
+    target_context_id: &[u8; 32],
+    nonce: &[u8; 16],
+    output_bytes: &[u8],
+) -> Result<(u64, Vec<u8>), ContextError> {
+    let receipt: CrossContextToolReceipt =
+        serde_json::from_slice(receipt_bytes).map_err(|err| {
+            ContextError::EventLogFailed(format!(
+                "SCP-SAGA-13039: CrossContextToolInvoked timestamp could not be \
+                 read from the receipt: {err}"
+            ))
+        })?;
+    let invoked_leaf_secs = receipt.timestamp_ms / 1000;
+    let invoked_payload = serde_json::json!({
+        "saga_id": saga_id,
+        "target_context_id": hex_context_id(target_context_id),
+        "nonce": hex::encode(nonce),
+        "output_hash": hex_output_hash(output_bytes),
+        "receipt_len": receipt_bytes.len(),
+    });
+    let invoked_payload_bytes = serde_json::to_vec(&invoked_payload).map_err(|err| {
+        ContextError::EventLogFailed(format!(
+            "SCP-SAGA-13040: CrossContextToolInvoked payload serialization failed: {err}"
+        ))
+    })?;
+    Ok((invoked_leaf_secs, invoked_payload_bytes))
+}
+
 /// Commit-A handler (spec §6.2.4 "Commit", caller side). Runs on the LOCAL
 /// caller-context actor.
 ///
@@ -1676,24 +1759,40 @@ async fn commit_a(
         return Outcome::err_mutated(sketch);
     }
 
-    // Append `CrossContextToolInvoked` to the local (caller) log: references the
-    // target ctx id + the SAME nonce as B's `ToolInvoked` so an auditor joins
-    // the two records into one provenance edge (spec §6.2.4 "Dual event-log
-    // recording"). The output hash links the record to the verified receipt.
-    // Runs ONLY after the witness + persist landed.
-    let event_name = format!("CrossContextToolInvoked:{}", req.saga_id.0);
-    let invoked_payload = serde_json::json!({
-        "saga_id": req.saga_id.0,
-        "target_context_id": hex_context_id(&req.target_context_id),
-        "nonce": hex::encode(req.nonce),
-        "output_hash": hex_output_hash(&req.output_bytes),
-        "receipt_len": req.receipt.len(),
-    });
+    // Build the convergent `CrossContextToolInvoked` leaf (timestamp + payload
+    // bytes) from the forwarded receipt + request. A malformed receipt or
+    // serialization failure here is a post-witness fault: roll the witness back
+    // and re-persist (identical compensation to the append-failure path below)
+    // so a retry re-runs Commit-A from a clean state rather than skipping the
+    // append forever.
+    let (invoked_leaf_secs, invoked_payload_bytes) = match cross_context_invoked_leaf(
+        &req.receipt,
+        &req.saga_id.0,
+        &req.target_context_id,
+        &req.nonce,
+        &req.output_bytes,
+    ) {
+        Ok(leaf) => leaf,
+        Err(err) => {
+            state.xctx_committed_invocations.remove(&req.saga_id);
+            if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
+                let sketch = outcome_error_sketch(&persist_err);
+                let _ = reply.send(Err(persist_err));
+                return Outcome::err_mutated(sketch);
+            }
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err_mutated(sketch);
+        }
+    };
     if let Err(err) = deps.event_log.append_context_event_with_payload(
         &req.caller_context_id,
-        &event_name,
+        scp_event_log::EventType::CrossContextToolInvoked,
         req.caller_did.as_ref(),
-        Some(&invoked_payload),
+        scp_event_log::EventPayload {
+            data: invoked_payload_bytes,
+        },
+        invoked_leaf_secs,
     ) {
         // The append failed AFTER the witness + persist landed. Roll the witness
         // back and RE-PERSIST so the rolled-back state is durable — otherwise the
@@ -1940,6 +2039,14 @@ async fn abort(
 /// The marker records which side committed, the `SagaId`, the `nonce`, and the
 /// committed-side event id — making a one-sided commit durably auditable rather
 /// than a silent repudiation primitive. Class-S sync-persists fail-closed.
+///
+/// `committed_timestamp_secs` is the CONVERGENT committer-assigned leaf
+/// timestamp — B's staged `recorded_timestamp_ms / 1000`, the same convergent
+/// instant the committed-side `ToolInvoked` leaf carries (spec §6.2.4 *Recorded
+/// timestamp*). The marker is a commit-ordered convergent durable leaf (ADR-011
+/// Amendment §6 carve-out), so the timestamp MUST be this convergent value and
+/// NOT an actor-local clock read, or two honest members would derive divergent
+/// marker leaves (§9.9.3).
 // Sync: the body performs only synchronous event-log append + Class-S persist,
 // so it does not `.await`. Keeping it sync lets it take a shared
 // `&PerContextState` borrow (which is `!Send`) without making the actor future
@@ -1952,6 +2059,7 @@ fn emit_divergence_marker(
     nonce: [u8; 16],
     committed_side: CommittedSide,
     committed_event_id: &str,
+    committed_timestamp_secs: u64,
     signing_key: &SigningKeyBytes,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -1979,10 +2087,13 @@ fn emit_divergence_marker(
         }
     };
 
-    // Serialize the signed marker as the event payload so an auditor can verify
-    // it directly from the log entry.
-    let marker_payload = match serde_json::to_value(&marker) {
-        Ok(v) => v,
+    // Serialize the signed marker as the event-leaf payload so an auditor can
+    // verify it directly from the log entry. The `saga_id` provenance formerly
+    // carried in the event-name string now rides INSIDE the payload — `saga_id`
+    // is a signed field of the `CrossContextDivergenceMarker` — while the typed
+    // `EventType::CrossContextDivergenceMarker` replaces the string name.
+    let marker_payload_bytes = match serde_json::to_vec(&marker) {
+        Ok(bytes) => bytes,
         Err(e) => {
             let err = ContextError::CryptoFailed(format!(
                 "SCP-SAGA-13037: divergence-marker serialization failed for saga '{}': {e}",
@@ -1993,12 +2104,14 @@ fn emit_divergence_marker(
             return Outcome::err(sketch);
         }
     };
-    let event_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
     if let Err(err) = deps.event_log.append_context_event_with_payload(
         &state.context_id,
-        &event_name,
+        scp_event_log::EventType::CrossContextDivergenceMarker,
         "",
-        Some(&marker_payload),
+        scp_event_log::EventPayload {
+            data: marker_payload_bytes,
+        },
+        committed_timestamp_secs,
     ) {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -2171,9 +2284,10 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event_type: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -2242,7 +2356,7 @@ mod tests {
     impl_persistence!(OkPersistence, Ok(()));
     impl_persistence!(FailPersistence, Err("induced persist failure".into()));
 
-    /// Event log that COUNTS `ToolInvoked:`-prefixed appends — used to assert a
+    /// Event log that COUNTS typed `ToolInvoked` appends — used to assert a
     /// Commit-B persist-retry produces EXACTLY ONE `ToolInvoked` (FIX 3).
     struct CountingEventLog {
         tool_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
@@ -2257,11 +2371,12 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            event: &str,
+            event_type: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            if event.starts_with("ToolInvoked:") {
+            if event_type == scp_event_log::EventType::ToolInvoked {
                 self.tool_invoked_appends
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -2385,7 +2500,7 @@ mod tests {
         }
     }
 
-    /// Event log that COUNTS `CrossContextToolInvoked:`-prefixed appends (the
+    /// Event log that COUNTS typed `CrossContextToolInvoked` appends (the
     /// A-side record) — used to assert a Commit-A whose witness-persist FAILS
     /// appends NO `CrossContextToolInvoked` orphan (the append is gated behind
     /// the successful witness persist).
@@ -2402,11 +2517,12 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            event: &str,
+            event_type: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            if event.starts_with("CrossContextToolInvoked:") {
+            if event_type == scp_event_log::EventType::CrossContextToolInvoked {
                 self.xctx_invoked_appends
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -3629,6 +3745,32 @@ mod tests {
         SigningKeyBytes::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
     }
 
+    /// Build a valid JCS-serialized `CrossContextToolReceipt` for Commit-A
+    /// tests. Commit-A re-reads the convergent leaf timestamp from the forwarded
+    /// receipt (spec §6.2.4 *Recorded timestamp*), so a Commit-A test must pass a
+    /// well-formed receipt rather than a stub blob. `timestamp_ms` is B's staged
+    /// `recorded_timestamp_ms`; the leaf the handler appends carries
+    /// `timestamp_ms / 1000`.
+    fn test_receipt_bytes(timestamp_ms: u64) -> Vec<u8> {
+        let target_key = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+        let receipt = CrossContextToolReceipt::sign(
+            &target_key,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0xC4; 32],
+                target_context_id: [0xEE; 32],
+                caller_did: CALLER.to_owned(),
+                nonce: [0x42; 16],
+                tool_registration_id: TOOL.to_owned(),
+                output_jcs: br#"{"result":1}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:saga-commit-a-1".to_owned(),
+                chain_depth: 3,
+                timestamp_ms,
+            },
+        )
+        .expect("sign test receipt");
+        jcs_receipt_bytes(&receipt).expect("serialize test receipt")
+    }
+
     /// Stage a Prepare-B slot for `saga_id` by running the real `prepare_b`
     /// (ungated tool) so Commit-B has the B-recorded provenance to sign over.
     async fn stage_prepared_b(
@@ -3823,7 +3965,7 @@ mod tests {
             caller_did: DID(CALLER.to_owned()),
             target_context_id: [0xEE; 32],
             nonce,
-            receipt: br#"{"sig":"x"}"#.to_vec(),
+            receipt: test_receipt_bytes(1_700_000_000_000),
             output_bytes: br#"{"result":1}"#.to_vec(),
         };
         let (tx, rx) = oneshot::channel();
@@ -3854,7 +3996,7 @@ mod tests {
             caller_did: DID(CALLER.to_owned()),
             target_context_id: [0xEE; 32],
             nonce,
-            receipt: br#"{"sig":"x"}"#.to_vec(),
+            receipt: test_receipt_bytes(1_700_000_000_000),
             output_bytes: br#"{"result":1}"#.to_vec(),
         };
         let (tx, rx) = oneshot::channel();
@@ -3927,7 +4069,7 @@ mod tests {
             caller_did: DID(CALLER.to_owned()),
             target_context_id: [0xEE; 32],
             nonce: [0x42; 16],
-            receipt: br#"{"sig":"x"}"#.to_vec(),
+            receipt: test_receipt_bytes(1_700_000_000_000),
             output_bytes: br#"{"result":1}"#.to_vec(),
         };
         let (tx, rx) = oneshot::channel();
@@ -4383,6 +4525,10 @@ mod tests {
             [0xAB; 16],
             CommittedSide::Target,
             "evt-committed-9",
+            // Convergent committer-assigned leaf timestamp (B's staged
+            // recorded_timestamp_ms / 1000); fixed here so the test is
+            // deterministic.
+            1_700_000_000,
             &signing,
             tx,
         );
@@ -4676,6 +4822,10 @@ mod tests {
                 adapter_proof: vec![],
                 timestamp: 1_000_001,
                 signature: vec![],
+                // Synthetic test receipt: never appended to the canonical Merkle
+                // log, so it is not anchored (matches `PaymentReceipt`'s
+                // unanchored default; the field lies outside the signed payload).
+                anchored: false,
             })
         }
         async fn void(
@@ -5121,7 +5271,7 @@ mod tests {
             caller_did: caller.clone(),
             target_context_id: [0xEE; 32],
             nonce: [0x42; 16],
-            receipt: br#"{"sig":"x"}"#.to_vec(),
+            receipt: test_receipt_bytes(1_700_000_000_000),
             output_bytes: br#"{"result":1}"#.to_vec(),
         };
         let (tx, rx) = oneshot::channel();

@@ -379,7 +379,11 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 /// native↔WASM unification variants (ADR-011 Amendment) are classified per the
 /// same §2c rationale: governance / membership / lifecycle /
 /// structural-evolution events are structural; high-frequency operational
-/// records are operational.
+/// records are operational. The 2 ADR-011 Amendment §6 cross-context-saga
+/// variants follow the same rule: `CrossContextDivergenceMarker` (a durable
+/// one-sided-commit accountability record) is structural;
+/// `CrossContextToolInvoked` (a per-invocation provenance edge, the
+/// cross-context analog of `ToolInvoked`) is operational.
 ///
 /// Classification note:
 /// [`EventType::ContentKeysRotated`] and [`EventType::RecoveryEpochAdvanced`]
@@ -446,7 +450,12 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::ConsequenceEnforcementFailed
         | EventType::ConsequenceEscalatedToSuspendAll
         | EventType::AppBound
-        | EventType::AppUnbound => true,
+        | EventType::AppUnbound
+        // Cross-context-saga divergence marker (ADR-011 Amendment §6): a durable
+        // non-repudiation/accountability record of a one-sided saga commit,
+        // essential for operator repair and state-reconstruction verification —
+        // structural per ADR-030 §2c (same accountability class as Consequence*).
+        | EventType::CrossContextDivergenceMarker => true,
 
         // === OPERATIONAL (base retention; high-frequency records) ===
         //
@@ -483,7 +492,11 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::CommitBroadcastPending
         | EventType::CommitBroadcastSucceeded
         | EventType::CommitBroadcastFailed
-        | EventType::PaymentCaptureFailed => false,
+        | EventType::PaymentCaptureFailed
+        // Cross-context-saga caller-side tool-call record (ADR-011 Amendment §6):
+        // a per-invocation provenance edge, the cross-context analog of the
+        // operational `ToolInvoked` record — operational per ADR-030 §2c.
+        | EventType::CrossContextToolInvoked => false,
     }
 }
 
@@ -1131,7 +1144,7 @@ mod tests {
         // exists — so a future re-classification of any variant must update this
         // table deliberately. The expected values mirror the cryptographer-
         // confirmed classification in `is_structural_event`.
-        const EXPECTED: [(EventType, bool); 75] = [
+        const EXPECTED: [(EventType, bool); 77] = [
             // --- Base variants ---
             (EventType::ContextCreated, true),
             (EventType::ContextClosing, true),
@@ -1209,15 +1222,18 @@ mod tests {
             (EventType::RecoveryEpochAdvanced, true),
             (EventType::AppBound, true),
             (EventType::AppUnbound, true),
+            // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
+            (EventType::CrossContextToolInvoked, false),
+            (EventType::CrossContextDivergenceMarker, true),
         ];
 
         // Exhaustiveness guard: the table must cover the full closed taxonomy
-        // (exactly 75 variants). Adding a variant to `EventType` without adding
+        // (exactly 77 variants). Adding a variant to `EventType` without adding
         // it here leaves it unclassified-by-test, so this count is pinned.
         assert_eq!(
             EXPECTED.len(),
-            75,
-            "classification table must cover all 75 EventType variants"
+            77,
+            "classification table must cover all 77 EventType variants"
         );
 
         for (event_type, expected_structural) in &EXPECTED {
