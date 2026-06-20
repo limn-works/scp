@@ -293,7 +293,7 @@ class TestIdentity:
             assert new_identity.did.startswith("did:dht:")
             # The SDK wrapper must surface the DidRotationEvent JSON so
             # callers can distribute it to context members per spec
-            # §9.12 step 4b.
+            # spec §9.12, ADR-003 §4b.
             assert new_identity.rotation_event_json is not None
             event = json.loads(new_identity.rotation_event_json)
             assert event["new_did"] == new_identity.did
