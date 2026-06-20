@@ -19,30 +19,21 @@ export function _evaluateTestEnv(env: Record<string, string | undefined> | undef
   );
 }
 
-// Evaluated once at import time — runtime mutations to process.env cannot flip this.
-const _IS_TEST_ENVIRONMENT: boolean = (() => {
+// Read process.env once at module load — runtime mutations cannot flip these.
+const _ENV_AT_LOAD: Record<string, string | undefined> | undefined = (() => {
   try {
-    const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-    return _evaluateTestEnv(proc?.env);
-  } catch {
-    return false;
-  }
-})();
-
-// Frozen alongside _IS_TEST_ENVIRONMENT so the error message in
-// assertTestEnvironment always reports the value that drove the decision,
-// not a potentially-mutated live read of process.env.
-const _NODE_ENV_AT_LOAD: string | undefined = (() => {
-  try {
-    const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-    const env = proc?.env;
-    return env && typeof env === "object" && Object.hasOwn(env, "NODE_ENV")
-      ? env.NODE_ENV
-      : undefined;
+    return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process
+      ?.env as Record<string, string | undefined> | undefined;
   } catch {
     return undefined;
   }
 })();
+
+export const _IS_TEST_ENVIRONMENT: boolean = _evaluateTestEnv(_ENV_AT_LOAD);
+const _NODE_ENV_AT_LOAD: string | undefined =
+  _ENV_AT_LOAD !== undefined && Object.hasOwn(_ENV_AT_LOAD, "NODE_ENV")
+    ? _ENV_AT_LOAD.NODE_ENV
+    : undefined;
 
 /**
  * Returns true when the runtime is in a test or development environment.
