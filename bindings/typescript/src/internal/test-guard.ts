@@ -1,10 +1,12 @@
 // Evaluated once at import time — runtime mutations to process.env cannot flip this.
 const _IS_TEST_ENVIRONMENT: boolean = (() => {
   try {
-    const proc = (globalThis as { process?: { env?: { NODE_ENV?: string; BUN_TEST?: string } } })
-      .process;
-    const env = proc?.env?.NODE_ENV;
-    return env === "test" || env === "development" || proc?.env?.BUN_TEST !== undefined;
+    const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+    const env = proc?.env;
+    if (!env || typeof env !== "object") return false;
+    const nodeEnv = Object.hasOwn(env, "NODE_ENV") ? env.NODE_ENV : undefined;
+    const bunTest = Object.hasOwn(env, "BUN_TEST") ? env.BUN_TEST : undefined;
+    return nodeEnv === "test" || nodeEnv === "development" || bunTest !== undefined;
   } catch {
     return false;
   }
@@ -28,10 +30,17 @@ export function isTestEnvironment(): boolean {
  */
 export function assertTestEnvironment(hookName: string): void {
   if (!isTestEnvironment()) {
+    const _proc = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+      .process;
+    const _env = _proc?.env;
+    const _nodeEnv =
+      _env && typeof _env === "object" && Object.hasOwn(_env, "NODE_ENV")
+        ? _env.NODE_ENV
+        : undefined;
     throw new Error(
       `${hookName} is a test-only hook and may only be called in test or development ` +
         `environments (NODE_ENV=test|development, or BUN_TEST is set). ` +
-        `Current NODE_ENV=${String((globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV)}. ` +
+        `Current NODE_ENV=${String(_nodeEnv)}. ` +
         `If you're seeing this in legitimate code, your build is mis-configured or a ` +
         `dependency is attempting to swap the SCP native bridge.`,
     );
