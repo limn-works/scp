@@ -215,7 +215,7 @@ if (!napiAvailable) {
       }
     });
 
-    test("migrate returns an Identity with a NEW DID (spec §3.2.1)", async () => {
+    test("migrate returns an Identity with a NEW DID (spec §9.12)", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreate("in_memory");
@@ -224,7 +224,7 @@ if (!napiAvailable) {
         // Migration creates a new DID — it does NOT preserve the old one.
         // Use identityRotateKey() if the same DID with a new key is needed.
         expect(migrated.did).not.toBe(identity.did);
-        // Migration must produce a rotation event callers MUST distribute (spec §3.2.1)
+        // Migration must produce a rotation event callers MUST distribute (spec §9.12)
         expect(typeof migrated.rotationEventJson).toBe("string");
         expect(migrated.rotationEventJson?.length).toBeGreaterThan(0);
       } finally {
@@ -240,7 +240,7 @@ if (!napiAvailable) {
         const migrated = await scp.identityMigrate(identity);
         expect(migrated).toBeInstanceOf(Identity);
         // Migration MUST have dropped the #agent key from the new DID document
-        // (spec §3.2.1). Attempting to remove a non-existent agent key produces
+        // (spec §9.12). Attempting to remove a non-existent agent key produces
         // IdentityError (Rust: IdentityError::AgentKeyNotFound).
         let threw = false;
         try {

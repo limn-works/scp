@@ -921,7 +921,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * Returns the JSON-serialized `DidRotationEvent` if this handle
      * was produced by [`Scp::identity_migrate`]; `None` otherwise.
      * SDK callers MUST distribute the event to active context members
-     * per spec §3.2.1 step 4b.
+     * per spec §9.12 step 4b.
      */
     func rotationEventJson()  -> String?
     
@@ -1213,7 +1213,7 @@ open func rotateKey()async throws  -> Identity  {
      * Returns the JSON-serialized `DidRotationEvent` if this handle
      * was produced by [`Scp::identity_migrate`]; `None` otherwise.
      * SDK callers MUST distribute the event to active context members
-     * per spec §3.2.1 step 4b.
+     * per spec §9.12 step 4b.
      */
 open func rotationEventJson() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
