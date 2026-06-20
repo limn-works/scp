@@ -37,8 +37,10 @@
 //!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
 //!   [`commit_class_s_restore`](ClassSCell::commit_class_s_restore),
 //!   [`commit_class_s_compensating`](ClassSCell::commit_class_s_compensating),
+//!   [`commit_class_s_keep_compensating`](ClassSCell::commit_class_s_keep_compensating),
 //!   [`commit_class_s_then_append`](ClassSCell::commit_class_s_then_append))
-//!   perform the fail-closed persist; [`commit_best_effort`](ClassSCell::commit_best_effort)
+//!   perform the fail-closed persist;
+//!   [`commit_class_c_best_effort`](ClassSCell::commit_class_c_best_effort)
 //!   performs the best-effort persist (Class C).
 //!
 //! # View-typed combinators (this PR)
@@ -58,6 +60,15 @@
 //! - `*_compensating` — like `*_restore`, but after the in-state restore it runs
 //!   an async compensation for an EXTERNAL effect the mutation produced
 //!   (e.g. void an escrow).
+//! - `*_keep_compensating` — KEEP-direction for Class-S (like `*_keep`, the
+//!   Class-S mutation is NOT restored on persist failure), but run an async
+//!   `on_persist_failure` to undo the Class-C / external effects the failed
+//!   persist did not make durable. For sites that consume a security-critical
+//!   replay nonce (keep-S) while charging an in-memory Class-C reservation that
+//!   must be reversed when the reservation does not durably land. The undo is
+//!   the CALLER's hook (the combinator's snapshot covers only Class-S, which is
+//!   intentionally NOT restored here), and it receives a [`ClassCMut`] so it
+//!   cannot re-touch Class-S.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
 //!   log adapter on [`ActorDeps`]); if `after` fails, restore the snapshot and
@@ -178,7 +189,7 @@ impl Deref for ClassSMut<'_> {
 /// Class-C / structural portion — there is **no** `class_s_mut` /
 /// `governance_class_s_mut` here.
 ///
-/// Handed to [`ClassSCell::commit_best_effort`] (Class-C, best-effort persist)
+/// Handed to [`ClassSCell::commit_class_c_best_effort`] (Class-C, best-effort persist)
 /// and to the async compensation closure of
 /// [`ClassSCell::commit_class_s_compensating`]. The compensation runs AFTER the
 /// Class-S in-state restore, so it must not be able to re-touch Class-S state —
@@ -349,8 +360,9 @@ pub(crate) struct AppendOutcomeError {
 ///
 /// Reads go through [`Deref`]; there is intentionally no [`DerefMut`] (see the
 /// module docs). Mutations go through the view-typed combinators
-/// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` / `_then_append`
-/// for fail-closed persist, [`Self::commit_best_effort`] for best-effort).
+/// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` /
+/// `_keep_compensating` / `_then_append` for fail-closed persist,
+/// [`Self::commit_class_c_best_effort`] for best-effort).
 pub(crate) struct ClassSCell {
     /// The wrapped state. Private — the only mutable access is through the
     /// combinators (or the PR1-temporary [`Self::state_mut`] escape hatch).
@@ -439,6 +451,10 @@ impl ClassSCell {
         persist_state_fail_closed(&self.state, deps, context_id).map(|()| value)
     }
 
+    /// Pure-Class-S rollback on persist failure (snapshot covers ONLY the
+    /// Class-S sub-structs; mixed Class-S+Class-C sites MUST use
+    /// [`Self::commit_class_s_compensating`]).
+    ///
     /// Mutate Class-S state through a [`ClassSMut`] view and persist
     /// **fail-closed**, RESTORING the Class-S sub-structs on persist failure
     /// (ADR-049 §9).
@@ -503,6 +519,8 @@ impl ClassSCell {
         }
     }
 
+    /// Class-S rollback + caller Class-C/external compensation on persist failure.
+    ///
     /// Mutate Class-S state through a [`ClassSMut`] view, persist **fail-closed**,
     /// and on persist failure RESTORE the Class-S sub-structs AND run an async
     /// `compensate` to undo an EXTERNAL effect the mutation produced
@@ -569,6 +587,90 @@ impl ClassSCell {
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
                 compensate(external, ClassCMut::new(&mut self.state), deps).await;
+                Err(persist_err)
+            }
+        }
+    }
+
+    /// KEEP Class-S on persist failure + caller Class-C/external compensation
+    /// (for keep-direction sites like a consumed replay nonce).
+    ///
+    /// Keep the Class-S mutation on persist failure (like
+    /// [`Self::commit_class_s_keep`]), but run `on_persist_failure` to undo
+    /// Class-C / external effects that the failed persist did not make durable.
+    /// The Class-S sub-structs are NOT restored. Returns the persist error after
+    /// compensation (ADR-049 §9).
+    ///
+    /// # Decision criterion (keep-S, compensate-C-on-persist-failure)
+    ///
+    /// Choose this combinator — over [`Self::commit_class_s_keep`] (which keeps
+    /// the Class-C mutation too) and over [`Self::commit_class_s_compensating`]
+    /// (which RESTORES Class-S) — when a single mutation BOTH:
+    ///
+    /// - consumes security-critical Class-S state that must STAY consumed on
+    ///   persist failure (un-consuming it re-opens a replay / re-spend window —
+    ///   the fail-closed direction), AND
+    /// - charges an in-memory Class-C / external reservation that DID NOT
+    ///   durably land and so must be reversed.
+    ///
+    /// This is the shape of `reserve_tool_economy`: it consumes a spending-UCAN
+    /// nonce (Class-S — kept) while charging the `budget_tracker` /
+    /// `velocity_tracker` / `hard_rate_limit` (Class-C — reversed on persist
+    /// failure, because the reservation the caller is being charged for did not
+    /// become durable). The Class-C reversal is CONDITIONAL on the persist
+    /// result, so it cannot be folded into `f` (which runs before the persist):
+    /// `f` returns the handles the reversal needs as `external` (`X`), and the
+    /// reversal runs only on the persist-failure arm.
+    ///
+    /// `on_persist_failure` receives a [`ClassCMut`] (NOT a [`ClassSMut`]): the
+    /// Class-S sub-structs are intentionally left as `f` mutated them, so the
+    /// compensation must not — and structurally CANNOT — re-touch Class-S.
+    ///
+    /// # Snapshot SCOPE contract — keep-direction for Class-S
+    ///
+    /// Unlike [`Self::commit_class_s_restore`] / [`Self::commit_class_s_compensating`]
+    /// this combinator takes NO snapshot of the Class-S sub-structs: keep-direction
+    /// means there is nothing to restore. The ONLY undo on persist failure is the
+    /// caller-supplied `on_persist_failure` over Class-C / external effects.
+    ///
+    /// Sequence:
+    /// 1. Run `f(view)` → `(value, external)`. If `f` errs, return the error (no
+    ///    persist, no compensation — nothing durable or external to unwind that
+    ///    `f` did not itself unwind).
+    /// 2. On `Ok((value, external))`, persist fail-closed.
+    ///    - On persist SUCCESS return `Ok(value)` — the external effect committed,
+    ///      nothing to compensate.
+    ///    - On persist FAILURE run
+    ///      `on_persist_failure(external, ClassCMut, deps).await` to undo the
+    ///      Class-C / external effect (the Class-S mutation is KEPT — NOT
+    ///      restored), then return the persist error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
+    /// `on_persist_failure`, with the Class-S mutation retained).
+    ///
+    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
+    #[allow(dead_code)]
+    pub(crate) async fn commit_class_s_keep_compensating<T, X>(
+        &mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<(T, X), ContextError>,
+        // An `AsyncFnOnce` (see `commit_class_s_compensating`) — written
+        // `async |..|` at the call site — so the returned future may BORROW the
+        // `ClassCMut` view and `&ActorDeps` for the call's lifetime. The view
+        // borrows `&mut self.state`, so the future is held only across the
+        // immediate `.await` below.
+        on_persist_failure: impl AsyncFnOnce(X, ClassCMut<'_>, &ActorDeps),
+    ) -> Result<T, ContextError> {
+        // No Class-S snapshot: keep-direction leaves the Class-S mutation in
+        // place on persist failure, so there is nothing to restore.
+        let (value, external) = f(ClassSMut::new(&mut self.state))?;
+        match persist_state_fail_closed(&self.state, deps, context_id) {
+            Ok(()) => Ok(value),
+            Err(persist_err) => {
+                on_persist_failure(external, ClassCMut::new(&mut self.state), deps).await;
                 Err(persist_err)
             }
         }
@@ -681,6 +783,9 @@ impl ClassSCell {
         }
     }
 
+    /// Class-C best-effort persist (the Class-C path — no Class-S mutator on the
+    /// view, persist failure is not surfaced).
+    ///
     /// Mutate Class-C state through a [`ClassCMut`] view and persist
     /// **best-effort** (ADR-049 §9). Runs `f`, then [`persist_state_best_effort`] —
     /// a persist failure is logged + metered but not surfaced (the ≤50 ms
@@ -690,7 +795,7 @@ impl ClassSCell {
     ///
     /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
     #[allow(dead_code)]
-    pub(crate) fn commit_best_effort(
+    pub(crate) fn commit_class_c_best_effort(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -1254,6 +1359,167 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // commit_class_s_keep_compensating
+    // ------------------------------------------------------------------
+
+    /// `*_keep_compensating` on persist SUCCESS returns `Ok(value)`, runs NO
+    /// compensation, and retains the Class-S mutation. (The Class-C effect `f`
+    /// staged also stands — nothing to compensate when the persist landed.)
+    #[tokio::test]
+    async fn keep_compensating_does_not_compensate_on_persist_success() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x36));
+        let ctx = ctx_hex(0x36);
+        let compensated = Arc::new(AtomicUsize::new(0));
+        let comp_for_closure = Arc::clone(&compensated);
+        let member = DID("did:example:keep-comp-success".to_owned());
+        let member_for_f = member.clone();
+
+        let value = cell
+            .commit_class_s_keep_compensating(
+                &deps,
+                &ctx,
+                move |mut view| {
+                    // Class-S: consume a replay nonce (kept).
+                    view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                    // Class-C: stage an in-memory reservation (a member here).
+                    view.rest_mut().members.insert(member_for_f);
+                    Ok((5u32, "reservation-handle"))
+                },
+                async move |_external, _classc: ClassCMut<'_>, _deps: &ActorDeps| {
+                    comp_for_closure.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+            .expect("persist succeeds ⇒ Ok");
+
+        assert_eq!(value, 5);
+        assert_eq!(
+            compensated.load(Ordering::SeqCst),
+            0,
+            "no compensation on persist success"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "Class-S nonce kept on success"
+        );
+        assert!(
+            cell.members.contains(&member),
+            "Class-C reservation stands on success"
+        );
+    }
+
+    /// (key behaviour) `*_keep_compensating` on persist FAILURE runs
+    /// `on_persist_failure` (which undoes the Class-C effect), KEEPS the Class-S
+    /// mutation (NOT restored — fail-closed direction), and returns the persist
+    /// error.
+    #[tokio::test]
+    async fn keep_compensating_keeps_class_s_and_compensates_class_c_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x37));
+        let ctx = ctx_hex(0x37);
+        let member = DID("did:example:keep-comp-failure".to_owned());
+        let member_for_f = member.clone();
+        let external_for_undo = member.clone();
+        // The compensation observes that the Class-S nonce was NOT restored
+        // (still present) at the time it runs.
+        let saw_nonce_kept = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let kept_flag = Arc::clone(&saw_nonce_kept);
+
+        let result = cell
+            .commit_class_s_keep_compensating(
+                &deps,
+                &ctx,
+                move |mut view| {
+                    view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                    view.rest_mut().members.insert(member_for_f);
+                    Ok(((), external_for_undo))
+                },
+                async move |external: DID, mut classc: ClassCMut<'_>, _deps: &ActorDeps| {
+                    // Class-S kept: the nonce is still recorded when we compensate
+                    // (read via Deref to `&PerContextState`; the restricted
+                    // `ClassCMut` view exposes no Class-S *mutator*).
+                    kept_flag.store(
+                        classc
+                            .class_s
+                            .xctx_nonce_dedup
+                            .entries()
+                            .contains_key(&[0x3Cu8; 16]),
+                        Ordering::SeqCst,
+                    );
+                    // Undo the Class-C reservation the failed persist did not make
+                    // durable.
+                    classc.rest_mut().members.remove(&external);
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "persist failure surfaces; got {result:?}"
+        );
+        assert!(
+            saw_nonce_kept.load(Ordering::SeqCst),
+            "Class-S nonce is KEPT (not restored) when on_persist_failure runs"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "Class-S nonce retained on persist failure (fail-closed direction)"
+        );
+        assert!(
+            !cell.members.contains(&member),
+            "Class-C reservation undone by on_persist_failure"
+        );
+    }
+
+    /// `*_keep_compensating` returns `f`'s error without persisting or
+    /// compensating when `f` rejects.
+    #[tokio::test]
+    async fn keep_compensating_returns_f_error_without_persisting() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x38));
+        let ctx = ctx_hex(0x38);
+        let compensated = Arc::new(AtomicUsize::new(0));
+        let comp_for_closure = Arc::clone(&compensated);
+
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_keep_compensating(
+                &deps,
+                &ctx,
+                |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
+                async move |_external: (), _classc: ClassCMut<'_>, _deps: &ActorDeps| {
+                    comp_for_closure.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "f's error propagates unchanged; got {result:?}"
+        );
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "no persist runs when f rejects"
+        );
+        assert_eq!(
+            compensated.load(Ordering::SeqCst),
+            0,
+            "no compensation runs when f rejects"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // commit_class_s_then_append
     // ------------------------------------------------------------------
 
@@ -1520,10 +1786,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // commit_best_effort
+    // commit_class_c_best_effort
     // ------------------------------------------------------------------
 
-    /// `commit_best_effort` runs the Class-C mutation and issues exactly one
+    /// `commit_class_c_best_effort` runs the Class-C mutation and issues exactly one
     /// best-effort persist.
     #[tokio::test]
     async fn best_effort_runs_mutation_and_persists() {
@@ -1537,7 +1803,7 @@ mod tests {
         let member = DID("did:example:best-effort-member".to_owned());
         let member_for_closure = member.clone();
 
-        cell.commit_best_effort(&deps, &ctx, move |mut view| {
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
             view.rest_mut().members.insert(member_for_closure);
         });
 
@@ -1548,7 +1814,7 @@ mod tests {
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
             1,
-            "commit_best_effort issues exactly one persist"
+            "commit_class_c_best_effort issues exactly one persist"
         );
     }
 
@@ -1564,7 +1830,7 @@ mod tests {
         let mut cell = ClassSCell::new(fresh_state(0x52));
         let ctx = ctx_hex(0x52);
 
-        cell.commit_best_effort(&deps, &ctx, |mut view| {
+        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
             let split = view.split_class_c();
             // Hold all five borrows live at once; mutate two of them to prove
             // they are independent mutable references.
