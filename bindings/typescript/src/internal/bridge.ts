@@ -929,9 +929,11 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  *
  * Guarded by a positive test-environment check: throws unless `NODE_ENV` is
  * `"test"` or `"development"`, or `BUN_TEST` is set (which `bun:test` sets
- * automatically). Production builds keep this helper in the output, but any
- * call site outside a test/development environment throws immediately so the
- * seam cannot be abused at runtime.
+ * automatically). The primary security boundary is the production bundle:
+ * tsup dead-code-eliminates this helper entirely from `dist/` (it is not
+ * re-exported from `src/index.ts`), and the `package.json` `exports` map
+ * prevents deep imports of `internal/bridge`. The env guard is defence-in-depth
+ * for non-bundled / dev-server usage.
  *
  * Intended use: construct a mock `Bridge` with spy stubs for specific
  * operations (e.g. `bridgeEvaluateTrust`), then call
