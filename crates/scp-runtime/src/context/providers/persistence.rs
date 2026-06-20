@@ -231,6 +231,11 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            saga_pending: std::collections::HashMap::new(),
+            xctx_committed_outputs: std::collections::HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
+            xctx_caller_reservations: std::collections::HashMap::new(),
+            xctx_nonce_dedup: std::collections::HashMap::new(),
         }
     }
 

@@ -4,10 +4,16 @@
 //! On supervisor startup, `Supervisor::replay_unresolved_sagas`
 //! reads the journal's latest unresolved entries and dispatches
 //! per-state recovery:
-//!   - `Initiated` / `PreparingA` — discard (no remote side-effects
-//!     yet).
-//!   - `PreparingB` — abort (actor A Prepared in memory; journal
-//!     Abort marker rolls it back).
+//!   - `Initiated` — discard (Prepare-A never dispatched, no remote
+//!     side-effects yet).
+//!   - `PreparingA` / `PreparingB` — record-keyed reversal-and-confirm
+//!     (Prepare-A durably staged the caller deduction + reservation
+//!     record before the PreparingB journal append, so a crash in
+//!     either window may leave a live durable reservation): reverse the
+//!     caller's LOCAL economy from the durable record and mark terminal
+//!     only on a confirmed reversal, else leave non-terminal. A
+//!     non-xctx entry (no caller triple) has nothing to reverse and is
+//!     marked terminal directly.
 //!   - `Committing` / `Aborting` — emit `NeedsRepair` for operator
 //!     review.
 //!   - `NeedsRepair` — carry over (operator intervention required).

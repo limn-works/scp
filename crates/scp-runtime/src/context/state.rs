@@ -851,6 +851,152 @@ pub struct ContextSnapshot {
     /// re-announce, the same state a cold restore always starts from.
     #[serde(default = "default_context_routing")]
     pub routing: crate::context::actor::state::ContextRouting,
+    /// Staged cross-context saga evidence awaiting Commit or Abort
+    /// (ADR-049 §3 / §9; spec §5.15.8, §6.2.4). **Class S** —
+    /// synchronously-persisted, fail-closed.
+    ///
+    /// # Crash-safety classification — Class S (sync-persisted, fail-closed)
+    ///
+    /// ADR-049 §9 line 144 lists "`saga_pending` Prepare/Commit/Abort
+    /// transitions in the actor snapshot" in the synchronously-persisted set.
+    /// The live actor-side slot is
+    /// [`PerContextState::saga_pending`](crate::context::actor::state::PerContextState::saga_pending),
+    /// a `HashMap<SagaId, SagaPreparedState>`. Each Prepare/Commit/Abort
+    /// transition persists the snapshot containing this map SYNCHRONOUSLY —
+    /// via [`persist_state_fail_closed`](crate::context::messaging_helpers::persist_state_fail_closed)
+    /// — BEFORE the phase reply is acked, and a persist FAILURE FAILS CLOSED
+    /// (the handler returns `Err`, never a best-effort `Ok`). Without this, a
+    /// crash between Prepare and Commit would leave the supervisor
+    /// `SagaJournal` recording a phase the actor can no longer replay (lost
+    /// staged MLS handles / reservation linkage) — an orphaned reservation
+    /// plus a wedged saga that can neither commit nor cleanly abort.
+    ///
+    /// # Non-derive barrier (§9.4.3)
+    ///
+    /// The live [`SagaPreparedState`](crate::context::supervisor::saga_prepared_state::SagaPreparedState)
+    /// enum deliberately does NOT derive `Serialize`/`Deserialize` (the
+    /// §9.4.3 bearer barrier). This snapshot field therefore carries the
+    /// sanctioned public-projection mirror
+    /// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
+    /// instead, populated through the shared
+    /// [`saga_pending_snapshot`](crate::context::messaging_helpers::saga_pending_snapshot)
+    /// helper at every snapshot builder.
+    ///
+    /// # Local-only coordination state
+    ///
+    /// This is local cross-context coordination evidence with no authority on
+    /// any other node. Same-node restore REHYDRATES it (crash recovery);
+    /// cross-node `import_context` and the public `strip_snapshot_for_public`
+    /// export DROP it to empty — a foreign saga must never drive local
+    /// Commit/Abort. `#[serde(default)]` so legacy / stripped snapshots
+    /// deserialize as an empty map.
+    #[serde(default)]
+    pub saga_pending: HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
+    >,
+
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
+    /// durable output capture"). **Class S** — synchronously-persisted,
+    /// fail-closed, mirroring [`Self::saga_pending`].
+    ///
+    /// The live actor-side slot is
+    /// [`PerContextState::xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs).
+    /// Commit-B captures the tool output + signed receipt here BEFORE acking, so
+    /// a Commit replayed after a crash (§17.16.4) re-emits the stored output and
+    /// re-signs nothing — it returns the IDENTICAL receipt. A coalesce-window
+    /// rollback of this capture would re-invoke the tool on replay, the exact
+    /// exactly-once violation the synchronous persist forecloses.
+    ///
+    /// Unlike `saga_pending` this carries no §9.4.3 non-derive barrier — the
+    /// receipt + output are public protocol artifacts (no bearer bytes), so the
+    /// snapshot stores the live
+    /// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+    /// directly. Same local-only coordination semantics: same-node restore
+    /// REHYDRATES it; cross-node `import_context` / `strip_snapshot_for_public`
+    /// DROP it to empty (a foreign saga must never drive local Commit replay).
+    /// `#[serde(default)]` so legacy / stripped snapshots deserialize as empty.
+    #[serde(default)]
+    pub xctx_committed_outputs: HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+    >,
+
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
+    /// §17.16.4). **Class S** — synchronously-persisted, fail-closed, mirroring
+    /// [`Self::saga_pending`].
+    ///
+    /// The live slot is
+    /// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations).
+    /// Commit-A inserts the `SagaId` here as the idempotency witness BEFORE
+    /// acking; a replayed Commit-A re-acks as a no-op. A coalesce-window
+    /// rollback would let a replay double-settle the escrow, the exact hazard
+    /// the synchronous persist forecloses. Same-node restore REHYDRATES it;
+    /// cross-node export/import DROP it to empty. `#[serde(default)]` so legacy /
+    /// stripped snapshots deserialize as empty.
+    #[serde(default)]
+    pub xctx_committed_invocations:
+        std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
+
+    /// Caller-side (A-owned) durable reversal records for in-flight
+    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// (spec §6.2.4 "Reservation release on every terminal path"). **Class S** —
+    /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
+    ///
+    /// The live slot is
+    /// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations).
+    /// Prepare-A inserts a record here in the same Class-S snapshot as the
+    /// deduction it reverses; on a `PreparingB`-window crash the recovery sweep's
+    /// clean abort (`Abort { reservation: None }`) reverses the caller's
+    /// velocity / budget / hard-rate-limit and voids the external escrow FROM
+    /// this record — the in-memory RAII carrier died with the crash, so without
+    /// it the caller would be durably over-charged and the escrow would leak. A
+    /// coalesce-window rollback of an inserted record would lose the only durable
+    /// reversal handle, the exact hazard the synchronous persist forecloses.
+    /// Same-node restore REHYDRATES it; cross-node export/import DROP it to empty
+    /// (caller economy is local). `#[serde(default)]` so legacy / stripped
+    /// snapshots deserialize as empty.
+    ///
+    /// Like `xctx_committed_outputs` this carries no §9.4.3 non-derive barrier —
+    /// every field is public economy metadata (the escrow handle is the same
+    /// serde [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+    /// the payment rail issues), so the snapshot stores the live
+    /// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
+    /// directly.
+    #[serde(default)]
+    pub xctx_caller_reservations: std::collections::HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    >,
+
+    /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
+    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
+    /// projection of
+    /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
+    /// `{16-byte nonce → first-seen Unix secs}`.
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed, mirroring
+    /// [`Self::saga_pending`]. This cache is the ONLY gate against a replayed
+    /// `CrossContextToolInvoke` envelope re-submitted under a FRESH `SagaId`
+    /// within the 5-minute TTL (the `SagaId` idempotency witnesses and the
+    /// `xctx_committed_outputs` short-circuit only catch a SAME-`SagaId` replay).
+    /// If it reinitialized empty on restore, an actor crash inside the TTL window
+    /// would let an attacker re-run a charging tool (BLACK-624-01). Persisting it
+    /// makes Prepare-B's recorded-nonce rejection actually survive a restart —
+    /// the recorded nonce is already deliberately KEPT on the reject path "for
+    /// replay protection", and this is what makes that intent durable.
+    ///
+    /// Same-node restore REHYDRATES it (via
+    /// [`NonceDedup::from_entries`](scp_protocol::crypto::sender_keys::NonceDedup::from_entries),
+    /// with the per-entry TTL pruned lazily on the next check); cross-node
+    /// `import_context` / `strip_snapshot_for_public` DROP it to empty — B's
+    /// freshness state has no authority on a foreign node, and a fresh node
+    /// starts its own replay window. `#[serde(default)]` so legacy / stripped
+    /// snapshots deserialize as an empty cache.
+    #[serde(default)]
+    pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.

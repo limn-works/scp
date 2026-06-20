@@ -2117,7 +2117,123 @@ pub fn build_snapshot_from_state(
         // single shared type between live state and the serialized snapshot,
         // so no field-by-field translation is needed.
         routing: state.routing.clone(),
+        // ADR-049 §9 Class S (line 144): persist the staged saga slot through
+        // its sanctioned serialization mirror so a Prepare's staged evidence
+        // survives an actor crash. See [`saga_pending_snapshot`].
+        saga_pending: saga_pending_snapshot(state),
+        xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
+        xctx_committed_invocations: xctx_committed_invocations_snapshot(state),
+        // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
+        // reservation reversal records so a `PreparingB`-window crash can reverse
+        // the caller deduction + void the escrow without the in-memory carrier.
+        xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
+        xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
     }
+}
+
+/// Project the actor-side `saga_pending` map onto its serializable Class-S
+/// snapshot mirror (ADR-049 §9 line 144; spec §5.15.8 / §6.2.4 Prepare).
+///
+/// The live [`SagaPreparedState`](crate::context::supervisor::saga_prepared_state::SagaPreparedState)
+/// enum keeps the §9.4.3 non-derive barrier, so the snapshot carries the
+/// sanctioned
+/// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
+/// mirror instead. Every snapshot builder (the canonical one here plus the
+/// broadcast / ttl-close / trust-recovery / manager copies) routes through
+/// THIS one helper, so a saga in flight is dropped by none of them.
+#[must_use]
+pub(in crate::context) fn saga_pending_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
+> {
+    use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
+    state
+        .saga_pending
+        .iter()
+        .map(|(id, prepared)| {
+            (
+                id.clone(),
+                SagaPreparedStateSnapshot::from_prepared(prepared),
+            )
+        })
+        .collect()
+}
+
+/// Build the Class-S snapshot projection of the actor's COMMITTED
+/// cross-context tool-invocation captures (spec §6.2.4 "Exactly-once
+/// execution with durable output capture"; ADR-049 §9). The live
+/// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+/// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
+/// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
+/// Used at every snapshot builder so a crash between Commit-B capture and the
+/// next coalesced write cannot lose the durable output (which would re-invoke
+/// the tool on replay).
+pub(in crate::context) fn xctx_committed_outputs_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+> {
+    state.xctx_committed_outputs.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
+/// COMMITTED cross-context tool-invocation witness set (spec §6.2.4 "Commit",
+/// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
+/// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations)
+/// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
+/// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
+/// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
+/// field through ONE helper, exactly like its siblings
+/// (`saga_pending_snapshot` / `xctx_committed_outputs_snapshot` /
+/// `xctx_caller_reservations_snapshot` / `xctx_nonce_dedup_snapshot`) — no
+/// Class-S saga field is centralized by convention alone. Without persisting it,
+/// a crash that rolled the witness back behind an acked Commit-A would
+/// double-settle the caller escrow on replay.
+pub(in crate::context) fn xctx_committed_invocations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
+    state.xctx_committed_invocations.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's caller-side durable
+/// reservation reversal records (spec §6.2.4 "Reservation release on every
+/// terminal path"; §17.16.4 crash recovery; ADR-049 §9). The live
+/// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations)
+/// is a `{SagaId → CallerReservationRecord}` map whose values carry no §9.4.3
+/// bearer bytes (public economy metadata), so — like
+/// [`xctx_committed_invocations_snapshot`] — the snapshot stores it directly via
+/// `Clone`. Exists so EVERY snapshot builder projects this Class-S saga field
+/// through ONE helper, exactly like its siblings (`saga_pending_snapshot` /
+/// `xctx_committed_outputs_snapshot` / `xctx_committed_invocations_snapshot` /
+/// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by
+/// convention alone. Without persisting it, a `PreparingB`-window crash could
+/// never reverse the caller's deduction or void the escrow from the durable
+/// record, durably over-charging the caller.
+pub(in crate::context) fn xctx_caller_reservations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+> {
+    state.xctx_caller_reservations.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's B-owned cross-context
+/// nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"; ADR-049 §9). The
+/// live [`NonceDedup`](scp_protocol::crypto::sender_keys::NonceDedup) projects
+/// to a plain `{nonce → first-seen secs}` map via `entries()`. Persisting it at
+/// every snapshot builder makes the replay-protection cache CRASH-SURVIVING: a
+/// restart no longer reopens the 5-minute window for a fresh-`SagaId` replay of
+/// a `CrossContextToolInvoke` (BLACK-624-01). Same-node restore rehydrates it;
+/// cross-node export/import drops it to empty (B's freshness state has no
+/// authority on a foreign node).
+pub(in crate::context) fn xctx_nonce_dedup_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<[u8; 16], u64> {
+    state.xctx_nonce_dedup.entries()
 }
 
 // ---------------------------------------------------------------------------

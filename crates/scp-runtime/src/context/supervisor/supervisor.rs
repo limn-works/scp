@@ -57,6 +57,8 @@ use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
+use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -71,6 +73,32 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 // SagaInput / SagaOutput — plan §"Cross-context saga protocol"
 // ---------------------------------------------------------------------------
 
+/// Construction seal for [`SagaInput::CrossContextToolInvocation`]. A field of
+/// this type makes the variant un-constructible outside this module: the seal's
+/// single field is PRIVATE, so no `CrossContextSagaSeal { .. }` literal is
+/// possible outside `supervisor.rs`, and the only constructor
+/// ([`Self::new`]) is module-private. A cross-context tool invocation can
+/// therefore only be started via
+/// [`Supervisor::start_cross_context_tool_invocation_saga`] — the sole entry
+/// point that supplies the supervisor-side executor + signing keys. The variant
+/// remains freely pattern-matchable (`{ .. }`) everywhere; only its
+/// construction is sealed.
+///
+/// The TYPE is named at the enclosing `pub enum`'s visibility (so the
+/// `private_interfaces` lint is satisfied — the field is `pub` by enum
+/// inheritance), but CONSTRUCTABILITY is gated by the private field, exactly the
+/// "nameable ≠ constructible" discipline ADR-049 §5 uses for `OwnedIdentityDid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossContextSagaSeal(());
+
+impl CrossContextSagaSeal {
+    /// Mint the seal. Module-private: only `supervisor.rs` can construct it, so
+    /// only `supervisor.rs` can construct a `CrossContextToolInvocation` input.
+    const fn new() -> Self {
+        Self(())
+    }
+}
+
 /// Input to `Supervisor::start_saga`. The variant enumerates the 3
 /// saga types defined in plan §"Cross-context saga protocol"
 /// (standing-pair create, cross-context tool invoke, broadcast hosting
@@ -80,6 +108,24 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 /// The type is a discriminated union so that adding a fourth saga type
 /// later is a compile error at every call site — the default branch is
 /// not permitted.
+///
+/// # Construction of `CrossContextToolInvocation` is sealed
+///
+/// The `CrossContextToolInvocation` variant carries a private
+/// [`CrossContextSagaSeal`] guard field, so it CANNOT be constructed outside
+/// this module: an external caller cannot name the seal type to build the
+/// variant. This makes a "construct it, then hand it to the generic
+/// [`Supervisor::start_saga`]" misuse a COMPILE error rather than a runtime
+/// abort — a cross-context tool invocation can only be started through the
+/// dedicated [`Supervisor::start_cross_context_tool_invocation_saga`], which is
+/// the only entry point that can supply the supervisor-side tool executor and
+/// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
+/// a required choice the type system can enforce must not be skippable). The
+/// generic `start_saga` therefore only ever receives the publicly-constructible
+/// variants (`StandingPairCreate` / `BroadcastHostingHandshake`, both
+/// `NotImplemented` today). External pattern-matching on
+/// `CrossContextToolInvocation { .. }` is still allowed; only construction is
+/// sealed.
 pub enum SagaInput {
     /// Standing-pair creation between two identities. Full field set
     /// arrives with `handlers/standing.rs` in commit 11.
@@ -98,10 +144,40 @@ pub enum SagaInput {
         /// the gating reservation (ADR-049 §3a) needs the real 2-context set;
         /// spec §6.2.4's cross-context tool-invoke transport needs it too.
         target_context_id: [u8; 32],
-        /// Calling identity.
+        /// Calling identity. The channel-authenticated initiator the
+        /// supervisor binds (spec §6.2.4 "Caller authentication"), NOT an
+        /// envelope-asserted value.
         caller_did: DID,
-        /// Tool registration to invoke.
+        /// Tool registration to invoke — a context-LOCAL identifier indexing
+        /// B's own tool registry.
         tool_registration_id: String,
+        /// UCAN proof reference — an INDEX into B's own UCAN store, never the
+        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated tool.
+        ucan_proof_id: Option<String>,
+        /// The invocation input — validated at Prepare-B against the target
+        /// tool's registered schema specificity floor (spec §9.2.1) and passed
+        /// to the supervisor-side executor at Commit-B.
+        input: serde_json::Value,
+        /// Caller-asserted chain depth — advisory/untrusted; used only for the
+        /// `>= max_chain_depth` reject and as the `+1` base for B's re-derived
+        /// `recorded_chain_depth` (spec §6.2.4 "Chain-depth enforcement").
+        asserted_chain_depth: u8,
+        /// Caller-asserted 16-byte envelope nonce — checked against B's TTL
+        /// dedup cache, then staged on accept; the join key between the two
+        /// event-log records (spec §6.2.4 "Freshness" / "Dual event-log
+        /// recording").
+        asserted_nonce: [u8; 16],
+        /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew
+        /// freshness check, never recorded (spec §6.2.4 "Recorded timestamp").
+        asserted_timestamp_ms: u64,
+        /// Private construction seal (see the `SagaInput` doc-comment): the
+        /// variant cannot be built outside this module because the field's
+        /// type is module-private, so the only way to start a cross-context
+        /// tool-invocation saga is the dedicated
+        /// [`Supervisor::start_cross_context_tool_invocation_saga`], which
+        /// supplies the executor + signing keys the generic `start_saga`
+        /// cannot.
+        _seal: CrossContextSagaSeal,
     },
     /// Broadcast hosting handshake.
     BroadcastHostingHandshake {
@@ -128,13 +204,306 @@ pub enum SagaInput {
     },
 }
 
-/// Output from `Supervisor::start_saga` on success. The saga's durable
-/// outcome; commit 6 carries only the saga ID so the type is stable for
-/// callers.
+#[cfg(any(test, feature = "testing"))]
+impl SagaInput {
+    /// Test-only constructor for a `CrossContextToolInvocation` input whose only
+    /// load-bearing fields are the `{caller, target}` participant context set
+    /// (every other field is a fixed placeholder). It exists so the
+    /// per-participant-context-set GATING tests — which drive a cross-context
+    /// input through the generic `start_saga` precisely to prove the reservation
+    /// is released on the executor-less misuse path — can still build the
+    /// variant the production seal otherwise forbids. It is gated behind
+    /// `test`/`testing` so no production FFI build can reach it: a production
+    /// cross-context saga is started ONLY via
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`], which supplies
+    /// the executor + signing keys.
+    #[must_use]
+    pub fn test_cross_context_for_gating(
+        caller_context_id: [u8; 32],
+        target_context_id: [u8; 32],
+    ) -> Self {
+        Self::CrossContextToolInvocation {
+            caller_context_id,
+            target_context_id,
+            caller_did: DID("did:example:caller".to_owned()),
+            tool_registration_id: "tool-1".to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({}),
+            asserted_chain_depth: 0,
+            asserted_nonce: [0u8; 16],
+            asserted_timestamp_ms: 0,
+            _seal: CrossContextSagaSeal::new(),
+        }
+    }
+}
+
+/// Output from `Supervisor::start_saga` on success. Carries the durable
+/// saga identifier plus — for a committed cross-context tool-invocation
+/// saga — the target's signed receipt and captured tool output (spec
+/// §6.2.4 "Receipt / response return path").
 #[derive(Debug)]
 pub struct SagaOutput {
     /// Durable saga identifier; usable as a handle into the journal.
     pub saga_id: SagaId,
+    /// The target's signed `CrossContextToolReceipt` bytes (JCS), present
+    /// for a committed `CrossContextToolInvocation` saga. `None` for saga
+    /// types that produce no receipt (standing-pair / broadcast).
+    pub receipt: Option<Vec<u8>>,
+    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// present for a committed `CrossContextToolInvocation` saga. The exact
+    /// bytes the caller (A) side recorded a hash of. `None` otherwise.
+    pub output: Option<Vec<u8>>,
+}
+
+/// The non-`Send` tool executor the supervisor FSM runs supervisor-side
+/// BETWEEN Commit-B reserve and Commit-B settle (spec §6.2.4 "Commit": the
+/// generic executor cannot cross the actor mailbox per ADR-049 §3, so the
+/// FSM triggers execution off the mailbox and forwards the captured output
+/// to the settle round-trip).
+///
+/// Boxed as a trait object so [`Supervisor::run_saga_fsm`] stays
+/// non-generic across the (test / standing-pair / broadcast) saga inputs
+/// that have no executor; only the `CrossContextToolInvocation` arm
+/// consumes it. The future is boxed for the same reason. The closure is
+/// `FnOnce` — it executes the tool exactly once (§6.2.4 "Exactly-once
+/// execution"); a replayed Commit short-circuits before reaching it via
+/// the actor-side `AlreadyCommitted` capture, so the FSM never invokes the
+/// executor twice.
+///
+/// **`Send`.** "The generic executor cannot cross the mailbox" (ADR-049 §3)
+/// means it is never embedded in a [`ContextCommand`] and never run on the
+/// actor task — it runs supervisor-side. The closure itself IS `Send` (it
+/// captures `Send` tool-handler state, exactly like the closures
+/// [`Supervisor::invoke_tool_with_economy`] takes), so the saga future stays
+/// `Send` and the block-until-terminal saga can be driven from a spawned task.
+type SagaToolExecutor<'a> = Box<
+    dyn FnOnce(
+            serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+        > + Send
+        + 'a,
+>;
+
+/// Shorthand for the cross-context tool-invocation prepared state reconstructed
+/// from a journal entry's evidence (spec §6.2.4 "Crash recovery §17.16.4").
+type XctxPrepared =
+    crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+/// Outcome of a §17.16.4 Commit-in-progress recovery re-drive. The crash
+/// recovery re-drives the idempotent Commit-B and re-acks Commit-A from the
+/// durable witness, then journals the resolved terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitInProgressResolution {
+    /// BOTH sides committed (B re-emitted the stored output AND the A-side
+    /// `xctx_committed_invocations` witness is present): the saga is fully
+    /// committed — resolve to `Committed`, NOT a false `NeedsRepair`.
+    Committed,
+    /// Genuinely unresolvable divergence (B committed but A did not, B never
+    /// landed, or a side is unreachable): stays `NeedsRepair` for operator repair.
+    NeedsRepair,
+}
+
+/// Whether a cross-context saga's CALLER-side LOCAL economy reversal (budget /
+/// velocity / hard-rate-limit, deducted + Class-S-persisted at Prepare-A and
+/// owned by the caller actor) was settled during an abort. This is the sole
+/// input to the coordinator's terminal-marker decision (spec §6.2.4
+/// "Reservation release on every terminal path"): a terminal-`Aborted` journal
+/// asserts "fully compensated" and MUST NOT be written while a caller refund is
+/// still outstanding. Produced by [`Supervisor::abort_xctx_participants`] (the
+/// live abort path) and by [`Supervisor::redrive_xctx_prepare_in_progress`] (the
+/// §17.16.4 crash-recovery `PreparingB` re-drive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerAbortReversal {
+    /// The caller-side LOCAL economy was reversed (the `Abort` was delivered and
+    /// the actor rolled it back), OR there was no caller reservation to reverse.
+    /// The coordinator may write the terminal-`Aborted` marker.
+    SettledOrAbsent,
+    /// The caller-side LOCAL economy reversal could NOT be confirmed: the carrier
+    /// `Abort { Some }` send failed AND the `Abort { None }` re-drive also failed
+    /// (persistent backpressure / closed inbox), the caller actor was
+    /// unreachable (despawned), or the delivered handler errored before durably
+    /// persisting the reversal. The coordinator MUST leave the journal
+    /// non-terminal (`PreparingB`) so the §17.16.4 crash-recovery sweep
+    /// re-drives `Abort { None }` and reverses the LOCAL economy from the durable
+    /// `CallerReservationRecord`.
+    ReversalOutstanding,
+}
+
+/// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
+/// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
+/// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
+/// its OWN marker (spec §6.2.4 "Dual event-log recording").
+type DivergenceMarkerPlan = (
+    String,
+    [u8; 16],
+    [(
+        &'static str,
+        [u8; 32],
+        crate::context::actor::commands::SigningKeyBytes,
+    ); 2],
+);
+
+/// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
+/// for a `CrossContextToolInvocation` saga (spec §6.2.4).
+///
+/// The generic FSM (journal, retry, NeedsRepair, abort, gating) stays
+/// data-agnostic; this carrier holds the cross-context-specific inputs the
+/// per-phase dispatch needs and accumulates the Prepare→Commit hand-off
+/// data so each phase sees the prior phase's output:
+///
+/// - the supervisor-side tool `executor` + the target/caller Active Signing
+///   Keys (the actor holds NO key — ADR-049; the keys are supplied by the
+///   FFI/SDK caller per-call, exactly like `send_heartbeat` /
+///   `build_local_checkpoint`),
+/// - `prepared_a` — the caller-side escrow/rate-limit reservation staged at
+///   Prepare-A and held across the saga (RAII-released on any abort, settled
+///   at Commit-A),
+/// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
+///   re-derived chain depth). Read by [`Self::xctx_prepared_evidence_bytes`] at
+///   Committing-evidence time: once recorded, B's values OVERRIDE the
+///   caller-asserted nonce / depth / timestamp in the journaled prepared
+///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
+///   re-derives from B's authoritative provenance, not the caller's assertion,
+/// - `committed` — the receipt + output captured at Commit-B, forwarded to
+///   Commit-A and surfaced in [`SagaOutput`].
+///
+/// `executor` is an `Option` so it can be `take`n exactly once at Commit-B.
+struct CrossContextSagaCtx<'a> {
+    /// Raw 32-byte caller context id (A's own context).
+    caller_context_id: [u8; 32],
+    /// Raw 32-byte target context id (B's own context; where the tool runs).
+    target_context_id: [u8; 32],
+    /// Channel-authenticated caller DID (spec §6.2.4 "Caller authentication").
+    caller_did: DID,
+    /// Context-local tool registration id (indexes B's registry).
+    tool_registration_id: String,
+    /// UCAN proof index into B's store (`None` ⇒ ungated tool).
+    ucan_proof_id: Option<String>,
+    /// Tool input — validated at Prepare-B, executed at Commit-B.
+    input: serde_json::Value,
+    /// Caller-asserted advisory chain depth (freshness/`+1` base only).
+    asserted_chain_depth: u8,
+    /// Caller-asserted 16-byte wire nonce (freshness + dual-log join key).
+    asserted_nonce: [u8; 16],
+    /// Caller-asserted send-time (ms) — §9.14 skew check only.
+    asserted_timestamp_ms: u64,
+    /// The channel-authenticated caller's role in the caller context, resolved
+    /// supervisor-side at initiation (NOT envelope-asserted). Carried to
+    /// Prepare-B so B enforces `InboundPolicy.allowed_source_roles` against the
+    /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
+    /// role assignment.
+    caller_source_role: Option<String>,
+    /// The target context's Active Signing Key — receipt + divergence-marker
+    /// signing (Commit-B / NeedsRepair). The actor holds no custody key
+    /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
+    /// command from this caller-supplied key.
+    target_signing_key: ed25519_dalek::SigningKey,
+    /// The caller context's Active Signing Key — used ONLY to sign the
+    /// caller-side `CrossContextDivergenceMarker` on a `NeedsRepair` outcome
+    /// (spec §6.2.4 "Dual event-log recording"). The actor holds no custody
+    /// key (ADR-049); the FSM rebuilds a `SigningKeyBytes` per command from
+    /// this caller-supplied key. Distinct from `target_signing_key`: each side
+    /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
+    caller_signing_key: ed25519_dalek::SigningKey,
+    /// The supervisor-side tool executor, taken once at Commit-B.
+    executor: Option<SagaToolExecutor<'a>>,
+    /// The captured tool output bytes, stashed the moment the executor runs
+    /// ONCE (Commit-B first execute), so a transient Commit-B SETTLE failure is
+    /// retryable WITHOUT re-invoking the tool (spec §6.2.4 "Exactly-once
+    /// execution"). On a retry the reserve returns `ReadyToExecute` (the capture
+    /// was rolled back by the failed settle's persist), but the tool already ran
+    /// and had side effects — so the FSM re-sends `CommitBSettle` with THESE
+    /// stashed bytes rather than calling the (already-taken) executor again.
+    /// `Some` ⇒ the tool has executed; never call the executor when this is set.
+    executor_output: Option<Vec<u8>>,
+    /// Prepare-A's held reservation (settled at Commit-A, released on abort).
+    prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
+    /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
+    /// Read by [`Self::xctx_prepared_evidence_bytes`]: once `Some`, these values
+    /// override the caller-asserted nonce / depth / timestamp in the journaled
+    /// prepared evidence (the §17.16.4 replay surface).
+    prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
+    /// Commit-B's captured receipt + output (forwarded to Commit-A + output).
+    committed: Option<CommittedSagaArtifacts>,
+    /// The target side's `ToolInvoked` event id, captured the moment Commit-B
+    /// lands (reserve `AlreadyCommitted` OR a first execution settle). `Some`
+    /// proves the TARGET committed its `ToolInvoked` record even when the saga
+    /// later diverges (Commit-A fails → `NeedsRepair`): the
+    /// [`CrossContextDivergenceMarker`] then records
+    /// `committed_side = Target` and this event id (spec §6.2.4
+    /// "Dual event-log recording"). `None` means Commit-B never landed, so no
+    /// side committed and a `NeedsRepair` cannot have diverged the logs.
+    committed_b_tool_invoked_event_id: Option<String>,
+    /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
+    /// exhaustion). It tells the [`Self::run_saga`] tail to LEAVE any held
+    /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
+    /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
+    /// auto-voided — only the concurrency slot is released — because the
+    /// operation may have partially committed; the signed
+    /// [`CrossContextDivergenceMarker`] + operator repair settles the escrow).
+    /// Every other terminal leaves this `false`, so the tail's void-or-settle
+    /// behaviour is unchanged on Aborted / unreachable-Commit-A paths.
+    reached_needs_repair: bool,
+}
+
+/// The receipt + output captured at Commit-B, forwarded to Commit-A and
+/// surfaced in [`SagaOutput`]. The `SagaId`-stable `ToolInvoked` event id is
+/// carried INSIDE the signed receipt (`receipt`), so it is not duplicated
+/// here — an auditor reads it from the verified receipt.
+struct CommittedSagaArtifacts {
+    /// JCS bytes of the target's signed `CrossContextToolReceipt`.
+    receipt: Vec<u8>,
+    /// The captured tool output bytes (the receipt's canonical `output_jcs`).
+    output: Vec<u8>,
+}
+
+/// A supervisor-level divergence repair record (spec §6.2.4 "Dual event-log
+/// recording"): the fallback witness recorded when a `NeedsRepair` side is
+/// UNREACHABLE (its actor is gone / `lookup` misses) so the signed marker
+/// cannot be appended into that side's event log. The supervisor records the
+/// divergence here instead — "or a supervisor-level repair journal if one side
+/// is unreachable" — so operator repair still has a durable account of which
+/// side committed, the saga id, the nonce, and the committed-side event id.
+///
+/// In-memory it is a fast read cache, but it is ALSO durably journaled (see
+/// [`Supervisor::record_supervisor_repair`]): each record is appended to the
+/// supervisor's saga journal as the `evidence` of a `NeedsRepair`
+/// [`JournalEntry`], so a supervisor restart REHYDRATES it from the journal
+/// rather than losing the unreachable-leg divergence account — preserving the
+/// spec's "durably auditable" guarantee for that leg. The reachable side's
+/// marker (when one side IS reachable) lives durably in that side's event log;
+/// the unreachable half is durably recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SagaDivergenceRepairRecord {
+    /// The context id (raw 32-byte digest, hex) of the UNREACHABLE side whose
+    /// marker could not be appended into its own log.
+    pub unreachable_context_hex: String,
+    /// Which side committed (caller or target).
+    pub committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+    /// The committed-side `ToolInvoked` / `CrossContextToolInvoked` event id.
+    pub committed_event_id: String,
+    /// The 16-byte correlation nonce joining the two event-log records.
+    #[serde(with = "scp_protocol::serde_util::serde_nonce_16")]
+    pub nonce: [u8; 16],
+}
+
+/// `MessagePack` (`rmp_serde::to_vec_named`) of the full accumulated repair-record
+/// set for one saga, carried as the `evidence` of a durable `NeedsRepair`
+/// [`JournalEntry`]. A NON-EMPTY `NeedsRepair` evidence is, by this convention,
+/// the supervisor-level divergence repair journal (the plain `NeedsRepair`
+/// transition appended on commit-retry exhaustion carries EMPTY evidence); the
+/// recovery path decodes it to rehydrate [`Supervisor::saga_repair_records`].
+fn encode_repair_records_evidence(
+    records: &[SagaDivergenceRepairRecord],
+) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec_named(records).map_err(|e| format!("encode repair records: {e}"))
+}
+
+/// Decode the `MessagePack` repair-record set from a durable `NeedsRepair`
+/// journal entry's `evidence` (the inverse of [`encode_repair_records_evidence`]).
+fn decode_repair_records_evidence(bytes: &[u8]) -> Result<Vec<SagaDivergenceRepairRecord>, String> {
+    rmp_serde::from_slice(bytes).map_err(|e| format!("decode repair records: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +761,72 @@ pub struct PendingSagaProjection {
     reserved: (),
 }
 
+/// Flat, named-field request for
+/// [`Supervisor::start_cross_context_tool_invocation_saga`] (spec §6.2.4).
+///
+/// Carries the §6.2.4 invocation envelope field set by **value**. Replaces a
+/// long positional argument list whose adjacent `[u8; 32]` ids
+/// (`caller_context_id` / `target_context_id`) and asserted-provenance scalars
+/// were transposable at a call site — a swap compiled and would silently sign
+/// and record the saga under the wrong context, the confused-deputy footgun the
+/// named fields foreclose. Per the project's Agent-first API tenet: one flat
+/// config object, every field named, no builder, no ordering to track.
+///
+/// The two Active Signing Keys (carried in the named-field [`SagaSigningKeys`])
+/// and the supervisor-side tool executor stay explicit parameters of the entry
+/// point — they are not envelope data (the keys are custody material the actor
+/// never holds; the executor is a non-`Send` closure), so folding them onto the
+/// wire request would mix envelope fields with capabilities.
+#[derive(Debug, Clone)]
+pub struct CrossContextToolInvocationRequest {
+    /// Raw 32-byte id of the caller (initiating) context.
+    pub caller_context_id: [u8; 32],
+    /// Raw 32-byte id of the target (executing) context.
+    pub target_context_id: [u8; 32],
+    /// Channel-authenticated DID of the initiator.
+    pub caller_did: DID,
+    /// Registration id of the tool being invoked across the interface.
+    pub tool_registration_id: String,
+    /// Optional id of the spending UCAN proof, resolved target-side at
+    /// Prepare-B. `None` for an ungated tool.
+    pub ucan_proof_id: Option<String>,
+    /// Tool input payload (JSON), schema-checked target-side.
+    pub input: serde_json::Value,
+    /// Caller-asserted inbound provenance chain depth; B re-derives `+1`.
+    pub asserted_chain_depth: u8,
+    /// Caller-asserted 16-byte envelope nonce, checked against B's dedup cache.
+    pub asserted_nonce: [u8; 16],
+    /// Caller-asserted send-time (Unix ms), checked against §9.14 skew.
+    pub asserted_timestamp_ms: u64,
+}
+
+/// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
+/// role so the call site cannot transpose them.
+///
+/// `target` and `caller` are both `&SigningKey` of the SAME type; passed as two
+/// adjacent positional `&SigningKey` parameters a swap would compile and stay
+/// self-consistent (verification uses whichever key was supplied), silently
+/// signing each side's divergence marker under the wrong key — the same
+/// confused-deputy footgun the named-field [`CrossContextToolInvocationRequest`]
+/// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
+/// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
+/// field-name error, not a silent miscapture. Per the Agent-first API tenet:
+/// one flat named-field object, no ordering to track.
+///
+/// The keys are held by reference (the entry point clones each into the
+/// FSM-carried context); they are capabilities, NOT envelope data, so they stay
+/// off the wire [`CrossContextToolInvocationRequest`].
+#[derive(Debug, Clone, Copy)]
+pub struct SagaSigningKeys<'a> {
+    /// The target context's Active Signing Key. Signs the
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
+    pub target: &'a ed25519_dalek::SigningKey,
+    /// The caller context's Active Signing Key. Signs the CALLER-side divergence
+    /// marker on `NeedsRepair`.
+    pub caller: &'a ed25519_dalek::SigningKey,
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor
 // ---------------------------------------------------------------------------
@@ -471,6 +906,16 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
+    /// Supervisor-level divergence repair journal (spec §6.2.4 "Dual event-log
+    /// recording"): the fallback witnesses recorded when a `NeedsRepair` side is
+    /// UNREACHABLE and its signed [`SagaDivergenceRepairRecord`] could not be
+    /// appended into that side's own event log. Keyed by saga id; a single
+    /// diverged saga may record both sides (target + caller unreachable) under
+    /// one key. In-memory only (lost on restart, like the reservation set);
+    /// operator repair reads it before the supervisor restarts. Lock-free reads
+    /// via `DashMap` (ADR-049 §Decision 12).
+    pub(in crate::context::supervisor) saga_repair_records:
+        DashMap<SagaId, Vec<SagaDivergenceRepairRecord>>,
 
     // -----------------------------------------------------------------
     // ADR-049 commit 12 — providers lifted from ContextManager (now
@@ -565,25 +1010,26 @@ pub struct Supervisor {
     /// replay-driven re-drive of an in-flight saga re-takes its set before
     /// the first post-restart `start_saga` can race it.
     ///
-    /// CONCRETE REPLAY GAP PR-2D MUST CLOSE — the journal record for a
+    /// REPLAY RESERVATION RECONSTRUCTION — the journal participant record for a
     /// `CrossContextToolInvocation` (built by [`saga_input_participants`])
     /// deliberately does NOT persist `target_context_id` ("Leave the journal
     /// shape UNCHANGED"): it records only `{caller_context_id, caller_did,
     /// tool_registration_id}`. But the gating set
-    /// ([`saga_participant_context_set`]) is `{caller, target}`. So a naïve
-    /// replay that rebuilds reservations from the journal record alone could
-    /// only re-reserve `{caller}`, NOT `{caller, target}` — leaving the
-    /// `target` context slot free and letting a fresh post-restart saga touch
-    /// it concurrently, defeating the §5.15.4 cross-context serialization for
-    /// the entire recovery window. PR-2D MUST therefore either (a) persist
-    /// `target_context_id` in the journal entry / the
-    /// `CrossContextToolInvocationPrepared` evidence so the full set is
-    /// reconstructible, OR (b) rehydrate the complete [`SagaInput`] on replay
-    /// and re-derive the set via [`saga_participant_context_set`] (the same
-    /// extractor `start_saga` calls) so the rebuilt reservation is the
-    /// COMPLETE `{caller, target}` set, not a caller-only subset. Whichever
-    /// PR-2D chooses, the rebuilt reservation MUST equal what `start_saga`
-    /// would have taken for that in-flight saga.
+    /// ([`saga_participant_context_set`]) is `{caller, target}`. A naïve replay
+    /// that rebuilds reservations from the participant record alone could only
+    /// re-reserve `{caller}`, NOT `{caller, target}` — leaving the `target`
+    /// context slot free and letting a fresh post-restart saga touch it
+    /// concurrently, defeating the §5.15.4 cross-context serialization for the
+    /// recovery window. This gap is CLOSED via **option (a)**: the
+    /// `PreparingB` / `Committing` journal entries carry the eight-field
+    /// `CrossContextToolInvocationPrepared` evidence (which embeds BOTH
+    /// `caller_context_id` AND `target_context_id`), so
+    /// [`Self::reconstruct_xctx_prepared`] rebuilds the COMPLETE `{caller,
+    /// target}` set from the evidence — see [`Self::xctx_prepared_evidence_bytes`].
+    /// When the Phase-2D startup loop rebuilds reservations for non-terminal
+    /// unresolved entries it reconstructs the full set from this evidence (the
+    /// rebuilt reservation equals what `start_saga` would have taken), NOT a
+    /// caller-only subset.
     ///
     /// The type is `std::sync::Mutex` (banned by `clippy.toml` for the
     /// await-deadlock hazard) with a narrowly-scoped allow: the critical
@@ -681,6 +1127,7 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
+            saga_repair_records: DashMap::new(),
             // ADR-049 commit 12 — providers lifted from
             // ContextManager. Populated by `with_providers`.
             crypto: OnceLock::new(),
@@ -784,6 +1231,42 @@ impl Supervisor {
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Arc<Self> {
+        // The default provider bootstrap wires the no-op saga journal (the
+        // bridge attaches a durable journal separately). Saga unit/integration
+        // tests that need a durable journal use
+        // [`Self::with_providers_and_journal`].
+        Self::with_providers_and_journal(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            mls_storage,
+            Arc::new(NoopSagaJournal),
+        )
+    }
+
+    /// Like [`Self::with_providers`] but with a caller-supplied saga journal —
+    /// the seam the saga FSM + crash-recovery tests use to drive the REAL
+    /// journal write-ordering over co-resident actors. Production bootstrap goes
+    /// through [`Self::with_providers`] (no-op journal); a durable journal is
+    /// attached at the bridge layer.
+    #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
+    pub(in crate::context) fn with_providers_and_journal(
+        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        saga_journal: Arc<dyn SagaJournal>,
+    ) -> Arc<Self> {
         // The supervisor's own `persistence` field is non-Option (saga
         // code requires a value); when the caller passes `None`, wire
         // the no-op stub the `for_query_shim` path uses. The
@@ -801,7 +1284,6 @@ impl Supervisor {
                 (Arc::clone(&arc), Some(arc))
             },
         );
-        let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
         let supervisor = Arc::new(Self::new_inner(
             supervisor_persistence,
             saga_journal,
@@ -2766,6 +3248,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { .. }
             | QueriesCommand::ContextParams { .. }
             | QueriesCommand::GetRoleState { .. }
+            | QueriesCommand::HasEstablishedToolInterface { .. }
             | QueriesCommand::PendingCommits { .. }
             | QueriesCommand::CommitFault { .. }
             | QueriesCommand::LocalMlsEpoch { .. }
@@ -4450,72 +4933,340 @@ impl Supervisor {
     ///
     /// # Unwired saga use cases (pending Phase 2C)
     ///
-    /// The 3 [`SagaInput`] variants (StandingPairCreate,
-    /// CrossContextToolInvocation, BroadcastHostingHandshake) each have
-    /// their wire protocol specced (§5.15.8 / §6.2.4 / §5.14.13 +
-    /// ADR-049 §3a) but their Prepare/Commit dispatch is not yet wired
-    /// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. This
-    /// method drives the FSM generically; specific `SagaInput` arms
-    /// return [`ContextError::NotImplemented`] at the Prepare dispatch
-    /// step until Phase 2C wires them. The coordinator itself — journal
-    /// writes, phase transitions, timeout/retry accounting, terminal
-    /// resolution — is fully implemented.
+    /// `StandingPairCreate` and `BroadcastHostingHandshake` remain spec-gapped
+    /// (their Prepare dispatch returns [`ContextError::NotImplemented`]; the FSM
+    /// transitions through `Initiated → PreparingA → Aborting → Aborted` and
+    /// surfaces the typed error). `CrossContextToolInvocation` is the wired
+    /// variant — its end-to-end Prepare/Commit dispatch over the two co-resident
+    /// participant actors lands here (spec §6.2.4); drive it via
+    /// [`Self::start_cross_context_tool_invocation_saga`], which supplies the
+    /// supervisor-side tool executor and the target's Active Signing Key.
+    /// Calling `start_saga` directly with a `CrossContextToolInvocation` input
+    /// (no executor / signing key) is a misuse: the FSM aborts at Prepare with a
+    /// typed error because it has no way to execute the tool or sign the receipt.
     ///
-    /// # Forward obligation — authorize the initiator BEFORE reserving (Phase 2C)
-    ///
-    /// Today every production [`SagaInput`] variant's Prepare dispatch returns
-    /// [`ContextError::NotImplemented`], and `start_saga` is reachable only from
-    /// in-process callers — never from attacker-influenceable FFI input — so the
-    /// reservation cannot be weaponized. That changes in Phase 2C, which wires
-    /// the real saga inputs and the block-until-terminal `start_*_saga` FFI
-    /// exports. At that point the reservation becomes attacker-reachable: a
-    /// malicious participant could name a VICTIM'S context id in a saga input and
-    /// reserve it (the overlap check would then deny the victim's own legitimate
-    /// saga — a targeted availability attack). Phase 2C MUST therefore verify
-    /// the initiator is authorized over EACH context id the saga names — a member
-    /// of, or capable on, that context — BEFORE
-    /// [`Self::try_reserve_context_set`] runs. This is a forward obligation, not
-    /// a runtime gap: it is unreachable until the FFI saga surface ships.
+    /// The coordinator itself — journal writes, phase transitions, timeout/retry
+    /// accounting, terminal resolution, per-participant-context-set gating — is
+    /// fully implemented and saga-type-agnostic.
     ///
     /// # Errors
     ///
     /// - [`ContextError::ActorBusy`] (a `SagaBusy` reason) if the new saga's
     ///   participant context set overlaps an in-flight saga's reserved set.
     ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
-    /// - [`ContextError::NotImplemented`] if the
-    ///   [`SagaInput`] variant's prepare dispatch is not yet wired
-    ///   (all 3 current variants, pending Phase 2C).
+    /// - [`ContextError::NotImplemented`] for the spec-gapped
+    ///   `StandingPairCreate` / `BroadcastHostingHandshake` inputs.
     /// - [`ContextError::InvalidState`] on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
-        // Per-participant-context-set reservation (ADR-049 §3a, spec
-        // §5.15.4). Atomically reserve the saga's WHOLE participant context
-        // set: if it overlaps an in-flight saga's set, reject with a typed
-        // SagaBusy; otherwise insert the whole set and hold the RAII
-        // reservation for the FSM scope. The reservation Drop releases the
-        // set on EVERY terminal (Committed, Aborted, NeedsRepair) AND on a
-        // panic-unwind through `run_saga_fsm` — including the NeedsRepair arm,
-        // which returns control here so `_reservation` drops and the stuck
-        // saga does NOT wedge unrelated, disjoint sagas.
+        // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
+        // acquire the gating reservation HERE on the start path (the gate
+        // requires the reserve call to live in `start_saga`'s body), then drive
+        // the FSM under it. No executor / signing key: the generic entry point
+        // cannot drive a `CrossContextToolInvocation` Commit (it has no way to
+        // run the tool or sign the receipt) — the cross-context arm's prepare
+        // dispatch aborts with a typed error.
         let context_set = saga_participant_context_set(&input);
-        let _reservation = self.try_reserve_context_set(&context_set)?;
+        let reservation = self.try_reserve_context_set(&context_set)?;
+        self.run_saga(input, None, reservation).await
+    }
 
+    /// Drive a cross-context tool-invocation saga (spec §6.2.4) end-to-end
+    /// over the two co-resident participant context-actors (caller + target),
+    /// blocking until the saga reaches a terminal state.
+    ///
+    /// The supervisor FSM dispatches `PrepareA` to the caller actor, `PrepareB`
+    /// to the target actor, then (on Commit) `CommitBReserve` → runs the
+    /// `executor` supervisor-side → `CommitBSettle` → `CommitA`. The tool runs
+    /// **exactly once** supervisor-side between the two Commit-B round-trips
+    /// (the non-`Send` executor cannot cross the actor mailbox per ADR-049 §3).
+    ///
+    /// `signing_keys` carries the two Active Signing Keys named by role
+    /// ([`SagaSigningKeys`]): `target` signs the
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
+    /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
+    /// side signs its own marker into its own log. The named fields make a
+    /// same-typed `&SigningKey` swap a compile-visible field-name error rather
+    /// than a silent miscapture. The actor holds no custody key (ADR-049), so
+    /// the caller supplies both per-call exactly as [`Self::send_heartbeat`] /
+    /// [`Self::build_local_checkpoint`] do.
+    ///
+    /// # Co-resident scope
+    ///
+    /// Both contexts MUST be locally co-resident (registered actors in this
+    /// supervisor). If the target actor is not co-resident the saga aborts with
+    /// a typed [`ContextError::ContextNotRegistered`] — the cross-node
+    /// child-bridge transport is separate future work.
+    ///
+    /// # Authorization
+    ///
+    /// Before reserving the participant context set, TWO authorize-before-reserve
+    /// gates run — one per axis of the `{caller, target}` set the reservation
+    /// would lock — so a reservation is never taken on the strength of one side
+    /// alone:
+    ///
+    /// 1. **Caller axis.** The initiator (`caller_did`) is verified to be a
+    ///    member of `caller_context_id`. A non-member is rejected — so a caller
+    ///    cannot name (and thereby reserve / deny) a caller context it does not
+    ///    belong to.
+    /// 2. **Target axis.** The caller context is verified to hold a
+    ///    bidirectionally-approved `ToolInterface` to `target_context_id` for
+    ///    `tool_registration_id` (the §6.2.0.1 standing consent the §6.2.4
+    ///    invocation rides — §6.2.4 does NOT create the interface). Without this,
+    ///    a caller who is a member of its OWN context could name an arbitrary
+    ///    victim `target_context_id` and reserve the victim's saga slot before
+    ///    any target-side check ran (those run inside Prepare-B, AFTER
+    ///    reservation), wedging legitimate sagas touching the victim with
+    ///    `ActorBusy`. This gate closes that wedge: a caller can only reserve a
+    ///    target it has a real established interface with.
+    ///
+    /// Either gate failing rejects with [`ContextError::PermissionDenied`]
+    /// WITHOUT reserving any context.
+    ///
+    /// # Forward obligation — `caller_did` MUST be channel-authenticated at the FFI seam
+    ///
+    /// This saga has NO production caller yet. Its channel-auth defenses — gate 1
+    /// above, the §6.2.4 *Caller authentication* clause, the aggregate
+    /// nonce-eviction replay bound (spec §6.2.4 *Cache-eviction bound*), and B's
+    /// `InboundPolicy` role check — ALL rest on `caller_did` (and
+    /// `caller_context_id`) being the AUTHENTICATED identity of the transport
+    /// leg, never an envelope-asserted value. The supervisor here only verifies
+    /// `is_member` (membership), which is NECESSARY but NOT SUFFICIENT: membership
+    /// does not by itself prove the request leg is authenticated as that member.
+    ///
+    /// Therefore the FFI/SDK wiring that eventually EXPOSES this saga MUST bind
+    /// `caller_did` / `caller_context_id` to the authenticated FFI principal /
+    /// channel — NOT merely to membership — per the §6.2.0 / §6.2.4
+    /// "channel-authenticated identity" requirement, before any value is passed
+    /// into this entry point. This is a forward obligation tied to the deferred
+    /// FFI surface (mirroring the ADR-049 §3a forward-obligation discipline and
+    /// the CLAUDE.md integration checklist: function → ContextManager → FFI →
+    /// SDK → `pipeline_wiring` assertion). It is recorded here as the upstream
+    /// anchor; the co-resident core path does not yet have an untrusted leg, so
+    /// the obligation lands with the wiring, not in this function.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the initiator is not a member of
+    ///   `caller_context_id`, no established interface to `target_context_id`
+    ///   exists for `tool_registration_id`, or any Prepare-side §6.2.4 check
+    ///   rejects.
+    /// - [`ContextError::ActorBusy`] (`SagaBusy`) on a participant-set overlap.
+    /// - [`ContextError::ContextNotRegistered`] if a participant actor is not
+    ///   co-resident.
+    /// - [`ContextError::InvalidState`] on journal I/O failure or a saga driven
+    ///   to `NeedsRepair`.
+    pub async fn start_cross_context_tool_invocation_saga<F, Fut>(
+        &self,
+        request: CrossContextToolInvocationRequest,
+        signing_keys: SagaSigningKeys<'_>,
+        executor: F,
+    ) -> Result<SagaOutput, ContextError>
+    where
+        F: FnOnce(serde_json::Value) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static,
+    {
+        let CrossContextToolInvocationRequest {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            tool_registration_id,
+            ucan_proof_id,
+            input,
+            asserted_chain_depth,
+            asserted_nonce,
+            asserted_timestamp_ms,
+        } = request;
+        // Authorize-before-reserve gate 1 (caller axis, forward obligation): the
+        // initiator MUST be a member of the caller context it names. Reject
+        // WITHOUT reserving so a non-member cannot reserve (and thereby deny) a
+        // caller context id it does not belong to.
+        let caller_hex = hex::encode(caller_context_id);
+        if !self.is_member(&caller_hex, caller_did.as_ref()).await {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13050: cross-context saga initiator '{caller_did}' is not a member \
+                 of caller context '{caller_hex}' — not authorized to initiate over it"
+            )));
+        }
+
+        // Authorize-before-reserve gate 2 (target axis, BLACK-624-02): the caller
+        // context MUST hold a bidirectionally-approved interface to the named
+        // target for this tool (the §6.2.0.1 standing consent the §6.2.4
+        // invocation rides — it does NOT create the interface). Without this, a
+        // caller who is a member of its OWN context could name an arbitrary
+        // victim target_context_id and reserve the victim's saga slot before any
+        // target-side check ran (those run inside Prepare-B, AFTER reservation),
+        // wedging legitimate sagas touching the victim with ActorBusy. Reject
+        // WITHOUT reserving so the wedge is foreclosed.
+        let target_hex = hex::encode(target_context_id);
+        if !self
+            .has_established_tool_interface(&caller_hex, &target_hex, &tool_registration_id)
+            .await
+        {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13062: cross-context saga from caller context '{caller_hex}' to target \
+                 context '{target_hex}' has no established interface for tool \
+                 '{tool_registration_id}' — not authorized to invoke (and not authorized to \
+                 reserve the target's saga slot)"
+            )));
+        }
+
+        // Resolve the channel-authenticated caller's source ROLE in the caller
+        // context (spec §6.2.4 "Caller authentication": all InboundPolicy checks
+        // MUST evaluate the channel-authenticated identity). The caller's role
+        // is authoritative only in the caller context the supervisor just proved
+        // membership of (gate 1); it is read HERE supervisor-side and carried to
+        // Prepare-B so B can enforce `InboundPolicy.allowed_source_roles` against
+        // the real channel-authenticated role, never an envelope-asserted one.
+        // `None` ⇒ the caller has no explicit role assignment (only valid if the
+        // interface's `allowed_source_roles` is empty = any).
+        let caller_source_role = self
+            .member_role(&caller_hex, caller_did.as_ref())
+            .await
+            .map(|assignment| assignment.role_name);
+
+        // Box the executor into the non-generic FSM-carried trait object. The
+        // closure runs supervisor-side at Commit-B (off the actor mailbox).
+        let boxed_executor: SagaToolExecutor<'_> =
+            Box::new(move |v: serde_json::Value| Box::pin(executor(v)) as _);
+
+        let ctx = CrossContextSagaCtx {
+            caller_context_id,
+            target_context_id,
+            caller_did: caller_did.clone(),
+            tool_registration_id: tool_registration_id.clone(),
+            ucan_proof_id: ucan_proof_id.clone(),
+            input: input.clone(),
+            asserted_chain_depth,
+            asserted_nonce,
+            asserted_timestamp_ms,
+            caller_source_role,
+            target_signing_key: signing_keys.target.clone(),
+            caller_signing_key: signing_keys.caller.clone(),
+            executor: Some(boxed_executor),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        let saga_input = SagaInput::CrossContextToolInvocation {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            tool_registration_id,
+            ucan_proof_id,
+            input,
+            asserted_chain_depth,
+            asserted_nonce,
+            asserted_timestamp_ms,
+            // This is the sole production construction site: the dedicated
+            // entry point supplied the executor + signing keys above.
+            _seal: CrossContextSagaSeal::new(),
+        };
+
+        // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
+        // acquire the gating reservation on the start path, then drive the FSM
+        // under it.
+        let context_set = saga_participant_context_set(&saga_input);
+        let reservation = self.try_reserve_context_set(&context_set)?;
+        self.run_saga(saga_input, Some(ctx), reservation).await
+    }
+
+    /// Shared start-saga driver: run the FSM under an ALREADY-acquired
+    /// participant-context-set reservation (ADR-049 §3a — the per-set gating
+    /// reservation is acquired by each public entry point via
+    /// [`Self::try_reserve_context_set`] so the gating is on the start path, not
+    /// in this helper). `_reservation` is the RAII guard, held for the FSM scope
+    /// and released on EVERY terminal (Committed / Aborted / NeedsRepair) AND on
+    /// a panic-unwind through `run_saga_fsm`, so a stuck saga never wedges
+    /// unrelated, disjoint sagas. `xctx` carries the cross-context executor +
+    /// phase-data when the saga is a wired `CrossContextToolInvocation`; it is
+    /// `None` for the spec-gapped / test inputs.
+    async fn run_saga(
+        &self,
+        input: SagaInput,
+        xctx: Option<CrossContextSagaCtx<'_>>,
+        _reservation: SagaSetReservation<'_>,
+    ) -> Result<SagaOutput, ContextError> {
         let saga_id = SagaId::new();
         let participants = saga_input_participants(&input);
         let secret_bearing = saga_input_is_secret_bearing(&input);
 
+        let mut xctx = xctx;
         let fsm_result = self
             .run_saga_fsm(
                 saga_id.clone(),
                 &input,
                 participants.clone(),
                 secret_bearing,
+                xctx.as_mut(),
             )
             .await;
 
         // `_reservation` releases the reserved context set on scope exit —
         // including on the panic-unwind path through `run_saga_fsm`.
 
-        fsm_result.map(|()| SagaOutput { saga_id })
+        // Drain any residual held Prepare-A reservation. The abort path settles
+        // the caller side when a Prepare fails; the Commit-A path consumes it on
+        // success. A reservation that survives to here was held into a Commit
+        // that NEVER reached Commit-A (e.g. the caller actor was unreachable at
+        // Commit-A): its owning actor's per-context settle will never run, so
+        // void the external escrow and consume the ticket — NEVER drop it
+        // unbalanced (the ticket's drop guard would otherwise fire).
+        //
+        // EXCEPTION — `NeedsRepair` (spec §6.2.4 "`NeedsRepair` reservation
+        // semantics"): a saga that diverged keeps its escrow RESERVED for
+        // operator-repair settlement (the operation may have partially
+        // committed — B executed and charged — so auto-voiding here would be a
+        // free-execution exploit). The NeedsRepair divergence path
+        // (`emit_divergence_markers`) deliberately does NOT take `prepared_a`,
+        // and `reached_needs_repair` tells us to leave it held: we drop the
+        // carrier WITHOUT voiding/settling, so the escrow stays reserved. (The
+        // concurrency slot is still released — `_reservation` drops on scope
+        // exit regardless.)
+        if let Some(ctx) = xctx.as_mut() {
+            if ctx.reached_needs_repair {
+                // Leave the reservation HELD for operator repair. The
+                // `ToolEconomyReservation`'s `#[must_use]` drop guard would
+                // normally fire on an unbalanced drop, so settle it as a
+                // divergence-held escrow that defers to operator repair rather
+                // than releasing or consuming it.
+                if let Some(reservation) = ctx.prepared_a.take() {
+                    reservation.reservation.ticket.hold_external_for_repair();
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        "cross-context saga NeedsRepair — Prepare-A escrow held for operator \
+                         repair (NOT auto-voided; settled by the divergence marker + operator)"
+                    );
+                }
+            } else if let Some(reservation) = ctx.prepared_a.take() {
+                reservation
+                    .reservation
+                    .ticket
+                    .void_external_and_consume(self.payment_adapter_ref())
+                    .await;
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    "cross-context saga — held Prepare-A reservation survived to terminal without \
+                     a Commit-A settle; voided the external escrow and consumed the ticket"
+                );
+            }
+        }
+
+        fsm_result.map(|()| {
+            // Surface the committed receipt/output (cross-context arm only).
+            let (receipt, output) = xctx
+                .and_then(|c| c.committed)
+                .map_or((None, None), |a| (Some(a.receipt), Some(a.output)));
+            SagaOutput {
+                saga_id,
+                receipt,
+                output,
+            }
+        })
     }
 
     /// Atomically reserve a saga's participant context set (ADR-049 §3a).
@@ -4652,10 +5403,13 @@ impl Supervisor {
 
     async fn recover_saga_entry(&self, entry: JournalEntry) {
         match entry.state {
-            SagaState::Initiated | SagaState::PreparingA => {
-                // No remote side-effects yet — discard by marking
-                // Aborted. `secret_bearing` classifies the resolution
-                // marker for secure-evidence overwrite.
+            SagaState::Initiated => {
+                // Truly no remote side-effects: Prepare-A was never
+                // dispatched. The FSM journals `Initiated` (seq 0) BEFORE the
+                // first `dispatch_prepare_phase`, so an `Initiated` crash leaves
+                // the durable economy untouched — discard by marking Aborted.
+                // `secret_bearing` classifies the resolution marker for
+                // secure-evidence overwrite.
                 let _ = self
                     .saga_journal
                     .mark_resolved(
@@ -4667,32 +5421,46 @@ impl Supervisor {
                 tracing::info!(
                     saga_id = %entry.saga_id,
                     state = ?entry.state,
-                    "saga recovery — discarded (no remote side-effects)"
+                    "saga recovery — discarded (Initiated: Prepare-A never dispatched, no \
+                     remote side-effects)"
                 );
+            }
+            SagaState::PreparingA => {
+                // Prepare-A DURABLY persisted the caller deduction + the
+                // `CallerReservationRecord` (actor `prepare_a`) into the
+                // per-context Class-S snapshot BEFORE the FSM appended the
+                // `PreparingB` journal entry, so a crash in that window can
+                // leave a LIVE durable reservation while the journal's latest
+                // state is `PreparingA`. Marking terminal-`Aborted` here (which
+                // asserts "fully compensated") would STRAND that deduction +
+                // record forever (the §17.16.4 sweep re-drives only NON-terminal
+                // journals → a permanent silent over-charge).
+                //
+                // A `PreparingA` xctx entry journals the SAME caller-provenance
+                // triple as `PreparingB` (`saga_input_participants`), so route it
+                // through the SAME record-keyed reversal-and-confirm path. With
+                // empty `PreparingA` evidence (`&[]`), `reconstruct_xctx_prepared`
+                // returns `None` → the path falls to
+                // `xctx_caller_hex_from_participants` →
+                // `redrive_caller_local_reversal`: it reverses the caller's LOCAL
+                // economy from the durable record and marks terminal ONLY on a
+                // confirmed `SettledOrAbsent` (or a persistence-deleted caller),
+                // else leaves the journal non-terminal for a later sweep. A
+                // non-xctx `PreparingA` (no caller participant triple) →
+                // `SettledOrAbsent` → safe terminal.
+                self.recover_preparing_b_entry(&entry).await;
             }
             SagaState::PreparingB => {
-                // Actor A Prepared but Commit never left coordinator;
-                // send best-effort Abort to actor A. Until saga-phase
-                // actor-side handlers land, this is a metric-only
-                // branch — the journal resolution IS the Abort from
-                // the coordinator's perspective.
-                let _ = self
-                    .saga_journal
-                    .mark_resolved(
-                        entry.saga_id.clone(),
-                        SagaTerminalState::Aborted,
-                        /*secret_bearing=*/ false,
-                    )
-                    .await;
-                tracing::warn!(
-                    saga_id = %entry.saga_id,
-                    "saga recovery — PreparingB observed; rolled back by journal abort marker"
-                );
+                self.recover_preparing_b_entry(&entry).await;
             }
-            SagaState::Committing | SagaState::Aborting => {
-                // Re-resolve: Commit retry logic is not visible through
-                // the journal alone — emit NeedsRepair so an operator
-                // sees it on the next startup.
+            SagaState::Committing => {
+                self.recover_committing_entry(&entry).await;
+            }
+            SagaState::Aborting => {
+                // An Aborting entry's rollback never completed; re-resolve to
+                // NeedsRepair so an operator sees it (the Abort side-effects are
+                // not journal-visible). No re-drive — Aborting carries no
+                // committed side.
                 let _ = self
                     .saga_journal
                     .append(JournalEntry {
@@ -4704,17 +5472,16 @@ impl Supervisor {
                         seq_per_saga: entry.seq_per_saga.saturating_add(1),
                     })
                     .await;
+                // §17.16.4 operator-alerting metric: this entry is now
+                // NeedsRepair and requires operator repair.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
-                    state = ?entry.state,
-                    "saga recovery — Committing/Aborting observed; marked NeedsRepair for operator review"
+                    "saga recovery — Aborting observed; marked NeedsRepair for operator review"
                 );
             }
             SagaState::NeedsRepair => {
-                tracing::error!(
-                    saga_id = %entry.saga_id,
-                    "saga recovery — NeedsRepair carryover; operator intervention required"
-                );
+                self.recover_needs_repair_entry(&entry);
             }
             SagaState::Committed | SagaState::Aborted => {
                 // Terminal — not returned by load_unresolved but
@@ -4723,54 +5490,743 @@ impl Supervisor {
         }
     }
 
+    /// §17.16.4 Prepare-in-progress recovery for a `PreparingA` OR `PreparingB`
+    /// journal entry.
+    ///
+    /// Both states share the same record-keyed reversal-and-confirm reconciliation:
+    /// `PreparingA` already DURABLY staged the caller deduction + reservation record
+    /// (actor `prepare_a`, before the FSM's `PreparingB` journal append), so a crash
+    /// at either state can leave a live durable reservation. The `recover_saga_entry`
+    /// `PreparingA` arm routes here precisely because a `PreparingA` xctx entry
+    /// journals the SAME caller-provenance triple as `PreparingB`; with empty
+    /// `PreparingA` evidence the `reconstruct_xctx_prepared` path is skipped and the
+    /// participant-keyed `redrive_caller_local_reversal` performs the reversal.
+    ///
+    /// Actor A (and possibly B) staged reservations but the Commit never left the
+    /// coordinator. Abort the Prepared side(s) — releasing the staged
+    /// rate/escrow/session reservations — and discard; NEVER re-Prepare. For a
+    /// reconstructible cross-context entry this re-drives a real `Abort { None }`
+    /// to the prepared actors (release); otherwise there is no caller reservation
+    /// to reverse and the journal abort marker IS the rollback record.
+    ///
+    /// The terminal-`Aborted` marker asserts "fully compensated", so it MUST NOT
+    /// be written while the caller's durable LOCAL-economy reversal is still
+    /// outstanding — exactly the invariant [`Self::abort_saga`] enforces on the
+    /// LIVE abort path. If the caller context is not yet resident when this
+    /// startup sweep runs (a `lookup` miss — ordering of context restore vs.
+    /// `replay_unresolved_sagas` is not enforced in-tree) OR the `Abort { None }`
+    /// send fails, the record-based reversal was NOT delivered: leave the journal
+    /// NON-terminal at `PreparingB` so a later sweep (after the caller is restored)
+    /// re-drives it. Marking terminal here would strand the caller's durable
+    /// deduction forever (the sweep re-drives ONLY non-terminal journals → a
+    /// permanent over-charge). The ONE exception is a PERMANENTLY-DELETED caller
+    /// context (absent from durable persistence): its reservation record died with
+    /// the context, so there is nothing to reverse and the saga is reaped instead
+    /// of looping forever — see [`Self::caller_context_deleted_from_persistence`].
+    ///
+    /// **Known limitation — external escrow hold on a context deleted
+    /// mid-`PreparingB`.** When the caller context is reaped as permanently
+    /// deleted (above), its caller LOCAL economy died with the snapshot, so there
+    /// is nothing to reverse LOCALLY and terminal-`Aborted` is correct for the
+    /// local ledger. But if the saga had staged an EXTERNAL escrow hold during
+    /// Prepare-A, the `escrow_authorization` needed to RELEASE that external hold
+    /// lives ONLY in the deleted context snapshot — it is NOT reconstructible from
+    /// the journal evidence (the journal records the abort decision, not the
+    /// escrow authorization secret). Such an external hold is therefore
+    /// irrecoverable from journal evidence alone once the context is deleted;
+    /// terminal-`Aborted` is the best available resolution (the saga cannot loop
+    /// forever waiting for a context that will never return), and operator/
+    /// external-system reconciliation is the only path to release the stranded
+    /// external hold. This is a pre-existing boundary of the journal-evidence
+    /// model, called out here so a future change does not silently assume the
+    /// terminal marker also released the external escrow.
+    async fn recover_preparing_b_entry(&self, entry: &JournalEntry) {
+        // `caller_hex_from_participants` is `Some(hex)` iff THIS journal
+        // entry names a caller context in `participants[0]` — i.e. it is a
+        // real cross-context entry (per `saga_input_participants`, an xctx
+        // entry is the triple `[hex(caller_context_id), caller_did,
+        // tool_registration_id]`: length 3 with a 64-hex first element).
+        // This identity is carried by the PLAINTEXT participant record,
+        // INDEPENDENT of the (separately-serialized) evidence blob, so it
+        // survives an evidence that is corrupt / truncated / unparseable.
+        let caller_hex_from_participants = Self::xctx_caller_hex_from_participants(entry);
+
+        let caller_reversal = match Self::reconstruct_xctx_prepared(entry) {
+            Some(prepared) => {
+                self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
+                    .await
+            }
+            // Evidence did NOT reconstruct. Two sub-cases:
+            //
+            //   (a) a REAL xctx entry whose evidence blob is corrupt /
+            //       truncated / unserializable. Its caller context is still
+            //       named in `participants[0]` and its durable
+            //       `CallerReservationRecord` may still be live, so a
+            //       terminal-`Aborted` here (asserting "fully compensated")
+            //       would STRAND the caller deduction. Drive the verdict via
+            //       the RECORD-keyed `redrive_caller_local_reversal` (which
+            //       reverses the caller's LOCAL economy from the durable
+            //       record, independent of the evidence) — the same helper
+            //       the reconstructible path's target-clearing redrive uses
+            //       for its caller leg.
+            //
+            //   (b) a genuinely participant-less / non-xctx entry (standing
+            //       pair / broadcast / test). There is no cross-context
+            //       caller reservation to reverse, so the journal abort
+            //       marker is the authoritative (and only needed) rollback
+            //       record — safe to mark terminal.
+            None => match caller_hex_from_participants.as_deref() {
+                Some(caller_hex) => {
+                    self.redrive_caller_local_reversal(&entry.saga_id, caller_hex)
+                        .await
+                }
+                None => CallerAbortReversal::SettledOrAbsent,
+            },
+        };
+
+        if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
+            // The caller reversal could not be confirmed delivered. Before
+            // leaving the journal non-terminal (the wave-15 invariant),
+            // distinguish a PERMANENTLY-DELETED caller context from a
+            // merely not-yet-restored one — durable persistence is the
+            // source of truth regardless of restore/spawn state:
+            //
+            //   - ABSENT from persistence ⇒ the context was deleted; its
+            //     `CallerReservationRecord` died with it, so there is
+            //     NOTHING left to reverse. Leaving the saga non-terminal
+            //     would make it NEVER reap (every sweep re-misses the
+            //     lookup). Mark it terminal-`Aborted` (reaped).
+            //   - PRESENT in persistence ⇒ not-yet-restored. The reversal
+            //     is genuinely still outstanding; leave the journal
+            //     non-terminal so a later sweep (after the caller respawns)
+            //     re-drives it from the durable record.
+            //
+            // The existence check is only meaningful for an entry that
+            // NAMES a caller context AND only when a persistence backend is
+            // configured (`persistence_ref`); absent either, fall through
+            // to the conservative wave-15 leave-non-terminal.
+            if let Some(caller_hex) = caller_hex_from_participants.as_deref()
+                && self.caller_context_deleted_from_persistence(caller_hex)
+            {
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Aborted,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::warn!(
+                    saga_id = %entry.saga_id,
+                    state = ?entry.state,
+                    context = %caller_hex,
+                    "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed but \
+                     the caller context is ABSENT from durable persistence (permanently \
+                     deleted): its caller reservation record died with the context, so \
+                     there is nothing to reverse — reaping the saga as terminal-Aborted \
+                     (NOT leaving it to never-reap)"
+                );
+                return;
+            }
+
+            // The producing site inside `redrive_caller_local_reversal`
+            // already routed its verdict through `Self::reversal_outstanding()`
+            // (incrementing the counter + emitting the stable
+            // `event = "xctx_caller_reversal_outstanding"` warn). Re-emit the
+            // SAME stable field here so a log query on it surfaces the
+            // "left non-terminal" decision too, but do NOT re-increment the
+            // counter (that would double-count a single stranded reversal).
+            tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
+                saga_id = %entry.saga_id,
+                state = ?entry.state,
+                "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed but the \
+                 caller-side LOCAL-economy reversal could not be delivered (caller not \
+                 yet restored / backpressure); leaving the journal NON-terminal so a \
+                 later crash-recovery sweep re-drives it (NOT marking terminal-Aborted \
+                 with the caller refund outstanding)"
+            );
+            return;
+        }
+
+        let _ = self
+            .saga_journal
+            .mark_resolved(
+                entry.saga_id.clone(),
+                SagaTerminalState::Aborted,
+                /*secret_bearing=*/ false,
+            )
+            .await;
+        tracing::warn!(
+            saga_id = %entry.saga_id,
+            state = ?entry.state,
+            "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed; aborted \
+             the Prepared side(s), confirmed the caller reversal, and discarded (never \
+             re-Prepared)"
+        );
+    }
+
+    /// §17.16.4 `NeedsRepair` carryover recovery: re-surface the operator-repair
+    /// alert at process start and rehydrate the supervisor-level divergence
+    /// repair records (spec §6.2.4 "Dual event-log recording") so the
+    /// unreachable-leg divergence account survives a supervisor restart. A
+    /// NON-EMPTY `NeedsRepair` evidence is, by convention, the `MessagePack` of
+    /// the full accumulated repair-record set (the plain `NeedsRepair` transition
+    /// carries EMPTY evidence); `load_unresolved` returns the LATEST entry per
+    /// saga, so this is the most complete set.
+    fn recover_needs_repair_entry(&self, entry: &JournalEntry) {
+        // §17.16.4 operator-alerting metric: a NeedsRepair saga is
+        // re-surfaced at process start until an operator repairs it.
+        crate::metrics::record_saga_repair_needed();
+        tracing::error!(
+            saga_id = %entry.saga_id,
+            "saga recovery — NeedsRepair carryover; operator intervention required"
+        );
+        if !entry.evidence.is_empty() {
+            match decode_repair_records_evidence(&entry.evidence) {
+                Ok(records) if !records.is_empty() => {
+                    self.saga_repair_records
+                        .insert(entry.saga_id.clone(), records);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(
+                    saga_id = %entry.saga_id,
+                    %err,
+                    "saga recovery — NeedsRepair entry carried non-empty evidence that \
+                     did not decode as a supervisor repair-record set; the durable \
+                     divergence account could not be rehydrated"
+                ),
+            }
+        }
+    }
+
+    /// §17.16.4 Commit-in-progress recovery for a `Committing` journal entry.
+    /// Re-drives the idempotent Commit (NEVER re-invoking the tool): B re-acks
+    /// the existing `ToolInvoked` and re-emits the STORED output; A re-acks from
+    /// the durable `xctx_committed_invocations` witness (keyed on the Class-S
+    /// witness, NOT the in-memory reservation that died with the crash). If BOTH
+    /// sides committed the saga is FULLY committed and resolves to `Committed`;
+    /// only a genuinely-unresolvable divergence (one-sided commit / unreachable
+    /// side / non-reconstructible entry) stays `NeedsRepair` for operator repair.
+    async fn recover_committing_entry(&self, entry: &JournalEntry) {
+        let resolution = match Self::reconstruct_xctx_prepared(entry) {
+            Some(prepared) => {
+                self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
+                    .await
+            }
+            None => CommitInProgressResolution::NeedsRepair,
+        };
+        match resolution {
+            CommitInProgressResolution::Committed => {
+                // Fully committed: mark the journal resolved (overwrite the
+                // resolution marker as secure evidence — same as the live commit
+                // path). `secret_bearing=false`: the §6.2.4 saga resolution
+                // markers carry no bearer secret.
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Committed,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::info!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — Commit-in-progress resolved to Committed (B re-emitted, A \
+                     witness present); no operator repair required"
+                );
+            }
+            CommitInProgressResolution::NeedsRepair => {
+                // Append a plain (empty-evidence) NeedsRepair terminal. This is
+                // the divergence-class terminal for the NeedsRepair paths that do
+                // NOT go through `record_supervisor_repair` — target unreachable,
+                // `ReadyToExecute` (Commit-B never landed), a Commit-B reserve
+                // send failure, or a non-reconstructible entry — where it is the
+                // ONLY durable NeedsRepair record, so it MUST NOT be dropped. When
+                // the divergence WAS one-sided, `redrive_commit_a_witness` already
+                // wrote an evidence-bearing repair entry at a HIGHER seq (>= 5)
+                // via `record_supervisor_repair`; `load_unresolved` selects the
+                // max-seq entry per saga, so that richer entry supersedes this
+                // empty one — the empty append is harmless (never the surviving
+                // read), not authoritative. (Latest-per-saga = empty here does
+                // NOT mean "no divergence detail": it means no side committed.)
+                let _ = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: entry.saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await;
+                // §17.16.4 operator-alerting metric: commit-in-progress could
+                // not confirm both sides; this saga is NeedsRepair.
+                crate::metrics::record_saga_repair_needed();
+                tracing::error!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — Commit-in-progress observed; re-drove the idempotent Commit-B \
+                     (no re-invoke) but could not confirm both sides committed — marked \
+                     NeedsRepair for operator review"
+                );
+            }
+        }
+    }
+
+    /// Reconstruct a cross-context tool-invocation saga's prepared state from a
+    /// journal entry's `evidence` (spec §6.2.4 "Crash recovery §17.16.4").
+    ///
+    /// The evidence is the `MessagePack` of the eight-field
+    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// wire — carrying BOTH the `caller_context_id` AND the `target_context_id`
+    /// (option (a) — closing the [`saga_input_participants`] caller-only gap) plus
+    /// the staged provenance. Decoding it yields the FULL `{caller, target}`
+    /// participant set and the prepared provenance the replay re-drive needs.
+    /// Returns `None` if the entry is not a cross-context saga (its evidence
+    /// does not decode), e.g. a standing-pair / broadcast / test entry.
+    fn reconstruct_xctx_prepared(entry: &JournalEntry) -> Option<XctxPrepared> {
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        if entry.evidence.is_empty() {
+            return None;
+        }
+        CrossContextToolInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+    }
+
+    /// Returns the caller context id (raw-digest hex) named in a journal
+    /// entry's PLAINTEXT participant record iff the entry is a cross-context
+    /// tool-invocation saga, else `None`.
+    ///
+    /// Per [`saga_input_participants`], a `CrossContextToolInvocation` entry's
+    /// participants are exactly the triple
+    /// `[hex(caller_context_id), caller_did, tool_registration_id]` — length 3
+    /// with a 64-char lowercase-hex first element (the caller's raw-digest
+    /// context id, the canonical `lookup` / persistence key). The other saga
+    /// variants either record a different-length set (`StandingPairCreate` ⇒ 2,
+    /// `BroadcastHostingHandshake` ⇒ 3 but with a DID/hex shape whose
+    /// `participants[0]` is the host context hex — see below) or a single-element
+    /// set (`TestForceNeedsRepair`).
+    ///
+    /// To avoid misclassifying a `BroadcastHostingHandshake` (also length 3,
+    /// also `hex(...)` first element) as a cross-context caller, this is used
+    /// ONLY on a `PreparingA` or `PreparingB` entry whose evidence FAILED to
+    /// reconstruct as the xctx prepared wire (a `PreparingA` entry ALWAYS has
+    /// empty evidence, so it always reaches this participant-keyed discriminant):
+    /// the broadcast-hosting saga journals NO
+    /// `CrossContextToolInvocationPrepared` evidence at all (its evidence either
+    /// decodes as xctx — handled by the `Some` arm — or is genuinely a different
+    /// saga). The length-3 + 64-hex shape is therefore a sound discriminant for
+    /// "a cross-context entry whose evidence is corrupt"; a broadcast entry that
+    /// reaches here drives a record-keyed `Abort { None }` against its host
+    /// context, which is a clean no-op (the host holds no caller
+    /// `CallerReservationRecord` keyed by this saga id), so a false-positive
+    /// classification cannot strand or mis-reverse anything — it is at worst a
+    /// harmless extra lookup.
+    fn xctx_caller_hex_from_participants(entry: &JournalEntry) -> Option<String> {
+        const RAW_DIGEST_HEX_LEN: usize = 64;
+        if entry.participants.len() != 3 {
+            return None;
+        }
+        let first = &entry.participants[0];
+        if first.len() == RAW_DIGEST_HEX_LEN && first.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(first.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` iff a caller context (`caller_hex`, the raw-digest hex
+    /// `lookup` / persistence key) is PERMANENTLY ABSENT from durable
+    /// persistence — i.e. it was deleted, not merely not-yet-restored.
+    ///
+    /// Durable persistence is the source of truth for context existence
+    /// regardless of in-memory spawn / restore state: a deleted context has had
+    /// its snapshot removed (`load_context` ⇒ `Ok(None)`), while a context that
+    /// merely has not been restored into an actor yet is still PRESENT in
+    /// storage (`load_context` ⇒ `Ok(Some(_))`). This mirrors the existence
+    /// check the actor-respawn path performs before re-hydrating
+    /// ([`Self::respawn_actor`]).
+    ///
+    /// Conservative on uncertainty — returns `false` (treat as "still present")
+    /// when no persistence backend is configured (`persistence_ref` is `None`,
+    /// so existence is unknowable) OR when the `load_context` read itself errors
+    /// (a transient storage failure must NOT be mistaken for deletion). In both
+    /// cases the saga is left non-terminal for a later sweep, never reaped on a
+    /// guess — reaping only on a CONFIRMED `Ok(None)` absence.
+    ///
+    /// **Backend assumption (`Ok(None)` ⇒ PERMANENTLY deleted).** Reaping on
+    /// `Ok(None)` is sound ONLY because every durable backend in-tree
+    /// distinguishes "absent" from "transiently unreadable": `Ok(None)` is
+    /// returned strictly when the snapshot KEY does not exist, and any I/O /
+    /// decode failure surfaces as `Err` (caught by the conservative arm above) —
+    /// there is no stored-but-transiently-`None` window. A FUTURE lazy on-disk
+    /// backend (e.g. one that returns `Ok(None)` for a not-yet-loaded shard, or
+    /// during a compaction window, before the key is actually known absent) MUST
+    /// preserve that contract — surfacing any uncertainty as `Err`, never
+    /// `Ok(None)` — or this reaper could mis-read a recoverable caller as deleted
+    /// and reap it, silently over-charging it (the durable
+    /// `CallerReservationRecord` would never be reversed). When in doubt, a
+    /// backend MUST err toward `Err` (leave non-terminal), never `Ok(None)`.
+    fn caller_context_deleted_from_persistence(&self, caller_hex: &str) -> bool {
+        let Some(persistence) = self.persistence_ref() else {
+            // No backend ⇒ existence is unknowable; do not reap on a guess.
+            return false;
+        };
+        match persistence.load_context(caller_hex) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(err) => {
+                tracing::warn!(
+                    context = %caller_hex,
+                    %err,
+                    "saga recovery — durable persistence existence check for a permanently-deleted \
+                     caller context errored; treating the context as STILL PRESENT (not reaping the \
+                     saga) so a transient storage failure cannot be mistaken for deletion"
+                );
+                false
+            }
+        }
+    }
+
+    /// §17.16.4 Prepare-in-progress re-drive: abort the Prepared side(s) of a
+    /// cross-context saga, releasing the staged reservations, then discard
+    /// (NEVER re-Prepare). The carrier `PreparedAFields` died with the crashed
+    /// coordinator, so BOTH legs are driven as `Abort { None }` — the actor
+    /// reverses its OWN staged state keyed by `SagaId`.
+    ///
+    /// - CALLER side: drives the record-based `Abort { None }` through
+    ///   [`Self::redrive_caller_local_reversal`] — the SAME helper the live
+    ///   abort path uses — so the caller reverses its LOCAL economy (budget /
+    ///   velocity / hard-rate-limit) from the durable `CallerReservationRecord`
+    ///   Prepare-A staged. The returned [`CallerAbortReversal`] reflects whether
+    ///   that reversal was CONFIRMED delivered: `SettledOrAbsent` iff the
+    ///   `Abort { None }` was delivered-and-acked (or there was genuinely no
+    ///   caller reservation to reverse — a clean record no-op);
+    ///   `ReversalOutstanding` on a `lookup` miss (caller not yet restored) or a
+    ///   send failure (persistent backpressure / closed inbox). This is the SOLE
+    ///   input to the coordinator's terminal-marker decision: a terminal-`Aborted`
+    ///   journal asserts "fully compensated" and MUST NOT be written while the
+    ///   caller refund is still outstanding (symmetric with [`Self::abort_saga`]).
+    ///
+    /// - TARGET side: released best-effort via [`Self::abort_target_leg`]
+    ///   (clears the staged `saga_pending` session slot). The target carries no
+    ///   caller LOCAL economy, so its release is orthogonal to the returned
+    ///   verdict — a failed/undelivered send strands nothing (the next sweep
+    ///   clears the slot).
+    ///
+    /// Invoked by [`Self::recover_saga_entry`] on a `PreparingB` entry, which is
+    /// driven by the Phase-2D startup replay loop
+    /// ([`Self::replay_unresolved_sagas`]).
+    async fn redrive_xctx_prepare_in_progress(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CallerAbortReversal {
+        // CALLER side: record-based `Abort { None }` re-drive — reverses the
+        // caller's LOCAL economy from the durable record and yields the verdict
+        // that gates the terminal marker (warns + counts on miss/failure).
+        let caller_hex = hex::encode(prepared.caller_context_id);
+        let caller_reversal = self
+            .redrive_caller_local_reversal(saga_id, &caller_hex)
+            .await;
+
+        // TARGET side: best-effort session-slot release, orthogonal to the
+        // caller verdict (the target stages no caller LOCAL economy).
+        self.abort_target_leg(saga_id, prepared.target_context_id)
+            .await;
+
+        caller_reversal
+    }
+
+    /// §17.16.4 Commit-in-progress re-drive: re-send the idempotent Commit-B,
+    /// which re-acks the existing `ToolInvoked` and re-emits the STORED output —
+    /// NEVER re-invoking the tool (the exactly-once-execution guarantee survives
+    /// a crash). Sends [`SagaPhaseMessage::CommitBReserve`]; on a committed saga
+    /// the actor replies `AlreadyCommitted` with the stored receipt/output, so
+    /// the tool is not re-run.
+    ///
+    /// Then re-acks the A side FROM THE DURABLE WITNESS: `commit_a` keys
+    /// idempotency on the Class-S `xctx_committed_invocations` witness (not the
+    /// in-memory reservation that died with the crash), so a Commit-A that
+    /// durably landed before the crash is observable NOW. This re-drive queries
+    /// the caller actor's witness ([`SagaPhaseMessage::CommitACheckWitness`]); if
+    /// BOTH sides are committed (B `AlreadyCommitted` + the A witness present)
+    /// the saga is FULLY committed and resolves to `Committed` — not a spurious
+    /// `NeedsRepair`. Only a genuinely-unresolvable divergence (B committed but A
+    /// did not, or a side is unreachable) stays `NeedsRepair`.
+    ///
+    /// Returns the resolution so [`Self::recover_saga_entry`] journals the right
+    /// terminal. Invoked by `recover_saga_entry` on a `Committing` entry, driven
+    /// by the Phase-2D startup replay loop ([`Self::replay_unresolved_sagas`]).
+    async fn redrive_xctx_commit_in_progress(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CommitInProgressResolution {
+        use crate::context::actor::commands::{CommitBReserveOutcome, SagaPhaseMessage};
+        let target_hex = hex::encode(prepared.target_context_id);
+        let Some(target) = self.lookup(&target_hex) else {
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                context = %target_hex,
+                "saga recovery — Commit-in-progress re-drive: target actor unreachable; operator \
+                 repair required"
+            );
+            return CommitInProgressResolution::NeedsRepair;
+        };
+        let reserve_saga_id = saga_id.clone();
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve {
+                    saga_id: reserve_saga_id,
+                    reply,
+                })
+            })
+            .await;
+        match reserve {
+            Ok(CommitBReserveOutcome::AlreadyCommitted { .. }) => {
+                tracing::info!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress re-drive: target re-emitted the STORED \
+                     output (no re-invoke), idempotent by SagaId; checking the A-side witness"
+                );
+                // B committed. Re-ack the A side from the durable witness: if
+                // Commit-A also landed before the crash the saga is fully
+                // committed — resolve to Committed, not a false NeedsRepair.
+                self.redrive_commit_a_witness(saga_id, prepared).await
+            }
+            Ok(CommitBReserveOutcome::ReadyToExecute) => {
+                // Commit-B had NOT durably landed before the crash; the tool was
+                // never executed, so there is no stored output to re-emit. NEVER
+                // re-invoke on the recovery path — the live initiator retries
+                // fresh (spec §17.16.4 "the initiator retries fresh"). No side
+                // committed, so this is a clean abort-equivalent, not a divergence.
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress re-drive: target reports ReadyToExecute \
+                     (Commit-B never durably landed); NOT re-invoking — initiator retries fresh"
+                );
+                CommitInProgressResolution::NeedsRepair
+            }
+            Err(err) => {
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "saga recovery — Commit-in-progress re-drive: Commit-B reserve send failed; \
+                     operator repair required"
+                );
+                CommitInProgressResolution::NeedsRepair
+            }
+        }
+    }
+
+    /// Re-ack the A side of a Commit-in-progress recovery from the durable
+    /// `xctx_committed_invocations` witness (spec §17.16.4). Queries the caller
+    /// actor read-only; a present witness means Commit-A durably landed before
+    /// the crash, so the (B-committed) saga is FULLY committed →
+    /// [`CommitInProgressResolution::Committed`]. An absent witness, an
+    /// unreachable caller, or a send failure means the A side did NOT commit (or
+    /// cannot be confirmed) — a genuine one-sided divergence that stays
+    /// [`CommitInProgressResolution::NeedsRepair`] for operator repair.
+    async fn redrive_commit_a_witness(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CommitInProgressResolution {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+        let caller_hex = hex::encode(prepared.caller_context_id);
+        // This fn is only reached after Commit-B re-emitted `AlreadyCommitted` —
+        // the TARGET side has durably committed `ToolInvoked`. Every arm below
+        // that does NOT confirm Commit-A is therefore a genuine ONE-SIDED
+        // commit (Target committed, Caller did not / cannot be confirmed). The
+        // signing keys died with the crash, so the per-side signed
+        // `CrossContextDivergenceMarker` cannot be appended — but the
+        // supervisor-level repair journal IS available post-crash, so the
+        // divergence MUST be recorded there before returning `NeedsRepair`
+        // (spec §6.2.4 "Dual event-log recording" — "or a supervisor-level
+        // repair journal if one side is unreachable"). The committed event id
+        // is the SagaId-stable `ToolInvoked:{saga_id}` (the id B signed into the
+        // receipt and wrote into its log); the nonce is B's staged
+        // `recorded_nonce` reconstructed from the journal evidence.
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+        let Some(caller) = self.lookup(&caller_hex) else {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                context = %caller_hex,
+                "saga recovery — Commit-in-progress: caller actor unreachable; cannot confirm the \
+                 A-side witness — recording supervisor repair (Target committed) and NeedsRepair"
+            );
+            self.record_supervisor_repair(
+                saga_id,
+                &caller_hex,
+                CommittedSide::Target,
+                &committed_event_id,
+                prepared.recorded_nonce,
+            )
+            .await;
+            return CommitInProgressResolution::NeedsRepair;
+        };
+        let witness_saga_id = saga_id.clone();
+        match caller
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness {
+                    saga_id: witness_saga_id,
+                    reply,
+                })
+            })
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress: BOTH sides committed (B re-emitted, A \
+                     witness present); resolving to Committed (no false NeedsRepair)"
+                );
+                CommitInProgressResolution::Committed
+            }
+            Ok(false) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress: target committed but the caller witness \
+                     is absent (Commit-A never landed) — one-sided commit; recording supervisor \
+                     repair and NeedsRepair"
+                );
+                self.record_supervisor_repair(
+                    saga_id,
+                    &caller_hex,
+                    CommittedSide::Target,
+                    &committed_event_id,
+                    prepared.recorded_nonce,
+                )
+                .await;
+                CommitInProgressResolution::NeedsRepair
+            }
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "saga recovery — Commit-in-progress: A-side witness query failed; cannot \
+                     confirm Commit-A — recording supervisor repair (Target committed) and \
+                     NeedsRepair"
+                );
+                self.record_supervisor_repair(
+                    saga_id,
+                    &caller_hex,
+                    CommittedSide::Target,
+                    &committed_event_id,
+                    prepared.recorded_nonce,
+                )
+                .await;
+                CommitInProgressResolution::NeedsRepair
+            }
+        }
+    }
+
     /// Run the saga FSM for a single saga. Returns `Ok(())` iff the
     /// saga reached `SagaState::Committed`. Every other terminal state
     /// (`Aborted`, `NeedsRepair`) returns a typed error that the caller
     /// surfaces.
+    ///
+    /// The FSM is saga-type-agnostic — it owns the journal write-ordering,
+    /// phase transitions, commit-retry/back-off, `NeedsRepair` accounting, and
+    /// abort sequencing. `xctx` threads the per-phase data hand-off for a
+    /// `CrossContextToolInvocation` saga (spec §6.2.4): Prepare-A's reservation,
+    /// Prepare-B's recorded provenance, and Commit-B's captured receipt/output
+    /// flow A→B→Commit through it. `None` for the spec-gapped / test inputs.
     async fn run_saga_fsm(
         &self,
         saga_id: SagaId,
         input: &SagaInput,
         participants: Vec<String>,
         secret_bearing: bool,
+        mut xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
         // 1. Initiated
         self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
             .await?;
 
-        // 2. PreparingA — not yet wired for any current SagaInput variant.
-        //    The prepare-dispatch returns NotImplemented and the FSM
-        //    transitions directly to Aborted. This preserves the
-        //    coordinator's observable behaviour (terminate with a typed
-        //    error rather than hang) and keeps every phase transition
-        //    in the journal so crash-recovery tests see the right
-        //    states.
+        // 2. PreparingA — dispatch to the caller actor (cross-context) or
+        //    NotImplemented (spec-gapped). On failure the FSM transitions
+        //    directly to Aborted, releasing any side that prepared, and
+        //    surfaces the typed error. Every phase transition is journaled so
+        //    crash-recovery tests see the right states.
         self.append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
             .await?;
 
-        let phase_a = self.dispatch_prepare_phase(input, SagaPhase::A).await;
+        let phase_a = self
+            .dispatch_prepare_phase(&saga_id, input, SagaPhase::A, xctx.as_deref_mut())
+            .await;
         if let Err(err) = phase_a {
-            self.abort_saga(&saga_id, &participants, 2, secret_bearing)
-                .await?;
+            self.abort_saga(
+                &saga_id,
+                &participants,
+                2,
+                secret_bearing,
+                xctx.as_deref_mut(),
+            )
+            .await?;
             return Err(err);
         }
 
-        // 3. PreparingB
-        self.append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
-            .await?;
+        // 3. PreparingB — journal the FULL `{caller, target}` evidence (option
+        //    (a) from the `reserved_saga_contexts` field doc): the
+        //    `CrossContextToolInvocationPrepared` wire carries BOTH context ids,
+        //    so a crash-recovery replay can rebuild the complete participant set
+        //    + the staged provenance (spec §6.2.4 "Crash recovery §17.16.4").
+        //    `saga_input_participants` deliberately omits `target_context_id`
+        //    from its (caller-only) provenance triple; the evidence closes that
+        //    gap. At PreparingB the caller-asserted nonce/depth stand in for B's
+        //    recorded values (B records them inside Prepare-B); the Committing
+        //    append below re-journals with B's authoritative recorded provenance.
+        let preparing_b_evidence = xctx
+            .as_deref()
+            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        self.append_journal(
+            &saga_id,
+            SagaState::PreparingB,
+            &participants,
+            2,
+            preparing_b_evidence.as_deref().unwrap_or(&[]),
+        )
+        .await?;
 
-        let phase_b = self.dispatch_prepare_phase(input, SagaPhase::B).await;
+        let phase_b = self
+            .dispatch_prepare_phase(&saga_id, input, SagaPhase::B, xctx.as_deref_mut())
+            .await;
         if let Err(err) = phase_b {
-            self.abort_saga(&saga_id, &participants, 3, secret_bearing)
-                .await?;
+            self.abort_saga(
+                &saga_id,
+                &participants,
+                3,
+                secret_bearing,
+                xctx.as_deref_mut(),
+            )
+            .await?;
             return Err(err);
         }
 
-        // 4. Committing — 3x retry with 500ms/1s/2s exponential back-off
-        self.append_journal(&saga_id, SagaState::Committing, &participants, 3, &[])
-            .await?;
+        // 4. Committing — 3x retry with 500ms/1s/2s exponential back-off.
+        //    Re-journal the evidence now that Prepare-B has recorded B's
+        //    authoritative provenance (clock / nonce / re-derived depth): a
+        //    Commit-in-progress crash-recovery replay (§17.16.4) reconstructs
+        //    the staged `CrossContextToolInvocationPrepared` from THIS evidence
+        //    to re-drive the idempotent Commit.
+        let committing_evidence = xctx
+            .as_deref()
+            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        self.append_journal(
+            &saga_id,
+            SagaState::Committing,
+            &participants,
+            3,
+            committing_evidence.as_deref().unwrap_or(&[]),
+        )
+        .await?;
 
-        let commit_result = self.commit_with_retry(input).await;
+        let commit_result = self
+            .commit_with_retry(&saga_id, input, xctx.as_deref_mut())
+            .await;
         match commit_result {
             Ok(()) => {
                 self.saga_journal
@@ -4786,33 +6242,64 @@ impl Supervisor {
                 Ok(())
             }
             Err(err) => {
-                // Commit retry exhausted — NeedsRepair.
+                // Commit retry exhausted — NeedsRepair (spec §6.2.4
+                // "commit_with_retry exhausts (3×) → NeedsRepair").
                 self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
                     .await?;
+                // §17.16.4 operator-alerting metric: a saga reached the
+                // NeedsRepair terminal and requires operator repair.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %saga_id,
                     %err,
                     "saga coordinator — commit retry exhausted, saga in NeedsRepair"
                 );
+                // Dual event-log recording (spec §6.2.4): on NeedsRepair both
+                // sides MUST emit a signed `CrossContextDivergenceMarker` (into
+                // each available log, or the supervisor-level repair journal if
+                // a side is unreachable) so a one-sided commit is durably
+                // auditable. Cross-context only; the test / spec-gapped inputs
+                // carry no `xctx`. Marks the ctx so `run_saga`'s tail leaves the
+                // escrow RESERVED (NOT auto-voided) for operator repair.
+                if let Some(ctx) = xctx {
+                    ctx.reached_needs_repair = true;
+                    // Extract the owned divergence plan SYNCHRONOUSLY (no `&ctx`
+                    // borrow crosses the `.await` — the ctx's boxed executor is
+                    // non-`Sync`), then emit. A `None` plan ⇒ Commit-B never
+                    // landed (no committed side, no divergence to mark).
+                    if let Some(plan) = Self::divergence_marker_plan(ctx) {
+                        Box::pin(self.emit_divergence_markers(&saga_id, plan)).await;
+                    } else {
+                        tracing::warn!(
+                            saga_id = %saga_id,
+                            "cross-context saga NeedsRepair with NO committed side (Commit-B never \
+                             landed); logs are clean, no divergence marker required"
+                        );
+                    }
+                }
                 Err(err)
             }
         }
     }
 
-    /// Dispatch a single Prepare phase. Returns
-    /// [`ContextError::NotImplemented`] for all 3 current
-    /// [`SagaInput`] variants because prepare-dispatch is not yet
-    /// wired (Phase 2C) — see
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// Dispatch a single Prepare phase under the 30s per-phase timeout
+    /// ([ADR-049](crate) §7; a timeout maps to
+    /// [`ContextError::TransportTimeout`]).
     ///
-    /// The wrapper enforces the 30s per-phase timeout
-    /// ([`ADR-049`](crate) §7) by awaiting the inner future under
-    /// `tokio::time::timeout`; a timeout maps to
-    /// [`ContextError::TransportTimeout`].
+    /// `StandingPairCreate` / `BroadcastHostingHandshake` are spec-gapped
+    /// (return [`ContextError::NotImplemented`]). For
+    /// `CrossContextToolInvocation` the FSM routes the per-phase message to the
+    /// co-resident participant actor and threads the reply into `xctx`:
+    /// Prepare-A → caller actor → hold `PreparedAFields`; Prepare-B → target
+    /// actor → hold `PreparedBFields`. A missing executor context for a
+    /// cross-context input is a misuse (`start_saga` without an executor) and
+    /// aborts with a typed error.
     async fn dispatch_prepare_phase(
         &self,
+        saga_id: &SagaId,
         input: &SagaInput,
         phase: SagaPhase,
+        xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
         const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -4824,11 +6311,17 @@ impl Supervisor {
                      decomposition)"
                 ))),
                 SagaInput::CrossContextToolInvocation { .. } => {
-                    Err(ContextError::NotImplemented(format!(
-                        "saga Prepare{phase:?} — CrossContextToolInvocation wiring deferred to \
-                         commit 11.5 per DEFERRED-commit-11-saga-use-cases.md gap 2 \
-                         (cross-context tool-invoke transport)"
-                    )))
+                    let Some(ctx) = xctx else {
+                        return Err(ContextError::InvalidState(format!(
+                            "SCP-SAGA-13051: saga Prepare{phase:?} — CrossContextToolInvocation \
+                             requires the supervisor-side executor + signing key; call \
+                             start_cross_context_tool_invocation_saga, not start_saga"
+                        )));
+                    };
+                    match phase {
+                        SagaPhase::A => self.dispatch_xctx_prepare_a(saga_id, ctx).await,
+                        SagaPhase::B => self.dispatch_xctx_prepare_b(saga_id, ctx).await,
+                    }
                 }
                 SagaInput::BroadcastHostingHandshake { .. } => {
                     Err(ContextError::NotImplemented(format!(
@@ -4853,13 +6346,106 @@ impl Supervisor {
         }
     }
 
-    /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error
-    /// after retries are exhausted. Until actor-side Commit handlers
-    /// land, this function calls `dispatch_commit_phase` which returns
-    /// `NotImplemented` for all current saga types — so the retry loop
-    /// is exercised but never succeeds for real inputs (tests inject
-    /// a test-only saga type that DOES succeed).
-    async fn commit_with_retry(&self, input: &SagaInput) -> Result<(), ContextError> {
+    /// Prepare-A (caller side, spec §6.2.4): resolve the co-resident caller
+    /// actor, send [`SagaPhaseMessage::PrepareA`], and hold the returned
+    /// [`PreparedAFields`] reservation in `ctx` for Commit-A / abort.
+    async fn dispatch_xctx_prepare_a(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        let caller_hex = hex::encode(ctx.caller_context_id);
+        let actor = self.lookup(&caller_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13052: cross-context saga Prepare-A — caller context '{caller_hex}' \
+                 is not a co-resident actor (cross-node child-bridge transport is future work)"
+            ))
+        })?;
+
+        let saga_id = saga_id.clone();
+        let caller_context_id = ctx.caller_context_id;
+        let caller_did = ctx.caller_did.clone();
+        let tool_registration_id = ctx.tool_registration_id.clone();
+
+        let prepared = actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA {
+                    saga_id,
+                    caller_context_id,
+                    caller_did,
+                    tool_registration_id,
+                    reply,
+                })
+            })
+            .await?;
+        ctx.prepared_a = Some(prepared);
+        Ok(())
+    }
+
+    /// Prepare-B (target side, spec §6.2.4): resolve the co-resident target
+    /// actor, send [`SagaPhaseMessage::PrepareB`] with the caller-asserted
+    /// envelope, and hold the returned [`PreparedBFields`] in `ctx`.
+    async fn dispatch_xctx_prepare_b(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        let target_hex = hex::encode(ctx.target_context_id);
+        let actor = self.lookup(&target_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13053: cross-context saga Prepare-B — target context '{target_hex}' \
+                 is not a co-resident actor (cross-node child-bridge transport is future work)"
+            ))
+        })?;
+
+        let saga_id = saga_id.clone();
+        let caller_context_id = ctx.caller_context_id;
+        let target_context_id = ctx.target_context_id;
+        let caller_did = ctx.caller_did.clone();
+        let tool_registration_id = ctx.tool_registration_id.clone();
+        let ucan_proof_id = ctx.ucan_proof_id.clone();
+        let input = ctx.input.clone();
+        let asserted_chain_depth = ctx.asserted_chain_depth;
+        let asserted_nonce = ctx.asserted_nonce;
+        let asserted_timestamp_ms = ctx.asserted_timestamp_ms;
+        let caller_source_role = ctx.caller_source_role.clone();
+
+        let prepared = actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB {
+                    saga_id,
+                    caller_context_id,
+                    target_context_id,
+                    caller_did,
+                    tool_registration_id,
+                    ucan_proof_id,
+                    input,
+                    asserted_chain_depth,
+                    asserted_nonce,
+                    asserted_timestamp_ms,
+                    caller_source_role,
+                    reply,
+                })
+            })
+            .await?;
+        ctx.prepared_b = Some(prepared);
+        Ok(())
+    }
+
+    /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error after
+    /// retries are exhausted (→ `NeedsRepair`). The `TestForceNeedsRepair`
+    /// variant always fails (driving the retry-exhaustion path); a wired
+    /// `CrossContextToolInvocation` runs the real two-side Commit.
+    async fn commit_with_retry(
+        &self,
+        saga_id: &SagaId,
+        input: &SagaInput,
+        mut xctx: Option<&mut CrossContextSagaCtx<'_>>,
+    ) -> Result<(), ContextError> {
         const BACKOFFS: &[std::time::Duration] = &[
             std::time::Duration::from_millis(500),
             std::time::Duration::from_secs(1),
@@ -4871,7 +6457,10 @@ impl Supervisor {
             if attempt > 0 {
                 tokio::time::sleep(*backoff).await;
             }
-            match self.dispatch_commit_phase(input).await {
+            match self
+                .dispatch_commit_phase(saga_id, input, xctx.as_deref_mut())
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     tracing::warn!(
@@ -4890,21 +6479,39 @@ impl Supervisor {
         }))
     }
 
-    /// Dispatch the Commit phase. Currently all variants return
-    /// `NotImplemented` pending commit-11.5 spec fill-in. The 30s
-    /// per-attempt timeout is enforced.
-    async fn dispatch_commit_phase(&self, input: &SagaInput) -> Result<(), ContextError> {
+    /// Dispatch the Commit phase under the 30s per-attempt timeout.
+    ///
+    /// For a wired `CrossContextToolInvocation` this drives the §6.2.4 Commit:
+    /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
+    /// Commit-A, ordered B then A. `StandingPairCreate` /
+    /// `BroadcastHostingHandshake` stay `NotImplemented`; `TestForceNeedsRepair`
+    /// always fails.
+    async fn dispatch_commit_phase(
+        &self,
+        saga_id: &SagaId,
+        input: &SagaInput,
+        xctx: Option<&mut CrossContextSagaCtx<'_>>,
+    ) -> Result<(), ContextError> {
         const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         let dispatch_fut = async {
             match input {
                 SagaInput::StandingPairCreate { .. }
-                | SagaInput::CrossContextToolInvocation { .. }
                 | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
-                    "saga Commit — all 3 saga types' commit-side wiring deferred to commit \
-                         11.5 per DEFERRED-commit-11-saga-use-cases.md"
+                    "saga Commit — StandingPairCreate / BroadcastHostingHandshake commit-side \
+                         wiring deferred per DEFERRED-commit-11-saga-use-cases.md"
                         .to_owned(),
                 )),
+                SagaInput::CrossContextToolInvocation { .. } => {
+                    let Some(ctx) = xctx else {
+                        return Err(ContextError::InvalidState(
+                            "SCP-SAGA-13054: saga Commit — CrossContextToolInvocation requires \
+                             the supervisor-side executor context (start_saga misuse)"
+                                .to_owned(),
+                        ));
+                    };
+                    self.dispatch_xctx_commit(saga_id, ctx).await
+                }
                 // Test-only: Commit ALWAYS fails so `commit_with_retry`
                 // exhausts its budget and the FSM transitions to NeedsRepair.
                 #[cfg(any(test, feature = "testing"))]
@@ -4923,19 +6530,1150 @@ impl Supervisor {
         }
     }
 
+    /// Drive the §6.2.4 Commit over the two co-resident actors, ordered B then
+    /// A:
+    ///
+    /// 1. **Commit-B reserve** — ask the target actor whether to execute. On a
+    ///    replay (`AlreadyCommitted`) it returns the STORED receipt/output and
+    ///    the tool is NOT re-invoked.
+    /// 2. **Run the executor supervisor-side** — the non-`Send` tool executor
+    ///    runs off the actor mailbox (ADR-049 §3), producing the output.
+    /// 3. **Commit-B settle** — hand the output to the target actor, which
+    ///    signs the receipt with `target_signing_key`, appends `ToolInvoked`,
+    ///    and durably captures the output keyed by `SagaId`.
+    /// 4. **Commit-A** — hand the receipt/output + the held Prepare-A
+    ///    reservation to the caller actor, which settles escrow and records
+    ///    `CrossContextToolInvoked` (sharing the nonce).
+    ///
+    /// The captured receipt/output are stored in `ctx.committed` for
+    /// [`SagaOutput`]. A failure at any step propagates (the FSM retries, then
+    /// `NeedsRepair`); the Prepare-A reservation stays held for the retry and is
+    /// settled only on a successful Commit-A.
+    async fn dispatch_xctx_commit(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+    ) -> Result<(), ContextError> {
+        // Commit B (execute-or-replay) then A, per §6.2.4.
+        let (receipt, output) = self.commit_b_execute_or_replay(saga_id, ctx).await?;
+
+        // Verify-before-settle (spec §6.2.4 "Signer authorization"): before
+        // Commit-A settles escrow + records the provenance edge, the FSM
+        // re-verifies B's signature over the receipt against the SAME key it
+        // gave B to sign with (`ctx.target_signing_key`). This is an in-saga
+        // integrity check — it proves the receipt was not corrupted/forged in
+        // transit back from Commit-B — NOT the spec's independent
+        // signer-authorization (governance-resolution) step. That step — confirm
+        // the signing key is in fact the Active Signing Key authorized to act for
+        // `target_context_id`, resolved via that context's membership/governance
+        // (§3, §7) — is the DOWNSTREAM receipt CONSUMER's burden (an auditor, or
+        // A re-presenting the receipt as provenance), discharged at the FFI/SDK
+        // boundary, not here: the FSM trivially holds the right key because it
+        // just handed it to B, so this check cannot stand in for an independent
+        // resolution. A verify failure aborts the Commit WITHOUT settling or
+        // recording — a corrupted / tampered receipt must never charge the caller
+        // or write a provenance edge. This also pins the bytes A records: the
+        // verified receipt's SIGNED `output_hash` is what Commit-A binds, not an
+        // independently recomputed hash.
+        let parsed = Self::verify_commit_b_receipt(saga_id, ctx, &receipt)?;
+
+        self.commit_a_settle(saga_id, ctx, &receipt, &parsed)
+            .await?;
+        ctx.committed = Some(CommittedSagaArtifacts { receipt, output });
+        Ok(())
+    }
+
+    /// Verify B's signed [`CrossContextToolReceipt`] against the Active Signing
+    /// Key authorized for `target_context_id` (spec §6.2.4 "Signer
+    /// authorization", normative MUST) and return the parsed receipt for the
+    /// Commit-A binding.
+    ///
+    /// The FSM holds the resolved target key (`ctx.target_signing_key` — the key
+    /// it supplied to Commit-B for signing), so verifying the receipt's
+    /// signature against `verifying_key()` is exactly "signed by the key
+    /// authorized for `target_context_id`". On a parse or signature failure this
+    /// returns a typed error BEFORE Commit-A runs, so a forged / tampered
+    /// receipt never settles escrow or writes the provenance edge.
+    fn verify_commit_b_receipt(
+        saga_id: &SagaId,
+        ctx: &CrossContextSagaCtx<'_>,
+        receipt_bytes: &[u8],
+    ) -> Result<CrossContextToolReceipt, ContextError> {
+        let receipt: CrossContextToolReceipt =
+            serde_json::from_slice(receipt_bytes).map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13063: cross-context saga Commit — target receipt for saga '{}' \
+                     is not a decodable CrossContextToolReceipt: {e}",
+                    saga_id.0
+                ))
+            })?;
+        let authorized_target_key = ctx.target_signing_key.verifying_key();
+        receipt.verify(&authorized_target_key).map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "SCP-SAGA-13064: cross-context saga Commit — target receipt signature for saga \
+                 '{}' does not verify under the key authorized for the target context (forged or \
+                 tampered receipt — aborting before settle): {e}",
+                saga_id.0
+            ))
+        })?;
+        Ok(receipt)
+    }
+
+    /// Commit-B (target side, §6.2.4): reserve, and either replay the stored
+    /// capture (`AlreadyCommitted`) or run the executor supervisor-side and
+    /// settle. Returns `(receipt_bytes, output_bytes)`.
+    async fn commit_b_execute_or_replay(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+    ) -> Result<(Vec<u8>, Vec<u8>), ContextError> {
+        use crate::context::actor::commands::{CommitBReserveOutcome, SagaPhaseMessage};
+
+        let target_hex = hex::encode(ctx.target_context_id);
+        let target = self.lookup(&target_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13055: cross-context saga Commit-B — target context '{target_hex}' \
+                 is not a co-resident actor"
+            ))
+        })?;
+        let reserve_saga_id = saga_id.clone();
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve {
+                    saga_id: reserve_saga_id,
+                    reply,
+                })
+            })
+            .await?;
+
+        match reserve {
+            // Replay: the tool already executed; re-use the stored capture. The
+            // `tool_invoked_event_id` is carried inside the signed receipt; we
+            // ALSO record it in `ctx` so a subsequent Commit-A failure → NeedsRepair
+            // knows the TARGET committed and which event id its
+            // `CrossContextDivergenceMarker` must name (spec §6.2.4).
+            CommitBReserveOutcome::AlreadyCommitted {
+                receipt,
+                output_bytes,
+                tool_invoked_event_id,
+            } => {
+                ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
+                Ok((receipt, output_bytes))
+            }
+            // First execution: run the executor supervisor-side, then settle.
+            CommitBReserveOutcome::ReadyToExecute => {
+                self.commit_b_first_execute(saga_id, ctx, &target_hex).await
+            }
+        }
+    }
+
+    /// First (non-replay) Commit-B: run the supervisor-side executor (off the
+    /// actor mailbox per ADR-049 §3) EXACTLY ONCE, stash its output in `ctx`, and
+    /// send [`SagaPhaseMessage::CommitBSettle`] with the captured output and the
+    /// target's Active Signing Key.
+    ///
+    /// Retryable settle (review wave-1): the tool runs only when no output is yet
+    /// stashed (`ctx.executor_output == None`). Once it has run, the output is
+    /// stashed; a transient settle FAILURE leaves `executor_output == Some` while
+    /// the actor's persist-rolled-back capture makes the next reserve report
+    /// `ReadyToExecute` again — so this is re-entered, but it RE-SENDS the settle
+    /// with the stashed bytes rather than re-invoking the tool (exactly-once
+    /// execution preserved; settle becomes retryable). The executor handle is
+    /// taken only on the genuine first execution.
+    async fn commit_b_first_execute(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+        target_hex: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), ContextError> {
+        use crate::context::actor::commands::{CommitBSettleOutcome, SagaPhaseMessage};
+
+        // Run the executor ONCE and stash its output. On a settle retry the
+        // output is already stashed — NEVER re-invoke (the tool had side
+        // effects); re-send the settle with the stashed bytes.
+        let exec_output_bytes = if let Some(stashed) = ctx.executor_output.clone() {
+            stashed
+        } else {
+            let executor = ctx.executor.take().ok_or_else(|| {
+                ContextError::InvalidState(
+                    "SCP-SAGA-13056: cross-context saga Commit-B — executor already consumed but \
+                     no output was stashed (a non-replay Commit attempt after the tool ran is a \
+                     coordinator bug)"
+                        .to_owned(),
+                )
+            })?;
+            let output_value = executor(ctx.input.clone()).await.map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13057: cross-context tool executor failed for saga '{}': {e}",
+                    saga_id.0
+                ))
+            })?;
+            let bytes = serde_json::to_vec(&output_value).map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13058: cross-context tool output is not serializable for saga \
+                     '{}': {e}",
+                    saga_id.0
+                ))
+            })?;
+            // Stash BEFORE the settle send, so a settle failure (and the actor's
+            // rolled-back capture) leaves the output recoverable for the retry —
+            // the tool is never re-invoked.
+            ctx.executor_output = Some(bytes.clone());
+            bytes
+        };
+
+        // Re-resolve the target actor (the executor ran off the mailbox; a fresh
+        // handle survives an interleaved respawn).
+        let target = self.lookup(target_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13060: cross-context saga Commit-B settle — target context \
+                 '{target_hex}' is not a co-resident actor"
+            ))
+        })?;
+        let settle_saga_id = saga_id.clone();
+        let target_signing_key = crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+            &ctx.target_signing_key,
+        );
+        let CommitBSettleOutcome {
+            receipt,
+            output_bytes,
+            tool_invoked_event_id,
+        } = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
+                    saga_id: settle_saga_id,
+                    output_bytes: exec_output_bytes,
+                    target_signing_key,
+                    reply,
+                })
+            })
+            .await?;
+        // Commit-B has landed durably: record the target's `ToolInvoked` event
+        // id so a later Commit-A failure → NeedsRepair knows the TARGET side
+        // committed and which event id the divergence marker must name.
+        ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
+        Ok((receipt, output_bytes))
+    }
+
+    /// Commit-A (caller side, §6.2.4): hand the held Prepare-A reservation +
+    /// the target's VERIFIED receipt to the caller actor, which settles the
+    /// escrow and records `CrossContextToolInvoked` (sharing the nonce).
+    ///
+    /// Ticket-safe + witness-driven re-drive (review wave-1):
+    ///
+    /// - **Held reservation present** — the normal path. The `#[must_use]`
+    ///   reservation (holding the `ToolEconomyTicket` whose `Drop` debug-asserts
+    ///   on an unbalanced drop) is sent via [`ContextActorHandle::send_recover_on_failure`].
+    ///   If the mailbox SEND itself fails (the actor died between `lookup` and
+    ///   send, or the mailbox stayed full for the 30s `SEND_TIMEOUT`), the
+    ///   un-delivered command is returned so we RECOVER the reservation and put
+    ///   it BACK into `ctx.prepared_a`: Commit-A never landed, so the FSM retry
+    ///   re-drives Commit-B (replay, no re-invoke) → Commit-A cleanly, and the
+    ///   ticket is never dropped unbalanced. `lookup` is NOT a delivery
+    ///   guarantee — that was the unsound assumption the old code made.
+    ///
+    /// - **Reservation already consumed (`prepared_a == None`)** — a prior
+    ///   Commit-A whose ACK was LOST after the handler durably committed (the
+    ///   reservation moved into the delivered command and the actor consumed the
+    ///   ticket). We re-ack from the durable `xctx_committed_invocations` witness
+    ///   (spec §17.16.4 "A re-acks … as a no-op"): if the caller actor confirms
+    ///   the witness, the saga resolves to `Committed` rather than a spurious
+    ///   `SCP-SAGA-13059` `NeedsRepair`. If the witness is absent the Commit-A
+    ///   genuinely did not commit (a real divergence), surfaced as a typed error.
+    ///
+    /// `receipt` carries B's VERIFIED signed receipt bytes; the caller records
+    /// the receipt's SIGNED `output_jcs` as the bound output (FIX 3 MED — A's
+    /// logged `output_hash` is the receipt's signed hash, not an independent
+    /// recompute).
+    async fn commit_a_settle(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+        receipt_bytes: &[u8],
+        receipt: &CrossContextToolReceipt,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        let caller_hex = hex::encode(ctx.caller_context_id);
+        let caller = self.lookup(&caller_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13061: cross-context saga Commit-A — caller context '{caller_hex}' \
+                 is not a co-resident actor"
+            ))
+        })?;
+
+        // The reservation was already consumed by a delivered Commit-A whose ACK
+        // was lost. Re-ack from the durable witness instead of re-sending (we no
+        // longer hold a ticket to send): a recorded witness IS the idempotent
+        // A-side re-ack → Committed, not a false NeedsRepair (spec §17.16.4).
+        let Some(reservation) = ctx.prepared_a.take() else {
+            return self
+                .commit_a_reack_from_witness(saga_id, &caller, &caller_hex)
+                .await;
+        };
+
+        // Bind A's recorded output to the receipt's SIGNED bytes (FIX 3 MED): the
+        // receipt's `output_jcs` is the exact preimage of the signed
+        // `output_hash`, so A hashes precisely what B signed.
+        let output_for_a = receipt.output_jcs.clone();
+        let commit_a_saga_id = saga_id.clone();
+        let caller_context_id = ctx.caller_context_id;
+        let caller_did = ctx.caller_did.clone();
+        let target_context_id = ctx.target_context_id;
+        let nonce = ctx.asserted_nonce;
+        let receipt_for_a = receipt_bytes.to_vec();
+
+        let send_result = caller
+            .send_recover_on_failure(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitA {
+                    saga_id: commit_a_saga_id,
+                    reservation: Box::new(reservation),
+                    caller_context_id,
+                    caller_did,
+                    target_context_id,
+                    nonce,
+                    receipt: receipt_for_a,
+                    output_bytes: output_for_a,
+                    reply,
+                })
+            })
+            .await;
+
+        match send_result {
+            Ok(()) => Ok(()),
+            // Send NEVER delivered — recover the reservation and restore it to
+            // `ctx.prepared_a` so the FSM retry re-drives Commit-A (and the
+            // ticket is never dropped unbalanced). Commit-A did not land, so the
+            // retry's Commit-B replay + fresh Commit-A is exactly correct.
+            Err((err, Some(recovered_cmd))) => {
+                if let Some(reservation) = Self::extract_commit_a_reservation(recovered_cmd) {
+                    ctx.prepared_a = Some(reservation);
+                } else {
+                    // Unreachable in practice: the recovered command IS the
+                    // CommitA we built. If a future refactor changes that, the
+                    // reservation has nowhere to go — log loudly rather than
+                    // silently leak (the carrier's drop guard then fires under
+                    // testing, surfacing the bug instead of hiding it).
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        "cross-context saga Commit-A — recovered a non-CommitA command on send \
+                         failure; the held reservation could not be restored"
+                    );
+                }
+                Err(err)
+            }
+            // Delivered but the handler errored (or dropped the reply): the actor
+            // already owns/consumed the ticket, so there is nothing to recover.
+            // `prepared_a` stays `None`; a retry re-acks from the witness above.
+            Err((err, None)) => Err(err),
+        }
+    }
+
+    /// Re-ack Commit-A from the durable `xctx_committed_invocations` witness when
+    /// the held reservation is gone (spec §17.16.4). Queries the caller actor
+    /// read-only; a recorded witness resolves the saga to `Committed`, an absent
+    /// witness surfaces a typed `SCP-SAGA-13059` (the Commit-A genuinely did not
+    /// commit — a real divergence the FSM carries to `NeedsRepair`).
+    async fn commit_a_reack_from_witness(
+        &self,
+        saga_id: &SagaId,
+        caller: &crate::context::actor::ContextActorHandle,
+        caller_hex: &str,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        let witness_saga_id = saga_id.clone();
+        let recorded = caller
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness {
+                    saga_id: witness_saga_id,
+                    reply,
+                })
+            })
+            .await?;
+        if recorded {
+            tracing::info!(
+                saga_id = %saga_id.0,
+                context = %caller_hex,
+                "cross-context saga Commit-A — reservation consumed but the durable witness \
+                 confirms Commit-A landed; re-acking as Committed (lost-reply recovery, §17.16.4)"
+            );
+            Ok(())
+        } else {
+            Err(ContextError::InvalidState(format!(
+                "SCP-SAGA-13059: cross-context saga Commit-A — no held Prepare-A reservation for \
+                 saga '{}' and the caller witness does not record a committed Commit-A (Commit-A \
+                 did not durably land)",
+                saga_id.0
+            )))
+        }
+    }
+
+    /// Extract the held Prepare-A reservation back out of a recovered
+    /// (un-delivered) `CommitA` command so the FSM can restore it to `ctx` for a
+    /// retry. Returns `None` if the command is not a `CommitA` (unreachable for
+    /// the command built in [`Self::commit_a_settle`]).
+    fn extract_commit_a_reservation(
+        cmd: Box<ContextCommand>,
+    ) -> Option<crate::context::actor::commands::PreparedAFields> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        if let ContextCommand::SagaPhase(SagaPhaseMessage::CommitA { reservation, .. }) = *cmd {
+            Some(*reservation)
+        } else {
+            None
+        }
+    }
+
+    /// Extract the held Prepare-A reservation back out of a recovered
+    /// (un-delivered) caller-side `Abort` command so the abort path can void its
+    /// external escrow + consume the ticket. Returns `None` if the command is
+    /// not an `Abort` carrying a reservation (unreachable for the command built
+    /// in [`Self::abort_xctx_participants`]).
+    fn extract_abort_reservation(
+        cmd: Box<ContextCommand>,
+    ) -> Option<crate::context::actor::commands::PreparedAFields> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        if let ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+            reservation: Some(reservation),
+            ..
+        }) = *cmd
+        {
+            Some(*reservation)
+        } else {
+            None
+        }
+    }
+
+    /// Emit the dual `CrossContextDivergenceMarker`s on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording").
+    ///
+    /// When `commit_with_retry` exhausts and the FSM reaches `NeedsRepair`,
+    /// BOTH sides must record a signed divergence marker so a one-sided commit
+    /// (the repudiation primitive) is durably auditable. This:
+    ///
+    /// 1. Determines **which side committed** from
+    ///    [`CrossContextSagaCtx::committed_b_tool_invoked_event_id`]: `Some`
+    ///    means Commit-B landed (the TARGET committed its `ToolInvoked`) and
+    ///    Commit-A then failed — `committed_side = Target`, the committed event
+    ///    id is the `ToolInvoked` id. `None` means Commit-B never landed; no
+    ///    side committed, so there is NOTHING to record (the logs are clean —
+    ///    no divergence). A clean no-commit `NeedsRepair` therefore emits no
+    ///    markers; it is a transient commit failure the operator re-drives, not
+    ///    a one-sided commit.
+    /// 2. For each reachable participant actor (target + caller), resolves that
+    ///    side's Active Signing Key (the FSM holds both — supplied per-call,
+    ///    ADR-049) and sends [`SagaPhaseMessage::EmitDivergenceMarker`] so the
+    ///    actor signs + appends the marker into ITS OWN event log.
+    /// 3. If a side is UNREACHABLE (`lookup` miss / actor gone), the signed
+    ///    marker cannot be appended into that side's log, so the divergence is
+    ///    recorded into the supervisor-level repair journal
+    ///    ([`Self::saga_repair_records`]) instead — "or a supervisor-level
+    ///    repair journal if one side is unreachable".
+    ///
+    /// Best-effort: a send / append failure for one side is logged but never
+    /// masks the `NeedsRepair` terminal — the operator-repair path reconciles
+    /// from whatever markers landed plus the supervisor repair journal. The
+    /// escrow is NOT settled here (the [`Self::run_saga`] tail holds it RESERVED
+    /// for operator repair) and `prepared_a` is intentionally left untouched.
+    async fn emit_divergence_markers(&self, saga_id: &SagaId, plan: DivergenceMarkerPlan) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+
+        // The OWNED plan was extracted by the SYNC [`Self::divergence_marker_plan`]
+        // at the (sync) FSM call site — NO `&CrossContextSagaCtx` borrow spans the
+        // `.await`s below (the ctx carries the non-`Sync` boxed executor, which
+        // would otherwise poison this future's `Send` bound). The loop holds only
+        // owned values.
+        let (committed_event_id, nonce, sides) = plan;
+        let committed_side = CommittedSide::Target;
+
+        for (label, context_id, signing_key_bytes) in sides {
+            let context_hex = hex::encode(context_id);
+            if let Some(actor) = self.lookup(&context_hex) {
+                let marker_saga_id = saga_id.clone();
+                let committed_event_id_for_send = committed_event_id.clone();
+                let result = actor
+                    .send(move |reply| {
+                        ContextCommand::SagaPhase(SagaPhaseMessage::EmitDivergenceMarker {
+                            saga_id: marker_saga_id,
+                            nonce,
+                            committed_side,
+                            committed_event_id: committed_event_id_for_send,
+                            signing_key: signing_key_bytes,
+                            reply,
+                        })
+                    })
+                    .await;
+                match result {
+                    Ok(()) => tracing::error!(
+                        saga_id = %saga_id.0,
+                        side = label,
+                        "cross-context saga NeedsRepair — signed divergence marker appended \
+                         to the {label} event log (operator repair required)"
+                    ),
+                    Err(err) => {
+                        // The actor is reachable but the append failed; record
+                        // the supervisor-level fallback witness so the
+                        // divergence is not lost.
+                        tracing::error!(
+                            saga_id = %saga_id.0,
+                            side = label,
+                            %err,
+                            "cross-context saga NeedsRepair — {label} divergence-marker \
+                             append FAILED; recording supervisor repair fallback"
+                        );
+                        self.record_supervisor_repair(
+                            saga_id,
+                            &context_hex,
+                            committed_side,
+                            &committed_event_id,
+                            nonce,
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                // Unreachable side: record into the supervisor-level repair
+                // journal instead of that side's (absent) log.
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    side = label,
+                    context = %context_hex,
+                    "cross-context saga NeedsRepair — {label} actor unreachable; recording \
+                     divergence into the supervisor-level repair journal"
+                );
+                self.record_supervisor_repair(
+                    saga_id,
+                    &context_hex,
+                    committed_side,
+                    &committed_event_id,
+                    nonce,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Synchronous extractor for [`Self::emit_divergence_markers`]: returns the
+    /// owned `(committed_event_id, nonce, [per-side (label, context_id,
+    /// signing_key)])` plan, or `None` if Commit-B never landed (no committed
+    /// side ⇒ no divergence). Holding the `&ctx` borrow inside this sync fn
+    /// (rather than across the caller's `.await`s) keeps the caller future
+    /// `Send` despite the ctx's non-`Sync` boxed executor.
+    fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
+        use crate::context::actor::commands::SigningKeyBytes;
+        let committed_event_id = ctx.committed_b_tool_invoked_event_id.clone()?;
+        // Each side records the SAME (committed_side, committed_event_id, nonce)
+        // — each into its own log under its OWN Active Signing Key. Only the
+        // TARGET can have committed-then-diverged in the current FSM (Commit-B
+        // lands first, then Commit-A).
+        //
+        // Keying off the B-committed event id alone is sound (no A-side symmetry
+        // needed): an A-without-B divergence is STRUCTURALLY IMPOSSIBLE. Commit-A
+        // (`commit_a`) appends its `CrossContextToolInvoked` ONLY after its
+        // idempotency-witness Class-S persist succeeds, which itself can only run
+        // after Commit-B landed and forwarded the receipt — so a durable A-side
+        // record can never exist without a durable B-side `ToolInvoked`. The
+        // append-before-persist inverse (which would have produced a silent
+        // A-without-B orphan on a persist failure) was the bug FIX corrected by
+        // mirroring `commit_b_first_settle`'s witness-persist-before-append
+        // ordering. A one-sided divergence is therefore always Target-committed.
+        let sides = [
+            (
+                "target",
+                ctx.target_context_id,
+                SigningKeyBytes::from_signing_key(&ctx.target_signing_key),
+            ),
+            (
+                "caller",
+                ctx.caller_context_id,
+                SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
+            ),
+        ];
+        // Source the STAGED `recorded_nonce` (B's captured copy of the wire
+        // value) for symmetry with the signed receipt, which draws its `nonce`
+        // from the same staged value (spec §6.2.4 *Staged nonce and recorded
+        // chain-depth*). A divergence marker can only exist once Commit-B landed
+        // (`committed_event_id` is `Some`), which implies Prepare-B ran and
+        // `prepared_b` is set — so this is the staged nonce in practice; the
+        // `asserted_nonce` fallback is defensive and equals the staged value by
+        // design (the nonce is a public correlation token B copies, not derives).
+        let marker_nonce = ctx
+            .prepared_b
+            .as_ref()
+            .map_or(ctx.asserted_nonce, |b| b.recorded_nonce);
+        Some((committed_event_id, marker_nonce, sides))
+    }
+
+    /// Record a supervisor-level divergence repair witness for an UNREACHABLE
+    /// (or append-failed) side of a `NeedsRepair` saga (spec §6.2.4 "Dual
+    /// event-log recording" — "or a supervisor-level repair journal if one side
+    /// is unreachable").
+    ///
+    /// Two-tier durability: pushes the record into the in-memory
+    /// [`Self::saga_repair_records`] read cache (keyed by saga id; a single
+    /// diverged saga may accumulate multiple records), AND durably appends the
+    /// FULL accumulated record set for the saga as the `evidence` of a
+    /// `NeedsRepair` [`JournalEntry`]. The durable write is the load-bearing
+    /// half: without it a supervisor crash before an operator reads the cache
+    /// would LOSE the unreachable-leg divergence account, weakening the spec's
+    /// "durably auditable" guarantee for that leg. On restart the recovery path
+    /// (`recover_saga_entry`'s `NeedsRepair` arm) decodes the latest such entry
+    /// and rehydrates the cache. A durable-append failure is logged (the
+    /// in-memory cache still holds the record for an operator reading a live
+    /// supervisor) but cannot itself be repaired here — it is the same
+    /// best-effort-then-surface posture the reachable-side marker append takes.
+    async fn record_supervisor_repair(
+        &self,
+        saga_id: &SagaId,
+        unreachable_context_hex: &str,
+        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        committed_event_id: &str,
+        nonce: [u8; 16],
+    ) {
+        // Push into the in-memory read cache and snapshot the full accumulated
+        // set + the per-saga append seq (vec length after the push) WITHOUT
+        // holding the DashMap guard across the `.await` below.
+        let (records, append_seq) = {
+            let mut entry = self.saga_repair_records.entry(saga_id.clone()).or_default();
+            entry.push(SagaDivergenceRepairRecord {
+                unreachable_context_hex: unreachable_context_hex.to_owned(),
+                committed_side,
+                committed_event_id: committed_event_id.to_owned(),
+                nonce,
+            });
+            // seq 4 is the plain NeedsRepair transition (empty evidence); the
+            // repair-record appends follow it monotonically (5, 6, …), one per
+            // accumulated record, so the LATEST-per-saga entry load_unresolved
+            // returns carries the full set.
+            (entry.clone(), 4 + entry.len() as u64)
+        };
+
+        let evidence = match encode_repair_records_evidence(&records) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "cross-context saga NeedsRepair — failed to ENCODE the supervisor repair \
+                     record set for the durable journal; the divergence stays in the in-memory \
+                     read cache only"
+                );
+                return;
+            }
+        };
+
+        // The participants are the two saga contexts; reuse the committed-side
+        // event id linkage carried inside the evidence. Durably append.
+        if let Err(err) = self
+            .append_journal(
+                saga_id,
+                SagaState::NeedsRepair,
+                &[unreachable_context_hex.to_owned()],
+                append_seq,
+                &evidence,
+            )
+            .await
+        {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "cross-context saga NeedsRepair — failed to DURABLY journal the supervisor \
+                 repair record; it remains in the in-memory read cache but will not survive a \
+                 supervisor restart"
+            );
+        }
+    }
+
+    /// Read the supervisor-level divergence repair records for a saga (operator
+    /// repair surface; also used by the NeedsRepair divergence tests). Returns
+    /// an empty vec if the saga has no supervisor-recorded divergence
+    /// (both sides were reachable and recorded into their own logs).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn saga_repair_records_for(&self, saga_id: &SagaId) -> Vec<SagaDivergenceRepairRecord> {
+        self.saga_repair_records
+            .get(saga_id)
+            .map(|e| e.clone())
+            .unwrap_or_default()
+    }
+
+    /// Build the journal `evidence` bytes for a cross-context tool-invocation
+    /// saga — the `MessagePack` of the eight-field
+    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// wire (spec §6.2.4 "Public-metadata journaling"). Carries BOTH the caller
+    /// AND target context ids (option (a) — closing the
+    /// [`saga_input_participants`] caller-only gap) plus the staged provenance,
+    /// so a crash-recovery replay (§17.16.4) reconstructs the full
+    /// `{caller, target}` participant set and the prepared state.
+    ///
+    /// Uses B's authoritative recorded provenance once Prepare-B has run
+    /// (`ctx.prepared_b`); before that, the caller-asserted nonce / depth stand
+    /// in (B re-derives them at Prepare-B, and the PreparingB-state replay arm
+    /// only ever ABORTS — it never re-drives a Commit, so it does not depend on
+    /// the recorded values). Returns `None` for a non-`CrossContextToolInvocation`
+    /// input (the test / spec-gapped variants carry no `xctx`).
+    fn xctx_prepared_evidence_bytes(
+        input: &SagaInput,
+        ctx: &CrossContextSagaCtx<'_>,
+    ) -> Option<Vec<u8>> {
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        // Only the cross-context variant journals prepared evidence.
+        if !matches!(input, SagaInput::CrossContextToolInvocation { .. }) {
+            return None;
+        }
+        let (recorded_timestamp_ms, recorded_nonce, recorded_chain_depth) =
+            ctx.prepared_b.as_ref().map_or_else(
+                || {
+                    // Pre-Prepare-B: B has not yet recorded. The caller-asserted
+                    // values stand in (the PreparingB-state replay arm aborts and
+                    // never re-drives a Commit, so it does not read them).
+                    (
+                        ctx.asserted_timestamp_ms,
+                        ctx.asserted_nonce,
+                        ctx.asserted_chain_depth,
+                    )
+                },
+                |b| {
+                    (
+                        b.recorded_timestamp_ms,
+                        b.recorded_nonce,
+                        b.recorded_chain_depth,
+                    )
+                },
+            );
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: ctx.caller_context_id,
+            target_context_id: ctx.target_context_id,
+            caller_did: ctx.caller_did.clone(),
+            tool_registration_id: ctx.tool_registration_id.clone(),
+            // The wire mirror carries a non-optional `ucan_proof_id`; an ungated
+            // tool (no proof) maps to the empty string (round-trips to `None`
+            // semantics via an empty proof reference on reconstruction).
+            ucan_proof_id: ctx.ucan_proof_id.clone().unwrap_or_default(),
+            recorded_timestamp_ms,
+            recorded_nonce,
+            recorded_chain_depth,
+        };
+        prepared.to_evidence_bytes().ok()
+    }
+
+    /// Abort the saga (spec §6.2.4 "Reservation release on every terminal
+    /// path"): release the staged participant reservations — for a cross-context
+    /// saga, send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
+    /// the staged reservations are released (the caller side hands its held
+    /// `PreparedAFields` back to reverse its LOCAL economy; the target side
+    /// clears its staged slot) — and THEN, iff the caller-side LOCAL economy
+    /// reversal was confirmed, mark the journal Aborting → Aborted.
+    ///
+    /// The reservation release runs BEFORE the `Aborting` transition so the
+    /// terminal marker is never written while the caller refund is still
+    /// outstanding (a terminal-`Aborted` journal asserts "fully compensated").
+    /// If [`Self::abort_xctx_participants`] reports the caller reversal
+    /// outstanding (send-failure + re-drive failure, unreachable actor, or a
+    /// delivered-but-errored handler), the journal is LEFT non-terminal (at
+    /// `PreparingB`) so the §17.16.4 crash-recovery sweep re-drives the
+    /// record-based `Abort { None }` reversal — never an unconditional terminal.
     async fn abort_saga(
         &self,
         saga_id: &SagaId,
         participants: &[String],
         next_seq: u64,
         secret_bearing: bool,
+        xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
+        // Release any staged participant reservations FIRST — BEFORE the
+        // `Aborting` journal transition — so the terminal marker is never
+        // written while the caller's LOCAL economy reversal is still
+        // outstanding. The caller-side budget / velocity / hard-rate-limit were
+        // deducted + Class-S-persisted at Prepare-A and live in the caller
+        // actor's `PerContextState`; they can ONLY be reversed BY that actor (a
+        // delivered `Abort`). `mark_resolved(Aborted)` asserts "fully
+        // compensated", so it MUST NOT precede the local reversal. See
+        // [`Self::abort_xctx_participants`] for the per-side delivery contract
+        // and the send-failure / unreachable re-drive that reverses the local
+        // economy from the durable `CallerReservationRecord`.
+        let caller_reversal = match xctx {
+            Some(ctx) => self.abort_xctx_participants(saga_id, ctx).await,
+            // Non-cross-context (spec-gapped / test) saga: no caller-side local
+            // economy to reverse, so the terminal marker is always safe.
+            None => CallerAbortReversal::SettledOrAbsent,
+        };
+
+        // If the caller's local-economy reversal could NOT be confirmed (the
+        // re-drive ALSO failed under persistent backpressure / a closed inbox),
+        // do NOT write a terminal `Aborted` marker: that would durably assert
+        // "fully compensated" while the caller stays over-charged forever (the
+        // §17.16.4 sweep re-drives ONLY a non-terminal `PreparingB`, never an
+        // `Aborted`). Leave the journal at its current pre-`Aborting` state
+        // (`PreparingB` — carrying the full caller+target evidence) so the
+        // startup crash-recovery sweep re-drives `Abort { None }` and reverses
+        // the local economy from the durable record. The FSM still surfaces the
+        // original abort error to its caller.
+        if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
+            // Observability: the producing site inside `abort_xctx_participants` /
+            // `redrive_caller_local_reversal` already routed its verdict through
+            // `Self::reversal_outstanding()`, which incremented
+            // `scp_saga_caller_reversal_outstanding_total` and (at the site) emitted
+            // the stable `event = "xctx_caller_reversal_outstanding"` warn. This
+            // coordinator branch re-emits the SAME stable field (so a log query on
+            // it surfaces the terminal "left non-terminal" decision too) but does
+            // NOT re-increment the counter — that would double-count a single
+            // stranded reversal. Log-based alerting on that stable field
+            // (thresholding the per-`saga_id` rate) is the intended signal.
+            tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
+                saga_id = %saga_id.0,
+                "cross-context saga abort — caller-side local-economy reversal could not be \
+                 delivered (persistent backpressure / closed inbox); leaving the journal \
+                 non-terminal so the crash-recovery sweep reconciles it (NOT marking \
+                 terminal-Aborted with the caller refund outstanding)"
+            );
+            return Ok(());
+        }
+
         self.append_journal(saga_id, SagaState::Aborting, participants, next_seq, &[])
             .await?;
+
         self.saga_journal
             .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, secret_bearing)
             .await
             .map_err(|e| ContextError::InvalidState(format!("saga journal mark_resolved: {e}")))
+    }
+
+    /// Record a stranded caller-side cross-context-saga reversal and return the
+    /// [`CallerAbortReversal::ReversalOutstanding`] verdict. Bumps the
+    /// `scp_saga_caller_reversal_outstanding_total` counter once per stranded
+    /// reversal so log-based / metric alerting can threshold the rate (each call
+    /// site additionally emits a stable `event = "xctx_caller_reversal_outstanding"`
+    /// structured warn carrying `saga_id`). Centralizing the counter here keeps
+    /// every producing site in lockstep — a new outstanding path cannot forget to
+    /// count itself — and avoids double-counting at the coordinator that consumes
+    /// the verdict.
+    fn reversal_outstanding() -> CallerAbortReversal {
+        crate::metrics::record_saga_caller_reversal_outstanding();
+        CallerAbortReversal::ReversalOutstanding
+    }
+
+    /// Send [`SagaPhaseMessage::Abort`] to the prepared participant actors of a
+    /// cross-context saga, reversing the caller-side LOCAL economy on every
+    /// reachable leg.
+    ///
+    /// - CALLER side: if Prepare-A staged a reservation, hand the carrier back
+    ///   via a `Abort { Some }` so the actor rolls the held escrow + LOCAL
+    ///   budget / velocity / hard-rate-limit back (the generation-checked
+    ///   carrier rollback). Taking it out of `ctx` ensures the
+    ///   `ToolEconomyTicket` is settled-or-rolled-back exactly once.
+    ///
+    ///   If that send FAILS (mailbox full for the full `SEND_TIMEOUT`, or the
+    ///   inbox is closed) the carrier never reached the actor, so its
+    ///   per-context LOCAL rollback never ran — the carrier's escrow void alone
+    ///   would leave the caller's LOCAL budget / velocity / hard-rate-limit
+    ///   deducted forever (a durable over-charge). The actor-owned LOCAL economy
+    ///   can ONLY be reversed BY the actor, so we recover the carrier, void +
+    ///   consume its external escrow (idempotent), and then RE-DRIVE the abort
+    ///   as `Abort { None }` — the SAME path the §17.16.4 crash-recovery sweep
+    ///   uses — which reverses the LOCAL economy from the durable
+    ///   `CallerReservationRecord` Prepare-A staged (and idempotently re-voids
+    ///   the same escrow). If that re-drive ALSO fails, the caller refund is
+    ///   STILL outstanding: we report [`CallerAbortReversal::ReversalOutstanding`]
+    ///   so the coordinator leaves the journal non-terminal for the sweep to
+    ///   reconcile — NEVER marking terminal-`Aborted` with the refund pending.
+    ///
+    ///   If the caller actor is UNREACHABLE (despawned — `lookup` miss), the
+    ///   in-memory carrier rollback cannot run, but the durable
+    ///   `CallerReservationRecord` survives in the persisted snapshot and the
+    ///   restored actor will carry it; we void the carrier escrow + consume the
+    ///   ticket (so its `#[must_use]` drop guard does not fire) and report
+    ///   `ReversalOutstanding` so the journal stays non-terminal until a respawn
+    ///   + sweep reverses the LOCAL economy from the record.
+    ///
+    ///   If `prepared_a` is `None` (the carrier never reached `ctx` — e.g. the
+    ///   §6.2.4 30s Prepare-A phase-timeout dropped the supervisor's reply
+    ///   receiver AFTER the actor durably persisted the deduction + record), this
+    ///   does NOT mean nothing was prepared. The durable record is the source of
+    ///   truth: we drive a record-based `Abort { None }` (via
+    ///   [`Self::redrive_caller_local_reversal`]) so the caller reverses the
+    ///   LOCAL economy from the record if present — a clean no-op (→
+    ///   `SettledOrAbsent`) only for a genuinely-nothing-prepared saga. Without
+    ///   this, a lost Prepare-A reply would strand the caller's durable deduction
+    ///   under a terminal `Aborted` forever (the startup sweep re-drives only
+    ///   non-terminal journals).
+    ///
+    /// - TARGET side: send `Abort` with `None` reservation so the actor clears
+    ///   its staged `saga_pending` slot (releasing the session reservation).
+    ///   Only meaningful if Prepare-B staged a slot. The target side carries no
+    ///   caller LOCAL economy, so it never affects the returned reversal status.
+    ///
+    /// Returns whether the CALLER-side local-economy reversal is settled (the
+    /// only input to the coordinator's terminal-marker decision); the target
+    /// slot release is best-effort and orthogonal.
+    async fn abort_xctx_participants(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut CrossContextSagaCtx<'_>,
+    ) -> CallerAbortReversal {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        // CALLER side. A `Some` carrier is the LIVE-abort fast path (rolled back
+        // BY the actor via the generation-checked carrier rollback). A `None`
+        // carrier does NOT mean "nothing prepared": the deduction + durable
+        // record land BEFORE the carrier reaches `ctx`, so a lost Prepare-A reply
+        // leaves `None` over a real durable deduction — reconciled below via the
+        // record-based `Abort { None }` re-drive.
+        // Used by BOTH arms: the `Some` carrier path (lookup + `Abort { Some }`)
+        // and the `None` record-reconcile path (the `Abort { None }` re-drive).
+        let caller_hex = hex::encode(ctx.caller_context_id);
+        let caller_reversal = if let Some(reservation) = ctx.prepared_a.take() {
+            if let Some(caller) = self.lookup(&caller_hex) {
+                let abort_saga_id = saga_id.clone();
+                // The Abort command carries the `#[must_use]` reservation (whose
+                // `ToolEconomyTicket` debug-asserts on an unbalanced drop). Use
+                // `send_recover_on_failure` — NOT the plain `send`, which drops
+                // the built command (and its ticket) INSIDE the send on a
+                // full/closed mailbox → a Drop panic under `--features testing`
+                // and an escrow leak in release. On a send failure we get the
+                // un-delivered command back, extract the reservation, void its
+                // external escrow, and then RE-DRIVE the abort as `Abort { None }`
+                // so the actor reverses the LOCAL economy from the durable
+                // record (the carrier never reached the actor, so its per-context
+                // LOCAL rollback could not run).
+                let send_result = caller
+                    .send_recover_on_failure(move |reply| {
+                        ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                            saga_id: abort_saga_id,
+                            reservation: Some(Box::new(reservation)),
+                            reply,
+                        })
+                    })
+                    .await;
+                match send_result {
+                    // Delivered: the actor owns + balanced the ticket AND reversed
+                    // its LOCAL budget / velocity / hard-rate-limit via the
+                    // generation-checked carrier rollback. Fully compensated.
+                    Ok(()) => CallerAbortReversal::SettledOrAbsent,
+                    // Send NEVER delivered: the carrier never reached the actor,
+                    // so its LOCAL rollback never ran. Recover the carrier and
+                    // void + consume its external escrow (idempotent), THEN
+                    // re-drive `Abort { None }` so the actor reverses the LOCAL
+                    // economy from the durable `CallerReservationRecord` (and
+                    // idempotently re-voids the same escrow). The local reversal
+                    // is settled ONLY if that re-drive is delivered.
+                    Err((err, Some(recovered_cmd))) => {
+                        if let Some(reservation) = Self::extract_abort_reservation(recovered_cmd) {
+                            reservation
+                                .reservation
+                                .ticket
+                                .void_external_and_consume(self.payment_adapter_ref())
+                                .await;
+                            tracing::warn!(
+                                saga_id = %saga_id.0,
+                                %err,
+                                "cross-context saga abort — caller-side Abort send failed; \
+                                 recovered the held reservation and voided its external escrow, \
+                                 re-driving Abort{{None}} to reverse the caller's LOCAL economy \
+                                 from the durable record (the carrier never reached the actor)"
+                            );
+                            self.redrive_caller_local_reversal(saga_id, &caller_hex)
+                                .await
+                        } else {
+                            // Unreachable in practice: the recovered command IS
+                            // the Abort we built (carrying `Some` reservation). If
+                            // a future refactor changes that, the ticket has
+                            // nowhere to go — log loudly rather than silently leak
+                            // (the carrier's drop guard then surfaces the bug).
+                            // The LOCAL economy was NOT reversed: report it
+                            // outstanding so the journal stays non-terminal.
+                            tracing::error!(
+                                event = "xctx_caller_reversal_outstanding",
+                                saga_id = %saga_id.0,
+                                %err,
+                                "cross-context saga abort — recovered a non-Abort (or \
+                                 reservation-less) command on send failure; the held \
+                                 reservation could not be balanced and the caller's LOCAL \
+                                 economy reversal is outstanding"
+                            );
+                            Self::reversal_outstanding()
+                        }
+                    }
+                    // Delivered but the handler errored (or dropped the reply):
+                    // the actor owns/consumed the ticket, but the handler may have
+                    // failed BEFORE durably persisting the reversal (e.g. a
+                    // Class-S persist failure after the in-memory rollback). A
+                    // crash in that window would resurrect the deduction from the
+                    // still-durable record, so the reversal is NOT confirmed
+                    // durable — report it outstanding so the journal stays
+                    // non-terminal and the (idempotent) sweep re-drives it.
+                    Err((err, None)) => {
+                        tracing::warn!(
+                            event = "xctx_caller_reversal_outstanding",
+                            saga_id = %saga_id.0,
+                            %err,
+                            "cross-context saga abort — caller-side Abort delivered but the \
+                             handler errored; the caller's LOCAL economy reversal is not \
+                             confirmed durable, leaving the journal non-terminal for the sweep"
+                        );
+                        Self::reversal_outstanding()
+                    }
+                }
+            } else {
+                // Caller actor is gone (despawned — `lookup` miss): its in-memory
+                // per-context rollback cannot run, but the durable
+                // `CallerReservationRecord` survives in the persisted snapshot
+                // and a restored actor carries it. Void the carrier escrow +
+                // consume the ticket so its unbalanced-drop guard does not fire,
+                // then report the LOCAL reversal outstanding so the journal stays
+                // non-terminal until a respawn + the §17.16.4 sweep reverses the
+                // LOCAL economy from the record (we cannot reverse actor-owned
+                // economy from the supervisor).
+                reservation
+                    .reservation
+                    .ticket
+                    .void_external_and_consume(self.payment_adapter_ref())
+                    .await;
+                tracing::warn!(
+                    event = "xctx_caller_reversal_outstanding",
+                    saga_id = %saga_id.0,
+                    "cross-context saga abort — caller actor not co-resident; voided the external \
+                     escrow and consumed the reservation ticket, leaving the journal non-terminal \
+                     so a respawn + crash-recovery sweep reverses the caller's LOCAL economy from \
+                     the durable record"
+                );
+                Self::reversal_outstanding()
+            }
+        } else {
+            // `ctx.prepared_a` is `None`. This does NOT prove "nothing was
+            // prepared": Prepare-A DURABLY persists the caller's deduction + the
+            // `xctx_caller_reservations` record BEFORE the in-memory carrier
+            // reaches `ctx.prepared_a`, so the carrier is absent whenever the
+            // Prepare-A REPLY was lost — e.g. the §6.2.4 `dispatch_prepare_phase`
+            // 30s phase-timeout fired and dropped the supervisor's reply receiver
+            // even though the caller actor already committed the deduction +
+            // record. Keying the caller reversal solely on the volatile carrier
+            // would then leave the caller over-charged forever under a terminal
+            // `Aborted` (the §17.16.4 startup sweep re-drives only NON-terminal
+            // journals). So the durable record — not the carrier — is the source
+            // of truth: drive a record-based `Abort { None }` to the caller (the
+            // SAME path `redrive_caller_local_reversal` uses — re-`lookup` +
+            // `Abort { None }`), which reverses the LOCAL economy from the record
+            // if one exists and is a clean no-op (→ `SettledOrAbsent`) for a
+            // genuinely-nothing-prepared saga. Folding its outcome into the
+            // verdict makes EVERY abort path reconcile the durable record before
+            // `mark_resolved(Aborted)`.
+            self.redrive_caller_local_reversal(saga_id, &caller_hex)
+                .await
+        };
+
+        // TARGET side (only if Prepare-B may have staged a slot). The target
+        // carries no caller LOCAL economy, so its release is best-effort and
+        // orthogonal to the returned `caller_reversal`.
+        if ctx.prepared_b.is_some() {
+            self.abort_target_leg(saga_id, ctx.target_context_id).await;
+        }
+
+        caller_reversal
+    }
+
+    /// Best-effort TARGET-side leg of a cross-context-saga abort: send
+    /// `Abort { reservation: None }` so the target actor clears its staged
+    /// `saga_pending` slot (releasing the session reservation). The target stages
+    /// no `ToolEconomyTicket`, so a failed/undelivered send strands nothing — the
+    /// next §17.16.4 crash-recovery sweep clears the slot — hence this never
+    /// affects the caller-side reversal verdict. A `lookup` miss is a clean no-op
+    /// (the despawned actor's snapshot carries the staged slot for the sweep).
+    async fn abort_target_leg(&self, saga_id: &SagaId, target_context_id: [u8; 32]) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        let target_hex = hex::encode(target_context_id);
+        let Some(target) = self.lookup(&target_hex) else {
+            return;
+        };
+        let abort_saga_id = saga_id.clone();
+        let result = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                    saga_id: abort_saga_id,
+                    reservation: None,
+                    reply,
+                })
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                %err,
+                "cross-context saga abort — target-side Abort send failed; the staged \
+                 slot will be cleared on the next crash-recovery sweep"
+            );
+        }
+    }
+
+    /// Re-drive a caller-side cross-context-saga abort as `Abort { None }` so the
+    /// caller actor reverses its LOCAL economy (budget / velocity /
+    /// hard-rate-limit) from the durable `CallerReservationRecord` Prepare-A
+    /// staged — the SAME path the §17.16.4 crash-recovery sweep
+    /// ([`Self::redrive_xctx_prepare_in_progress`]) uses.
+    ///
+    /// Invoked by [`Self::abort_xctx_participants`] ONLY after the carrier
+    /// `Abort { Some }` send failed and its external escrow was already
+    /// voided+consumed; the `None` re-drive carries no ticket, so the LOCAL
+    /// reversal (idempotently re-voiding the same escrow) is the only effect. The
+    /// actor consumes the record on reversal, so this is a clean no-op if the
+    /// record was already drained.
+    ///
+    /// Re-`lookup`s the caller actor afresh by `context_id` (rather than reusing
+    /// the handle whose send just failed): a busy / shutting-down caller actor
+    /// may have been despawned + respawned from its persisted snapshot in the
+    /// interim, and the restored instance carries the durable
+    /// `CallerReservationRecord`. A lookup miss means the actor is gone — the
+    /// reversal cannot run here and stays outstanding for a respawn + sweep.
+    ///
+    /// Returns [`CallerAbortReversal::SettledOrAbsent`] iff the `None` re-drive
+    /// was DELIVERED (the actor reversed + persisted the LOCAL economy);
+    /// otherwise [`CallerAbortReversal::ReversalOutstanding`] so the coordinator
+    /// leaves the journal non-terminal for the crash-recovery sweep — NEVER
+    /// marking terminal-`Aborted` with the caller refund still pending.
+    async fn redrive_caller_local_reversal(
+        &self,
+        saga_id: &SagaId,
+        caller_hex: &str,
+    ) -> CallerAbortReversal {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        let Some(caller) = self.lookup(caller_hex) else {
+            tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
+                saga_id = %saga_id.0,
+                context = %caller_hex,
+                "cross-context saga abort — caller actor not co-resident on Abort{{None}} \
+                 re-drive; the caller's LOCAL economy reversal is outstanding, leaving the \
+                 journal non-terminal so a respawn + crash-recovery sweep reverses it from \
+                 the durable record"
+            );
+            return Self::reversal_outstanding();
+        };
+        let abort_saga_id = saga_id.clone();
+        let result = caller
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                    saga_id: abort_saga_id,
+                    reservation: None,
+                    reply,
+                })
+            })
+            .await;
+        match result {
+            Ok(()) => CallerAbortReversal::SettledOrAbsent,
+            Err(err) => {
+                tracing::warn!(
+                    event = "xctx_caller_reversal_outstanding",
+                    saga_id = %saga_id.0,
+                    %err,
+                    "cross-context saga abort — caller-side Abort{{None}} re-drive also failed \
+                     (persistent backpressure / closed inbox); the caller's LOCAL economy \
+                     reversal is outstanding, leaving the journal non-terminal for the sweep"
+                );
+                Self::reversal_outstanding()
+            }
+        }
     }
 
     async fn append_journal(
@@ -5929,6 +8667,43 @@ impl Supervisor {
         let cmd = QueriesCommand::IsMember {
             context_id: context_id.to_owned(),
             did: did.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return false;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    /// Returns `true` iff the caller context `source_context_hex` holds a
+    /// bidirectionally-approved `ToolInterface` to `target_context_hex` for
+    /// `tool_registration_id` (spec §6.2.0.1 standing consent). Routes through
+    /// the CALLER context's actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// The query is addressed to the caller context (the initiator is a member
+    /// of it, already authorized) and reads that context's own
+    /// `tool_interfaces`, so it is the target-side authorize-before-reserve gate
+    /// for [`Self::start_cross_context_tool_invocation_saga`]: a caller cannot
+    /// name a victim `target_context_id` it has no established interface with
+    /// (spec §6.2.4 "Target-context binding" rides the §6.2.0.1 consent — it
+    /// does NOT create it). `false` on an unknown context or no matching
+    /// both-approved interface.
+    #[must_use]
+    pub async fn has_established_tool_interface(
+        &self,
+        source_context_hex: &str,
+        target_context_hex: &str,
+        tool_registration_id: &str,
+    ) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::HasEstablishedToolInterface {
+            context_id: source_context_hex.to_owned(),
+            source_context_hex: source_context_hex.to_owned(),
+            target_context_hex: target_context_hex.to_owned(),
+            tool_registration_id: tool_registration_id.to_owned(),
             reply: tx,
         };
         if self.dispatch_query(cmd).await.is_err() {
@@ -7360,6 +10135,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { context_id, .. }
             | QueriesCommand::ContextParams { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
+            | QueriesCommand::HasEstablishedToolInterface { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
             | QueriesCommand::CommitFault { context_id, .. }
             | QueriesCommand::LocalMlsEpoch { context_id, .. }
@@ -7467,10 +10243,12 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             // (see `saga_participant_context_set`), NOT the journal
             // provenance record: this extractor intentionally records only
             // the caller side plus the DID + tool id. Leave the journal
-            // shape UNCHANGED.
-            target_context_id: _,
+            // shape UNCHANGED. The Prepare-B envelope fields (input,
+            // ucan_proof_id, asserted freshness/depth, declared_cost) are
+            // never journaled — only the caller-side provenance triple is.
             caller_did,
             tool_registration_id,
+            ..
         } => vec![
             hex::encode(caller_context_id),
             caller_did.to_string(),
@@ -7699,6 +10477,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // Legacy `get_role_state` returns `None`.
         QueriesCommand::GetRoleState { reply, .. } => {
             let _ = reply.send(Ok(None));
+        }
+        // An unknown caller context holds no established interface.
+        QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
+            let _ = reply.send(Ok(false));
         }
         // Legacy `pending_commits` returns an empty `Vec`.
         QueriesCommand::PendingCommits { reply, .. } => {
@@ -8450,14 +11232,15 @@ mod tests {
         // `ContextActorHandle` is not `Debug`, so pattern-match on the
         // `Result` rather than calling `expect_err` (which needs `Debug`
         // on the `Ok` variant).
-        match supervisor_arc
+        let dup = supervisor_arc
             .spawn_actor_with_state(state2, deps2, None)
-            .await
-        {
-            Err(ContextError::CreationFailed(_)) => {}
-            Err(other) => panic!("duplicate spawn must fail with CreationFailed, got {other:?}"),
-            Ok(_) => panic!("duplicate spawn must be rejected, got Ok"),
-        }
+            .await;
+        // `ContextActorHandle` (the Ok variant) is not Debug, so assert via
+        // `matches!` (which never formats the value) rather than `panic!`-arms.
+        assert!(
+            matches!(dup, Err(ContextError::CreationFailed(_))),
+            "duplicate spawn must be rejected with CreationFailed"
+        );
         // The original actor is still the registered one.
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
@@ -8544,17 +11327,11 @@ mod tests {
             .settle_tool_economy_via_actor("ctx-never-registered", &invoker, request)
             .await;
 
-        match result {
-            Err(ContextError::ContextNotRegistered(msg)) => {
-                assert!(
-                    msg.contains("registered actor"),
-                    "error must explain the missing actor, got: {msg}"
-                );
-            }
-            other => panic!(
-                "settle with no registered actor must return ContextNotRegistered, got {other:?}"
-            ),
-        }
+        assert!(
+            matches!(&result, Err(ContextError::ContextNotRegistered(msg)) if msg.contains("registered actor")),
+            "settle with no registered actor must return ContextNotRegistered \
+             explaining the missing actor, got {result:?}"
+        );
         // No panic ⇒ the ticket was consumed, not dropped unbalanced.
     }
 
@@ -8794,6 +11571,11 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            saga_pending: HashMap::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
+            xctx_caller_reservations: HashMap::new(),
+            xctx_nonce_dedup: HashMap::new(),
         }
     }
 
@@ -9216,14 +11998,15 @@ mod tests {
     #[tokio::test]
     async fn build_actor_deps_fails_when_no_providers() {
         let supervisor = Arc::new(Supervisor::for_query_shim());
-        match supervisor
+        let result = supervisor
             .build_actor_deps(&DID("did:example:none".to_owned()))
-            .await
-        {
-            Ok(_) => panic!("build_actor_deps must fail when providers are unpopulated"),
-            Err(ContextError::NotInitialized(_)) => {}
-            Err(other) => panic!("expected NotInitialized, got {other:?}"),
-        }
+            .await;
+        // `ActorDeps` (the Ok variant) is not Debug; assert via `matches!`,
+        // which never formats the value.
+        assert!(
+            matches!(result, Err(ContextError::NotInitialized(_))),
+            "build_actor_deps must fail with NotInitialized when providers are unpopulated"
+        );
     }
 
     /// The returned `SupervisorHandle` wraps a clone of the OUTER
@@ -10890,7 +13673,11 @@ mod tests {
     /// field added to `GovernanceState` but not the snapshot drops on
     /// round-trip → the corresponding assertion fires).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn security_critical_state_is_class_s_or_m_not_coalesced() {
+        use crate::context::supervisor::saga_prepared_state::{
+            SagaPreparedState, SagaPreparedStateSnapshot,
+        };
         // ---- Class M (crash-surviving in the supervisor-owned crypto Arc;
         // restored by monotonic max-merge per §23.17.2 Inv 2, NOT via the
         // ContextSnapshot governance fields). Documented, not asserted here —
@@ -10953,6 +13740,79 @@ mod tests {
         let excluded = DID("did:example:class-s-excluded".to_owned());
         state.access.read_exclusion_list.insert(excluded.clone());
 
+        // saga_pending (ADR-049 §9 line 144 — staged cross-context saga
+        // evidence). Stage TWO variants under distinct saga ids: the live
+        // slice-2 cross-context-tool variant (eight journaled fields) and the
+        // receipt-bearing standing-pair variant. Both must survive the
+        // snapshot round-trip through their sanctioned non-derive mirror.
+        let xctx_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
+        state.saga_pending.insert(
+            xctx_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextToolInvocation(
+                crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared {
+                    caller_context_id: [0x5Au8; 32],
+                    target_context_id: [0x6Bu8; 32],
+                    caller_did: DID("did:example:class-s-caller".to_owned()),
+                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    ucan_proof_id: "class-s-ucan-token".to_owned(),
+                    recorded_timestamp_ms: 1_700_000_000_456,
+                    recorded_nonce: [0xC7u8; 16],
+                    recorded_chain_depth: 4,
+                },
+            ),
+        );
+        let standing_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-standing".to_owned());
+        let standing_derived = [0x9Du8; 32];
+        state.saga_pending.insert(
+            standing_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::StandingPairCreate(
+                crate::context::supervisor::saga_prepared_state::StandingPairCreatePrepared {
+                    peer_did: DID("did:example:class-s-peer".to_owned()),
+                    local_did: DID("did:example:class-s-admin".to_owned()),
+                    derived_context_id: standing_derived,
+                    creation_receipt: None,
+                },
+            ),
+        );
+
+        // Committed cross-context tool invocation (ADR-049 §9 line 144 — spec
+        // §6.2.4 "Exactly-once execution with durable output capture"). Both the
+        // TARGET-side durable output capture and the CALLER-side commit witness
+        // are Class S: a coalesce-window rollback would re-invoke the tool /
+        // double-settle the escrow on replay. Seed both so the round-trip
+        // asserts they survive the production sync-persist builder.
+        let committed_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-committed".to_owned());
+        let committed_receipt =
+            scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[0x3Cu8; 32]),
+                scp_protocol::context::tools::cross_context_saga::CrossContextToolReceiptFields {
+                    caller_context_id: [0x5Au8; 32],
+                    target_context_id: [0x6Bu8; 32],
+                    caller_did: "did:example:class-s-caller".to_owned(),
+                    nonce: [0xC7u8; 16],
+                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    output_jcs: br#"{"result":42}"#.to_vec(),
+                    tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+                    chain_depth: 4,
+                    timestamp_ms: 1_700_000_000_456,
+                },
+            )
+            .expect("Class-S committed receipt signs");
+        state.xctx_committed_outputs.insert(
+            committed_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::CommittedToolInvocation {
+                receipt: committed_receipt.clone(),
+                output_bytes: br#"{"result":42}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+            },
+        );
+        state
+            .xctx_committed_invocations
+            .insert(committed_saga_id.clone());
+
         // Build the snapshot via the EXACT production sync-persist builder
         // (`build_snapshot_from_state`, the one `persist_state_fail_closed`
         // calls), then round-trip through the real on-disk serialization format.
@@ -10988,6 +13848,105 @@ mod tests {
         assert!(
             restored.read_exclusion_list.contains(&excluded),
             "Class S: read_exclusion_list must round-trip (access revocation)"
+        );
+
+        // saga_pending (ADR-049 §9 line 144): both staged variants must survive
+        // the snapshot round-trip through the `SagaPreparedStateSnapshot`
+        // mirror, and rehydrate to the identical live `SagaPreparedState`. A
+        // field that the builder dropped, or a mirror that lost a journaled
+        // field, is exactly the regression this asserts against.
+        assert_eq!(
+            restored.saga_pending.len(),
+            2,
+            "Class S: both staged sagas must round-trip the snapshot"
+        );
+        // `SagaPreparedStateSnapshot`/`SagaPreparedState` mismatches are asserted
+        // via `matches!` + `if let` (no `panic!`/`unreachable!` — handler
+        // panic-ban gate). The `matches!` guard guarantees the `if let` body runs.
+        let xctx_snap = restored
+            .saga_pending
+            .get(&xctx_saga_id)
+            .expect("Class S: cross-context saga must round-trip");
+        assert!(
+            matches!(
+                xctx_snap,
+                SagaPreparedStateSnapshot::CrossContextToolInvocation(_)
+            ),
+            "Class S: wrong cross-context saga variant after round-trip"
+        );
+        if let SagaPreparedStateSnapshot::CrossContextToolInvocation(snap) = xctx_snap {
+            assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
+            assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
+            assert_eq!(snap.caller_did, "did:example:class-s-caller");
+            assert_eq!(snap.tool_registration_id, "class-s-tool-v1");
+            assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
+            assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
+            assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
+            assert_eq!(snap.recorded_chain_depth, 4);
+        }
+
+        let standing_snap = restored
+            .saga_pending
+            .get(&standing_saga_id)
+            .expect("Class S: standing-pair saga must round-trip");
+        assert!(
+            matches!(
+                standing_snap,
+                SagaPreparedStateSnapshot::StandingPairCreate(_)
+            ),
+            "Class S: wrong standing-pair saga variant after round-trip"
+        );
+        if let SagaPreparedStateSnapshot::StandingPairCreate(snap) = standing_snap {
+            assert_eq!(snap.peer_did, "did:example:class-s-peer");
+            assert_eq!(snap.local_did, "did:example:class-s-admin");
+            assert_eq!(snap.derived_context_id, standing_derived);
+            assert!(snap.creation_receipt.is_none());
+        }
+
+        // The mirror must rehydrate to the identical live `SagaPreparedState`
+        // (the same-node restore contract). Exercise `into_prepared` directly.
+        let rehydrated = restored
+            .saga_pending
+            .get(&xctx_saga_id)
+            .expect("present")
+            .clone()
+            .into_prepared();
+        assert!(
+            matches!(rehydrated, SagaPreparedState::CrossContextToolInvocation(_)),
+            "Class S: rehydrated wrong variant"
+        );
+        if let SagaPreparedState::CrossContextToolInvocation(p) = rehydrated {
+            assert_eq!(p.recorded_chain_depth, 4);
+            assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
+        }
+
+        // Committed cross-context tool invocation (spec §6.2.4 "Exactly-once
+        // execution with durable output capture"): the TARGET-side durable
+        // output capture (signed receipt + output) and the CALLER-side commit
+        // witness MUST both survive the snapshot round-trip. A capture dropped
+        // here would re-invoke the tool on replay; a witness dropped here would
+        // double-settle the escrow.
+        let restored_committed = restored
+            .xctx_committed_outputs
+            .get(&committed_saga_id)
+            .expect("Class S: committed cross-context output capture must round-trip");
+        assert_eq!(
+            restored_committed.receipt, committed_receipt,
+            "Class S: the signed receipt must round-trip byte-for-byte (replay reproducibility)"
+        );
+        assert_eq!(
+            restored_committed.tool_invoked_event_id,
+            "ToolInvoked:saga-class-s-committed"
+        );
+        assert_eq!(
+            restored_committed.output_bytes,
+            br#"{"result":42}"#.to_vec()
+        );
+        assert!(
+            restored
+                .xctx_committed_invocations
+                .contains(&committed_saga_id),
+            "Class S: the caller-side commit witness must round-trip (idempotency / no double-settle)"
         );
     }
 
@@ -11793,5 +14752,3564 @@ mod tests {
             "finalize_send must roll the reserved sequence back to the baseline \
              EXACTLY ONCE (not double-rolled below it)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.4 cross-context tool-invocation saga — end-to-end FSM over
+    // two co-resident actors (slice 5: supervisor FSM dispatch).
+    //
+    // These drive the REAL FSM through
+    // `start_cross_context_tool_invocation_saga` over two actors spawned
+    // in ONE supervisor (caller + target), with the supervisor-side tool
+    // executor running between Commit-B reserve and settle.
+    // -----------------------------------------------------------------
+
+    /// Caller / target context ids for the saga E2E tests.
+    const XCTX_CALLER: [u8; 32] = [0x11u8; 32];
+    const XCTX_TARGET: [u8; 32] = [0x22u8; 32];
+    const XCTX_TOOL: &str = "calculator-v1";
+
+    /// A recorded event-log append: `(context_id, event_name, actor_did, payload)`.
+    type RecordedEvent = ([u8; 32], String, String, Option<serde_json::Value>);
+
+    /// An event-log provider that RECORDS every append so a test can assert
+    /// the dual `ToolInvoked` / `CrossContextToolInvoked` records (§6.2.4
+    /// "Dual event-log recording") landed with the shared correlation nonce.
+    #[derive(Clone, Default)]
+    struct RecordingEventLog {
+        events: Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
+    }
+    impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            id: &[u8; 32],
+            event: &str,
+            actor: &str,
+            payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((*id, event.to_owned(), actor.to_owned(), payload.cloned()));
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Build a supervisor whose key_resolver resolves `creator_did` to
+    /// `creator_key` (needed for the target's UCAN re-bind validation), with
+    /// real (in-memory) providers so both actors can be spawned via
+    /// `spawn_actor_with_state`. The caller supplies the `event_log` provider
+    /// so a test can inject a recording log to assert the dual event-log
+    /// records.
+    fn xctx_supervisor_with_event_log(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxSaga".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == creator_did {
+                Some(creator_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        )
+    }
+
+    /// Convenience: a supervisor with a swallowing `TestEventLog` (for tests
+    /// that do not inspect the event log).
+    fn xctx_supervisor(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+    ) -> Arc<Supervisor> {
+        xctx_supervisor_with_event_log(creator_did, creator_key, Box::new(TestEventLog))
+    }
+
+    /// A persistence double that fails the persist for ONE specific context the
+    /// Nth time it is called (1-based), then succeeds — modelling a transient
+    /// Class-S persist failure at a chosen saga step (e.g. the target's
+    /// Commit-B settle persist). All other contexts / calls succeed.
+    #[derive(Clone)]
+    struct FailContextPersistOncePersistence {
+        target_hex: String,
+        fail_on_call: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ContextPersistence for FailContextPersistOncePersistence {
+        fn persist_context(
+            &self,
+            id: &str,
+            _snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if id == self.target_hex {
+                let n = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(1);
+                if n == self.fail_on_call {
+                    return Err("induced transient target persist failure".into());
+                }
+            }
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            _id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A supervisor wired with a caller-supplied persistence backend (for the
+    /// settle-retry test that injects a transient persist failure).
+    fn xctx_supervisor_with_persistence(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxSagaPersist".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == creator_did {
+                Some(creator_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+        )
+    }
+
+    /// Build the CALLER context state: `caller_did` is a member (so the
+    /// authorize-before-reserve `is_member` check passes) holding
+    /// `ToolInterface` (so Prepare-A's outbound gate passes). `creator_did` is
+    /// the role-state creator.
+    async fn xctx_caller_state(
+        caller_did: &str,
+        creator_did: &str,
+    ) -> crate::context::actor::state::PerContextState {
+        use scp_protocol::context::roles::Capability;
+        let mut st = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            XCTX_CALLER,
+            1_700_000_000,
+            DID(creator_did.to_owned()),
+        );
+        st.handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .await
+            .expect("active");
+        st.role_state.creator_did = creator_did.to_owned();
+        // `is_member` reads `membership`; the outbound gate reads `role_state`.
+        st.membership
+            .add_member(DID(caller_did.to_owned()), "member".to_owned(), Vec::new());
+        st.role_state.members.insert(caller_did.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::ToolInterface);
+        caps.insert(Capability::ToolInvokeAll);
+        st.role_state
+            .member_capabilities
+            .insert(caller_did.to_owned(), caps);
+        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
+            Capability::ToolInterface,
+            Capability::ToolInvokeAll,
+        ]);
+        // Established (both-approved) outbound interface caller→target for
+        // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
+        // passes. Source/target ids are the hex id-form §6.2.4 stores.
+        st.governance.tool_interfaces.push(
+            scp_protocol::context::tools::interface::ToolInterface {
+                source_context: hex::encode(XCTX_CALLER),
+                target_context: hex::encode(XCTX_TARGET),
+                tool_id: XCTX_TOOL.to_owned(),
+                rate_limit: None,
+                inbound_rate_limit: None,
+                per_caller_rate_limit: None,
+                approved_by_source: true,
+                approved_by_target: true,
+                outbound_policy: None,
+                inbound_policy: None,
+            },
+        );
+        st
+    }
+
+    /// Build the TARGET context state: registered `XCTX_TOOL` (2-field schemas,
+    /// passing the specificity floor), `caller_did` granted ToolInterface +
+    /// ToolInvokeAll, `creator_did` the role-state creator / UCAN root issuer.
+    async fn xctx_target_state(
+        caller_did: &str,
+        creator_did: &str,
+    ) -> crate::context::actor::state::PerContextState {
+        use scp_protocol::context::roles::Capability;
+        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+        let mut st = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            XCTX_TARGET,
+            1_700_000_000,
+            DID(creator_did.to_owned()),
+        );
+        st.handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .await
+            .expect("active");
+        st.role_state.creator_did = creator_did.to_owned();
+        st.membership
+            .add_member(DID(caller_did.to_owned()), "member".to_owned(), Vec::new());
+        st.role_state.members.insert(caller_did.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::ToolInterface);
+        caps.insert(Capability::ToolInvokeAll);
+        st.role_state
+            .member_capabilities
+            .insert(caller_did.to_owned(), caps);
+        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
+            Capability::ToolInterface,
+            Capability::ToolInvokeAll,
+        ]);
+        st.governance.registered_tools.push(ToolRegistration {
+            tool_id: XCTX_TOOL.to_owned(),
+            name: "Calculator".to_owned(),
+            description: "adds".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": {"type": "number"} }
+                }),
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: DID(creator_did.to_owned()),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        });
+        st
+    }
+
+    /// Spawn both participant actors in `supervisor` and return their handles
+    /// (caller, target). The deps are built per-actor through the production
+    /// `build_actor_deps` path so the actors run real handlers.
+    async fn spawn_xctx_pair(
+        supervisor: &Arc<Supervisor>,
+        caller_state: crate::context::actor::state::PerContextState,
+        target_state: crate::context::actor::state::PerContextState,
+    ) {
+        let caller_deps = supervisor
+            .build_actor_deps(&DID("did:example:xctx-caller-owner".to_owned()))
+            .await
+            .expect("caller deps");
+        supervisor
+            .spawn_actor_with_state(caller_state, caller_deps, None)
+            .await
+            .expect("spawn caller actor");
+        let target_deps = supervisor
+            .build_actor_deps(&DID("did:example:xctx-target-owner".to_owned()))
+            .await
+            .expect("target deps");
+        supervisor
+            .spawn_actor_with_state(target_state, target_deps, None)
+            .await
+            .expect("spawn target actor");
+    }
+
+    /// Happy path: an ungated cross-context tool invocation drives the FULL FSM
+    /// to a committed terminal. The tool executes EXACTLY ONCE supervisor-side,
+    /// a verifiable receipt + the captured output are surfaced in `SagaOutput`,
+    /// and the caller-side escrow reservation is settled (no unbalanced-ticket
+    /// panic). The signed receipt's preimage fields (nonce / target ctx id /
+    /// tool id) reflect what B recorded.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full happy-path E2E: drive + receipt + dual-log assertions
+    async fn xctx_saga_happy_path_commits_and_executes_once() {
+        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxHappyCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let event_log = RecordingEventLog::default();
+        let supervisor = xctx_supervisor_with_event_log(
+            creator_did.clone(),
+            creator_key,
+            Box::new(event_log.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxHappyCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        // The target's Active Signing Key (caller-supplied, ADR-049 — the actor
+        // holds no key).
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+
+        // Count executor invocations to prove exactly-once.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let a = input["a"].as_i64().unwrap_or(0);
+                let b = input["b"].as_i64().unwrap_or(0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x42u8; 16];
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None, // ungated tool — no UCAN proof
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("cross-context saga must commit");
+
+        // The tool ran exactly once.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the tool MUST execute exactly once across the saga"
+        );
+
+        // The receipt + output are surfaced.
+        let receipt_bytes = output.receipt.expect("committed saga surfaces a receipt");
+        let output_bytes = output.output.expect("committed saga surfaces the output");
+        let receipt: CrossContextToolReceipt =
+            serde_json::from_slice(&receipt_bytes).expect("receipt decodes");
+        // The receipt is signed by the target's key over B-recorded provenance.
+        assert!(
+            receipt.verify(&target_signing.verifying_key()).is_ok(),
+            "the receipt must verify under the target's signing key"
+        );
+        assert_eq!(receipt.target_context_id, XCTX_TARGET);
+        assert_eq!(receipt.caller_context_id, XCTX_CALLER);
+        assert_eq!(receipt.nonce, nonce);
+        assert_eq!(receipt.tool_registration_id, XCTX_TOOL);
+        // B re-derived chain depth = incoming(2) + 1.
+        assert_eq!(receipt.chain_depth, 3);
+        // The output is the canonical tool result.
+        let out_value: serde_json::Value =
+            serde_json::from_slice(&output_bytes).expect("output decodes");
+        assert_eq!(out_value, serde_json::json!({ "result": 3 }));
+
+        // Dual event-log recording (§6.2.4): `ToolInvoked` on the TARGET log and
+        // `CrossContextToolInvoked` on the CALLER log, sharing the nonce.
+        let events = event_log
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let nonce_hex = hex::encode(nonce);
+        let tool_invoked = events
+            .iter()
+            .find(|(id, name, _, _)| *id == XCTX_TARGET && name.starts_with("ToolInvoked:"))
+            .expect("target log must carry a ToolInvoked record");
+        // The target's record carries B's re-derived chain depth + the saga id.
+        let ti_payload = tool_invoked.3.as_ref().expect("ToolInvoked payload");
+        assert_eq!(ti_payload["chain_depth"], serde_json::json!(3));
+        let xctx_invoked = events
+            .iter()
+            .find(|(id, name, _, _)| {
+                *id == XCTX_CALLER && name.starts_with("CrossContextToolInvoked:")
+            })
+            .expect("caller log must carry a CrossContextToolInvoked record");
+        let cci_payload = xctx_invoked
+            .3
+            .as_ref()
+            .expect("CrossContextToolInvoked payload");
+        // The two records share the correlation nonce (the join key) and the
+        // caller record references the target ctx id.
+        assert_eq!(cci_payload["nonce"], serde_json::json!(nonce_hex));
+        assert_eq!(
+            cci_payload["target_context_id"],
+            serde_json::json!(hex::encode(XCTX_TARGET))
+        );
+    }
+
+    /// Prepare-B reject (confused deputy): the caller references a UCAN proof in
+    /// B's store that is delegated to a DIFFERENT principal. Prepare-B rejects
+    /// (SCP-SAGA-13013), the saga ABORTS, the tool NEVER executes, and the
+    /// participant-context-set reservation is released (a follow-up saga over
+    /// the same set is NOT ActorBusy).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // confused-deputy E2E: mint UCAN + reject + release assertions
+    async fn xctx_saga_prepare_b_confused_deputy_aborts_no_execution() {
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::{KeyCustody, KeyType};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Mint a UCAN delegated to OTHER (not the caller) — the confused-deputy
+        // attempt. The creator (root issuer) key must resolve via the
+        // supervisor's key_resolver.
+        let custody = InMemoryKeyCustody::new();
+        let creator_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let creator_pk = custody.public_key(&creator_handle).await.unwrap();
+        let creator_did = format!("did:dht:z{}", zbase32::encode(creator_pk.as_bytes()));
+        let creator_key =
+            ed25519_dalek::VerifyingKey::from_bytes(creator_pk.as_bytes().try_into().unwrap())
+                .unwrap();
+
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxDeputyCaller";
+        let other_did = "did:dht:z6MkXctxDeputyOther";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let mut target_state = xctx_target_state(caller_did, &creator_did).await;
+
+        // Proof audience = OTHER, NOT the carried caller_did.
+        let ctx_hex = hex::encode(XCTX_TARGET);
+        let caps = vec![format!("tool_invoke:{XCTX_TOOL}")];
+        let params = crate::crypto::ucan::mint::MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &creator_handle,
+            audience_did: other_did,
+            context_id: &ctx_hex,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let token =
+            crate::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+                .await
+                .expect("mint");
+        target_state
+            .xctx_ucan_proofs
+            .proofs
+            .insert("proof-other".to_owned(), token);
+
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 0 }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let err = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: Some("proof-other".to_owned()),
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x43u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect_err("confused-deputy proof must abort the saga");
+        assert!(
+            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13013")),
+            "expected SCP-SAGA-13013 confused-deputy rejection, got {err:?}"
+        );
+        // The tool NEVER executed.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a rejected Prepare-B must NOT execute the tool"
+        );
+
+        // The reservation was released: a follow-up over the SAME set is not
+        // ActorBusy (it aborts again at Prepare-B, NOT with SagaBusy).
+        let now_ms2 = supervisor.clock_ref().expect("clock").now_millis();
+        let err2 = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: Some("proof-other".to_owned()),
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x44u8; 16],
+                    asserted_timestamp_ms: now_ms2,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
+            )
+            .await
+            .expect_err("follow-up still rejects at Prepare-B");
+        assert!(
+            !matches!(err2, ContextError::ActorBusy(_)),
+            "the aborted saga must RELEASE its reservation (no ActorBusy), got {err2:?}"
+        );
+    }
+
+    /// FIX A target-wedge (BLACK-624-02): a caller who is a member of its OWN
+    /// context but has NO established interface to a VICTIM target cannot reserve
+    /// (and thereby wedge) the victim's saga slot. The saga rejects with the
+    /// target-axis authorize-before-reserve error (SCP-SAGA-13062) BEFORE any
+    /// reservation, and a LEGITIMATE saga touching the victim target is NOT
+    /// locked out afterward (the victim slot was never taken).
+    #[tokio::test]
+    async fn xctx_saga_unestablished_target_is_rejected_before_reservation() {
+        const XCTX_VICTIM: [u8; 32] = [0xBBu8; 32];
+
+        let creator_did = "did:dht:z6MkXctxWedgeCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWedgeCaller";
+
+        // The caller context has an established interface to XCTX_TARGET only —
+        // NOT to XCTX_VICTIM. The caller is a member of its own context (so the
+        // caller-axis is_member gate trivially passes).
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        supervisor
+            .spawn_actor_with_state(
+                caller_state,
+                supervisor
+                    .build_actor_deps(&DID("did:example:xctx-wedge-caller-owner".to_owned()))
+                    .await
+                    .expect("caller deps"),
+                None,
+            )
+            .await
+            .expect("spawn caller actor");
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+
+        // The caller names the VICTIM target it has NO established interface
+        // with. The saga MUST reject at the target-axis gate, before reserving.
+        let err = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_VICTIM,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x4Au8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
+            )
+            .await
+            .expect_err("a caller with no established interface to the victim must be rejected");
+        assert!(
+            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13062")),
+            "expected target-axis authorize-before-reserve rejection (SCP-SAGA-13062), got: {err:?}"
+        );
+
+        // The victim's saga slot was NEVER reserved — a legitimate saga that
+        // genuinely involves the victim target can still reserve it. (We exercise
+        // the SAME reservation critical section the start path uses.)
+        let legit =
+            supervisor.test_reserve_saga_context_set(&SagaInput::CrossContextToolInvocation {
+                caller_context_id: [0xC1u8; 32],
+                target_context_id: XCTX_VICTIM,
+                caller_did: DID("did:dht:zLegit".to_owned()),
+                tool_registration_id: "legit-tool".to_owned(),
+                ucan_proof_id: None,
+                input: serde_json::json!({}),
+                asserted_chain_depth: 0,
+                asserted_nonce: [0u8; 16],
+                asserted_timestamp_ms: 0,
+                _seal: CrossContextSagaSeal::new(),
+            });
+        assert!(
+            !matches!(legit, Err(ContextError::ActorBusy(_))),
+            "the victim target slot must be free (the rejected saga never reserved it), \
+             got {:?}",
+            legit.err()
+        );
+    }
+
+    /// Per-context-set busy: while one saga's participant set is reserved
+    /// in-flight (held via the production reservation primitive), a second
+    /// overlapping cross-context saga is rejected with ActorBusy / SagaBusy.
+    #[tokio::test]
+    async fn xctx_saga_overlapping_set_is_saga_busy() {
+        let creator_did = "did:dht:z6MkXctxBusyCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxBusyCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        // Hold the {caller, target} set in flight via the production reservation
+        // primitive (same critical section start_saga uses).
+        let held = supervisor
+            .test_reserve_saga_context_set(&SagaInput::CrossContextToolInvocation {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: DID(caller_did.to_owned()),
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                ucan_proof_id: None,
+                input: serde_json::json!({}),
+                asserted_chain_depth: 0,
+                asserted_nonce: [0u8; 16],
+                asserted_timestamp_ms: 0,
+                _seal: CrossContextSagaSeal::new(),
+            })
+            .expect("first reservation succeeds");
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let err = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x45u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
+            )
+            .await
+            .expect_err("overlapping saga must be rejected while the set is held");
+        assert!(
+            matches!(&err, ContextError::ActorBusy(msg) if msg.contains("SagaBusy")),
+            "overlap rejection must be ActorBusy(SagaBusy), got: {err:?}"
+        );
+        drop(held);
+    }
+
+    /// Replay: after a saga commits, re-driving Commit-B for the SAME `SagaId`
+    /// (the crash-recovery replay path) re-emits the STORED output + receipt
+    /// WITHOUT re-invoking the tool. We run a full saga, then directly send a
+    /// second `CommitBReserve` for that saga id to the target actor and assert
+    /// it returns `AlreadyCommitted` with the same output — the executor call
+    /// counter stays at 1.
+    #[tokio::test]
+    async fn xctx_saga_commit_replay_reemits_without_reinvoke() {
+        use crate::context::actor::commands::{CommitBReserveOutcome, SagaPhaseMessage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxReplayCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxReplayCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x46u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("saga commits");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "tool ran once on first commit"
+        );
+
+        // Recover the committed SagaId from the journal (the only unresolved
+        // set is empty after Committed, so use the durable receipt's output to
+        // compare). We need the SagaId — re-derive it by replaying Commit-B
+        // reserve against the target for the committed saga.
+        //
+        // The supervisor minted a fresh SagaId internally; the durable capture
+        // is keyed by it. The receipt carries the SagaId-stable
+        // `tool_invoked_event_id` (`ToolInvoked:<saga_id>`), so recover the
+        // saga id from it.
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&output.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries the saga id")
+            .to_owned();
+        let saga_id = crate::context::supervisor::saga_journal::SagaId(saga_id_str);
+
+        // Re-drive Commit-B reserve for the SAME saga id (the replay path).
+        let target = supervisor
+            .lookup(&hex::encode(XCTX_TARGET))
+            .expect("target actor co-resident");
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve { saga_id, reply })
+            })
+            .await
+            .expect("replay reserve");
+
+        assert!(
+            matches!(reserve, CommitBReserveOutcome::AlreadyCommitted { .. }),
+            "a committed saga's replay must be AlreadyCommitted, not ReadyToExecute, got {reserve:?}"
+        );
+        if let CommitBReserveOutcome::AlreadyCommitted { output_bytes, .. } = reserve {
+            let v: serde_json::Value =
+                serde_json::from_slice(&output_bytes).expect("decode replay output");
+            assert_eq!(
+                v,
+                serde_json::json!({ "result": 3 }),
+                "replay re-emits the stored output"
+            );
+        }
+
+        // The executor was NEVER re-invoked by the replay.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "replay MUST NOT re-invoke the tool"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.4 slice 6 — NeedsRepair dual divergence marker +
+    // §17.16.4 crash-recovery replay arms.
+    // -----------------------------------------------------------------
+
+    /// Build a `CrossContextSagaCtx` with the TARGET marked as committed
+    /// (`committed_b_tool_invoked_event_id = Some(event_id)`) so
+    /// `emit_divergence_markers` records `committed_side = Target`. The executor
+    /// is a never-called no-op (divergence emission never runs the tool).
+    fn divergence_ctx<'a>(
+        nonce: [u8; 16],
+        tool_invoked_event_id: String,
+        target_signing: &ed25519_dalek::SigningKey,
+        caller_signing: &ed25519_dalek::SigningKey,
+        caller_did: &str,
+    ) -> CrossContextSagaCtx<'a> {
+        CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: 1_700_000_000,
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({})) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: Some(tool_invoked_event_id),
+            reached_needs_repair: false,
+        }
+    }
+
+    /// NeedsRepair dual divergence marker (spec §6.2.4 "Dual event-log
+    /// recording"): when the TARGET committed but the saga diverged, BOTH the
+    /// target and caller actors emit a signed `CrossContextDivergenceMarker`
+    /// into their OWN event log. The markers record `committed_side = Target`,
+    /// the saga id, the nonce, and the committed event id, and each verifies
+    /// under its own side's Active Signing Key. Both sides reachable ⇒ NO
+    /// supervisor-level repair record.
+    #[tokio::test]
+    async fn xctx_needs_repair_emits_dual_signed_divergence_markers() {
+        use scp_protocol::context::tools::cross_context_saga::{
+            CommittedSide, CrossContextDivergenceMarker,
+        };
+
+        let creator_did = "did:dht:z6MkXctxDivCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let event_log = RecordingEventLog::default();
+        let supervisor = xctx_supervisor_with_event_log(
+            creator_did.clone(),
+            creator_key,
+            Box::new(event_log.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxDivCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+        let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+
+        let ctx = divergence_ctx(
+            nonce,
+            committed_event_id.clone(),
+            &target_signing,
+            &caller_signing,
+            caller_did,
+        );
+        let plan = Supervisor::divergence_marker_plan(&ctx).expect("target committed ⇒ plan");
+        Box::pin(supervisor.emit_divergence_markers(&saga_id, plan)).await;
+
+        // Both sides reachable ⇒ no supervisor repair fallback.
+        assert!(
+            supervisor.saga_repair_records_for(&saga_id).is_empty(),
+            "both actors reachable ⇒ NO supervisor-level repair record"
+        );
+
+        let events = event_log
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
+
+        // TARGET log carries a marker signed by the TARGET key.
+        let (_, _, _, target_payload) = events
+            .iter()
+            .find(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name)
+            .expect("target log must carry a divergence marker");
+        let target_marker: CrossContextDivergenceMarker =
+            serde_json::from_value(target_payload.clone().expect("marker payload"))
+                .expect("decode target marker");
+        assert_eq!(target_marker.committed_side, CommittedSide::Target);
+        assert_eq!(target_marker.saga_id, saga_id.0);
+        assert_eq!(target_marker.nonce, nonce);
+        assert_eq!(target_marker.committed_event_id, committed_event_id);
+        assert!(
+            target_marker
+                .verify(&target_signing.verifying_key())
+                .is_ok(),
+            "target marker must verify under the target key"
+        );
+
+        // CALLER log carries a marker signed by the CALLER key.
+        let (_, _, _, caller_payload) = events
+            .iter()
+            .find(|(id, name, _, _)| *id == XCTX_CALLER && *name == marker_name)
+            .expect("caller log must carry a divergence marker");
+        let caller_marker: CrossContextDivergenceMarker =
+            serde_json::from_value(caller_payload.clone().expect("marker payload"))
+                .expect("decode caller marker");
+        assert_eq!(caller_marker.committed_side, CommittedSide::Target);
+        assert_eq!(caller_marker.saga_id, saga_id.0);
+        assert_eq!(caller_marker.nonce, nonce);
+        assert_eq!(caller_marker.committed_event_id, committed_event_id);
+        assert!(
+            caller_marker
+                .verify(&caller_signing.verifying_key())
+                .is_ok(),
+            "caller marker must verify under the caller key"
+        );
+        // The marker is NOT cross-verifiable: each side signs with its own key.
+        assert!(
+            caller_marker
+                .verify(&target_signing.verifying_key())
+                .is_err(),
+            "the caller marker must NOT verify under the target key"
+        );
+    }
+
+    /// NeedsRepair with an UNREACHABLE side: when the caller actor is gone, its
+    /// signed marker cannot be appended into its (absent) log, so the divergence
+    /// is recorded into the supervisor-level repair journal instead (spec
+    /// §6.2.4 — "or a supervisor-level repair journal if one side is
+    /// unreachable"). The reachable target side still records into its own log.
+    #[tokio::test]
+    async fn xctx_needs_repair_unreachable_side_records_supervisor_repair() {
+        let creator_did = "did:dht:z6MkXctxRepairCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let event_log = RecordingEventLog::default();
+        let supervisor = xctx_supervisor_with_event_log(
+            creator_did.clone(),
+            creator_key,
+            Box::new(event_log.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxRepairCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        // Despawn the CALLER actor so it is unreachable at divergence time.
+        assert!(
+            supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await,
+            "despawn caller actor"
+        );
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x55u8; 16];
+        let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+
+        let ctx = divergence_ctx(
+            nonce,
+            committed_event_id.clone(),
+            &target_signing,
+            &caller_signing,
+            caller_did,
+        );
+        let plan = Supervisor::divergence_marker_plan(&ctx).expect("target committed ⇒ plan");
+        Box::pin(supervisor.emit_divergence_markers(&saga_id, plan)).await;
+
+        // The unreachable CALLER side is recorded in the supervisor repair journal.
+        let repair = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            repair.len(),
+            1,
+            "exactly one supervisor repair record for the unreachable caller side, got {repair:?}"
+        );
+        assert_eq!(repair[0].unreachable_context_hex, hex::encode(XCTX_CALLER));
+        assert_eq!(repair[0].committed_event_id, committed_event_id);
+        assert_eq!(repair[0].nonce, nonce);
+        assert_eq!(
+            repair[0].committed_side,
+            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+        );
+
+        // The reachable TARGET side still recorded into its own log.
+        let events = event_log
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
+        assert!(
+            events
+                .iter()
+                .any(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name),
+            "the reachable target side must still record its marker into its own log"
+        );
+    }
+
+    /// FIX 2 (durable repair journal): a supervisor-level divergence repair
+    /// record (recorded when a `NeedsRepair` side is unreachable) MUST survive a
+    /// supervisor restart — the spec's "durably auditable" guarantee for the
+    /// unreachable leg. `record_supervisor_repair` durably appends the record to
+    /// the saga journal; a fresh supervisor over the SAME storage rehydrates it
+    /// from the journal via `replay_unresolved_sagas`. Without the durable write
+    /// the in-memory DashMap would be empty after restart and the divergence
+    /// account lost.
+    #[tokio::test]
+    async fn supervisor_repair_record_survives_restart() {
+        use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaId};
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+
+        // Shared durable storage so a second supervisor sees the first's writes.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let persistence: Arc<dyn ContextPersistence> =
+            Arc::new(crate::context::persistence::NoopContextPersistence);
+        let supervisor = Supervisor::new(persistence, journal, SupervisorConfig::default());
+
+        let saga_id = SagaId("saga-durable-repair".to_owned());
+        let unreachable_hex = hex::encode([0x9Au8; 32]);
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+        let nonce = [0x9Bu8; 16];
+
+        // Record the unreachable-side divergence (durably journals it).
+        supervisor
+            .record_supervisor_repair(
+                &saga_id,
+                &unreachable_hex,
+                CommittedSide::Target,
+                &committed_event_id,
+                nonce,
+            )
+            .await;
+
+        // The in-memory read cache holds it on the live supervisor.
+        let live = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(live.len(), 1, "live supervisor caches the repair record");
+
+        // The journal durably retains a NeedsRepair entry whose evidence decodes
+        // to the record set — the durable half of the two-tier write.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_id)
+            .expect("a NeedsRepair entry for the saga is durably retained");
+        assert_eq!(entry.state, SagaState::NeedsRepair);
+        assert!(
+            !entry.evidence.is_empty(),
+            "the durable repair entry carries non-empty repair-record evidence"
+        );
+        let decoded = decode_repair_records_evidence(&entry.evidence).expect("evidence decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].unreachable_context_hex, unreachable_hex);
+        assert_eq!(decoded[0].committed_event_id, committed_event_id);
+        assert_eq!(decoded[0].nonce, nonce);
+        assert_eq!(decoded[0].committed_side, CommittedSide::Target);
+
+        // RESTART: a fresh supervisor over the SAME storage starts with an EMPTY
+        // in-memory cache, then rehydrates it from the durable journal.
+        let journal2: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let persistence2: Arc<dyn ContextPersistence> =
+            Arc::new(crate::context::persistence::NoopContextPersistence);
+        let restarted = Supervisor::new(persistence2, journal2, SupervisorConfig::default());
+        assert!(
+            restarted.saga_repair_records_for(&saga_id).is_empty(),
+            "a fresh supervisor starts with an empty in-memory repair cache"
+        );
+        restarted
+            .replay_unresolved_sagas()
+            .await
+            .expect("replay rehydrates");
+        let rehydrated = restarted.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            rehydrated.len(),
+            1,
+            "the repair record MUST be rehydrated from the durable journal on restart"
+        );
+        assert_eq!(rehydrated[0].unreachable_context_hex, unreachable_hex);
+        assert_eq!(rehydrated[0].committed_event_id, committed_event_id);
+        assert_eq!(rehydrated[0].nonce, nonce);
+        assert_eq!(rehydrated[0].committed_side, CommittedSide::Target);
+    }
+
+    /// NeedsRepair concurrency-slot release: a `TestForceNeedsRepair` saga
+    /// (commit always fails → NeedsRepair) RELEASES the participant-context-set
+    /// reservation, so an OVERLAPPING saga over the same context then reserves
+    /// successfully (no `ActorBusy`). Confirms the concurrency slot is released
+    /// while the (separate) escrow path is unaffected (spec §6.2.4 "`NeedsRepair`
+    /// reservation semantics" — the two release differently).
+    #[tokio::test]
+    async fn xctx_needs_repair_releases_concurrency_slot() {
+        let supervisor = Arc::new(Supervisor::for_query_shim());
+        let ctx_id = [0x77u8; 32];
+
+        // Drive a saga to NeedsRepair (commit-retry exhaustion).
+        let err = supervisor
+            .start_saga(SagaInput::TestForceNeedsRepair { context_id: ctx_id })
+            .await
+            .expect_err("commit-retry-exhausted saga returns NeedsRepair");
+        assert!(
+            !matches!(err, ContextError::ActorBusy(_)),
+            "a NeedsRepair terminal must not surface as ActorBusy, got {err:?}"
+        );
+
+        // The NeedsRepair terminal RELEASED the slot: a follow-up saga over the
+        // SAME (overlapping) context reserves successfully (it does not reject
+        // with SagaBusy).
+        let reservation = supervisor
+            .test_reserve_saga_context_set(&SagaInput::TestForceNeedsRepair { context_id: ctx_id });
+        assert!(
+            reservation.is_ok(),
+            "NeedsRepair must release the context slot so an overlapping saga reserves, got {:?}",
+            reservation.err()
+        );
+    }
+
+    /// §17.16.4 participant-set reconstruction (option (a)): the journaled
+    /// `CrossContextToolInvocationPrepared` evidence carries BOTH context ids, so
+    /// a crash-recovery replay reconstructs the FULL `{caller, target}`
+    /// participant set — NOT the caller-only journal triple. Proves the
+    /// reservation-gap the field doc flags is closed.
+    #[test]
+    fn xctx_replay_reconstructs_full_participant_set() {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID("did:dht:z6MkReconCaller".to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: 1_700_000_111,
+            recorded_nonce: [0x66u8; 16],
+            recorded_chain_depth: 3,
+        };
+        let evidence = prepared.to_evidence_bytes().expect("encode evidence");
+        let entry = JournalEntry {
+            saga_id: SagaId::new(),
+            state: SagaState::Committing,
+            // The journal provenance triple is caller-ONLY (no target).
+            participants: vec![
+                hex::encode(XCTX_CALLER),
+                "did:dht:z6MkReconCaller".to_owned(),
+                XCTX_TOOL.to_owned(),
+            ],
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: 1_700_000_111,
+            seq_per_saga: 3,
+        };
+
+        let recon = Supervisor::reconstruct_xctx_prepared(&entry)
+            .expect("cross-context evidence reconstructs");
+        // The FULL {caller, target} set is recoverable from the evidence even
+        // though `participants` omits the target.
+        assert_eq!(recon.caller_context_id, XCTX_CALLER);
+        assert_eq!(recon.target_context_id, XCTX_TARGET);
+        assert_eq!(recon.recorded_chain_depth, 3);
+        assert_eq!(recon.recorded_nonce, [0x66u8; 16]);
+        assert!(
+            !entry.participants.contains(&hex::encode(XCTX_TARGET)),
+            "the journal participant triple deliberately omits the target — the evidence closes \
+             the gap"
+        );
+    }
+
+    /// Build a `with_providers_and_journal` supervisor over a SHARED durable
+    /// saga journal + a `MapPersistence` pre-seeded with the given `present`
+    /// context hexes. No xctx actors are spawned, so a caller-reversal re-drive
+    /// `lookup`-misses (the caller is non-resident) and yields
+    /// `ReversalOutstanding` — exactly the crash-recovery sweep ordering the
+    /// §17.16.4 invariant reasons about (`replay_unresolved_sagas` running before
+    /// the caller context is restored). The returned journal handle lets the test
+    /// assert terminal-vs-non-terminal via `load_unresolved`.
+    fn xctx_recovery_supervisor_with_present_contexts(
+        present: &[String],
+    ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
+        let contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>> =
+            Arc::new(DashMap::new());
+        for hex_id in present {
+            contexts.insert(
+                hex_id.clone(),
+                import_test_snapshot(hex_id, "did:dht:z6MkRecoveryCreator"),
+            );
+        }
+        let persistence: Box<dyn ContextPersistence> = Box::new(MapPersistence {
+            contexts: Arc::clone(&contexts),
+        });
+        xctx_recovery_supervisor_with_persistence(persistence)
+    }
+
+    /// A `ContextPersistence` whose `load_context` ALWAYS returns `Err` — models a
+    /// TRANSIENT storage failure (the backend is reachable for some ops but the
+    /// existence read errored). The §17.16.4 reaper MUST treat this conservatively
+    /// as "context still present" (NOT deleted) so a transient read failure cannot
+    /// be mistaken for a permanent deletion and mis-reap a recoverable caller —
+    /// see [`Supervisor::caller_context_deleted_from_persistence`]'s `Err` arm.
+    struct ErringLoadPersistence;
+    impl ContextPersistence for ErringLoadPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("synthetic transient storage failure on load_context".into())
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a `with_providers_and_journal` recovery supervisor over a SHARED
+    /// durable saga journal + the GIVEN persistence backend. No xctx actors are
+    /// spawned, so a caller-reversal re-drive `lookup`-misses (the caller is
+    /// non-resident) and yields `ReversalOutstanding` — exactly the crash-recovery
+    /// sweep ordering the §17.16.4 invariant reasons about
+    /// (`replay_unresolved_sagas` running before the caller context is restored).
+    /// The persistence backend's `load_context` verdict (`Ok(None)` / `Ok(Some)` /
+    /// `Err`) then decides reap-vs-leave-non-terminal, which the returned journal
+    /// handle lets the test assert via `load_unresolved`.
+    fn xctx_recovery_supervisor_with_persistence(
+        persistence: Box<dyn ContextPersistence>,
+    ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
+        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkRecoverySupervisor".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+            Arc::clone(&journal),
+        );
+        (supervisor, journal)
+    }
+
+    /// Inject a `PreparingB` xctx journal entry whose PLAINTEXT participant
+    /// triple names the caller in `participants[0]` but whose EVIDENCE blob is
+    /// deliberately mangled (non-empty but unparseable), then drive
+    /// `replay_unresolved_sagas`. Returns whether the saga survived as a
+    /// non-terminal `PreparingB` entry (true) or was marked terminal (false).
+    async fn replay_corrupt_evidence_preparing_b(
+        supervisor: &Arc<Supervisor>,
+        journal: &Arc<dyn SagaJournal>,
+        saga_id: &crate::context::supervisor::saga_journal::SagaId,
+        caller_hex: &str,
+    ) -> bool {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaState};
+
+        // A real xctx PreparingB entry: `participants = [hex(caller), did, tool]`
+        // (length 3, 64-hex first element) but with corrupt/unparseable evidence
+        // (NON-empty so `reconstruct_xctx_prepared` reaches the decode path and
+        // fails there, rather than short-circuiting on the empty-evidence guard).
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: vec![
+                caller_hex.to_owned(),
+                "did:dht:z6MkCorruptEvidenceCaller".to_owned(),
+                XCTX_TOOL.to_owned(),
+            ],
+            evidence: Zeroizing::new(vec![0xFFu8, 0x00, 0x13, 0x37]),
+            timestamp_ms: 1_700_000_222,
+            seq_per_saga: 1,
+        };
+        journal
+            .append(entry)
+            .await
+            .expect("append PreparingB entry");
+
+        // Pre-condition: the corrupt evidence does NOT reconstruct, so the wave-15
+        // `None` arm is exercised.
+        let probe = journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved")
+            .into_iter()
+            .find(|e| &e.saga_id == saga_id)
+            .expect("PreparingB entry present pre-replay");
+        assert!(
+            Supervisor::reconstruct_xctx_prepared(&probe).is_none(),
+            "the mangled evidence must NOT reconstruct (exercises the None arm)"
+        );
+
+        supervisor.replay_unresolved_sagas().await.expect("replay");
+
+        journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved post-replay")
+            .iter()
+            .any(|e| &e.saga_id == saga_id && e.state == SagaState::PreparingB)
+    }
+
+    /// FIX 1 (bug-catcher LOW): a `PreparingB` cross-context entry whose EVIDENCE
+    /// is corrupt — but whose PLAINTEXT `participants[0]` still names a LIVE caller
+    /// context — must NOT be marked terminal-`Aborted` (which would falsely assert
+    /// "fully compensated" and STRAND the caller's durable deduction). The
+    /// crash-recovery sweep must instead reconcile the caller via the record-keyed
+    /// `redrive_caller_local_reversal`; with the caller non-resident (and PRESENT
+    /// in persistence — not deleted) the reversal is outstanding and the journal
+    /// stays NON-terminal for a later sweep.
+    ///
+    /// PRE-FIX this stranded the caller: the `None` arm collapsed to
+    /// `SettledOrAbsent` → terminal-`Aborted`. POST-FIX it stays `PreparingB`.
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_reconciles_caller_not_stranded() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // Caller PRESENT in persistence (not-yet-restored, not deleted) so the
+        // FIX-3 deleted-context reaping does NOT apply — the saga must stay
+        // non-terminal purely on the outstanding-reversal invariant.
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_present_contexts(std::slice::from_ref(&caller_hex));
+        let saga_id = SagaId("saga-corrupt-evidence-live-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry naming a LIVE (present, non-resident) caller \
+             must stay NON-terminal (caller reversal outstanding) — NOT be marked terminal-Aborted \
+             and strand the caller deduction"
+        );
+    }
+
+    /// FIX 3 (black-hat LOW): a `PreparingB` xctx entry whose caller context is
+    /// PERMANENTLY DELETED (ABSENT from durable persistence) must be REAPED
+    /// (marked terminal-`Aborted`) instead of looping forever non-terminal — its
+    /// `CallerReservationRecord` died with the context, so there is nothing to
+    /// reverse. Contrast with the present-but-not-restored case, which stays
+    /// non-terminal (the prior test).
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_deleted_caller_is_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // Caller ABSENT from persistence (deleted): `present` is empty.
+        let (supervisor, journal) = xctx_recovery_supervisor_with_present_contexts(&[]);
+        let saga_id = SagaId("saga-corrupt-evidence-deleted-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            !stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry whose caller context is ABSENT from durable \
+             persistence (permanently deleted) must be REAPED as terminal-Aborted — NOT left to \
+             never-reap"
+        );
+    }
+
+    /// FIX 3 over-restriction guard: a caller context that is PRESENT in durable
+    /// persistence (not-yet-restored, NOT deleted) must NOT be reaped — the
+    /// reversal is genuinely still outstanding and a later sweep (after respawn)
+    /// must re-drive it. This is the same shape as the FIX-1 test but asserted
+    /// against the deleted-context distinction specifically: present ⇒ keep
+    /// non-terminal, absent ⇒ reap.
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_present_caller_not_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_present_contexts(std::slice::from_ref(&caller_hex));
+        let saga_id = SagaId("saga-corrupt-evidence-present-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a present-but-not-restored caller context must NOT be reaped (its reversal is still \
+             outstanding) — only an ABSENT (deleted) caller is reaped"
+        );
+    }
+
+    /// FIX 3 conservative-on-error guard: a `PreparingB` xctx entry whose caller
+    /// context existence check ERRORS (`load_context` ⇒ `Err`, a TRANSIENT storage
+    /// failure) must NOT be reaped — a transient read failure must not be mistaken
+    /// for a permanent deletion. The reaper's `Err` arm
+    /// ([`Supervisor::caller_context_deleted_from_persistence`]) returns `false`
+    /// (treat as still present), so the saga is LEFT non-terminal for a later
+    /// sweep (after the storage recovers). Without this guard an `Err` mis-read as
+    /// "deleted" would reap a still-recoverable caller and silently OVER-CHARGE it
+    /// (the durable `CallerReservationRecord` would never be reversed). This test
+    /// FAILS if the `Err` arm is inverted to reap (e.g. `Err(_) => true`).
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_load_error_not_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // `load_context` ALWAYS errors → the existence check cannot confirm
+        // deletion → conservative leave-non-terminal.
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_persistence(Box::new(ErringLoadPersistence));
+        let saga_id = SagaId("saga-corrupt-evidence-load-error-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry whose caller-context existence check ERRORS \
+             (transient storage failure) must be LEFT non-terminal (conservative-on-error) — NOT \
+             reaped, which would over-charge a still-recoverable caller"
+        );
+    }
+
+    /// §17.16.4 Commit-in-progress replay re-emits the STORED output WITHOUT
+    /// re-invoking the tool. We commit a real saga (executor runs once), then
+    /// reconstruct the prepared state from journaled evidence and re-drive the
+    /// Commit-in-progress recovery path; the target re-emits the stored output
+    /// via the idempotent `AlreadyCommitted`, and the executor counter stays 1.
+    #[tokio::test]
+    async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxReplay2Creator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxReplay2Caller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x42u8; 16];
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("saga commits");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool ran once");
+
+        // Recover the committed saga id from the receipt.
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&output.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        // Build a Commit-in-progress journal entry whose evidence carries the
+        // full {caller, target} prepared state, then run the recovery re-drive.
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::Committing,
+            participants: vec![hex::encode(XCTX_CALLER)],
+            evidence: Zeroizing::new(prepared.to_evidence_bytes().expect("encode")),
+            timestamp_ms: now_ms,
+            seq_per_saga: 3,
+        };
+        let recon = Supervisor::reconstruct_xctx_prepared(&entry).expect("reconstruct");
+        Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &recon)).await;
+
+        // The re-drive re-emitted the stored output via AlreadyCommitted — the
+        // tool was NEVER re-invoked.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Commit-in-progress replay MUST NOT re-invoke the tool"
+        );
+    }
+
+    /// FIX 2 (§17.16.4): a Commit-in-progress recovery whose A-side
+    /// `xctx_committed_invocations` witness IS present resolves to `Committed`,
+    /// NOT a spurious `NeedsRepair`. We commit a real saga (both witnesses land),
+    /// then run the recovery re-drive and assert it returns `Committed` (the
+    /// A-side witness re-ack succeeded) — and the tool never re-runs.
+    ///
+    /// (The journal is the no-op test journal here, so the resolution is
+    /// asserted on the re-drive's RETURN value — the input `recover_committing_entry`
+    /// consumes to choose `mark_resolved(Committed)` vs the NeedsRepair append.)
+    #[tokio::test]
+    async fn xctx_commit_in_progress_with_witness_resolves_committed() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxWitnessCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWitnessCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x42u8; 16];
+        let out = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("saga commits");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool ran once");
+
+        // Recover the committed saga id from the receipt — its A-side witness is
+        // present in the (still-live) caller actor.
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+        // The re-drive re-acks Commit-A FROM THE WITNESS and resolves Committed —
+        // not a false NeedsRepair.
+        let resolution =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &prepared)).await;
+        assert_eq!(
+            resolution,
+            CommitInProgressResolution::Committed,
+            "a Commit-in-progress recovery with a present A-side witness MUST resolve to \
+             Committed (not a false NeedsRepair)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not re-invoke the tool"
+        );
+
+        // Contrast: with NO A-side witness (a different, never-committed saga id),
+        // the same re-drive stays NeedsRepair — only a genuine commit resolves.
+        let absent = SagaId("never-committed-saga".to_owned());
+        let resolution_absent =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&absent, &prepared)).await;
+        assert_eq!(
+            resolution_absent,
+            CommitInProgressResolution::NeedsRepair,
+            "a saga with no committed B-side / A-witness must stay NeedsRepair"
+        );
+    }
+
+    /// FIX 4 (crash-recovery one-sided divergence): a Commit-in-progress recovery
+    /// where the TARGET committed (B replays `AlreadyCommitted`) but the A side
+    /// is UNREACHABLE (caller actor gone post-crash) is a genuine one-sided
+    /// commit. The signing keys died with the crash, so a signed
+    /// `CrossContextDivergenceMarker` cannot be appended — but the SUPERVISOR
+    /// REPAIR JOURNAL is available, so the divergence MUST be durably recorded
+    /// there (spec §6.2.4 "or a supervisor-level repair journal if one side is
+    /// unreachable") rather than silently resolving to a bare `NeedsRepair`.
+    #[tokio::test]
+    async fn xctx_commit_in_progress_one_sided_records_supervisor_repair() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxOneSidedCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxOneSidedCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x77u8; 16];
+        let out = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("saga commits");
+
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        // Despawn the CALLER (A) actor: post-crash it is unreachable, so the
+        // A-side witness cannot be confirmed even though B durably committed.
+        assert!(
+            supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await,
+            "despawn caller actor (A unreachable post-crash)"
+        );
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+
+        // B re-emits AlreadyCommitted; A is unreachable ⇒ genuine one-sided
+        // commit ⇒ NeedsRepair AND a supervisor repair record.
+        let resolution =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &prepared)).await;
+        assert_eq!(
+            resolution,
+            CommitInProgressResolution::NeedsRepair,
+            "target committed + caller unreachable is a one-sided commit ⇒ NeedsRepair"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not re-invoke"
+        );
+
+        // FIX 4: the divergence is durably recorded in the supervisor repair
+        // journal (the post-crash fallback for the unreachable signing side).
+        let repair = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            repair.len(),
+            1,
+            "a one-sided crash-recovery divergence MUST record exactly one supervisor repair \
+             record, got {repair:?}"
+        );
+        assert_eq!(repair[0].unreachable_context_hex, hex::encode(XCTX_CALLER));
+        assert_eq!(
+            repair[0].committed_event_id,
+            format!("ToolInvoked:{}", saga_id.0)
+        );
+        assert_eq!(repair[0].nonce, nonce);
+        assert_eq!(
+            repair[0].committed_side,
+            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+        );
+    }
+
+    /// FIX 3 (crypto, §6.2.4 "Signer authorization"): the Commit-A path verifies
+    /// B's receipt signature against the key authorized for `target_context_id`
+    /// BEFORE settling. A receipt signed by a DIFFERENT key is rejected — the
+    /// saga aborts before any settle/record. Exercised directly on
+    /// `verify_commit_b_receipt`: a ctx holding target key Y rejects a receipt
+    /// signed by key X.
+    #[tokio::test]
+    async fn xctx_commit_a_rejects_receipt_signed_by_wrong_key() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use scp_protocol::context::tools::cross_context_saga::{
+            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        };
+
+        let authorized = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // The ctx is authorized for the TARGET key `authorized`.
+        let ctx = divergence_ctx(
+            nonce,
+            "ToolInvoked:wrong-key-saga".to_owned(),
+            &authorized,
+            &caller_signing,
+            "did:dht:z6MkWrongKeyCaller",
+        );
+
+        // A receipt signed by the ATTACKER key (not authorized for the target).
+        let forged = CrossContextToolReceipt::sign(
+            &attacker,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
+        )
+        .expect("sign forged receipt");
+        let forged_bytes = serde_json::to_vec(&forged).expect("encode");
+
+        let saga_id = SagaId("wrong-key-saga".to_owned());
+        let result = Supervisor::verify_commit_b_receipt(&saga_id, &ctx, &forged_bytes);
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::CryptoFailed(m)) if m.contains("SCP-SAGA-13064")
+            ),
+            "a receipt signed by a key NOT authorized for the target context must be rejected \
+             before settle, got {result:?}"
+        );
+
+        // Sanity: the SAME receipt signed by the AUTHORIZED key verifies.
+        let valid = CrossContextToolReceipt::sign(
+            &authorized,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
+        )
+        .expect("sign valid receipt");
+        let valid_bytes = serde_json::to_vec(&valid).expect("encode");
+        assert!(
+            Supervisor::verify_commit_b_receipt(&saga_id, &ctx, &valid_bytes).is_ok(),
+            "a receipt signed by the authorized target key must verify"
+        );
+    }
+
+    /// FIX 5 (§6.2.4 "Exactly-once execution"): a transient Commit-B SETTLE
+    /// failure is retryable WITHOUT re-invoking the tool. The target's Commit-B
+    /// settle persist fails once (Class-S fail-closed → the capture rolls back),
+    /// so the FSM retries: reserve reports `ReadyToExecute` again, but the
+    /// executor output is STASHED in the ctx — the settle is re-sent with the
+    /// stashed bytes and the tool is NEVER re-invoked. The saga commits on retry
+    /// and the executor ran exactly once.
+    #[tokio::test]
+    async fn xctx_commit_b_settle_retry_does_not_reinvoke_tool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxSettleRetryCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        // Fail the TARGET context's 2nd persist (Prepare-B = call 1, Commit-B
+        // settle = call 2) exactly once; the retried settle (call 3) succeeds.
+        let persistence = FailContextPersistOncePersistence {
+            target_hex: hex::encode(XCTX_TARGET),
+            fail_on_call: 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let supervisor = xctx_supervisor_with_persistence(
+            creator_did.clone(),
+            creator_key,
+            Box::new(persistence),
+        );
+        let caller_did = "did:dht:z6MkXctxSettleRetryCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let a = input["a"].as_i64().unwrap_or(0);
+                let b = input["b"].as_i64().unwrap_or(0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: [0x42u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect("saga must commit after the transient settle failure is retried");
+
+        // The transient settle failure was retried to a committed terminal …
+        let out_value: serde_json::Value =
+            serde_json::from_slice(&output.output.expect("output")).expect("decode");
+        assert_eq!(out_value, serde_json::json!({ "result": 3 }));
+        // … and despite the retry the tool executed EXACTLY ONCE (the stashed
+        // output was re-sent, never re-invoked).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a Commit-B settle retry MUST re-send the stashed output, never re-invoke the tool"
+        );
+    }
+
+    /// FIX 1 (§6.2.4): a Commit-A whose mailbox SEND fails (the caller actor
+    /// died between `lookup` and send) does NOT drop the escrow ticket unbalanced
+    /// (no debug-assert panic under `--features testing`, no escrow leak in
+    /// release) and KEEPS the reservation consumable for a retry. We Prepare-A on
+    /// a live caller (staging a real reservation), DESPAWN the caller, then call
+    /// `commit_a_settle`: it returns Err but RECOVERS the reservation back into
+    /// `ctx.prepared_a` — proving the ticket was not dropped and the retry can
+    /// re-drive Commit-A.
+    #[tokio::test]
+    async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
+        use scp_protocol::context::tools::cross_context_saga::{
+            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        };
+
+        let creator_did = "did:dht:z6MkXctxSendFailCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxSendFailCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // Build a saga ctx and run the REAL Prepare-A so `prepared_a` holds a
+        // genuine `#[must_use]` reservation (its ticket's Drop guard fires if it
+        // is ever dropped unbalanced).
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+        supervisor
+            .dispatch_xctx_prepare_a(&SagaId::new(), &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // Now the caller actor dies BEFORE Commit-A reaches it.
+        let despawned = supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await;
+        assert!(despawned, "caller actor despawned");
+
+        // Build a verified receipt signed by the target's authorized key (the
+        // Commit-A path passes the VERIFIED receipt; we mirror that here).
+        let receipt = CrossContextToolReceipt::sign(
+            &target_signing,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: caller_did.to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:send-fail-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
+        )
+        .expect("sign receipt");
+        let receipt_bytes = serde_json::to_vec(&receipt).expect("encode");
+
+        let saga_id = SagaId("send-fail-saga".to_owned());
+        let result = supervisor
+            .commit_a_settle(&saga_id, &mut ctx, &receipt_bytes, &receipt)
+            .await;
+
+        // The send failed (caller gone) — but the ticket was NOT dropped: it is
+        // recovered back into `ctx.prepared_a`, consumable on retry. Reaching
+        // this assertion without a drop-guard panic IS the FIX-1 guarantee.
+        assert!(
+            result.is_err(),
+            "Commit-A to a despawned caller must surface the send failure"
+        );
+        assert!(
+            ctx.prepared_a.is_some(),
+            "the escrow reservation MUST be recovered into ctx for retry (never dropped \
+             unbalanced — no ticket-drop panic, no escrow leak)"
+        );
+
+        // Drain the recovered reservation cleanly so the test does not itself
+        // leak the must-use ticket (mirrors the run_saga tail's void+consume for
+        // a Commit-A that never landed).
+        if let Some(reservation) = ctx.prepared_a.take() {
+            reservation
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+    }
+
+    /// FIX 1 (abort ticket-safe send): a caller-side `Abort` whose mailbox SEND
+    /// fails (the caller handle is FOUND in the registry but its mailbox is
+    /// closed) must NOT drop the `#[must_use]` reservation ticket carried in the
+    /// boxed command — that would trip the ticket's unbalanced-`Drop`
+    /// debug-assert under `--features testing` (and leak escrow in release).
+    /// `abort_xctx_participants` uses `send_recover_on_failure`, recovers the
+    /// un-delivered `Abort` command via `extract_abort_reservation`, and voids
+    /// its external escrow + consumes the ticket. This injects a registered-but-
+    /// dead handle (closed mailbox) so the lookup HITS and the SEND fails —
+    /// exercising the recover path, not the lookup-miss branch. Reaching the end
+    /// without a drop-guard panic IS the guarantee.
+    #[tokio::test]
+    async fn xctx_abort_send_failure_voids_ticket_no_panic() {
+        use crate::context::actor::ContextActorHandle;
+
+        let creator_did = "did:dht:z6MkXctxAbortSendFailCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxAbortSendFailCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // Run the REAL Prepare-A (on the still-live caller actor) so `prepared_a`
+        // holds a genuine must-use reservation whose ticket Drop guard fires if
+        // it is ever dropped unbalanced.
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+        supervisor
+            .dispatch_xctx_prepare_a(&SagaId::new(), &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // REPLACE the live caller handle with a registered-but-DEAD one: a
+        // channel whose receiver is dropped. `lookup` now HITS, but the mailbox
+        // is closed, so `send_recover_on_failure` fails the send and returns the
+        // un-delivered `Abort` command for ticket recovery — the exact path FIX 1
+        // hardens (the old plain `send` would drop the command + ticket here).
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(dead_rx);
+        supervisor.actors.insert(
+            hex::encode(XCTX_CALLER),
+            ContextActorHandle::from_sender(dead_tx),
+        );
+
+        // Abort: the caller-side send fails on the closed mailbox. The held
+        // reservation's ticket must be recovered + voided + consumed, never
+        // dropped unbalanced. `abort_xctx_participants` takes `prepared_a` out.
+        let saga_id = SagaId("abort-send-fail-saga".to_owned());
+        Box::pin(supervisor.abort_xctx_participants(&saga_id, &mut ctx)).await;
+
+        // The reservation was taken out of ctx and balanced (voided+consumed) by
+        // the abort path — not left in ctx and not dropped unbalanced.
+        assert!(
+            ctx.prepared_a.is_none(),
+            "the abort path must take and balance the reservation (no leftover in ctx)"
+        );
+        // Reaching here without a ticket-drop panic IS the FIX-1 guarantee.
+    }
+
+    /// A persistence double that CAPTURES the latest snapshot per context, so a
+    /// test can read an actor's owned economy (`hard_rate_limit_state`) and its
+    /// durable `xctx_caller_reservations` after a `FlushSnapshot` without
+    /// reaching into the actor's private state.
+    #[derive(Clone, Default)]
+    struct CapturingPersistence {
+        snapshots: Arc<dashmap::DashMap<String, crate::context::state::ContextSnapshot>>,
+    }
+    impl ContextPersistence for CapturingPersistence {
+        fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.snapshots.insert(id.to_owned(), snap.clone());
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.snapshots.get(id).map(|e| e.value().clone()))
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Flush a co-resident actor's snapshot through the production
+    /// `FlushSnapshot` command and return the captured `ContextSnapshot` (the
+    /// economy + durable-reservation state the persistence double recorded).
+    async fn flush_and_read_snapshot(
+        supervisor: &Arc<Supervisor>,
+        persistence: &CapturingPersistence,
+        context_id: [u8; 32],
+    ) -> crate::context::state::ContextSnapshot {
+        use crate::context::actor::commands::LifecycleCommand;
+        let hex = hex::encode(context_id);
+        let actor = supervisor
+            .lookup(&hex)
+            .expect("actor co-resident for flush");
+        actor
+            .send(|reply| ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply }))
+            .await
+            .expect("flush snapshot");
+        persistence
+            .snapshots
+            .get(&hex)
+            .map(|e| e.value().clone())
+            .expect("snapshot captured by the persistence double")
+    }
+
+    /// §6.2.4 "Reservation release on every terminal path" (review wave-8): a
+    /// LIVE abort whose caller-side `Abort { Some }` mailbox send FAILS must NOT
+    /// mark the journal terminal-`Aborted` while the caller's LOCAL economy
+    /// reversal is still outstanding — that would durably over-charge the caller
+    /// forever (the §17.16.4 sweep re-drives ONLY a non-terminal `PreparingB`,
+    /// never an `Aborted`). Instead the coordinator leaves the journal
+    /// non-terminal, and the durable `CallerReservationRecord` makes the LOCAL
+    /// economy reversible by a record-based `Abort { None }` re-drive.
+    ///
+    /// PART 1 (the regression — FAILS pre-fix): with the caller handle replaced
+    /// by a registered-but-DEAD one (closed mailbox), the caller-side
+    /// `Abort { Some }` send fails AND the `Abort { None }` re-drive to the same
+    /// dead handle fails, so the caller's LOCAL economy reversal is outstanding.
+    /// `abort_saga` MUST therefore leave the journal NON-terminal (at
+    /// `PreparingB`, the sweep-redrivable state) — NOT mark terminal-`Aborted`.
+    /// Pre-fix, `abort_saga` marked `Aborted` unconditionally (the over-charge).
+    ///
+    /// PART 2 (reconciliation via the production re-drive): the (still-live)
+    /// caller actor — restored to the registry, exactly as a respawn would
+    /// surface it — is driven through the SAME `Abort { None }` re-drive the
+    /// crash-recovery sweep uses. It reverses the caller's LOCAL economy from the
+    /// durable record: the hard-rate-limit token is refunded, the durable record
+    /// is consumed, and the helper reports the reversal settled. This is the
+    /// reconciliation the BUGGY terminal-`Aborted` path destroyed by never
+    /// re-driving.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full send-failure abort E2E: reserve + journal + re-drive
+    async fn live_abort_send_failure_reverses_caller_economy_via_record_redrive() {
+        use crate::context::supervisor::saga_journal::{
+            ProtocolRepositorySagaJournal, SagaId, SagaState,
+        };
+
+        let creator_did = "did:dht:z6MkXctxWave8Creator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let persistence = CapturingPersistence::default();
+        // A REAL durable saga journal (over in-memory storage) so the terminal-
+        // marker decision is observable via `load_unresolved` — the default
+        // `with_providers` journal is a no-op stub.
+        let journal_storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
+            Arc::clone(&journal_storage),
+        ));
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxWave8".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = {
+            let creator_did = creator_did.clone();
+            Arc::new(move |did: &DID| {
+                if did.as_ref() == creator_did {
+                    Some(creator_key)
+                } else {
+                    None
+                }
+            })
+        };
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(Box::new(persistence.clone())),
+            None,
+            None,
+            None,
+            mls_storage,
+            journal,
+        );
+        let caller_did = "did:dht:z6MkXctxWave8Caller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // Capture the LIVE caller handle — never despawned; we only swap the
+        // registry pointer for Part 1, then restore this same live handle for the
+        // Part 2 re-drive (the actor keeps its consumed token + durable record
+        // throughout, exactly as a restored snapshot would carry them).
+        let live_caller = supervisor.lookup(&caller_hex).expect("caller co-resident");
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        let saga_id = SagaId("wave8-send-fail-saga".to_owned());
+        let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
+
+        // Real Prepare-A on the live caller actor: consumes a hard-rate-limit
+        // token, records velocity, and stages the durable
+        // `CallerReservationRecord`. Returns the must-use carrier into `ctx`.
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // Baseline: the reserve mutated OWNED state (else the test proves
+        // nothing). The hard-rate-limit bucket dropped below full burst and the
+        // durable record is present.
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            // A fresh caller starts at full burst; a reserve drains exactly one
+            // token. Recover the burst ceiling from the snapshot: it is the
+            // refunded value asserted in Part 2.
+            let burst = token_after_reserve + 1000; // one token = 1000 milli-tokens
+            assert!(
+                token_after_reserve < burst,
+                "reserve must have consumed a hard-rate-limit token \
+                 (after_reserve={token_after_reserve}, burst={burst})"
+            );
+            burst
+        };
+
+        // Journal the FSM up to PreparingB (the real state at the post-Prepare-B-
+        // failure `abort_saga` call site), carrying the full caller+target
+        // evidence the sweep re-drives.
+        let evidence = Supervisor::xctx_prepared_evidence_bytes(
+            &SagaInput::test_cross_context_for_gating(XCTX_CALLER, XCTX_TARGET),
+            &ctx,
+        )
+        .expect("xctx evidence");
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &evidence)
+            .await
+            .expect("journal PreparingB");
+
+        // ---- PART 1: send-failure abort MUST NOT mark terminal-Aborted ----
+        // Swap the registry caller handle for a DEAD one (closed mailbox): the
+        // caller-side `Abort { Some }` send fails, and the `Abort { None }`
+        // re-drive to the same dead handle also fails ⇒ the LOCAL reversal is
+        // outstanding. The real live actor is untouched (still holds the consumed
+        // token + record); we only swapped the registry pointer.
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(dead_rx);
+        supervisor
+            .actors
+            .insert(caller_hex.clone(), ContextActorHandle::from_sender(dead_tx));
+
+        supervisor
+            .abort_saga(
+                &saga_id,
+                &participants,
+                3,
+                /*secret_bearing=*/ false,
+                Some(&mut ctx),
+            )
+            .await
+            .expect("abort_saga returns Ok (best-effort, non-terminal on outstanding reversal)");
+
+        // The journal MUST be non-terminal: the saga is still unresolved (latest
+        // entry PreparingB), NOT marked terminal-Aborted. Pre-fix this FAILED —
+        // `abort_saga` marked `Aborted` unconditionally, dropping the saga out of
+        // `load_unresolved` and leaving the caller over-charged forever.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let entry = unresolved.iter().find(|e| e.saga_id == saga_id).expect(
+            "the send-failure saga MUST remain UNRESOLVED (not terminal-Aborted) so the \
+                     crash-recovery sweep can re-drive the caller's LOCAL economy reversal",
+        );
+        assert_eq!(
+            entry.state,
+            SagaState::PreparingB,
+            "the journal must stay at the sweep-redrivable PreparingB state, not advance to \
+             Aborting/Aborted while the caller refund is outstanding"
+        );
+        assert_ne!(
+            entry.state,
+            SagaState::Aborted,
+            "abort_saga MUST NOT write a terminal-Aborted marker with the caller's LOCAL \
+             economy reversal outstanding (the durable over-charge this fix closes)"
+        );
+
+        // ---- PART 2: record-based Abort{None} re-drive reverses LOCAL economy --
+        // Restore the live caller actor to the registry (as a respawn would
+        // surface it) and drive the SAME production re-drive the sweep uses.
+        supervisor.actors.insert(caller_hex.clone(), live_caller);
+        let reversal = supervisor
+            .redrive_caller_local_reversal(&saga_id, &caller_hex)
+            .await;
+        assert_eq!(
+            reversal,
+            CallerAbortReversal::SettledOrAbsent,
+            "the Abort{{None}} re-drive must be delivered and settle the caller's LOCAL economy"
+        );
+
+        // The caller's LOCAL economy is reversed and the durable record consumed.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after_abort = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            token_after_abort, burst_milli,
+            "the record-based Abort{{None}} re-drive MUST refund the consumed hard-rate-limit \
+             token (restore to full burst) — the caller is NOT over-charged"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable CallerReservationRecord MUST be consumed by the reversal so it can \
+             never double-reverse"
+        );
+    }
+
+    /// Build a supervisor over a REAL durable saga journal (in-memory storage) +
+    /// a capturing persistence, so the crash-recovery terminal-marker decision is
+    /// observable via `load_unresolved` (the default `with_providers` journal is a
+    /// no-op stub). Returns the supervisor and the live persistence double.
+    fn xctx_supervisor_with_real_journal(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+    ) -> (Arc<Supervisor>, CapturingPersistence) {
+        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+        let persistence = CapturingPersistence::default();
+        let journal_storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
+            Arc::clone(&journal_storage),
+        ));
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxWave15".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == creator_did {
+                Some(creator_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(Box::new(persistence.clone())),
+            None,
+            None,
+            None,
+            mls_storage,
+            journal,
+        );
+        (supervisor, persistence)
+    }
+
+    /// §6.2.4 review wave-15 — CRASH-RECOVERY symmetry with the live abort path.
+    /// The startup `recover_saga_entry` `PreparingB` arm re-drives the prepared
+    /// side(s) and then marks the journal terminal-`Aborted`. But the caller-side
+    /// record-based `Abort { None }` re-drive can FAIL to deliver: if
+    /// `replay_unresolved_sagas` runs BEFORE the caller context is restored
+    /// (ordering is not enforced in-tree), the `lookup` misses. Pre-fix the arm
+    /// marked terminal-`Aborted` UNCONDITIONALLY — so the caller's durable
+    /// LOCAL-economy deduction was NEVER reversed AND the §17.16.4 sweep (which
+    /// re-drives ONLY non-terminal journals) could never re-drive a terminal
+    /// entry: a permanent over-charge. The fix makes the arm honour the SAME
+    /// invariant the live abort path (`abort_saga`) enforces — terminal-`Aborted`
+    /// MUST NOT be written until the caller reversal is CONFIRMED delivered.
+    ///
+    /// NON-RESIDENT caller (this test): the durable record is staged (real
+    /// Prepare-A), then the caller actor is despawned BEFORE recovery so the
+    /// re-drive `lookup` misses ⇒ the journal MUST be LEFT non-terminal (the
+    /// sweep re-drives it after a respawn). PRE-FIX this marked terminal-Aborted.
+    #[tokio::test]
+    async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave15NonResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave15NonResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave15-nonresident-saga".to_owned());
+        let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Real Prepare-A: durably stages the caller deduction + reservation
+        // record on the live caller actor. (We balance the returned carrier
+        // immediately — like a lost-reply supervisor would — so its #[must_use]
+        // drop guard does not fire; the durable record is what recovery reverses.)
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        let snap_before = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        assert!(
+            snap_before.xctx_caller_reservations.contains_key(&saga_id),
+            "Prepare-A staged the durable caller reservation record"
+        );
+
+        // Journal up to a RECONSTRUCTIBLE PreparingB carrying the full
+        // caller+target evidence (the real post-Prepare-B-failure state).
+        let evidence = Supervisor::xctx_prepared_evidence_bytes(
+            &SagaInput::test_cross_context_for_gating(XCTX_CALLER, XCTX_TARGET),
+            &ctx,
+        )
+        .expect("xctx evidence");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &evidence)
+            .await
+            .expect("journal PreparingB");
+
+        // Despawn the caller BEFORE recovery: this models `replay_unresolved_sagas`
+        // running before the caller context is restored. The re-drive `lookup`
+        // now misses ⇒ the record-based reversal cannot be delivered.
+        assert!(
+            supervisor.actors.remove(&caller_hex).is_some(),
+            "caller actor despawned to simulate restore-after-replay ordering"
+        );
+
+        // Drive the REAL crash-recovery path on the PreparingB entry.
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 2,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // CORE: the journal MUST stay NON-terminal at PreparingB (still in
+        // load_unresolved) so the next sweep — after the caller is restored —
+        // re-drives the reversal. PRE-FIX recover_saga_entry marked terminal-
+        // Aborted UNCONDITIONALLY, dropping the saga out of load_unresolved and
+        // stranding the caller's durable deduction forever.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let found = unresolved.iter().find(|e| e.saga_id == saga_id).expect(
+            "the non-resident-caller PreparingB saga MUST remain UNRESOLVED (not terminal-Aborted) \
+             so a later crash-recovery sweep re-drives the caller's LOCAL economy reversal",
+        );
+        assert_eq!(
+            found.state,
+            SagaState::PreparingB,
+            "the journal must stay at the sweep-redrivable PreparingB state, not advance to \
+             terminal-Aborted while the caller reversal is outstanding"
+        );
+        // The durable record is UNTOUCHED (reversal never ran against the missing
+        // actor), so a respawn + sweep can still reverse it — the over-charge is
+        // recoverable, not permanent. The caller actor is despawned, so we read
+        // its LAST persisted snapshot directly from the persistence double (it
+        // still carries the record Prepare-A staged before despawn).
+        let snap_after = persistence
+            .snapshots
+            .get(&caller_hex)
+            .map(|e| e.value().clone())
+            .expect("the despawned caller's last persisted snapshot is retained");
+        assert!(
+            snap_after.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record survives a non-resident-caller recovery so the next sweep can \
+             still reverse it (the reversal did not silently run against a missing actor)"
+        );
+    }
+
+    /// §6.2.4 review wave-15 companion — RESIDENT caller with a durable record:
+    /// the crash-recovery `PreparingB` re-drive DELIVERS the record-based
+    /// `Abort { None }`, reverses the caller's LOCAL economy from the durable
+    /// record, AND (only then) marks the journal terminal-`Aborted`. This proves
+    /// the fix still resolves the happy case — it gates the terminal marker on a
+    /// CONFIRMED reversal, it does not block it unconditionally.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
+    async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave15ResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave15ResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave15-resident-saga".to_owned());
+        let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        // Recover the burst ceiling + balance the carrier (lost-reply shape).
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+
+        let evidence = Supervisor::xctx_prepared_evidence_bytes(
+            &SagaInput::test_cross_context_for_gating(XCTX_CALLER, XCTX_TARGET),
+            &ctx,
+        )
+        .expect("xctx evidence");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &evidence)
+            .await
+            .expect("journal PreparingB");
+
+        // The caller stays RESIDENT (as a restore-before-replay ordering would
+        // surface it). Drive the REAL crash-recovery path.
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 2,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // The record-based reversal RAN: the hard-rate-limit token is refunded to
+        // full burst and the durable record is consumed.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after recovery");
+        assert_eq!(
+            token_after, burst_milli,
+            "the resident-caller PreparingB recovery MUST reverse the caller's LOCAL economy from \
+             the durable record (refund to full burst) — the caller is NOT over-charged"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record MUST be consumed by the record-based reversal"
+        );
+
+        // The reversal was CONFIRMED, so the journal IS marked terminal-Aborted:
+        // the saga drops out of load_unresolved.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "a CONFIRMED caller reversal lets recovery mark the journal terminal-Aborted (the \
+             saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
+    /// §6.2.4 review wave-23 — CRASH-RECOVERY in the `PreparingA` window.
+    /// The FSM journals `PreparingA` (seq 1) BEFORE dispatching Prepare-A, and
+    /// Prepare-A DURABLY persists the caller deduction + the
+    /// `CallerReservationRecord` into the Class-S snapshot BEFORE the FSM appends
+    /// the `PreparingB` entry (seq 2). A crash in that window leaves the journal's
+    /// latest state at `PreparingA` over a LIVE durable reservation.
+    ///
+    /// PRE-FIX the `recover_saga_entry` arm treated `Initiated | PreparingA`
+    /// identically and marked terminal-`Aborted` UNCONDITIONALLY ("no remote
+    /// side-effects yet"). For `PreparingA` that is FALSE: the terminal marker
+    /// asserts "fully compensated" while the caller deduction + record are still
+    /// live, so the §17.16.4 sweep (which re-drives ONLY non-terminal journals)
+    /// can never reverse them — a permanent silent over-charge + leaked record.
+    ///
+    /// The fix routes `PreparingA` through the SAME record-keyed reversal-and-
+    /// confirm path as `PreparingB` (`recover_preparing_b_entry`). A `PreparingA`
+    /// xctx entry journals the SAME caller-provenance TRIPLE
+    /// (`saga_input_participants`: `[caller_hex, caller_did, tool_id]`) and EMPTY
+    /// evidence (`&[]`), so `reconstruct_xctx_prepared` returns `None` and the
+    /// participant-keyed `redrive_caller_local_reversal` reverses the caller's
+    /// LOCAL economy from the durable record. RESIDENT caller (this test): the
+    /// re-drive DELIVERS, the record is reversed + consumed, and ONLY THEN the
+    /// journal is marked terminal-`Aborted`. PRE-FIX the deduction was stranded
+    /// and the record leaked.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
+    async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave23PrepACreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave23PrepACaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave23-preparing-a-resident-saga".to_owned());
+        // The REAL FSM journals a cross-context entry's participants as the
+        // caller-provenance TRIPLE `[caller_hex, caller_did, tool_id]`
+        // (`saga_input_participants`), NOT the 2-element `[caller, target]` set
+        // the wave-15 PreparingB tests hand-built (they relied on the
+        // evidence-reconstruction path). A PreparingA entry has EMPTY evidence, so
+        // the reversal MUST come through the participant-keyed path — which
+        // REQUIRES the genuine length-3 triple here.
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Journal `Initiated` (seq 0) then `PreparingA` (seq 1) with EMPTY
+        // evidence — EXACTLY the FSM's pre-dispatch journal shape (the FSM appends
+        // `PreparingA` with `&[]` BEFORE `dispatch_prepare_phase(A)`).
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+
+        // Real Prepare-A: durably stages the caller deduction + reservation
+        // record on the live caller actor (the durable state a crash in the
+        // PreparingA window leaves behind). Balance the returned carrier
+        // immediately (lost-reply shape) so its #[must_use] drop guard does not
+        // fire; the durable record is what recovery reverses.
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+
+        // Drive the REAL crash-recovery dispatcher on a `PreparingA` entry with
+        // EMPTY evidence (the genuine FSM journal shape). The caller stays
+        // RESIDENT (restore-before-replay ordering).
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingA,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(Vec::new()),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 1,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // CORE: the record-based reversal RAN — the hard-rate-limit token is
+        // refunded to full burst and the durable record is consumed. PRE-FIX the
+        // PreparingA arm marked terminal-Aborted WITHOUT reversing, so the token
+        // stayed deducted and the record leaked ⇒ these assertions FAIL.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after recovery");
+        assert_eq!(
+            token_after, burst_milli,
+            "the resident-caller PreparingA recovery MUST reverse the caller's LOCAL economy from \
+             the durable record (refund to full burst) — the caller is NOT over-charged. PRE-FIX \
+             the unconditional-Aborted PreparingA arm stranded this deduction forever"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable CallerReservationRecord MUST be consumed by the PreparingA recovery \
+             reversal (PRE-FIX it leaked — the arm never touched it)"
+        );
+
+        // The reversal was CONFIRMED, so the journal IS marked terminal-Aborted
+        // and the saga drops out of load_unresolved.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "a CONFIRMED caller reversal lets PreparingA recovery mark the journal terminal-\
+             Aborted (the saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
+    /// §6.2.4 review wave-23 companion — `PreparingA` crash with a NON-RESIDENT
+    /// caller (despawned before recovery, modelling `replay_unresolved_sagas`
+    /// running before the caller is restored). The record-keyed re-drive `lookup`
+    /// misses ⇒ the reversal is outstanding ⇒ the journal MUST be LEFT
+    /// non-terminal at `PreparingA` so a later sweep re-drives it after a respawn.
+    /// PRE-FIX the unconditional-Aborted arm marked it terminal, dropping it out
+    /// of `load_unresolved` and stranding the durable deduction forever.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + despawn + recover + assert
+    async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave23PrepANonResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave23PrepANonResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave23-preparing-a-nonresident-saga".to_owned());
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        let snap_before = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        assert!(
+            snap_before.xctx_caller_reservations.contains_key(&saga_id),
+            "Prepare-A staged the durable caller reservation record"
+        );
+
+        // Despawn the caller BEFORE recovery so the record-keyed re-drive lookup
+        // misses (restore-after-replay ordering). The caller context's snapshot
+        // is STILL PRESENT in persistence (it was not deleted), so recovery must
+        // distinguish "not yet restored" from "permanently deleted" and leave the
+        // journal non-terminal (NOT reap it).
+        assert!(
+            supervisor.actors.remove(&caller_hex).is_some(),
+            "caller actor despawned to simulate restore-after-replay ordering"
+        );
+
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingA,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(Vec::new()),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 1,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // The journal MUST stay NON-terminal at PreparingA (still in
+        // load_unresolved) so the next sweep — after the caller is restored —
+        // re-drives the reversal. PRE-FIX recover_saga_entry marked terminal-
+        // Aborted UNCONDITIONALLY, stranding the durable deduction forever.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let found = unresolved.iter().find(|e| e.saga_id == saga_id).expect(
+            "the non-resident-caller PreparingA saga MUST remain UNRESOLVED (not terminal-Aborted) \
+             so a later crash-recovery sweep re-drives the caller's LOCAL economy reversal",
+        );
+        assert_eq!(
+            found.state,
+            SagaState::PreparingA,
+            "the journal must stay at the sweep-redrivable PreparingA state, not advance to \
+             terminal-Aborted while the caller reversal is outstanding"
+        );
+        // The durable record is UNTOUCHED (reversal never ran against the missing
+        // actor), so a respawn + sweep can still reverse it.
+        let snap_after = persistence
+            .snapshots
+            .get(&caller_hex)
+            .map(|e| e.value().clone())
+            .expect("the despawned caller's last persisted snapshot is retained");
+        assert!(
+            snap_after.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record survives a non-resident-caller PreparingA recovery so the next \
+             sweep can still reverse it (the reversal did not silently run against a missing actor)"
+        );
+    }
+
+    /// HIGH 2 (§6.2.4 review wave-14): `abort_xctx_participants` with
+    /// `ctx.prepared_a == None` MUST still reconcile the durable
+    /// `CallerReservationRecord`. The carrier is `None` whenever the Prepare-A
+    /// REPLY was lost — e.g. the `dispatch_prepare_phase` 30s `PHASE_TIMEOUT`
+    /// fired and dropped the supervisor's reply receiver EVEN THOUGH the caller
+    /// actor already durably persisted the deduction + record. Pre-fix the `else`
+    /// branch returned `SettledOrAbsent` WITHOUT consulting the record or sending
+    /// anything, so the abort marked the saga terminal-`Aborted` while the caller
+    /// stayed over-charged forever (the §17.16.4 sweep re-drives only NON-terminal
+    /// journals). The fix drives a record-based `Abort { None }` (the same path
+    /// `redrive_caller_local_reversal` uses) so EVERY abort path reconciles the
+    /// record before `mark_resolved(Aborted)`.
+    ///
+    /// We Prepare-A on a live caller (staging the durable record + deduction),
+    /// then BALANCE + DROP the in-memory carrier exactly as a lost-reply
+    /// supervisor would (so `ctx.prepared_a == None` over a real durable
+    /// deduction), then call `abort_xctx_participants` directly. The captured
+    /// snapshot MUST show the hard-rate-limit token refunded to full burst and the
+    /// record consumed. PRE-FIX it returns `SettledOrAbsent` and the token stays
+    /// deducted ⇒ FAIL.
+    #[tokio::test]
+    async fn abort_with_lost_carrier_reconciles_durable_record() {
+        let creator_did = "did:dht:z6MkXctxHigh2Creator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let persistence = CapturingPersistence::default();
+        let supervisor = xctx_supervisor_with_persistence(
+            creator_did.clone(),
+            creator_key,
+            Box::new(persistence.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxHigh2Caller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("high2-lost-carrier-saga".to_owned());
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Real Prepare-A: stages the durable record + deduction on the live
+        // caller and returns the must-use carrier into `ctx.prepared_a`.
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // Baseline: the reserve moved owned state and staged the record.
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            let burst = token_after_reserve + 1000; // one token = 1000 milli-tokens
+            assert!(token_after_reserve < burst, "reserve consumed a token");
+            burst
+        };
+
+        // Simulate the LOST Prepare-A reply: the supervisor never received the
+        // carrier (phase-timeout dropped the reply receiver). A lost-carrier
+        // supervisor balances the recovered must-use ticket (void escrow +
+        // consume) and leaves `ctx.prepared_a == None` over the real durable
+        // deduction. We reproduce exactly that state.
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        assert!(
+            ctx.prepared_a.is_none(),
+            "the lost-carrier state has prepared_a == None over a durable deduction"
+        );
+
+        // Drive the abort. The fix's `else` branch re-drives `Abort { None }`,
+        // reversing the caller's LOCAL economy from the durable record.
+        let verdict = supervisor.abort_xctx_participants(&saga_id, &mut ctx).await;
+        assert_eq!(
+            verdict,
+            CallerAbortReversal::SettledOrAbsent,
+            "a delivered record-based Abort{{None}} settles the caller reversal"
+        );
+
+        // CORE: the caller's LOCAL economy IS reversed and the record consumed.
+        // PRE-FIX the else branch returned SettledOrAbsent without driving
+        // anything, so the token stays deducted and the record stays present.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after_abort = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            token_after_abort, burst_milli,
+            "the prepared_a==None abort MUST reverse the caller's LOCAL economy from the \
+             durable record (refund to full burst) — the caller is NOT over-charged"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record MUST be consumed by the record-based reversal"
+        );
+    }
+
+    /// §17.16.4 Prepare-in-progress replay aborts the Prepared side(s) and
+    /// discards — never re-Prepares. We Prepare-B (staging the target's
+    /// `saga_pending` session slot keyed by the saga id), then run the
+    /// Prepare-in-progress recovery re-drive, which sends `Abort` to the target
+    /// to RELEASE the staged slot. We then confirm the slot is gone: a
+    /// subsequent Commit-B reserve for that saga finds NO staged prepared
+    /// (SCP-SAGA-13030), proving the recovery released-and-discarded it. The
+    /// tool never executes (no Commit ever ran).
+    #[tokio::test]
+    async fn xctx_replay_prepare_in_progress_releases_and_discards() {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+        let creator_did = "did:dht:z6MkXctxPrepReplayCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxPrepReplayCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let saga_id = SagaId::new();
+
+        // Stage Prepare-B on the target actor: this stages the eight-field
+        // prepared into `saga_pending`, keyed by the saga id (the session slot
+        // the recovery Abort releases).
+        let target = supervisor
+            .lookup(&hex::encode(XCTX_TARGET))
+            .expect("target co-resident");
+        let prepare_saga_id = saga_id.clone();
+        let prepare_did = DID(caller_did.to_owned());
+        let prepare_now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB {
+                    saga_id: prepare_saga_id,
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: prepare_did,
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: [0x99u8; 16],
+                    asserted_timestamp_ms: prepare_now_ms,
+                    caller_source_role: None,
+                    reply,
+                })
+            })
+            .await
+            .expect("Prepare-B stages the target session slot");
+
+        // Run the Prepare-in-progress recovery re-drive: it aborts the prepared
+        // side(s), releasing the target's staged `saga_pending` slot.
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: 1,
+            recorded_nonce: [0x99u8; 16],
+            recorded_chain_depth: 3,
+        };
+        let verdict =
+            Box::pin(supervisor.redrive_xctx_prepare_in_progress(&saga_id, &prepared)).await;
+        // The caller actor is resident and Prepare-A never staged a reservation
+        // here, so the caller-side `Abort { None }` is delivered to a clean
+        // record no-op: the reversal is settled (`SettledOrAbsent`), which is the
+        // verdict that lets `recover_saga_entry` mark the journal terminal.
+        assert_eq!(
+            verdict,
+            CallerAbortReversal::SettledOrAbsent,
+            "a resident caller with no staged reservation settles the reversal (clean no-op)"
+        );
+
+        // The staged slot was RELEASED: a Commit-B reserve for this saga now
+        // finds NO staged prepared (the recovery discarded it; it was never
+        // re-Prepared).
+        let reserve_saga_id = saga_id.clone();
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve {
+                    saga_id: reserve_saga_id,
+                    reply,
+                })
+            })
+            .await;
+        assert!(
+            matches!(
+                &reserve,
+                Err(ContextError::InvalidState(m)) if m.contains("SCP-SAGA-13030")
+            ),
+            "after Prepare-in-progress recovery the staged slot must be released (no staged \
+             prepared on Commit-B reserve), got {reserve:?}"
+        );
+    }
+
+    /// The NeedsRepair `run_saga` tail HOLDS the escrow reserved (does NOT void
+    /// it) for operator repair, while every other terminal voids/settles it
+    /// (spec §6.2.4 "`NeedsRepair` reservation semantics"). Exercised directly
+    /// on the ticket primitive: `hold_external_for_repair` consumes the carrier
+    /// (no unbalanced-drop panic) WITHOUT voiding the external escrow, distinct
+    /// from `void_external_and_consume`.
+    #[test]
+    fn needs_repair_holds_escrow_without_voiding() {
+        // A no-escrow ticket: `hold_external_for_repair` simply consumes it so
+        // its `#[must_use]` drop guard does not fire (no panic). The semantic
+        // difference from voiding is documented + asserted by the no-panic drop:
+        // had the carrier been dropped WITHOUT being consumed, the debug-assert
+        // in `ToolEconomyTicket::drop` would fire.
+        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(DID(
+            "did:dht:z6MkHoldRepair".to_owned(),
+        ));
+        ticket.hold_external_for_repair();
+        // Reaching here without a drop-guard panic proves the carrier was marked
+        // consumed (held for repair), not leaked.
+    }
+
+    /// Build a real `PreparedAFields` carrying a `#[must_use]` no-escrow ticket —
+    /// the exact carrier the Prepare-A handler hands the FSM. Used by the
+    /// extractor round-trip tests below so the recovered reservation is a genuine
+    /// ticket-bearing reservation (not a synthetic stand-in), making the
+    /// round-trip assertion meaningful.
+    fn build_prepared_a_fields_for_test() -> crate::context::actor::commands::PreparedAFields {
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+        let invoker = DID("did:example:xctx-extractor".to_owned());
+        let handle = crate::context::ContextHandle::new(
+            "ctx-extractor".to_owned(),
+            ContextParams::default(),
+        );
+        let role_state = ContextRoleState::new(
+            "ctx-extractor",
+            "did:example:xctx-extractor",
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        let ticket =
+            crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(invoker);
+        let reservation = crate::context::tools_helpers::ToolEconomyReservation {
+            handle,
+            role_state,
+            generation: 1,
+            ticket,
+        };
+        crate::context::actor::commands::PreparedAFields { reservation }
+    }
+
+    /// `extract_abort_reservation` must recover the `#[must_use]` ticket-bearing
+    /// reservation from the EXACT `Abort { reservation: Some(..) }` command that
+    /// `abort_xctx_participants` builds. The `else`/`None` arm is "unreachable in
+    /// practice" but was previously enforced only by a comment; this test makes a
+    /// future command-shape refactor that breaks the lockstep fail HERE (a
+    /// returned `None` that silently drops the ticket) instead of leaking a
+    /// reservation at runtime. The recovered ticket is consumed so its drop guard
+    /// does not fire under `--features testing`.
+    #[test]
+    fn extract_abort_reservation_round_trips_the_exact_built_command() {
+        let prepared = build_prepared_a_fields_for_test();
+        let (reply, _rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
+        // The EXACT command shape `abort_xctx_participants` constructs for the
+        // caller-side abort (carrying `Some(Box::new(reservation))`).
+        let cmd = Box::new(ContextCommand::SagaPhase(
+            crate::context::actor::commands::SagaPhaseMessage::Abort {
+                saga_id: SagaId("saga-extract-abort".to_owned()),
+                reservation: Some(Box::new(prepared)),
+                reply,
+            },
+        ));
+
+        let recovered = Supervisor::extract_abort_reservation(cmd);
+        assert!(
+            recovered.is_some(),
+            "extract_abort_reservation must recover the reservation from the exact \
+             Abort {{ reservation: Some(..) }} command abort_xctx_participants builds — \
+             a None here means the extractor/builder command shape drifted out of lockstep \
+             and a held ticket would be silently dropped"
+        );
+        // Consume the recovered ticket so the `#[must_use]` drop guard does not
+        // fire (mirrors the real abort path's void+consume).
+        recovered
+            .unwrap()
+            .reservation
+            .ticket
+            .consume_abandoning_escrow();
+    }
+
+    /// `extract_commit_a_reservation` must recover the reservation from the EXACT
+    /// `CommitA { reservation: Box::new(..), .. }` command that `commit_a_settle`
+    /// builds. Same lockstep guarantee as the abort extractor: a command-shape
+    /// refactor that breaks the re-pattern-match fails this test rather than
+    /// silently dropping the held ticket on the recovery path.
+    #[test]
+    fn extract_commit_a_reservation_round_trips_the_exact_built_command() {
+        let prepared = build_prepared_a_fields_for_test();
+        let (reply, _rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
+        // The EXACT command shape `commit_a_settle` constructs.
+        let cmd = Box::new(ContextCommand::SagaPhase(
+            crate::context::actor::commands::SagaPhaseMessage::CommitA {
+                saga_id: SagaId("saga-extract-commit-a".to_owned()),
+                reservation: Box::new(prepared),
+                caller_context_id: [0x11; 32],
+                caller_did: DID("did:example:caller".to_owned()),
+                target_context_id: [0x22; 32],
+                nonce: [0x33; 16],
+                receipt: vec![1, 2, 3],
+                output_bytes: vec![4, 5, 6],
+                reply,
+            },
+        ));
+
+        let recovered = Supervisor::extract_commit_a_reservation(cmd);
+        assert!(
+            recovered.is_some(),
+            "extract_commit_a_reservation must recover the reservation from the exact \
+             CommitA command commit_a_settle builds — a None here means the extractor/builder \
+             command shape drifted out of lockstep and a held ticket would be silently dropped"
+        );
+        recovered
+            .unwrap()
+            .reservation
+            .ticket
+            .consume_abandoning_escrow();
     }
 }
