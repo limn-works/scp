@@ -1642,7 +1642,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    // Recovery and custody migration (#632, spec §9.12)
     async identityExecuteRecovery(
       did: string,
       tier: string,

@@ -110,7 +110,7 @@ class Identity:
     produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §9.12,
     ADR-003 §4b/4c). It carries the JSON-serialized
     ``DidRotationEvent`` that the SDK MUST distribute to active
-    context members per spec §3.2.1 step 4b. ``None`` for handles
+    context members per spec §9.12 step 4b. ``None`` for handles
     produced by other operations.
     """
 

@@ -521,7 +521,7 @@ export interface Bridge {
     issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
-  // Recovery and custody migration (spec §9.12, §3.2.1)
+  // Recovery and custody migration (spec §9.12)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(
     did: string,
@@ -665,7 +665,7 @@ export interface BridgeIdentityHandle {
    * JSON-serialized `scp_identity::DidRotationEvent`, present only on
    * handles produced by `identityMigrate` (spec §9.12, ADR-003 §4b/4c).
    * SDK callers MUST distribute this event to active context members
-   * per spec §3.2.1 (Identity Key migration). `undefined` for any handle minted by
+   * per spec §9.12 (Identity Key migration). `undefined` for any handle minted by
    * other operations (`identityCreate`, `identityRotateKey`, agent-key
    * ops, external load) — those do not change the DID, so no
    * `DidRotationEvent` is constructed.

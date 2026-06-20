@@ -49,7 +49,7 @@ export interface PaymentReceiptVerificationEntry {
   /** Whether the adapter successfully processed this receipt. */
   ok: boolean;
   /** Receipt identifier — present only when ok is true. */
-  receipt_id?: string;
+  receiptId?: string;
   /** Whether the receipt was cryptographically valid — present only when ok is true. */
   valid?: boolean;
   /** Structured verification detail — present only when ok is true. */
@@ -64,10 +64,10 @@ export interface PaymentReceiptVerificationEntry {
  *
  * Mirrors the canonical wire shape produced by
  * `verification_results_to_json` in `scp-runtime/economy/receipt.rs`.
- * `all_valid` is `true` iff every entry reached the adapter and was
+ * `allValid` is `true` iff every entry reached the adapter and was
  * reported valid (vacuously `true` for an empty batch). Inspect `results`
  * for per-receipt detail. An entry with `ok === true` means the adapter
- * responded — NOT that the payment is valid; check `valid` / `all_valid`
+ * responded — NOT that the payment is valid; check `valid` / `allValid`
  * for actual validity.
  */
 export interface PaymentReceiptVerificationResult {
@@ -75,7 +75,7 @@ export interface PaymentReceiptVerificationResult {
    * `true` iff every receipt both reached the adapter and the adapter
    * reported it valid. Vacuously `true` for an empty batch.
    */
-  all_valid: boolean;
+  allValid: boolean;
   /** Per-receipt verification outcomes. */
   results: PaymentReceiptVerificationEntry[];
 }

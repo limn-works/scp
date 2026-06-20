@@ -101,17 +101,23 @@ def normalize_address(address: str) -> str:
 async def discover_contexts(_scp: Any, query: str) -> list[dict[str, Any]]:
     """Discover contexts advertised by a DID or named by an ``scp://`` URI.
 
-    For an ``scp://`` URI the lookup is a synchronous parse. For a ``did:``
-    query it resolves the DID document and projects its advertised contexts,
-    which may involve network (DHT) resolution — so the call is dispatched to
-    a worker thread to avoid blocking the event loop.
+    For a ``did:`` query the bridge resolves the DID document and projects its
+    advertised contexts, which may involve network (DHT) resolution. For an
+    ``scp://`` URI the bridge performs a local parse. Both paths are dispatched
+    to a worker thread via :func:`asyncio.to_thread` to keep the event loop
+    free regardless of bridge implementation.
 
     Takes an explicit ``scp`` instance for cross-SDK consistency with
     ``discoverContexts(scp, query)`` in TypeScript and other SDK bindings.
 
     Args:
-        _scp: An active :class:`~scp_sdk.SCP` instance (required for
-            cross-SDK parity with TypeScript; not used in the implementation).
+        _scp: An active :class:`~scp_sdk.SCP` instance. Accepted for
+            cross-SDK parity with TypeScript's ``discoverContexts(scp, query)``,
+            which dispatches per-instance via ``getBridge(scp)``. In Python,
+            ``context_discover`` is a module-level ``#[pyfunction]`` rather than
+            an instance method, so dispatch goes through the module bridge
+            (``_bridge().context_discover(query)``). The parameter is intentionally
+            unused — the leading underscore signals this.
         query: A ``did:`` identifier or an ``scp://`` context URI.
 
     Returns:

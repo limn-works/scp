@@ -288,7 +288,7 @@ interface WasmModule {
     attestationJson: string,
     issuerPublicKeyHex: string,
   ) => Promise<boolean>;
-  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  // Recovery and custody migration (#632, spec §9.12)
   identity_execute_recovery: (did: string, tier: string, contextIds: string[]) => string;
   identity_execute_custody_migration: (did: string, target: string, contextIds: string[]) => string;
   // Membership queries
@@ -1866,7 +1866,7 @@ export function createWasmBridge(): Bridge {
       // The WASM bridge returns the migrated identity AND a JSON-
       // serialized `DidRotationEvent` carrying the migration +
       // pre-rotation proofs. The SDK layer distributes the event to
-      // active context members per spec §3.2.1 step 4b.
+      // active context members per spec §9.12 step 4b.
       return {
         did: result.identity.did,
         custodyType: result.identity.custodyType,
@@ -1932,7 +1932,7 @@ export function createWasmBridge(): Bridge {
       return await wasm.identity_verify_link_attestation(attestationJson, issuerPublicKeyHex);
     },
 
-    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    // Recovery and custody migration (#632, spec §9.12)
     async identityExecuteRecovery(
       did: string,
       tier: string,

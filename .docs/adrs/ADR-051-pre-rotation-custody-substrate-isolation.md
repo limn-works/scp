@@ -41,7 +41,7 @@ Close the gap by introducing a **dedicated pre-rotation custody callback interfa
 
 ### 1. A separate `PreRotationCustodyProvider` FFI callback interface
 
-Define a new callback interface (UniFFI `[Trait, WithForeign]`, with the matching PyO3 `Py<PyAny>` and NAPI threadsafe-function adapters) that the SDK implements **independently** of its operational `KeyCustodyProvider`. Modeling it as a separate provider — not new methods on `KeyCustodyProvider` — is the mechanism that enforces §3's "MUST NOT be accessible through the same custody provider or authentication flow." The interface mirrors the Rust-core `PreRotationCustody` trait the core already consumes:
+Define a new callback interface (UniFFI `[Trait, WithForeign]`, with the matching PyO3 `Py<PyAny>` and NAPI threadsafe-function adapters) that the SDK implements **independently** of its operational `KeyCustodyProvider`. Modeling it as a separate provider — not new methods on `KeyCustodyProvider` — is the mechanism that enforces §3's "MUST NOT be accessible through the same custody provider or authentication flow." The interface extends the Rust-core `PreRotationCustody` trait the core already consumes (the existing trait stores externally-generated keys via `store_committed_pre_rotation_key`; `generate()` has no current trait counterpart — it is a new in-substrate generation method added by this ADR):
 
 - `generate() -> PreRotationKeyHandle` — generate the keypair **inside the separate substrate** (hardware key, secondary-device enclave, cloud key vault, or an encrypted-offline/Shamir/BIP39 wrapper), never in shared process memory.
 - `public_key(handle) -> [u8; 32]` — for the `SHA-256(public_key)` commitment.
