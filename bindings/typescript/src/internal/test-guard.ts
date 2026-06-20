@@ -1,12 +1,27 @@
+/**
+ * Evaluate whether a given env object indicates a test or development
+ * environment.
+ *
+ * Extracted from the module-load IIFE so the decision logic can be unit-tested
+ * independently of the frozen module-level constant.
+ *
+ * Uses `Object.hasOwn` to prevent prototype-pollution bypass
+ * (`Object.prototype.NODE_ENV = "test"` must not elevate trust).
+ *
+ * @internal
+ */
+export function _evaluateTestEnv(env: Record<string, string | undefined> | undefined): boolean {
+  if (!env || typeof env !== "object") return false;
+  const nodeEnv = Object.hasOwn(env, "NODE_ENV") ? env.NODE_ENV : undefined;
+  const bunTest = Object.hasOwn(env, "BUN_TEST") ? env.BUN_TEST : undefined;
+  return nodeEnv === "test" || nodeEnv === "development" || bunTest !== undefined;
+}
+
 // Evaluated once at import time — runtime mutations to process.env cannot flip this.
 const _IS_TEST_ENVIRONMENT: boolean = (() => {
   try {
     const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-    const env = proc?.env;
-    if (!env || typeof env !== "object") return false;
-    const nodeEnv = Object.hasOwn(env, "NODE_ENV") ? env.NODE_ENV : undefined;
-    const bunTest = Object.hasOwn(env, "BUN_TEST") ? env.BUN_TEST : undefined;
-    return nodeEnv === "test" || nodeEnv === "development" || bunTest !== undefined;
+    return _evaluateTestEnv(proc?.env);
   } catch {
     return false;
   }
@@ -20,7 +35,7 @@ const _NODE_ENV_AT_LOAD: string | undefined = (() => {
     const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
     const env = proc?.env;
     return env && typeof env === "object" && Object.hasOwn(env, "NODE_ENV")
-      ? env["NODE_ENV"]
+      ? env.NODE_ENV
       : undefined;
   } catch {
     return undefined;

@@ -1044,8 +1044,6 @@ def _check_operation_in_sdk(
     domain_lower = domain.lower()
     domain_snake = f"{domain_lower}_{op_name}"
     domain_camel = _to_camel(domain_snake)
-    # py_ prefixed (PyO3 bridge naming convention)
-    py_prefixed = f"py_{op_name}"
 
     candidates = [
         # Raw operation names
@@ -1055,7 +1053,6 @@ def _check_operation_in_sdk(
         # Domain-prefixed
         domain_snake,  # messaging_send_message
         domain_camel,  # messagingSendMessage
-        py_prefixed,  # py_send_message
         # Class.method patterns — use domain name as-is from JSON
         # (preserves EventLog, UCAN, MCP casing)
         f"{domain}.{op_name}",  # EventLog.verify
