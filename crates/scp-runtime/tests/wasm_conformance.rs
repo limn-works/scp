@@ -2328,6 +2328,57 @@ fn cross_impl_governance_action_executed_leaf_bytes() {
     assert_eq!(decoded.action_type, "RemoveMember");
 }
 
+/// `GovernanceProposalCreated`, `GovernanceVoteCast`, and
+/// `GovernanceVoteWithdrawn` carry an EMPTY canonical leaf payload (§9.9.3).
+///
+/// Native appends all three via `append_context_event`, which calls
+/// `append_event` with `EventPayload::default()` (`data: []`). The `proposal_id`
+/// these events concern lives only in the buffer-only `ContextEvent`, NOT in the
+/// durable Merkle leaf. The WASM bridge test
+/// `cross_impl_governance_proposal_vote_leaf_is_empty_wasm` asserts the SAME
+/// empty leaf from its real `append_log_event` path; a WASM regression that
+/// stamps `proposal_id.as_bytes()` into the leaf would diverge the cross-platform
+/// `tree::root` and false-positive §9.9.3 equivocation. This test drives native's
+/// REAL durable append for each type and proves the landed leaf is empty.
+#[test]
+fn cross_impl_governance_proposal_vote_leaf_is_empty() {
+    use scp_runtime::context::builder::ContextEventLogProvider;
+    use scp_runtime::context::providers::MerkleEventLogProvider;
+
+    let ctx: [u8; 32] = [0x67; 32];
+    let log = MerkleEventLogProvider::new();
+    log.init_event_log(&ctx).unwrap();
+
+    // Drive native's REAL empty-payload append helper (`append_context_event`)
+    // for each governance proposal/vote EventType — the exact call shape
+    // `governance_helpers` uses for these three events.
+    for event_type in [
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+    ] {
+        log.append_context_event(&ctx, event_type, "did:dht:z6MkProposer", 1_700_000_000)
+            .unwrap();
+    }
+
+    let entries = log.event_log_entries(&ctx).unwrap().unwrap();
+    for event_type in [
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+    ] {
+        let logged = entries
+            .iter()
+            .find(|e| e.event_type == event_type)
+            .unwrap_or_else(|| panic!("{event_type:?} leaf must be present"));
+        assert!(
+            logged.payload.data.is_empty(),
+            "{event_type:?} canonical leaf payload MUST be empty (§9.9.3) — the \
+             proposal_id is buffer-only, never part of the durable Merkle leaf"
+        );
+    }
+}
+
 /// Canonical `TokenRevoked` leaf payload — JSON `{token_cid, revoker_did,
 /// context_id}`. Produced by the SHARED
 /// `scp_protocol::crypto::ucan::revoke::token_revoked_payload` that BOTH the

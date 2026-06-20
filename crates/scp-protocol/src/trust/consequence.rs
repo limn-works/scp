@@ -879,17 +879,25 @@ pub fn merge_consequence_events(
         if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
             break;
         }
-        buffer_events_accepted += 1;
 
+        // Dense, contiguous numbering: key the sequence on the count of
+        // ACCEPTED buffer events (`buffer_events_accepted`, pre-increment), NOT
+        // the raw enumeration index `idx`. Using `idx` would leave gaps whenever
+        // a buffer event is skipped (dedup / age / skew / non-`MessageSent`),
+        // contradicting the contiguity the doc promises. The sequence is
+        // evidence-only metadata — `matches_trigger` never reads it — so this is
+        // behavior-preserving and keeps the merged sets identical across the
+        // native runtime and the WASM bridge.
         events.push(Event {
             event_type,
             actor_did,
             timestamp: estimated_ts,
-            sequence: next_seq + idx as u64,
+            sequence: next_seq + buffer_events_accepted as u64,
             payload: scp_event_log::EventPayload { data: payload_data },
             prev_hash: [0u8; 32],
             signature: Vec::new(),
         });
+        buffer_events_accepted += 1;
     }
 
     events

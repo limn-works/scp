@@ -951,4 +951,74 @@ mod cross_impl_leaf_parity {
             br#"{"action_type":"SuspendAccess","rule_index":3,"target_did":"did:dht:z6MkSubject","trigger_kind":"WarningCount"}"#;
         assert_eq!(payload.data, expected);
     }
+
+    /// `GovernanceProposalCreated` / `GovernanceVoteCast` /
+    /// `GovernanceVoteWithdrawn`: the WASM bridge's durable leaf MUST carry an
+    /// EMPTY payload, matching native's `append_context_event`
+    /// (`EventPayload::default()`). The native test
+    /// `cross_impl_governance_proposal_vote_leaf_is_empty` pins the SAME empty
+    /// leaf from native's real producer path.
+    ///
+    /// The production append sites pass `b""` (the `proposal_id` rides only in
+    /// the buffer-only `ContextEvent`). This test drives the WASM append path
+    /// with that production payload and asserts the landed leaf is empty; it ALSO
+    /// proves the regression is detectable by appending the pre-fix
+    /// `proposal_id.as_bytes()` payload to a parallel log and asserting the two
+    /// Merkle roots DIVERGE — i.e. a leaf that stamped the `proposal_id` would
+    /// produce a different `tree::root` and false-positive §9.9.3 equivocation
+    /// against native.
+    #[test]
+    fn cross_impl_governance_proposal_vote_leaf_is_empty_wasm() {
+        use crate::manager::make_bare_per_context_state;
+        use scp_event_log::EventType;
+
+        const GOVERNANCE_PROPOSAL_VOTE_EVENTS: [EventType; 3] = [
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+        ];
+        let proposal_id = "prop-converge-001";
+        let actor = "did:dht:z6MkProposer";
+
+        // Production path: append each governance event with the EMPTY payload
+        // the real `append_log_event` call sites now pass.
+        let mut empty_state = make_bare_per_context_state("ctx-gov-empty", actor);
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            empty_state.test_append_log_event_at(event_type, actor, 1_700_000_000, b"");
+        }
+
+        // Every durable governance leaf carries an empty payload — byte-parity
+        // with native's `append_context_event`.
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            let logged = empty_state
+                .event_log_events()
+                .iter()
+                .find(|e| e.event_type == event_type);
+            assert!(
+                logged.is_some_and(|e| e.payload.data.is_empty()),
+                "{event_type:?} WASM canonical leaf MUST be present with an EMPTY \
+                 payload (§9.9.3)"
+            );
+        }
+
+        // Regression detector: a parallel log that stamps `proposal_id.as_bytes()`
+        // (the pre-fix WASM behavior) MUST yield a DIFFERENT Merkle root, proving
+        // the empty-payload fix is load-bearing for native↔WASM convergence.
+        let mut stamped_state = make_bare_per_context_state("ctx-gov-stamped", actor);
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            stamped_state.test_append_log_event_at(
+                event_type,
+                actor,
+                1_700_000_000,
+                proposal_id.as_bytes(),
+            );
+        }
+        assert_ne!(
+            empty_state.test_event_log_root(),
+            stamped_state.test_event_log_root(),
+            "stamping proposal_id into the leaf MUST diverge the Merkle root — the \
+             empty-payload parity with native is what prevents a §9.9.3 \
+             false-positive equivocation across platforms"
+        );
+    }
 }

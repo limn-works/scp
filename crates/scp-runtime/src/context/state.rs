@@ -245,12 +245,20 @@ pub struct PendingCeilingModification {
     /// is identical across members — and is recorded as the convergent
     /// `CeilingModified` leaf timestamp when the change is applied.
     pub effective_at: u64,
-    /// Convergent local Unix timestamp (seconds) at which THIS member
-    /// observed/processed the originating governance commit. Unlike
-    /// `effective_at` (which is anchored on the proposer-chosen, hence
-    /// backdatable, `proposal.created_at`), this is the applying member's own
-    /// monotonic clock at commit-processing time. It is the non-backdatable
-    /// floor of the notification window (see [`Self::is_effective`]).
+    /// Local Unix timestamp (seconds) at which THIS member observed/processed
+    /// the originating governance commit. Unlike `effective_at` (which is
+    /// anchored on the proposer-chosen, hence backdatable, `proposal.created_at`),
+    /// this is the applying member's own clock at commit-processing time. It is
+    /// the non-backdatable floor of the notification window (see
+    /// [`Self::is_effective`]).
+    ///
+    /// SECURITY: this field is serialized into the signed export snapshot. The
+    /// non-backdatable invariant holds IN-PROCESS (it is set from the local
+    /// clock when the commit is processed) AND is RE-ESTABLISHED on the
+    /// untrusted import path: `import_context` re-pins `observed_at` to the
+    /// importing member's local clock, so a malicious exporter who backdates it
+    /// in a signed export cannot collapse the notification window on import. The
+    /// trusted RESTORE path (self-respawn) keeps it verbatim.
     pub observed_at: u64,
     /// The governance proposal ID that approved this modification.
     pub proposal_id: ProposalId,
@@ -308,12 +316,20 @@ pub struct PendingEconomicPolicyChange {
     /// is identical across members — and is recorded as the convergent
     /// `EconomicPolicyApplied` leaf timestamp when the change is applied.
     pub effective_at: u64,
-    /// Convergent local Unix timestamp (seconds) at which THIS member
-    /// observed/processed the originating governance commit. Unlike
-    /// `effective_at` (which is anchored on the proposer-chosen, hence
-    /// backdatable, `proposal.created_at`), this is the applying member's own
-    /// monotonic clock at commit-processing time. It is the non-backdatable
-    /// floor of the 24-hour notification window (see [`Self::is_effective`]).
+    /// Local Unix timestamp (seconds) at which THIS member observed/processed
+    /// the originating governance commit. Unlike `effective_at` (which is
+    /// anchored on the proposer-chosen, hence backdatable, `proposal.created_at`),
+    /// this is the applying member's own clock at commit-processing time. It is
+    /// the non-backdatable floor of the 24-hour notification window (see
+    /// [`Self::is_effective`]).
+    ///
+    /// SECURITY: this field is serialized into the signed export snapshot. The
+    /// non-backdatable invariant holds IN-PROCESS (it is set from the local
+    /// clock when the commit is processed) AND is RE-ESTABLISHED on the
+    /// untrusted import path: `import_context` re-pins `observed_at` to the
+    /// importing member's local clock, so a malicious exporter who backdates it
+    /// in a signed export cannot collapse the 24-hour window on import. The
+    /// trusted RESTORE path (self-respawn) keeps it verbatim.
     pub observed_at: u64,
     /// The governance proposal ID that approved this change.
     pub proposal_id: ProposalId,

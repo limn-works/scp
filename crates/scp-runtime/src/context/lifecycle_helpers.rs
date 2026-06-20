@@ -1774,6 +1774,30 @@ pub async fn import_context(
         "import",
     );
 
+    // SECURITY (§5.3.2, §19.3): re-pin the non-backdatable notification-window
+    // floor on the UNTRUSTED import path. `observed_at` is the local
+    // commit-processing clock that anchors the mandatory notification window's
+    // lower bound (`is_effective` gates on `effective_at.max(observed_at +
+    // PERIOD)`). It rides verbatim in the signed export snapshot, so a malicious
+    // exporter could backdate BOTH `effective_at` (proposer-controlled) and
+    // `observed_at` to collapse the window to zero on import. We therefore
+    // re-pin `observed_at` to THIS importing member's local clock, restarting
+    // the window from import time (conservative/safe). This mirrors the
+    // `creation_timestamp_secs` re-pin and the `cooldown_until` sanitization
+    // above. The RESTORE path (trusted self-respawn) keeps `observed_at`
+    // verbatim — re-pinning there would let a crash-loop re-arm the window
+    // forever.
+    let sanitized_pending_ceiling_modification =
+        export.snapshot.pending_ceiling_modification.clone().map(|mut p| {
+            p.observed_at = now_for_validation;
+            p
+        });
+    let sanitized_pending_economic_policy_change =
+        export.snapshot.pending_economic_policy_change.clone().map(|mut p| {
+            p.observed_at = now_for_validation;
+            p
+        });
+
     // ADR-049 Phase 2A finalization keystone: import path is encrypted-only
     // (`broadcast_context: None` below). Derive the actor's `members` set
     // from the imported membership snapshot — `members()` enumerates the
@@ -1832,8 +1856,11 @@ pub async fn import_context(
             deadlock: DeadlockDetectionState::default(),
             threshold_signers: export.snapshot.threshold_signers,
             threshold_value: export.snapshot.threshold_value,
-            pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
-            pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
+            // SECURITY: `observed_at` re-pinned to local import time (see the
+            // sanitization above) so a backdated signed export cannot collapse
+            // the §5.3.2 / §19.3 notification window on import.
+            pending_ceiling_modification: sanitized_pending_ceiling_modification,
+            pending_economic_policy_change: sanitized_pending_economic_policy_change,
             registered_tools: export.snapshot.registered_tools,
             tool_interfaces: export.snapshot.tool_interfaces,
             pruning_policy: export.snapshot.pruning_policy,

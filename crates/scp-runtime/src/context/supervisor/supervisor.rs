@@ -11905,6 +11905,131 @@ mod tests {
             .expect("pre-existing store handle is still live after the rejected import");
     }
 
+    /// SECURITY (§5.3.2, §19.3): a Full export whose `pending_economic_policy_change`
+    /// has a BACKDATED `observed_at` (and backdated `effective_at`) MUST NOT be
+    /// immediately effective on import. `import_context` re-pins `observed_at` to
+    /// the importing member's local clock, so the non-backdatable notification
+    /// window restarts from import time. Without the re-pin, a malicious exporter
+    /// who signs a backdated `observed_at` collapses the window to zero and the
+    /// policy applies on the first apply tick — exactly the bypass this guards.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_repins_observed_at_so_backdated_pending_change_is_not_effective() {
+        use crate::context::state::ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        use ed25519_dalek::Signer;
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+        // Deterministic import-time clock.
+        const IMPORT_TIME: u64 = 1_700_000_000;
+        let clock = Arc::new(TestClock::new(IMPORT_TIME));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let supervisor =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let creator = "did:key:repin-test-creator";
+        let context_id = "repin-observed-at-ctx";
+        let mut snapshot = import_test_snapshot(context_id, creator);
+
+        // Attacker backdates BOTH the convergent `effective_at` AND the
+        // non-backdatable floor `observed_at` to the distant past. Installed
+        // verbatim, `is_effective(IMPORT_TIME + 1)` would be true (window
+        // collapsed). `effective_at` is well below import time too, so only the
+        // re-pinned floor keeps the change pending.
+        let backdated = IMPORT_TIME - 10 * ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode(*b"USD\0"),
+                per_message: Some(Amount(1)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["test".to_owned()],
+            pricing_formula: None,
+            payee: DID("did:dht:z6MkPayee".to_owned()),
+        };
+        snapshot.pending_economic_policy_change =
+            Some(crate::context::state::PendingEconomicPolicyChange {
+                new_policy: policy,
+                notified_at: backdated,
+                effective_at: backdated + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+                observed_at: backdated,
+                proposal_id: [0u8; 32],
+            });
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        // Empty event-log data: `recompute_event_log_root([])` is `[0u8; 32]`,
+        // which matches `import_test_snapshot`'s signed `event_log_merkle_root`
+        // so the Merkle-binding check passes and the import succeeds.
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            Vec::new(),
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed full export");
+
+        // Fresh import (no live context for this id) — succeeds.
+        supervisor
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect("a valid signed full export imports successfully");
+
+        // At import_time + 1: the re-pinned floor is `IMPORT_TIME +
+        // ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS`, so the change is NOT yet
+        // effective despite the backdated `effective_at`. Without the re-pin
+        // this apply would return `true`.
+        let applied_early = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_governance_command(
+                    crate::context::actor::commands::GovernanceCommand::ApplyPendingEconomicPolicyChange {
+                        context_id: context_id.to_owned(),
+                        current_timestamp: IMPORT_TIME + 1,
+                        reply: tx,
+                    },
+                )
+                .await
+                .expect("apply dispatch routes to the imported actor");
+            rx.await.expect("apply handler replies").expect("apply ok")
+        };
+        assert!(
+            !applied_early,
+            "a backdated pending economic-policy change MUST NOT be effective just after import \
+             — `observed_at` is re-pinned to local import time, restarting the §19.3 window"
+        );
+
+        // At import_time + PERIOD: the re-pinned window has elapsed, so the
+        // change now applies. This proves the re-pin restarts (does not destroy)
+        // the window.
+        let applied_after_period = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_governance_command(
+                    crate::context::actor::commands::GovernanceCommand::ApplyPendingEconomicPolicyChange {
+                        context_id: context_id.to_owned(),
+                        current_timestamp: IMPORT_TIME
+                            + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS
+                            + 1,
+                        reply: tx,
+                    },
+                )
+                .await
+                .expect("apply dispatch routes to the imported actor");
+            rx.await.expect("apply handler replies").expect("apply ok")
+        };
+        assert!(
+            applied_after_period,
+            "the change MUST become effective once the re-pinned notification window \
+             (import_time + PERIOD) has elapsed"
+        );
+    }
+
     /// Helper mirroring `export_import::tests::create_event_log_data` —
     /// builds a Merkle event log byte payload via the provider.
     fn create_event_log_data(

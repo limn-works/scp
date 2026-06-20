@@ -723,6 +723,13 @@ impl PerContextState {
         let _ = append_unsigned_event(&mut self.event_log, &event);
     }
 
+    /// Test-only: the current Merkle root of this context's event log. Used by
+    /// cross-impl leaf-parity tests to prove a payload change perturbs the root.
+    #[cfg(test)]
+    pub(crate) fn test_event_log_root(&self) -> [u8; 32] {
+        scp_event_log::tree::root(&self.event_log)
+    }
+
     /// Test-only: insert a member with the given role.
     #[cfg(test)]
     pub(crate) fn test_insert_member(&mut self, did: &str, role: &str) {
@@ -3944,10 +3951,15 @@ impl WasmContextManager {
             resulting_epoch: None,
             target_did: action.target_did().cloned(),
         });
+        // SECURITY/§9.9.3: native appends GovernanceProposalCreated with an
+        // EMPTY payload (`append_context_event`, no payload) — match it so the
+        // leaf preimage is byte-identical across platforms. The proposal_id is
+        // NOT part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` pushed above (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceProposalCreated,
             proposer_did,
-            proposal_id.as_bytes(),
+            b"",
             // Convergent: the proposal's signed `created_at` (set to `now_secs`
             // above), copied by every member — matches the native runtime's
             // proposal-derived leaf timestamp (§7.3.1, §9.9.3).
@@ -4063,10 +4075,15 @@ impl WasmContextManager {
             proposal.approvals.len() >= required
         };
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteCast,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
             // Convergent: the voter's signed vote `created_at` (= `now_secs`,
             // the same value stamped on the SignedVote), copied by every member
             // (§7.3.1, §9.9.3).
@@ -4175,10 +4192,15 @@ impl WasmContextManager {
             total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
         };
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteCast,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
             // Convergent: the voter's signed vote `created_at` (= `now_secs`,
             // the same value stamped on the SignedVote), copied by every member
             // (§7.3.1, §9.9.3).
@@ -4248,10 +4270,15 @@ impl WasmContextManager {
             });
         }
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteWithdrawn with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteWithdrawn,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
             // Committer-assigned: the withdrawing voter's clock, the source of
             // the withdrawal commit's `created_at` (§7.3.1, §9.9.3).
             crate::time::now_secs(),
