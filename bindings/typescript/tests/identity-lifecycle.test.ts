@@ -61,6 +61,55 @@ describe("SCP identity-lifecycle surface", () => {
     }
   });
 
+  it("identityMigrate routes through the injected bridge spy and exposes rotationEventJson", async () => {
+    // The spy handle includes rotationEventJson — a field the bridge sets only
+    // on migrate results. The Identity.rotationEventJson getter must surface it.
+    const spyHandle: BridgeIdentityHandle = {
+      did: "did:dht:zSpy",
+      custodyType: "in_memory",
+      rotationEventJson: '{"event":"rotate"}',
+    };
+    const spyCalls: BridgeIdentityHandle[] = [];
+
+    const PROBE_PROPS = new Set<string | symbol>([
+      "then",
+      "catch",
+      "finally",
+      Symbol.toPrimitive,
+      Symbol.toStringTag,
+      Symbol.iterator,
+      Symbol.asyncIterator,
+    ]);
+
+    const spyBridge = new Proxy({} as Bridge, {
+      get(_t, prop) {
+        if (PROBE_PROPS.has(prop)) return undefined;
+        if (prop === "identityMigrate") {
+          return (handle: BridgeIdentityHandle) => {
+            spyCalls.push(handle);
+            return Promise.resolve(spyHandle);
+          };
+        }
+        throw new Error(`Spy bridge: unexpected call to Bridge.${String(prop)}`);
+      },
+    });
+
+    const { scp } = mountMockScp();
+    __setBridgeForTests(scp, spyBridge);
+
+    const rawHandle: BridgeIdentityHandle = { did: "did:dht:zInput", custodyType: "in_memory" };
+    const identity = Identity._fromHandle(scp, rawHandle);
+
+    const result = await scp.identityMigrate(identity);
+
+    expect(spyCalls).toHaveLength(1);
+    expect(spyCalls[0]).toBe(rawHandle);
+    expect(result).toBeInstanceOf(Identity);
+    expect(result.did).toBe("did:dht:zSpy");
+    // rotationEventJson getter must surface the field from the bridge handle.
+    expect(result.rotationEventJson).toBe('{"event":"rotate"}');
+  });
+
   for (const method of LIFECYCLE_METHODS) {
     it(`${method} routes through the injected bridge spy`, async () => {
       // Build a spy bridge that records calls to the specific lifecycle method
@@ -174,6 +223,9 @@ if (!napiAvailable) {
         // Migration creates a new DID — it does NOT preserve the old one.
         // Use identityRotateKey() if the same DID with a new key is needed.
         expect(migrated.did).not.toBe(identity.did);
+        // Migration must produce a rotation event callers MUST distribute (spec §3.2.1)
+        expect(typeof migrated.rotationEventJson).toBe("string");
+        expect(migrated.rotationEventJson?.length).toBeGreaterThan(0);
       } finally {
         await scp.shutdown(1);
       }
