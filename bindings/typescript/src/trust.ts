@@ -22,7 +22,7 @@
  * The remaining functional entry points (`aggregateTrustInput`,
  * `verifyParticipationRequirements`) live on the {@link SCP} class as
  * `scp.aggregateTrustInput(...)` / `scp.verifyParticipationRequirements(...)`
- * (Phase 4 PR 4, #1549, ADR-048).
+ * (Phase 4 PR 4, ADR-048).
  *
  * See ADR-017 (Trust Engine), ADR-022 in `.docs/adrs/phase-4.md`, and
  * `.docs/sketch.md` section `SCP.Trust.evaluate`.
@@ -62,7 +62,7 @@ export interface AggregationInput {
   /** 32-byte Merkle root as an array of numbers. */
   merkleRoot: readonly number[];
   /**
-   * Consequence rules declared at context creation (ADR-017, #1531).
+   * Consequence rules declared at context creation (ADR-017).
    *
    * Typed {@link ConsequenceRule} array — the SDK serializes to the JSON
    * wire shape before forwarding to the bridge.
@@ -98,7 +98,7 @@ export interface AggregatedTrustInput {
 }
 
 // ---------------------------------------------------------------------------
-// Four-layer trust evaluation (spec §9.3, ADR-017)
+// Four-layer trust evaluation (spec §7.2–7.5, ADR-017)
 // ---------------------------------------------------------------------------
 
 /**
@@ -398,7 +398,7 @@ export const __PASSED_BEFORE: Readonly<Record<UcanFailureCategory, ReadonlySet<s
 /**
  * Evaluates the trustworthiness of a participant in a context.
  *
- * Performs the four-layer trust evaluation model (spec §9.3, ADR-017):
+ * Performs the four-layer trust evaluation model (spec §7.2–7.5, ADR-017):
  *
  * 1. **Protocol enforcement** — validates each provided UCAN token via
  *    `scp.ucanValidate`, classifying any failure into the independent Layer 1

@@ -834,7 +834,7 @@ export class SCP {
    *
    * The returned handle carries a `rotationEventJson` field (a serialized
    * `scp_identity::DidRotationEvent`). Callers **MUST** distribute this
-   * rotation event to all active context members per spec §3.2.1 step 4b
+   * rotation event to all active context members per spec §3.2.1 (Identity Key migration)
    * so peers can update their routing tables. Access it via
    * `identity.rotationEventJson` on the returned `Identity`.
    *

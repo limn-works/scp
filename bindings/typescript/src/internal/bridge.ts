@@ -587,7 +587,7 @@ export interface Bridge {
     issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
-  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  // Recovery and custody migration (spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(
     did: string,
@@ -740,7 +740,7 @@ export interface BridgeIdentityHandle {
    * JSON-serialized `scp_did::DidRotationEvent`, present only on
    * handles produced by `identityMigrate` (spec §9.12, ADR-003 §4b/4c).
    * SDK callers MUST distribute this event to active context members
-   * per spec §3.2.1 step 4b. `undefined` for any handle minted by
+   * per spec §3.2.1 (Identity Key migration). `undefined` for any handle minted by
    * other operations (`identityCreate`, `identityRotateKey`, agent-key
    * ops, external load) — those do not change the DID, so no
    * `DidRotationEvent` is constructed.
@@ -926,10 +926,11 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  * **Test-only.** Injects a pre-built `Bridge` into the per-instance WeakMap
  * so that `getBridge(scp)` returns it without loading any platform addon.
  *
- * Guarded by `NODE_ENV !== "production"` — the same pattern as
- * `__constructScpWithNativeForTests` in `scp.ts`. Production builds keep this
- * helper, but any call site in a production environment throws immediately so
- * the seam cannot be abused at runtime.
+ * Guarded by a positive test-environment check: throws unless `NODE_ENV` is
+ * `"test"` or `"development"`, or `BUN_TEST` is set (which `bun:test` sets
+ * automatically). Production builds keep this helper in the output, but any
+ * call site outside a test/development environment throws immediately so the
+ * seam cannot be abused at runtime.
  *
  * Intended use: construct a mock `Bridge` with spy stubs for specific
  * operations (e.g. `bridgeEvaluateTrust`), then call
@@ -940,11 +941,14 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  */
 export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
   const env = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
-  if (env === "production") {
+  const isTesting =
+    env === "test" ||
+    env === "development" ||
+    (globalThis as { BUN_TEST?: boolean }).BUN_TEST !== undefined;
+  if (!isTesting) {
     throw new Error(
-      "__setBridgeForTests is a test-only hook and must not be called in production " +
-        "(NODE_ENV=production). If you're seeing this in legitimate code, your build is " +
-        "including test helpers that should be excluded.",
+      "__setBridgeForTests is a test-only hook. It must only be called in test or development " +
+        "environments. Set NODE_ENV=test, NODE_ENV=development, or ensure BUN_TEST is set.",
     );
   }
   _nativeBridgeForScp.set(scp, bridge);
