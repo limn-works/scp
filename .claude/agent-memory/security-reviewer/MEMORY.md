@@ -270,3 +270,6 @@
 - MEDIUM: send_sequence wrapping_add allows theoretical nonce reuse at u64::MAX
 - FIXED from prior: sender key AAD zeros; MLS management messages; epoch poisoning defense; error message sanitization
 - GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
+
+### fix/sdk-coverage-fail-closed-and-parity @ f6caeb5dd (2026-06-20) -- CLEAN
+- See `trust-error-classifier-f6caeb5dd.md`. No CRITICAL/HIGH. trust.ts UCAN error classifier SAFE (START-anchored fixed prefixes + startsWith, attacker data always after fixed colon-literal, output ADVISORY not authz). LESSON: error-string classifiers MUST use startsWith on start-anchored prefixes, never includes(). __setBridgeForTests triple-isolated (not in index.ts + exports map blocks deep import + NODE_ENV guard). check-sdk-coverage all_exempted_ops gate sound for honest-drift not malicious committer. ADR-051 (Proposed) = pre-existing MEDIUM (pre-rotation key shares process-memory substrate, §9.7.4.1 §3). MLS provider.rs = doc-comment-only.
