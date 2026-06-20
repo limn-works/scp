@@ -4590,31 +4590,48 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Handles a broadcast key request from a subscriber.
+    /// Handles a broadcast key request from a subscriber, sealing the author's
+    /// current broadcast key to the requester's X25519 `wrapping_pubkey`
+    /// (HPKE Base mode, §5.14.2). The raw broadcast key never crosses the FFI
+    /// boundary — only the sealed material is returned.
     ///
     /// # Returns
     ///
-    /// A debug string describing the key request decision.
+    /// `Some(json)` on grant, where `json` is a serialized
+    /// [`SealedBroadcastKey`](scp_core::context::broadcast::SealedBroadcastKey)
+    /// (the subscriber opens it via [`Self::broadcast_open_key`]). `None` on
+    /// deny — per §5.14.8 the author returns no key material to a denied
+    /// (blocked, unregistered, or unauthorized) requester.
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the operation fails.
-    #[pyo3(signature = (handle, author_did, requester_did))]
+    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 32 bytes, or
+    /// `RuntimeError` if the operation fails.
+    #[pyo3(signature = (handle, author_did, requester_did, wrapping_pubkey))]
     pub fn broadcast_handle_key_request(
         &self,
         handle: &PyContextHandle,
         author_did: &str,
         requester_did: &str,
-    ) -> PyResult<String> {
+        wrapping_pubkey: &[u8],
+    ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
         validate::validate_did(requester_did)?;
+        let wrapping: [u8; 32] = wrapping_pubkey.try_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "wrapping_pubkey must be 32 bytes, got {}",
+                wrapping_pubkey.len()
+            ))
+        })?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
+        let context_id_for_seal = context_id.clone();
+        let author_did_owned = author_did.to_owned();
         let author: scp_identity::DID = author_did.to_owned().into();
         let requester: scp_identity::DID = requester_did.to_owned().into();
 
@@ -4625,6 +4642,7 @@ impl crate::scp::PyScp {
                 context_id,
                 author_did: author,
                 requester_did: requester,
+                wrapping_pubkey: wrapping,
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
@@ -4638,8 +4656,42 @@ impl crate::scp::PyScp {
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("broadcast key request handling failed: {e}"))
                 })?;
-            Ok(format!("{decision:?}"))
+            // Grant→sealed-JSON / Deny→None via the shared helper (per-SDK error
+            // mapping kept here; only the value-shape logic is shared).
+            scp_ffi_common::broadcast::seal_decision_to_json(
+                decision,
+                &author_did_owned,
+                &context_id_for_seal,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("serialize sealed broadcast key: {e}")))
         })
+    }
+
+    /// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held
+    /// X25519 wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+    ///
+    /// Pure crypto — no handle, no `self` state. The `sealed_json` is the
+    /// JSON produced by [`Self::broadcast_handle_key_request`] on grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValueError` if `sealed_json` is malformed or `wrapping_secret`
+    /// is not 32 bytes, or `RuntimeError` if HPKE open fails.
+    #[staticmethod]
+    #[pyo3(signature = (sealed_json, wrapping_secret))]
+    pub fn broadcast_open_key(sealed_json: &str, wrapping_secret: &[u8]) -> PyResult<Vec<u8>> {
+        use scp_ffi_common::broadcast::OpenSealedKeyError;
+        scp_ffi_common::broadcast::open_sealed_broadcast_key(sealed_json, wrapping_secret).map_err(
+            |e| match e {
+                // Malformed JSON / wrong-length secret are caller-input errors
+                // (ValueError); a failed HPKE open is a runtime crypto error.
+                OpenSealedKeyError::InvalidJson { .. }
+                | OpenSealedKeyError::InvalidSecretLength { .. } => {
+                    PyValueError::new_err(e.to_string())
+                }
+                OpenSealedKeyError::OpenFailed { .. } => PyRuntimeError::new_err(e.to_string()),
+            },
+        )
     }
 
     /// Returns the number of broadcast subscribers for a context.

@@ -17,10 +17,27 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+
+/**
+ * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
+ * broadcast key-distribution tests. Uses Node/Bun's WebCrypto-backed
+ * `generateKeyPairSync('x25519')` and extracts the raw scalars from the JWK
+ * `d` (private) and `x` (public) base64url fields — no third-party dependency.
+ */
+function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } {
+  const { publicKey: pub, privateKey: priv } = generateKeyPairSync("x25519");
+  const pubJwk = pub.export({ format: "jwk" }) as { x: string };
+  const privJwk = priv.export({ format: "jwk" }) as { d: string };
+  return {
+    publicKey: new Uint8Array(Buffer.from(pubJwk.x, "base64url")),
+    secret: new Uint8Array(Buffer.from(privJwk.d, "base64url")),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
@@ -1485,7 +1502,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       ).rejects.toThrow();
     });
 
-    test("handle key request returns a decision", async () => {
+    test("handle key request grants and the subscriber opens the key", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1499,9 +1516,45 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       await napi.broadcastSubscribe(ctx, subscriber.did);
 
-      const decision = await napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did);
-      expect(typeof decision).toBe("string");
-      expect(decision.length).toBeGreaterThan(0);
+      // Real X25519 wrapping keypair for the subscriber (HPKE recipient).
+      const { secret, publicKey } = generateX25519KeyPair();
+      const sealedJson = await napi.broadcastHandleKeyRequest(
+        ctx,
+        identity.did,
+        subscriber.did,
+        publicKey,
+      );
+      expect(sealedJson).not.toBeNull();
+      expect(typeof sealedJson).toBe("string");
+      expect((sealedJson as string).length).toBeGreaterThan(0);
+
+      // The subscriber opens the sealed key with its matching secret and gets
+      // the raw 32-byte AES-256 broadcast key.
+      const key = await napi.broadcastOpenKey(sealedJson as string, secret);
+      expect(key.length).toBe(32);
+    });
+
+    test("handle key request denies a non-subscriber with no key material", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const stranger = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+          memoryScope: "full",
+        }),
+      );
+
+      // `stranger` never subscribed — the author returns no key material.
+      const { publicKey } = generateX25519KeyPair();
+      const decision = await napi.broadcastHandleKeyRequest(
+        ctx,
+        identity.did,
+        stranger.did,
+        publicKey,
+      );
+      expect(decision).toBeNull();
     });
   });
 

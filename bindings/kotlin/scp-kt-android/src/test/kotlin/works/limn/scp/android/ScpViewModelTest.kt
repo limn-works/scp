@@ -231,7 +231,12 @@ private class TestNativeBindings : NativeBindings {
     override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
     override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
-    override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String = "{}"
+    override fun broadcastHandleKeyRequest(
+        contextHandle: Long,
+        authorDid: String,
+        requesterDid: String,
+        wrappingPubkey: ByteArray,
+    ): String? = "{}"
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
     override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
     override fun broadcastAdmission(contextHandle: Long): String? = null

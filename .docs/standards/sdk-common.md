@@ -44,6 +44,75 @@ ScpError (root)
 | `SCP-ECON-` | 12000-12999 |
 | `SCP-SAGA-` | 13000-13999 |
 
+### Registered SCP-SAGA- codes (cross-context tool-invocation saga, §6.2.4)
+
+The `SCP-SAGA-` band (`13000-13999`, ADR-049 §3a) is partitioned into
+sub-blocks by *which layer* raises the error, so a code is unique to one
+distinct condition and `grep`-disambiguates a log line to a single call site.
+`check-error-codes.sh` only range-checks the band; uniqueness within the band
+is maintained by keeping each distinct error's number disjoint from every other
+distinct error's number. When adding a new error, take the next free number
+**inside the owning sub-block** — never reuse a number assigned to a different
+condition, even across files.
+
+| Sub-block | Owner | Purpose |
+|-----------|-------|---------|
+| `13000-13009` | `scp-protocol` `cross_context_saga.rs` | Saga-type signing / verification (pure, sync) |
+| `13010-13099` | `scp-runtime` saga handler + supervisor FSM | Prepare / Commit / Abort phase coordination |
+| `13100-13999` | *(reserved)* | Future saga families (standing-pair, broadcast-hosting handshake) |
+
+Within `13010-13099`, the handler (`actor/handlers/saga.rs`, the per-context
+authorization + freshness + Commit-B execute/settle path) holds `13010-13049`,
+and the supervisor (`supervisor/supervisor.rs`, the cross-actor FSM driver)
+holds `13050-13099`, so the two layers never contend for the same number.
+
+| Code | Layer | Condition |
+|------|-------|-----------|
+| `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
+| `SCP-SAGA-13001` | protocol | Ed25519 saga signature failed verification |
+| `SCP-SAGA-13002` | protocol | Malformed Ed25519 verifying key |
+| `SCP-SAGA-13010` | handler | Caller lacks `tool:interface` capability (outbound) |
+| `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
+| `SCP-SAGA-13012` | handler | `ucan_proof_id` not resolvable in target proof store |
+| `SCP-SAGA-13013` | handler | UCAN re-validation failed (confused-deputy re-bind) |
+| `SCP-SAGA-13014` | handler | `target_context_id` mismatch |
+| `SCP-SAGA-13015` | handler | Inbound policy requires a spending UCAN but none was presented |
+| `SCP-SAGA-13016` | handler | Tool not found in target registry |
+| `SCP-SAGA-13017` | handler | Input schema specificity floor not met |
+| `SCP-SAGA-13018` | handler | Invocation timestamp outside §9.14 skew tolerance |
+| `SCP-SAGA-13019` | handler | Invocation nonce already seen in target dedup cache (replay) |
+| `SCP-SAGA-13020` | handler | Re-derived chain depth exceeds `max_chain_depth` |
+| `SCP-SAGA-13021` | handler | Input does not conform to registered schema |
+| `SCP-SAGA-13023` | handler | Per-interface §6.2.0.2 rate limit exceeded |
+| `SCP-SAGA-13024` | handler | Per-caller §6.2.0.2 rate limit exceeded |
+| `SCP-SAGA-13025` | handler | Caller role not in inbound `allowed_source_roles` |
+| `SCP-SAGA-13026` | handler | Per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B |
+| `SCP-SAGA-13027` | handler | Configured inbound rate exceeds the cache-eviction-safe ceiling (§6.2.4 sizing-vs-ceiling) |
+| `SCP-SAGA-13030` | handler | Commit-B reserve found no staged cross-context invocation |
+| `SCP-SAGA-13031` | handler | Commit-B settle found no staged cross-context invocation |
+| `SCP-SAGA-13032` | handler | Commit-B tool output is not valid JSON |
+| `SCP-SAGA-13033` | handler | Commit-B receipt output JCS canonicalization failed |
+| `SCP-SAGA-13034` | handler | Commit-B receipt signing failed |
+| `SCP-SAGA-13035` | handler | Commit-B receipt serialization failed |
+| `SCP-SAGA-13036` | handler | Divergence-marker signing failed |
+| `SCP-SAGA-13037` | handler | Divergence-marker serialization failed |
+| `SCP-SAGA-13038` | handler | Saga phase reached the wrong dispatch helper |
+| `SCP-SAGA-13050` | supervisor | Initiator is not a member of the named caller context (caller-axis authorize-before-reserve) |
+| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13052` | supervisor | Prepare-A — caller context is not a co-resident actor |
+| `SCP-SAGA-13053` | supervisor | Prepare-B — target context is not a co-resident actor |
+| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13055` | supervisor | Commit-B — target context is not a co-resident actor |
+| `SCP-SAGA-13056` | supervisor | Commit-B — executor already consumed but no output stashed (coordinator bug) |
+| `SCP-SAGA-13057` | supervisor | Commit-B — cross-context tool executor failed |
+| `SCP-SAGA-13058` | supervisor | Commit-B — tool output is not serializable |
+| `SCP-SAGA-13059` | supervisor | Commit-A — no held reservation and witness absent (Commit-A did not durably land) |
+| `SCP-SAGA-13060` | supervisor | Commit-B settle — target context is not a co-resident actor |
+| `SCP-SAGA-13061` | supervisor | Commit-A — caller context is not a co-resident actor |
+| `SCP-SAGA-13062` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
+| `SCP-SAGA-13063` | supervisor | Commit — target receipt missing for saga |
+| `SCP-SAGA-13064` | supervisor | Commit — target receipt signature invalid |
+
 ### Registered SCP-ATTEST- codes
 
 | Code | Description |

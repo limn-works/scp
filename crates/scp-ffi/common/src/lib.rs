@@ -144,6 +144,14 @@ pub mod event_log;
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 
+// Shared broadcast key-distribution value-shape helpers (§5.14.2). The
+// Grant→sealed-JSON and sealed-JSON→raw-key seams are identical across PyO3,
+// napi-rs, and UniFFI; extracted here so the hand-populated author_did/context_id
+// echo cannot drift. Requires scp-core (behind `resolvers`). WASM keeps its own
+// inline copy (ADR-034).
+#[cfg(feature = "resolvers")]
+pub mod broadcast;
+
 // Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
 // Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based
 // so each bridge keeps its own custody accessor and error type. Requires

@@ -44,6 +44,18 @@
 - Sybil resistance tests on no-op functions asserting Ok -- tautological
 - See `feedback_test_duplication.md` for details
 
+### Python validator tests (bindings/python/tests/test_validation.py, test_types.py)
+- All `validate_*` in scp_sdk/context.py are `-> None`, raise-on-invalid (ValidationError or ValueError)
+- `assert validate_x(...) is None` is a small improvement over bare call: guards against accidental refactor to return-bool/return-error-string (some sibling validators DO return `str|None`: validate_against_template, validate_context_params). NOT vacuous, but weak.
+- STRONGER assertion available for test_nfc_normalization: validator NFC-normalizes internally but discards result (returns None), so normalization is unobservable via this fn. To observe, would need to assert AssetEntry/ContentPath round-trip or expose normalized form. Current test only proves "decomposed form does not raise" — does not prove it normalizes vs. just accepts non-ASCII.
+- Negative coverage is strong: pytest.raises with `match=` on message substrings + error code (SCP-VALID-7010/11/12). Good.
+- Coverage GAPS: validate_admission has NO negative/case-insensitivity-specific gap test for whitespace (" open"); validate_broadcast_key_hex positive only tests 64-char — boundary 63/65 rejection lives in test, verify. _validate_csp / _validate_hostname / SiteConfig.__post_init__ validators — check separate coverage.
+
+### Kotlin SmokeTest CustodyType
+- CustodyType.rawValue IS real behavior, NOT tautology: consumed at FFI boundary `identityCreate(custody.rawValue)` (CoroutineBridge.kt:1465, Identity.kt:241). Asserting "platform" pins the wire contract Rust depends on.
+- fromRawValue round-trip + unknown->null is genuine, non-brittle, pure (no native dep). Good smoke test choice given native lib not yet linked.
+- Minor: only 1 of 3 enum values' rawValue asserted (PLATFORM); IN_MEMORY tested via fromRawValue, SOFTWARE untested. Parameterize for completeness.
+
 ## Review Checklist Additions (SCP-specific)
 - Conformance dispatcher must cover ALL operations from `.docs/scaffold/shared.md` categories
 - Every SDK source module needs a corresponding test file (Trust.swift was missing tests)

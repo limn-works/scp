@@ -616,23 +616,47 @@ public extension Context {
 
     /// Handles a broadcast key request from a subscriber.
     ///
+    /// Seals the author's current broadcast key to the requester's 32-byte
+    /// X25519 ``wrappingPubkey`` (HPKE, §5.14.2). Returns the JSON of a sealed
+    /// broadcast key on grant, or `nil` on deny (§5.14.8 — a denied requester
+    /// receives no key material). The subscriber opens the returned JSON with
+    /// ``broadcastOpenKey(sealedJson:wrappingSecret:)``.
+    ///
     /// - Parameters:
     ///   - authorDid: The DID of the author handling the request.
     ///   - requesterDid: The DID of the requester.
-    ///   - handleKeyRequestFn: Bridge function override for testing.
-    /// - Returns: A string describing the key request decision.
+    ///   - wrappingPubkey: The requester's 32-byte X25519 public key.
+    /// - Returns: The sealed-broadcast-key JSON on grant, or `nil` on deny.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastHandleKeyRequest(
         authorDid: String,
-        requesterDid: String
-    ) async throws -> String {
+        requesterDid: String,
+        wrappingPubkey: Data
+    ) async throws -> String? {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
         return try await scp.broadcastHandleKeyRequest(
-            handle: handle, authorDid: authorDid, requesterDid: requesterDid
+            handle: handle, authorDid: authorDid, requesterDid: requesterDid, wrappingPubkey: wrappingPubkey
         )
+    }
+
+    /// Opens an HPKE-sealed broadcast key (§5.14.2).
+    ///
+    /// Pure crypto: opens the sealed key returned by
+    /// ``broadcastHandleKeyRequest(authorDid:requesterDid:wrappingPubkey:)`` on
+    /// grant, using the subscriber's 32-byte X25519 ``wrappingSecret``, and
+    /// returns the raw 32-byte AES-256 broadcast key.
+    ///
+    /// - Parameters:
+    ///   - sealedJson: The sealed-broadcast-key JSON from a granted request.
+    ///   - wrappingSecret: The subscriber's 32-byte X25519 secret.
+    /// - Returns: The raw 32-byte AES-256 broadcast key.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` if inputs are malformed, or
+    ///   ``ScpError/Context(msg:code:)`` if the HPKE open fails.
+    func broadcastOpenKey(sealedJson: String, wrappingSecret: Data) throws -> Data {
+        try scp.broadcastOpenKey(sealedJson: sealedJson, wrappingSecret: wrappingSecret)
     }
 
     /// Returns the number of broadcast subscribers for this context.

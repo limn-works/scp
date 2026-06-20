@@ -1114,11 +1114,35 @@ class SCP:
         )
 
     async def broadcast_handle_key_request(
-        self, handle: Any, author_did: str, requester_did: str
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.broadcast_handle_key_request``."""
+        self, handle: Any, author_did: str, requester_did: str, wrapping_pubkey: bytes
+    ) -> str | None:
+        """Delegate to ``_scp_core.SCP.broadcast_handle_key_request``.
+
+        Seals the author's current broadcast key to the requester's 32-byte
+        X25519 ``wrapping_pubkey`` (HPKE, spec §5.14.2). Returns the JSON of a
+        sealed broadcast key on grant, or ``None`` on deny (§5.14.8 — a denied
+        requester receives no key material). The subscriber opens the returned
+        JSON with :meth:`broadcast_open_key`.
+        """
         return await asyncio.to_thread(
-            self._native.broadcast_handle_key_request, handle, author_did, requester_did
+            self._native.broadcast_handle_key_request,
+            handle,
+            author_did,
+            requester_did,
+            wrapping_pubkey,
+        )
+
+    async def broadcast_open_key(self, sealed_json: str, wrapping_secret: bytes) -> bytes:
+        """Delegate to ``_scp_core.SCP.broadcast_open_key``.
+
+        Opens an HPKE-sealed broadcast key (spec §5.14.2) using the
+        subscriber's 32-byte X25519 ``wrapping_secret``, returning the raw
+        32-byte AES-256 broadcast key. ``sealed_json`` is the JSON returned by
+        :meth:`broadcast_handle_key_request` on grant. Pure crypto — invoked as
+        a static method on the native ``SCP`` class via the instance handle.
+        """
+        return await asyncio.to_thread(
+            self._native.broadcast_open_key, sealed_json, wrapping_secret
         )
 
     async def broadcast_is_subscriber(self, handle: Any, did: str) -> Any:

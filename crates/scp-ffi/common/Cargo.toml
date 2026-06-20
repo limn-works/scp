@@ -63,6 +63,10 @@ scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # #[tokio::test(start_paused = true)]) — not pulled in by the optional runtime
 # `tokio` dep's "full" features, which intentionally excludes it.
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+# Test-only: deterministic X25519 keypair generation for the shared broadcast
+# key seal/open round-trip tests (src/broadcast.rs). Production code never needs
+# X25519 here — the protocol layer owns the HPKE seal/open.
+x25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

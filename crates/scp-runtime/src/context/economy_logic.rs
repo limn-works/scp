@@ -59,12 +59,18 @@ use crate::economy::integration::{self, IntegrationError};
 /// returns [`UcanError::MalformedToken`] which the spending UCAN validator
 /// surfaces as a signature failure — closing the C1 attack where a fabricated
 /// UCAN with no real signer was accepted.
-struct KeyResolverDidResolver<'a> {
+///
+/// Public so the cross-context tool-invocation saga handler
+/// ([`crate::context::actor::handlers::saga`]) reuses the SAME VM-aware DID→key
+/// adapter for its §7 UCAN re-validation (spec §6.2.4), rather than
+/// reimplementing the `#active`/`#agent` resolution and so producing a divergent
+/// answer than the rest of the runtime.
+pub struct KeyResolverDidResolver<'a> {
     key_resolver: &'a KeyResolver,
 }
 
 impl<'a> KeyResolverDidResolver<'a> {
-    fn new(key_resolver: &'a KeyResolver) -> Self {
+    pub(crate) fn new(key_resolver: &'a KeyResolver) -> Self {
         Self { key_resolver }
     }
 }
@@ -115,8 +121,12 @@ impl DidResolver for KeyResolverDidResolver<'_> {
 /// real, so when revocation lands the only change required is populating the
 /// set. This is the opposite of a stub: it is the empty case of a real
 /// integration.
-struct ContextRevocationChecker<'a> {
-    revoked_cids: &'a HashSet<String>,
+///
+/// `pub(crate)` so the cross-context tool-invocation saga handler reuses the
+/// SAME per-context revocation surface for its §7 UCAN re-validation (spec
+/// §6.2.4), backed by the same `revoked_spending_ucan_cids` set.
+pub struct ContextRevocationChecker<'a> {
+    pub(crate) revoked_cids: &'a HashSet<String>,
 }
 
 impl RevocationChecker for ContextRevocationChecker<'_> {

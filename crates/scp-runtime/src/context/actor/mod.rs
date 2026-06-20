@@ -703,7 +703,36 @@ impl ContextActor {
             // mistakenly routes through the actor's mailbox — the real
             // FFI dispatch goes through `Supervisor::dispatch_query`.
             ContextCommand::Queries(q) => Self::skeleton_dispatch_queries(q),
-            ContextCommand::SagaPhase(SagaPhaseMessage::Placeholder { reply }) => {
+            // The skeleton actor owns no state, so every saga-phase variant
+            // acks its typed oneshot with `Err(NotImplemented)` — the real
+            // Prepare-A/Prepare-B bodies run only on a stateful actor via
+            // `dispatch_state` → `handlers::saga::dispatch`. PrepareA replies a
+            // `PreparedAFields`, the rest reply `()`, so the two reply-shapes
+            // are acked separately; within each shape the body is identical.
+            ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            // CommitBReserve / CommitBSettle reply distinct outcome shapes, so
+            // they are acked separately from the unit-reply phase arms.
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            // CommitACheckWitness replies a distinct `bool` outcome shape, so it
+            // is acked separately from the unit-reply phase arms.
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(
+                SagaPhaseMessage::CommitA { reply, .. }
+                | SagaPhaseMessage::Abort { reply, .. }
+                | SagaPhaseMessage::EmitDivergenceMarker { reply, .. },
+            ) => {
                 ack_not_impl(reply, "saga_phase");
             }
             ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply }) => {
@@ -867,6 +896,9 @@ impl ContextActor {
             }
             QueriesCommand::GetRoleState { reply, .. } => {
                 ack_not_impl(reply, "queries::get_role_state");
+            }
+            QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
+                ack_not_impl(reply, "queries::has_established_tool_interface");
             }
             QueriesCommand::PendingCommits { reply, .. } => {
                 ack_not_impl(reply, "queries::pending_commits");

@@ -1647,14 +1647,19 @@ pub fn broadcast_admission(handle: &WasmContextHandle) -> Option<String> {
         .flatten()
 }
 
-/// Handles a broadcast key request and returns a grant/deny decision as JSON.
+/// Handles a broadcast key request, sealing the author's current broadcast key
+/// to the requester's X25519 `wrapping_pubkey` (HPKE Base mode, §5.14.2).
 ///
-/// Returns a JSON string: `{"decision": "grant"}` or `{"decision": "deny", "reason": "..."}`.
+/// Resolves to a JSON string (a serialized `SealedBroadcastKey`) on grant, or
+/// `null` on deny (§5.14.8 — no key material to a denied requester). The raw
+/// broadcast key never crosses the JS boundary — only the sealed material.
+/// The JS type is `string | null`.
 #[wasm_bindgen]
 pub fn broadcast_handle_key_request(
     handle: &WasmContextHandle,
     author_did: String,
     requester_did: String,
+    wrapping_pubkey: Vec<u8>,
 ) -> Promise {
     if let Err(e) = validate_did(&author_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -1665,13 +1670,77 @@ pub fn broadcast_handle_key_request(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
+        let wrapping: [u8; 32] = wrapping_pubkey.as_slice().try_into().map_err(|_| {
+            ScpWasmError::Validation {
+                message: format!(
+                    "wrapping_pubkey must be 32 bytes, got {}",
+                    wrapping_pubkey.len()
+                ),
+                code: codes::VALID_7007.to_owned(),
+            }
+            .into_js()
+        })?;
+
         let result = with_manager(|mgr| {
-            mgr.handle_broadcast_key_request(&context_id, &author_did, &requester_did)
+            mgr.handle_broadcast_key_request(&context_id, &author_did, &requester_did, &wrapping)
         })
         .map_err(ScpWasmError::into_js)?;
 
-        Ok(JsValue::from_str(&result))
+        Ok(result.map_or(JsValue::NULL, |json| JsValue::from_str(&json)))
     })
+}
+
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
+/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+///
+/// Pure crypto — no context handle, no manager state. `sealed_json` is the JSON
+/// returned by [`broadcast_handle_key_request`] on grant; `wrapping_secret` is
+/// the subscriber's 32-byte X25519 secret matching the `wrapping_pubkey`
+/// presented on the request.
+///
+/// # Errors
+///
+/// Returns a `JsError` if `sealed_json` is malformed, `wrapping_secret` is not
+/// 32 bytes, or HPKE open fails.
+#[wasm_bindgen]
+pub fn broadcast_open_key(
+    sealed_json: String,
+    wrapping_secret: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    use scp_protocol::context::broadcast::SealedBroadcastKey;
+    let sealed: SealedBroadcastKey = serde_json::from_str(&sealed_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid sealed broadcast key JSON: {e}"),
+            code: codes::VALID_7002.to_owned(),
+        }
+        .into_js()
+    })?;
+    let secret: [u8; 32] = wrapping_secret.as_slice().try_into().map_err(|_| {
+        ScpWasmError::Validation {
+            message: format!(
+                "wrapping_secret must be 32 bytes, got {}",
+                wrapping_secret.len()
+            ),
+            code: codes::VALID_7007.to_owned(),
+        }
+        .into_js()
+    })?;
+    let key = scp_protocol::crypto::sender_keys::broadcast::open_broadcast_key(
+        &sealed.ct,
+        &sealed.enc,
+        &secret,
+        &sealed.context_id,
+        &sealed.author_did,
+        sealed.epoch,
+    )
+    .map_err(|e| {
+        ScpWasmError::Context {
+            message: format!("broadcast key open failed: {e}"),
+            code: codes::CTX_2023.to_owned(),
+        }
+        .into_js()
+    })?;
+    Ok(key.as_bytes().to_vec())
 }
 
 // ---------------------------------------------------------------------------

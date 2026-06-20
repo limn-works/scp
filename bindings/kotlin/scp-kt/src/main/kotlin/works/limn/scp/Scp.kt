@@ -436,12 +436,27 @@ class SCP internal constructor(
         handle: ContextHandle,
         authorDid: String,
         requesterDid: String,
-    ): String =
+        wrappingPubkey: ByteArray,
+    ): String? =
         inner.broadcastHandleKeyRequest(
             handle = handle,
             authorDid = authorDid,
             requesterDid = requesterDid,
+            wrappingPubkey = wrappingPubkey,
         )
+
+    /**
+     * Opens an HPKE-sealed broadcast key (§5.14.2) using the subscriber's
+     * 32-byte X25519 [wrappingSecret], returning the raw 32-byte AES-256
+     * broadcast key. [sealedJson] is the JSON returned by
+     * [broadcastHandleKeyRequest] on grant. Delegates to the generated
+     * module-level `broadcastOpenKey` UniFFI free function (fully qualified to
+     * avoid shadowing by this same-named wrapper).
+     */
+    fun broadcastOpenKey(
+        sealedJson: String,
+        wrappingSecret: ByteArray,
+    ): ByteArray = uniffi.scp.broadcastOpenKey(sealedJson = sealedJson, wrappingSecret = wrappingSecret)
 
     /** Forwards to [NativeScp.broadcastIsSubscriber] on [inner]. */
     suspend fun broadcastIsSubscriber(

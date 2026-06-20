@@ -12,11 +12,11 @@ use std::hash::BuildHasher;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 
 use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
+use crate::crypto::sender_keys::broadcast::seal_broadcast_key_to_subscriber;
 use crate::crypto::sender_keys::{
     BroadcastEnvelope, BroadcastKey, SealBroadcastParams, SenderKey, generate_sender_key,
     seal_broadcast,
@@ -389,19 +389,22 @@ pub struct AuthorKeyRotation {
 /// authorized to receive key material. The decision is one of:
 ///
 /// - **Grant**: the subscriber is registered, not blocked, and (for gated
-///   contexts) holds a valid UCAN. The caller should proceed with HPKE key
-///   distribution.
+///   contexts) holds a valid UCAN. The broadcast key has already been
+///   HPKE-sealed to the requester's `wrapping_pubkey` inside the handler —
+///   only the sealed material (`enc` + `ct`) is carried, never the raw key.
 /// - **Deny**: the subscriber is blocked, unregistered, or unauthorized.
 ///   The author sends no response (cryptographic exclusion per §5.14.8).
 #[derive(Clone, PartialEq, Eq)]
 pub enum KeyRequestDecision {
-    /// Grant: subscriber is authorized. Includes the author's current
-    /// broadcast key bytes and epoch for HPKE wrapping.
+    /// Grant: subscriber is authorized. The author's current broadcast key
+    /// has been HPKE-sealed (RFC 9180 Base mode, §5.14.2) to the requester's
+    /// X25519 `wrapping_pubkey` — the raw AES-256 key never leaves the
+    /// protocol layer (it is not present in this variant).
     Grant {
-        /// The raw 32-byte AES-256 broadcast key material.
-        /// Wrapped in [`Zeroizing`] for defense-in-depth: key material is
-        /// overwritten with zeros when the decision value is dropped.
-        key_bytes: Zeroizing<[u8; 32]>,
+        /// HPKE encapsulated key (32 bytes).
+        enc: [u8; 32],
+        /// HPKE ciphertext: 32-byte sealed key + 16-byte AEAD tag (48 bytes).
+        ct: Vec<u8>,
         /// The current key epoch.
         epoch: u64,
     },
@@ -415,14 +418,53 @@ pub enum KeyRequestDecision {
 impl std::fmt::Debug for KeyRequestDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Grant { epoch, .. } => f
+            Self::Grant { enc, ct, epoch } => f
                 .debug_struct("Grant")
-                .field("key_bytes", &"[REDACTED]")
+                .field("enc_len", &enc.len())
+                .field("ct_len", &ct.len())
                 .field("epoch", epoch)
                 .finish(),
             Self::Deny { reason } => f.debug_struct("Deny").field("reason", reason).finish(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SealedBroadcastKey
+// ---------------------------------------------------------------------------
+
+/// Wire-serializable sealed broadcast key returned to SDK callers after a
+/// granted key request (§5.14.2). Carries only HPKE-sealed material — the raw
+/// AES-256 broadcast key never crosses the FFI boundary.
+///
+/// The `author_did` and `context_id` are echoed so the receiving subscriber can
+/// reconstruct the HPKE `info`/`aad` binding (§5.14.2) when opening the sealed
+/// key via [`crate::crypto::sender_keys::broadcast::open_broadcast_key`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedBroadcastKey {
+    /// HPKE encapsulated key (32 bytes). Fixed-size array, bounded by
+    /// construction.
+    pub enc: [u8; 32],
+    /// HPKE ciphertext (sealed key || tag, exactly 48 bytes for a legitimate
+    /// payload). Deserialized from attacker-supplied JSON, so the serde-level
+    /// [`serde_bounded_bytes`] cap rejects multi-gigabyte allocations before any
+    /// crypto runs; the exact 48-byte gate is enforced fail-fast in
+    /// [`open_broadcast_key`](crate::crypto::sender_keys::broadcast::open_broadcast_key).
+    /// Stays a `Vec<u8>` (not `[u8; 48]`) to preserve the cross-SDK
+    /// array-of-numbers JSON contract the Python/TypeScript bridge tests assert.
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
+    pub ct: Vec<u8>,
+    /// The key epoch this sealed key corresponds to.
+    pub epoch: u64,
+    /// The author DID whose broadcast key this is (HPKE info/aad binding).
+    /// Bounded on deserialize to reject oversized identifiers from hostile JSON.
+    #[serde(with = "crate::serde_util::serde_bounded_string")]
+    pub author_did: String,
+    /// The context ID (HPKE info/aad binding). Bounded on deserialize to reject
+    /// oversized identifiers from hostile JSON.
+    #[serde(with = "crate::serde_util::serde_bounded_string")]
+    pub context_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,16 +1501,24 @@ impl BroadcastContext {
     /// 3. For gated contexts: the requester presented a valid UCAN at
     ///    registration time (recorded in [`SubscriberRecord::has_ucan`]).
     ///
-    /// If all checks pass, returns [`KeyRequestDecision::Grant`] with the
-    /// author's current broadcast key material and epoch. The caller is
-    /// responsible for HPKE-wrapping the key material to the requester's
-    /// wrapping public key (using `crypto::sender_keys::key_protocol`).
+    /// If all checks pass, this function HPKE-seals (Base mode, §5.14.2) the
+    /// author's current broadcast key to the requester's `wrapping_pubkey`
+    /// internally and returns [`KeyRequestDecision::Grant`] carrying the sealed
+    /// `enc`/`ct` and the key `epoch`. The raw broadcast key never leaves this
+    /// function — only the sealed material crosses any boundary.
     ///
     /// If any check fails, returns [`KeyRequestDecision::Deny`]. Per
     /// §5.14.8, the author sends **no response** to denied requests --
-    /// the requester times out and cannot decrypt future content.
+    /// the requester times out and cannot decrypt future content. A seal
+    /// failure after authorization passes is an internal error, surfaced as a
+    /// `Deny` with a distinct reason so it does not leak block-list status.
     #[must_use]
-    pub fn handle_key_request(&self, author_did: &str, requester_did: &str) -> KeyRequestDecision {
+    pub fn handle_key_request(
+        &self,
+        author_did: &str,
+        requester_did: &str,
+        wrapping_pubkey: &[u8; 32],
+    ) -> KeyRequestDecision {
         // All deny paths use a uniform reason string so denial causes
         // (blocked, unsubscribed, gated, unknown author) are indistinguishable
         // in diagnostic output. This prevents block list status leakage
@@ -1510,8 +1560,29 @@ impl BroadcastContext {
             };
         }
 
+        // Seal the broadcast key to the requester's X25519 wrapping pubkey
+        // (HPKE Base mode, §5.14.2). The raw key MUST NOT leave this layer —
+        // only the sealed `enc`/`ct` are returned to the caller/FFI boundary.
+        // A seal failure is an INTERNAL error, not an authorization denial, so
+        // it uses a distinct reason and does NOT leak block-list status.
+        let (ct, enc) = match seal_broadcast_key_to_subscriber(
+            &author.broadcast_key,
+            wrapping_pubkey,
+            &self.context_id,
+            author_did,
+            author.epoch,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return KeyRequestDecision::Deny {
+                    reason: format!("seal failed: {e}"),
+                };
+            }
+        };
+
         KeyRequestDecision::Grant {
-            key_bytes: Zeroizing::new(*author.broadcast_key.as_bytes()),
+            enc,
+            ct,
             epoch: author.epoch,
         }
     }
@@ -1684,9 +1755,74 @@ where
 )]
 mod tests {
     use super::*;
+    #[test]
+    fn sealed_broadcast_key_serde_hardening() {
+        // Locks in the cross-SDK wire contract for `SealedBroadcastKey`:
+        // round-trip fidelity, the array-of-numbers JSON shape that the
+        // Python/TypeScript bridges assert, and `deny_unknown_fields` rejection
+        // of extra fields from hostile JSON.
+        let original = SealedBroadcastKey {
+            enc: [1u8; 32],
+            ct: vec![2u8; 48],
+            epoch: 7,
+            author_did: "did:example:a".to_owned(),
+            context_id: "ctx-1".to_owned(),
+        };
+
+        // Round-trip: serialize then deserialize, asserting every field.
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: SealedBroadcastKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.enc, original.enc);
+        assert_eq!(decoded.ct, original.ct);
+        assert_eq!(decoded.epoch, original.epoch);
+        assert_eq!(decoded.author_did, original.author_did);
+        assert_eq!(decoded.context_id, original.context_id);
+
+        // Wire shape (cross-SDK contract): bytes serialize as arrays of numbers
+        // (NOT base64), and string fields serialize as plain strings. These
+        // exact substrings pin the Python/TS array-of-numbers contract at the
+        // Rust type level.
+        assert!(
+            json.contains("\"ct\":[2,2,2"),
+            "ct must serialize as an array of numbers, got: {json}"
+        );
+        assert!(
+            json.contains("\"enc\":[1,1"),
+            "enc must serialize as an array of numbers, got: {json}"
+        );
+        assert!(
+            json.contains("\"author_did\":\"did:example:a\""),
+            "author_did must serialize as a plain string, got: {json}"
+        );
+
+        // deny_unknown_fields: an object carrying an extra unknown field must be
+        // rejected on deserialize. Build valid 32/48-number arrays programmatically
+        // for readability.
+        let enc_arr = (0..32).map(|_| "1").collect::<Vec<_>>().join(",");
+        let ct_arr = (0..48).map(|_| "2").collect::<Vec<_>>().join(",");
+        let bogus_json = format!(
+            "{{\"enc\":[{enc_arr}],\"ct\":[{ct_arr}],\"epoch\":7,\"author_did\":\"did:example:a\",\"context_id\":\"ctx-1\",\"bogus\":1}}"
+        );
+        let result: Result<SealedBroadcastKey, _> = serde_json::from_str(&bogus_json);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject an extra unknown field, but it deserialized"
+        );
+
+        // Sanity: the same JSON without the bogus field must deserialize cleanly,
+        // proving the rejection above is caused by the unknown field, not a
+        // malformed array.
+        let clean_json = format!(
+            "{{\"enc\":[{enc_arr}],\"ct\":[{ct_arr}],\"epoch\":7,\"author_did\":\"did:example:a\",\"context_id\":\"ctx-1\"}}"
+        );
+        let clean: SealedBroadcastKey = serde_json::from_str(&clean_json).unwrap();
+        assert_eq!(clean.epoch, 7);
+        assert_eq!(clean.ct.len(), 48);
+    }
+
     use crate::context::governance::AccessScope;
     use crate::crypto::sender_keys::{
-        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast_trusted,
+        decrypt_sender_layer, encrypt_sender_layer, open_broadcast_trusted,
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
@@ -2270,7 +2406,7 @@ mod tests {
 
         // Key request for the blocked author returns Deny.
         assert!(matches!(
-            ctx.handle_key_request("did:example:sole-author", "did:example:sub1"),
+            ctx.handle_key_request("did:example:sole-author", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -2299,7 +2435,7 @@ mod tests {
 
         // Key request succeeds before block.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
 
@@ -2307,7 +2443,7 @@ mod tests {
 
         // Key request fails after block (author not found).
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -2372,7 +2508,8 @@ mod tests {
         let _alice_envelope = test_publish(&mut ctx, "did:example:alice", alice_msg2).unwrap();
 
         // Subscribers can still decrypt Alice's messages via key request.
-        let alice_decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
+        let alice_decision =
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]);
         assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
 
         // Bob cannot publish (PermissionDenied).
@@ -2380,7 +2517,8 @@ mod tests {
         assert!(bob_result.is_err());
 
         // Key request for Bob returns Deny (author not found).
-        let bob_decision = ctx.handle_key_request("did:example:bob", "did:example:sub1");
+        let bob_decision =
+            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]);
         assert!(matches!(bob_decision, KeyRequestDecision::Deny { .. }));
 
         // Subscribers cannot get Bob's key at any epoch — his key is destroyed.
@@ -3050,7 +3188,7 @@ mod tests {
             .unwrap();
 
         // Key request should now succeed (not blocked).
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave", &[0u8; 32]);
         assert!(
             !matches!(decision, KeyRequestDecision::Deny { .. }),
             "unblocked subscriber should be able to request keys"
@@ -3258,17 +3396,42 @@ mod tests {
 
     #[test]
     fn handle_key_request_grants_registered_subscriber() {
+        use crate::crypto::sender_keys::broadcast::open_broadcast_key;
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        // The subscriber's X25519 wrapping keypair travels with the request.
+        let subscriber_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:bob",
+            &subscriber_pub.to_bytes(),
+        );
         match decision {
-            KeyRequestDecision::Grant { key_bytes, epoch } => {
+            KeyRequestDecision::Grant { enc, ct, epoch } => {
                 assert_eq!(epoch, 0);
+                // ct is the 32-byte sealed key + 16-byte AEAD tag.
+                assert_eq!(ct.len(), 48);
+                // Full round-trip: open the sealed key and confirm it matches
+                // the author's actual broadcast key (raw key never crossed the
+                // boundary — only the sealed `enc`/`ct` did).
+                let recovered = open_broadcast_key(
+                    &ct,
+                    &enc,
+                    &subscriber_secret.to_bytes(),
+                    ctx.context_id(),
+                    "did:example:alice",
+                    epoch,
+                )
+                .unwrap();
                 assert_eq!(
-                    *key_bytes,
-                    *ctx.get_author("did:example:alice")
+                    recovered.as_bytes(),
+                    ctx.get_author("did:example:alice")
                         .unwrap()
                         .broadcast_key
                         .as_bytes()
@@ -3288,7 +3451,7 @@ mod tests {
         ctx.block_subscriber("did:example:alice", "did:example:dave")
             .unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave", &[0u8; 32]);
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "blocked subscriber must be denied"
@@ -3300,7 +3463,8 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:unknown");
+        let decision =
+            ctx.handle_key_request("did:example:alice", "did:example:unknown", &[0u8; 32]);
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "unregistered DID must be denied"
@@ -3312,7 +3476,7 @@ mod tests {
         let mut ctx = make_open_ctx();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        let decision = ctx.handle_key_request("did:example:unknown", "did:example:bob");
+        let decision = ctx.handle_key_request("did:example:unknown", "did:example:bob", &[0u8; 32]);
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "unknown author must result in deny"
@@ -3326,7 +3490,7 @@ mod tests {
         ctx.add_author("did:example:carol").unwrap();
 
         // Authors have implicit read access and can request each other's keys.
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:carol");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:carol", &[0u8; 32]);
         assert!(
             matches!(decision, KeyRequestDecision::Grant { .. }),
             "authors should be able to request each other's keys"
@@ -3344,7 +3508,7 @@ mod tests {
         ctx.block_subscriber("did:example:alice", "did:example:eve")
             .unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
         match decision {
             KeyRequestDecision::Grant { epoch, .. } => {
                 assert_eq!(epoch, 1, "should return the post-rotation epoch");
@@ -3374,7 +3538,7 @@ mod tests {
             },
         );
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "gated context must deny subscriber without UCAN"
@@ -3430,20 +3594,36 @@ mod tests {
         assert_eq!(sub_result.author_epochs["did:example:alice"], 0);
         assert!(ctx.is_subscriber("did:example:bob"));
 
-        // Step 2: Key request succeeds.
-        let key_decision = ctx.handle_key_request("did:example:alice", "did:example:bob");
-        let (key_bytes, epoch) = match key_decision {
-            KeyRequestDecision::Grant { key_bytes, epoch } => (key_bytes, epoch),
+        // Step 2: Key request succeeds. The subscriber's X25519 wrapping
+        // keypair travels with the request; the Grant carries only the
+        // HPKE-sealed key material.
+        let subscriber_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let subscriber_pub = x25519_dalek::PublicKey::from(&subscriber_secret);
+        let key_decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:bob",
+            &subscriber_pub.to_bytes(),
+        );
+        let (enc, ct, epoch) = match key_decision {
+            KeyRequestDecision::Grant { enc, ct, epoch } => (enc, ct, epoch),
             KeyRequestDecision::Deny { reason } => panic!("expected Grant: {reason}"),
         };
         assert_eq!(epoch, 0);
 
-        // Step 3: Decrypt a broadcast message with the granted key.
+        // Step 3: Open the sealed key, then decrypt a broadcast message with it.
+        let received_key = crate::crypto::sender_keys::broadcast::open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            ctx.context_id(),
+            "did:example:alice",
+            epoch,
+        )
+        .unwrap();
         let author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let plaintext = b"Hello broadcast subscribers!";
         let ciphertext =
             encrypt_sender_layer(author_key, plaintext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
-        let received_key = SenderKey::from_bytes(*key_bytes);
         let decrypted =
             decrypt_sender_layer(&received_key, &ciphertext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
         assert_eq!(decrypted, plaintext);
@@ -3459,7 +3639,7 @@ mod tests {
         assert!(!ctx.can_read_any("did:example:bob"));
 
         // Step 6: Key request now denied.
-        let denied = ctx.handle_key_request("did:example:alice", "did:example:bob");
+        let denied = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
         assert!(matches!(denied, KeyRequestDecision::Deny { .. }));
 
         // Step 7: Old key cannot decrypt new content.
@@ -3502,7 +3682,7 @@ mod tests {
         assert!(ctx.is_subscriber("did:example:sub1"));
 
         // Key request succeeds (has_ucan = true).
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]);
         assert!(matches!(decision, KeyRequestDecision::Grant { .. }));
 
         // Unsubscribe.
@@ -3527,17 +3707,17 @@ mod tests {
 
         // sub1 and sub3 can still request keys.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub3"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub3", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
 
         // sub2 is denied.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub2"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub2", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -3572,19 +3752,26 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn key_request_decision_debug_redacts_key_bytes() {
+    fn key_request_decision_debug_redacts_key_material() {
+        // The Grant variant carries only sealed HPKE material (enc/ct), never
+        // the raw key. Its Debug output prints only lengths + epoch — no bytes.
         let decision = KeyRequestDecision::Grant {
-            key_bytes: Zeroizing::new([42u8; 32]),
+            enc: [0xAB; 32],
+            ct: vec![0xCD; 48],
             epoch: 5,
         };
         let debug = format!("{decision:?}");
         assert!(
-            debug.contains("REDACTED"),
-            "Grant debug must redact key bytes"
+            debug.contains("enc_len"),
+            "Grant debug must report enc length"
         );
         assert!(
-            !debug.contains("42"),
-            "Grant debug must not contain raw key byte values"
+            debug.contains("ct_len"),
+            "Grant debug must report ct length"
+        );
+        assert!(
+            !debug.contains("171") && !debug.contains("205") && !debug.contains("ab"),
+            "Grant debug must not contain raw enc/ct byte values, got: {debug}"
         );
         assert!(debug.contains('5'), "Grant debug must contain epoch");
     }
@@ -4164,15 +4351,15 @@ mod tests {
 
         // Before ban: sub1 can get keys from all authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub1"),
+            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub1"),
+            ctx.handle_key_request("did:example:carol", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
 
@@ -4182,29 +4369,29 @@ mod tests {
 
         // After ban: sub1 is denied from ALL authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub1"),
+            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub1"),
+            ctx.handle_key_request("did:example:carol", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Deny { .. }
         ));
 
         // sub2 is unaffected — still granted from all authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub2"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub2", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub2"),
+            ctx.handle_key_request("did:example:bob", "did:example:sub2", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub2"),
+            ctx.handle_key_request("did:example:carol", "did:example:sub2", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
     }
@@ -4224,7 +4411,7 @@ mod tests {
         // After re-subscription, key requests are granted.
         assert!(ctx.is_subscriber("did:example:sub1"));
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
             KeyRequestDecision::Grant { .. }
         ));
     }

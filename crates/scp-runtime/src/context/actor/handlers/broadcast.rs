@@ -101,6 +101,7 @@ async fn dispatch_inner(
             context_id,
             author_did,
             requester_did,
+            wrapping_pubkey,
             reply,
         } => {
             handle_handle_broadcast_key_request(
@@ -109,6 +110,7 @@ async fn dispatch_inner(
                 &context_id,
                 &author_did,
                 &requester_did,
+                wrapping_pubkey,
                 reply,
             )
             .await
@@ -313,6 +315,7 @@ async fn handle_handle_broadcast_key_request(
     context_id: &str,
     author_did: &scp_identity::DID,
     requester_did: &scp_identity::DID,
+    wrapping_pubkey: [u8; 32],
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
@@ -321,6 +324,7 @@ async fn handle_handle_broadcast_key_request(
             deps,
             author_did,
             requester_did,
+            &wrapping_pubkey,
         )
     };
 

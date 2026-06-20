@@ -45,7 +45,7 @@ use tokio::sync::oneshot;
 
 use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
+use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
@@ -259,23 +259,6 @@ async fn handle_settle_tool_economy(
 
     let _ = reply.send(reply_result);
     outcome
-}
-
-/// Produce a best-effort clone-equivalent `ContextError` for the
-/// handler's [`Outcome`] sink.
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
-        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
-        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
-        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
-        ContextError::ContextNotActive => ContextError::ContextNotActive,
-        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
-        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
 }
 
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {

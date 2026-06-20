@@ -103,6 +103,38 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // `spawn_actor_with_state`.
 
 // ---------------------------------------------------------------------------
+// §6.2.4 cross-context saga nonce-dedup TTL construction guard
+// ---------------------------------------------------------------------------
+
+/// Mechanically assert that a freshly-constructed cross-context nonce-dedup
+/// cache carries the PRODUCTION saga TTL
+/// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS))
+/// — the longer-than-skew anti-replay window the spec REQUIRES (spec §6.2.4
+/// *Window relationship*, BLACK-XCTX-01).
+///
+/// Called at every spawn / restore site here that builds B's
+/// `xctx_nonce_dedup`, so a future regression to the default-TTL
+/// [`NonceDedup::new`](scp_protocol::crypto::sender_keys::NonceDedup::new) —
+/// whose 300s window is COTERMINOUS with the skew tolerance, the exact
+/// coterminous condition the spec forbids — is caught at construction rather
+/// than silently re-opening the replay gap. A `debug_assert` survives
+/// refactors: any builder that swaps in the wrong TTL trips it under test /
+/// debug builds. Lives in this (non-handler) lifecycle module — never on the
+/// actor handler path — so it does not run inside an actor's mailbox future
+/// (ADR-049 §10 handler panic ban applies to handlers, not these bootstrap
+/// constructors).
+#[track_caller]
+fn debug_assert_saga_dedup_ttl(dedup: &scp_protocol::crypto::sender_keys::NonceDedup) {
+    debug_assert_eq!(
+        dedup.ttl_secs(),
+        crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        "cross-context nonce-dedup cache MUST be built with the production saga TTL \
+         (strictly longer than the freshness skew); a default-TTL NonceDedup::new() re-opens \
+         the coterminous-window replay gap (spec §6.2.4 Window relationship, BLACK-XCTX-01)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
 
@@ -1259,12 +1291,27 @@ pub async fn create_context(
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        xctx_committed_outputs: HashMap::new(),
+        xctx_committed_invocations: std::collections::HashSet::new(),
+        // Caller-side cross-context reservation reversal records (spec §6.2.4):
+        // fresh on create; cross-node import DROPS them (caller economy is
+        // local — a foreign saga must never drive local reversal).
+        xctx_caller_reservations: std::collections::HashMap::new(),
+        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated tool interface is
+        // established. Not rehydrated from any snapshot — reconstructable
+        // interface state, never authorization secrecy.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        ),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
         mode,
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: the create path
     // no longer writes the legacy contexts DashMap. It hands the freshly
@@ -1816,17 +1863,41 @@ pub async fn import_context(
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone: import path is
         // encrypted-only (`mode = ContextModeState::Encrypted(default)`).
-        // Receive tracker, saga registry, and Welcome scratchpad start
-        // empty; lifecycle is Open after the replaceability gate
-        // succeeded and the snapshot validated.
+        // Receive tracker and Welcome scratchpad start empty; lifecycle is
+        // Open after the replaceability gate succeeded and the snapshot
+        // validated.
+        //
+        // The saga slot starts EMPTY on import (NOT rehydrated from the
+        // snapshot): unlike same-node restore, a cross-node import receives an
+        // UNTRUSTED exporter's snapshot, and staged saga evidence is
+        // local-instance cross-context coordination state with no authority on
+        // the importing node — its supervisor `SagaJournal`, reservations, and
+        // peer actors do not exist here. `strip_snapshot_for_public` already
+        // strips it to empty; a full import deliberately drops it too so a
+        // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        xctx_committed_outputs: HashMap::new(),
+        xctx_committed_invocations: std::collections::HashSet::new(),
+        // Caller-side cross-context reservation reversal records (spec §6.2.4):
+        // fresh on create; cross-node import DROPS them (caller economy is
+        // local — a foreign saga must never drive local reversal).
+        xctx_caller_reservations: std::collections::HashMap::new(),
+        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated tool interface is
+        // established. Not rehydrated from any snapshot — reconstructable
+        // interface state, never authorization secrecy.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        ),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // 7. Register the imported context as an owned-state actor.
     //
@@ -2236,18 +2307,57 @@ pub async fn restore_context(
         merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         routing: restored_routing,
         send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone: restore path rehydrates
-        // pending sagas / Welcome scratchpads as fresh — the legacy
-        // snapshot format does not carry them, and restore is local
-        // re-launch so cross-context sagas are restarted from scratch.
+        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+        // staged saga slot from the snapshot. This is the crash-recovery path
+        // the §9 invariant covers — a Prepare's staged-but-unpublished MLS
+        // handles and B-side reservation linkage MUST survive a crash so
+        // Commit can consume the right reservation. Each entry is reconstructed
+        // from its sanctioned `SagaPreparedStateSnapshot` mirror. The Welcome
+        // scratchpad is genuinely transient and restarts fresh.
         recv_tracker: RecvSequenceTracker::new(),
-        saga_pending: HashMap::new(),
+        saga_pending: ctx_snapshot
+            .saga_pending
+            .into_iter()
+            .map(|(id, mirror)| (id, mirror.into_prepared()))
+            .collect(),
+        // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
+        // it is reconstructable interface state, repopulated when the tool
+        // interface is (re-)established.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
+        // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
+        // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
+        // within the dedup TTL; reinitializing it empty on restore would let
+        // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
+        // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
+        // import drops it (the snapshot field is empty), so a foreign node starts
+        // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
+        // than the freshness skew tolerance) so the restored window matches the
+        // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
+            ctx_snapshot.xctx_nonce_dedup,
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        ),
+        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+        // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
+        // with durable output capture") so a Commit replayed after a crash
+        // re-emits the STORED output + the IDENTICAL receipt rather than
+        // re-invoking the tool. The live `CommittedToolInvocation` is public (no
+        // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
+        xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+        xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
+        // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
+        // caller-side durable reservation reversal records so a crash-recovery
+        // abort can reverse the caller deduction + void the escrow from the
+        // record. Dropped on cross-node import (caller economy is local).
+        xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
         mode,
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: restore mirrors
     // create — hand the rehydrated `PerContextState` directly to

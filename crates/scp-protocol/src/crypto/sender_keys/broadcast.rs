@@ -915,6 +915,20 @@ pub fn open_broadcast_key(
     author_did: &str,
     epoch: u64,
 ) -> Result<SenderKey, SenderKeyError> {
+    // Tight, fail-fast length gate: a legitimate sealed broadcast key ciphertext
+    // is always exactly 48 bytes (32-byte sealed AES-256 key + 16-byte
+    // AES-128-GCM tag). Reject any other length BEFORE the HPKE DH so hostile
+    // input cannot drive a wasted key agreement, and so a wrong-length `ct` that
+    // slipped past the serde-level bound is caught here as well (defense in
+    // depth alongside `SealedBroadcastKey`'s `serde_bounded_bytes`).
+    const SEALED_BROADCAST_KEY_CT_LEN: usize = 48;
+    if sealed.len() != SEALED_BROADCAST_KEY_CT_LEN {
+        return Err(SenderKeyError::HpkeDecryptionFailed(format!(
+            "sealed broadcast key ciphertext must be {SEALED_BROADCAST_KEY_CT_LEN} bytes, got {}",
+            sealed.len()
+        )));
+    }
+
     let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
     let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
 
@@ -1966,5 +1980,101 @@ mod tests {
             result.is_err(),
             "a sender-key-domain ciphertext must not open as a broadcast key"
         );
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_wrong_length_sealed() {
+        // The fail-fast 48-byte length gate must fire BEFORE the HPKE DH for any
+        // `sealed` that is not exactly 48 bytes. Both a too-short (47) and a
+        // too-long (49) buffer must be rejected with the length-gate message,
+        // not the slower AEAD-failure path. A valid-looking 32-byte `enc` and a
+        // dummy wrapping secret are supplied to prove the gate is reached purely
+        // on length, independent of any key agreement.
+        let enc = [0u8; 32];
+        let wrapping_secret = [7u8; 32];
+
+        for bad_len in [47usize, 49usize] {
+            let sealed = vec![0u8; bad_len];
+            let result = open_broadcast_key(
+                &sealed,
+                &enc,
+                &wrapping_secret,
+                "ctx-broadcast",
+                "did:dht:author",
+                0,
+            );
+            let err = result.expect_err("non-48-byte sealed key must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("48 bytes"),
+                "expected length-gate message mentioning \"48 bytes\" for len {bad_len}, got: {msg}"
+            );
+            assert!(
+                msg.contains(&bad_len.to_string()),
+                "length-gate message should report the actual length {bad_len}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_wrong_epoch() {
+        // The epoch is bound into the HPKE info/aad. Sealing at epoch N and
+        // opening at epoch N+1 (same context/author/keys) must fail the AEAD.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        // Open under a different epoch — wrong info/aad → AEAD failure.
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            1,
+        );
+        assert!(result.is_err(), "wrong epoch should fail HPKE open");
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_wrong_author() {
+        // The author DID is bound into the HPKE info/aad. Sealing for one author
+        // and opening as another (same context/epoch/keys) must fail the AEAD.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:alice",
+            0,
+        )
+        .unwrap();
+
+        // Open under a different author_did — wrong info/aad → AEAD failure.
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:bob",
+            0,
+        );
+        assert!(result.is_err(), "wrong author should fail HPKE open");
     }
 }

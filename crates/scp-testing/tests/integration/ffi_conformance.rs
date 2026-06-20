@@ -1697,10 +1697,11 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "context_handle_ttl_expiry",
     "context_propose_ttl_extension",
     "context_reset_ttl_timer",
-    // Broadcast (4)
+    // Broadcast (5)
     "broadcast_publish_asset",
     "broadcast_publish_assets",
     "broadcast_handle_key_request",
+    "broadcast_open_key",
     "broadcast_unblock",
     // Identity (7)
     "identity_link_attestations",

@@ -580,6 +580,41 @@ impl SenderVelocityTracker {
         }
         false
     }
+
+    /// Removes exactly ONE entry for `sender` recorded at `timestamp_secs`,
+    /// undoing a single [`record_message`](Self::record_message) call WITHOUT
+    /// needing its [`VelocityRollbackToken`].
+    ///
+    /// This is the DURABLE counterpart to [`Self::rollback`]. The rollback
+    /// token is a local-only sequence number that is intentionally NOT
+    /// persisted — [`Self::snapshot_entries`] preserves only timestamps and
+    /// [`Self::from_snapshot`] synthesizes FRESH sequence numbers, so a token
+    /// minted before a process restart can never match a restored entry. A
+    /// reservation whose reversal must survive a crash (e.g. a cross-context
+    /// saga's caller-side Prepare deduction, reversed on a post-crash abort)
+    /// therefore persists the entry's TIMESTAMP and reverses it through here.
+    ///
+    /// Removes a single matching entry (not all entries at that timestamp): it
+    /// reverses exactly one `record_message`, mirroring `rollback`'s
+    /// single-entry semantics, so a caller that recorded two messages in the
+    /// same second and reverses one leaves the other intact. Returns `true` if
+    /// an entry was found and removed. A `false` is not an error — the entry
+    /// may have been pruned by a later `get_velocity` / `record_message` call,
+    /// or the sender may have no entries at that timestamp at all.
+    #[allow(clippy::significant_drop_tightening)] // Lock scopes the entire lookup+mutate.
+    pub fn rollback_one_at(&self, sender: &DID, timestamp_secs: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = state.get_mut(sender)
+            && let Some(pos) = entries.iter().position(|&(ts, _)| ts == timestamp_secs)
+        {
+            entries.swap_remove(pos);
+            return true;
+        }
+        false
+    }
 }
 
 impl std::fmt::Debug for SenderVelocityTracker {
@@ -1460,6 +1495,80 @@ mod tests {
         assert!(!ts.contains(&1000));
         assert!(ts.contains(&1001));
         assert!(ts.contains(&1002));
+    }
+
+    // --- Rollback by timestamp (durable; token-independent) ---
+
+    /// `rollback_one_at` reverses exactly one entry recorded at a timestamp
+    /// WITHOUT a token — the durable reversal path used after a restore where
+    /// the original `VelocityRollbackToken` is meaningless (restored entries
+    /// get fresh sequence numbers).
+    #[test]
+    fn rollback_one_at_removes_single_entry_by_timestamp() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+
+        tracker.record_message(&alice, 1000);
+        tracker.record_message(&alice, 1001);
+        assert_eq!(tracker.get_velocity(&alice, 1005), 2);
+
+        assert!(tracker.rollback_one_at(&alice, 1000));
+        assert_eq!(tracker.get_velocity(&alice, 1005), 1);
+        let snap = tracker.snapshot_entries();
+        let ts = snap.get(alice.as_ref()).unwrap();
+        assert!(!ts.contains(&1000));
+        assert!(ts.contains(&1001));
+    }
+
+    /// `rollback_one_at` removes exactly ONE of several entries sharing a
+    /// timestamp — it reverses a single `record_message`, not all of them.
+    #[test]
+    fn rollback_one_at_removes_only_one_of_duplicate_timestamps() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+
+        tracker.record_message(&alice, 1000);
+        tracker.record_message(&alice, 1000);
+        assert_eq!(tracker.get_velocity(&alice, 1005), 2);
+
+        assert!(tracker.rollback_one_at(&alice, 1000));
+        // One duplicate-timestamp entry survives.
+        assert_eq!(tracker.get_velocity(&alice, 1005), 1);
+    }
+
+    /// `rollback_one_at` survives a snapshot roundtrip: the entry persists by
+    /// TIMESTAMP across `from_snapshot` (which discards the original token's
+    /// sequence number), and the restored entry is still reversible by
+    /// timestamp.
+    #[test]
+    fn rollback_one_at_reverses_a_restored_entry() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        tracker.record_message(&alice, 1000);
+
+        // Snapshot + restore (drops the original rollback-token seq).
+        let entries = tracker.snapshot_entries();
+        let restored = SenderVelocityTracker::from_snapshot(60, entries);
+        assert_eq!(restored.get_velocity(&alice, 1005), 1);
+
+        // The token-based path cannot reverse it post-restore, but the
+        // timestamp-based path can.
+        assert!(restored.rollback_one_at(&alice, 1000));
+        assert_eq!(restored.get_velocity(&alice, 1005), 0);
+    }
+
+    /// `rollback_one_at` on a missing sender / timestamp is a safe `false`.
+    #[test]
+    fn rollback_one_at_missing_is_safe_false() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        tracker.record_message(&alice, 1000);
+
+        assert!(!tracker.rollback_one_at(&alice, 9999));
+        let bob = did("did:dht:z6MkBob");
+        assert!(!tracker.rollback_one_at(&bob, 1000));
+        // The real entry is untouched.
+        assert_eq!(tracker.get_velocity(&alice, 1005), 1);
     }
 
     // --- F8: prune-on-record + hard cap ---

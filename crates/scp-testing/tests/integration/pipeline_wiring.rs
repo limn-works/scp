@@ -81,11 +81,27 @@ const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // sever the closed heartbeat loop.
 const NAPI_CONTEXT_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
 
+// PyO3 reference bridge context source — owns `broadcast_open_key`, the
+// pure-crypto FFI entry point that opens an HPKE-sealed broadcast key
+// (§5.14.2). The `broadcast_open_key_calls_open_broadcast_key` assertion
+// below pins this entry point to the protocol-layer `open_broadcast_key`
+// primitive so a refactor cannot silently sever the FFI surface from the
+// real crypto.
+const PYO3_CONTEXT_SRC: &str = include_str!("../../../../crates/scp-ffi/src/context.rs");
+
 // Shared heartbeat scheduler (scp-ffi-common) — `run_heartbeat_scheduler`
 // drives `Supervisor::send_heartbeat` at the per-profile cadence. Pinned by
 // `b3_heartbeat_send_receive_loop_wired`.
 const HEARTBEAT_SCHEDULER_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/heartbeat_scheduler.rs");
+
+// Shared broadcast key-distribution helpers (scp-ffi-common §5.14.2). The
+// Grant→sealed-JSON and sealed-JSON→raw-key value-shape logic is extracted here
+// once; the PyO3, napi-rs, and UniFFI bridges delegate to it. Pinned by
+// `broadcast_open_key_calls_open_broadcast_key` so the FFI open path still
+// reaches the real HPKE `open_broadcast_key` primitive through the shared seam.
+const COMMON_BROADCAST_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/broadcast.rs");
 
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
@@ -229,6 +245,40 @@ fn deliver_incoming_calls_open() {
                 && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")),
         "deliver_incoming must call crypto.open (envelope pipeline), either directly \
          or via decrypt_and_dispatch"
+    );
+}
+
+// Broadcast key-distribution pull protocol (§5.14.2): the PyO3 reference
+// bridge's `broadcast_open_key` FFI entry point must reach the protocol-layer
+// `open_broadcast_key` primitive (the real HPKE open). The open path now routes
+// through the shared `scp-ffi-common` helper `open_sealed_broadcast_key`
+// (deduped across PyO3/napi-rs/UniFFI), which calls `open_broadcast_key`
+// internally — so the assertion accepts either a direct call OR the delegation
+// chain (bridge → shared helper → primitive), mirroring how
+// `deliver_incoming_calls_open` accepts the `decrypt_and_dispatch` delegation.
+// This still pins the FFI surface to the real crypto so a refactor cannot
+// silently stub the open path or route it away from `open_broadcast_key`.
+#[test]
+fn broadcast_open_key_calls_open_broadcast_key() {
+    let direct = fn_body_contains(
+        PYO3_CONTEXT_SRC,
+        "broadcast_open_key",
+        "open_broadcast_key(",
+    );
+    let via_shared_helper = fn_body_contains(
+        PYO3_CONTEXT_SRC,
+        "broadcast_open_key",
+        "open_sealed_broadcast_key(",
+    ) && fn_body_contains(
+        COMMON_BROADCAST_SRC,
+        "open_sealed_broadcast_key",
+        "open_broadcast_key(",
+    );
+    assert!(
+        direct || via_shared_helper,
+        "PyO3 broadcast_open_key must reach open_broadcast_key (HPKE open \
+         primitive), either directly or via the shared \
+         open_sealed_broadcast_key helper"
     );
 }
 

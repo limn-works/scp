@@ -601,6 +601,7 @@ pub fn handle_broadcast_key_request(
     deps: &ActorDeps,
     author_did: &DID,
     requester_did: &DID,
+    wrapping_pubkey: &[u8; 32],
 ) -> Result<KeyRequestDecision, ContextError> {
     if !deps.local_dids.load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
@@ -613,7 +614,7 @@ pub fn handle_broadcast_key_request(
         .as_ref()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-    Ok(bc.handle_key_request(author_did, requester_did))
+    Ok(bc.handle_key_request(author_did, requester_did, wrapping_pubkey))
 }
 
 // ---------------------------------------------------------------------------
@@ -789,5 +790,16 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         checkpoint_last_time_secs: state.checkpoint_last_time_secs,
         generation: state.generation,
         routing: state.routing.clone(),
+        // ADR-049 §9 Class S (line 144): persist the staged saga slot
+        // through its sanctioned mirror via the shared helper.
+        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
+        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
+            state,
+        ),
+        xctx_committed_invocations:
+            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(state),
+        xctx_caller_reservations:
+            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
+        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
     }
 }

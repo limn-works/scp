@@ -1622,6 +1622,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Tier-2 sync-delta context snapshot signing | §23.16.4 |
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
 | `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
+| `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
 | `"SCP-BCAST-HOST-REQ-V1:"` | Broadcast hosting request signing | §5.14.13 |
 | `"SCP-BCAST-HOST-GRANT-V1:"` | Broadcast hosting grant signing | §5.14.13 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction, NOT a §9.5.1 signature-preimage separator (the colon-join is non-§9.5.1; `"standing-"` is an output id-prefix) | §5.15.8 |

@@ -350,5 +350,16 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
         generation: ctx.generation,
         routing: ctx.routing.clone(),
+        // ADR-049 §9 Class S (line 144): persist the staged saga slot through
+        // its sanctioned mirror via the shared helper.
+        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(ctx),
+        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
+            ctx,
+        ),
+        xctx_committed_invocations:
+            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(ctx),
+        xctx_caller_reservations:
+            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(ctx),
+        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
     }
 }
