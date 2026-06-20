@@ -32,8 +32,8 @@
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "kotlin": "UniFFI bridge does not export rotate_key",
-            "swift": "UniFFI bridge does not export rotate_key"
+            "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
+            "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
         },
         {
