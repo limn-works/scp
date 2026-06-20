@@ -77,6 +77,49 @@
 //!   receives a READ-ONLY `&PerContextState` (it reads the just-persisted state
 //!   to build the record) and CANNOT mutate Class-S — see the method docs.
 //!
+//! # Combinator coverage & migration scope
+//!
+//! These six combinators are deliberately the set for the **common** Class-S
+//! persist/rollback shapes, not an exhaustive cover of every call site. The
+//! Class-S-capable five span the *keep / restore* × *no-Class-C-undo /
+//! Class-C-(or-external)-undo* grid — `*_keep` (keep, no undo), `*_restore`
+//! (restore, no undo), `*_keep_compensating` (keep, undo C/external),
+//! `*_compensating` (restore, undo C/external) — plus `*_then_append` for the
+//! one extra shape of a fail-closed persist FOLLOWED BY an external durable
+//! append (event-log) that can itself fail; `commit_class_c_best_effort` covers
+//! the Class-C best-effort path. They are chosen because they are the shapes
+//! that recur; they are NOT proof that every site fits one of them.
+//!
+//! A site whose shape falls OUTSIDE this set is handled when **that site
+//! migrates** (during the handler migration, where its exact crash/atomicity
+//! semantics are known), not pre-covered speculatively here. Two known
+//! outliers, recorded so a future migrator does not mistake the gap for an
+//! oversight:
+//!
+//! - **Intra-Class-S keep-one-field / restore-another split.** A single site
+//!   can KEEP one Class-S field while RESTORING another on persist failure
+//!   (e.g. `prepare_b` records the `xctx_nonce_dedup` entry — keep-direction,
+//!   un-recording re-opens the replay window — while staging `saga_pending`,
+//!   which must roll back if the persist does not land). The combinators'
+//!   snapshot/restore is all-or-nothing over the Class-S sub-structs, so no
+//!   single combinator expresses this. It is migrated by DECOMPOSING the site
+//!   into a sequential `commit_class_s_keep` then `commit_class_s_restore` (two
+//!   fail-closed persists — the migration must verify the intermediate-crash
+//!   state between them is recoverable), or by introducing a site-specific
+//!   field-granular combinator if decomposition is not sound for that site.
+//! - **Append-then-persist of UNCHANGED state.** A site that appends a record
+//!   to an external sink and then persists *without mutating Class-S* (e.g.
+//!   `emit_divergence_marker`) is not a Class-S mutation site at all and needs
+//!   no combinator — it routes through the ordinary persist path.
+//!
+//! The [`ClassSCell::state_mut`] escape hatch is what bridges every site that
+//! has not yet migrated: a site still on `state_mut` is EXPECTED during the
+//! migration, not a defect. `state_mut` is deleted in the terminal migration
+//! step, once every Class-S mutation routes through a combinator (or a
+//! site-specific one added along the way); at that point — with the Class-S
+//! fields privatized and no `DerefMut` — the compiler, not this prose,
+//! enforces that every Class-S mutation is fail-closed-persisted.
+//!
 //! # Behaviour-neutral scaffolding
 //!
 //! No handler is migrated to these combinators yet (handlers still mutate through
