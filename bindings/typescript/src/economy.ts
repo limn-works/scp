@@ -130,37 +130,36 @@ export function formatAmount(
 // Payment receipt verification
 // ---------------------------------------------------------------------------
 
-/** Per-receipt entry in a {@link PaymentReceiptVerificationResult}. */
+/** One entry in the per-receipt verification results array. */
 export interface PaymentReceiptVerificationEntry {
-  /** Opaque identifier for this receipt, as supplied by the caller. */
-  receipt_id: string;
-  /** Whether the payment adapter accepted the receipt as valid. */
-  valid: boolean;
-  /**
-   * Human-readable reason for rejection, present when `valid` is `false`.
-   * Absent when the receipt is valid.
-   */
-  reason?: string;
+  /** Whether the adapter successfully processed this receipt. */
+  ok: boolean;
+  /** Receipt identifier — present only when ok is true. */
+  receipt_id?: string;
+  /** Whether the receipt was cryptographically valid — present only when ok is true. */
+  valid?: boolean;
+  /** Structured verification detail — present only when ok is true. */
+  result?: Readonly<Record<string, unknown>>;
+  /** Error message — present only when ok is false. */
+  error?: string;
 }
 
 /**
  * Result of verifying a batch of payment receipts via
  * {@link SCP.economyVerifyPaymentReceipts}.
  *
- * Mirrors the Python SDK return shape for `economy_verify_payment_receipts`.
- * `ok` indicates that the adapter responded for all receipts; `all_valid`
- * is `true` iff every entry reached the adapter and was reported valid (and
- * is vacuously `true` for an empty batch). Inspect `results` for per-receipt
- * detail. `ok === true` means the adapter *responded* — NOT that the payment
- * is valid; check `valid` / `all_valid` for validity.
+ * Mirrors the canonical wire shape produced by
+ * `verification_results_to_json` in `scp-runtime/economy/receipt.rs`.
+ * `all_valid` is `true` iff every entry reached the adapter and was
+ * reported valid (vacuously `true` for an empty batch). Inspect `results`
+ * for per-receipt detail. An entry with `ok === true` means the adapter
+ * responded — NOT that the payment is valid; check `valid` / `all_valid`
+ * for actual validity.
  */
 export interface PaymentReceiptVerificationResult {
-  /** `true` if the adapter responded for every receipt in the batch. */
-  ok: boolean;
   /**
-   * `true` iff every receipt both reached the adapter (`ok === true`) and
-   * the adapter reported it valid (`result.valid === true`). Vacuously `true`
-   * for an empty batch.
+   * `true` iff every receipt both reached the adapter and the adapter
+   * reported it valid. Vacuously `true` for an empty batch.
    */
   all_valid: boolean;
   /** Per-receipt verification outcomes. */

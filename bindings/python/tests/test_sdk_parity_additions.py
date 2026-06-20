@@ -57,13 +57,13 @@ async def test_economy_verify_payment_receipts_parses_json_result() -> None:
     scp = SCP.__new__(SCP)
     scp._native = MagicMock()
     scp._native.economy_verify_payment_receipts.return_value = (
-        '{"all_valid": false, "receipts": [{"valid": false, "ok": true}]}'
+        '{"all_valid": false, "results": [{"receipt_id": "r1", "ok": true, "valid": false}]}'
     )
 
     result = await scp.economy_verify_payment_receipts([])
 
     assert result["all_valid"] is False
     # An invalid-but-reachable receipt keeps ok==true; callers must read valid.
-    assert result["receipts"][0]["valid"] is False
-    assert result["receipts"][0]["ok"] is True
+    assert result["results"][0]["valid"] is False
+    assert result["results"][0]["ok"] is True
     scp._native.economy_verify_payment_receipts.assert_called_once_with("[]")
