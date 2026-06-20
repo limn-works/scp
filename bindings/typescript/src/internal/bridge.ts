@@ -36,6 +36,7 @@ import type {
   TransportStatus,
   UcanToken,
 } from "../types";
+import { assertTestEnvironment } from "./test-guard";
 
 // ---------------------------------------------------------------------------
 // Shared CapabilityValidation projection
@@ -940,15 +941,6 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  * @internal Phase 4 PR 4 — used by `bridge-trust.test.ts` default-options tests.
  */
 export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
-  const proc = (globalThis as { process?: { env?: { NODE_ENV?: string; BUN_TEST?: string } } })
-    .process;
-  const env = proc?.env?.NODE_ENV;
-  const isTesting = env === "test" || env === "development" || proc?.env?.BUN_TEST !== undefined;
-  if (!isTesting) {
-    throw new Error(
-      "__setBridgeForTests is a test-only hook. It must only be called in test or development " +
-        "environments. Set NODE_ENV=test, NODE_ENV=development, or ensure BUN_TEST is set.",
-    );
-  }
+  assertTestEnvironment("__setBridgeForTests");
   _nativeBridgeForScp.set(scp, bridge);
 }

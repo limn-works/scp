@@ -491,6 +491,8 @@ export async function evaluateTrust(
       contextsParticipated: 1,
       totalDuration: 0,
       governanceActionsAgainst: 0,
+      // Mirrors Python SDK: each ToolInvoked event becomes one entry with
+      // count: 1. No aggregation by tool ID — thin facade over the bridge.
       toolInvocations: events
         .filter((e) => e.eventType === "ToolInvoked")
         .map((e) => ({ type: e.eventType, count: 1 })),

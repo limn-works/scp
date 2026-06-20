@@ -44,6 +44,7 @@ import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./e
 import type { Identity } from "./identity";
 import { getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
 import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
@@ -828,14 +829,14 @@ export class SCP {
   }
 
   /**
-   * Migrates an identity across a custody or device boundary (spec §3.2.1,
-   * ADR-003 §4b/4c). Migration reveals the pre-rotation key and publishes
+   * Migrates an identity across a custody or device boundary (spec §3,
+   * ADR-003 §4b). Migration reveals the pre-rotation key and publishes
    * a new DID document, creating an identity with a **NEW DID** — the
    * returned {@link Identity} has a different DID from the input.
    *
    * The returned handle carries a `rotationEventJson` field (a serialized
    * `scp_identity::DidRotationEvent`). Callers **MUST** distribute this
-   * rotation event to all active context members per spec §3.2.1 (Identity Key migration)
+   * rotation event to all active context members (spec §3, ADR-003 §4b)
    * so peers can update their routing tables. Access it via
    * `identity.rotationEventJson` on the returned `Identity`.
    *
@@ -2768,11 +2769,8 @@ export class SCP {
    *
    * @param receipts Array of receipt objects to verify. Each object shape is
    *   adapter-specific; the bridge serializes the array to JSON internally.
-   * @returns Typed {@link PaymentReceiptVerificationResult} with `ok`,
-   *   `all_valid`, and per-receipt `results`.
-   * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
-   *   verification requires a native client whose bridge runs the payment
-   *   adapter (ADR-034).
+   * @returns Typed {@link PaymentReceiptVerificationResult} with `all_valid`
+   *   and per-receipt `results`.
    */
   economyVerifyPaymentReceipts(
     receipts: readonly Record<string, unknown>[],
@@ -3851,33 +3849,7 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
  * `process` is treated as blocked.
  */
 function assertTestHookAllowed(hookName: string): void {
-  const env: string | undefined = (() => {
-    try {
-      return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
-    } catch {
-      return undefined;
-    }
-  })();
-  const isBunTest: boolean = (() => {
-    try {
-      return (
-        (globalThis as { process?: { env?: { BUN_TEST?: string } } }).process?.env?.BUN_TEST !==
-        undefined
-      );
-    } catch {
-      return false;
-    }
-  })();
-  const allowed = env === "test" || env === "development" || isBunTest;
-  if (!allowed) {
-    throw new Error(
-      `${hookName} is a test-only hook and may only be called in test or development ` +
-        `environments (NODE_ENV=test|development, or BUN_TEST is set). ` +
-        `Current NODE_ENV=${String(env)}. If you're seeing this in legitimate code, ` +
-        `your build is mis-configured or a dependency is attempting to swap the SCP ` +
-        `native bridge.`,
-    );
-  }
+  assertTestEnvironment(hookName);
 }
 
 // `__setNativeForTests` + `replaceNativeWithMock` removed in round-3 cleanup:
