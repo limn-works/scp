@@ -631,7 +631,7 @@ export interface Bridge {
    * Awaits in-flight tasks up to `timeoutMillis` milliseconds, aborts any
    * remaining tasks when the deadline expires, clears registries,
    * disconnects transport, and runs shutdown hooks. The unit is
-   * milliseconds after the #1549 Phase 4 unit unification — pass `1000`
+   * milliseconds (Phase 4 unit unification) — pass `1000`
    * for a 1-second deadline, not `1`.
    *
    * Returns a `Promise<void>` — **callers must `await` it**. Previously

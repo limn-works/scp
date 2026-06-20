@@ -14,7 +14,9 @@ export function _evaluateTestEnv(env: Record<string, string | undefined> | undef
   if (!env || typeof env !== "object") return false;
   const nodeEnv = Object.hasOwn(env, "NODE_ENV") ? env.NODE_ENV : undefined;
   const bunTest = Object.hasOwn(env, "BUN_TEST") ? env.BUN_TEST : undefined;
-  return nodeEnv === "test" || nodeEnv === "development" || bunTest !== undefined;
+  return (
+    nodeEnv === "test" || nodeEnv === "development" || (bunTest !== undefined && bunTest.length > 0)
+  );
 }
 
 // Evaluated once at import time — runtime mutations to process.env cannot flip this.

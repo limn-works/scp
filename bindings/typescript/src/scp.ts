@@ -752,14 +752,14 @@ export class SCP {
   }
 
   /**
-   * Migrates an identity across a custody or device boundary (spec §3,
+   * Migrates an identity across a custody or device boundary (spec §9.12,
    * ADR-003 §4b). Migration reveals the pre-rotation key and publishes
    * a new DID document, creating an identity with a **NEW DID** — the
    * returned {@link Identity} has a different DID from the input.
    *
    * The returned handle carries a `rotationEventJson` field (a serialized
    * `scp_identity::DidRotationEvent`). Callers **MUST** distribute this
-   * rotation event to all active context members (spec §3, ADR-003 §4b)
+   * rotation event to all active context members (spec §9.12, ADR-003 §4b)
    * so peers can update their routing tables. Access it via
    * `identity.rotationEventJson` on the returned `Identity`.
    *
