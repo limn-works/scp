@@ -3,6 +3,7 @@
 - [Event-Log Substrate Phase-2 Final Review](eventlog_substrate_phase2_final.md) — APPROVED; provider trait typed EventType+timestamp_secs, anchored fields cross-binding consistent, PaymentReceived mirrors sibling, WASM shares taxonomy/merge by construction
 - [Cross-SDK shape parity](cross-sdk-shape-parity.md) — SCP agent-first tenet: identical API shape across all 4 bindings; recurring parity defects (return-type/param/signature/name-collision) to flag
 - [TS↔Python trust parity](ts-python-trust-parity.md) — four-layer trust + bridge-trust-tier + identity-lifecycle parity conventions; intentional divergences vs parity smells
+- [SDK coverage fail-closed + parity review](sdk_coverage_failclosed_parity_review.md) — fix/sdk-coverage-fail-closed-and-parity: identity-lifecycle+economyVerifyPaymentReceipts clean; MED discover_contexts TS/py signature split (singleton vs SCP-instance)
 
 ## SCP SDK Standards Review (2026-02-22)
 - Reviewed all 10 files in `.docs/standards/` (sdk-common.md + 8 language files + conventions.md)
