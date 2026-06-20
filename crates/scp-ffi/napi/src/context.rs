@@ -2581,8 +2581,11 @@ pub(crate) async fn broadcast_unblock_subscriber_on(
 
 /// Per-bridge-instance implementation of [`broadcast_handle_key_request`].
 ///
-/// Validates the author DID is locally controlled and processes the key
-/// distribution request. Returns a debug string describing the decision.
+/// Validates the author DID is locally controlled, then HPKE-seals the author's
+/// current broadcast key to the requester's X25519 `wrapping_pubkey`
+/// (§5.14.2). Returns `Some(json)` (a serialized `SealedBroadcastKey`) on
+/// grant, or `None` on deny (§5.14.8 — no key material to a denied requester).
+/// The raw broadcast key never crosses the FFI boundary.
 /// Routed through the ADR-049 broadcast dispatch surface.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_handle_key_request_on(
@@ -2590,13 +2593,25 @@ pub(crate) async fn broadcast_handle_key_request_on(
     handle: &NapiContextHandle,
     author_did: String,
     requester_did: String,
-) -> napi::Result<String> {
+    wrapping_pubkey: Vec<u8>,
+) -> napi::Result<Option<String>> {
     use scp_core::context::actor::commands::BroadcastCommand;
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let wrapping: [u8; 32] = wrapping_pubkey.as_slice().try_into().map_err(|_| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "wrapping_pubkey must be 32 bytes, got {}",
+                wrapping_pubkey.len()
+            ),
+            code: codes::VALID_7007.to_owned(),
+        })
+    })?;
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
+    let context_id_for_seal = context_id.clone();
+    let author_did_owned = author_did.clone();
     let author: DID = DID(author_did);
     let requester: DID = DID(requester_did);
 
@@ -2605,6 +2620,7 @@ pub(crate) async fn broadcast_handle_key_request_on(
         context_id,
         author_did: author,
         requester_did: requester,
+        wrapping_pubkey: wrapping,
         reply: tx,
     };
     sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
@@ -2614,7 +2630,62 @@ pub(crate) async fn broadcast_handle_key_request_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    Ok(format!("{decision:?}"))
+    // Grant→sealed-JSON / Deny→None via the shared helper (per-SDK error mapping
+    // kept here; only the value-shape logic is shared).
+    scp_ffi_common::broadcast::seal_decision_to_json(
+        decision,
+        &author_did_owned,
+        &context_id_for_seal,
+    )
+    .map_err(|e| {
+        // Serializing a just-constructed SealedBroadcastKey is an internal
+        // failure, not caller-input validation — classify as Context (CTX_2023)
+        // to match the UniFFI/PyO3/WASM bridges.
+        NapiError::from(ScpNapiError::Context {
+            message: format!("serialize sealed broadcast key: {e}"),
+            code: codes::CTX_2023.to_owned(),
+        })
+    })
+}
+
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
+/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+///
+/// Pure crypto — no bridge-instance state, so it is a module-level free
+/// `#[napi]` fn (ADR-048 §1) with no per-instance `_on` variant. `sealed_json`
+/// is the JSON returned by `broadcastHandleKeyRequest` on grant.
+///
+/// # Errors
+///
+/// Returns a validation error if `sealed_json` is malformed or
+/// `wrapping_secret` is not 32 bytes, or a context error if HPKE open fails.
+#[napi(js_name = "broadcastOpenKey")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned parameters
+pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi::Result<Vec<u8>> {
+    use scp_ffi_common::broadcast::OpenSealedKeyError;
+    scp_ffi_common::broadcast::open_sealed_broadcast_key(&sealed_json, &wrapping_secret).map_err(
+        |e| {
+            // Malformed JSON / wrong-length secret are caller-input validation
+            // errors; a failed HPKE open is a context/crypto error. Mirrors the
+            // PyO3/UniFFI/WASM classification so the error variant is consistent
+            // across every SDK.
+            let scp_err = match &e {
+                OpenSealedKeyError::InvalidJson { .. } => ScpNapiError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7002.to_owned(),
+                },
+                OpenSealedKeyError::InvalidSecretLength { .. } => ScpNapiError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7007.to_owned(),
+                },
+                OpenSealedKeyError::OpenFailed { .. } => ScpNapiError::Context {
+                    message: e.to_string(),
+                    code: codes::CTX_2023.to_owned(),
+                },
+            };
+            NapiError::from(scp_err)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

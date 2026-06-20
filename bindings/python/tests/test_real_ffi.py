@@ -17,6 +17,8 @@ event log, discovery, and provenance through real FFI.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -718,3 +720,109 @@ class TestTrust:
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure
+
+
+# ---------------------------------------------------------------------------
+# Broadcast key distribution (spec §5.14.2)
+# ---------------------------------------------------------------------------
+
+
+class TestBroadcastKeyDistribution:
+    """Pull-based broadcast key-distribution protocol through real FFI.
+
+    Exercises the Python SDK wrapper surface for the §5.14.2 pull protocol:
+    ``broadcast_handle_key_request`` (author seals its current broadcast key
+    to a requester) and ``broadcast_open_key`` (subscriber unwraps the sealed
+    key). These are dependency-free assertions on the binding contract — they
+    cover the deny decision (§5.14.8 cryptographic exclusion), the
+    ``broadcast_open_key`` input validation, and the grant JSON shape. A true
+    open round-trip needs a real X25519 keypair (no stdlib X25519, no test
+    crypto dependency) and is covered by the TypeScript suite.
+    """
+
+    @staticmethod
+    def _broadcast_handle(scp: SCP, author_did: str):
+        """Create an active broadcast context whose creator is the sole author."""
+        return scp._native.context_create(
+            author_did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "full",
+                "mode": "broadcast",
+            },
+        )
+
+    async def test_key_request_denies_unregistered_requester(self, scp: SCP):
+        """§5.14.8: an author returns no key material to a requester that never
+        subscribed. The deny decision short-circuits before any sealing, so it
+        needs no real X25519 wrapping key — ``bytes(32)`` is accepted and the
+        wrapper surfaces the deny as ``None`` (not an empty/sealed blob)."""
+        author = await scp.identity_create(CustodyType.IN_MEMORY)
+        stranger = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = self._broadcast_handle(scp, author.did)
+        assert handle.mode == "broadcast"
+
+        decision = await scp.broadcast_handle_key_request(
+            handle,
+            author.did,
+            stranger.did,
+            bytes(32),
+        )
+        assert decision is None
+
+    async def test_open_key_rejects_malformed_sealed_json(self, scp: SCP):
+        """``broadcast_open_key`` must reject a sealed payload that is not valid
+        JSON before attempting any HPKE open."""
+        with pytest.raises(ValueError):
+            await scp.broadcast_open_key("not valid json", bytes(32))
+
+    async def test_open_key_rejects_wrong_length_secret(self, scp: SCP):
+        """``broadcast_open_key`` must reject a wrapping secret that is not
+        exactly 32 bytes. The JSON is syntactically valid (and structurally a
+        plausible SealedBroadcastKey) so the length gate is the failing check,
+        not deserialization."""
+        sealed_json = json.dumps(
+            {
+                "enc": [0] * 32,
+                "ct": [0] * 48,
+                "epoch": 0,
+                "author_did": "did:dht:z6MkBroadcastAuthorForLenCheck",
+                "context_id": "ctx-broadcast-len-check",
+            }
+        )
+        with pytest.raises(ValueError):
+            await scp.broadcast_open_key(sealed_json, b"short")
+
+    async def test_key_request_grants_registered_subscriber_shape(self, scp: SCP):
+        """A registered subscriber receives a sealed broadcast key. ``bytes(32)``
+        (the all-zero X25519 point) is a valid HPKE recipient input, so the seal
+        succeeds and the wrapper returns the SealedBroadcastKey JSON. We assert
+        the JSON shape only — a true open round-trip would need the X25519 secret
+        matching the all-zero *public* key (which is not the all-zero secret), so
+        the full unwrap is left to the TypeScript suite (real WebCrypto X25519)."""
+        author = await scp.identity_create(CustodyType.IN_MEMORY)
+        subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = self._broadcast_handle(scp, author.did)
+
+        await scp.broadcast_subscribe(handle, subscriber.did)
+        assert await scp.broadcast_is_subscriber(handle, subscriber.did) is True
+
+        sealed_json = await scp.broadcast_handle_key_request(
+            handle,
+            author.did,
+            subscriber.did,
+            bytes(32),
+        )
+        assert isinstance(sealed_json, str)
+        assert len(sealed_json) > 0
+
+        sealed = json.loads(sealed_json)
+        # SealedBroadcastKey shape (spec §5.14.2): HPKE encapsulation (`enc`),
+        # ciphertext (`ct`), the author's key epoch, and the binding fields the
+        # opener must echo into HPKE AAD.
+        assert set(sealed) >= {"enc", "ct", "epoch", "author_did", "context_id"}
+        assert isinstance(sealed["enc"], list)
+        assert isinstance(sealed["ct"], list)
+        assert sealed["author_did"] == author.did
+        assert sealed["context_id"] == handle.context_id
+        assert isinstance(sealed["epoch"], int)

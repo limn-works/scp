@@ -2066,7 +2066,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-    func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String) async throws  -> String
+    func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String, wrappingPubkey: Data) async throws  -> String?
     
     /**
      * Per-instance equivalent of the free-function
@@ -3611,19 +3611,19 @@ open func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String,
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-open func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String)async throws  -> String  {
+open func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String, wrappingPubkey: Data)async throws  -> String?  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_handle_key_request(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterString.lower(requesterDid)
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterString.lower(requesterDid),FfiConverterData.lower(wrappingPubkey)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
+            liftFunc: FfiConverterOptionString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -14395,6 +14395,28 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
 })
 }
 /**
+ * Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
+ * wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+ *
+ * Pure crypto — no `SCP` instance state. `sealed_json` is the JSON returned by
+ * [`Scp::broadcast_handle_key_request`] on grant; `wrapping_secret` is the
+ * subscriber's 32-byte X25519 secret matching the `wrapping_pubkey` presented
+ * on the request.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Validation` if `sealed_json` is malformed or
+ * `wrapping_secret` is not 32 bytes; `ScpError::Context` if HPKE open fails.
+ */
+public func broadcastOpenKey(sealedJson: String, wrappingSecret: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_broadcast_open_key(
+        FfiConverterString.lower(sealedJson),
+        FfiConverterData.lower(wrappingSecret),$0
+    )
+})
+}
+/**
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * Detects whether the query is a DID or an `scp://` URI and delegates to
@@ -15102,6 +15124,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 24667) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15375,7 +15400,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_block_subscriber() != 22466) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 345) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 28358) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_is_subscriber() != 4444) {

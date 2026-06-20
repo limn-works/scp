@@ -158,7 +158,9 @@ export interface Bridge {
     handle: BridgeContextHandle,
     authorDid: string,
     requesterDid: string,
-  ): Promise<string>;
+    wrappingPubkey: Uint8Array,
+  ): Promise<string | null>;
+  broadcastOpenKey(sealedJson: string, wrappingSecret: Uint8Array): Promise<Uint8Array>;
   broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null>;
   broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean>;
   broadcastAdmission(handle: BridgeContextHandle): Promise<BroadcastAdmissionPolicy | null>;

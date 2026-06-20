@@ -5128,6 +5128,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "x25519-dalek 2.0.1",
  "z-base-32",
  "zeroize",
 ]

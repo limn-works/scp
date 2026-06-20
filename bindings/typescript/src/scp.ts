@@ -1287,18 +1287,62 @@ export class SCP {
     )(handle, subscriberDid, unblockerDid);
   }
 
+  /**
+   * Seals the author's current broadcast key to the requester's 32-byte
+   * X25519 `wrappingPubkey` (HPKE, spec §5.14.2).
+   *
+   * On grant, returns a JSON string encoding the sealed broadcast key; feed
+   * that exact string into {@link broadcastOpenKey} together with the X25519
+   * `wrappingSecret` matching the `wrappingPubkey` presented here to recover
+   * the raw key. On deny (§5.14.8 — a blocked, unregistered, or unauthorized
+   * requester), returns `null` and no key material is produced. The raw
+   * AES-256 broadcast key never crosses the FFI boundary; only sealed material
+   * is returned.
+   *
+   * @param wrappingPubkey - the requester's 32-byte X25519 public key.
+   */
   async broadcastHandleKeyRequest(
     handle: unknown,
     authorDid: string,
     requesterDid: string,
-  ): Promise<string> {
+    wrappingPubkey: Uint8Array,
+  ): Promise<string | null> {
+    // NAPI Vec<u8> IN params map to number[] in JS, not Uint8Array.
+    const wrappingArray = Array.from(wrappingPubkey) as unknown as number[];
     return await (
       this.#native.broadcastHandleKeyRequest as (
         h: unknown,
         a: string,
         r: string,
-      ) => Promise<string>
-    )(handle, authorDid, requesterDid);
+        w: number[],
+      ) => Promise<string | null>
+    )(handle, authorDid, requesterDid, wrappingArray);
+  }
+
+  /**
+   * Opens an HPKE-sealed broadcast key (spec §5.14.2) using the subscriber's
+   * 32-byte X25519 `wrappingSecret`, returning the raw 32-byte AES-256
+   * broadcast key.
+   *
+   * `sealedJson` is the JSON string returned by
+   * {@link broadcastHandleKeyRequest} on grant; `wrappingSecret` must match the
+   * `wrappingPubkey` presented on that request. Pure crypto — no instance
+   * state.
+   *
+   * @param sealedJson - the sealed-key JSON from `broadcastHandleKeyRequest`.
+   * @param wrappingSecret - the subscriber's 32-byte X25519 secret.
+   */
+  // why: `broadcastOpenKey` is a module-level NAPI free function
+  // (`#[napi] pub fn broadcast_open_key`), not an SCP-class method, so it
+  // routes through `nativeFreeFn` per ADR-048 §1 rather than `this.#native`.
+  // The Rust fn is synchronous; the returned Uint8Array is surfaced via this
+  // async method's Promise.
+  async broadcastOpenKey(sealedJson: string, wrappingSecret: Uint8Array): Promise<Uint8Array> {
+    // NAPI Vec<u8> IN params map to number[] in JS; the Vec<u8> return is a
+    // Buffer (a Uint8Array).
+    const secretArray = Array.from(wrappingSecret) as unknown as number[];
+    const fn = nativeFreeFn<(s: string, w: number[]) => Uint8Array>("broadcastOpenKey");
+    return fn(sealedJson, secretArray);
   }
 
   // ───────────────────────────────────────────────────────────────────────

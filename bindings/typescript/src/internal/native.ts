@@ -469,14 +469,31 @@ export function createNativeBridge(scp: SCP): Bridge {
       handle: BridgeContextHandle,
       authorDid: string,
       requesterDid: string,
-    ): Promise<string> {
+      wrappingPubkey: Uint8Array,
+    ): Promise<string | null> {
+      // NAPI Vec<u8> IN params map to number[] in JS, not Uint8Array.
+      const wrappingArray = Array.from(wrappingPubkey) as unknown as number[];
       return await (
         native.broadcastHandleKeyRequest as (
           h: BridgeContextHandle,
           a: string,
           r: string,
-        ) => Promise<string>
-      )(handle, authorDid, requesterDid);
+          w: number[],
+        ) => Promise<string | null>
+      )(handle, authorDid, requesterDid, wrappingArray);
+    },
+
+    async broadcastOpenKey(sealedJson: string, wrappingSecret: Uint8Array): Promise<Uint8Array> {
+      // Free NAPI function (`#[napi] pub fn broadcast_open_key` in
+      // crates/scp-ffi/napi/src/context.rs) — routed through `addon.X`, not
+      // the per-instance `native.X`, per the ADR-048 dispatcher rule. The
+      // Rust fn is synchronous (`Result<Vec<u8>>`); its Vec<u8> IN param maps
+      // to number[] in JS, and the Vec<u8> return is a Buffer (a Uint8Array).
+      const secretArray = Array.from(wrappingSecret) as unknown as number[];
+      return (addon.broadcastOpenKey as (s: string, w: number[]) => Uint8Array)(
+        sealedJson,
+        secretArray,
+      );
     },
 
     async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {

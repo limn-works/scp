@@ -601,6 +601,7 @@ pub fn handle_broadcast_key_request(
     deps: &ActorDeps,
     author_did: &DID,
     requester_did: &DID,
+    wrapping_pubkey: &[u8; 32],
 ) -> Result<KeyRequestDecision, ContextError> {
     if !deps.local_dids.load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
@@ -613,7 +614,7 @@ pub fn handle_broadcast_key_request(
         .as_ref()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-    Ok(bc.handle_key_request(author_did, requester_did))
+    Ok(bc.handle_key_request(author_did, requester_did, wrapping_pubkey))
 }
 
 // ---------------------------------------------------------------------------

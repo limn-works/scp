@@ -305,11 +305,36 @@ async fn handle_key_request_non_blocked() {
     ctx.add_author("did:key:author1").unwrap();
     subscribe_open(&mut ctx, "did:key:subscriber1", 1000).unwrap();
 
-    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1");
+    // The subscriber's X25519 wrapping keypair travels with the request; the
+    // Grant carries only the HPKE-sealed key material (never the raw key).
+    let subscriber_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let subscriber_pub = x25519_dalek::PublicKey::from(&subscriber_secret);
+    let decision = ctx.handle_key_request(
+        "did:key:author1",
+        "did:key:subscriber1",
+        &subscriber_pub.to_bytes(),
+    );
     match decision {
-        KeyRequestDecision::Grant { key_bytes, epoch } => {
+        KeyRequestDecision::Grant { enc, ct, epoch } => {
             assert_eq!(epoch, 0);
-            assert_eq!(key_bytes.len(), 32);
+            assert_eq!(ct.len(), 48, "ct is 32-byte sealed key + 16-byte tag");
+            // Full round-trip: the opened key matches the author's broadcast key.
+            let recovered = scp_core::crypto::sender_keys::broadcast::open_broadcast_key(
+                &ct,
+                &enc,
+                &subscriber_secret.to_bytes(),
+                "ctx-key-req",
+                "did:key:author1",
+                epoch,
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.as_bytes(),
+                ctx.get_author("did:key:author1")
+                    .unwrap()
+                    .broadcast_key
+                    .as_bytes()
+            );
         }
         KeyRequestDecision::Deny { reason } => {
             panic!("expected Grant, got Deny: {reason}");
@@ -337,7 +362,7 @@ async fn handle_key_request_blocked() {
     ctx.block_subscriber("did:key:author1", "did:key:subscriber1")
         .unwrap();
 
-    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1");
+    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &[0u8; 32]);
     match decision {
         KeyRequestDecision::Deny { reason } => {
             assert!(!reason.is_empty(), "deny reason should not be empty");

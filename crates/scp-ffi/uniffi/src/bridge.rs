@@ -5674,6 +5674,49 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast key distribution (§5.14.2)
+// ---------------------------------------------------------------------------
+
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
+/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+///
+/// Pure crypto — no `SCP` instance state. `sealed_json` is the JSON returned by
+/// [`Scp::broadcast_handle_key_request`] on grant; `wrapping_secret` is the
+/// subscriber's 32-byte X25519 secret matching the `wrapping_pubkey` presented
+/// on the request.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `sealed_json` is malformed or
+/// `wrapping_secret` is not 32 bytes; `ScpError::Context` if HPKE open fails.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned parameters
+pub fn broadcast_open_key(
+    sealed_json: String,
+    wrapping_secret: Vec<u8>,
+) -> Result<Vec<u8>, ScpError> {
+    use scp_ffi_common::broadcast::OpenSealedKeyError;
+    scp_ffi_common::broadcast::open_sealed_broadcast_key(&sealed_json, &wrapping_secret).map_err(
+        |e| match e {
+            // Malformed JSON / wrong-length secret are caller-input validation
+            // errors; a failed HPKE open is a context/crypto error.
+            OpenSealedKeyError::InvalidJson { .. } => ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7002.to_owned(),
+            },
+            OpenSealedKeyError::InvalidSecretLength { .. } => ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7007.to_owned(),
+            },
+            OpenSealedKeyError::OpenFailed { .. } => ScpError::Context {
+                msg: e.to_string(),
+                code: codes::CTX_2023.to_owned(),
+            },
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Provenance quality evaluation
 // ---------------------------------------------------------------------------
 
@@ -11075,23 +11118,41 @@ impl Scp {
         handle: Arc<ContextHandle>,
         author_did: String,
         requester_did: String,
-    ) -> Result<String, ScpError> {
+        wrapping_pubkey: Vec<u8>,
+    ) -> Result<Option<String>, ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        validate_did(&author_did)?;
+        validate_did(&requester_did)?;
+        let wrapping: [u8; 32] =
+            wrapping_pubkey
+                .as_slice()
+                .try_into()
+                .map_err(|_| ScpError::Validation {
+                    msg: format!(
+                        "wrapping_pubkey must be 32 bytes, got {}",
+                        wrapping_pubkey.len()
+                    ),
+                    code: codes::VALID_7007.to_owned(),
+                })?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
+                let context_id = handle.context_id.clone();
+                let context_id_for_seal = context_id.clone();
+                let author_did_owned = author_did.clone();
                 let author: scp_identity::DID = author_did.into();
                 let requester: scp_identity::DID = requester_did.into();
                 use scp_core::context::actor::commands::BroadcastCommand;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
-                    context_id: handle.context_id.clone(),
+                    context_id,
                     author_did: author,
                     requester_did: requester,
+                    wrapping_pubkey: wrapping,
                     reply: tx,
                 };
                 sup.dispatch_broadcast_command(cmd)
@@ -11104,7 +11165,17 @@ impl Scp {
                         code: codes::CTX_2037.to_owned(),
                     })?
                     .map_err(ScpError::from)?;
-                Ok(format!("{decision:?}"))
+                // Grant→sealed-JSON / Deny→None via the shared helper (per-SDK
+                // error mapping kept here; only the value-shape logic is shared).
+                scp_ffi_common::broadcast::seal_decision_to_json(
+                    decision,
+                    &author_did_owned,
+                    &context_id_for_seal,
+                )
+                .map_err(|e| ScpError::Context {
+                    msg: format!("serialize sealed broadcast key: {e}"),
+                    code: codes::CTX_2023.to_owned(),
+                })
             })
             .await
             .map_err(|e| ScpError::Context {

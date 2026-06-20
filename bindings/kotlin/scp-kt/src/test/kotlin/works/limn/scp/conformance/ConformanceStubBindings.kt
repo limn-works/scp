@@ -285,7 +285,8 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         authorDid: String,
         requesterDid: String,
-    ): String = """{"key":"stub"}"""
+        wrappingPubkey: ByteArray,
+    ): String? = """{"key":"stub"}"""
 
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
 

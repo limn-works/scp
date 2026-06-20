@@ -765,7 +765,7 @@ async fn blocked_subscriber_key_request_denied() {
         .unwrap();
 
     // Key request from blocked subscriber should be denied
-    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1");
+    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &[0u8; 32]);
     match decision {
         KeyRequestDecision::Deny { reason } => {
             assert!(

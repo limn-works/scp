@@ -241,6 +241,14 @@ public final class SCP: @unchecked Sendable {
 // that callers write `scp.identityCreate(...)` as an idiomatic Swift
 // method call. No state is shared with any other `SCP` instance.
 
+/// Module-scope forwarder to the generated free `broadcastOpenKey` UniFFI
+/// function. At module scope no instance/extension method shadows the global
+/// name, so this bare call binds to the real binding (not a recursive
+/// self-call). The SCP wrapper type's `broadcastOpenKey` method delegates here.
+private func ffiBroadcastOpenKey(sealedJson: String, wrappingSecret: Data) throws -> Data {
+    try broadcastOpenKey(sealedJson: sealedJson, wrappingSecret: wrappingSecret)
+}
+
 public extension SCP {
     /// Forwards to ``Scp/accessKeyGenerate`` on ``inner``.
     func accessKeyGenerate(contextId: String, memberDid: String, callerDid: String) async throws {
@@ -295,8 +303,21 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/broadcastHandleKeyRequest`` on ``inner``.
-    func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String) async throws -> String {
-        try await inner.broadcastHandleKeyRequest(handle: handle, authorDid: authorDid, requesterDid: requesterDid)
+    func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String, wrappingPubkey: Data) async throws -> String? {
+        try await inner.broadcastHandleKeyRequest(handle: handle, authorDid: authorDid, requesterDid: requesterDid, wrappingPubkey: wrappingPubkey)
+    }
+
+    /// Forwards to the free ``broadcastOpenKey`` UniFFI binding.
+    ///
+    /// Opens an HPKE-sealed broadcast key (§5.14.2) using the subscriber's
+    /// 32-byte X25519 ``wrappingSecret``, returning the raw 32-byte AES-256
+    /// broadcast key. ``sealedJson`` is the JSON returned by
+    /// ``broadcastHandleKeyRequest`` on grant.
+    func broadcastOpenKey(sealedJson: String, wrappingSecret: Data) throws -> Data {
+        // Routes through the module-scope forwarder because the generated
+        // `broadcastOpenKey` is a free function whose name the SCP module shares
+        // with this wrapper type — an in-method bare call would self-recurse.
+        try ffiBroadcastOpenKey(sealedJson: sealedJson, wrappingSecret: wrappingSecret)
     }
 
     /// Forwards to ``Scp/broadcastIsSubscriber`` on ``inner``.

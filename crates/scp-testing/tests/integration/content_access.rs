@@ -415,7 +415,7 @@ fn broadcast_block_denies_key_request() {
     subscribe_open(&mut ctx, subscriber_did, 1000).unwrap();
 
     // Before blocking: key request should be granted.
-    let decision = ctx.handle_key_request(author_did, subscriber_did);
+    let decision = ctx.handle_key_request(author_did, subscriber_did, &[0u8; 32]);
     assert!(
         matches!(decision, KeyRequestDecision::Grant { .. }),
         "subscriber should be granted before block"
@@ -425,7 +425,7 @@ fn broadcast_block_denies_key_request() {
     ctx.block_subscriber(author_did, subscriber_did).unwrap();
 
     // After blocking: key request should be denied.
-    let decision = ctx.handle_key_request(author_did, subscriber_did);
+    let decision = ctx.handle_key_request(author_did, subscriber_did, &[0u8; 32]);
     assert!(
         matches!(decision, KeyRequestDecision::Deny { .. }),
         "blocked subscriber should be denied"
@@ -455,7 +455,7 @@ fn sender_key_rotation_on_block() {
     subscribe_open(&mut ctx, subscriber_b, 1001).unwrap();
 
     // Get the initial epoch.
-    let initial_decision = ctx.handle_key_request(author_did, subscriber_a);
+    let initial_decision = ctx.handle_key_request(author_did, subscriber_a, &[0u8; 32]);
     let initial_epoch = match &initial_decision {
         KeyRequestDecision::Grant { epoch, .. } => *epoch,
         KeyRequestDecision::Deny { reason } => panic!("expected Grant, got Deny: {reason}"),
@@ -474,7 +474,7 @@ fn sender_key_rotation_on_block() {
     );
 
     // subscriber_a (not blocked) should still get access at the new epoch.
-    let post_block_decision = ctx.handle_key_request(author_did, subscriber_a);
+    let post_block_decision = ctx.handle_key_request(author_did, subscriber_a, &[0u8; 32]);
     match &post_block_decision {
         KeyRequestDecision::Grant { epoch, .. } => {
             assert_eq!(*epoch, 1, "non-blocked subscriber should see epoch 1");
@@ -485,7 +485,7 @@ fn sender_key_rotation_on_block() {
     }
 
     // subscriber_b (blocked) should be denied.
-    let denied = ctx.handle_key_request(author_did, subscriber_b);
+    let denied = ctx.handle_key_request(author_did, subscriber_b, &[0u8; 32]);
     assert!(
         matches!(denied, KeyRequestDecision::Deny { .. }),
         "blocked subscriber should be denied after key rotation"

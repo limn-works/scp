@@ -333,7 +333,9 @@ interface WasmModule {
     handle: BridgeContextHandle,
     authorDid: string,
     requesterDid: string,
-  ) => Promise<string>;
+    wrappingPubkey: Uint8Array,
+  ) => Promise<string | null>;
+  broadcast_open_key: (sealedJson: string, wrappingSecret: Uint8Array) => Uint8Array;
   // Identity key rotation
   identity_rotate_key: (identity: { did: string; custodyType: string }) => {
     did: string;
@@ -988,9 +990,23 @@ export function createWasmBridge(): Bridge {
       handle: BridgeContextHandle,
       authorDid: string,
       requesterDid: string,
-    ): Promise<string> {
+      wrappingPubkey: Uint8Array,
+    ): Promise<string | null> {
       const wasm = getWasm();
-      return await wasm.broadcast_handle_key_request(handle, authorDid, requesterDid);
+      return await wasm.broadcast_handle_key_request(
+        handle,
+        authorDid,
+        requesterDid,
+        wrappingPubkey,
+      );
+    },
+
+    async broadcastOpenKey(sealedJson: string, wrappingSecret: Uint8Array): Promise<Uint8Array> {
+      // Synchronous wasm-bindgen export (`broadcast_open_key` returns
+      // `Result<Vec<u8>, JsError>`); the Uint8Array is returned through this
+      // async method's Promise.
+      const wasm = getWasm();
+      return wasm.broadcast_open_key(sealedJson, wrappingSecret);
     },
 
     async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
