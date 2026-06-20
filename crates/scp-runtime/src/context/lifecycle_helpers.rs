@@ -1215,15 +1215,12 @@ pub async fn create_context(
         members: actor_members,
         governance: GovernanceState {
             engine: governance_engine,
-            executed_proposals: HashMap::new(),
             approved_proposals: HashMap::new(),
             // H10: fresh contexts start with a zero monotonic counter.
             next_proposal_seq: 0,
             freeze: None,
             timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
-            threshold_signers: initial_threshold_signers,
-            threshold_value: initial_threshold_value,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
             registered_tools: Vec::new(),
@@ -1243,12 +1240,17 @@ pub async fn create_context(
             velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
             participation_cache: HashMap::new(),
             cooldown_until: HashMap::new(),
-            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                context_id.clone(),
-                Arc::clone(&deps.clock),
-            ),
             revoked_spending_ucan_cids: HashSet::new(),
             proposal_timestamps: HashMap::new(),
+            class_s: crate::context::state::GovernanceClassS {
+                executed_proposals: HashMap::new(),
+                threshold_signers: initial_threshold_signers,
+                threshold_value: initial_threshold_value,
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.clone(),
+                    Arc::clone(&deps.clock),
+                ),
+            },
         },
         role_state,
         receive_buffer: ReceiveBuffer::new(),
@@ -1293,21 +1295,23 @@ pub async fn create_context(
         // tree above is the proof-generation surface and is populated
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
-        saga_pending: HashMap::new(),
-        xctx_committed_outputs: HashMap::new(),
-        xctx_committed_invocations: std::collections::HashSet::new(),
-        // Caller-side cross-context reservation reversal records (spec §6.2.4):
-        // fresh on create; cross-node import DROPS them (caller economy is
-        // local — a foreign saga must never drive local reversal).
-        xctx_caller_reservations: std::collections::HashMap::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-        ),
+        class_s: crate::context::actor::state::ClassSState {
+            saga_pending: HashMap::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
+            // Caller-side cross-context reservation reversal records (spec §6.2.4):
+            // fresh on create; cross-node import DROPS them (caller economy is
+            // local — a foreign saga must never drive local reversal).
+            xctx_caller_reservations: std::collections::HashMap::new(),
+            xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
+        },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -1826,15 +1830,6 @@ pub async fn import_context(
         migration_state: None,
         governance: GovernanceState {
             engine: governance_engine,
-            executed_proposals: {
-                let now = deps.clock.now_secs();
-                export
-                    .snapshot
-                    .executed_proposals
-                    .into_iter()
-                    .map(|id| (id, now))
-                    .collect()
-            },
             // C3: Wipe `approved_proposals`. Importing approved-but-not-
             // yet-executed proposals lets a malicious snapshot pre-load
             // forged `RemoveMember` entries.
@@ -1844,8 +1839,6 @@ pub async fn import_context(
             freeze: export.snapshot.governance_freeze,
             timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
-            threshold_signers: export.snapshot.threshold_signers,
-            threshold_value: export.snapshot.threshold_value,
             // SECURITY: `observed_at` re-pinned to local import time (see the
             // sanitization above) so a backdated signed export cannot collapse
             // the §5.3.2 / §19.3 notification window on import.
@@ -1868,12 +1861,6 @@ pub async fn import_context(
             // C3: Wipe `participation_cache` — rebuilt lazily.
             participation_cache: HashMap::new(),
             cooldown_until: sanitized_cooldown_until,
-            // IMPORT path (not restore): start with a FRESH spending-
-            // nonce tracker.
-            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                context_id.clone(),
-                Arc::clone(&deps.clock),
-            ),
             // Carry the revocation set through import: it is a downward-
             // authorization decision (a revoked spending UCAN must STAY revoked)
             // and it is bound into the SIGNED export preimage, so dropping it
@@ -1883,6 +1870,25 @@ pub async fn import_context(
             revoked_spending_ucan_cids: export.snapshot.revoked_spending_ucan_cids,
             // C3: Wipe `proposal_timestamps`.
             proposal_timestamps: HashMap::new(),
+            class_s: crate::context::state::GovernanceClassS {
+                executed_proposals: {
+                    let now = deps.clock.now_secs();
+                    export
+                        .snapshot
+                        .executed_proposals
+                        .into_iter()
+                        .map(|id| (id, now))
+                        .collect()
+                },
+                threshold_signers: export.snapshot.threshold_signers,
+                threshold_value: export.snapshot.threshold_value,
+                // IMPORT path (not restore): start with a FRESH spending-
+                // nonce tracker.
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.clone(),
+                    Arc::clone(&deps.clock),
+                ),
+            },
         },
         epoch: EpochState {
             mls_epoch: export.snapshot.mls_epoch,
@@ -1937,21 +1943,23 @@ pub async fn import_context(
         // strips it to empty; a full import deliberately drops it too so a
         // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
-        saga_pending: HashMap::new(),
-        xctx_committed_outputs: HashMap::new(),
-        xctx_committed_invocations: std::collections::HashSet::new(),
-        // Caller-side cross-context reservation reversal records (spec §6.2.4):
-        // fresh on create; cross-node import DROPS them (caller economy is
-        // local — a foreign saga must never drive local reversal).
-        xctx_caller_reservations: std::collections::HashMap::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
-            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-        ),
+        class_s: crate::context::actor::state::ClassSState {
+            saga_pending: HashMap::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
+            // Caller-side cross-context reservation reversal records (spec §6.2.4):
+            // fresh on create; cross-node import DROPS them (caller economy is
+            // local — a foreign saga must never drive local reversal).
+            xctx_caller_reservations: std::collections::HashMap::new(),
+            xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
+        },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -2305,14 +2313,6 @@ pub async fn restore_context(
         members: actor_members,
         governance: GovernanceState {
             engine: governance_engine,
-            executed_proposals: {
-                let now = deps.clock.now_secs();
-                ctx_snapshot
-                    .executed_proposals
-                    .into_iter()
-                    .map(|id| (id, now))
-                    .collect()
-            },
             next_proposal_seq: ctx_snapshot
                 .next_proposal_seq
                 .max(ctx_snapshot.approved_proposals.len() as u64),
@@ -2320,8 +2320,6 @@ pub async fn restore_context(
             freeze: ctx_snapshot.governance_freeze,
             timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
-            threshold_signers: ctx_snapshot.threshold_signers,
-            threshold_value: ctx_snapshot.threshold_value,
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
             registered_tools: ctx_snapshot.registered_tools,
@@ -2339,11 +2337,6 @@ pub async fn restore_context(
             velocity_tracker: validated_velocity_tracker,
             participation_cache: ctx_snapshot.participation_cache,
             cooldown_until: ctx_snapshot.cooldown_until,
-            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
-                context_id.to_owned(),
-                Arc::clone(&deps.clock),
-                ctx_snapshot.spending_nonce_tracker_state,
-            ),
             // ADR-049 §9 Class S: restore the revocation set FROM the snapshot.
             // Resetting it to empty here (the prior behaviour) silently dropped
             // every revocation on actor respawn / process restart — a
@@ -2351,6 +2344,24 @@ pub async fn restore_context(
             // forbids. The snapshot is authoritative.
             revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
             proposal_timestamps: ctx_snapshot.proposal_timestamps,
+            class_s: crate::context::state::GovernanceClassS {
+                executed_proposals: {
+                    let now = deps.clock.now_secs();
+                    ctx_snapshot
+                        .executed_proposals
+                        .into_iter()
+                        .map(|id| (id, now))
+                        .collect()
+                },
+                threshold_signers: ctx_snapshot.threshold_signers,
+                threshold_value: ctx_snapshot.threshold_value,
+                spending_nonce_tracker:
+                    scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                        context_id.to_owned(),
+                        Arc::clone(&deps.clock),
+                        ctx_snapshot.spending_nonce_tracker_state,
+                    ),
+            },
         },
         role_state: ctx_snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
@@ -2392,42 +2403,44 @@ pub async fn restore_context(
         // from its sanctioned `SagaPreparedStateSnapshot` mirror. The Welcome
         // scratchpad is genuinely transient and restarts fresh.
         recv_tracker: RecvSequenceTracker::new(),
-        saga_pending: ctx_snapshot
-            .saga_pending
-            .into_iter()
-            .map(|(id, mirror)| (id, mirror.into_prepared()))
-            .collect(),
         // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
         // it is reconstructable interface state, repopulated when the tool
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
-        // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
-        // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
-        // within the dedup TTL; reinitializing it empty on restore would let
-        // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
-        // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
-        // import drops it (the snapshot field is empty), so a foreign node starts
-        // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
-        // than the freshness skew tolerance) so the restored window matches the
-        // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
-            ctx_snapshot.xctx_nonce_dedup,
-            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-        ),
-        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
-        // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
-        // with durable output capture") so a Commit replayed after a crash
-        // re-emits the STORED output + the IDENTICAL receipt rather than
-        // re-invoking the tool. The live `CommittedToolInvocation` is public (no
-        // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
-        xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
-        xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
-        // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
-        // caller-side durable reservation reversal records so a crash-recovery
-        // abort can reverse the caller deduction + void the escrow from the
-        // record. Dropped on cross-node import (caller economy is local).
-        xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+        class_s: crate::context::actor::state::ClassSState {
+            saga_pending: ctx_snapshot
+                .saga_pending
+                .into_iter()
+                .map(|(id, mirror)| (id, mirror.into_prepared()))
+                .collect(),
+            // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
+            // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
+            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
+            // within the dedup TTL; reinitializing it empty on restore would let
+            // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
+            // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
+            // import drops it (the snapshot field is empty), so a foreign node starts
+            // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
+            // than the freshness skew tolerance) so the restored window matches the
+            // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
+            xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
+                ctx_snapshot.xctx_nonce_dedup,
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
+            // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+            // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
+            // with durable output capture") so a Commit replayed after a crash
+            // re-emits the STORED output + the IDENTICAL receipt rather than
+            // re-invoking the tool. The live `CommittedToolInvocation` is public (no
+            // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
+            xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+            xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
+            // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
+            // caller-side durable reservation reversal records so a crash-recovery
+            // abort can reverse the caller deduction + void the escrow from the
+            // record. Dropped on cross-node import (caller economy is local).
+            xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+        },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

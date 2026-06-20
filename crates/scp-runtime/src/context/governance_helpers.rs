@@ -1795,17 +1795,17 @@ pub fn execute_add_signer(
     if !state.membership.contains(did) {
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
-    if state.governance.threshold_signers.contains(did) {
+    if state.governance.class_s.threshold_signers.contains(did) {
         return Err(ContextError::PermissionDenied(format!(
             "DID is already a signer: {did}"
         )));
     }
-    if state.governance.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+    if state.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
         return Err(ContextError::LimitExceeded(format!(
             "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
         )));
     }
-    state.governance.threshold_signers.push(did.clone());
+    state.governance.class_s.threshold_signers.push(did.clone());
 
     let creator_did = state.role_state.creator_did.clone();
     let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
@@ -1863,18 +1863,23 @@ pub fn execute_remove_signer(
 
     require_active(&state.handle)?;
 
-    let before = state.governance.threshold_signers.len();
-    state.governance.threshold_signers.retain(|s| s != did);
-    if state.governance.threshold_signers.len() == before {
+    let before = state.governance.class_s.threshold_signers.len();
+    state
+        .governance
+        .class_s
+        .threshold_signers
+        .retain(|s| s != did);
+    if state.governance.class_s.threshold_signers.len() == before {
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
-    if state.governance.threshold_value > 0 {
-        let remaining = u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
-        if state.governance.threshold_value > remaining {
-            state.governance.threshold_signers.push(did.clone());
+    if state.governance.class_s.threshold_value > 0 {
+        let remaining =
+            u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+        if state.governance.class_s.threshold_value > remaining {
+            state.governance.class_s.threshold_signers.push(did.clone());
             return Err(ContextError::PermissionDenied(format!(
                 "removing signer would leave {remaining} signers < threshold {}",
-                state.governance.threshold_value
+                state.governance.class_s.threshold_value
             )));
         }
     }
@@ -1929,13 +1934,14 @@ pub fn execute_modify_threshold(
 
     require_active(&state.handle)?;
 
-    let signer_count = u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
+    let signer_count =
+        u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
     if new_threshold == 0 || new_threshold > signer_count {
         return Err(ContextError::PermissionDenied(format!(
             "threshold must be 1..={signer_count}, got {new_threshold}"
         )));
     }
-    state.governance.threshold_value = new_threshold;
+    state.governance.class_s.threshold_value = new_threshold;
 
     // ADR-049 §9 Class S: changing the governance threshold is an
     // authorization-control transition — persist fail-closed so a crash cannot
@@ -2187,12 +2193,24 @@ pub fn execute_resolve_conflict(
                 )));
             };
             let now = deps.clock.now_secs();
-            state.governance.executed_proposals.insert(*loser, now);
+            state
+                .governance
+                .class_s
+                .executed_proposals
+                .insert(*loser, now);
         }
         scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
             let now = deps.clock.now_secs();
-            state.governance.executed_proposals.insert(*proposal_a, now);
-            state.governance.executed_proposals.insert(*proposal_b, now);
+            state
+                .governance
+                .class_s
+                .executed_proposals
+                .insert(*proposal_a, now);
+            state
+                .governance
+                .class_s
+                .executed_proposals
+                .insert(*proposal_b, now);
         }
     }
 
@@ -2401,8 +2419,8 @@ pub fn execute_reconfigure_governance(
 
     require_active(&state.handle)?;
 
-    let original_signers = state.governance.threshold_signers.clone();
-    let original_threshold = state.governance.threshold_value;
+    let original_signers = state.governance.class_s.threshold_signers.clone();
+    let original_threshold = state.governance.class_s.threshold_value;
 
     let reconfigure_result: Result<(), ContextError> = (|| {
         for change in changes {
@@ -2410,30 +2428,30 @@ pub fn execute_reconfigure_governance(
                 scp_protocol::context::governance::GovernanceReconfigAction::RemoveInactiveSigner {
                     did,
                 } => {
-                    state.governance.threshold_signers.retain(|s| s != did);
+                    state.governance.class_s.threshold_signers.retain(|s| s != did);
                 }
                 scp_protocol::context::governance::GovernanceReconfigAction::ReduceThreshold {
                     new_threshold,
                 } => {
-                    let signer_count = u32::try_from(state.governance.threshold_signers.len())
+                    let signer_count = u32::try_from(state.governance.class_s.threshold_signers.len())
                         .unwrap_or(u32::MAX);
                     if *new_threshold == 0 || *new_threshold > signer_count {
                         return Err(ContextError::PermissionDenied(format!(
                             "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
                         )));
                     }
-                    state.governance.threshold_value = *new_threshold;
+                    state.governance.class_s.threshold_value = *new_threshold;
                 }
             }
         }
 
-        if state.governance.threshold_value > 0 {
+        if state.governance.class_s.threshold_value > 0 {
             let remaining =
-                u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
-            if state.governance.threshold_value > remaining {
+                u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            if state.governance.class_s.threshold_value > remaining {
                 return Err(ContextError::PermissionDenied(format!(
                     "reconfiguration left {remaining} signers < threshold {}",
-                    state.governance.threshold_value,
+                    state.governance.class_s.threshold_value,
                 )));
             }
         }
@@ -2441,8 +2459,8 @@ pub fn execute_reconfigure_governance(
     })();
 
     if let Err(e) = reconfigure_result {
-        state.governance.threshold_signers = original_signers;
-        state.governance.threshold_value = original_threshold;
+        state.governance.class_s.threshold_signers = original_signers;
+        state.governance.class_s.threshold_value = original_threshold;
         return Err(e);
     }
 
@@ -4473,6 +4491,7 @@ pub async fn execute_governance_action(
 
     if state
         .governance
+        .class_s
         .executed_proposals
         .contains_key(&proposal.proposal_id)
     {
@@ -4483,10 +4502,12 @@ pub async fn execute_governance_action(
     let now = deps.clock.now_secs();
     state
         .governance
+        .class_s
         .executed_proposals
         .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
     state
         .governance
+        .class_s
         .executed_proposals
         .insert(proposal.proposal_id, now);
 
@@ -4502,6 +4523,7 @@ pub async fn execute_governance_action(
             // error).
             state
                 .governance
+                .class_s
                 .executed_proposals
                 .remove(&proposal.proposal_id);
             return Err(e);

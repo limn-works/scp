@@ -246,7 +246,7 @@ pub fn enforce_send_economy(
             context_id,
             clock,
             pricing,
-            nonce_tracker: &mut governance.spending_nonce_tracker,
+            nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
             revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
             key_resolver,
         },
@@ -2099,12 +2099,9 @@ pub fn build_snapshot_from_state(
         // --- Persisted: threaded into ContextSnapshot below. ---
         // `engine` is persisted via `governance_model_config: Some(engine.model_config())`.
         engine: _engine_persisted_as_model_config,
-        executed_proposals: _executed_proposals,
         approved_proposals: _approved_proposals,
         next_proposal_seq: _next_proposal_seq,
         freeze: _freeze,
-        threshold_signers: _threshold_signers,
-        threshold_value: _threshold_value,
         pending_ceiling_modification: _pending_ceiling_modification,
         pending_economic_policy_change: _pending_economic_policy_change,
         registered_tools: _registered_tools,
@@ -2118,9 +2115,19 @@ pub fn build_snapshot_from_state(
         cooldown_until: _cooldown_until,
         message_pricing: _message_pricing,
         hard_rate_limit: _hard_rate_limit,
-        spending_nonce_tracker: _spending_nonce_tracker,
         revoked_spending_ucan_cids: _revoked_spending_ucan_cids,
         proposal_timestamps: _proposal_timestamps,
+        // Class-S governance subset (ADR-049 §9): exhaustively destructured so a
+        // NEW Class-S governance field forces a conscious persist decision here
+        // too. `executed_proposals` / `threshold_signers` / `threshold_value` /
+        // `spending_nonce_tracker` are all persisted into the snapshot below.
+        class_s:
+            crate::context::state::GovernanceClassS {
+                executed_proposals: _executed_proposals,
+                threshold_signers: _threshold_signers,
+                threshold_value: _threshold_value,
+                spending_nonce_tracker: _spending_nonce_tracker,
+            },
         // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
         // `timeout_task`: governance-timer handle, re-installed by the actor
         // registry on respawn (no durable identity to preserve).
@@ -2153,6 +2160,7 @@ pub fn build_snapshot_from_state(
         event_log_merkle_root: [0u8; 32],
         executed_proposals: state
             .governance
+            .class_s
             .executed_proposals
             .keys()
             .copied()
@@ -2161,8 +2169,8 @@ pub fn build_snapshot_from_state(
         registered_tools: state.governance.registered_tools.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),
         tool_interfaces: state.governance.tool_interfaces.clone(),
-        threshold_signers: state.governance.threshold_signers.clone(),
-        threshold_value: state.governance.threshold_value,
+        threshold_signers: state.governance.class_s.threshold_signers.clone(),
+        threshold_value: state.governance.class_s.threshold_value,
         pruning_policy: state.governance.pruning_policy.clone(),
         governance_model_config: Some(state.governance.engine.model_config()),
         economic_policy: state.governance.economic_policy.clone(),
@@ -2191,7 +2199,11 @@ pub fn build_snapshot_from_state(
         message_pricing: state.governance.message_pricing.clone(),
         hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state.governance.spending_nonce_tracker.snapshot_entries(),
+        spending_nonce_tracker_state: state
+            .governance
+            .class_s
+            .spending_nonce_tracker
+            .snapshot_entries(),
         revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),
@@ -2235,6 +2247,7 @@ pub(in crate::context) fn saga_pending_snapshot(
 > {
     use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
     state
+        .class_s
         .saga_pending
         .iter()
         .map(|(id, prepared)| {
@@ -2261,7 +2274,7 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
     crate::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
 > {
-    state.xctx_committed_outputs.clone()
+    state.class_s.xctx_committed_outputs.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
@@ -2280,7 +2293,7 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
 pub(in crate::context) fn xctx_committed_invocations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
-    state.xctx_committed_invocations.clone()
+    state.class_s.xctx_committed_invocations.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's caller-side durable
@@ -2303,7 +2316,7 @@ pub(in crate::context) fn xctx_caller_reservations_snapshot(
     crate::context::supervisor::saga_journal::SagaId,
     crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
 > {
-    state.xctx_caller_reservations.clone()
+    state.class_s.xctx_caller_reservations.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's B-owned cross-context
@@ -2318,7 +2331,7 @@ pub(in crate::context) fn xctx_caller_reservations_snapshot(
 pub(in crate::context) fn xctx_nonce_dedup_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<[u8; 16], u64> {
-    state.xctx_nonce_dedup.entries()
+    state.class_s.xctx_nonce_dedup.entries()
 }
 
 // ---------------------------------------------------------------------------

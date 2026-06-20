@@ -721,6 +721,261 @@ impl ContextModeState {
 }
 
 // ---------------------------------------------------------------------------
+// ClassSState — the actor's Class-S (fail-closed-persist) state subset
+// ---------------------------------------------------------------------------
+
+/// The Class-S subset of [`PerContextState`] (ADR-049 §9).
+///
+/// Groups the cross-context-saga fields whose mutation is a security-critical
+/// downward-authorization or anti-replay transition that MUST be persisted
+/// fail-closed before the operation is acknowledged. A ≤50 ms coalesce-window
+/// rollback of any of these re-opens a window the caller already observed as
+/// closed (a replay, a re-invoke, a double-settle).
+///
+/// This is a behaviour-neutral DATA SPLIT: the fields keep their `pub(crate)`
+/// visibility and existing call sites reach them through the lengthened path
+/// `class_s.<field>`. Privatizing them behind a persist-on-commit mutator
+/// boundary (so the fail-closed invariant becomes a compile error to violate,
+/// retiring the source-text gate) is a separate later PR.
+///
+/// # Not `Clone`
+///
+/// `saga_pending` holds [`SagaPreparedState`], which deliberately implements
+/// no `Clone` / `Serialize` (the §9.4.3 bearer-leak barrier), and
+/// `xctx_nonce_dedup` is a [`NonceDedup`] cache. So [`Self::snapshot`] /
+/// [`Self::restore`] project through the sanctioned mirrors
+/// ([`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot),
+/// [`NonceDedup::entries`] / [`NonceDedup::from_entries_with_ttl`]); the three
+/// committed/reservation witnesses are `Clone` and snapshot by clone.
+pub struct ClassSState {
+    /// Staged cross-context saga mutations awaiting Commit or Abort. Plan
+    /// §"Cross-context saga protocol" restricts to at most one entry —
+    /// concurrent sagas against the same actor are serialized by
+    /// rejecting new Prepare while this map is non-empty.
+    pub(crate) saga_pending: HashMap<SagaId, SagaPreparedState>,
+
+    /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
+    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). Keyed by the
+    /// 16-byte envelope `nonce`; bounded 10,000-entry / 5-minute-TTL /
+    /// oldest-first eviction (the same [`NonceDedup`] discipline §6.2.2 uses).
+    /// **B — the Prepare-B verifying party — owns this cache**: the
+    /// freshness/replay state lives where the authorization decision is made,
+    /// since Prepare-A runs on the caller's actor and cannot authoritatively
+    /// dedup against B's state. Prepare-B rejects a duplicate nonce and records
+    /// a fresh one on accept.
+    ///
+    /// **Class-S persisted — crash survival is load-bearing.** This cache IS
+    /// captured into the Class-S snapshot (its `(nonce, accepted-at-secs)`
+    /// entries are serialized by `xctx_nonce_dedup_snapshot`) and rehydrated on
+    /// restore (`NonceDedup::from_entries_with_ttl`). It is NOT reconstructable
+    /// freshness state: if it were dropped from the snapshot, a crash between
+    /// accept and the coalesce-window persist would clear the seen-nonce set and
+    /// re-open the §6.2.4 replay window an attacker could exploit by replaying a
+    /// captured envelope across the restart boundary. The persistence + restore
+    /// of this cache is what closes that window; do not delete it from the
+    /// snapshot.
+    ///
+    /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
+    /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
+    /// guarantee holds only while the *TTL*
+    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS),
+    /// 600 s — 2× the freshness skew tolerance), not eviction, is what drops an
+    /// entry. That requires the maximum number of distinct nonces a caller can
+    /// land within the TTL window to stay safely below the capacity. The
+    /// per-interface §6.2.0.2 inbound rate limit
+    /// (`InboundPolicy::max_calls_per_minute`) caps that accept rate: worst-case
+    /// `max_calls_per_minute × (SAGA_NONCE_DEDUP_TTL_SECS / 60)` distinct nonces
+    /// over the window. The default (60/min ⇒ 600 over the 10-minute window)
+    /// holds with a ~16× margin; the [`crate::context::actor::handlers::saga`]
+    /// tests assert a ≥2× margin against the default and a documented
+    /// configuration ceiling so a future high `max_calls_per_minute` cannot
+    /// silently erode the eviction-based bound.
+    pub(crate) xctx_nonce_dedup: NonceDedup,
+
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
+    /// durable output capture"). Populated at Commit-B settle with the captured
+    /// tool output, the signed [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt),
+    /// and the `tool_invoked_event_id`, so a Commit replayed after a crash
+    /// (§17.16.4) re-emits the STORED output and the IDENTICAL signed receipt —
+    /// NEVER re-invoking the tool, never minting a fresh event id.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9), the same
+    /// discipline as [`Self::saga_pending`]: a crash that rolled the capture
+    /// back behind an acked Commit-B would re-invoke the tool on replay and
+    /// re-sign a divergent receipt, breaking the exactly-once + receipt-
+    /// reproducibility guarantees. Survives same-node restore; dropped (like
+    /// `saga_pending`) on cross-node export/import — a foreign node must never
+    /// drive local Commit replay.
+    ///
+    /// **Retention bound.** A `SagaId`-keyed idempotency witness; one entry per
+    /// committed cross-context invocation, retained for the lifetime of the
+    /// context. It is intentionally append-only over the saga-journal retention
+    /// horizon: an entry is load-bearing only while a crash-replayed Commit
+    /// could still re-drive this saga (§17.16.4), i.e. until the saga journal
+    /// itself can no longer surface the saga for replay. Past that horizon an
+    /// entry is dead weight, so this map's compaction is tied to (and must not
+    /// outlive) saga-journal compaction — when the journal gains a retention cut
+    /// (the point past which replay is impossible), this map is pruned to the
+    /// same horizon. Until that seam exists the map grows with committed-saga
+    /// count; this note exists so that growth is a tracked retention decision,
+    /// not a silent leak. No speculative compaction is built here.
+    pub(crate) xctx_committed_outputs:
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
+
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
+    /// §17.16.4 crash recovery: "A re-acks its `CrossContextToolInvoked` append
+    /// and re-settles escrow as a no-op"). Commit-A inserts the `SagaId` here as
+    /// the idempotency witness BEFORE acking; a replayed Commit-A finds the
+    /// witness and re-acks without re-settling the escrow or re-appending the
+    /// `CrossContextToolInvoked` record.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): without
+    /// it, a crash that rolled the witness back behind an acked Commit-A would
+    /// double-settle the escrow on replay. Survives same-node restore; dropped
+    /// on cross-node export/import (a foreign saga must never drive local replay).
+    ///
+    /// **Retention bound.** Same discipline as
+    /// [`Self::xctx_committed_outputs`]: one `SagaId` per committed Commit-A,
+    /// retained for the context's lifetime and load-bearing only while a
+    /// crash-replayed Commit-A could still re-drive the saga (§17.16.4). Its
+    /// compaction is tied to saga-journal retention — pruned to the journal's
+    /// retention horizon once that horizon exists. Until then it grows with
+    /// committed-saga count; documented here so the growth is a tracked
+    /// retention decision rather than a silent memory-growth vector. No
+    /// speculative compaction is built here.
+    pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
+
+    /// Caller-side (A-owned) durable reversal records for in-flight
+    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// (spec §6.2.4 "Reservation release on every terminal path"). Prepare-A
+    /// inserts a [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
+    /// here in the SAME Class-S snapshot as the velocity / budget /
+    /// hard-rate-limit deduction + escrow authorization it persists, so the
+    /// deduction and the means to reverse it land atomically.
+    ///
+    /// **Why this exists.** The live
+    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// RAII carrier that normally reverses a caller reservation lives ONLY in
+    /// the supervisor's in-memory saga context and dies with an actor/process
+    /// crash. A `PreparingB`-window crash drives a CLEAN abort
+    /// (`Abort { reservation: None }`) to the caller actor; without a durable
+    /// record the persisted deduction could never be reversed and the external
+    /// escrow never voided — a durable over-charge + escrow leak. This map lets
+    /// the crash-recovery abort reverse the reservation BY `SagaId`, without the
+    /// carrier.
+    ///
+    /// **Carrier-authoritative; record is the crash-only fallback.** The live
+    /// `Abort { Some(reservation) }` and Commit-A paths reverse / settle via the
+    /// carrier, then CONSUME the record (remove without re-reversing). The
+    /// record's own reversal runs ONLY on the carrier-absent `Abort { None }`
+    /// path, so the two reversal paths are mutually exclusive by construction —
+    /// a saga is never double-reversed.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): a crash
+    /// that rolled an inserted record back behind an acked Prepare-A would lose
+    /// the only durable reversal handle for a deduction that DID persist.
+    /// Survives same-node restore; dropped on cross-node export/import (caller
+    /// economy is local — a foreign node must never drive local reversal),
+    /// exactly like [`Self::xctx_committed_invocations`].
+    ///
+    /// **Retention bound.** One entry per in-flight caller Prepare-A; consumed
+    /// (removed) on EVERY terminal path — Commit-A success, live abort, and
+    /// crash-recovery abort — so the map holds only genuinely in-flight caller
+    /// reservations and does not accumulate over the context lifetime.
+    pub(crate) xctx_caller_reservations: std::collections::HashMap<
+        SagaId,
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    >,
+}
+
+/// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
+///
+/// The live sub-struct cannot derive `Clone` (its `saga_pending` holds the
+/// non-`Clone` §9.4.3 bearer-barrier [`SagaPreparedState`], and
+/// `xctx_nonce_dedup` is a cache). This snapshot captures each field through
+/// its sanctioned mirror so [`ClassSState::restore`] can rebuild a value-stable
+/// copy. Used only for the in-memory snapshot/restore round-trip — the on-disk
+/// [`ContextSnapshot`](crate::context::state::ContextSnapshot) format is
+/// unchanged (these fields continue to serialize as their existing flat
+/// snapshot fields).
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 PR2a is a behaviour-neutral data split + mirror snapshot. The snapshot/restore mirror's first PRODUCTION consumer is the later privatization PR (restore wiring through the mutator-combinator boundary); for now it is exercised by the crate-internal lossless round-trip unit test. Mirrors the PR1 ClassSCell scaffolding precedent."
+)]
+pub struct ClassSStateSnapshot {
+    /// Mirror of [`ClassSState::saga_pending`], each entry projected through
+    /// [`SagaPreparedStateSnapshot::from_prepared`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot::from_prepared).
+    pub(crate) saga_pending:
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot>,
+    /// `(nonce → first-seen-secs)` entries of [`ClassSState::xctx_nonce_dedup`].
+    pub(crate) xctx_nonce_dedup_entries: HashMap<[u8; 16], u64>,
+    /// TTL of [`ClassSState::xctx_nonce_dedup`], captured so restore rebuilds
+    /// the same replay window via
+    /// [`NonceDedup::from_entries_with_ttl`].
+    pub(crate) xctx_nonce_dedup_ttl_secs: u64,
+    /// Mirror of [`ClassSState::xctx_committed_outputs`].
+    pub(crate) xctx_committed_outputs:
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
+    /// Mirror of [`ClassSState::xctx_committed_invocations`].
+    pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
+    /// Mirror of [`ClassSState::xctx_caller_reservations`].
+    pub(crate) xctx_caller_reservations: std::collections::HashMap<
+        SagaId,
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    >,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 PR2a is a behaviour-neutral data split + mirror snapshot. The snapshot/restore mirror's first PRODUCTION consumer is the later privatization PR (restore wiring through the mutator-combinator boundary); for now it is exercised by the crate-internal lossless round-trip unit test. Mirrors the PR1 ClassSCell scaffolding precedent."
+)]
+impl ClassSState {
+    /// Project this Class-S subset onto its `Clone`-able mirror (ADR-049 §9).
+    /// Lossless inverse of [`Self::restore`].
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> ClassSStateSnapshot {
+        use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
+        ClassSStateSnapshot {
+            saga_pending: self
+                .saga_pending
+                .iter()
+                .map(|(id, prepared)| {
+                    (
+                        id.clone(),
+                        SagaPreparedStateSnapshot::from_prepared(prepared),
+                    )
+                })
+                .collect(),
+            xctx_nonce_dedup_entries: self.xctx_nonce_dedup.entries(),
+            xctx_nonce_dedup_ttl_secs: self.xctx_nonce_dedup.ttl_secs(),
+            xctx_committed_outputs: self.xctx_committed_outputs.clone(),
+            xctx_committed_invocations: self.xctx_committed_invocations.clone(),
+            xctx_caller_reservations: self.xctx_caller_reservations.clone(),
+        }
+    }
+
+    /// Restore this Class-S subset from its mirror (ADR-049 §9), rehydrating
+    /// `saga_pending` via `into_prepared` and `xctx_nonce_dedup` from its
+    /// captured entries + TTL. Lossless inverse of [`Self::snapshot`].
+    pub(crate) fn restore(&mut self, snap: ClassSStateSnapshot) {
+        self.saga_pending = snap
+            .saga_pending
+            .into_iter()
+            .map(|(id, mirror)| (id, mirror.into_prepared()))
+            .collect();
+        self.xctx_nonce_dedup = NonceDedup::from_entries_with_ttl(
+            snap.xctx_nonce_dedup_entries,
+            snap.xctx_nonce_dedup_ttl_secs,
+        );
+        self.xctx_committed_outputs = snap.xctx_committed_outputs;
+        self.xctx_committed_invocations = snap.xctx_committed_invocations;
+        self.xctx_caller_reservations = snap.xctx_caller_reservations;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PerContextState — the actor's owned state payload
 // ---------------------------------------------------------------------------
 
@@ -1011,12 +1266,6 @@ pub struct PerContextState {
     /// Per-sender receive-sequence high-water marks for anti-replay.
     pub recv_tracker: RecvSequenceTracker,
 
-    /// Staged cross-context saga mutations awaiting Commit or Abort. Plan
-    /// §"Cross-context saga protocol" restricts to at most one entry —
-    /// concurrent sagas against the same actor are serialized by
-    /// rejecting new Prepare while this map is non-empty.
-    pub saga_pending: HashMap<SagaId, SagaPreparedState>,
-
     /// Target-side (B-owned) UCAN proof store for cross-context tool
     /// invocation (spec §6.2.4 normative (1)). Maps a `ucan_proof_id` — the
     /// INDEX carried on the `CrossContextToolInvoke` envelope, never the proof
@@ -1026,148 +1275,22 @@ pub struct PerContextState {
     /// `caller_did` + `tool_registration_id` (the confused-deputy defense). The
     /// store doubles as the delegation-chain `ProofResolver` for that
     /// validation. Empty until a gated tool interface is established; the
-    /// freshness/replay state ([`Self::xctx_nonce_dedup`]) and this store both
-    /// live where the authorization decision is made — on B's actor.
+    /// freshness/replay state ([`ClassSState::xctx_nonce_dedup`]) and this store
+    /// both live where the authorization decision is made — on B's actor.
     ///
     /// Not part of the Class-S snapshot: it is reconstructable interface state
     /// repopulated when the tool interface is (re-)established, never
     /// authorization secrecy whose coalesce-window rollback re-opens a replay.
     pub xctx_ucan_proofs: InMemoryProofResolver,
 
-    /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
-    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). Keyed by the
-    /// 16-byte envelope `nonce`; bounded 10,000-entry / 5-minute-TTL /
-    /// oldest-first eviction (the same [`NonceDedup`] discipline §6.2.2 uses).
-    /// **B — the Prepare-B verifying party — owns this cache**: the
-    /// freshness/replay state lives where the authorization decision is made,
-    /// since Prepare-A runs on the caller's actor and cannot authoritatively
-    /// dedup against B's state. Prepare-B rejects a duplicate nonce and records
-    /// a fresh one on accept.
-    ///
-    /// **Class-S persisted — crash survival is load-bearing.** This cache IS
-    /// captured into the Class-S snapshot (its `(nonce, accepted-at-secs)`
-    /// entries are serialized by `xctx_nonce_dedup_snapshot`) and rehydrated on
-    /// restore (`NonceDedup::from_entries_with_ttl`). It is NOT reconstructable
-    /// freshness state: if it were dropped from the snapshot, a crash between
-    /// accept and the coalesce-window persist would clear the seen-nonce set and
-    /// re-open the §6.2.4 replay window an attacker could exploit by replaying a
-    /// captured envelope across the restart boundary. The persistence + restore
-    /// of this cache is what closes that window; do not delete it from the
-    /// snapshot.
-    ///
-    /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
-    /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
-    /// guarantee holds only while the *TTL*
-    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS),
-    /// 600 s — 2× the freshness skew tolerance), not eviction, is what drops an
-    /// entry. That requires the maximum number of distinct nonces a caller can
-    /// land within the TTL window to stay safely below the capacity. The
-    /// per-interface §6.2.0.2 inbound rate limit
-    /// (`InboundPolicy::max_calls_per_minute`) caps that accept rate: worst-case
-    /// `max_calls_per_minute × (SAGA_NONCE_DEDUP_TTL_SECS / 60)` distinct nonces
-    /// over the window. The default (60/min ⇒ 600 over the 10-minute window)
-    /// holds with a ~16× margin; the [`crate::context::actor::handlers::saga`]
-    /// tests assert a ≥2× margin against the default and a documented
-    /// configuration ceiling so a future high `max_calls_per_minute` cannot
-    /// silently erode the eviction-based bound.
-    pub xctx_nonce_dedup: NonceDedup,
-
-    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
-    /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
-    /// durable output capture"). Populated at Commit-B settle with the captured
-    /// tool output, the signed [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt),
-    /// and the `tool_invoked_event_id`, so a Commit replayed after a crash
-    /// (§17.16.4) re-emits the STORED output and the IDENTICAL signed receipt —
-    /// NEVER re-invoking the tool, never minting a fresh event id.
-    ///
-    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9), the same
-    /// discipline as [`Self::saga_pending`]: a crash that rolled the capture
-    /// back behind an acked Commit-B would re-invoke the tool on replay and
-    /// re-sign a divergent receipt, breaking the exactly-once + receipt-
-    /// reproducibility guarantees. Survives same-node restore; dropped (like
-    /// `saga_pending`) on cross-node export/import — a foreign node must never
-    /// drive local Commit replay.
-    ///
-    /// **Retention bound.** A `SagaId`-keyed idempotency witness; one entry per
-    /// committed cross-context invocation, retained for the lifetime of the
-    /// context. It is intentionally append-only over the saga-journal retention
-    /// horizon: an entry is load-bearing only while a crash-replayed Commit
-    /// could still re-drive this saga (§17.16.4), i.e. until the saga journal
-    /// itself can no longer surface the saga for replay. Past that horizon an
-    /// entry is dead weight, so this map's compaction is tied to (and must not
-    /// outlive) saga-journal compaction — when the journal gains a retention cut
-    /// (the point past which replay is impossible), this map is pruned to the
-    /// same horizon. Until that seam exists the map grows with committed-saga
-    /// count; this note exists so that growth is a tracked retention decision,
-    /// not a silent leak. No speculative compaction is built here.
-    pub xctx_committed_outputs:
-        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
-
-    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
-    /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
-    /// §17.16.4 crash recovery: "A re-acks its `CrossContextToolInvoked` append
-    /// and re-settles escrow as a no-op"). Commit-A inserts the `SagaId` here as
-    /// the idempotency witness BEFORE acking; a replayed Commit-A finds the
-    /// witness and re-acks without re-settling the escrow or re-appending the
-    /// `CrossContextToolInvoked` record.
-    ///
-    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): without
-    /// it, a crash that rolled the witness back behind an acked Commit-A would
-    /// double-settle the escrow on replay. Survives same-node restore; dropped
-    /// on cross-node export/import (a foreign saga must never drive local replay).
-    ///
-    /// **Retention bound.** Same discipline as
-    /// [`Self::xctx_committed_outputs`]: one `SagaId` per committed Commit-A,
-    /// retained for the context's lifetime and load-bearing only while a
-    /// crash-replayed Commit-A could still re-drive the saga (§17.16.4). Its
-    /// compaction is tied to saga-journal retention — pruned to the journal's
-    /// retention horizon once that horizon exists. Until then it grows with
-    /// committed-saga count; documented here so the growth is a tracked
-    /// retention decision rather than a silent memory-growth vector. No
-    /// speculative compaction is built here.
-    pub xctx_committed_invocations: std::collections::HashSet<SagaId>,
-
-    /// Caller-side (A-owned) durable reversal records for in-flight
-    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
-    /// (spec §6.2.4 "Reservation release on every terminal path"). Prepare-A
-    /// inserts a [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
-    /// here in the SAME Class-S snapshot as the velocity / budget /
-    /// hard-rate-limit deduction + escrow authorization it persists, so the
-    /// deduction and the means to reverse it land atomically.
-    ///
-    /// **Why this exists.** The live
-    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
-    /// RAII carrier that normally reverses a caller reservation lives ONLY in
-    /// the supervisor's in-memory saga context and dies with an actor/process
-    /// crash. A `PreparingB`-window crash drives a CLEAN abort
-    /// (`Abort { reservation: None }`) to the caller actor; without a durable
-    /// record the persisted deduction could never be reversed and the external
-    /// escrow never voided — a durable over-charge + escrow leak. This map lets
-    /// the crash-recovery abort reverse the reservation BY `SagaId`, without the
-    /// carrier.
-    ///
-    /// **Carrier-authoritative; record is the crash-only fallback.** The live
-    /// `Abort { Some(reservation) }` and Commit-A paths reverse / settle via the
-    /// carrier, then CONSUME the record (remove without re-reversing). The
-    /// record's own reversal runs ONLY on the carrier-absent `Abort { None }`
-    /// path, so the two reversal paths are mutually exclusive by construction —
-    /// a saga is never double-reversed.
-    ///
-    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): a crash
-    /// that rolled an inserted record back behind an acked Prepare-A would lose
-    /// the only durable reversal handle for a deduction that DID persist.
-    /// Survives same-node restore; dropped on cross-node export/import (caller
-    /// economy is local — a foreign node must never drive local reversal),
-    /// exactly like [`Self::xctx_committed_invocations`].
-    ///
-    /// **Retention bound.** One entry per in-flight caller Prepare-A; consumed
-    /// (removed) on EVERY terminal path — Commit-A success, live abort, and
-    /// crash-recovery abort — so the map holds only genuinely in-flight caller
-    /// reservations and does not accumulate over the context lifetime.
-    pub xctx_caller_reservations: std::collections::HashMap<
-        SagaId,
-        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
-    >,
+    /// Class-S cross-context-saga state (ADR-049 §9). Groups the staged-saga
+    /// slot, the B-owned anti-replay nonce-dedup cache, and the three durable
+    /// committed/reservation witnesses whose ≤50 ms coalesce-window rollback
+    /// would re-open a replay / re-invoke / double-settle window the caller
+    /// already observed as closed. See [`ClassSState`] for the per-field
+    /// security rationale. Fields stay `pub(crate)` — privatization behind a
+    /// mutator-combinator boundary is a LATER PR.
+    pub(crate) class_s: ClassSState,
 
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1
@@ -1217,6 +1340,17 @@ fn empty_role_state_for_test() -> ContextRoleState {
 }
 
 impl PerContextState {
+    /// Read-only view of the staged cross-context saga slot
+    /// ([`ClassSState::saga_pending`]). A `pub` accessor (the field itself is
+    /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape
+    /// integration test can witness the slot without naming the crate-internal
+    /// sub-struct path.
+    #[inline]
+    #[must_use]
+    pub const fn saga_pending(&self) -> &HashMap<SagaId, SagaPreparedState> {
+        &self.class_s.saga_pending
+    }
+
     /// Pushes an event to the receive buffer and, if a broadcast channel
     /// is provided, sends a sanitized copy there too. Mirrors the
     /// security invariants of the standalone
@@ -1332,20 +1466,23 @@ impl PerContextState {
             last_seen_remote_checkpoint: HashMap::new(),
             send_tracker: SendSequenceTracker::new(),
             recv_tracker: RecvSequenceTracker::new(),
-            saga_pending: HashMap::new(),
             xctx_ucan_proofs: InMemoryProofResolver::new(),
-            // Seed the PRODUCTION saga dedup TTL (strictly longer than the
-            // freshness skew, BLACK-XCTX-01) in the test fixture too, so handler
-            // tests run the same anti-replay window the prod spawn / restore
-            // sites build — `NonceDedup::new()`'s default 300s TTL is coterminous
-            // with the skew tolerance, the condition the spec FORBIDS, and would
-            // make test-window behaviour diverge from production.
-            xctx_nonce_dedup: NonceDedup::with_ttl(
-                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-            ),
-            xctx_committed_outputs: HashMap::new(),
-            xctx_committed_invocations: std::collections::HashSet::new(),
-            xctx_caller_reservations: std::collections::HashMap::new(),
+            class_s: ClassSState {
+                saga_pending: HashMap::new(),
+                // Seed the PRODUCTION saga dedup TTL (strictly longer than the
+                // freshness skew, BLACK-XCTX-01) in the test fixture too, so
+                // handler tests run the same anti-replay window the prod spawn /
+                // restore sites build — `NonceDedup::new()`'s default 300s TTL is
+                // coterminous with the skew tolerance, the condition the spec
+                // FORBIDS, and would make test-window behaviour diverge from
+                // production.
+                xctx_nonce_dedup: NonceDedup::with_ttl(
+                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                ),
+                xctx_committed_outputs: HashMap::new(),
+                xctx_committed_invocations: std::collections::HashSet::new(),
+                xctx_caller_reservations: std::collections::HashMap::new(),
+            },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
@@ -1480,7 +1617,7 @@ mod tests {
         assert_eq!(s.created_at, 42);
         assert_eq!(s.lifecycle_state, ContextLifecycleState::Open);
         assert_eq!(s.send_tracker.last_issued(), 0);
-        assert!(s.saga_pending.is_empty());
+        assert!(s.class_s.saga_pending.is_empty());
         assert!(s.members.is_empty());
         assert!(s.welcome_scratchpad.is_none());
         assert!(s.event_log.is_none());
@@ -1558,17 +1695,23 @@ mod tests {
             last_seen_remote_checkpoint,
             send_tracker,
             recv_tracker,
-            saga_pending,
             xctx_ucan_proofs,
-            xctx_nonce_dedup,
-            xctx_committed_outputs,
-            xctx_committed_invocations,
-            xctx_caller_reservations,
+            class_s,
             pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
         } = s;
+
+        // Class-S sub-struct: exhaustively destructure so a new Class-S field
+        // forces an update here too (forward-lock against silent field drops).
+        let ClassSState {
+            saga_pending,
+            xctx_nonce_dedup,
+            xctx_committed_outputs,
+            xctx_committed_invocations,
+            xctx_caller_reservations,
+        } = class_s;
 
         // Identity + lifetime.
         assert_eq!(context_id, [3u8; 32]);
@@ -1682,12 +1825,15 @@ mod tests {
             last_seen_remote_checkpoint: _,
             send_tracker: _,
             recv_tracker: _,
-            saga_pending: _,
             xctx_ucan_proofs: _,
-            xctx_nonce_dedup: _,
-            xctx_committed_outputs: _,
-            xctx_committed_invocations: _,
-            xctx_caller_reservations: _,
+            class_s:
+                ClassSState {
+                    saga_pending: _,
+                    xctx_nonce_dedup: _,
+                    xctx_committed_outputs: _,
+                    xctx_committed_invocations: _,
+                    xctx_caller_reservations: _,
+                },
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,
             lifecycle_state: _,
@@ -1795,5 +1941,226 @@ mod tests {
         // Zeroization on drop is asserted by `Zeroizing`'s own tests; we
         // assert here only that the field compiles under `Zeroizing<[u8;32]>`.
         drop(kp);
+    }
+
+    /// ADR-049 §9 PR2a: the Class-S sub-struct mirror snapshot/restore is a
+    /// LOSSLESS round-trip. Populate `ClassSState` (incl. a staged saga + a
+    /// recorded nonce + the three committed/reservation witnesses) and
+    /// `GovernanceClassS` (executed-proposals + threshold + spending-nonce
+    /// tracker), snapshot both, MUTATE the live state, then restore — and assert
+    /// the observable state matches the pre-mutation snapshot. This is what makes
+    /// the mirror methods non-dead-code and proves the §9.4.3 bearer-barrier
+    /// (`saga_pending` is not `Clone`) survives the mirror without loss.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn class_s_and_governance_class_s_snapshot_restore_is_lossless() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::{
+            CallerReservationRecord, CommittedToolInvocation, CrossContextToolInvocationPrepared,
+            SagaPreparedState,
+        };
+
+        let mut state =
+            PerContextState::new_for_test_encrypted([0xC5u8; 32], 1_700_000_000, test_admin());
+
+        // --- Populate ClassSState ---
+        let saga_a = SagaId("saga-lossless-a".to_owned());
+        state.class_s.saga_pending.insert(
+            saga_a.clone(),
+            SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+                caller_context_id: [0x1Au8; 32],
+                target_context_id: [0x2Bu8; 32],
+                caller_did: DID("did:example:lossless-caller".to_owned()),
+                tool_registration_id: "lossless-tool-v1".to_owned(),
+                ucan_proof_id: "lossless-ucan".to_owned(),
+                recorded_timestamp_ms: 1_700_000_000_123,
+                recorded_nonce: [0x3Cu8; 16],
+                recorded_chain_depth: 2,
+            }),
+        );
+        state
+            .class_s
+            .xctx_nonce_dedup
+            .record([0x3Cu8; 16], 1_700_000_000);
+
+        let receipt =
+            scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[0x4Du8; 32]),
+                scp_protocol::context::tools::cross_context_saga::CrossContextToolReceiptFields {
+                    caller_context_id: [0x1Au8; 32],
+                    target_context_id: [0x2Bu8; 32],
+                    caller_did: "did:example:lossless-caller".to_owned(),
+                    nonce: [0x3Cu8; 16],
+                    tool_registration_id: "lossless-tool-v1".to_owned(),
+                    output_jcs: br#"{"ok":1}"#.to_vec(),
+                    tool_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+                    chain_depth: 2,
+                    timestamp_ms: 1_700_000_000_123,
+                },
+            )
+            .expect("receipt signs");
+        let committed_saga = SagaId("saga-lossless-committed".to_owned());
+        state.class_s.xctx_committed_outputs.insert(
+            committed_saga.clone(),
+            CommittedToolInvocation {
+                receipt,
+                output_bytes: br#"{"ok":1}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+            },
+        );
+        state
+            .class_s
+            .xctx_committed_invocations
+            .insert(committed_saga.clone());
+        let reservation_saga = SagaId("saga-lossless-reservation".to_owned());
+        let reservation_record = CallerReservationRecord {
+            actor_did: DID("did:example:lossless-caller".to_owned()),
+            deducted_cost: None,
+            needs_hard_rate_limit_refund: true,
+            recorded_at_secs: 1_700_000_000,
+            escrow_authorization: None,
+        };
+        state
+            .class_s
+            .xctx_caller_reservations
+            .insert(reservation_saga.clone(), reservation_record.clone());
+
+        // --- Populate GovernanceClassS ---
+        let executed_id = [0x5Eu8; 32];
+        state
+            .governance
+            .class_s
+            .executed_proposals
+            .insert(executed_id, 1_700_000_000);
+        state
+            .governance
+            .class_s
+            .threshold_signers
+            .push(DID("did:example:signer-1".to_owned()));
+        state.governance.class_s.threshold_value = 3;
+        // Seed a consumed spending-UCAN nonce so the tracker carries durable
+        // state. Seed via `from_snapshot` (explicit entries) rather than
+        // `.record()` so the test does not depend on wall-clock freshness — the
+        // entry's presence after the round-trip is what proves the tracker
+        // survives losslessly.
+        let spend_nonce = "1700000000000-aabbccddeeff00112233445566778899".to_owned();
+        let mut spend_entries = HashMap::new();
+        spend_entries.insert(spend_nonce.clone(), (1_700_000_000_u64, u64::MAX));
+        state.governance.class_s.spending_nonce_tracker =
+            scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                hex_encode_context_id(&[0xC5u8; 32]),
+                Arc::new(SystemClock) as Arc<dyn Clock>,
+                spend_entries,
+            );
+
+        // --- Snapshot BOTH sub-structs (the lossless mirror) ---
+        let class_s_snap = state.class_s.snapshot();
+        let gov_snap = state.governance.class_s.snapshot();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        // --- MUTATE the live state away from the snapshot ---
+        state.class_s.saga_pending.clear();
+        state.class_s.xctx_nonce_dedup = NonceDedup::new();
+        state.class_s.xctx_committed_outputs.clear();
+        state.class_s.xctx_committed_invocations.clear();
+        state.class_s.xctx_caller_reservations.clear();
+        state.governance.class_s.executed_proposals.clear();
+        state.governance.class_s.threshold_signers.clear();
+        state.governance.class_s.threshold_value = 0;
+        state.governance.class_s.spending_nonce_tracker =
+            scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                "wiped".to_owned(),
+                Arc::clone(&clock),
+            );
+
+        // --- RESTORE from the snapshots ---
+        state.class_s.restore(class_s_snap);
+        state.governance.class_s.restore(gov_snap, &clock);
+
+        // --- Assert observable state is value-stable ---
+        // saga_pending: the staged variant + its eight journaled fields survive.
+        assert_eq!(state.class_s.saga_pending.len(), 1);
+        match state
+            .class_s
+            .saga_pending
+            .get(&saga_a)
+            .expect("saga restored")
+        {
+            SagaPreparedState::CrossContextToolInvocation(inner) => {
+                assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
+                assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
+                assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
+                assert_eq!(inner.tool_registration_id, "lossless-tool-v1");
+                assert_eq!(inner.ucan_proof_id, "lossless-ucan");
+                assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
+                assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
+                assert_eq!(inner.recorded_chain_depth, 2);
+            }
+            SagaPreparedState::StandingPairCreate(_)
+            | SagaPreparedState::BroadcastHostingHandshake(_) => {
+                panic!("wrong saga variant after restore")
+            }
+        }
+        // xctx_nonce_dedup: the recorded nonce + TTL survive (a fresh replay of
+        // the same nonce within the TTL is still detected).
+        assert!(
+            state
+                .class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "recorded nonce survives the round-trip"
+        );
+        assert_eq!(
+            state.class_s.xctx_nonce_dedup.ttl_secs(),
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            "the dedup TTL survives the round-trip"
+        );
+        // committed outputs / invocations / reservations.
+        assert!(
+            state
+                .class_s
+                .xctx_committed_outputs
+                .contains_key(&committed_saga)
+        );
+        assert!(
+            state
+                .class_s
+                .xctx_committed_invocations
+                .contains(&committed_saga)
+        );
+        assert_eq!(
+            state
+                .class_s
+                .xctx_caller_reservations
+                .get(&reservation_saga),
+            Some(&reservation_record)
+        );
+
+        // GovernanceClassS.
+        assert!(
+            state
+                .governance
+                .class_s
+                .executed_proposals
+                .contains_key(&executed_id)
+        );
+        assert_eq!(
+            state.governance.class_s.threshold_signers,
+            vec![DID("did:example:signer-1".to_owned())]
+        );
+        assert_eq!(state.governance.class_s.threshold_value, 3);
+        // The spending-nonce tracker rehydrates value-stable: the consumed nonce
+        // entry survives the snapshot/restore round-trip (so a future replay
+        // would still be caught once the freshness window is re-entered).
+        assert!(
+            state
+                .governance
+                .class_s
+                .spending_nonce_tracker
+                .snapshot_entries()
+                .contains_key(&spend_nonce),
+            "restored spending-nonce tracker retains the recorded nonce"
+        );
     }
 }

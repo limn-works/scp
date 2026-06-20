@@ -541,6 +541,7 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         event_log_merkle_root: [0u8; 32],
         executed_proposals: state
             .governance
+            .class_s
             .executed_proposals
             .keys()
             .copied()
@@ -549,8 +550,8 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         registered_tools: state.governance.registered_tools.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),
         tool_interfaces: state.governance.tool_interfaces.clone(),
-        threshold_signers: state.governance.threshold_signers.clone(),
-        threshold_value: state.governance.threshold_value,
+        threshold_signers: state.governance.class_s.threshold_signers.clone(),
+        threshold_value: state.governance.class_s.threshold_value,
         pruning_policy: state.governance.pruning_policy.clone(),
         governance_model_config: Some(state.governance.engine.model_config()),
         economic_policy: state.governance.economic_policy.clone(),
@@ -581,7 +582,11 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         message_pricing: state.governance.message_pricing.clone(),
         hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state.governance.spending_nonce_tracker.snapshot_entries(),
+        spending_nonce_tracker_state: state
+            .governance
+            .class_s
+            .spending_nonce_tracker
+            .snapshot_entries(),
         revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),

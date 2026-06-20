@@ -574,7 +574,7 @@ pub async fn reserve_tool_economy(
             spending,
             invoker_did,
             context_id,
-            &mut state.governance.spending_nonce_tracker,
+            &mut state.governance.class_s.spending_nonce_tracker,
             &state.governance.revoked_spending_ucan_cids,
             key_resolver,
             clock,
@@ -618,7 +618,7 @@ pub async fn reserve_tool_economy(
         && let Some(spending) = spending_ucan
         && let Err(e) = scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
             spending,
-            &mut state.governance.spending_nonce_tracker,
+            &mut state.governance.class_s.spending_nonce_tracker,
         )
     {
         if let Some(cost) = deducted_cost {

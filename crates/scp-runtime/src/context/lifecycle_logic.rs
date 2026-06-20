@@ -315,7 +315,7 @@ pub fn enforce_join_economy(
         context_id,
         clock,
         pricing,
-        nonce_tracker: &mut governance.spending_nonce_tracker,
+        nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
         revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
         key_resolver,
     })

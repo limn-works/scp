@@ -306,13 +306,19 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         membership: ctx.membership.clone(),
         role_state: ctx.role_state.clone(),
         event_log_merkle_root: [0u8; 32],
-        executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
+        executed_proposals: ctx
+            .governance
+            .class_s
+            .executed_proposals
+            .keys()
+            .copied()
+            .collect(),
         ttl_remaining_secs,
         registered_tools: ctx.governance.registered_tools.clone(),
         read_exclusion_list: ctx.access.read_exclusion_list.clone(),
         tool_interfaces: ctx.governance.tool_interfaces.clone(),
-        threshold_signers: ctx.governance.threshold_signers.clone(),
-        threshold_value: ctx.governance.threshold_value,
+        threshold_signers: ctx.governance.class_s.threshold_signers.clone(),
+        threshold_value: ctx.governance.class_s.threshold_value,
         pruning_policy: ctx.governance.pruning_policy.clone(),
         governance_model_config: Some(ctx.governance.engine.model_config()),
         economic_policy: ctx.governance.economic_policy.clone(),
@@ -343,7 +349,11 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         message_pricing: ctx.governance.message_pricing.clone(),
         hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
+        spending_nonce_tracker_state: ctx
+            .governance
+            .class_s
+            .spending_nonce_tracker
+            .snapshot_entries(),
         revoked_spending_ucan_cids: ctx.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: ctx.pending_commits.clone(),
         commit_fault: ctx.commit_fault.clone(),
