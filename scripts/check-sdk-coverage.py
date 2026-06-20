@@ -247,6 +247,8 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["isMember"],
     },
     ("Governance", "member_role"): {
+        "python": ["context_member_role"],
+        "typescript": ["contextMemberRole"],
         "swift": ["memberRole"],
     },
     # Governance rows whose method lives under context_* in Python / TypeScript.
@@ -389,7 +391,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     ("MCP", "connect_client"): {
         "python": ["McpClient"],
-        "typescript": ["connectMcp", "McpClient"],
+        "typescript": ["mcpClientConnectStdio", "mcpClientConnectSse"],
         "swift": ["McpClient", "connect"],
     },
     # Server -- methods live on Relay/Node classes
