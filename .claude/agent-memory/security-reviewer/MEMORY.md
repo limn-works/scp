@@ -2,6 +2,17 @@
 
 ## SCP Codebase Security Patterns
 
+### ADR-039 Per-Message Persona Wiring (SCP-AB-021, ba06a8e0+7d4cdcf0) -- 2026-06-20 -- ZERO BLOCKING FINDINGS
+- KeyResolver widened to Fn(&DID, SigningKeyId)->Option<VerifyingKey>. Threaded signing_key_id through Supervisor::send_message -> handle_send_message -> messaging_helpers::send_message -> encrypt_and_send -> build_encrypted_envelope (removed hardcoded Active stamp at messaging_helpers.rs:178).
+- ATTRIBUTION INTEGRITY SOUND. verify_and_unwrap (messaging_helpers.rs:309) resolves key by SENDER-declared inner.signing_key_id, then verifies sig against THAT key. Forging persona fails: claim #agent while signing with #active => sig fails against registered #agent key. Mismatch caught at receive. Send-side has NO binding between signing_key and signing_key_id (both caller-supplied) -- usability footgun (produces unverifiable msg), NOT a forgery vector.
+- Governance votes ALL pin SigningKeyId::Active (majority/multisig/unanimity/SingleAdmin). Deliberate+documented: one-DID-one-vote scoped to human. Attacker cannot cast vote under #agent. SAFE.
+- Checkpoint send (send_checkpoint #active) + verify (verify_remote_checkpoint_authenticity queries_helpers.rs:735 #active) symmetric. Membership BEFORE sig BEFORE Merkle. Correct.
+- SigningKeyId::from_fragment (identity.rs) single canonical decoder, fail-closed (#active/#agent only; #0/bare/empty rejected). Deserialize routed through it.
+- economy KeyResolverDidResolver: bare path->Active; by_kid parses via from_fragment, MalformedToken on unknown. Fail-closed. Err msg includes VM name (public constant) -- no leak.
+- ALL production resolvers fail-closed: not_configured_key_resolver None for ALL kids; self_host/bridge_instance |_,_| None; FFI context_send PyO3/NAPI/UniFFI hardcode Active (NOT attacker-controllable). No prod resolver resolves real DID-doc VM keys yet (pre-existing: verification effectively off until wired).
+- OBSERVATION (PRE-EXISTING, not this diff): enforce_inner_envelope_category_a defined in scp-protocol but NEVER called on live receive path (verify_and_unwrap omits it). Inner-envelope Category-A custody enforcement unwired at runtime; absent in base 1dcbdd4b too.
+- No new unwrap/expect/panic in non-test code; agent_binding_pipeline_tests.rs (843 lines) is #[cfg(test)] gated.
+
 ### PyO3 Passphrase Storage + Redacting Debug (ed6290851, actor-per-context) -- 2026-06-04
 - See `pyo3-passphrase-storage-ed6290851.md`. CLEAN, no findings. Fail-closed passphrase path,
   exactly-one-of key/passphrase, hand-written redacting Debug on all 3 bridges, dev-affordance
