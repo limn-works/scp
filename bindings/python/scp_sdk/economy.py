@@ -10,13 +10,9 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import Any, TypedDict
 
 from scp_sdk.errors import ScpError
-
-if TYPE_CHECKING:
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Payment receipt verification types
@@ -207,16 +203,6 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
     # consistent across the SDK.
     m = metrics if metrics is not None else {}
     return bridge.economy_evaluate_formula(formula_json, m)
-
-
-# ---------------------------------------------------------------------------
-# Budget tracking
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Antispam velocity tracking
-# ---------------------------------------------------------------------------
 
 
 __all__ = [
