@@ -71,6 +71,37 @@ pub fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolv
     )
 }
 
+/// Builds a VM-aware governance [`KeyResolver`](scp_core::context::governance::KeyResolver)
+/// backed by a production [`IdentityBackedDidResolver`].
+///
+/// The returned closure resolves the voter's DID document live (cache-backed)
+/// and extracts the Ed25519 verifying key for the *exact* signing key the
+/// caller claims (`#active` or `#agent`, via
+/// [`IdentityBackedDidResolver::verifying_key_for`]). Governance vote signatures
+/// are therefore verified against the document-derived key rather than any
+/// key supplied by the caller (ADR-039 §3a).
+///
+/// Per the `KeyResolver` contract, any resolution failure — unknown DID,
+/// missing verification method, network-unavailable, downgrade, or a malformed
+/// key — collapses to `None` (the closure returns `Option`, not `Result`).
+/// `None` causes the governance engine to reject the vote, so failing closed
+/// here is the safe default.
+///
+/// Callers pass the bridge instance's resolver and receive a closure they
+/// cannot accidentally make collapse to the always-`None`
+/// [`not_configured_key_resolver`]: the only way to get this resolver is to
+/// already hold a real [`IdentityBackedDidResolver`].
+#[must_use]
+pub fn document_vm_key_resolver(
+    did_resolver: std::sync::Arc<IdentityBackedDidResolver>,
+) -> scp_core::context::governance::KeyResolver {
+    std::sync::Arc::new(
+        move |did: &scp_identity::DID, kid: scp_identity::SigningKeyId| {
+            did_resolver.verifying_key_for(did, kid).ok()
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // DID resolver helpers
 // ---------------------------------------------------------------------------
