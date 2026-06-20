@@ -123,7 +123,8 @@ async def discover_contexts(scp: Any, query: str) -> list[dict[str, Any]]:
     """
     import asyncio
 
-    results = await asyncio.to_thread(scp._native.context_discover, query)
+    bridge = _bridge()
+    results = await asyncio.to_thread(bridge.context_discover, query)
     return [dict(item) for item in results]
 
 

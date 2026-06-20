@@ -1194,6 +1194,15 @@ def main() -> int:
                                 f"must be a non-empty string"
                             )
                             errors += 1
+                else:
+                    # Cell value is neither True, False, nor None (e.g. a
+                    # typo'd string "true" or an integer).  Reject it so
+                    # authoring errors don't silently fall through.
+                    print(
+                        f"  ERROR: {domain}/{op_name}: SDK '{sdk}' has unexpected cell value "
+                        f"{expected!r} — must be true, false, or null."
+                    )
+                    errors += 1
 
             # All-exempted check: if every SDK that claims coverage for this
             # operation has a coverage_exemption (and none was statically

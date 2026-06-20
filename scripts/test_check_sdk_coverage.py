@@ -10,6 +10,8 @@ Covers:
      least one other SDK is statically verified.
   6. Gate exits 1 when every true cell for an op has a coverage_exemption but
      none is statically verified (all-exempted guard).
+  7. Gate exits 1 when a cell value is neither a boolean nor null (e.g. the
+     string "true" instead of a JSON boolean true).
 """
 
 from __future__ import annotations
@@ -494,4 +496,59 @@ def test_gate_fails_on_invalid_false_entry_exemption_reason(tmp_path: Path) -> N
     )
     assert "must be a non-empty string" in result.stdout, (
         f"Expected 'must be a non-empty string' in stdout.\nstdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Gate exits 1 when a cell value is not a boolean or null
+#
+# A typo'd string "true" (instead of JSON boolean true) must be rejected.
+# The gate's else-branch fires, emits "unexpected cell value", and exits 1.
+# This test is mutation-robust: removing the else-branch causes the string
+# cell to fall through silently, making returncode 0 and the assertion fail.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_unexpected_cell_value(tmp_path: Path) -> None:
+    """A cell value that is not a boolean or null must be rejected.
+
+    The string ``"true"`` is a common authoring mistake (JSON requires bare
+    ``true``, not the quoted form).  Without the else-branch, this silently
+    falls through and the capability appears unchecked.  With the branch,
+    the gate emits an 'unexpected cell value' error and exits 1.
+    """
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "cell_value_op_zzz",
+                        # python uses the string "true" — a typo that must be rejected
+                        "python": "true",
+                        "typescript": False,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "typescript": "Not yet implemented in TypeScript SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for unexpected cell value, got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "unexpected cell value" in result.stdout, (
+        f"Expected 'unexpected cell value' error phrase in stdout.\nstdout:\n{result.stdout}"
     )
