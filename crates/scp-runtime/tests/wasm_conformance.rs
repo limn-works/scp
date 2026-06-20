@@ -2425,6 +2425,43 @@ fn cross_impl_consequence_durability_gate_is_shared() {
     ));
 }
 
+/// Build-time guard against a `serde_json/preserve_order` regression.
+///
+/// The `consequence_event_payload` and `token_revoked_payload` leaves above are
+/// canonical because `serde_json::json!` builds a `BTreeMap` (sorted keys) when
+/// the `preserve_order` feature is OFF — which is the workspace default today.
+/// If any dependency ever turned that feature ON (it is additive across the
+/// whole build), `json!` would switch to an insertion-ordered map and the
+/// emitted leaf bytes would silently shift, breaking the §25 cross-impl
+/// Merkle-root KATs with no other build-time signal.
+///
+/// This test pins the property DIRECTLY and independently of any payload's
+/// field values: it constructs a JSON object whose keys are inserted in
+/// REVERSE-sorted order and asserts the serialized bytes come out in SORTED
+/// order. A `preserve_order` flip makes this assertion fail FIRST with a message
+/// naming the cause, turning a silent KAT drift into a loud, self-explaining
+/// build break.
+#[test]
+fn serde_json_emits_sorted_keys_preserve_order_must_stay_off() {
+    // Keys inserted in reverse-sorted order: `z`, `m`, `a`. With sorted-key
+    // (BTreeMap) serialization the output is `{"a":..,"m":..,"z":..}`; with
+    // `preserve_order` ON it would be `{"z":..,"m":..,"a":..}`.
+    let value = serde_json::json!({
+        "z": 1,
+        "m": 2,
+        "a": 3,
+    });
+    let bytes = serde_json::to_vec(&value).expect("json must serialize");
+    assert_eq!(
+        bytes,
+        br#"{"a":3,"m":2,"z":1}"#,
+        "serde_json must emit SORTED keys — a `preserve_order` (insertion-order) \
+         flip would silently shift convergent leaf bytes (consequence / \
+         TokenRevoked payloads) and break the §25 Merkle-root KATs. Keep the \
+         `preserve_order` feature OFF workspace-wide."
+    );
+}
+
 /// HONEST KNOWN-GAP MARKER (deliberately `#[ignore]`d — do NOT remove the
 /// attribute to make it "pass").
 ///

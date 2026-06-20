@@ -590,6 +590,22 @@ pub fn detect_and_handle_conflicts(
                 // `GovernanceFreezeExpired` leaf (`freeze_start + FREEZE_TIMEOUT`)
                 // is thus convergent-by-construction (§7.3.1, §9.9.3), matching the
                 // committer-assigned-timestamp treatment of other governance leaves.
+                //
+                // SECURITY (residual, accepted): `created_at` is proposer-chosen
+                // and backdatable (signature-bound only against third parties), so
+                // `freeze_start` — and thus the auto-resolution deadline — can be
+                // pulled earlier than honest wall-clock. Unlike the deferred
+                // ceiling / economic-policy windows (whose apply gate is pinned to
+                // a local non-backdatable `observed_at + PERIOD` floor in
+                // `is_effective`), the freeze is NOT an authorization control: it
+                // is a liveness safety valve that auto-resolves a stuck two-proposal
+                // deadlock. Backdating only ENDS a deadlock earlier (benign for
+                // safety, and never grants capability), and it requires TWO
+                // conflicting SIGNED proposals at the same sequence — i.e. two
+                // colluding signers, not a unilateral proposer. The
+                // local-floor treatment is therefore intentionally not applied
+                // here: it would force widening the `governance.freeze` tuple and
+                // its expiry/leaf-deadline consumers for no authorization gain.
                 let freeze_start = new_proposal.created_at.max(conflicting_proposal.created_at);
                 state.governance.freeze =
                     Some((new_proposal.proposal_id, conflicting_id, freeze_start));
@@ -1381,13 +1397,26 @@ pub fn execute_modify_ceiling(
     // copies the same value), never local `now()`. `effective_at =
     // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
     // members, so the deferred ceiling change activates at the same instant
-    // everywhere (§7.3.1, §9.9.3).
+    // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
+    // the `CeilingModified` leaf when the change applies.
+    //
+    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+    // only against third parties — the proposer can backdate it freely. Used
+    // alone as the apply gate, a proposer could set `created_at` far in the
+    // past so `effective_at <= commit time` and collapse the mandatory
+    // notification window to zero. To keep activation convergent yet
+    // non-backdatable, also record `observed_at` — THIS member's local clock at
+    // commit-processing time (not proposer-controlled). `is_effective` requires
+    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+    // never be shorter than `PERIOD` of locally observed time (§5.3.2).
     let notified_at = timestamp_secs;
     let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+    let observed_at = deps.clock.now_secs();
     state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
         new_capabilities: new_ceiling.to_vec(),
         notified_at,
         effective_at,
+        observed_at,
         proposal_id,
     });
 
@@ -2478,13 +2507,28 @@ pub fn execute_set_economic_policy(
     // copies the same value), never local `now()`. `effective_at =
     // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
     // members, so the deferred economic-policy change activates at the same
-    // instant everywhere (§7.3.1, §9.9.3).
+    // instant everywhere (§7.3.1, §9.9.3). This convergent value is also what
+    // lands on the `EconomicPolicyApplied` leaf when the change applies.
+    //
+    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+    // only against third parties — the proposer can backdate it freely. Used
+    // alone as the apply gate, a proposer could set `created_at` far in the
+    // past so `effective_at <= commit time` and collapse the mandatory 24-hour
+    // notification window to zero, violating §19.3 ("MUST NOT take effect
+    // sooner than 24 hours after the `EconomicPolicyChanged` event is committed
+    // to the event log"). To keep activation convergent yet non-backdatable,
+    // also record `observed_at` — THIS member's local clock at commit-
+    // processing time (not proposer-controlled). `is_effective` requires
+    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+    // never be shorter than `PERIOD` of locally observed time.
     let notified_at = timestamp_secs;
     let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+    let observed_at = deps.clock.now_secs();
     state.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
         new_policy: policy.clone(),
         notified_at,
         effective_at,
+        observed_at,
         proposal_id,
     });
 
