@@ -7070,6 +7070,18 @@ impl Supervisor {
     fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
         use crate::context::actor::commands::SigningKeyBytes;
         let committed_event_id = ctx.committed_b_tool_invoked_event_id.clone()?;
+        // B's VERIFIED staged provenance is the ONLY admissible source for the
+        // convergent marker-leaf nonce + timestamp. In the current FSM a
+        // committed B (`committed_event_id` is `Some`) always implies Prepare-B
+        // ran and `prepared_b` is set, so this `?` never trips on the live path.
+        // But the invariant is enforced by TYPES here, not by call-ordering: a
+        // future recovery path that runs this plan with `prepared_b: None` MUST
+        // NOT be able to substitute the caller-ASSERTED (untrusted, proposer-
+        // controlled) nonce / timestamp into a convergent durable leaf. Absent
+        // B's verified provenance there is no honest convergent value to mark
+        // with, so refuse to produce a marker plan — the caller already handles
+        // the `None`/skip outcome (no committed side ⇒ no divergence to record).
+        let prepared_b = ctx.prepared_b.as_ref()?;
         // Each side records the SAME (committed_side, committed_event_id, nonce)
         // — each into its own log under its OWN Active Signing Key. Only the
         // TARGET can have committed-then-diverged in the current FSM (Commit-B
@@ -7100,30 +7112,17 @@ impl Supervisor {
         // Source the STAGED `recorded_nonce` (B's captured copy of the wire
         // value) for symmetry with the signed receipt, which draws its `nonce`
         // from the same staged value (spec §6.2.4 *Staged nonce and recorded
-        // chain-depth*). A divergence marker can only exist once Commit-B landed
-        // (`committed_event_id` is `Some`), which implies Prepare-B ran and
-        // `prepared_b` is set — so this is the staged nonce in practice; the
-        // `asserted_nonce` fallback is defensive and equals the staged value by
-        // design (the nonce is a public correlation token B copies, not derives).
-        let marker_nonce = ctx
-            .prepared_b
-            .as_ref()
-            .map_or(ctx.asserted_nonce, |b| b.recorded_nonce);
+        // chain-depth*). Drawn from B's VERIFIED provenance only — never the
+        // caller-asserted nonce (see the `prepared_b` guard above).
+        let marker_nonce = prepared_b.recorded_nonce;
         // CONVERGENT marker-leaf timestamp: B's staged `recorded_timestamp_ms`
         // (the same value signed into the receipt and written into the
-        // committed-side `ToolInvoked` leaf), in SECONDS. A marker can only exist
-        // once Commit-B landed (`committed_event_id` is `Some`), which implies
-        // Prepare-B ran and `prepared_b` is set — so this is B's staged value in
-        // practice; the `asserted_timestamp_ms` fallback is defensive. Drawing
-        // the marker leaf's timestamp from this single convergent instant (rather
-        // than each emitting actor's local clock) keeps the marker leaf
-        // byte-identical across honest members (§7.3.1, §9.9.3, §6.2.4 *Recorded
-        // timestamp*).
-        let committed_timestamp_secs = ctx
-            .prepared_b
-            .as_ref()
-            .map_or(ctx.asserted_timestamp_ms, |b| b.recorded_timestamp_ms)
-            / 1000;
+        // committed-side `ToolInvoked` leaf), in SECONDS. Drawing the marker
+        // leaf's timestamp from this single convergent instant (rather than each
+        // emitting actor's local clock — or, worse, the caller-asserted value)
+        // keeps the marker leaf byte-identical across honest members (§7.3.1,
+        // §9.9.3, §6.2.4 *Recorded timestamp*).
+        let committed_timestamp_secs = prepared_b.recorded_timestamp_ms / 1000;
         Some((
             committed_event_id,
             marker_nonce,
