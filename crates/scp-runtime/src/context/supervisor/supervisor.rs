@@ -15975,11 +15975,45 @@ mod tests {
             })),
             executor_output: None,
             prepared_a: None,
-            prepared_b: None,
+            // A committed Commit-B (`committed_b_tool_invoked_event_id` is
+            // `Some`) always implies Prepare-B ran, so `prepared_b` is `Some` on
+            // the real FSM path. The marker draws its convergent nonce/timestamp
+            // from B's VERIFIED staged provenance here (never the caller-asserted
+            // values), so the staged copies mirror the asserted ones.
+            prepared_b: Some(crate::context::actor::commands::PreparedBFields {
+                recorded_timestamp_ms: 1_700_000_000,
+                recorded_nonce: nonce,
+                recorded_chain_depth: 3,
+            }),
             committed: None,
             committed_b_tool_invoked_event_id: Some(tool_invoked_event_id),
             reached_needs_repair: false,
         }
+    }
+
+    /// Security regression (black-hat): `divergence_marker_plan` MUST refuse to
+    /// mint a marker plan when `prepared_b` is absent — otherwise a future
+    /// recovery path could substitute the caller-ASSERTED (untrusted) nonce /
+    /// timestamp into a convergent durable marker leaf. With no verified
+    /// Commit-B provenance there is no honest convergent value, so the plan is
+    /// `None` (no marker emitted).
+    #[test]
+    fn divergence_marker_plan_refuses_without_verified_commit_b() {
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let mut ctx = divergence_ctx(
+            [0x42u8; 16],
+            "ToolInvoked:test".to_owned(),
+            &target_signing,
+            &caller_signing,
+            "did:dht:z6MkXctxDivCaller",
+        );
+        // Real path: committed Commit-B ⇒ prepared_b is Some ⇒ a plan exists.
+        assert!(Supervisor::divergence_marker_plan(&ctx).is_some());
+        // Synthetic unreachable case: committed event id present but no verified
+        // Prepare-B provenance ⇒ refuse to produce a plan (no untrusted fallback).
+        ctx.prepared_b = None;
+        assert!(Supervisor::divergence_marker_plan(&ctx).is_none());
     }
 
     /// NeedsRepair dual divergence marker (spec §6.2.4 "Dual event-log
