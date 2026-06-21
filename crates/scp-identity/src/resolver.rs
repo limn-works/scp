@@ -35,7 +35,9 @@ use tracing::{debug, info, warn};
 
 use crate::IdentityError;
 use crate::cache::{Clock, DidCache, SystemClock};
-use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
+use crate::dht::{
+    decode_multibase_key, extract_public_key, verify_bep44_signature, verify_self_certification,
+};
 use crate::dht_client::{DhtClient, DhtRecord};
 use crate::document::DidDocument;
 use crate::republish::RelayPublisher;
@@ -790,6 +792,65 @@ fn validate_dht_result(
 }
 
 // ---------------------------------------------------------------------------
+// Document → verifying-key extraction (ADR-053 / spec §10.17)
+// ---------------------------------------------------------------------------
+
+/// Extracts the Ed25519 verifying key for a specific signing key from a resolved
+/// DID document, keyed by the requested [`SigningKeyId`](scp_primitives::SigningKeyId).
+///
+/// This is the single, pure, sync document→key extraction shared by every
+/// participant that verifies governance vote signatures against a voter's
+/// *document-derived* key (ADR-039 §3a):
+///
+/// - the FFI bridges' `IdentityBackedDidResolver::verifying_key_for`
+///   (`scp-ffi-common`), wrapped into the bridge `KeyResolver` by
+///   `document_vm_key_resolver`; and
+/// - the co-located self-host participant `Supervisor` (`scp-node`,
+///   `self_host.rs`), per ADR-053 / spec §10.17 — a co-located participant is a
+///   real participant and MUST use the real document-derived resolver, never a
+///   `|_, _| None` stub.
+///
+/// It lives here, in the lowest layer that owns every primitive it needs
+/// ([`DidDocument::verification_method_by_fragment`], [`decode_multibase_key`],
+/// `ed25519-dalek`), so both consumers call ONE tested helper rather than
+/// duplicating the extraction — a second copy is exactly the "resolver silently
+/// ignores the `SigningKeyId`" failure mode ADR-053 §Rejected-Alternatives-3
+/// warns against. `scp-ffi-common` depends on `scp-node`, so `scp-node` cannot
+/// call the bridge copy without a crate cycle; hoisting the pure extraction here
+/// breaks that cycle.
+///
+/// The lookup is keyed by [`SigningKeyId::fragment`](scp_primitives::SigningKeyId::fragment)
+/// (`"active"` / `"agent"`) — the `SigningKeyId` is honored, never ignored:
+/// resolving [`SigningKeyId::Agent`](scp_primitives::SigningKeyId::Agent) returns
+/// the document's distinct `#agent` key, not the `#active` key.
+///
+/// # Purity and downgrade protection
+///
+/// This is a **pure** function of `(document, kid)`: it performs no resolution,
+/// no I/O, and advances no sequence/rotation state. The load-bearing
+/// anti-rollback guard is the shared `DualLayerResolver`/[`DidCache`] sequence
+/// check performed during [`resolve`](DidResolver::resolve) (which produced the
+/// `document`); this helper deliberately re-implements no per-instance rotation
+/// ratchet on top of it.
+///
+/// # Returns
+///
+/// `Some(key)` when the requested verification method is present and decodes to
+/// a valid Ed25519 curve point; `None` when the verification method is absent,
+/// its `publicKeyMultibase` cannot be decoded, or the bytes are not a valid
+/// Ed25519 public key. `None` is the safe per-lookup miss — a caller building a
+/// governance `KeyResolver` maps it to "vote rejected" (fail closed).
+#[must_use]
+pub fn verifying_key_from_document(
+    document: &DidDocument,
+    kid: scp_primitives::SigningKeyId,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let vm = document.verification_method_by_fragment(kid.fragment())?;
+    let bytes = decode_multibase_key(&vm.public_key_multibase).ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -810,6 +871,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::SigningKeyId;
     use crate::cache::{DidCache, TestClock};
     use crate::dht::bep44_signable;
     use crate::dht_client::{DhtRecord, InMemoryDhtClient};
@@ -1946,5 +2008,87 @@ mod tests {
 
         // No healing publisher configured — nothing should happen (no panic).
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // verifying_key_from_document (ADR-053 / spec §10.17, SHB-008)
+    // -----------------------------------------------------------------------
+
+    /// The hoisted pure extraction resolves the requested verification method,
+    /// honors the `SigningKeyId` (Active vs Agent are distinct keys, never
+    /// collapsed), and returns `None` when the requested method is absent.
+    ///
+    /// Builds a DID document with distinct `#active` and `#agent` verification
+    /// methods (via [`DidDocument::new_with_agent_key`]) and asserts:
+    /// - `SigningKeyId::Active` → `Some(active_key)`;
+    /// - `SigningKeyId::Agent` → `Some(agent_key)`, distinct from the active key;
+    /// - a document with NO `#agent` method → `None` for `SigningKeyId::Agent`.
+    #[test]
+    fn verifying_key_from_document_resolves_active_agent_and_rejects_missing() {
+        // Distinct Ed25519 keys for identity (#0), active (#active), and agent
+        // (#agent) so the SigningKeyId routing is observable, not a coincidence.
+        let active_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let agent_signing = SigningKey::from_bytes(&[9u8; 32]);
+        let active_key = active_signing.verifying_key();
+        let agent_key = agent_signing.verifying_key();
+        assert_ne!(
+            active_key.as_bytes(),
+            agent_key.as_bytes(),
+            "test setup: active and agent keys must differ"
+        );
+
+        let identity_pub = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let did = format!("did:dht:z{}", zbase32::encode(identity_pub.as_bytes()));
+
+        // Document carrying BOTH #active and #agent (ADR-039 shared-DID shape).
+        let doc_with_agent = DidDocument::new_with_agent_key(
+            &did,
+            identity_pub.as_bytes(),
+            active_key.as_bytes(),
+            &[3u8; 32],
+            Some(agent_key.as_bytes()),
+        );
+
+        // Active resolves to the active key.
+        let resolved_active = verifying_key_from_document(&doc_with_agent, SigningKeyId::Active)
+            .expect("active VM must resolve");
+        assert_eq!(
+            resolved_active.as_bytes(),
+            active_key.as_bytes(),
+            "SigningKeyId::Active must return the #active key"
+        );
+
+        // Agent resolves to the agent key — distinct from active (kid honored).
+        let resolved_agent = verifying_key_from_document(&doc_with_agent, SigningKeyId::Agent)
+            .expect("agent VM must resolve");
+        assert_eq!(
+            resolved_agent.as_bytes(),
+            agent_key.as_bytes(),
+            "SigningKeyId::Agent must return the #agent key"
+        );
+        assert_ne!(
+            resolved_agent.as_bytes(),
+            resolved_active.as_bytes(),
+            "the Agent key must be distinct from the Active key — the SigningKeyId \
+             is honored, not ignored"
+        );
+
+        // A document with NO #agent method returns None for the agent lookup
+        // (the requested verification method is absent).
+        let doc_no_agent = DidDocument::new(
+            &did,
+            identity_pub.as_bytes(),
+            active_key.as_bytes(),
+            &[3u8; 32],
+        );
+        assert!(
+            verifying_key_from_document(&doc_no_agent, SigningKeyId::Agent).is_none(),
+            "a missing #agent verification method must resolve to None"
+        );
+        // The active key is still resolvable on the agent-less document.
+        assert!(
+            verifying_key_from_document(&doc_no_agent, SigningKeyId::Active).is_some(),
+            "the #active method is present and must still resolve"
+        );
     }
 }
