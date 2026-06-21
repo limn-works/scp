@@ -734,6 +734,11 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// itself is not consulted by [`matches_trigger`] (which keys on
 /// `event_type` / `actor_did` / `timestamp` / `payload`), but pinning it
 /// deterministically keeps the merged sets identical across implementations.
+///
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
+/// FFI bridge (`crates/scp-ffi/wasm`) reimplements the convergent consequence
+/// path and delegates to this shared function across the crate boundary. It is
+/// not part of the SDK surface (see the cross-layer exemption registry).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn merge_consequence_events(

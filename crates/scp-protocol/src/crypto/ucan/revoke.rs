@@ -610,6 +610,11 @@ pub trait RevocationEventLogger {
 /// That sorted order is deterministic and identical across the native/PyO3/
 /// UniFFI/NAPI bridge path and the WASM bridge (same `serde_json`, same default
 /// features), which is what makes the leaf converge.
+///
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
+/// FFI bridge (`crates/scp-ffi/wasm`) and `crates/scp-ffi/common` build the
+/// token-revocation leaf via this shared function across the crate boundary. It
+/// is not part of the SDK surface (see the cross-layer exemption registry).
 #[must_use]
 pub fn token_revoked_payload(context_id: &str, token_cid: &str, revoker_did: &str) -> Vec<u8> {
     let value = serde_json::json!({
