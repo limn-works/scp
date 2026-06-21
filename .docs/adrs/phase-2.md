@@ -1852,3 +1852,59 @@ The two guarantees the typestate markers previously enforced collapse into **req
 - **architecture.md §2.5 (injection-through-initializers):** preserved; the config object is the initializer through which injection happens.
 - **Name reconciliation (`IdentitySource`):** `crates/scp-node/src/lib.rs` already defines a *private* `enum IdentitySource<K, D>` (variants `Generate { key_custody, did_method }`, `Explicit(Box<ExplicitIdentity>)`) used by the existing typestate builder. The public `IdentitySource` this ADR introduces has different variants (adds `Persisted`, field names `custody`/`did_method`). Phase B-P1 reconciles the collision — extend/reuse the existing enum or rename one — before the public type ships. The final name is an implementation decision, not fixed here.
 
+## ADR-053: Node Is Infrastructure; Participation Is an SDK Client
+
+> **Note:** ADR-053 is numbered sequentially after ADR-052 but, like ADR-032/035/042/052, lives in the Phase 2 document by *subject*, not by number: it governs `scp-node` (Phase 2, Context + Transport) and the self-host binary the SHB PRD ships. Its scope is cross-cutting — it constrains every construction site where a participant is created relative to a node.
+
+**Status:** Decided
+
+### Context
+
+A `scp-node` (`crates/scp-node`) is pure infrastructure: a relay (store-and-forward of opaque encrypted blobs, §10.4), an identity service (DID resolution / DHT publication), and an HTTP projection surface (§10.12.11). The specs already imply that a node never *participates* in a context as itself:
+
+- **§10.2 (Device-as-Node):** the device *is* a node, but the protocol's guarantee is "no server *owns* you" — identity and context state live with the DID, not the node.
+- **§10.4 (Relay Architecture):** relays are protocol-unaware — they "store and forward encrypted blobs," and "cannot read content, inspect membership, or understand context semantics."
+- **§10.5 (SDK Transport Architecture):** "The SCP SDK owns all protocol logic — contexts, agents, trust, capabilities, governance." Transport (the node's job) "is not the product."
+- **§10.12.6 (Transport Security):** the relay authenticates nothing at the transport level; MLS is the confidentiality boundary; the relay is a dumb pipe by construction.
+
+All *participation* — joining a context, creating an MLS group, publishing `BroadcastContent`, signing governance votes — is performed by an **SDK participant client** (a `Supervisor`/`ContextManager`, ADR-049) **bound to a DID**, which brings its own custody and runs the full protocol pipeline. There is exactly **one participant engine** in the codebase (the `Supervisor`); a node is never a second, special kind of participant.
+
+"Self-host website publishing" (the SHB PRD) reads at first glance like "the node participates." It is not. It is a **co-located SDK participant client running inside the node process**, sharing the node's custody, publishing the site as `BroadcastContent` over the node's own loopback relay (§10.12.11, ADR-042). The participant and the node are distinct roles that happen to share a process.
+
+The current implementation **violates** this boundary. `crates/scp-node/src/self_host.rs` hand-rolls the in-process `Supervisor` with a **stubbed `KeyResolver`** (`Arc::new(|_, _| None)`). A `|_, _| None` resolver means the co-located participant cannot verify any governance vote signature against a voter's document-derived key — it is a participant with verification disabled. The stub's own comment attributes this to a crate cycle (the production resolver, `document_vm_key_resolver`, lives in `scp-ffi-common`, which depends on `scp-node`). The FFI bridge, by contrast, wires the **real** resolver. The boundary this ADR draws makes the stub a recognized defect, not an accepted shape: a co-located participant is a *real* participant and MUST be constructed with the real, document-derived resolver.
+
+### Decision
+
+**A node is pure infrastructure and NEVER participates in a context as itself.** A node is: a relay (§10.4), an identity service, and an HTTP projection surface (§10.12.11). It holds custody and resolves DIDs, but it does not join contexts, create MLS groups, or sign protocol messages in its own right.
+
+**All participation is performed by an SDK participant client (a `Supervisor`/`ContextManager`) bound to a DID.** There is one participant engine. A participant brings custody, a DID, and the full protocol pipeline — including the **real, document-derived `KeyResolver`** that extracts a voter's verification-method key from their resolved DID document, keyed by the requested `SigningKeyId`. A participant constructed with a `|_, _| None` resolver is incomplete by the completeness baseline (CLAUDE.md) and is forbidden.
+
+There are **two deployment shapes** for a participant relative to a node:
+
+- **BUNDLED (co-located).** The participant client runs **inside the node process**. Custody/keys never cross a process boundary; it is a single binary. The participant reaches the node's relay over the in-process loopback socket (`ws://127.0.0.1:<relay_port>/scp/v1`, `RelayUrlSource::DhtResolved`), authenticating with the node's bridge bearer token. **This is the self-host website binary** (`scp-node --self-host`): the co-located `Supervisor` in `self_host.rs` publishes `BroadcastContent`; the node projects it over HTTP. The participant is not the node — it is a participant that the node hosts.
+
+- **EXTERNAL (separate process).** The participant client runs in **its own process**, connecting to a node's relay over the socket — loopback when same-box, `wss://` when off-host (§10.12.5/§10.12.6 transport rules apply). It **brings its own custody**. Its access to context content is enforced **cryptographically** (MLS group membership + UCAN capabilities — encryption-as-access-control), exactly as for any participant; the relay remains a protocol-unaware dumb pipe. A relay operator MAY additionally require an **admission token** on the external client connection as an **infrastructure abuse-prevention / rate-limiting control** (open `wss://` relays are spam/DoS/storage-abuse vectors; §10.4 mandates "rate limiting and abuse prevention"). That admission token is **not** the access-control boundary and is distinct from the node's internal bridge bearer token and from the loopback-only dev/control endpoints.
+
+The relay's external **client listener** is a deliberately distinct public surface: TLS-terminated (and optionally admission-token-gated) for EXTERNAL participants, while the node's dev/control and bridge endpoints remain loopback-only. Opening the relay to external participants does NOT open dev/bridge endpoints.
+
+### Rationale
+
+- **Makes an implied boundary explicit and mechanically enforceable.** §10.2/§10.4/§10.5/§10.12.6 already imply "node ≠ participant"; without a named decision, `self_host.rs` drifted into hand-rolling a half-participant inside the node. Naming the boundary turns the `|_, _| None` resolver from "an accepted node affordance" into a recognized defect.
+- **One participant engine (CLAUDE.md "Simple over complex," "one canonical pattern").** A "node-as-participant special mode" would be a second engine with its own (degraded) construction. Co-locating the *existing* `Supervisor` instead means the bundled binary runs the **same** code path as every other participant.
+- **Custody never crosses a process boundary in the BUNDLED shape** — the single-binary security property the self-host thesis depends on (§10.2 "no server owns you").
+- **Keeps the relay a dumb pipe in the EXTERNAL shape.** Access control stays cryptographic (MLS/UCAN); the optional admission token is abuse-prevention infrastructure, not a security boundary — so external participants are served without contradicting §10.4 (protocol-unaware relay) or the encryption-as-access-control tenet.
+
+### Rejected Alternatives
+
+1. **Node-as-participant special mode (rejected).** Let the node itself join contexts and publish, with a node-specific participant path that may run with a reduced resolver (the de-facto status quo at `self_host.rs`). **Rejected:** it creates a *second* participant engine alongside the `Supervisor`, violating "one canonical pattern" (Agent-first API design) and "Simple over complex." Worse, the node-specific path is where the `|_, _| None` resolver hid — a node "participating" with vote-verification disabled is exactly the resolver gap this ADR closes. A node has no DID-bound participant identity of its own; making it pretend to be one blurs §10.4's "protocol-unaware relay" guarantee. Participation must always be a real `Supervisor` bound to a DID with the real resolver, whether co-located or external.
+2. **Share an `Arc<dyn BlobStore>` directly between the co-located participant and the node (rejected).** Skip the loopback relay; hand the participant the node's blob backend in-process. **Rejected:** it makes the BUNDLED shape structurally different from the EXTERNAL shape (which must go over a socket), so the bundled binary would not exercise the real publish→relay→`commit_deploy` path. SHB-002 deliberately communicates via the loopback relay, "NOT a directly-shared `Arc` blob backend," so the same code path is proven end to end.
+3. **Keep the stubbed `KeyResolver` as a documented node limitation (rejected).** Accept `|_, _| None` because the cycle is inconvenient. **Rejected:** violates the completeness baseline ("never `None` when data exists elsewhere in the system"; CLAUDE.md). The real value exists; the only obstacle is crate layering. That is fixed by **hoisting the pure document-VM key extraction** (`verifying_key_from_document(document, kid)`) into a lower-layer crate (`scp-identity`, which already owns `DualLayerResolver` and every extraction primitive) and having both the FFI bridges and `scp-node` consume that one shared, tested helper — not by accepting a degraded participant, and not by duplicating the extraction inline in `scp-node` (a second copy is exactly the "resolver silently ignores the `SigningKeyId`" failure mode).
+4. **Make the EXTERNAL admission token the access-control boundary (rejected).** Gate participation itself on a relay-issued token. **Rejected:** it would re-introduce transport-level access control over a relay the protocol mandates be a dumb pipe (§10.4), duplicating — in weaker, relay-trusting form — the access control MLS/UCAN already enforce cryptographically (encryption-as-access-control). The token is retained only as optional abuse-prevention infrastructure, never as the security boundary.
+
+### Dependencies
+
+- **Spec §10.17 (Node vs. Participant):** the normative prose this ADR enacts. (Cross-references: §10.2, §10.4, §10.5, §10.12.6, §10.12.11.)
+- **ADR-049 (actor-per-context / `Supervisor`):** the one participant engine. The co-located and external clients are both `Supervisor` instances.
+- **ADR-042 (Broadcast Content Delivery):** the publish path the BUNDLED participant drives.
+- **ADR-052 (Unified Construction Pattern):** the participant and node are both constructed via flat config; a node config never carries "participate as self" — participation is always a separate `Supervisor` construction.
+

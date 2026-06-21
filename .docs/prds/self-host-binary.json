@@ -6,14 +6,16 @@
       "id": "gate-self-host-1",
       "name": "Self-Host Binary Run Mode",
       "priority": "P1",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SHB-001",
         "SHB-002",
         "SHB-003",
         "SHB-004",
         "SHB-005",
-        "SHB-006"
+        "SHB-006",
+        "SHB-007",
+        "SHB-008"
       ]
     }
   ],
@@ -68,33 +70,42 @@
     },
     {
       "id": "SHB-002",
-      "title": "Run an in-process Supervisor on a loopback relay for the self-host publish path",
+      "title": "Run a co-located SDK participant client (bundled shape) on a loopback relay for the self-host publish path",
       "gate": "gate-self-host-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-node/src/main.rs",
         "crates/scp-node/src/self_host.rs"
       ],
-      "description": "Self-host mode must publish broadcast site assets and then project them. The publish path requires a protocol participant (a Supervisor / ContextManager) connected to a relay so that `BroadcastContent` assets can be PUBLISHed before `commit_deploy` projects them. This story builds the self-host run path: construct an `ApplicationNode` via `ApplicationNodeBuilder::no_domain()` (per §10.12.8, §10.12.11) AND an in-process Supervisor connected to the node's own loopback relay (`ws://127.0.0.1:<relay_port>/scp/v1`, `RelayUrlSource::DhtResolved`, authenticated with the node's bridge bearer token; `connect_loopback_supervisor` in `crates/scp-node/src/self_host.rs`). The Supervisor publishes sealed `BroadcastContent` envelopes onto that relay's blob storage and `commit_deploy` scans the same relay's blob storage — communication is via the loopback relay, NOT a directly-shared `Arc` blob backend between Supervisor and node. This closes the publish -> commit_deploy loop. Asset publication and projection activation are SHB-003; this story is the runtime wiring (no_domain node + loopback-relay-connected Supervisor) only.",
+      "description": "Self-host mode publishes broadcast site assets and then projects them. Per ADR-053 and §10.17 (Node vs. Participant), the publishing actor is NOT the node participating in a context — it is a co-located SDK participant client (a Supervisor / ContextManager) running inside the node process (the BUNDLED deployment shape), sharing the node's custody. This story builds that bundled run path: construct an `ApplicationNode` via `ApplicationNodeBuilder::no_domain()` (per §10.12.8, §10.12.11) AND a co-located Supervisor connected to the node's own loopback relay (`ws://127.0.0.1:<relay_port>/scp/v1`, `RelayUrlSource::DhtResolved`, authenticated with the node's bridge bearer token; `connect_loopback_supervisor` in `crates/scp-node/src/self_host.rs`). The co-located participant MUST be constructed as a REAL participant: its `KeyResolver` MUST be the production document-derived resolver that extracts a voter's verification-method key from their resolved DID document keyed by the requested `SigningKeyId` (built via the hoisted `verifying_key_from_document` helper that SHB-008 places in `scp-identity` and that the FFI bridges' `document_vm_key_resolver` also consumes), NOT the `Arc::new(|_, _| None)` stub currently in `connect_loopback_supervisor`. The Supervisor publishes sealed `BroadcastContent` envelopes onto that relay's blob storage and `commit_deploy` scans the same relay's blob storage — communication is via the loopback relay, NOT a directly-shared `Arc` blob backend between Supervisor and node. This closes the publish -> commit_deploy loop. Asset publication and projection activation are SHB-003; this story is the runtime wiring (no_domain node + loopback-relay-connected real-resolver Supervisor) only.",
       "acceptanceCriteria": [
         "Self-host run path constructs the node via `ApplicationNodeBuilder::no_domain()`: `grep -q 'no_domain()' crates/scp-node/src/main.rs` returns true on the self-host code path",
         "Self-host run path constructs an in-process Supervisor connected to the node's own loopback relay: test `self_host_uses_selfhost_surface_and_loopback_relay` asserts the self-host surface is selected and the Supervisor publishes via a `127.0.0.1` loopback relay URL",
         "Behind a tunnel/proxy (`SCP_NODE_SELF_HOST_NO_NAT=1`), the loopback relay URL is used without running the STUN probe: test `skip_nat_probe_uses_loopback_relay_url_without_probing` asserts the loopback relay URL is bound and no NAT probe is performed",
         "Self-host run path does NOT call `.domain()` or provision ACME TLS: test `self_host_no_domain_skips_acme` asserts no ACME/domain TLS provisioning is invoked on the self-host path",
-        "End-to-end publish -> commit -> serve through the loopback relay succeeds: test `self_host_shares_single_root_storage_handle_and_serves` publishes assets through the Supervisor over the loopback relay and asserts the node serves them (proving the publish->commit_deploy loop closes over one shared root storage handle)"
+        "End-to-end publish -> commit -> serve through the loopback relay succeeds: test `self_host_shares_single_root_storage_handle_and_serves` publishes assets through the Supervisor over the loopback relay and asserts the node serves them (proving the publish->commit_deploy loop closes over one shared root storage handle)",
+        "The co-located participant uses the REAL document-derived KeyResolver, not the |_,_| None stub: CI command `grep -q 'verifying_key_from_document' crates/scp-node/src/self_host.rs` returns true",
+        "The forbidden stub is absent: CI command `grep -nE 'Arc::new\\(\\|_.*\\|\\s*None\\)' crates/scp-node/src/self_host.rs` returns no match (the |_,_| None KeyResolver in connect_loopback_supervisor is removed)",
+        "The resolver actually resolves: test `self_host_supervisor_keyresolver_resolves_active_key` registers a DID document and asserts the co-located Supervisor's KeyResolver returns Some(verifying_key) for SigningKeyId::Active and None for an unknown DID (proving it is not the constant-None stub)"
       ],
       "actionItems": [
         "Add a `run_self_host` function in main.rs guarded by the self_host CliConfig field",
         "Build the ApplicationNode with `ApplicationNodeBuilder::no_domain()`",
-        "Construct an in-process Supervisor/ContextManager connected to the node's loopback relay (bridge-bearer-authenticated) in `self_host.rs`",
-        "Add tests: self_host_uses_selfhost_surface_and_loopback_relay, skip_nat_probe_uses_loopback_relay_url_without_probing, self_host_no_domain_skips_acme, self_host_shares_single_root_storage_handle_and_serves"
+        "Construct a co-located Supervisor/ContextManager connected to the node's loopback relay (bridge-bearer-authenticated) in `self_host.rs`",
+        "Replace the `Arc::new(|_, _| None)` KeyResolver in connect_loopback_supervisor with the real resolver built from the hoisted `verifying_key_from_document` helper (SHB-008) over the node's DID resolver",
+        "Add tests: self_host_uses_selfhost_surface_and_loopback_relay, skip_nat_probe_uses_loopback_relay_url_without_probing, self_host_no_domain_skips_acme, self_host_shares_single_root_storage_handle_and_serves, self_host_supervisor_keyresolver_resolves_active_key"
       ],
       "blockedBy": [
-        "SHB-001"
+        "SHB-001",
+        "SHB-008"
       ],
       "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.17 Node vs. Participant"
+        },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
           "section": "### 10.12.8 ApplicationNode Integration"
@@ -106,6 +117,10 @@
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
           "section": "## 18.6 Application Node"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-053: Node Is Infrastructure; Participation Is an SDK Client"
         },
         {
           "file": ".docs/adrs/phase-2.md",
@@ -284,6 +299,101 @@
         {
           "file": ".docs/adrs/phase-2.md",
           "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-008",
+      "title": "Hoist the document-VM key extraction to scp-identity so scp-node can build a real participant resolver without a crate cycle",
+      "gate": "gate-self-host-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-ffi/common/src/resolvers.rs",
+        "crates/scp-ffi/common/src/bridge_runtime.rs",
+        "crates/scp-node/src/self_host.rs"
+      ],
+      "description": "Per ADR-053 / §10.17, a co-located participant MUST be a real participant with the real document-derived KeyResolver. Today the production extraction lives in scp-ffi-common (`IdentityBackedDidResolver::verifying_key_for` in `crates/scp-ffi/common/src/resolvers.rs`, wrapped by `document_vm_key_resolver` in `crates/scp-ffi/common/src/bridge_runtime.rs`). It cannot be called from scp-node because scp-ffi-common depends on scp-node (its `server` feature), so a scp-node -> scp-ffi-common edge would be a dependency cycle — this is the documented root cause of the `Arc::new(|_, _| None)` stub in `self_host.rs`. The extraction logic itself is pure and uses only primitives scp-node already depends on (DualLayerResolver, `DidDocument::verification_method_by_fragment`, `decode_multibase_key`, `SigningKeyId::fragment`, ed25519-dalek), all owned by scp-identity. This story hoists a single pure, sync helper `verifying_key_from_document(document, kid) -> Option<VerifyingKey>` (keyed by the requested SigningKeyId — never ignoring it) into scp-identity, and rewires BOTH consumers to call it: the FFI bridges' `verifying_key_for` and the new scp-node co-located resolver. Only the location of the extraction moves; the async->sync runtime bridging stays caller-local (it is runtime-specific). The load-bearing anti-rollback guard remains the shared DualLayerResolver/DidCache sequence check inside `resolve()`; this helper does pure document->key extraction only. No behavior change to the FFI bridges. This unblocks SHB-002's real-participant requirement.",
+      "acceptanceCriteria": [
+        "A single pure sync extraction helper exists in scp-identity and is keyed by SigningKeyId: CI command `grep -q 'fn verifying_key_from_document' crates/scp-identity/src/resolver.rs` returns true",
+        "The FFI bridge consumes the hoisted helper rather than a private re-implementation: CI command `grep -q 'verifying_key_from_document' crates/scp-ffi/common/src/resolvers.rs` returns true",
+        "The hoisted helper resolves the requested key and rejects unknowns: test `verifying_key_from_document_resolves_active_agent_and_rejects_missing` asserts Some(active_key) for SigningKeyId::Active, Some(agent_key) for SigningKeyId::Agent (distinct from the active key — the SigningKeyId is honored, not ignored), and None when the document lacks the requested verification method",
+        "No dependency cycle is introduced: `cargo build -p scp-node` and `cargo build -p scp-ffi-common` both succeed (no cyclic-dependency error)",
+        "FFI bridge behavior is unchanged: test `bridge_keyresolver_resolves_via_hoisted_helper` asserts the bridge KeyResolver returns Some(verifying_key) for a registered DID document's Active key",
+        "`DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test -p scp-identity verifying_key_from_document_resolves_active_agent_and_rejects_missing` passes"
+      ],
+      "actionItems": [
+        "Add `pub fn verifying_key_from_document(document: &DidDocument, kid: SigningKeyId) -> Option<VerifyingKey>` to scp-identity (resolver.rs), keyed by `kid.fragment()`, using verification_method_by_fragment + decode_multibase_key + VerifyingKey::from_bytes",
+        "Rewire `IdentityBackedDidResolver::verifying_key_for` in scp-ffi-common to call the hoisted helper instead of re-implementing extraction",
+        "Confirm scp-node depends on scp-identity (it already does) and add no scp-ffi-common edge; verify no cycle",
+        "Add tests: verifying_key_from_document_resolves_active_agent_and_rejects_missing (scp-identity), bridge_keyresolver_resolves_via_hoisted_helper (scp-ffi-common)"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.17 Node vs. Participant"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-053: Node Is Infrastructure; Participation Is an SDK Client"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-007",
+      "title": "Enable the external participant shape: relay client-listener bind config (TLS) + optional abuse-control admission token",
+      "gate": "gate-self-host-1",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs"
+      ],
+      "description": "ADR-053 / §10.17 define two participant deployment shapes; SHB-002 ships the BUNDLED (co-located) shape. This story enables the EXTERNAL shape: an SDK participant client in a separate process connecting to this node's relay over the socket — loopback same-box, wss:// off-host (§10.12.5/§10.12.6 transport rules). Two pieces: (1) an opt-in NodeConfig option (a `RelayClientListener` enum, flat-config per ADR-052, never a bool) that allows the relay's participant-facing client connection (the TLS-terminated `/scp/v1` public route) to serve EXTERNAL participants, defaulting to LoopbackOnly (fail-safe); when set to PublicTls it requires a TLS mode that terminates TLS on the public surface and the Full public surface (so `/scp/v1` is reachable over wss://), and it MUST be rejected (loud InvalidConfig) when combined with the SelfHost surface or Plaintext TLS. (2) An OPTIONAL admission token the node can issue and the `/scp/v1` upgrade handler validates as an ABUSE-PREVENTION / rate-limiting control — explicitly NOT the access-control boundary (access control for external participants is cryptographic: MLS group membership + UCAN, encryption-as-access-control; the relay stays a protocol-unaware dumb pipe per §10.4). The admission token is distinct from the node's internal bridge bearer token (which the public-route proxy injects on the operator's behalf and never exposes) and from the loopback-only dev/control endpoints. This story MUST NOT weaken SHB-005: dev/control (dev_api ALLOWED_HOSTS loopback-only) and bridge routes (`/v1/scp/bridge/*`) stay loopback-only and are never mounted on a public surface. Off-host external connections require wss:// (TLS); loopback ws:// remains permitted per §10.12.6. The startup disclosure (extending SHB-004's banner) MUST state when the relay client listener is opened to external participants beyond loopback.",
+      "acceptanceCriteria": [
+        "A relay client-listener option exists and is opt-in, defaulting to loopback-only: test `external_listener_defaults_to_loopback` asserts the RelayClientListener config defaults to LoopbackOnly when unset",
+        "PublicTls is rejected when it cannot be served safely: test `external_listener_rejects_plaintext_and_selfhost_surface` asserts NodeConfig validation returns InvalidConfig for PublicTls combined with Plaintext TLS, and for PublicTls combined with the SelfHost public surface, and returns Ok for PublicTls with a TLS-terminating Full surface",
+        "The admission token is abuse-control, distinct from the bridge bearer token: test `participant_admission_token_distinct_from_bridge_token` asserts an issued admission token value is not equal to `node.bridge_token_hex()`",
+        "When an admission token is configured, the public `/scp/v1` upgrade rejects connections lacking a valid token: test `external_listener_rejects_missing_admission_token` asserts a `/scp/v1` upgrade without the Authorization: Bearer admission token is refused, and with a valid token is accepted and proxied",
+        "Access control is not transferred to the relay: test `external_listener_admission_token_is_not_access_control` asserts that with admission disabled (the default), an MLS non-member still cannot read context content (cryptographic access control is unaffected by the transport admission setting)",
+        "SHB-005 is not weakened: test `self_host_public_surface_excludes_relay_and_bridge` still passes, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)",
+        "The startup banner discloses when the relay client listener is opened beyond loopback: test `external_listener_banner_discloses_public_bind` asserts the banner names the external participant listener and PUBLIC INTERNET exposure when PublicTls is enabled"
+      ],
+      "actionItems": [
+        "Add a `RelayClientListener` enum (LoopbackOnly default, PublicTls) to NodeConfig in config.rs/lib.rs, with validation rejecting PublicTls + Plaintext and PublicTls + SelfHost surface",
+        "Add optional admission-token issuance (distinct from the bridge bearer token, reusing the StorageBridgeLookup pattern) and validate it in the `/scp/v1` ws_upgrade_handler as abuse-control only",
+        "Require wss:// (TLS) for off-host external participant connections; permit ws:// for loopback per §10.12.6",
+        "Keep dev/control (ALLOWED_HOSTS loopback-only) and bridge routes unmounted on any public surface (do not regress SHB-005)",
+        "Extend the self-host startup banner to disclose relay-client-listener exposure beyond loopback",
+        "Add tests: external_listener_defaults_to_loopback, external_listener_rejects_plaintext_and_selfhost_surface, participant_admission_token_distinct_from_bridge_token, external_listener_rejects_missing_admission_token, external_listener_admission_token_is_not_access_control, external_listener_banner_discloses_public_bind"
+      ],
+      "blockedBy": [
+        "SHB-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.17 Node vs. Participant"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.6 Transport Security for Self-Hosted Relays"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-053: Node Is Infrastructure; Participation Is an SDK Client"
         }
       ],
       "details": {}
