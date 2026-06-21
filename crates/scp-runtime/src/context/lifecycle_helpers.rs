@@ -3723,7 +3723,8 @@ mod restore_reconcile_tests {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkPayConverge".to_owned(),
         ));
-        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_: &DID| None);
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_: &DID, _| None);
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
