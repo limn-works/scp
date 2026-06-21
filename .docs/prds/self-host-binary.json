@@ -87,7 +87,7 @@
         "Self-host run path does NOT call `.domain()` or provision ACME TLS: test `self_host_no_domain_skips_acme` asserts no ACME/domain TLS provisioning is invoked on the self-host path",
         "End-to-end publish -> commit -> serve through the loopback relay succeeds: test `self_host_shares_single_root_storage_handle_and_serves` publishes assets through the Supervisor over the loopback relay and asserts the node serves them (proving the publish->commit_deploy loop closes over one shared root storage handle)",
         "The co-located participant uses the REAL document-derived KeyResolver, not the |_,_| None stub: CI command `grep -q 'verifying_key_from_document' crates/scp-node/src/self_host.rs` returns true",
-        "The forbidden stub is absent: CI command `grep -nE 'Arc::new\\(\\|_.*\\|\\s*None\\)' crates/scp-node/src/self_host.rs` returns no match (the |_,_| None KeyResolver in connect_loopback_supervisor is removed)",
+        "The forbidden stub is absent (reformat-robust): CI command `rg -U --multiline 'Arc::new\\(\\s*\\|[^|]*\\|\\s*\\{?\\s*None' crates/scp-node/src/self_host.rs` returns no match (catches inline, block-body, and multiline-arg reformattings of the constant-None KeyResolver in connect_loopback_supervisor; the load-bearing gate is the positive resolves-test below)",
         "The resolver actually resolves: test `self_host_supervisor_keyresolver_resolves_active_key` registers a DID document and asserts the co-located Supervisor's KeyResolver returns Some(verifying_key) for SigningKeyId::Active and None for an unknown DID (proving it is not the constant-None stub)"
       ],
       "actionItems": [
@@ -127,7 +127,9 @@
           "section": "## ADR-035: Local HTTP Control API and Broadcast Projection"
         }
       ],
-      "details": {}
+      "details": {
+        "statusNote": "SHB-003/005/006 remain `done` because their acceptance criteria are resolver-independent (their tests do not exercise the governance KeyResolver); only SHB-002's new real-resolver criteria reopened this story to `pending`. SHB-002's pre-existing publish-path criteria and tests remain passing."
+      }
     },
     {
       "id": "SHB-003",
@@ -363,7 +365,7 @@
         "PublicTls is rejected when it cannot be served safely: test `external_listener_rejects_plaintext_and_selfhost_surface` asserts NodeConfig validation returns InvalidConfig for PublicTls combined with Plaintext TLS, and for PublicTls combined with the SelfHost public surface, and returns Ok for PublicTls with a TLS-terminating Full surface",
         "The admission token is abuse-control, distinct from the bridge bearer token: test `participant_admission_token_distinct_from_bridge_token` asserts an issued admission token value is not equal to `node.bridge_token_hex()`",
         "When an admission token is configured, the public `/scp/v1` upgrade rejects connections lacking a valid token: test `external_listener_rejects_missing_admission_token` asserts a `/scp/v1` upgrade without the Authorization: Bearer admission token is refused, and with a valid token is accepted and proxied",
-        "Access control is not transferred to the relay: test `external_listener_admission_token_is_not_access_control` asserts that with admission disabled (the default), an MLS non-member still cannot read context content (cryptographic access control is unaffected by the transport admission setting)",
+        "Access control is not transferred to the relay: test `external_listener_admission_token_is_not_access_control` asserts that an MLS non-member cannot read context content in BOTH states — with admission disabled (default), AND with admission enabled while presenting a valid admission token — proving the token is abuse-control only and never grants content access (cryptographic access control is unaffected by the transport admission setting)",
         "SHB-005 is not weakened: test `self_host_public_surface_excludes_relay_and_bridge` still passes, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)",
         "The startup banner discloses when the relay client listener is opened beyond loopback: test `external_listener_banner_discloses_public_bind` asserts the banner names the external participant listener and PUBLIC INTERNET exposure when PublicTls is enabled"
       ],
@@ -382,6 +384,10 @@
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
           "section": "## 10.17 Node vs. Participant"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.5 Tier 4: Domain-Based Deployment"
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
