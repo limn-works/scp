@@ -127,7 +127,7 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// The REAL document-derived governance
     /// [`KeyResolver`](scp_core::context::governance::KeyResolver) for the
     /// co-located participant (ADR-053 / spec §10.17). Build it with
-    /// [`document_vm_key_resolver`] over a
+    /// [`colocated_document_vm_key_resolver`] over a
     /// [`DualLayerResolver`](scp_identity::DualLayerResolver) that shares the
     /// node's [`DidCache`](scp_identity::DidCache); never the `|_, _| None` stub.
     pub key_resolver: scp_core::context::governance::KeyResolver,
@@ -438,11 +438,36 @@ impl SelfHostDeployer {
 /// are verified against each voter's document-derived key, never the
 /// `|_, _| None` stub the bundled path used to ship.
 ///
-/// The async resolution is bridged to the sync `KeyResolver` signature exactly
-/// as the bridge's `IdentityBackedDidResolver::resolve_sync` does: inside a
-/// tokio runtime, [`block_in_place`](tokio::task::block_in_place) drives the
-/// resolve on `handle` without starving a worker thread; outside one (no
-/// current runtime), `handle.block_on` is used directly.
+/// The async resolution is bridged to the sync `KeyResolver` signature with a
+/// runtime-FLAVOR-aware match, mirroring the repo's other async→sync bridges
+/// ([`ApplicationNode`]'s `stop_and_wait` and the supervisor's
+/// `try_consume_hard_rate_limit_from_any_context`):
+/// - **No ambient runtime** (a bare sync caller / `block_on`-driven entry):
+///   `handle.block_on` drives the resolve directly.
+/// - **Multi-thread runtime:** [`block_in_place`](tokio::task::block_in_place)
+///   re-enters `handle` to await the resolve without starving a worker thread.
+/// - **Current-thread runtime:** `block_in_place` is multi-thread-only and would
+///   PANIC here, so the resolve is driven on a DEDICATED `std::thread` that
+///   builds and `block_on`s its own current-thread runtime (see
+///   [`colocated_resolve_vm_on_dedicated_thread`]). A governance vote MUST be
+///   verified, never silently rejected by a runtime-bridging panic — so this
+///   branch resolves the key rather than returning `None`.
+///
+/// # Anti-rollback guard (load-bearing vs. defense-in-depth)
+///
+/// The load-bearing anti-rollback mechanism is the shared
+/// [`DidCache`](scp_identity::DidCache) sequence check performed INSIDE the
+/// resolver's [`resolve`](scp_identity::resolver::DidResolver::resolve)
+/// (operating on the node's shared cache). The FFI bridge's
+/// `IdentityBackedDidResolver::verifying_key_for` additionally applies a
+/// per-instance `seen_sequences` ratchet as defense-in-depth; that ratchet is
+/// intentionally NOT replicated here. It is a non-load-bearing artifact of the
+/// bridge's async→sync `IdentityBackedDidResolver` wrapper, and routing through
+/// that wrapper is impossible from scp-node — the wrapper lives in
+/// `scp-ffi-common`, which depends on scp-node, the dependency cycle this
+/// co-located helper exists to avoid. Adding a redundant ratchet here would
+/// re-check, in weaker per-instance form, a property the shared cache already
+/// enforces soundly.
 ///
 /// Per the `KeyResolver` contract, any resolution failure — unknown DID,
 /// missing verification method, network-unavailable, downgrade, or a malformed
@@ -455,7 +480,7 @@ impl SelfHostDeployer {
 /// callers constructing a [`DeploySiteParams`] (e.g. an integration test) build
 /// it the same way over their own
 /// [`DualLayerResolver`](scp_identity::DualLayerResolver).
-pub fn document_vm_key_resolver<R: scp_identity::resolver::DidResolver + 'static>(
+pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver + 'static>(
     resolver: Arc<R>,
     handle: tokio::runtime::Handle,
 ) -> scp_core::context::governance::KeyResolver {
@@ -464,17 +489,76 @@ pub fn document_vm_key_resolver<R: scp_identity::resolver::DidResolver + 'static
             let resolver = Arc::clone(&resolver);
             let did_owned = did.as_ref().to_owned();
             let handle = handle.clone();
-            // Bridge async -> sync exactly like IdentityBackedDidResolver::resolve_sync.
-            let resolve_outcome = if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::task::block_in_place(|| handle.block_on(resolver.resolve(&did_owned)))
-            } else {
-                handle.block_on(resolver.resolve(&did_owned))
-            };
-            // Any error or absent document is a per-lookup miss (fail closed).
-            let doc = resolve_outcome.ok().flatten()?;
-            scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+            // Bridge async -> sync with a runtime-FLAVOR-aware match. `block_in_place`
+            // is multi-thread-only and PANICS on a current-thread runtime, so the
+            // current-thread regime is driven on a dedicated thread instead.
+            match tokio::runtime::Handle::try_current() {
+                // No ambient runtime: drive the resolve directly on `handle`.
+                Err(_) => {
+                    let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
+                    let doc = outcome.ok().flatten()?;
+                    scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+                }
+                Ok(current) => match current.runtime_flavor() {
+                    // Multi-thread runtime: `block_in_place` re-enters `handle`.
+                    tokio::runtime::RuntimeFlavor::MultiThread => {
+                        let outcome = tokio::task::block_in_place(|| {
+                            handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
+                        }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
+                        let doc = outcome.ok().flatten()?;
+                        scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+                    }
+                    // Current-thread runtime: `block_in_place` would panic. Drive the
+                    // resolve on a dedicated thread that owns its own runtime, and
+                    // return the resolved key (a vote must be verified, not rejected).
+                    _ => colocated_resolve_vm_on_dedicated_thread(resolver, did_owned, kid),
+                },
+            }
         },
     )
+}
+
+/// Dedicated-thread escape hatch for the current-thread-runtime regime, where
+/// [`block_in_place`](tokio::task::block_in_place) would panic. Spawns a
+/// `std::thread`, builds a current-thread tokio runtime there, `block_on`s the
+/// resolve, extracts the requested verification-method key via the hoisted
+/// [`scp_identity::resolver::verifying_key_from_document`], and returns it over
+/// an mpsc channel.
+///
+/// Fails closed (`None`) on runtime-build failure or a join/recv error (the
+/// thread panicked before sending) — the `KeyResolver` per-lookup miss
+/// semantics — never panicking the governance caller. Mirrors the supervisor's
+/// `run_rate_limit_on_dedicated_thread`.
+fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolver + 'static>(
+    resolver: Arc<R>,
+    did_owned: String,
+    kid: scp_identity::SigningKeyId,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "co-located KeyResolver dedicated runtime build failed; failing closed"
+                );
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        let outcome = rt.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (dedicated current-thread runtime for the current-thread-runtime regime; mirrors run_rate_limit_on_dedicated_thread)
+        // Any error or absent document is a per-lookup miss (fail closed).
+        let key = outcome.ok().flatten().and_then(|doc| {
+            scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+        });
+        let _ = tx.send(key);
+    });
+    // A join/recv error (the thread panicked before sending) fails closed.
+    rx.recv().ok().flatten()
 }
 
 /// Builds an in-process [`Supervisor`](scp_core::context::supervisor::Supervisor)
@@ -486,7 +570,7 @@ pub fn document_vm_key_resolver<R: scp_identity::resolver::DidResolver + 'static
 /// closing the publish -> commit loop in-process.
 ///
 /// `key_resolver` is the REAL document-derived governance resolver (built via
-/// [`document_vm_key_resolver`] over a [`DualLayerResolver`](scp_identity::DualLayerResolver)
+/// [`colocated_document_vm_key_resolver`] over a [`DualLayerResolver`](scp_identity::DualLayerResolver)
 /// that shares the node's [`DidCache`](scp_identity::DidCache)). It is passed
 /// straight into [`Supervisor::with_providers`], so the co-located participant
 /// verifies governance votes against each voter's published verification method
@@ -1239,7 +1323,7 @@ fn build_shared_cache_key_resolver<D: scp_identity::dht_client::DhtClient + 'sta
         cache,
         Vec::new(),
     ));
-    document_vm_key_resolver(resolver, handle)
+    colocated_document_vm_key_resolver(resolver, handle)
 }
 
 /// The DHT-mode-independent inputs threaded from [`host_site_until`] into the
@@ -2561,7 +2645,7 @@ mod tests {
     }
 
     /// SHB-002: the co-located participant's `KeyResolver`, built via
-    /// [`document_vm_key_resolver`] over a `DualLayerResolver` sharing an
+    /// [`colocated_document_vm_key_resolver`] over a `DualLayerResolver` sharing an
     /// in-memory DHT + cache, resolves a registered DID's `#active` key and
     /// returns `None` for an unknown DID — proving it is the REAL
     /// document-derived resolver, not the constant-`None` stub.
@@ -2581,7 +2665,8 @@ mod tests {
             Arc::clone(&cache),
             Vec::new(),
         ));
-        let key_resolver = document_vm_key_resolver(resolver, tokio::runtime::Handle::current());
+        let key_resolver =
+            colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current());
 
         // A real resolver returns the document's #active key (NOT the None stub).
         let active_result = tokio::task::spawn_blocking({
@@ -2621,6 +2706,55 @@ mod tests {
         assert!(
             unknown.is_none(),
             "an unknown DID must resolve to None (fail closed)"
+        );
+    }
+
+    /// FINDING 1 (BLOCKER) regression: the co-located `KeyResolver` must resolve
+    /// when invoked on a CURRENT-THREAD tokio runtime — the flavor a bare
+    /// `#[tokio::test]` (and a current-thread-driven Supervisor) provides.
+    ///
+    /// The governance engine invokes the resolver synchronously while the
+    /// Supervisor's runtime is ambient. The old bridge gated solely on
+    /// `Handle::try_current().is_ok()` and then called `block_in_place`, which is
+    /// MULTI-THREAD-ONLY and PANICS on a current-thread runtime — silently
+    /// failing the vote instead of verifying it. This test calls the resolver
+    /// DIRECTLY on the current-thread runtime's thread (no `spawn_blocking`
+    /// hop-off to a multi-thread pool), so it exercises the current-thread
+    /// branch: it MUST return `Some(expected_key)` without panicking. Against the
+    /// pre-fix code this test panics; with the dedicated-thread bridge it passes.
+    #[tokio::test]
+    async fn colocated_document_vm_key_resolver_resolves_on_current_thread_runtime() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+
+        // Register a DID document into the shared in-memory DHT.
+        let (did, active_public) = seed_self_host_identity(&dht).await;
+
+        // Build the co-located participant resolver over the SHARED cache + DHT,
+        // exactly as the production `host_site` path wires it. `Handle::current()`
+        // here is the bare-`#[tokio::test]` CURRENT-THREAD runtime handle.
+        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::clone(&dht),
+            Arc::clone(&cache),
+            Vec::new(),
+        ));
+        let key_resolver =
+            colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current());
+
+        // Invoke DIRECTLY on the current-thread runtime's thread — the path that
+        // panicked under the old `block_in_place` gate. Must resolve, not panic.
+        let active_result = key_resolver(
+            &scp_identity::DID::from(did),
+            scp_identity::SigningKeyId::Active,
+        );
+        assert_eq!(
+            active_result,
+            Some(active_public),
+            "the co-located KeyResolver must resolve the registered DID's #active \
+             key when invoked on a current-thread runtime (proves the BLOCKER fix: \
+             the current-thread regime drives the resolve on a dedicated thread \
+             instead of panicking in block_in_place)"
         );
     }
 }

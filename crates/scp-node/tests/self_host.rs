@@ -127,7 +127,7 @@ impl BuiltNode {
             Arc::clone(&self.cache),
             Vec::new(),
         ));
-        scp_node::document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
+        scp_node::colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
     }
 }
 
@@ -834,7 +834,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
             Arc::clone(&cache),
             Vec::new(),
         ));
-        scp_node::document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
+        scp_node::colocated_document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
     };
 
     // -- Deploy the embedded site and assert it serves end to end. The
