@@ -6873,6 +6873,16 @@ impl Supervisor {
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let target_context_id = ctx.target_context_id;
+        // INVARIANT (spec §6.2.4 *Staged nonce*): the caller-side
+        // `CrossContextToolInvoked` leaf and the `CrossContextDivergenceMarker`
+        // form one `nonce`-joined provenance edge, so they MUST carry the same
+        // nonce. `ctx.asserted_nonce` is byte-identical to B's
+        // `prepared_b.recorded_nonce` (which the marker uses) because Prepare-B
+        // copies the wire nonce verbatim into `recorded_nonce` (saga.rs, "B's
+        // staged copy of the 16-byte wire nonce") — the nonce is a public
+        // correlation token B copies, never derives. If B's `recorded_nonce`
+        // ever stops being a verbatim copy, source this from
+        // `prepared_b.recorded_nonce` too so both records share one origin.
         let nonce = ctx.asserted_nonce;
         let receipt_for_a = receipt_bytes.to_vec();
 
