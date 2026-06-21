@@ -915,6 +915,9 @@ impl ContextActor {
             QueriesCommand::NeedsReconnect { reply, .. } => {
                 ack_not_impl(reply, "queries::needs_reconnect");
             }
+            QueriesCommand::PaymentHistory { reply, .. } => {
+                ack_not_impl(reply, "queries::payment_history");
+            }
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { reply, .. } => {
                 ack_not_impl(reply, "queries::get_access_key");
@@ -1516,9 +1519,10 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }

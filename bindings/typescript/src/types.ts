@@ -703,7 +703,7 @@ export interface TransportConfig {
 
 /** A protocol event from the context event log. */
 export interface Event {
-  /** Event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`). */
+  /** Event type (e.g., `"ContextCreated"`, `"MemberJoined"`, `"GovernanceActionExecuted"`). */
   readonly eventType: string;
   /** DID of the actor who produced this event. */
   readonly actorDid: string;
@@ -876,6 +876,15 @@ export interface ParticipationProfile {
   readonly governanceActionsBy: number;
   /** Total tool invocations across all tool types. */
   readonly toolInvocationCount: number;
+  /**
+   * Whether `toolInvocationCount` is anchored in the canonical Merkle log.
+   *
+   * `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+   * computed from per-author local events, not the Merkle log (§7.3.2; ADR-011
+   * amendment exclusion taxonomy §2). Consumers MUST NOT treat the count as
+   * Merkle-proven while this is `false`.
+   */
+  readonly toolInvocationCountAnchored: boolean;
   /** Number of contexts created. */
   readonly contextCreationCount: number;
   /** Number of role transitions. */

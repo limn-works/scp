@@ -1,5 +1,11 @@
 # Backend Agent Memory (scoped)
 
+- [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360
+
+- [project-convergent-timer-deadline-bases](project_convergent_timer_deadline_bases.md) — timer leaves (TTL/freeze/deferred-change) anchored on convergent bases not local now; new PerContextState::creation_timestamp_secs + anchor flag; restore/import stays local (signed-snapshot creation-time = ADR-051); WASM gov-execute fails loud (CTX-2041) vs silent 0; extension-override gotcha
+
+- [project-notification-window-non-backdatable](project_notification_window_non_backdatable.md) — HIGH fix (4cad781e5): bf9266777 made deferred econ/ceiling effective_at=proposal.created_at (proposer-backdatable→collapses notification window). effective_at IS a leaf base, so add observed_at (local commit-time) + gate=max(effective_at, observed_at+PERIOD); freeze left w/ SECURITY comment; preserve_order KAT guard added
+
 - [project-adr052-p3c-hostsiteconfig](project_adr052_p3c_hostsiteconfig.md) — ADR-052 P3c: HostSiteOptions→HostSiteConfig (name dodges FFI projection::SiteConfig collision); fold plaintext→TlsMode/skip_nat→Reach; promote DhtMode to shared config.rs; sugar=host_site(HostSiteConfig); no FFI touch
 
 - [project-ticket-1540-checkpoint-equivocation-sync](project_ticket_1540_checkpoint_equivocation_sync.md) — #1540 wire checkpoint+equivocation into sync/reconnect; Step-1 dup-type=MERGE (scp-protocol already deps scp-event-log, no tokio); full 7-step seam map

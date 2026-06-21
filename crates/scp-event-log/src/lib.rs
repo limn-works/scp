@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 76 event type variants.
+//! - [`EventType`] -- The 77 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -90,7 +90,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 76 event type variants for SCP context event logs.
+/// The 77 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -98,14 +98,16 @@ pub trait EventLogSigner: Send + Sync {
 /// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
-/// and app-sandbox-binding variants. This is a CLOSED set with no catch-all
+/// and app-sandbox-binding variants; the cross-context-saga event model
+/// (ADR-011 Amendment §6 for `CrossContextToolInvoked`; spec §6.2.4 for
+/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
 /// Governance event payloads are serialized into [`EventPayload`]. The
 /// payload fields for each governance event type are documented below;
 /// producers serialize them as `MessagePack` into `EventPayload::data`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// Context was created.
     ContextCreated,
@@ -170,35 +172,51 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// A governance proposal was created (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `proposer_did`, `action`,
-    /// `voting_deadline`.
+    /// Durable leaf payload: EMPTY. Both native (`append_context_event`,
+    /// `EventPayload::default()`) and WASM append this leaf with no payload so
+    /// the leaf preimage is byte-identical across platforms (§9.9.3
+    /// native↔WASM parity). The associated data (`proposal_id`,
+    /// `proposer_did`, `action`, `voting_deadline`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceProposalCreated,
     /// A vote was cast on a governance proposal (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `voter_did`, `vote`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `voter_did`, `vote`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteCast,
     /// A vote was withdrawn from a governance proposal (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `voter_did`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `voter_did`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteWithdrawn,
     /// A governance proposal was resolved (approved, rejected, expired)
     /// (ADR-031 §8).
     ///
-    /// Payload fields: `proposal_id`, `status`, `executor_did`,
-    /// `resulting_epoch`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_id`, `status`, `executor_did`,
+    /// `resulting_epoch`) rides only on the buffer-only `ContextEvent`, never
+    /// in the canonical Merkle leaf.
     GovernanceProposalResolved,
     /// A governance conflict was detected (two proposals landed at the
     /// same event log sequence) (ADR-031 §7).
     ///
-    /// Payload fields: `proposal_a`, `proposal_b`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`proposal_a`, `proposal_b`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictDetected,
     /// A governance conflict was resolved (ADR-031 §7).
     ///
-    /// Payload fields: `winner_id`, `resolution`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`winner_id`, `resolution`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictResolved,
     /// A deadlock recovery was performed (ADR-031 §10).
     ///
-    /// Payload fields: `justification`, `changes`.
+    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// associated data (`justification`, `changes`) rides only on the
+    /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceDeadlockRecovery,
     /// A governance action was executed from an approved proposal
     /// (ADR-031 §8).
@@ -222,7 +240,7 @@ pub enum EventType {
     // -------------------------------------------------------------------
     // Governance-action-coverage event types (native↔WASM unification;
     // ADR-011 Amendment in `.docs/adrs/phase-2.md`). Each traces to a
-    // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9 / §9.10
+    // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9
     // protocol action. Parameters live in [`EventPayload`], never in the
     // type name.
     // -------------------------------------------------------------------
@@ -279,8 +297,11 @@ pub enum EventType {
     /// A commit broadcast was deferred to the queue (deferred-commit queue
     /// record).
     CommitBroadcastPending,
-    /// A per-context pseudonym was announced (§9.10.4).
-    PseudonymAnnounced,
+    // PseudonymAnnounced (§9.10.4) is intentionally NOT a variant: a
+    // pseudonym announcement is a per-receiver routing-bootstrap signal, not a
+    // convergent durable event. It lives only as `ContextEvent::PseudonymAnnounced`
+    // (a receive-buffer notification) — see the ADR-011 Amendment exclusion list
+    // in `.docs/adrs/phase-2.md`, alongside MessageReceived and EquivocationDetected.
 
     // -------------------------------------------------------------------
     // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters
@@ -386,6 +407,43 @@ pub enum EventType {
     /// Payload (positional `MessagePack`): `app_did: String`. See
     /// [`crate::payload`].
     AppUnbound,
+
+    // -------------------------------------------------------------------
+    // Cross-context tool-call saga event types (ADR-011 Amendment §6
+    // carve-out; `.docs/adrs/phase-2.md`). UNLIKE the intra-context,
+    // per-author `ToolInvoked` emission (excluded as non-convergent under
+    // the §2 per-author exclusion), the cross-context tool-call saga records
+    // these WITHIN the saga's MLS-Commit phase: they are commit-ordered,
+    // convergent, durable leaves — every honest member processing the same
+    // saga commit produces the byte-identical leaf (committer-assigned
+    // timestamp drawn from B's signed `CrossContextToolReceipt`). The
+    // committed-side event id is itself a signed receipt field, so the
+    // record is canonical by design. See spec §6.2.4 "Dual event-log
+    // recording".
+    // -------------------------------------------------------------------
+    /// A cross-context tool call was recorded on the CALLER side (spec
+    /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
+    ///
+    /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
+    /// event. Emitted by the caller-side actor at Commit-A referencing the
+    /// target context id and the same `nonce` as the target's
+    /// [`EventType::ToolInvoked`] record, so an auditor joins the two into one
+    /// provenance edge. The committer-assigned leaf timestamp is the target's
+    /// signed-receipt `timestamp_ms` (B's staged Prepare-B instant), so two
+    /// honest members reconstruct the identical leaf.
+    CrossContextToolInvoked,
+    /// A one-sided cross-context saga commit was made durably auditable (spec
+    /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
+    ///
+    /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
+    /// event. Emitted on a `NeedsRepair` outcome into each available side's
+    /// log, recording which side committed, the `SagaId`, the `nonce`, and the
+    /// committed-side event id (a signed `CrossContextDivergenceMarker`
+    /// payload). The committer-assigned leaf timestamp is the target's staged
+    /// `recorded_timestamp_ms` (the same convergent instant the committed-side
+    /// [`EventType::ToolInvoked`] leaf carries), so the marker leaf is
+    /// byte-identical across honest members.
+    CrossContextDivergenceMarker,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +454,10 @@ pub enum EventType {
 ///
 /// Phase 2 stores the payload as opaque bytes. Future phases will introduce
 /// structured payload variants per `EventType`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`Default`] yields an empty payload (`data == []`), the canonical
+/// representation for non-parameterized events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventPayload {
     /// Opaque payload data. Interpretation depends on the event type.
     #[serde(with = "serde_bytes")]
@@ -650,8 +711,8 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 76-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_76_distinct_variants`.
+        // The 77-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -724,7 +785,6 @@ mod tests {
             EventType::PruningPolicyModified,
             EventType::CommitBroadcasted,
             EventType::CommitBroadcastPending,
-            EventType::PseudonymAnnounced,
             EventType::ContextTombstoned,
             EventType::ContextMigrationCancelled,
             EventType::TtlExtended,
@@ -741,19 +801,21 @@ mod tests {
             EventType::RecoveryEpochAdvanced,
             EventType::AppBound,
             EventType::AppUnbound,
+            EventType::CrossContextToolInvoked,
+            EventType::CrossContextDivergenceMarker,
         ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_76_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            76,
-            "closed EventType taxonomy must enumerate exactly 76 variants"
+            77,
+            "closed EventType taxonomy must enumerate exactly 77 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -764,8 +826,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            76,
-            "all 76 EventType variants must serialize to distinct values"
+            77,
+            "all 77 EventType variants must serialize to distinct values"
         );
     }
 

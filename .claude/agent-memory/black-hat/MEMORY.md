@@ -248,6 +248,7 @@ Notes:
 - action_ucan=None now means "already verified"
 - Current callers correct; future callers may skip capability check
 - No compile-time enforcement of precondition
+- [Event-Log Substrate Swap Phase 2](eventlog_substrate_swap_phase2.md) — RFC6962 swap: export forgery CLOSED; equivocation detector false-positive under dormant cross-member replication; in-memory dedup wiped on respawn
 
 ## ADR-039 Persona Attribution Wiring (branch claude/scp-network-architecture-7zq21l, ba06a8e0+7d4cdcf0)
 

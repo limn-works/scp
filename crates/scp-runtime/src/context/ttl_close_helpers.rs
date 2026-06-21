@@ -82,6 +82,16 @@ pub async fn handle_ttl_expiry(
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
 
+    // Timer-triggered expiry: the convergent leaf timestamp is the pre-computed
+    // TTL deadline held in convergent state (every member holds the identical
+    // value), never local `now()` (§7.3.1, §9.9.3). Fall back to the clock only
+    // if no deadline was recorded (defensive; the timer fires off a deadline).
+    let expiry_deadline_secs = state
+        .ttl
+        .timer
+        .deadline_unix_secs
+        .unwrap_or_else(|| deps.clock.now_secs());
+
     // Async TTL expiry logic. Pass transport for best-effort relay
     // ciphertext deletion (§5.11).
     let result = ttl::try_ttl_expiry_cleanup(
@@ -90,6 +100,7 @@ pub async fn handle_ttl_expiry(
         Some(deps.transport.as_ref()),
         deps.event_log.as_ref(),
         0,
+        expiry_deadline_secs,
     )
     .await;
 
@@ -204,7 +215,14 @@ pub async fn reset_ttl_timer(
     // resets the cancel signal (mutate owned state).
     state.ttl.extension = None;
 
-    spawn_ttl_timer(state, deps, context_id, new_duration, handle).await;
+    // Reset (consensual TTL extension via `reset_ttl_timer`): no convergent
+    // deadline is threaded here, so arm relative to the local clock (the prior
+    // behaviour). The governance ExtendTtl path computes the convergent
+    // extended deadline itself (`old_deadline + additional`) and installs it
+    // through `start_ttl_timer` with an explicit override; cross-member
+    // convergence of a freshly-proposed extension duration is a forward step
+    // under ADR-051.
+    spawn_ttl_timer(state, deps, context_id, new_duration, None, handle).await;
 
     // Persist context state after TTL reset (best-effort).
     persist_state_best_effort(state, deps, context_id);
@@ -224,9 +242,40 @@ pub async fn start_ttl_timer(
     deps: &ActorDeps,
     context_id: &str,
     duration: std::time::Duration,
+    // Convergent absolute expiry deadline (Unix seconds), if the caller can
+    // supply one. The initial-create path passes
+    // `Some(creation_timestamp_secs + params.ttl)`; the governance ExtendTtl
+    // path passes its already-convergent extended deadline. `None` (e.g. the
+    // restore/import path, whose persisted snapshot does not yet carry the
+    // convergent creation time — see ADR-051) arms relative to the local
+    // clock. `duration` is always the local sleep interval.
+    deadline_override: Option<u64>,
     handle: ContextHandle,
 ) {
-    spawn_ttl_timer(state, deps, context_id, duration, handle).await;
+    spawn_ttl_timer(state, deps, context_id, duration, deadline_override, handle).await;
+}
+
+/// Computes the CONVERGENT initial-TTL expiry deadline (Unix seconds) for a
+/// context: `creation_timestamp_secs + params.ttl`.
+///
+/// Both inputs are convergent across members — `creation_timestamp_secs` is the
+/// creator-assigned `ContextCreated` value copied onto every member's state,
+/// and `ttl_secs` is the TTL in the context params (legible to every member) —
+/// so every member computes the IDENTICAL absolute deadline regardless of when
+/// (or with what local clock) it armed its timer. This is the value recorded on
+/// `ContextExpired`/`ContextClosed` leaves, making them convergent-by-
+/// construction (§7.3.1, §9.9.3).
+///
+/// Returns `None` when the context has no finite TTL.
+#[must_use]
+pub const fn convergent_ttl_deadline_secs(
+    creation_timestamp_secs: u64,
+    ttl_secs: Option<u64>,
+) -> Option<u64> {
+    match ttl_secs {
+        Some(ttl) => Some(creation_timestamp_secs.saturating_add(ttl)),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +313,17 @@ async fn spawn_ttl_timer(
     deps: &ActorDeps,
     context_id: &str,
     duration: std::time::Duration,
+    // The absolute expiry deadline (Unix seconds) to record on
+    // `state.ttl.timer.deadline_unix_secs`, which becomes the
+    // `ContextExpired`/`ContextClosed` leaf timestamp when the timer fires.
+    // `Some(d)` installs a CONVERGENT deadline (e.g. the initial-start
+    // `creation_timestamp_secs + params.ttl`, or a TTL-extension's
+    // already-convergent `old_deadline + additional`); `None` falls back to
+    // local arm-time `now + duration` (the prior behaviour, used only where
+    // no convergent deadline is available). See each caller for which
+    // applies. The local sleep below always fires after `duration` on the
+    // local clock — only the recorded leaf timestamp is the convergent value.
+    deadline_override: Option<u64>,
     // The legacy timer task captured `handle` to run the expiry pipeline
     // inline. The actor-shape `FireTimer` handler now clones
     // `state.handle` itself, so the task no longer needs it. Retained on
@@ -281,10 +341,13 @@ async fn spawn_ttl_timer(
     let cancel = Arc::new(Notify::new());
     state.ttl.timer.cancel = Arc::clone(&cancel);
 
-    // Record absolute deadline for persistence snapshots (mirrors
-    // `TtlTimer::spawn_with_transport`).
-    let now_secs = deps.clock.now_secs();
-    state.ttl.timer.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
+    // Record the absolute expiry deadline that the timer fire will stamp on
+    // the `ContextExpired`/`ContextClosed` leaf. A `deadline_override` is the
+    // CONVERGENT value (see the parameter doc); only when it is absent do we
+    // fall back to local arm-time `now + duration`.
+    let deadline_secs = deadline_override
+        .unwrap_or_else(|| deps.clock.now_secs().saturating_add(duration.as_secs()));
+    state.ttl.timer.deadline_unix_secs = Some(deadline_secs);
 
     // Clone the cross-actor providers the FireTimer pipeline needs. The
     // timer task itself only resolves the actor + mailboxes FireTimer;
@@ -353,17 +416,28 @@ async fn spawn_ttl_timer(
 /// actor-shape contract so a future expansion can mutate per-context
 /// state without changing the signature.
 pub async fn finalize_close(
-    _state: &mut PerContextState,
+    state: &mut PerContextState,
     deps: &ActorDeps,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
+
+    // Convergent `ContextClosed` leaf timestamp: the pre-computed TTL deadline
+    // held in convergent state when this is a timer-driven close; fall back to
+    // the closer's clock for a governance/explicit close with no TTL deadline.
+    // Never a per-member local `now()` for the timer case (§7.3.1, §9.9.3).
+    let close_ts = state
+        .ttl
+        .timer
+        .deadline_unix_secs
+        .unwrap_or_else(|| deps.clock.now_secs());
 
     ttl::finalize_close(
         handle,
         deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
+        close_ts,
     )
     .await?;
 
@@ -523,5 +597,71 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convergent_ttl_deadline_secs;
+
+    /// Two members with WILDLY different local arm-time clocks must compute the
+    /// IDENTICAL absolute TTL expiry deadline, because it is derived from the
+    /// convergent creation timestamp + the params TTL — not local `now()`. This
+    /// is the property that makes the `ContextExpired`/`ContextClosed` leaf
+    /// timestamp convergent-by-construction (§7.3.1, §9.9.3).
+    #[test]
+    fn ttl_deadline_converges_independent_of_arm_time_clock() {
+        // Convergent inputs every member shares: the creator-assigned creation
+        // timestamp and the TTL duration from the (legible) context params.
+        let creation_timestamp_secs = 1_700_000_000_u64;
+        let ttl_secs = 3_600_u64; // 1 hour
+
+        // The function takes ONLY convergent inputs — there is no local-clock
+        // parameter, so two members necessarily agree.
+        let alice_deadline = convergent_ttl_deadline_secs(creation_timestamp_secs, Some(ttl_secs));
+        let bob_deadline = convergent_ttl_deadline_secs(creation_timestamp_secs, Some(ttl_secs));
+
+        assert_eq!(alice_deadline, bob_deadline);
+        assert_eq!(alice_deadline, Some(creation_timestamp_secs + ttl_secs));
+    }
+
+    /// Negative control: deriving the deadline from each member's local
+    /// arm-time clock (`now + ttl`) — the OLD behaviour — diverges when the two
+    /// members' clocks differ, which is exactly what the convergent base fixes.
+    #[test]
+    fn local_arm_time_base_diverges_across_members() {
+        let ttl_secs = 3_600_u64;
+        // Two honest members arm their timers at different local wall-clock
+        // instants (clock skew + arm-time staggering).
+        let alice_arm_now = 1_700_000_000_u64;
+        let bob_arm_now = 1_700_000_042_u64;
+
+        let alice_local_deadline = alice_arm_now + ttl_secs;
+        let bob_local_deadline = bob_arm_now + ttl_secs;
+
+        // The discredited local-now base does NOT converge...
+        assert_ne!(alice_local_deadline, bob_local_deadline);
+        // ...whereas the convergent base anchored on a shared creation time does.
+        let creation = 1_699_999_900_u64;
+        assert_eq!(
+            convergent_ttl_deadline_secs(creation, Some(ttl_secs)),
+            convergent_ttl_deadline_secs(creation, Some(ttl_secs)),
+        );
+    }
+
+    /// No finite TTL ⇒ no deadline.
+    #[test]
+    fn no_ttl_yields_no_deadline() {
+        assert_eq!(convergent_ttl_deadline_secs(1_700_000_000, None), None);
+    }
+
+    /// Saturating add: a pathological creation time near `u64::MAX` cannot
+    /// panic the deadline computation.
+    #[test]
+    fn deadline_saturates_instead_of_overflowing() {
+        assert_eq!(
+            convergent_ttl_deadline_secs(u64::MAX, Some(10)),
+            Some(u64::MAX)
+        );
     }
 }

@@ -5053,6 +5053,9 @@ impl crate::scp::PyScp {
                     context_id,
                     params: core_params,
                     duration,
+                    // Ignored by ResetTtlTimer (extension reset never anchors to
+                    // creation).
+                    anchor_deadline_to_creation: false,
                 }),
                 reply: tx,
             };

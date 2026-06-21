@@ -105,8 +105,11 @@ where
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberJoined",
+        scp_event_log::EventType::MemberJoined,
         subscriber_did.as_ref(),
+        // Committer-assigned: the subscriber's signed subscribe-request
+        // timestamp, copied by every member (§7.3.1, §9.9.3).
+        timestamp,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -161,8 +164,12 @@ pub fn unsubscribe_broadcast(
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberLeft",
+        scp_event_log::EventType::MemberLeft,
         subscriber_did.as_ref(),
+        // Committer-assigned: the unsubscribing author's clock — the source of
+        // the `created_at` on its outgoing leave message, copied by every
+        // member (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 
@@ -394,12 +401,12 @@ fn apply_guarded(
     deps.transport
         .send_message(context_id_bytes, &envelope_bytes)?;
 
-    deps.event_log.append_context_event(
-        context_id_bytes,
-        "MessageSent",
-        pending.author_did.as_ref(),
-    )?;
-    state.checkpoint_events_since += 1;
+    // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the
+    // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
+    // non-convergent event surfaced only as the local `ContextEvent::MessageSent`
+    // emitted above. The former durable append (and its `checkpoint_events_since`
+    // increment) is removed so two honest members derive the same
+    // `event_log_merkle_root` (§9.9.3).
 
     Ok(envelope)
 }
@@ -522,8 +529,15 @@ pub fn block_broadcast_subscriber(
 
     persist_broadcast_snapshot(deps, context_id, &snapshot);
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberBlocked", author_did.as_ref())?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberBlocked,
+        author_did.as_ref(),
+        // Committer-assigned: the blocking author's clock — the source of the
+        // `created_at` on its outgoing block message, copied by every member
+        // (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(result)
@@ -577,8 +591,12 @@ pub fn unblock_broadcast_subscriber(
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberUnblocked",
+        scp_event_log::EventType::MemberUnblocked,
         author_did.as_ref(),
+        // Committer-assigned: the unblocking author's clock — the source of the
+        // `created_at` on its outgoing unblock message, copied by every member
+        // (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 

@@ -267,6 +267,27 @@ pub struct PaymentReceipt {
     pub adapter_proof: Vec<u8>,
     /// Unix timestamp (seconds) when the payment was captured.
     pub timestamp: u64,
+    /// Whether this receipt is anchored in the canonical Merkle event log.
+    ///
+    /// `false` until ADR-051 makes per-payee receipts convergent: a
+    /// `PaymentReceipt` is per-payee application activity surfaced as a local
+    /// `ContextEvent`, not a convergent Merkle leaf (spec §19.6, ADR-011
+    /// amendment exclusion taxonomy §2). Consumers requiring Merkle-proven
+    /// provenance MUST reject an unanchored receipt. This field is deliberately
+    /// EXCLUDED from the signing preimage (§19.6 receipt signature scope ends at
+    /// `timestamp`).
+    ///
+    /// # UNSIGNED WIRE FIELD — do not trust the deserialized value
+    ///
+    /// Because `anchored` lies OUTSIDE the signed payload, it is NOT
+    /// authenticated by the receipt signature: a relay or peer can flip it
+    /// freely on the wire without invalidating the signature. A consumer MUST
+    /// derive anchoring from its own local Merkle / event-log state and MUST
+    /// NOT trust the deserialized wire value of this field. Today it is always
+    /// constructed `false` and no production code reads it across the wire, so
+    /// this is preventive — but the moment a consumer begins reading it, it
+    /// must treat the deserialized value as untrusted.
+    pub anchored: bool,
     /// Ed25519 signature by the payer over the receipt data.
     pub signature: Vec<u8>,
 }
@@ -287,6 +308,7 @@ impl fmt::Debug for PaymentReceipt {
                 &format!("[{} bytes]", self.adapter_proof.len()),
             )
             .field("timestamp", &self.timestamp)
+            .field("anchored", &self.anchored)
             .field("signature", &format!("[{} bytes]", self.signature.len()))
             .finish()
     }
@@ -618,6 +640,7 @@ impl PaymentAdapter for NoOpPaymentAdapter {
             adapter_id: "noop".to_owned(),
             adapter_proof: Vec::new(),
             timestamp: 0,
+            anchored: false,
             signature: Vec::new(),
         })
     }

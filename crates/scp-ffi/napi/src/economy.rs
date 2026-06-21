@@ -628,6 +628,7 @@ mod tests {
                 adapter_id: "noop".to_owned(),
                 adapter_proof: Vec::new(),
                 timestamp: 0,
+                anchored: false,
                 signature: Vec::new(),
             })
             .collect();

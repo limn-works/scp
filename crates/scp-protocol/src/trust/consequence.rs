@@ -88,6 +88,19 @@ pub enum ConsequenceTrigger {
 
     /// The subject invoked tools at a rate exceeding the threshold within the
     /// time window. Counted from `EventType::ToolInvoked` events.
+    ///
+    /// # Currently dormant / non-functional
+    ///
+    /// This trigger cannot fire today (native AND WASM). It keys on
+    /// `EventType::ToolInvoked`, but per-author `ToolInvoked` is no longer
+    /// durably logged and there is no corresponding `ContextEvent::ToolInvoked`
+    /// variant, so no convergent tool-invocation signal exists in the interim.
+    /// A configured `ToolRateExceeded` rule is therefore a no-op until a
+    /// convergent tool-rate input arrives with the ADR-051 causal-DAG ordering.
+    /// The variant is retained (removing it is an API change, out of scope) so
+    /// rules remain expressible against the eventual convergent signal. Tool
+    /// flooding remains bounded in the interim by the independent hard rate
+    /// limit, which does not depend on this trigger.
     ToolRateExceeded,
 
     /// The subject accumulated warnings (governance actions against them)
@@ -96,10 +109,100 @@ pub enum ConsequenceTrigger {
     WarningCount,
 
     /// A custom trigger identified by a string key. The event counting logic
-    /// matches governance action events whose payload starts with the given
-    /// key (null-terminated or end-of-data), allowing context-specific
+    /// matches governance-action events whose payload's `target_did` field
+    /// (decoded from the typed positional-`MessagePack` or JSON-object
+    /// encoding) starts with the given key, allowing context-specific
     /// consequence definitions.
     Custom(String),
+}
+
+/// Whether a consequence triggered by this condition may be recorded as a
+/// **durable Merkle leaf** in the canonical event log.
+///
+/// This is the single source of truth for the consequence-durability gate
+/// (keyed on the enum, never on a string). Per ADR-051 §6 and the phase-2.md
+/// ADR-011 amendment ("Consequence emission"), a derived record is automatic
+/// *and* convergent iff its trigger **input** is convergent:
+///
+/// - **Convergent triggers** — `WarningCount` (governance-action counts) and
+///   `Custom` (matched against convergent governance-action events). These
+///   auto-derive identically on every honest member from the convergent log, so
+///   their consequence leaf converges and is durable.
+/// - **Non-convergent triggers** — `MessageVelocity` and `ToolRateExceeded`. A
+///   *rate* (count ÷ time) needs a convergent clock, which the protocol neither
+///   has (no operator / transport-independent / offline) nor needs. Rate-limiting
+///   is local flow control (§23.16.8), not a recorded consequence; a durable
+///   suspension rides governance (ADR-031), where the commit *is* both the
+///   execution and the record. Velocity-triggered consequences therefore add no
+///   durable leaf — they remain buffer-only `ContextEvent`s while still driving
+///   local enforcement.
+///
+/// A consequence whose rule is missing or whose trigger cannot be resolved is
+/// treated as **non-durable** (fail-safe: never mint an unconvergent leaf).
+#[must_use]
+pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
+    match trigger {
+        ConsequenceTrigger::WarningCount | ConsequenceTrigger::Custom(_) => true,
+        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::ToolRateExceeded => false,
+    }
+}
+
+/// The convergent Merkle-leaf timestamp for a durable consequence leaf.
+///
+/// This is the `timestamp` of the highest-sequence piece of evidence that
+/// triggered the consequence — i.e. the convergent log event that crossed the
+/// trigger threshold.
+///
+/// Because the evidence is drawn from the shared convergent event log, every
+/// honest member (native or WASM) derives the identical value, keeping the
+/// durable leaf byte-identical across members for the §9.9.3
+/// equal-count/equal-root equivocation test. Only convergent-trigger
+/// consequences reach a durable leaf ([`is_convergent_trigger`]), so the
+/// evidence is convergent here; an evidence-less consequence (which never
+/// produces a durable leaf) yields 0.
+#[must_use]
+pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u64 {
+    consequence
+        .evidence
+        .iter()
+        .max_by_key(|e| e.event_sequence)
+        .map_or(0, |e| e.timestamp)
+}
+
+/// Stable string label for a [`ConsequenceTrigger`], used as the `trigger_kind`
+/// field of a durable consequence Merkle-leaf payload
+/// (`scp_event_log::payload::consequence_event_payload`).
+///
+/// This is the single source of the label so that the native runtime and the
+/// WASM bridge produce byte-identical leaf payloads (§9.9.3 convergence). Note
+/// the `Custom(key)` arm emits `"Custom:{key}"` — NOT the `{:?}` Debug form
+/// `Custom("{key}")` — because the durable leaf preimage must be a stable,
+/// implementation-independent string.
+#[must_use]
+pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
+    match trigger {
+        ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
+        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
+        ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
+    }
+}
+
+/// Stable string label for a [`ConsequenceAction`], used as the `action_type`
+/// field of a durable consequence Merkle-leaf payload
+/// (`scp_event_log::payload::consequence_event_payload`).
+///
+/// Shared by the native runtime and the WASM bridge so both produce
+/// byte-identical leaf payloads (§9.9.3 convergence). For an
+/// [`ConsequenceAction::Enforcement`] this delegates to
+/// [`EnforcementSeverity::variant_name`]; an [`ConsequenceAction::AssignRole`]
+/// is labelled `"AssignRole"`.
+#[must_use]
+pub const fn consequence_action_type(action: &ConsequenceAction) -> &'static str {
+    match action {
+        ConsequenceAction::Enforcement(sev) => sev.variant_name(),
+        ConsequenceAction::AssignRole { .. } => "AssignRole",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +677,238 @@ pub struct TriggeredConsequence {
 }
 
 // ---------------------------------------------------------------------------
+// merge_consequence_events
+// ---------------------------------------------------------------------------
+
+/// Maximum age (in seconds) for receive-buffer events used in consequence
+/// evaluation. Events estimated to be older than this are discarded as
+/// stale, preventing manipulation via timestamp back-dating.
+const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Maximum clock skew tolerance (in seconds) for buffer event timestamps.
+/// Events with estimated timestamps more than this far in the future are
+/// discarded.
+const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
+
+/// Maximum number of receive-buffer events consumed per consequence evaluation
+/// cycle. Caps the cost of evaluation and prevents an attacker from flooding
+/// the buffer to drive synthetic high event counts (e.g. inflating a
+/// `WarningCount` trigger by queuing thousands of messages before governance
+/// runs). Events beyond this cap are simply not fed into the evaluator;
+/// the persisted event log (Source 1) covers all durable history.
+const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
+
+/// Merges the durable Merkle event log with the recent receive buffer into the
+/// single event history that [`evaluate_consequence_rules`] (and participation
+/// record computation, ADR-017) reads.
+///
+/// This is the **single** convergence-critical merge shared by the native
+/// runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`). The §9.9.3
+/// equivocation-detection guarantee depends on native and WASM producing
+/// byte-identical merged event sets from identical inputs, so both bridges MUST
+/// route through this function rather than re-implementing the projection and
+/// buffer-gate logic. Each caller supplies its own already-acquired sources as
+/// borrowed slices — native reads Source 1 from its `ContextEventLogProvider`,
+/// WASM from its in-memory `EventLog` — so this function is agnostic to how the
+/// sources were obtained.
+///
+/// Combines two sources:
+/// 1. **Event log history** (`log_entries`) — full persisted history with real
+///    timestamps and `actor_did`. Each entry's typed [`EventType`] is projected
+///    onto the coarse trigger buckets [`matches_trigger`] understands
+///    (governance and consequence-enforcement variants collapse to
+///    [`EventType::GovernanceAction`]; operational variants map to their
+///    velocity buckets). The canonical payload bytes pass through unchanged.
+///    Projecting consequence events into the governance bucket closes the
+///    recursive blind spot (white-hat H4): subsequent rule evaluation can see
+///    prior consequence enforcement (e.g. "if member has been auto-suspended N
+///    times, demote").
+/// 2. **Receive buffer events** (`buffer`) — recent in-memory `ContextEvent`s.
+///    Buffer events use estimated timestamps (spaced 1 second apart backwards
+///    from `now_secs`) and are gated by [`MAX_BUFFER_EVENT_AGE_SECS`],
+///    [`MAX_FUTURE_TOLERANCE_SECS`], and [`MAX_BUFFER_EVENTS_FOR_EVAL`].
+///
+/// The merged set is numbered with a single dense, contiguous `sequence`
+/// counter (Source-1 entries first, then accepted Source-2 entries), so the two
+/// bridges agree on every field of every emitted [`Event`]. The `sequence`
+/// itself is not consulted by [`matches_trigger`] (which keys on
+/// `event_type` / `actor_did` / `timestamp` / `payload`), but pinning it
+/// deterministically keeps the merged sets identical across implementations.
+///
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
+/// FFI bridge (`crates/scp-ffi/wasm`) reimplements the convergent consequence
+/// path and delegates to this shared function across the crate boundary. It is
+/// not part of the SDK surface (see the cross-layer exemption registry).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn merge_consequence_events(
+    log_entries: &[Event],
+    buffer: &std::collections::VecDeque<crate::context::membership::ContextEvent>,
+    now_secs: u64,
+) -> Vec<Event> {
+    use crate::context::membership::ContextEvent;
+
+    let mut events: Vec<Event> = Vec::new();
+
+    // Source 1: Full event log history (persisted, with real timestamps and
+    // actor_did). Project each entry's typed `EventType` onto the bucket
+    // `matches_trigger` understands.
+    for entry in log_entries {
+        let event_type = match entry.event_type {
+            // DORMANT: per ADR-051 §6 / the phase-2.md ADR-011 amendment
+            // exclusion taxonomy §2, `MessageSent` / `ToolInvoked` are
+            // per-author, non-convergent events no longer appended to the
+            // durable log — Source 1 will not yield them in the interim.
+            // Velocity / tool-rate evaluation continues to read them from
+            // the receive buffer (Source 2, below), which is correct and
+            // intended (local, per-receiver flow control needs no
+            // convergence). These arms re-activate when ADR-051 §2's causal
+            // DAG re-enters application events into the canonical log.
+            EventType::MessageSent => EventType::MessageSent,
+            EventType::MemberJoined => EventType::MemberJoined,
+            EventType::MemberLeft => EventType::MemberLeft,
+            EventType::RoleAssigned => EventType::RoleAssigned,
+            EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
+                EventType::ToolInvoked
+            }
+            EventType::GovernanceAction
+            | EventType::GovernanceProposalCreated
+            | EventType::GovernanceVoteCast
+            | EventType::GovernanceVoteWithdrawn
+            | EventType::GovernanceProposalResolved
+            | EventType::GovernanceDeadlockRecovery
+            | EventType::GovernanceConflictDetected
+            | EventType::GovernanceConflictResolved
+            | EventType::GovernanceActionExecuted
+            | EventType::AccessRevoked
+            | EventType::ConsequenceTriggered
+            | EventType::ConsequenceEnforced
+            | EventType::ConsequenceEnforcementFailed
+            | EventType::ConsequenceEscalatedToSuspendAll => EventType::GovernanceAction,
+            _ => continue, // Skip event types not relevant to consequence evaluation
+        };
+        // The event already carries its canonical payload bytes (typed
+        // positional MessagePack for promoted variants, JSON for the
+        // remaining untyped ones). `payload_target_is` / `payload_starts_with`
+        // decode both encodings, so pass the bytes through unchanged.
+        events.push(Event {
+            event_type,
+            actor_did: entry.actor_did.clone(),
+            timestamp: entry.timestamp,
+            sequence: events.len() as u64,
+            payload: entry.payload.clone(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+    }
+
+    // Source 2: Receive buffer events.
+    //
+    // CONVERGENCE INVARIANT (ADR-051 §6 / phase-2.md ADR-011 amendment §2 /
+    // spec §9.9.3 equivocation detection): the buffer may ONLY contribute
+    // per-author / velocity-class event types that are NOT in the durable
+    // log — i.e. `MessageSent` alone. `MessageSent` is per-author and is
+    // excluded from the canonical Merkle log (Source 1), so the receive
+    // buffer is its only source; velocity / rate triggers legitimately need
+    // it, and per-member variation is by-design local flow control that
+    // never feeds a convergent or durable leaf.
+    //
+    // Convergent events (membership, governance, consequence) are appended
+    // to the durable log BEFORE being pushed to the receive buffer (see
+    // `governance_helpers.rs`), so they ALWAYS appear in Source 1 on every
+    // honest member identically. Sourcing them ALSO from the per-member
+    // buffer here would double-count them on quiet members and skip them on
+    // busy ones (the dedup below is keyed on the member-local `buffer_len`),
+    // producing divergent `WarningCount` / `Custom` counts and therefore a
+    // divergent durable `ConsequenceTriggered` leaf — a false-positive
+    // equivocation that defeats the entire convergence guarantee. Those
+    // events MUST come exclusively from Source 1, so the match below omits
+    // them (they fall through to `_ => continue`).
+    //
+    // The dedup / age / skew / cap logic below now only ever gates
+    // `MessageSent` buffer events. Because `MessageSent` is not in Source 1,
+    // the `estimated_ts <= last_log_ts` dedup may still skip some of them;
+    // that is acceptable — velocity / rate is non-durable, per-receiver
+    // local flow control where per-member variation is by design.
+    let last_log_ts = events.last().map_or(0, |e| e.timestamp);
+    let buffer_len = buffer.len() as u64;
+    let next_seq = events.len() as u64;
+
+    // Track how many buffer-derived events we've accepted so far. Once
+    // MAX_BUFFER_EVENTS_FOR_EVAL is reached, stop adding more.
+    // This cap prevents an attacker from flooding the buffer to inflate
+    // synthetic event counts (e.g. triggering a `WarningCount` consequence
+    // prematurely). The persisted event log (Source 1) covers all durable
+    // history; the buffer is only a short-term supplement.
+    let mut buffer_events_accepted: usize = 0;
+
+    for (idx, ctx_event) in buffer.iter().enumerate() {
+        let (event_type, actor_did, payload_data) = match ctx_event {
+            // Only per-author / velocity-class events are sourced from the
+            // buffer (see the CONVERGENCE INVARIANT comment above).
+            // `MessageSent` is excluded from the durable log, so the buffer is
+            // its only source. All convergent events (MemberJoined/MemberLeft/
+            // GovernanceActionExecuted/consequence) are intentionally NOT
+            // matched here — they come exclusively from Source 1 to preserve
+            // durable-leaf convergence — and fall through to `_ => continue`.
+            ContextEvent::MessageSent { sender_did, .. }
+            | ContextEvent::MessageReceived { sender_did, .. } => {
+                (EventType::MessageSent, sender_did.clone(), Vec::new())
+            }
+            _ => continue,
+        };
+        // Oldest event gets `now - (buffer_len - 1)`, newest gets `now`.
+        let estimated_ts =
+            now_secs.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(idx as u64));
+
+        // Skip buffer events that are likely already covered by the event log.
+        if estimated_ts <= last_log_ts && last_log_ts > 0 {
+            continue;
+        }
+
+        // Defense in depth: reject buffer events with estimated timestamps too
+        // far in the future. Currently the estimation formula guarantees
+        // estimated_ts <= now_secs, so this never triggers — but it guards
+        // against future changes to the formula.
+        if estimated_ts > now_secs.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
+            continue;
+        }
+
+        // Reject buffer events with timestamps too far in the past (M18).
+        if now_secs.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
+            continue;
+        }
+
+        // M-R cap: stop once we've accepted MAX_BUFFER_EVENTS_FOR_EVAL events
+        // from the buffer. Additional events are not fed to the evaluator.
+        if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
+            break;
+        }
+
+        // Dense, contiguous numbering: key the sequence on the count of
+        // ACCEPTED buffer events (`buffer_events_accepted`, pre-increment), NOT
+        // the raw enumeration index `idx`. Using `idx` would leave gaps whenever
+        // a buffer event is skipped (dedup / age / skew / non-`MessageSent`),
+        // contradicting the contiguity the doc promises. The sequence is
+        // evidence-only metadata — `matches_trigger` never reads it — so this is
+        // behavior-preserving and keeps the merged sets identical across the
+        // native runtime and the WASM bridge.
+        events.push(Event {
+            event_type,
+            actor_did,
+            timestamp: estimated_ts,
+            sequence: next_seq + buffer_events_accepted as u64,
+            payload: scp_event_log::EventPayload { data: payload_data },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+        buffer_events_accepted += 1;
+    }
+
+    events
+}
+
+// ---------------------------------------------------------------------------
 // evaluate_consequence_rules
 // ---------------------------------------------------------------------------
 
@@ -631,7 +966,7 @@ pub fn evaluate_consequence_rules(
                 event_sequence: event.sequence,
                 timestamp: event.timestamp,
                 actor_did: event.actor_did.clone(),
-                event_type: event.event_type.clone(),
+                event_type: event.event_type,
             })
             .collect();
 
@@ -705,6 +1040,57 @@ pub trait ConsequenceDispatcher {
     /// Records a cooldown for rule `rule_index` that expires at `until`
     /// (Unix seconds).
     fn set_cooldown(&mut self, rule_index: usize, until: u64);
+
+    /// Appends a durable consequence-enforcement Merkle leaf to the context's
+    /// canonical event log.
+    ///
+    /// [`enforce_triggered`] calls this — BEFORE the matching
+    /// [`push_event`](Self::push_event) (the H4 ordering invariant) — at each
+    /// emit point, but ONLY for **convergent-trigger** consequences (gated on
+    /// [`is_convergent_trigger`]). Non-convergent (velocity / rate) consequences
+    /// drive local enforcement and `push_event` only, never a durable leaf,
+    /// because a rate leaf would diverge across honest members and break §9.9.3
+    /// equivocation detection.
+    ///
+    /// `event_type` is one of [`ConsequenceTriggered`], [`ConsequenceEnforced`],
+    /// [`ConsequenceEnforcementFailed`], or
+    /// [`ConsequenceEscalatedToSuspendAll`]. `trigger_kind` / `action_type` are
+    /// the shared labels from [`trigger_kind_str`] / [`consequence_action_type`].
+    /// Implementations MUST build the leaf payload with
+    /// `scp_event_log::payload::consequence_event_payload(subject_did, rule_index,
+    /// trigger_kind, action_type)` so native and WASM leaves are byte-identical.
+    ///
+    /// The default body is a no-op: the native runtime mints these leaves in its
+    /// own enforcement loop and does not route through this trait, so only the
+    /// WASM bridge (which uses [`enforce_triggered`]) overrides it.
+    ///
+    /// [`ConsequenceTriggered`]: scp_event_log::EventType::ConsequenceTriggered
+    /// [`ConsequenceEnforced`]: scp_event_log::EventType::ConsequenceEnforced
+    /// [`ConsequenceEnforcementFailed`]: scp_event_log::EventType::ConsequenceEnforcementFailed
+    /// [`ConsequenceEscalatedToSuspendAll`]: scp_event_log::EventType::ConsequenceEscalatedToSuspendAll
+    fn append_durable_consequence_leaf(
+        &mut self,
+        event_type: scp_event_log::EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+        // Convergent leaf timestamp: the triggering event's `created_at` (see
+        // [`convergent_consequence_timestamp`]), copied identically by every
+        // member so native and WASM leaves are byte-identical (§7.3.1, §9.9.3).
+        trigger_timestamp_secs: u64,
+    ) {
+        // Default: no durable leaf. See doc comment — native does not use this
+        // path; WASM overrides it.
+        let _ = (
+            event_type,
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+            trigger_timestamp_secs,
+        );
+    }
 }
 
 /// Enforces a pre-evaluated set of triggered consequences using a
@@ -749,92 +1135,209 @@ pub fn enforce_triggered<D: ConsequenceDispatcher>(
             continue;
         }
 
-        let action_type = match &consequence.action {
-            ConsequenceAction::Enforcement(sev) => sev.variant_name(),
-            ConsequenceAction::AssignRole { .. } => "AssignRole",
-        };
-        let trigger_type = rules
-            .get(consequence.rule_index)
-            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
+        if enforce_one_triggered(
+            dispatcher,
+            context_id,
+            subject_did,
+            now_secs,
+            consequence,
+            rules,
+            member_present,
+        ) {
+            count += 1;
+        }
+    }
 
-        dispatcher.push_event(
-            crate::context::membership::ContextEvent::ConsequenceTriggered {
-                context_id: context_id.to_owned(),
-                member_did: DID::from(subject_did.to_owned()),
-                rule_index: consequence.rule_index,
-                trigger_type,
-                action_type: action_type.to_owned(),
-            },
+    count
+}
+
+/// Bundles the per-consequence leaf labels so [`enforce_one_triggered`] can mint
+/// a durable leaf in one call per branch (keeps the function within the
+/// `clippy::too_many_lines` budget without changing behaviour).
+struct LeafCtx<'a> {
+    durable: bool,
+    subject_did: &'a str,
+    rule_index: usize,
+    trigger_kind: &'a str,
+    /// Convergent leaf timestamp — the triggering event's `created_at` (see
+    /// [`convergent_consequence_timestamp`]), copied identically by every
+    /// member (§7.3.1, §9.9.3).
+    trigger_timestamp_secs: u64,
+}
+
+/// Mints one durable consequence leaf via the dispatcher hook IFF the trigger is
+/// convergent (`ctx.durable`). A no-op otherwise — the gate that keeps
+/// non-convergent (velocity/rate) consequences out of the canonical Merkle log.
+fn mint_leaf<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    ctx: &LeafCtx<'_>,
+    event_type: EventType,
+    action_type: &str,
+) {
+    if ctx.durable {
+        dispatcher.append_durable_consequence_leaf(
+            event_type,
+            ctx.subject_did,
+            ctx.rule_index,
+            ctx.trigger_kind,
+            action_type,
+            ctx.trigger_timestamp_secs,
         );
+    }
+}
 
-        // Emit-and-skip for absent members with evidence.
-        if !member_present {
-            dispatcher.push_event(
-                crate::context::membership::ContextEvent::ConsequenceEnforced {
-                    context_id: context_id.to_owned(),
-                    member_did: DID::from(subject_did.to_owned()),
-                    action_type: action_type.to_owned(),
-                    success: false,
-                },
-            );
-            count += 1;
-            continue;
-        }
+/// Enforces a SINGLE triggered consequence past the cooldown / ghost-DID
+/// guards, minting durable leaves (when convergent) before each buffer push
+/// (H4 ordering). Returns `true` if it counted as dispatched.
+///
+/// Extracted from [`enforce_triggered`] so the public loop stays within the
+/// `clippy::too_many_lines` budget; the branch structure mirrors the native
+/// runtime's `process_one_triggered_consequence`.
+fn enforce_one_triggered<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    context_id: &str,
+    subject_did: &str,
+    now_secs: u64,
+    consequence: &TriggeredConsequence,
+    rules: &[ConsequenceRule],
+    member_present: bool,
+) -> bool {
+    let action_type = consequence_action_type(&consequence.action);
+    let rule = rules.get(consequence.rule_index);
+    let trigger_type = rule.map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
 
-        let success = match &consequence.action {
-            ConsequenceAction::Enforcement(severity) => match severity {
-                EnforcementSeverity::SuspendCapability { capabilities } => {
-                    dispatcher.suspend_capabilities(subject_did, capabilities)
-                }
-                EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
-                EnforcementSeverity::RevokeAccess { .. }
-                | EnforcementSeverity::RemoveMember { .. } => {
-                    // Cryptographic tiers must not reach consequence dispatch
-                    // without the opt-in flag. Fail here; escalation to
-                    // SuspendAll happens below.
-                    false
-                }
-            },
-            ConsequenceAction::AssignRole { to_role } => {
-                dispatcher.assign_role(subject_did, to_role)
+    // Durability gate (ADR-051 §6 / phase-2.md ADR-011 amendment, H4): a
+    // consequence leaf is a durable Merkle entry ONLY when its trigger input is
+    // convergent (`WarningCount` / `Custom`), keyed on the enum via
+    // `is_convergent_trigger` — never on a string. A missing or unresolvable
+    // rule is treated as non-durable (fail-safe). The durable-leaf
+    // `trigger_kind` label uses the wire-stable `trigger_kind_str` (`Custom:key`),
+    // NOT the `{:?}` Debug `trigger_type` used for the local `ContextEvent`, so
+    // native and WASM leaf preimages match.
+    let leaf_trigger_kind =
+        rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
+    let leaf = LeafCtx {
+        durable: rule.is_some_and(|r| is_convergent_trigger(&r.trigger)),
+        subject_did,
+        rule_index: consequence.rule_index,
+        trigger_kind: &leaf_trigger_kind,
+        trigger_timestamp_secs: convergent_consequence_timestamp(consequence),
+    };
+
+    // ConsequenceTriggered: durable leaf (when convergent) BEFORE the local
+    // push (H4 ordering), unconditional buffer push.
+    mint_leaf(
+        dispatcher,
+        &leaf,
+        EventType::ConsequenceTriggered,
+        action_type,
+    );
+    dispatcher.push_event(
+        crate::context::membership::ContextEvent::ConsequenceTriggered {
+            context_id: context_id.to_owned(),
+            member_did: DID::from(subject_did.to_owned()),
+            rule_index: consequence.rule_index,
+            trigger_type,
+            action_type: action_type.to_owned(),
+        },
+    );
+
+    // Emit-and-skip for absent members with evidence: durable
+    // ConsequenceEnforcementFailed (when convergent) then buffer push.
+    if !member_present {
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEnforcementFailed,
+            action_type,
+        );
+        push_enforced(dispatcher, context_id, subject_did, action_type, false);
+        return true;
+    }
+
+    let success = match &consequence.action {
+        ConsequenceAction::Enforcement(severity) => match severity {
+            EnforcementSeverity::SuspendCapability { capabilities } => {
+                dispatcher.suspend_capabilities(subject_did, capabilities)
             }
-        };
+            EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
+            EnforcementSeverity::RevokeAccess { .. } | EnforcementSeverity::RemoveMember { .. } => {
+                // Cryptographic tiers must not reach consequence dispatch
+                // without the opt-in flag. Fail here; escalation to
+                // SuspendAll happens below.
+                false
+            }
+        },
+        ConsequenceAction::AssignRole { to_role } => dispatcher.assign_role(subject_did, to_role),
+    };
 
-        if !success {
-            // Escalate to SuspendAll on enforcement failure.
-            let _ = dispatcher.suspend_all(subject_did);
-            dispatcher.push_event(
-                crate::context::membership::ContextEvent::ConsequenceEnforced {
-                    context_id: context_id.to_owned(),
-                    member_did: DID::from(subject_did.to_owned()),
-                    action_type: "SuspendAll(escalated)".to_owned(),
-                    success: true,
-                },
-            );
-            count += 1;
-            continue;
-        }
-
-        // Record cooldown.
-        if let Some(rule) = rules.get(consequence.rule_index) {
-            dispatcher.set_cooldown(
-                consequence.rule_index,
-                now_secs.saturating_add(rule.window.as_secs()),
-            );
-        }
-
+    if !success {
+        // Escalate to SuspendAll on enforcement failure (H10). The local
+        // enforcement is unconditional. The two audit records (failure then
+        // escalation) are durable Merkle leaves only for convergent triggers —
+        // failure first, then escalation, both BEFORE the buffer push.
+        let _ = dispatcher.suspend_all(subject_did);
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEnforcementFailed,
+            action_type,
+        );
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEscalatedToSuspendAll,
+            "SuspendAll",
+        );
         dispatcher.push_event(
             crate::context::membership::ContextEvent::ConsequenceEnforced {
                 context_id: context_id.to_owned(),
                 member_did: DID::from(subject_did.to_owned()),
-                action_type: action_type.to_owned(),
-                success,
+                action_type: "SuspendAll(escalated)".to_owned(),
+                success: true,
             },
         );
-        count += 1;
+        return true;
     }
 
-    count
+    // Record cooldown.
+    if let Some(rule) = rules.get(consequence.rule_index) {
+        dispatcher.set_cooldown(
+            consequence.rule_index,
+            now_secs.saturating_add(rule.window.as_secs()),
+        );
+    }
+
+    // ConsequenceEnforced { success: true }: durable leaf (when convergent)
+    // BEFORE the buffer push.
+    mint_leaf(
+        dispatcher,
+        &leaf,
+        EventType::ConsequenceEnforced,
+        action_type,
+    );
+    push_enforced(dispatcher, context_id, subject_did, action_type, success);
+    true
+}
+
+/// Pushes a `ConsequenceEnforced` buffer event (SDK observability). Extracted to
+/// keep [`enforce_one_triggered`] within the line budget without changing
+/// behaviour.
+fn push_enforced<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    context_id: &str,
+    subject_did: &str,
+    action_type: &str,
+    success: bool,
+) {
+    dispatcher.push_event(
+        crate::context::membership::ContextEvent::ConsequenceEnforced {
+            context_id: context_id.to_owned(),
+            member_did: DID::from(subject_did.to_owned()),
+            action_type: action_type.to_owned(),
+            success,
+        },
+    );
 }
 
 /// Checks whether an event matches a trigger condition for the given subject.
@@ -864,50 +1367,100 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
 
 /// Checks if the payload data represents a target DID matching the given DID.
 ///
-/// Parses the payload as a JSON object with a `"target_did"` field. Falls
-/// back to the legacy null-terminated string convention for backward
-/// compatibility.
-fn payload_target_is(data: &[u8], target_did: &str) -> bool {
+/// Returns the `target_did` carried by an event-log payload, if any.
+///
+/// The runtime emits exactly two payload encodings into the durable event log,
+/// and this decoder accepts only those two:
+///
+/// 1. **Positional `MessagePack`** for the typed
+///    [`scp_event_log::payload`] structs whose first field is `target_did`
+///    (e.g. [`scp_event_log::payload::AccessRevokedPayload`],
+///    [`scp_event_log::payload::GovernanceActionExecutedPayload`]). These are
+///    fixarrays; the first element is the `target_did` string.
+/// 2. **JSON objects** with a `"target_did"` field, for the consequence
+///    enforcement records (`ConsequenceTriggered`, …) and other untyped
+///    governance payloads that have not (yet) been promoted to a typed struct.
+///
+/// The positional case allocates a `String` because the bytes are decoded; the
+/// JSON case copies the matched field.
+fn payload_target_did(data: &[u8]) -> Option<String> {
     if data.is_empty() {
-        return false;
+        return None;
     }
-    // Try structured JSON first.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-        return val
-            .get("target_did")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == target_did);
+    // 1. Typed positional MessagePack: read the fixarray and take element 0.
+    if let Some(did) = rmp_array_first_string(data) {
+        return Some(did);
     }
-    // Legacy fallback: null-terminated UTF-8 string.
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end]) == Ok(target_did)
+    // 2. Structured JSON object.
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|val| {
+            val.get("target_did")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
 }
 
-/// Checks if a payload's data starts with the given prefix.
+/// Decodes `data` as a positional `MessagePack` array and returns its first
+/// element as a `String`, if `data` is an array whose first element is a
+/// string. Returns `None` for any other shape (including JSON-object payloads,
+/// which are `MessagePack` maps, not arrays).
 ///
-/// For structured JSON payloads, checks the `"custom_key"` field. Falls
-/// back to the legacy null-terminated string convention.
+/// This is the decode counterpart to
+/// [`scp_event_log::payload::encode_payload`] for the typed payload structs
+/// whose first field is `target_did`. It reads only the first element, so it
+/// works uniformly across structs of differing arity (1-field
+/// `AccessRevokedPayload`, 2-field `GovernanceActionExecutedPayload`).
+fn rmp_array_first_string(data: &[u8]) -> Option<String> {
+    let mut cursor = data;
+    let value = rmpv::decode::read_value(&mut cursor).ok()?;
+    match value {
+        rmpv::Value::Array(items) => items
+            .into_iter()
+            .next()
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        _ => None,
+    }
+}
+
+/// Checks whether the event-log payload's `target_did` matches `target_did`.
+///
+/// See [`payload_target_did`] for the supported payload encodings.
+fn payload_target_is(data: &[u8], target_did: &str) -> bool {
+    payload_target_did(data).is_some_and(|did| did == target_did)
+}
+
+/// Checks whether the event-log payload's identifying string matches (or
+/// begins with) `prefix`, used by the `Custom` trigger to match consequence
+/// records against its key.
+///
+/// Decodes the same two live encodings as [`payload_target_did`]:
+///
+/// 1. **Positional `MessagePack`** — match the first array element
+///    (`target_did`) against the prefix.
+/// 2. **JSON objects** — match the `"target_did"` field against the prefix.
+///
+/// The `Custom` trigger's payload is the consequence-record JSON object, whose
+/// identifying field is `target_did` (the trigger kind is separately encoded as
+/// `"trigger_kind": "Custom:<key>"`), so the JSON branch reads `target_did`.
 fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
     if data.is_empty() {
         return false;
     }
-    // Try structured JSON first.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-        // Check custom_key field for Custom triggers.
-        if let Some(key) = val.get("custom_key").and_then(|v| v.as_str()) {
-            return key == prefix || key.starts_with(prefix);
-        }
-        // Also check target_did for backward compat with custom triggers
-        // that might use target DID as key.
-        if let Some(did) = val.get("target_did").and_then(|v| v.as_str()) {
-            return did == prefix || did.starts_with(prefix);
-        }
-        return false;
+    // Typed positional MessagePack: match the first array element (target_did)
+    // against the prefix, mirroring the JSON target_did path below.
+    if let Some(did) = rmp_array_first_string(data) {
+        return did == prefix || did.starts_with(prefix);
     }
-    // Legacy fallback: null-terminated UTF-8 string.
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end])
-        .is_ok_and(|payload_str| payload_str == prefix || payload_str.starts_with(prefix))
+    // Structured JSON object: match the target_did field.
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|val| {
+            val.get("target_did")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|did| did == prefix || did.starts_with(prefix))
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +1609,64 @@ mod tests {
             }
         );
         assert_eq!(result[0].evidence.len(), 2);
+    }
+
+    /// The `WarningCount` trigger must match events whose payload is a typed
+    /// positional `MessagePack` struct (the encoding the runtime now emits for
+    /// `AccessRevoked` / `GovernanceActionExecuted`), not just JSON objects.
+    /// Exercises the `rmp_array_first_string` decode path in
+    /// [`payload_target_did`].
+    #[test]
+    fn warning_count_matches_typed_positional_payload() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "observer".to_owned(),
+            },
+            threshold: 2,
+            window: Duration::from_mins(5),
+        }];
+
+        // Encode the same way the runtime producers do: positional rmp of a
+        // struct whose first field is `target_did`.
+        let revoked =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
+                target_did: "did:key:alice".to_owned(),
+            })
+            .unwrap();
+        let executed = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did: "did:key:alice".to_owned(),
+                action_type: "RemoveMember".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                800,
+                0,
+                revoked.data,
+            ),
+            // A 2-field struct must still decode to its first element.
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                900,
+                1,
+                executed.data,
+            ),
+        ];
+
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        assert_eq!(result.len(), 1, "typed payloads must drive WarningCount");
+        assert_eq!(result[0].evidence.len(), 2);
+
+        // A different subject must NOT match.
+        let none = evaluate_consequence_rules(&rules, &events, "did:key:bob", 1000);
+        assert!(none.is_empty(), "typed payload target_did must be exact");
     }
 
     // -----------------------------------------------------------------------
@@ -1836,5 +2447,237 @@ mod tests {
             panic!("expected SuspendCapability");
         };
         assert_eq!(capabilities, &caps);
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_triggered — durable-leaf hook gating, ordering, per-branch
+    // EventType (the WASM-side leaf-minting path; native uses its own loop).
+    // -----------------------------------------------------------------------
+
+    /// Records every interaction so the test can assert the interleaving of
+    /// durable-leaf appends and buffer pushes (the H4 ordering invariant) and
+    /// which `EventType` is minted in each branch.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        present: bool,
+        suspend_succeeds: bool,
+        /// Ordered trace: `("leaf", EventType)` for a durable append,
+        /// `("push", "<ConsequenceTriggered|ConsequenceEnforced>")` for a buffer push.
+        trace: Vec<(&'static str, String)>,
+        /// Captured `(subject, rule_index, trigger_kind, action_type)` for the
+        /// first leaf, to verify the labels passed to the producer.
+        first_leaf_args: Option<(String, usize, String, String)>,
+    }
+
+    impl ConsequenceDispatcher for RecordingDispatcher {
+        fn is_member_present(&self, _subject_did: &str) -> bool {
+            self.present
+        }
+        fn suspend_capabilities(&mut self, _s: &str, _c: &[Capability]) -> bool {
+            self.suspend_succeeds
+        }
+        fn suspend_all(&mut self, _s: &str) -> bool {
+            true
+        }
+        fn assign_role(&mut self, _s: &str, _r: &str) -> bool {
+            self.suspend_succeeds
+        }
+        fn push_event(&mut self, event: crate::context::membership::ContextEvent) {
+            let label = match event {
+                crate::context::membership::ContextEvent::ConsequenceTriggered { .. } => {
+                    "ConsequenceTriggered"
+                }
+                crate::context::membership::ContextEvent::ConsequenceEnforced { .. } => {
+                    "ConsequenceEnforced"
+                }
+                _ => "Other",
+            };
+            self.trace.push(("push", label.to_owned()));
+        }
+        fn get_cooldown(&self, _rule_index: usize) -> Option<u64> {
+            None
+        }
+        fn set_cooldown(&mut self, _rule_index: usize, _until: u64) {}
+        fn append_durable_consequence_leaf(
+            &mut self,
+            event_type: EventType,
+            subject_did: &str,
+            rule_index: usize,
+            trigger_kind: &str,
+            action_type: &str,
+            _trigger_timestamp_secs: u64,
+        ) {
+            if self.first_leaf_args.is_none() {
+                self.first_leaf_args = Some((
+                    subject_did.to_owned(),
+                    rule_index,
+                    trigger_kind.to_owned(),
+                    action_type.to_owned(),
+                ));
+            }
+            self.trace.push(("leaf", format!("{event_type:?}")));
+        }
+    }
+
+    fn warning_rule(action: ConsequenceAction) -> ConsequenceRule {
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action,
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }
+    }
+
+    fn velocity_rule(action: ConsequenceAction) -> ConsequenceRule {
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action,
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }
+    }
+
+    fn triggered(rule_index: usize, action: ConsequenceAction) -> TriggeredConsequence {
+        TriggeredConsequence {
+            rule_index,
+            action,
+            evidence: vec![ConsequenceEvidence {
+                event_sequence: 0,
+                timestamp: 100,
+                actor_did: "did:key:gov".into(),
+                event_type: EventType::GovernanceAction,
+            }],
+        }
+    }
+
+    /// Convergent (`WarningCount`) + successful enforcement: durable
+    /// `ConsequenceTriggered` BEFORE its push, then durable `ConsequenceEnforced`
+    /// BEFORE its push (H4 ordering). Labels are the shared producer labels.
+    #[test]
+    fn enforce_triggered_convergent_success_mints_ordered_leaves() {
+        let rules = vec![warning_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforced".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "durable leaf must precede each matching buffer push (H4 ordering)"
+        );
+        assert_eq!(
+            d.first_leaf_args,
+            Some((
+                "did:key:subject".to_owned(),
+                0,
+                "WarningCount".to_owned(),
+                "SuspendAccess".to_owned()
+            )),
+            "leaf must carry the shared trigger_kind / action_type labels"
+        );
+    }
+
+    /// Non-convergent (MessageVelocity): NO durable leaf is minted, only buffer
+    /// pushes — the gate that keeps velocity/rate out of the canonical log.
+    #[test]
+    fn enforce_triggered_non_convergent_mints_no_leaf() {
+        let rules = vec![velocity_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert!(
+            d.trace.iter().all(|(kind, _)| *kind == "push"),
+            "a non-convergent trigger must mint NO durable leaf, got: {:?}",
+            d.trace
+        );
+        assert!(d.first_leaf_args.is_none());
+    }
+
+    /// Convergent + enforcement FAILURE: durable `ConsequenceTriggered`, then on
+    /// failure durable `ConsequenceEnforcementFailed` THEN
+    /// `ConsequenceEscalatedToSuspendAll`, both before the escalation push.
+    #[test]
+    fn enforce_triggered_convergent_failure_mints_failure_then_escalation() {
+        let rules = vec![warning_rule(suspend_write())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: false, // force enforcement failure -> escalation
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_write())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
+                ("leaf", "ConsequenceEscalatedToSuspendAll".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "failure path: triggered leaf+push, then failure+escalation leaves \
+             before the escalation push (H4/H10)"
+        );
+    }
+
+    /// Convergent + absent member WITH evidence: durable `ConsequenceTriggered`
+    /// then durable `ConsequenceEnforcementFailed` (no escalation — nothing to
+    /// enforce against), each before its push.
+    #[test]
+    fn enforce_triggered_convergent_absent_member_mints_triggered_then_failed() {
+        let rules = vec![warning_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: false, // absent, but evidence present (triggered() supplies it)
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "absent-with-evidence path mints Triggered then EnforcementFailed, no escalation"
+        );
     }
 }

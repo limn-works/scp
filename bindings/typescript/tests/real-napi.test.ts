@@ -664,7 +664,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(typeof events[0]?.sequence).toBe("number");
     });
 
-    test("queries events with a MessageSent filter after send (relay transport)", async () => {
+    test("a send surfaces MessageSent on the ContextEvent buffer, not the durable log", async () => {
       const identity = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -675,15 +675,28 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
       // §9.10.4: a lone-member encrypted send is a no-op that records no
       // MessageSent event. Add a peer and seed its per-member pseudonym so the
-      // send actually fans out and the MessageSent event is recorded.
+      // send actually fans out and the MessageSent event is emitted.
       await napi.contextJoin(ctx, bob.did);
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
+      // Clear the join/create ContextEvents so the only event we observe below is
+      // the one produced by the send.
+      await napi.contextDrainEvents(ctx);
+
       await napi.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
-      const events = await napi.eventLogQuery(ctx, { eventType: "MessageSent" });
-      expect(Array.isArray(events)).toBe(true);
-      expect(events.length).toBeGreaterThanOrEqual(1);
-      expect(events[0]?.eventType).toBe("MessageSent");
+      // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
+      // non-convergent application activity. It is NOT a durable Merkle leaf —
+      // it is surfaced only as a local `ContextEvent::MessageSent` on the
+      // in-process buffer (drained here as a Debug-formatted string).
+      const drained = await napi.contextDrainEvents(ctx);
+      expect(drained.some((e) => e.includes("MessageSent"))).toBe(true);
+
+      // The durable event log (read by eventLogQuery) deliberately excludes
+      // MessageSent so two honest members derive the same merkle_root (§9.9.3),
+      // so a MessageSent filter against the durable log returns nothing.
+      const durable = await napi.eventLogQuery(ctx, { eventType: "MessageSent" });
+      expect(Array.isArray(durable)).toBe(true);
+      expect(durable.length).toBe(0);
     });
 
     // event_log_verify now syncs ContextManager Merkle entries into the

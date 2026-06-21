@@ -360,15 +360,25 @@ pub fn verify_and_unwrap(
 // ---------------------------------------------------------------------------
 
 /// Delivers a single plaintext to the receive buffer, checking if it is a
-/// pseudonym announcement first. Returns the event-log event name for the
-/// delivered message, or `None` when silently dropped.
+/// pseudonym announcement first.
+///
+/// The return is an optional [`scp_event_log::EventType`] — the event to
+/// durably append for the delivered message — but ALL received traffic is
+/// buffer-only, so this currently always returns `None`: ordinary application
+/// messages, pseudonym announcements (a §9.10.4 routing-bootstrap signal handled
+/// via the in-memory peer registry + `ContextEvent::PseudonymAnnounced` buffer
+/// emit), and silently-dropped rejections alike. A receiver-minted Merkle leaf
+/// is not sender-authenticated and would diverge honest receivers' roots
+/// (§9.9.3). The `Some` channel is retained so a future sender-authenticated
+/// received event can opt into a durable append without re-plumbing the
+/// buffered-drain call sites.
 pub fn deliver_plaintext_or_announcement(
     state: &mut PerContextState,
     sender_did: &str,
     plaintext: &[u8],
     context_id: &str,
     event_tx: Option<&ContextEventSender>,
-) -> Option<&'static str> {
+) -> Option<scp_event_log::EventType> {
     // §9.10.4: run the shared announcement-ingest validator. The buffered path
     // maps a rejection to `None` (silent drop) — the message has already been
     // buffered/reordered, so there is no caller to return a typed error to.
@@ -379,16 +389,33 @@ pub fn deliver_plaintext_or_announcement(
                 sender_did,
                 "processed buffered pseudonym announcement"
             );
-            Some("PseudonymAnnounced")
+            // A received pseudonym announcement is a §9.10.4 routing-bootstrap
+            // signal, NOT a durable Merkle event. `ingest_pseudonym_announcement`
+            // already inserted the peer's routing ID into the in-memory registry
+            // and emitted `ContextEvent::PseudonymAnnounced` to the receive
+            // buffer (the announcement's entire function). Returning `None`
+            // suppresses any durable append, exactly as for received application
+            // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
+            // append cannot converge across honest members (late joiners miss
+            // earlier announcements; WASM never appends on receive), which would
+            // false-positive §9.9.3 equivocation detection.
+            None
         }
         AnnouncementOutcome::Rejected(_reason) => None,
         AnnouncementOutcome::NotAnnouncement => {
+            // Received application messages are pushed to the in-memory
+            // receive buffer for SDK observation, but NOT appended to the
+            // durable Merkle event log: a receiver-minted MessageReceived leaf
+            // is not authenticated by the sender, so logging it would let two
+            // honest receivers compute divergent Merkle roots for the same
+            // context and trip §9.9.3 equivocation detection. Returning `None`
+            // suppresses the append while preserving the buffer push.
             let event = ContextEvent::MessageReceived {
                 sender_did: DID(sender_did.to_owned()),
                 payload: plaintext.to_vec(),
             };
             emit_event_into(&mut state.receive_buffer, event, context_id, event_tx);
-            Some("MessageReceived")
+            None
         }
     }
 }
@@ -594,15 +621,44 @@ fn ingest_pseudonym_announcement(
 // ---------------------------------------------------------------------------
 
 /// Runs post-delivery governance logic for a single buffered/drained
-/// message. Bug fix: velocity, event-log append, consequence
-/// evaluation, and checkpoint increment apply to buffered messages too.
+/// message.
+///
+/// Governance — velocity tracking, consequence evaluation/enforcement, and the
+/// `checkpoint_events_since` increment — runs UNCONDITIONALLY for every
+/// delivered buffered message, mirroring the in-order delivery path
+/// (`deliver_message_and_drain_buffered`). Two regressions this function is the
+/// fix for: (1) buffered messages historically skipped governance entirely; (2)
+/// the durable Merkle append is now decoupled — `event_name` is `Some` only for
+/// a sender-authenticated received event. No current received-traffic class
+/// qualifies: ordinary application messages (`MessageReceived`) and pseudonym
+/// announcements (`PseudonymAnnounced`) are both receive-buffer/`ContextEvent`
+/// signals, not durable events, so `deliver_plaintext_or_announcement` returns
+/// `None` for all received traffic (§9.9.3: a receiver-minted leaf is not
+/// sender-authenticated, so appending it — per receiver, in per-receiver arrival
+/// order — would let honest receivers compute divergent roots and false-positive
+/// equivocation detection). Such messages MUST still record velocity, run
+/// consequence eval, and increment the checkpoint counter, only skipping the
+/// append. The `Some` branch remains so a future sender-authenticated received
+/// event can opt into a durable append without re-plumbing this helper.
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
     state: &mut PerContextState,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
-    event_name: &str,
+    event_name: Option<scp_event_log::EventType>,
+    // Committer-assigned leaf timestamp copied from the inbound message
+    // envelope's `created_at` (seconds), for the sender-authenticated received
+    // event the `Some(event_name)` branch would append. It would be convergent
+    // by copy — never a per-member local `now()` (§7.3.1, §9.9.3).
+    //
+    // DORMANT: every current caller passes `event_name = None`, so this
+    // timestamp is not yet consumed — the receive-side append branch that
+    // would replicate a committer's leaf onto a receiving member's log is not
+    // wired. Until that lands (the cross-member leaf-replication forward step
+    // under ADR-051), membership/governance leaves remain committer-appended
+    // only and do NOT converge cross-member. Do not assume this value is live.
+    event_timestamp_secs: u64,
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
@@ -615,11 +671,20 @@ pub fn run_buffered_post_delivery(
         .velocity_tracker
         .record_message(&DID(sender_did.to_owned()), now);
 
-    if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
+    // Durable Merkle append ONLY for sender-authenticated events. Application
+    // messages (`None`) skip the append but still run governance below.
+    if let Some(event_name) = event_name
+        && let Err(e) = event_log.append_context_event(
+            context_id_bytes,
+            event_name,
+            sender_did,
+            event_timestamp_secs,
+        )
+    {
         tracing::warn!(
             context_id,
             sender_did,
-            event_name,
+            event_name = ?event_name,
             "failed to append buffered event to event log: {e}"
         );
     }
@@ -1578,17 +1643,16 @@ pub async fn capture_send_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
-            state, deps, a, sender_did, context_id,
-        )
-        .await
+        && let Err(e) =
+            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
     {
         // H8: do NOT rollback budget — service was delivered.
         tracing::warn!(
             context_id,
             "payment capture failed after successful send: {e}"
         );
-        // H19: append durable audit record.
+        // H19: surface the capture failure as a local `ContextEvent` (no durable
+        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
         record_payment_capture_failure(
             state,
             deps,
@@ -1601,9 +1665,18 @@ pub async fn capture_send_payment(
     }
 }
 
-/// Append a `PaymentCaptureFailed` durable event log entry plus the
-/// matching receive-buffer push. Actor-shape inline replacement for
+/// Surface a `PaymentCaptureFailed` as a local `ContextEvent` (receive-buffer
+/// push + `event_tx` notification). Actor-shape inline replacement for
 /// `manager_methods::record_payment_capture_failure`.
+///
+/// Per ADR-051 §6 / the phase-2.md ADR-011 amendment exclusion taxonomy §2, the
+/// payment receipts (`PaymentReceived` / `PaymentCaptureFailed`) are per-payee,
+/// non-convergent events appended by their payee alone — they are excluded from
+/// the canonical Merkle log so two honest members derive the same
+/// `event_log_merkle_root` (§9.9.3). The former durable
+/// `EventType::PaymentCaptureFailed` append (and its `checkpoint_events_since`
+/// increment) is removed; the `ContextEvent::PaymentCaptureFailed` emission
+/// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
     state: &mut PerContextState,
@@ -1614,24 +1687,6 @@ fn record_payment_capture_failure(
     error_msg: &str,
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload = serde_json::json!({
-        "action": action,
-        "error": error_msg,
-        "cost": cost.map(scp_protocol::economy::types::Amount::value),
-    });
-    if let Err(log_err) = deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        "PaymentCaptureFailed",
-        actor_did.as_ref(),
-        Some(&payload),
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append PaymentCaptureFailed to event log: {log_err}"
-        );
-    }
-    state.checkpoint_events_since += 1;
     let event = ContextEvent::PaymentCaptureFailed {
         action: action.to_owned(),
         actor_did: actor_did.clone(),
@@ -1649,30 +1704,6 @@ fn record_payment_capture_failure(
 // ---------------------------------------------------------------------------
 // 12. finalize_send
 // ---------------------------------------------------------------------------
-
-/// Appends the `MessageSent` event log entry and, on a log-append failure,
-/// rolls the reserved per-sender sequence back (gated `!is_broadcast`) before
-/// surfacing the error. This is the FIRST of [`finalize_send`]'s rollback
-/// sites; it shares the single sequence-rollback ownership invariant documented
-/// on [`finalize_send`] (the caller must not double-revert).
-fn append_message_sent_or_rollback_sequence(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id_bytes: &[u8; 32],
-    sender_did: &DID,
-    is_broadcast: bool,
-) -> Result<(), ContextError> {
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(context_id_bytes, "MessageSent", sender_did.as_ref())
-    {
-        if !is_broadcast {
-            state.membership.rollback_sequence_number(sender_did);
-        }
-        return Err(e);
-    }
-    Ok(())
-}
 
 /// Computes and caches the sender's participation record after a send.
 /// Factored out of [`finalize_send`] to keep that function within the line
@@ -1729,9 +1760,13 @@ fn record_send_participation(
 /// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
 ///
 /// `finalize_send` OWNS the per-sender sequence rollback on ALL of its error
-/// exits — the FIRST `append_context_event` (delegated to
-/// [`append_message_sent_or_rollback_sequence`]), the TTL early-return below,
-/// and the final persist failure (in [`persist_finalized_send`]). The
+/// exits — the TTL early-return below and the final persist failure (in
+/// [`persist_finalized_send`]). (The former FIRST `MessageSent` durable-append
+/// rollback site is gone: per ADR-051 §6 / the phase-2.md ADR-011 amendment
+/// exclusion taxonomy §2, `MessageSent` is a per-author, non-convergent event
+/// excluded from the canonical Merkle log — there is no durable append to fail,
+/// so the local `ContextEvent::MessageSent` emission below is now the sole
+/// surfacing of a send.) The
 /// `send_message` caller deliberately does NOT roll the sequence back when
 /// `finalize_send` returns `Err`: doing so would double-revert, a `+1`
 /// reservation undone by a `−2` via `saturating_sub`, leaving a per-sender gap
@@ -1755,15 +1790,12 @@ pub fn finalize_send(
     spending_nonce_committed: bool,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
-    // M12: append event log BEFORE consequence evaluation; on failure roll the
-    // reserved sequence back (round-9 leak fix — see the helper doc).
-    append_message_sent_or_rollback_sequence(
-        state,
-        deps,
-        context_id_bytes,
-        sender_did,
-        is_broadcast,
-    )?;
+    // M12: `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 /
+    // the phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
+    // non-convergent event surfaced only as the local `ContextEvent::MessageSent`
+    // emitted below. The former pre-consequence durable append (and its
+    // sequence-rollback-on-append-failure) is removed so two honest members
+    // derive the same `event_log_merkle_root` (§9.9.3).
 
     // Phase 3 reacquire-and-mutate is unnecessary in the actor model;
     // the actor owns state for the duration of the command. We DO
@@ -2362,24 +2394,29 @@ pub fn validate_and_drain_timeouts(
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            if let Some(event_name) = deliver_plaintext_or_announcement(
+            let event_name = deliver_plaintext_or_announcement(
                 state,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
-            ) {
-                run_buffered_post_delivery(
-                    state,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                );
-            }
+            );
+            run_buffered_post_delivery(
+                state,
+                context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            );
         }
     }
 
@@ -2443,24 +2480,29 @@ pub fn buffer_ahead_message(
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            if let Some(event_name) = deliver_plaintext_or_announcement(
+            let event_name = deliver_plaintext_or_announcement(
                 state,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
-            ) {
-                run_buffered_post_delivery(
-                    state,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                );
-            }
+            );
+            run_buffered_post_delivery(
+                state,
+                context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            );
         }
     }
 }
@@ -2528,10 +2570,16 @@ pub fn deliver_message_and_drain_buffered(
             // Fall through to the normal-message delivery path below.
         }
         AnnouncementOutcome::Recorded => {
-            // Recorded + emitted by the shared validator. The remaining
+            // Recorded + emitted by the shared validator (registry insert +
+            // `ContextEvent::PseudonymAnnounced` buffer signal). The remaining
             // follow-up — sequence-tracker advance, reorder-buffer drain,
-            // velocity, durable event-log append, and consequence evaluation —
-            // is specific to the in-order direct path and runs here only.
+            // velocity, and consequence evaluation — is specific to the in-order
+            // direct path and runs here only. There is NO durable Merkle append:
+            // a received announcement is a §9.10.4 routing-bootstrap signal, not a
+            // convergent event (per-receiver arrival order; WASM never appends on
+            // receive), so appending it would false-positive §9.9.3 equivocation
+            // detection — the same reason received application messages are
+            // buffer-only.
             state
                 .sequence_tracker
                 .advance(context_id, sender_did, inner.sequence, inner.timestamp);
@@ -2554,24 +2602,30 @@ pub fn deliver_message_and_drain_buffered(
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                if let Some(event_name) = deliver_plaintext_or_announcement(
+                let event_name = deliver_plaintext_or_announcement(
                     state,
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
                     deps.event_tx.as_ref(),
-                ) {
-                    run_buffered_post_delivery(
-                        state,
-                        context_id,
-                        context_id_bytes,
-                        &msg.sender_did,
-                        event_name,
-                        &*deps.clock,
-                        &*deps.event_log,
-                        deps.event_tx.as_ref(),
-                    );
-                }
+                );
+                run_buffered_post_delivery(
+                    state,
+                    context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication
+                    // lands (ADR-051). See `run_buffered_post_delivery`'s param
+                    // doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                );
             }
 
             let now = deps.clock.now_secs();
@@ -2580,17 +2634,6 @@ pub fn deliver_message_and_drain_buffered(
                     .governance
                     .velocity_tracker
                     .record_message(&DID(sender_did.to_owned()), now);
-            }
-            if let Err(e) = deps.event_log.append_context_event(
-                context_id_bytes,
-                "PseudonymAnnounced",
-                sender_did,
-            ) {
-                tracing::warn!(
-                    context_id,
-                    sender_did,
-                    "failed to append PseudonymAnnounced to event log: {e}"
-                );
             }
             let consequence_rules: Vec<ConsequenceRule> =
                 state.governance.consequence_rules.clone();
@@ -2666,37 +2709,37 @@ pub fn deliver_message_and_drain_buffered(
             msg.inner.sequence,
             msg.inner.timestamp,
         );
-        if let Some(event_name) = deliver_plaintext_or_announcement(
+        let event_name = deliver_plaintext_or_announcement(
             state,
             &msg.sender_did,
             &msg.plaintext,
             context_id,
             deps.event_tx.as_ref(),
-        ) {
-            run_buffered_post_delivery(
-                state,
-                context_id,
-                context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
-            );
-        }
-    }
-
-    // H5: append durable event log entry BEFORE consequence eval.
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(context_id_bytes, "MessageReceived", sender_did)
-    {
-        tracing::warn!(
+        );
+        run_buffered_post_delivery(
+            state,
             context_id,
-            sender_did,
-            "failed to append MessageReceived to event log on receive path: {e}"
+            context_id_bytes,
+            &msg.sender_did,
+            event_name,
+            // Dormant: `event_name` here is always `None`
+            // (`deliver_plaintext_or_announcement` never appends on receive),
+            // so this committer-copied timestamp is not yet consumed. Live only
+            // once cross-member leaf replication lands (ADR-051). See
+            // `run_buffered_post_delivery`'s param doc.
+            msg.inner.timestamp / 1000,
+            &*deps.clock,
+            &*deps.event_log,
+            deps.event_tx.as_ref(),
         );
     }
+
+    // §9.9.3: received application messages are NOT appended to the durable
+    // Merkle event log. A MessageReceived leaf is minted by the receiver and
+    // is not authenticated by the sender, so two honest receivers would
+    // compute divergent roots for the same context and false-positive
+    // equivocation detection. The receive buffer (in-memory, SDK-observable)
+    // still records the message; consequence evaluation reads it from there.
 
     // H16: defense-in-depth velocity + consequence eval on receive.
     let now = deps.clock.now_secs();
@@ -2939,7 +2982,10 @@ mod pseudonym_routing_tests {
         let bytes = announcement_bytes(ALICE, alice_pseudonym);
 
         let result = deliver_plaintext_or_announcement(&mut state, ALICE, &bytes, &ctx, None);
-        assert_eq!(result, Some("PseudonymAnnounced"));
+        // A recorded announcement is a buffer-only routing signal — NO durable
+        // Merkle leaf is minted on receive (§9.9.3), so the typed-append channel
+        // is `None`. The registry update is the observable effect.
+        assert_eq!(result, None);
         // Registry now maps Alice's DID to her announced routing ID.
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&alice_pseudonym));
@@ -2952,7 +2998,9 @@ mod pseudonym_routing_tests {
         let first = [0x42u8; 32];
         let rotated = [0x43u8; 32];
 
-        // First announcement.
+        // First announcement. Recorded announcements are buffer-only (no durable
+        // Merkle leaf on receive, §9.9.3), so the typed-append channel is `None`;
+        // the registry update below is the observable effect.
         assert_eq!(
             deliver_plaintext_or_announcement(
                 &mut state,
@@ -2961,7 +3009,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            None
         );
         // Same DID re-announces a rotated routing ID — legitimate key rotation.
         assert_eq!(
@@ -2972,7 +3020,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            None
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
@@ -3030,7 +3078,9 @@ mod pseudonym_routing_tests {
         let ctx = ctx_hex(0x11);
         let shared_rid = [0x55u8; 32];
 
-        // Alice legitimately claims `shared_rid` first.
+        // Alice legitimately claims `shared_rid` first. Recorded ⇒ buffer-only
+        // (no durable Merkle leaf on receive, §9.9.3) ⇒ `None`; the registry
+        // assertions below distinguish Recorded (inserted) from Rejected.
         assert_eq!(
             deliver_plaintext_or_announcement(
                 &mut state,
@@ -3039,7 +3089,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            None
         );
         // Bob tries to claim Alice's already-registered routing ID → collision.
         assert_eq!(
@@ -3081,9 +3131,20 @@ mod pseudonym_routing_tests {
     fn buffered_non_announcement_is_delivered_as_normal_message() {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
+        let buffered_before = state.receive_buffer.event_log_entries().len();
         let result =
             deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
-        assert_eq!(result, Some("MessageReceived"));
+        // A non-announcement application message is pushed to the in-memory
+        // receive buffer but NOT minted as a durable Merkle leaf (a
+        // receiver-minted MessageReceived leaf is not sender-authenticated and
+        // would let honest receivers diverge their roots, §9.9.3), so the
+        // function returns None.
+        assert_eq!(result, None);
+        assert_eq!(
+            state.receive_buffer.event_log_entries().len(),
+            buffered_before + 1,
+            "the received message must still be buffered for SDK observation"
+        );
     }
 
     /// The shared validator returns the EXACT outcome each call site maps:
@@ -3126,6 +3187,566 @@ mod pseudonym_routing_tests {
             ),
             AnnouncementOutcome::Rejected(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: buffered-drain post-delivery governance MUST run for
+    // application messages even though they produce no Merkle append.
+    //
+    // The Merkle-append suppression for received application messages (§9.9.3 —
+    // a receiver-minted `MessageReceived` leaf is not sender-authenticated, so
+    // appending it would let honest receivers diverge their roots) made
+    // `deliver_plaintext_or_announcement` return `None` for app data. The four
+    // buffered-drain call sites previously gated ALL of
+    // `run_buffered_post_delivery` on that `Some`, which silently dropped
+    // velocity tracking, consequence evaluation/enforcement, and the
+    // `checkpoint_events_since` increment for every buffered application
+    // message — only announcements (still `Some`) stayed covered. The in-order
+    // path always ran these unconditionally, so the buffered path had drifted.
+    //
+    // This test drives the post-delivery helper with `event_name == None` (the
+    // application-message case) and asserts all three governance side effects
+    // still fire. It FAILS against the gated implementation (the helper was
+    // never called) and PASSES once the append is decoupled from governance.
+    // -----------------------------------------------------------------------
+
+    use crate::context::actor::state::PerContextState as RegressionState;
+    use scp_primitives::TestClock;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// Event-log provider that flags which `EventType`s were appended so the
+    /// test can prove (a) a non-convergent (velocity-triggered) consequence
+    /// appends NO durable `ConsequenceTriggered` Merkle leaf (ADR-051 §6) and
+    /// (b) the application message itself appends NO `MessageSent` Merkle leaf
+    /// for a `None` event type (§9.9.3). Uses atomics only (no `Mutex`) per
+    /// ADR-049's runtime-state model.
+    #[derive(Default)]
+    struct RecordingEventLog {
+        saw_consequence_triggered: AtomicBool,
+        saw_message_sent: AtomicBool,
+    }
+
+    impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            match event {
+                scp_event_log::EventType::ConsequenceTriggered => {
+                    self.saw_consequence_triggered
+                        .store(true, AtomicOrdering::SeqCst);
+                }
+                scp_event_log::EventType::MessageSent => {
+                    self.saw_message_sent.store(true, AtomicOrdering::SeqCst);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
+        use crate::context::messaging_helpers::{
+            deliver_plaintext_or_announcement, run_buffered_post_delivery,
+        };
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+
+        let ctx = ctx_hex(0x11);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let mut state: RegressionState = encrypted_state();
+
+        // Install a MessageVelocity rule that triggers on the FIRST message from
+        // a sender. Received application messages are projected to
+        // `EventType::MessageSent` for consequence purposes
+        // (`event_log_entries_for_consequences`), so one buffered app message is
+        // enough to trip threshold 1. The triggered consequence carries non-empty
+        // evidence, so `ConsequenceTriggered` is emitted even though the sender is
+        // not in the test fixture's (empty) membership set.
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        });
+
+        let clock = TestClock::new(1_700_000_100);
+        let event_log = RecordingEventLog::default();
+
+        let checkpoint_before = state.checkpoint_events_since;
+
+        // Deliver an ordinary application message via the buffered ingest entry
+        // point. It is pushed to the receive buffer but returns `None` (no
+        // sender-authenticated Merkle leaf — §9.9.3).
+        let event_name =
+            deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
+        assert_eq!(
+            event_name, None,
+            "a received application message must not mint a durable Merkle leaf"
+        );
+
+        // Post-delivery governance MUST run unconditionally, mirroring the
+        // in-order path — this is exactly the call shape the four buffered-drain
+        // sites now use.
+        run_buffered_post_delivery(
+            &mut state,
+            &ctx,
+            &ctx_bytes,
+            ALICE,
+            event_name,
+            1_700_000_000,
+            &clock,
+            &event_log,
+            None,
+        );
+
+        // (a) Velocity was recorded for the sender.
+        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        assert!(
+            velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
+            "buffered application message must record sender velocity (was skipped by the gated bug)"
+        );
+
+        // (b) Consequence evaluation + enforcement ran, but a MessageVelocity
+        // trigger is NON-CONVERGENT (ADR-051 §6 / phase-2.md ADR-011 amendment):
+        // it must NOT mint a durable `ConsequenceTriggered` Merkle leaf (a
+        // per-receiver, velocity-derived leaf cannot converge across honest
+        // members — §9.9.3), and the application message itself appends no
+        // `MessageSent` leaf. That governance DID run is proven by the recorded
+        // velocity (a) above and the buffered `ContextEvent::ConsequenceTriggered`
+        // surfaced below — local enforcement is unchanged; only the durable leaf
+        // is suppressed.
+        assert!(
+            !event_log
+                .saw_consequence_triggered
+                .load(AtomicOrdering::SeqCst),
+            "a MessageVelocity-triggered consequence is non-convergent and MUST NOT \
+             append a durable ConsequenceTriggered Merkle leaf (ADR-051 §6)"
+        );
+        assert!(
+            !event_log.saw_message_sent.load(AtomicOrdering::SeqCst),
+            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
+        );
+        // The non-durable consequence is still surfaced as a local `ContextEvent`
+        // in the receive buffer (the sole surfacing for velocity triggers).
+        let saw_triggered_ctx_event = state.receive_buffer.event_log_entries().iter().any(|e| {
+            matches!(
+                e,
+                scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
+            )
+        });
+        assert!(
+            saw_triggered_ctx_event,
+            "the non-durable velocity consequence must still emit a \
+             ContextEvent::ConsequenceTriggered into the receive buffer"
+        );
+
+        // (c) The checkpoint counter advanced for the delivered application
+        // message: `run_buffered_post_delivery` increments it once unconditionally
+        // for the buffered delivery itself. The velocity consequence adds NO
+        // durable leaf and so does NOT additionally advance it (the counter now
+        // tracks the true durable-leaf count). The pre-change gated bug left it
+        // UNCHANGED entirely.
+        assert!(
+            state.checkpoint_events_since > checkpoint_before,
+            "buffered application message must advance checkpoint_events_since once \
+             for the delivery (was skipped by the gated bug): \
+             before={checkpoint_before}, after={}",
+            state.checkpoint_events_since
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // STRONGER regression: drive a buffered APPLICATION message END-TO-END
+    // through a REAL buffered-drain call site so a re-introduced
+    // `if let Some(event_name) { run_buffered_post_delivery(...) }` gate is
+    // caught.
+    //
+    // The helper-contract test above calls `run_buffered_post_delivery`
+    // DIRECTLY, so it proves the helper does the right thing GIVEN it is
+    // called — but it cannot observe the four call sites that decide WHETHER
+    // to call it. The actual bug lived at those call sites (the
+    // `deliver_plaintext_or_announcement` result was gated through
+    // `if let Some(...)`, which is `None` for application data, so governance
+    // was skipped). This test exercises `validate_and_drain_timeouts` — one of
+    // the four real drain paths — with a buffered-ahead application message
+    // that times out, forcing the call site to run
+    // `deliver_plaintext_or_announcement` (→ `None`) followed by
+    // `run_buffered_post_delivery`. It asserts the governance side effects fire
+    // (velocity recorded + a buffered `ContextEvent::ConsequenceTriggered` +
+    // the delivery checkpoint increment) WITHOUT any durable leaf — neither a
+    // `MessageSent` leaf nor (for the non-convergent velocity trigger) a durable
+    // `ConsequenceTriggered` leaf (ADR-051 §6). Re-adding an `if let Some` gate
+    // around the call site makes this test FAIL (governance is skipped for the
+    // `None`-typed application message), which the helper-contract test would not
+    // catch.
+    // -----------------------------------------------------------------------
+
+    /// Event-log provider that records appended `EventType`s through shared
+    /// `Arc<AtomicBool>` handles, so the test can read them AFTER the provider
+    /// has been moved into the supervisor / `ActorDeps`. Atomics only (no
+    /// `Mutex`) per ADR-049's runtime-state model.
+    struct DrainRecordingEventLog {
+        consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// `EventType` enumerates 77 variants; `PseudonymAnnounced` was REMOVED
+        /// (it is a `ContextEvent`-only routing signal, not a durable event). A
+        /// recorder cannot match a non-existent variant, so a received
+        /// announcement is proven buffer-only by the ABSENCE of any append at
+        /// all (`any_append == false`) after the announcement-drain path.
+        any_append: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.any_append
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            match event {
+                scp_event_log::EventType::ConsequenceTriggered => {
+                    self.consequence_triggered
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                scp_event_log::EventType::MessageSent => {
+                    self.message_sent
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal application-message `InnerEnvelope` for the drain test. The
+    /// drain path reads only `sequence`/`timestamp`/`context_id`/`sender_did`;
+    /// the body is the separate `plaintext` argument.
+    fn drain_test_inner(ctx: &str, sequence: u64) -> scp_protocol::envelope::inner::InnerEnvelope {
+        scp_protocol::envelope::inner::InnerEnvelope {
+            version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: ctx.to_owned(),
+            sender_did: ALICE.to_owned(),
+            epoch: 0,
+            generation: 0,
+            sequence,
+            timestamp: 1_700_000_000,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signature: [0u8; 64],
+            extensions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Assemble a supervisor-backed `ActorDeps` carrying `event_log` and a
+    /// `TestClock`. Extracted so the drain test stays under `too_many_lines`.
+    async fn build_drain_test_deps(
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> crate::context::actor::deps::ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+        use std::sync::Arc;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ALICE.to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_primitives::Clock> =
+            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ALICE.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    #[tokio::test]
+    async fn buffered_drain_call_site_runs_governance_for_application_message() {
+        use crate::context::messaging_helpers::validate_and_drain_timeouts;
+        use scp_protocol::context::roles::Capability;
+        use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let ctx = ctx_hex(0x11);
+        let mut state: PerContextState = encrypted_state();
+
+        // ALICE must be a writable member: the drain loop re-checks membership +
+        // `MessagesWrite` before delivering each buffered message.
+        state
+            .membership
+            .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
+        state.members.insert(DID(ALICE.to_owned()));
+        state.role_state.members.insert(ALICE.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::MessagesWrite);
+        state
+            .role_state
+            .member_capabilities
+            .insert(ALICE.to_owned(), caps);
+
+        // A MessageVelocity rule that trips on the first message. Received
+        // application messages project to `EventType::MessageSent` for
+        // consequence purposes, so one buffered app message trips threshold 1
+        // and emits `ConsequenceTriggered` (non-empty evidence).
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        });
+
+        // Pre-buffer an out-of-order APPLICATION message (sequence 2, expected
+        // 1) with `received_at = 0` so it is past the gap timeout once we pass a
+        // large `now_ms`. This is a plain application payload (not a pseudonym
+        // announcement), so on drain `deliver_plaintext_or_announcement` returns
+        // `None` — exactly the case the gated bug dropped.
+        let buffered = state.reorder_buffer.buffer(BufferedMessage {
+            inner: drain_test_inner(&ctx, 2),
+            sender_did: ALICE.to_owned(),
+            plaintext: b"buffered application payload".to_vec(),
+            received_at: 0,
+        });
+        assert!(
+            buffered.is_none(),
+            "single buffered message must not overflow the reorder buffer"
+        );
+
+        // Shared recording handles survive the move into the supervisor.
+        let saw_consequence_triggered = Arc::new(AtomicBool::new(false));
+        let saw_message_sent = Arc::new(AtomicBool::new(false));
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(DrainRecordingEventLog {
+                consequence_triggered: Arc::clone(&saw_consequence_triggered),
+                message_sent: Arc::clone(&saw_message_sent),
+                any_append: Arc::new(AtomicBool::new(false)),
+            });
+        let deps = build_drain_test_deps(event_log).await;
+
+        let checkpoint_before = state.checkpoint_events_since;
+
+        // Drive the REAL drain call site: the incoming in-order message (seq 1)
+        // is validated, and `now_ms` is past the gap timeout, so the buffered
+        // seq-2 application message force-drains through
+        // `validate_and_drain_timeouts`' loop — which calls
+        // `deliver_plaintext_or_announcement` (→ `None`) then
+        // `run_buffered_post_delivery`. A re-added `if let Some` gate here would
+        // skip governance for the `None`-typed application message.
+        let incoming = drain_test_inner(&ctx, 1);
+        let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
+        validate_and_drain_timeouts(&mut state, &deps, &ctx, &incoming, now_ms)
+            .expect("validate_and_drain_timeouts");
+
+        // (a) Velocity recorded for the buffered sender via the drain path.
+        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        assert!(
+            velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
+            "buffered-drain call site must record sender velocity (a re-added `if let Some` gate skips it)"
+        );
+
+        // (b) Consequence evaluation/enforcement ran, but a MessageVelocity
+        // trigger is NON-CONVERGENT (ADR-051 §6 / phase-2.md ADR-011 amendment):
+        // it must NOT append a durable `ConsequenceTriggered` Merkle leaf, and the
+        // application message itself appends no `MessageSent` leaf (§9.9.3). That
+        // governance DID run is proven by the recorded velocity (a) above and the
+        // buffered `ContextEvent::ConsequenceTriggered` (below) — a re-added
+        // `if let Some` gate around the call site would skip BOTH.
+        assert!(
+            !saw_consequence_triggered.load(AtomicOrdering::SeqCst),
+            "a MessageVelocity-triggered consequence is non-convergent and MUST NOT \
+             append a durable ConsequenceTriggered Merkle leaf (ADR-051 §6)"
+        );
+        assert!(
+            !saw_message_sent.load(AtomicOrdering::SeqCst),
+            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
+        );
+        // Governance still surfaced the consequence as a local `ContextEvent`,
+        // proving the buffered-drain call site DID run enforcement (a re-added
+        // `if let Some` gate would leave the buffer without it).
+        let saw_triggered_ctx_event = state.receive_buffer.event_log_entries().iter().any(|e| {
+            matches!(
+                e,
+                scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
+            )
+        });
+        assert!(
+            saw_triggered_ctx_event,
+            "the buffered-drain call site must surface a ContextEvent::ConsequenceTriggered \
+             for the velocity consequence (a re-added `if let Some` gate skips governance)"
+        );
+
+        // (c) The checkpoint counter advanced for the drained application
+        // message: the buffered-delivery path increments it once unconditionally.
+        // The non-durable velocity consequence adds no leaf and so does not
+        // additionally advance it. The gated bug left it unchanged entirely.
+        assert!(
+            state.checkpoint_events_since > checkpoint_before,
+            "buffered-drain call site must advance checkpoint_events_since once for the \
+             delivery (a re-added `if let Some` gate skips it): \
+             before={checkpoint_before}, after={}",
+            state.checkpoint_events_since
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a RECEIVED pseudonym announcement must NOT mint a durable
+    // Merkle leaf.
+    //
+    // PseudonymAnnounced is a §9.10.4 routing-bootstrap `ContextEvent` signal,
+    // not a durable event (it was removed from the closed `EventType` taxonomy).
+    // A received announcement updates the in-memory peer registry and emits a
+    // `ContextEvent::PseudonymAnnounced` buffer notification, but a per-receiver,
+    // per-arrival-order Merkle append cannot converge across honest members and
+    // would false-positive §9.9.3 equivocation detection. This test drives a
+    // legitimate in-order announcement through the REAL direct delivery path
+    // (`deliver_message_and_drain_buffered`) and asserts (a) the registry was
+    // updated (the announcement WAS processed) and (b) NO event was appended to
+    // the durable log at all. A re-introduced receive-path append would set
+    // `saw_any_append` and fail this test.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn received_announcement_updates_registry_without_durable_append() {
+        use crate::context::messaging_helpers::deliver_message_and_drain_buffered;
+        use scp_protocol::context::roles::Capability;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let ctx = ctx_hex(0x11);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let mut state: PerContextState = encrypted_state();
+
+        // The direct delivery path requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+
+        // ALICE must be a writable member: the direct path checks membership +
+        // `MessagesWrite` before delivering.
+        state
+            .membership
+            .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
+        state.members.insert(DID(ALICE.to_owned()));
+        state.role_state.members.insert(ALICE.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::MessagesWrite);
+        state
+            .role_state
+            .member_capabilities
+            .insert(ALICE.to_owned(), caps);
+
+        let saw_any_append = Arc::new(AtomicBool::new(false));
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(DrainRecordingEventLog {
+                consequence_triggered: Arc::new(AtomicBool::new(false)),
+                message_sent: Arc::new(AtomicBool::new(false)),
+                any_append: Arc::clone(&saw_any_append),
+            });
+        let deps = build_drain_test_deps(event_log).await;
+
+        // A legitimate in-order pseudonym announcement (ALICE announces her own
+        // routing ID). The drain path reads sequence/timestamp/context/sender
+        // from the inner envelope; the announcement payload is the `plaintext`.
+        let alice_pseudonym = [0x42u8; 32];
+        let announcement = crate::context::state::PseudonymAnnouncement {
+            tag: crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: ALICE.to_owned(),
+            pseudonym: alice_pseudonym,
+        };
+        let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
+        let inner = drain_test_inner(&ctx, 1);
+
+        let consumed = deliver_message_and_drain_buffered(
+            &mut state, &deps, &ctx, &ctx_bytes, ALICE, &inner, &plaintext, false,
+        )
+        .expect("deliver_message_and_drain_buffered");
+
+        // The announcement WAS recognized + processed (consumed as an internal
+        // protocol message) and inserted into the in-memory peer registry.
+        assert!(
+            consumed,
+            "a tagged pseudonym announcement must be consumed as an internal protocol message"
+        );
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert_eq!(
+            reg.get(&DID(ALICE.to_owned())),
+            Some(&alice_pseudonym),
+            "a processed announcement must update the in-memory peer registry (its entire function)"
+        );
+
+        // But NO durable Merkle leaf was appended on the receive path: a received
+        // announcement is buffer-only (§9.9.3 non-convergence). There are no
+        // consequence rules installed, so the ONLY append a regression could add
+        // is the removed receive-path PseudonymAnnounced leaf.
+        assert!(
+            !saw_any_append.load(AtomicOrdering::SeqCst),
+            "a received pseudonym announcement must NOT mint any durable Merkle leaf (§9.9.3)"
+        );
     }
 
     // -----------------------------------------------------------------------

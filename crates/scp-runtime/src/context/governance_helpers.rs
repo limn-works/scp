@@ -146,20 +146,51 @@ pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> G
 // governance_event_label (transitive helper, actor-shape — pure)
 // ---------------------------------------------------------------------------
 
-/// Returns the event-log label string for a [`GovernanceEvent`] variant.
+/// Governance-freeze auto-resolution timeout (§ SCP-272): a simultaneous-
+/// conflict freeze auto-resolves this many seconds after it began. The expiry
+/// instant (`freeze_start + FREEZE_TIMEOUT_SECONDS`) is the convergent deadline
+/// recorded on the `GovernanceFreezeExpired` leaf (§7.3.1, §9.9.3).
+const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
+/// Commit-provenance for a governance-action leaf: the approved proposal id,
+/// the acting DID, and the committer-assigned leaf timestamp.
+///
+/// The timestamp is `proposal.created_at` — a value bound into the SIGNED
+/// proposal, so it is identical and tamper-evident for every member that
+/// processes the proposal (convergent-by-construction). The leaf carrying it,
+/// however, is currently appended ONLY by the committing member: the
+/// receive-side append path is dormant, so governance leaves are not yet
+/// replicated cross-member. Cross-member leaf replication is the forward step
+/// under ADR-051 (§7.3.1, §9.9.3).
+///
+/// Bundled so the per-action `execute_*` helpers carry one provenance value
+/// instead of three loose trailing parameters (keeps each helper within the
+/// argument budget and groups the "who/what/when committed this" triplet).
+#[derive(Clone, Copy)]
+pub struct CommitMeta<'a> {
+    /// The approved proposal whose execution mints this leaf.
+    pub pid: ProposalId,
+    /// The acting DID recorded as the leaf actor.
+    pub actor_did: &'a str,
+    /// The convergent committer-assigned leaf timestamp (Unix seconds).
+    pub timestamp_secs: u64,
+}
+
+/// Returns the [`scp_event_log::EventType`] for a [`GovernanceEvent`] variant.
 ///
 /// Pure projection over a borrowed event; no `state`/`deps` needed.
 #[must_use]
-pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+pub const fn governance_event_label(event: &GovernanceEvent) -> scp_event_log::EventType {
+    use scp_event_log::EventType;
     match event {
-        GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
-        GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
-        GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
-        GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
-        GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
-        GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
-        GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
-        GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+        GovernanceEvent::ProposalCreated { .. } => EventType::GovernanceProposalCreated,
+        GovernanceEvent::VoteCast { .. } => EventType::GovernanceVoteCast,
+        GovernanceEvent::VoteWithdrawn { .. } => EventType::GovernanceVoteWithdrawn,
+        GovernanceEvent::ProposalResolved { .. } => EventType::GovernanceProposalResolved,
+        GovernanceEvent::DeadlockRecovery { .. } => EventType::GovernanceDeadlockRecovery,
+        GovernanceEvent::ConflictDetected { .. } => EventType::GovernanceConflictDetected,
+        GovernanceEvent::ConflictResolved { .. } => EventType::GovernanceConflictResolved,
+        GovernanceEvent::GovernanceActionExecuted { .. } => EventType::GovernanceActionExecuted,
     }
 }
 
@@ -258,6 +289,10 @@ pub async fn tombstone_migrated_context(
 
     let destination_id = migration.destination_context_id.clone();
     let migration_pid = migration.proposal_id;
+    // Timer-triggered tombstone (grace period elapsed): the convergent leaf
+    // timestamp is the pre-computed grace-period deadline (deterministic across
+    // members), never local `now()` (§7.3.1, §9.9.3).
+    let tombstone_ts = migration.grace_period_end;
 
     state
         .handle
@@ -287,14 +322,18 @@ pub async fn tombstone_migrated_context(
     // fail-closed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
-    deps.event_log.append_context_event(
+    let tombstone_payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
+            destination_id: destination_id.clone(),
+            migration_proposal_id: migration_pid,
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &format!(
-            "ContextTombstoned:{}:{}",
-            destination_id,
-            hex::encode(migration_pid)
-        ),
+        scp_event_log::EventType::ContextTombstoned,
         "system",
+        tombstone_payload,
+        tombstone_ts,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -347,6 +386,12 @@ pub async fn withdraw_governance_vote(
     require_active(&state.handle)?;
 
     let gov_ctx = build_governance_context(state, &*deps.clock);
+    // Committer-assigned convergent leaf timestamp for the withdrawal commit:
+    // the same value the engine context observes and the outgoing commit
+    // envelope is stamped with; receivers copy it from the inbound envelope.
+    // Never a per-member local reading divergent from the commit (§7.3.1,
+    // §9.9.3).
+    let withdraw_ts = gov_ctx.now;
     let (status, events) = state
         .governance
         .engine
@@ -360,6 +405,7 @@ pub async fn withdraw_governance_vote(
             &context_id_bytes,
             governance_event_label(event),
             voter_did.as_ref(),
+            withdraw_ts,
         )?;
         event_count += 1;
     }
@@ -407,8 +453,15 @@ pub async fn apply_pending_ceiling_modification(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "CeilingModified", "")?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::CeilingModified,
+        "",
+        // Timer-triggered deferred application: the convergent leaf timestamp is
+        // the pre-computed effective deadline (deterministic across members),
+        // never local `now()` (§7.3.1, §9.9.3).
+        pending.effective_at,
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(true)
@@ -446,8 +499,15 @@ pub async fn apply_pending_economic_policy_change(
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::EconomicPolicyApplied,
+        "",
+        // Timer-triggered deferred application: the convergent leaf timestamp is
+        // the pre-computed effective deadline (deterministic across members),
+        // never local `now()` (§7.3.1, §9.9.3).
+        pending.effective_at,
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(true)
@@ -486,9 +546,10 @@ pub fn detect_and_handle_conflicts(
     use scp_protocol::context::governance::actions_conflict;
 
     let mut events = Vec::new();
-    // Wall-clock timestamp — used ONLY for the audit slot of
-    // `approved_proposals` and for the freeze start time. Never
-    // used for sequence comparison (H10).
+    // Wall-clock timestamp — used ONLY for the local audit slot of
+    // `approved_proposals`. NOT used for the freeze start time (that is
+    // derived convergently from the conflicting proposals' signed
+    // `created_at`, below) and never used for sequence comparison (H10).
     let current_timestamp = deps.clock.now_secs();
 
     // H10: assign the monotonic seq for the new proposal up front, and
@@ -517,13 +578,37 @@ pub fn detect_and_handle_conflicts(
         }
     }
 
-    for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
-        conflicts
+    for (conflicting_id, conflicting_seq, _conflicting_timestamp, conflicting_proposal) in conflicts
     {
         match new_seq.cmp(&conflicting_seq) {
             std::cmp::Ordering::Equal => {
+                // Convergent freeze start: derive from the conflicting proposals'
+                // signed `created_at` values, never local `now()`. Every member
+                // observes the same two signed proposals, so
+                // `max(created_at_a, created_at_b)` is identical across members and
+                // tamper-evident (it is bound into the signed proposals). The
+                // `GovernanceFreezeExpired` leaf (`freeze_start + FREEZE_TIMEOUT`)
+                // is thus convergent-by-construction (§7.3.1, §9.9.3), matching the
+                // committer-assigned-timestamp treatment of other governance leaves.
+                //
+                // SECURITY (residual, accepted): `created_at` is proposer-chosen
+                // and backdatable (signature-bound only against third parties), so
+                // `freeze_start` — and thus the auto-resolution deadline — can be
+                // pulled earlier than honest wall-clock. Unlike the deferred
+                // ceiling / economic-policy windows (whose apply gate is pinned to
+                // a local non-backdatable `observed_at + PERIOD` floor in
+                // `is_effective`), the freeze is NOT an authorization control: it
+                // is a liveness safety valve that auto-resolves a stuck two-proposal
+                // deadlock. Backdating only ENDS a deadlock earlier (benign for
+                // safety, and never grants capability), and it requires TWO
+                // conflicting SIGNED proposals at the same sequence — i.e. two
+                // colluding signers, not a unilateral proposer. The
+                // local-floor treatment is therefore intentionally not applied
+                // here: it would force widening the `governance.freeze` tuple and
+                // its expiry/leaf-deadline consumers for no authorization gain.
+                let freeze_start = new_proposal.created_at.max(conflicting_proposal.created_at);
                 state.governance.freeze =
-                    Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                    Some((new_proposal.proposal_id, conflicting_id, freeze_start));
                 events.push(GovernanceEvent::ConflictDetected {
                     proposal_a: new_proposal.proposal_id,
                     proposal_b: conflicting_id,
@@ -566,8 +651,6 @@ pub fn check_and_resolve_expired_freezes(
     state: &mut PerContextState,
     deps: &ActorDeps,
 ) -> Vec<GovernanceEvent> {
-    const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
-
     let current_timestamp = deps.clock.now_secs();
 
     if let Some((proposal_a, proposal_b, freeze_start)) = state.governance.freeze
@@ -639,9 +722,13 @@ pub fn execute_suspend_member(
     context_id: &str,
     did: &DID,
     capabilities: &[Capability],
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     require_active(&state.handle)?;
 
     if !state.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -673,8 +760,12 @@ pub fn execute_suspend_member(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberSuspended,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -693,9 +784,13 @@ pub fn execute_revoke(
     context_id: &str,
     did: &DID,
     access: AccessScope,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<usize, ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -782,11 +877,17 @@ pub fn execute_revoke(
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
+    let access_revoked_payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
+            target_did: did.as_ref().to_owned(),
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        "AccessRevoked",
+        scp_event_log::EventType::AccessRevoked,
         actor_did,
-        Some(&serde_json::json!({"target_did": did.as_ref()})),
+        access_revoked_payload,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -828,9 +929,13 @@ pub fn execute_restore_access(
     context_id: &str,
     did: &DID,
     capabilities: &[Capability],
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -908,8 +1013,12 @@ pub fn execute_restore_access(
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
-    deps.event_log
-        .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::AccessRestored,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(())
@@ -925,9 +1034,13 @@ pub fn execute_add_member(
     context_id: &str,
     did: &DID,
     role: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -984,8 +1097,12 @@ pub fn execute_add_member(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberJoined,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -999,9 +1116,13 @@ pub fn execute_remove_member(
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1094,8 +1215,12 @@ pub fn execute_remove_member(
     // transition — persist fail-closed so a crash cannot re-admit a removed
     // member.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberLeft,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1110,9 +1235,13 @@ pub fn execute_change_role(
     context_id: &str,
     did: &DID,
     new_role: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1133,8 +1262,12 @@ pub fn execute_change_role(
     // authorization) — persist fail-closed so a crash cannot restore authority
     // a demotion removed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::RoleAssigned,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1148,9 +1281,13 @@ pub fn execute_register_tool(
     deps: &ActorDeps,
     context_id: &str,
     registration: &ToolRegistration,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1169,8 +1306,12 @@ pub fn execute_register_tool(
     state.governance.registered_tools.push(registration.clone());
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ToolRegistered,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1184,9 +1325,13 @@ pub fn execute_remove_tool(
     deps: &ActorDeps,
     context_id: &str,
     tool_id: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1202,8 +1347,12 @@ pub fn execute_remove_tool(
     // crash in the ≤50ms coalesce window cannot roll the removal back and
     // re-grant invocation of a tool the caller was told was removed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ToolRemoved,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1217,9 +1366,13 @@ pub fn execute_modify_ceiling(
     deps: &ActorDeps,
     context_id: &str,
     new_ceiling: &[Capability],
-    proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: proposal_id,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1239,12 +1392,31 @@ pub fn execute_modify_ceiling(
         ));
     }
 
-    let now = deps.clock.now_secs();
-    let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+    // Convergent notification/activation window: anchor on the committer-
+    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+    // copies the same value), never local `now()`. `effective_at =
+    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+    // members, so the deferred ceiling change activates at the same instant
+    // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
+    // the `CeilingModified` leaf when the change applies.
+    //
+    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+    // only against third parties — the proposer can backdate it freely. Used
+    // alone as the apply gate, a proposer could set `created_at` far in the
+    // past so `effective_at <= commit time` and collapse the mandatory
+    // notification window to zero. To keep activation convergent yet
+    // non-backdatable, also record `observed_at` — THIS member's local clock at
+    // commit-processing time (not proposer-controlled). `is_effective` requires
+    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+    // never be shorter than `PERIOD` of locally observed time (§5.3.2).
+    let notified_at = timestamp_secs;
+    let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+    let observed_at = deps.clock.now_secs();
     state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
         new_capabilities: new_ceiling.to_vec(),
-        notified_at: now,
+        notified_at,
         effective_at,
+        observed_at,
         proposal_id,
     });
 
@@ -1252,7 +1424,7 @@ pub fn execute_modify_ceiling(
         state,
         ContextEvent::CeilingChangeNotification {
             new_capabilities: new_ceiling.to_vec(),
-            notified_at: now,
+            notified_at,
             effective_at,
             proposal_id,
         },
@@ -1266,8 +1438,9 @@ pub fn execute_modify_ceiling(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "CeilingModificationPending",
+        scp_event_log::EventType::CeilingModificationPending,
         actor_did,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -1282,9 +1455,13 @@ pub async fn execute_close_context(
     deps: &ActorDeps,
     context_id: &str,
     _reason: Option<&str>,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1306,8 +1483,12 @@ pub async fn execute_close_context(
     // (a closed context must not silently re-open on a crash) — persist
     // fail-closed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextClosing,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1326,9 +1507,13 @@ pub async fn execute_extend_ttl(
     context_id: &str,
     additional_secs: u64,
     approvals: &[scp_protocol::context::governance::SignedVote],
-    proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: proposal_id,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1340,15 +1525,19 @@ pub async fn execute_extend_ttl(
     let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
     if !missing.is_empty() {
         let rejecting_members: Vec<&str> = missing.clone();
-        let rejected_payload = serde_json::json!({
-            "event": "TTLExtensionRejected",
-            "proposal_id": hex::encode(proposal_id),
-            "rejecting_members": rejecting_members,
-        });
-        deps.event_log.append_context_event(
+        let rejected_payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::TtlExtensionRejectedPayload {
+                proposal_id,
+                rejecting_members: rejecting_members.iter().map(|m| (*m).to_owned()).collect(),
+            },
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log.append_context_event_with_payload(
             &context_id_bytes,
-            &rejected_payload.to_string(),
+            scp_event_log::EventType::TtlExtensionRejected,
             actor_did,
+            rejected_payload,
+            timestamp_secs,
         )?;
         state.checkpoint_events_since += 1;
         return Err(ContextError::PermissionDenied(format!(
@@ -1383,6 +1572,12 @@ pub async fn execute_extend_ttl(
             deps,
             context_id,
             std::time::Duration::from_secs(secs),
+            // The extended deadline `new_dl` was computed convergently above as
+            // `old_deadline + additional_secs` (anchored on the prior
+            // convergent deadline). Pass it through as the override so the
+            // re-armed timer records that convergent value — not the local
+            // arm-time `now + remaining` — on the `ContextExpired` leaf.
+            Some(new_dl),
             handle,
         )
         .await;
@@ -1390,17 +1585,20 @@ pub async fn execute_extend_ttl(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
 
-    let extended_payload = serde_json::json!({
-        "event": "TTLExtended",
-        "old_deadline_unix": old_dl,
-        "new_deadline_unix": new_dl,
-        "proposal_id": hex::encode(proposal_id),
-        "consenting_members": consenting,
-    });
-    deps.event_log.append_context_event(
+    let extended_payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+            old_deadline_unix: old_dl,
+            new_deadline_unix: new_dl,
+            proposal_id,
+            consenting_members: consenting,
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &extended_payload.to_string(),
+        scp_event_log::EventType::TtlExtended,
         actor_did,
+        extended_payload,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -1415,9 +1613,13 @@ pub fn execute_transfer_admin(
     deps: &ActorDeps,
     context_id: &str,
     new_admin: &DID,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1452,8 +1654,12 @@ pub fn execute_transfer_admin(
     // cannot restore the prior admin's authority after the transfer was
     // acknowledged.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::AdminTransferred,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1467,9 +1673,13 @@ pub fn execute_create_child_context(
     deps: &ActorDeps,
     context_id: &str,
     _params: &ContextParams,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1484,8 +1694,12 @@ pub fn execute_create_child_context(
         ));
     }
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ChildContextCreated,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1499,9 +1713,13 @@ pub fn execute_modify_pruning_policy(
     deps: &ActorDeps,
     context_id: &str,
     new_policy: &PruningPolicy,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let structural_mul_bp = new_policy
@@ -1545,8 +1763,12 @@ pub fn execute_modify_pruning_policy(
     state.governance.pruning_policy = Some(new_policy.clone());
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "PruningPolicyModified", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::PruningPolicyModified,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1560,9 +1782,13 @@ pub fn execute_add_signer(
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1608,8 +1834,12 @@ pub fn execute_add_signer(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::SignerAdded,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1623,9 +1853,13 @@ pub fn execute_remove_signer(
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1666,8 +1900,12 @@ pub fn execute_remove_signer(
     // authorization — persist fail-closed so a crash cannot re-admit a removed
     // signer.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::SignerRemoved,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1681,9 +1919,13 @@ pub fn execute_modify_threshold(
     deps: &ActorDeps,
     context_id: &str,
     new_threshold: u32,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1700,8 +1942,12 @@ pub fn execute_modify_threshold(
     // authorization-control transition — persist fail-closed so a crash cannot
     // revert to a weaker threshold the caller was told had changed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ThresholdModified,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1715,9 +1961,13 @@ pub fn execute_establish_tool_interface(
     deps: &ActorDeps,
     context_id: &str,
     interface: &ToolInterface,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1742,8 +1992,9 @@ pub fn execute_establish_tool_interface(
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "ToolInterfaceEstablished",
+        scp_event_log::EventType::ToolInterfaceEstablished,
         actor_did,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -1759,9 +2010,13 @@ pub fn execute_reset_member(
     context_id: &str,
     did: &DID,
     _reason: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1836,8 +2091,12 @@ pub fn execute_reset_member(
         );
     }
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberReset,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     state.governance.pending_epoch_resets.push(did.clone());
 
@@ -1860,9 +2119,13 @@ pub fn execute_resolve_conflict(
     proposal_a: &ProposalId,
     proposal_b: &ProposalId,
     resolution: &scp_protocol::context::governance::ConflictResolution,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1947,8 +2210,9 @@ pub fn execute_resolve_conflict(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "GovernanceConflictResolved",
+        scp_event_log::EventType::GovernanceConflictResolved,
         actor_did,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -1963,9 +2227,13 @@ pub fn execute_promote_context(
     deps: &ActorDeps,
     context_id: &str,
     approvals: &[scp_protocol::context::governance::SignedVote],
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -1997,8 +2265,12 @@ pub fn execute_promote_context(
     state.handle.promote_memory_scope();
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextPromoted,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2013,9 +2285,13 @@ pub fn execute_rotate_content_keys(
     deps: &ActorDeps,
     context_id: &str,
     reason: Option<&str>,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -2085,8 +2361,12 @@ pub fn execute_rotate_content_keys(
         persist_broadcast_snapshot(deps, context_id, snap);
     }
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContentKeysRotated,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2102,9 +2382,13 @@ pub fn execute_reconfigure_governance(
     context_id: &str,
     changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
     justification: &scp_protocol::context::governance::DeadlockJustification,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     if changes.is_empty() {
         return Err(ContextError::PermissionDenied(
             "reconfigure_governance requires at least one change".to_owned(),
@@ -2171,8 +2455,12 @@ pub fn execute_reconfigure_governance(
     // cannot revert to the prior governance configuration after the
     // reconfiguration was acknowledged.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
-    deps.event_log
-        .append_context_event(&context_id_bytes, "GovernanceReconfigured", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::GovernanceReconfigured,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2186,9 +2474,13 @@ pub fn execute_set_economic_policy(
     deps: &ActorDeps,
     context_id: &str,
     policy: &EconomicPolicy,
-    proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: proposal_id,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
         .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
 
@@ -2210,19 +2502,40 @@ pub fn execute_set_economic_policy(
         ));
     }
 
-    let now = deps.clock.now_secs();
-    let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+    // Convergent notification/activation window: anchor on the committer-
+    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+    // copies the same value), never local `now()`. `effective_at =
+    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+    // members, so the deferred economic-policy change activates at the same
+    // instant everywhere (§7.3.1, §9.9.3). This convergent value is also what
+    // lands on the `EconomicPolicyApplied` leaf when the change applies.
+    //
+    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+    // only against third parties — the proposer can backdate it freely. Used
+    // alone as the apply gate, a proposer could set `created_at` far in the
+    // past so `effective_at <= commit time` and collapse the mandatory 24-hour
+    // notification window to zero, violating §19.3 ("MUST NOT take effect
+    // sooner than 24 hours after the `EconomicPolicyChanged` event is committed
+    // to the event log"). To keep activation convergent yet non-backdatable,
+    // also record `observed_at` — THIS member's local clock at commit-
+    // processing time (not proposer-controlled). `is_effective` requires
+    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+    // never be shorter than `PERIOD` of locally observed time.
+    let notified_at = timestamp_secs;
+    let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+    let observed_at = deps.clock.now_secs();
     state.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
         new_policy: policy.clone(),
-        notified_at: now,
+        notified_at,
         effective_at,
+        observed_at,
         proposal_id,
     });
 
     emit(
         state,
         ContextEvent::EconomicPolicyChangeNotification {
-            notified_at: now,
+            notified_at,
             effective_at,
             proposal_id,
         },
@@ -2231,8 +2544,12 @@ pub fn execute_set_economic_policy(
     );
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyChanged", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::EconomicPolicyChanged,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2249,9 +2566,13 @@ pub fn execute_approve_spend(
     spender: &DID,
     amount: scp_protocol::economy::types::Amount,
     purpose: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -2263,14 +2584,20 @@ pub fn execute_approve_spend(
     state.governance.budget_tracker.grant(spender, amount);
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    let payload = serde_json::json!({
-        "event": "SpendApproved",
-        "spender": spender.as_ref(),
-        "amount": amount,
-        "purpose": purpose,
-    });
-    deps.event_log
-        .append_context_event(&context_id_bytes, &payload.to_string(), actor_did)?;
+    let spend_payload =
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
+            spender: spender.as_ref().to_owned(),
+            amount: amount.value(),
+            purpose: purpose.to_owned(),
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
+        &context_id_bytes,
+        scp_event_log::EventType::SpendApproved,
+        actor_did,
+        spend_payload,
+        timestamp_secs,
+    )?;
     Ok(())
 }
 
@@ -2282,9 +2609,13 @@ pub fn execute_lock_economic_policy(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     require_active(&state.handle)?;
@@ -2306,8 +2637,12 @@ pub fn execute_lock_economic_policy(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyLocked", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::EconomicPolicyLocked,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2321,9 +2656,13 @@ pub fn execute_modify_hard_rate_limit(
     deps: &ActorDeps,
     context_id: &str,
     new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     new_config.validate().map_err(|e| {
@@ -2353,8 +2692,12 @@ pub fn execute_modify_hard_rate_limit(
         );
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "HardRateLimitModified", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::HardRateLimitModified,
+        actor_did,
+        timestamp_secs,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2385,13 +2728,17 @@ pub fn execute_propose_context_migration<'a>(
     reason: &'a str,
     grace_period_secs: u64,
     auto_invite: bool,
-    proposal_id: ProposalId,
-    actor_did: &'a str,
+    meta: CommitMeta<'a>,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<MigrationProposedResult, ContextError>> + Send + 'a,
     >,
 > {
+    let CommitMeta {
+        pid: proposal_id,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     Box::pin(async move {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2512,8 +2859,9 @@ pub fn execute_propose_context_migration<'a>(
         crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
         deps.event_log.append_context_event(
             &context_id_bytes,
-            "ContextMigrationStarted",
+            scp_event_log::EventType::ContextMigrationStarted,
             actor_did,
+            timestamp_secs,
         )?;
         state.checkpoint_events_since += 1;
 
@@ -2532,9 +2880,13 @@ pub async fn execute_cancel_context_migration(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-    _proposal_id: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let s = state
@@ -2574,13 +2926,18 @@ pub async fn execute_cancel_context_migration(
     );
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log.append_context_event(
+    let cancel_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::ContextMigrationCancelledPayload {
+            original_proposal_id,
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &format!(
-            "ContextMigrationCancelled:{}",
-            hex::encode(original_proposal_id)
-        ),
+        scp_event_log::EventType::ContextMigrationCancelled,
         actor_did,
+        cancel_payload,
+        timestamp_secs,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -2660,15 +3017,27 @@ pub async fn propose_governance_action_inner(
     actor_check_proposer_eligibility(state, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
 
     // SCP-272: Check and auto-resolve expired governance freezes.
+    // Timer-triggered expiry: capture the pre-computed freeze deadline
+    // (freeze_start + timeout) BEFORE resolution clears the freeze, so the
+    // GovernanceFreezeExpired leaf carries that convergent deadline rather than
+    // a per-member local `now()` (§7.3.1, §9.9.3).
+    let freeze_expiry_deadline = state
+        .governance
+        .freeze
+        .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
     let freeze_events = check_and_resolve_expired_freezes(state, deps);
     if !freeze_events.is_empty() {
         let cid_bytes = context_id_to_bytes(context_id);
+        // The freeze was present when `freeze_events` is non-empty (expiry just
+        // fired), so the deadline is always `Some` here.
+        let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
         for event in &freeze_events {
             if let GovernanceEvent::ConflictResolved { .. } = event {
                 deps.event_log.append_context_event(
                     &cid_bytes,
-                    "GovernanceFreezeExpired",
+                    scp_event_log::EventType::GovernanceFreezeExpired,
                     proposer_did.as_ref(),
+                    freeze_ts,
                 )?;
                 state.checkpoint_events_since += 1;
             }
@@ -2720,16 +3089,21 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictDetected",
+                        scp_event_log::EventType::GovernanceConflictDetected,
                         proposer_did.as_ref(),
+                        // Conflict detected deterministically while processing
+                        // this proposal: the convergent leaf timestamp is the
+                        // proposal's signed `created_at` (§7.3.1, §9.9.3).
+                        proposal.created_at,
                     )?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictResolved",
+                        scp_event_log::EventType::GovernanceConflictResolved,
                         proposer_did.as_ref(),
+                        proposal.created_at,
                     )?;
                     conflict_event_count += 1;
                 }
@@ -3009,22 +3383,28 @@ pub async fn vote_on_proposal_inner(
     // Emit conflict events to the event log.
     if !conflict_events.is_empty() {
         let context_id_bytes = context_id_to_bytes(context_id);
+        // Conflict detected/resolved deterministically while processing this
+        // approved proposal: the convergent leaf timestamp is the proposal's
+        // signed `created_at` (§7.3.1, §9.9.3).
+        let conflict_ts = proposal_for_execution.as_ref().map_or(0, |p| p.created_at);
         let mut conflict_event_count: u64 = 0;
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictDetected",
+                        scp_event_log::EventType::GovernanceConflictDetected,
                         voter_did.as_ref(),
+                        conflict_ts,
                     )?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictResolved",
+                        scp_event_log::EventType::GovernanceConflictResolved,
                         voter_did.as_ref(),
+                        conflict_ts,
                     )?;
                     conflict_event_count += 1;
                 }
@@ -3135,28 +3515,83 @@ pub fn dispatch_content_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
-    pid: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let CommitMeta {
+        pid,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     match action {
         GovernanceAction::AddSigner { did } => {
-            execute_add_signer(state, deps, context_id, did, pid, actor_did)?;
+            execute_add_signer(
+                state,
+                deps,
+                context_id,
+                did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::SignerAdded)
         }
         GovernanceAction::RemoveSigner { did } => {
-            execute_remove_signer(state, deps, context_id, did, pid, actor_did)?;
+            execute_remove_signer(
+                state,
+                deps,
+                context_id,
+                did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::SignerRemoved)
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
-            execute_modify_threshold(state, deps, context_id, *new_threshold, pid, actor_did)?;
+            execute_modify_threshold(
+                state,
+                deps,
+                context_id,
+                *new_threshold,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
         GovernanceAction::EstablishToolInterface { interface } => {
-            execute_establish_tool_interface(state, deps, context_id, interface, pid, actor_did)?;
+            execute_establish_tool_interface(
+                state,
+                deps,
+                context_id,
+                interface,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::ToolInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
-            execute_reset_member(state, deps, context_id, did, reason, pid, actor_did)?;
+            execute_reset_member(
+                state,
+                deps,
+                context_id,
+                did,
+                reason,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::MemberReset)
         }
         GovernanceAction::ResolveConflict {
@@ -3165,7 +3600,17 @@ pub fn dispatch_content_governance_action(
             resolution,
         } => {
             execute_resolve_conflict(
-                state, deps, context_id, proposal_a, proposal_b, resolution, pid, actor_did,
+                state,
+                deps,
+                context_id,
+                proposal_a,
+                proposal_b,
+                resolution,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
             )?;
             Ok(GovernanceActionResult::ConflictResolved)
         }
@@ -3175,8 +3620,11 @@ pub fn dispatch_content_governance_action(
                 deps,
                 context_id,
                 reason.as_deref(),
-                pid,
-                actor_did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
             )?;
             Ok(GovernanceActionResult::ContentKeysRotated(
                 ContentKeysRotatedResult {
@@ -3194,8 +3642,11 @@ pub fn dispatch_content_governance_action(
                 context_id,
                 changes,
                 justification,
-                pid,
-                actor_did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
             )?;
             Ok(GovernanceActionResult::GovernanceReconfigured(
                 GovernanceReconfiguredResult {
@@ -3256,49 +3707,155 @@ pub async fn dispatch_context_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
-    pid: ProposalId,
-    actor_did: &str,
+    meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let CommitMeta {
+        pid,
+        actor_did,
+        timestamp_secs,
+    } = meta;
     match action {
         GovernanceAction::AddMember { did, role } => {
-            execute_add_member(state, deps, context_id, did, role, pid, actor_did)?;
+            execute_add_member(
+                state,
+                deps,
+                context_id,
+                did,
+                role,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::MemberAdded)
         }
         GovernanceAction::RemoveMember { did, .. } => {
-            execute_remove_member(state, deps, context_id, did, pid, actor_did)?;
+            execute_remove_member(
+                state,
+                deps,
+                context_id,
+                did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::MemberRemoved)
         }
         GovernanceAction::ChangeRole { did, new_role } => {
-            execute_change_role(state, deps, context_id, did, new_role, pid, actor_did)?;
+            execute_change_role(
+                state,
+                deps,
+                context_id,
+                did,
+                new_role,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::RoleChanged)
         }
         GovernanceAction::RegisterTool { registration } => {
-            execute_register_tool(state, deps, context_id, registration, pid, actor_did)?;
+            execute_register_tool(
+                state,
+                deps,
+                context_id,
+                registration,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::ToolRegistered)
         }
         GovernanceAction::RemoveTool { tool_id } => {
-            execute_remove_tool(state, deps, context_id, tool_id, pid, actor_did)?;
+            execute_remove_tool(
+                state,
+                deps,
+                context_id,
+                tool_id,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::ToolRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
-            execute_modify_ceiling(state, deps, context_id, new_ceiling, pid, actor_did)?;
+            execute_modify_ceiling(
+                state,
+                deps,
+                context_id,
+                new_ceiling,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::CeilingModified)
         }
         GovernanceAction::CloseContext { reason } => {
-            execute_close_context(state, deps, context_id, reason.as_deref(), pid, actor_did)
-                .await?;
+            execute_close_context(
+                state,
+                deps,
+                context_id,
+                reason.as_deref(),
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )
+            .await?;
             Ok(GovernanceActionResult::ContextClosed)
         }
         GovernanceAction::TransferAdmin { new_admin } => {
-            execute_transfer_admin(state, deps, context_id, new_admin, pid, actor_did)?;
+            execute_transfer_admin(
+                state,
+                deps,
+                context_id,
+                new_admin,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::AdminTransferred)
         }
         GovernanceAction::CreateChildContext { params } => {
-            execute_create_child_context(state, deps, context_id, params, pid, actor_did)?;
+            execute_create_child_context(
+                state,
+                deps,
+                context_id,
+                params,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::ChildContextCreated)
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
-            execute_modify_pruning_policy(state, deps, context_id, new_policy, pid, actor_did)?;
+            execute_modify_pruning_policy(
+                state,
+                deps,
+                context_id,
+                new_policy,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )?;
             Ok(GovernanceActionResult::PruningPolicyModified)
         }
         GovernanceAction::ProposeContextMigration {
@@ -3320,14 +3877,27 @@ pub async fn dispatch_context_governance_action(
                 reason,
                 *grace_period_secs,
                 *auto_invite,
-                pid,
-                actor_did,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
             )
             .await?;
             Ok(GovernanceActionResult::MigrationProposed(result))
         }
         GovernanceAction::CancelContextMigration => {
-            execute_cancel_context_migration(state, deps, context_id, pid, actor_did).await?;
+            execute_cancel_context_migration(
+                state,
+                deps,
+                context_id,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )
+            .await?;
             Ok(GovernanceActionResult::MigrationCancelled)
         }
         GovernanceAction::AddSigner { .. }
@@ -3337,9 +3907,17 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
-        | GovernanceAction::ReconfigureGovernance { .. } => {
-            dispatch_content_governance_action(state, deps, context_id, action, pid, actor_did)
-        }
+        | GovernanceAction::ReconfigureGovernance { .. } => dispatch_content_governance_action(
+            state,
+            deps,
+            context_id,
+            action,
+            CommitMeta {
+                pid,
+                actor_did,
+                timestamp_secs,
+            },
+        ),
         GovernanceAction::PromoteContext
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::SuspendCapability { .. }
@@ -3378,9 +3956,27 @@ pub async fn dispatch_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = proposal.proposer_did.as_ref();
+    // Committer-assigned leaf timestamp: the proposal's signed `created_at`.
+    // The value is identical and tamper-evident for every member that
+    // processes the signed proposal (convergent-by-construction), never local
+    // `now()`. The leaf itself is currently committer-appended-only — the
+    // receive-side append path is dormant, so cross-member leaf replication is
+    // the forward step under ADR-051 (§7.3.1, §9.9.3).
+    let ts = proposal.created_at;
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
-            execute_suspend_member(state, deps, context_id, did, capabilities, pid, actor)?;
+            execute_suspend_member(
+                state,
+                deps,
+                context_id,
+                did,
+                capabilities,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::MemberSuspended(
                 SuspendMemberResult {
                     did: did.clone(),
@@ -3421,13 +4017,28 @@ pub async fn dispatch_governance_action(
             // member's capabilities after the caller was told the ban applied.
             crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
             let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log
-                .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;
+            deps.event_log.append_context_event(
+                &context_id_bytes,
+                scp_event_log::EventType::MemberSuspendedAll,
+                actor,
+                ts,
+            )?;
             state.checkpoint_events_since += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
-            let r = execute_revoke(state, deps, context_id, did, *access, pid, actor)?;
+            let r = execute_revoke(
+                state,
+                deps,
+                context_id,
+                did,
+                *access,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
                 did: did.clone(),
                 access: *access,
@@ -3435,7 +4046,18 @@ pub async fn dispatch_governance_action(
             }))
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
-            execute_restore_access(state, deps, context_id, did, capabilities, pid, actor)?;
+            execute_restore_access(
+                state,
+                deps,
+                context_id,
+                did,
+                capabilities,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::AccessRestored(
                 RestoreAccessResult {
                     did: did.clone(),
@@ -3444,7 +4066,17 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::PromoteContext => {
-            execute_promote_context(state, deps, context_id, &proposal.approvals, pid, actor)?;
+            execute_promote_context(
+                state,
+                deps,
+                context_id,
+                &proposal.approvals,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::ContextPromoted)
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
@@ -3454,14 +4086,27 @@ pub async fn dispatch_governance_action(
                 context_id,
                 *additional_secs,
                 &proposal.approvals,
-                pid,
-                actor,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
             )
             .await?;
             Ok(GovernanceActionResult::TtlExtended)
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
-            execute_set_economic_policy(state, deps, context_id, policy, pid, actor)?;
+            execute_set_economic_policy(
+                state,
+                deps,
+                context_id,
+                policy,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ApproveSpend {
@@ -3470,16 +4115,45 @@ pub async fn dispatch_governance_action(
             purpose,
         } => {
             execute_approve_spend(
-                state, deps, context_id, spender, *amount, purpose, pid, actor,
+                state,
+                deps,
+                context_id,
+                spender,
+                *amount,
+                purpose,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
             )?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::LockEconomicPolicy => {
-            execute_lock_economic_policy(state, deps, context_id, pid, actor)?;
+            execute_lock_economic_policy(
+                state,
+                deps,
+                context_id,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
-            execute_modify_hard_rate_limit(state, deps, context_id, new_config, pid, actor)?;
+            execute_modify_hard_rate_limit(
+                state,
+                deps,
+                context_id,
+                new_config,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )?;
             Ok(GovernanceActionResult::Executed)
         }
         // Remaining actions dispatched to context-level handler.
@@ -3508,8 +4182,11 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 &proposal.action,
-                pid,
-                actor,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
             )
             .await
         }
@@ -3573,15 +4250,28 @@ pub fn finalize_governance_action(
 
     let context_id_bytes = context_id_to_bytes(context_id);
     let action_variant = proposal.action.variant_name();
-    let payload = Some(proposal.action.target_did().map_or_else(
-        || serde_json::json!({"action_type": action_variant}),
-        |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
-    ));
+    let executed_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::GovernanceActionExecutedPayload {
+            target_did: proposal
+                .action
+                .target_did()
+                .map(|d| d.as_ref().to_owned())
+                .unwrap_or_default(),
+            action_type: action_variant.to_owned(),
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
         governance_event_label(&executed_event),
         proposal.proposer_did.as_ref(),
-        payload.as_ref(),
+        executed_payload,
+        // Committer-assigned timestamp: the proposal's signed `created_at` —
+        // identical and tamper-evident for every member that processes the
+        // signed proposal (convergent-by-construction), never local `now()`.
+        // The leaf is currently committer-appended-only; cross-member leaf
+        // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
+        proposal.created_at,
     )?;
 
     let action_summary = proposal.action.variant_name().to_owned();
@@ -3846,14 +4536,19 @@ pub fn try_broadcast_commit_or_enqueue(
     if commit_bytes.is_empty() {
         return Ok(());
     }
+    // Committer-assigned timestamp for this member's own commit-lifecycle leaf:
+    // the committer's clock — the same source as the `created_at` it stamps on
+    // the outgoing commit envelope (§7.3.1, §9.9.3).
+    let commit_ts = deps.clock.now_secs();
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     match deps.transport.send_message(&routing_id, &commit_bytes) {
         Ok(()) => {
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log.append_context_event(
                 &context_id_bytes,
-                "CommitBroadcasted",
+                scp_event_log::EventType::CommitBroadcasted,
                 actor_did,
+                commit_ts,
             )?;
             state.checkpoint_events_since += 1;
             Ok(())
@@ -3908,8 +4603,9 @@ pub fn try_broadcast_commit_or_enqueue(
             );
             deps.event_log.append_context_event(
                 &context_id_bytes,
-                "CommitBroadcastPending",
+                scp_event_log::EventType::CommitBroadcastPending,
                 actor_did,
+                commit_ts,
             )?;
             state.checkpoint_events_since += 1;
             tracing::warn!(

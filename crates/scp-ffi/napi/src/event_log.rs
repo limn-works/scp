@@ -137,19 +137,26 @@ pub(crate) async fn event_log_query_on(
         let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
 
         #[allow(clippy::cast_precision_loss)]
-        let events: Vec<NapiEvent> = filtered
-            .into_iter()
-            .map(|(seq, entry)| NapiEvent {
-                event_type: entry.event.clone(),
-                actor_did: entry.actor_did.clone(),
+        let mut events: Vec<NapiEvent> = Vec::with_capacity(filtered.len());
+        for (seq, entry) in filtered {
+            let leaf_hash = scp_event_log::tree::leaf_hash(entry).map_err(|e| {
+                napi::Error::from(ScpNapiError::Context {
+                    message: format!("event leaf hash failed: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?;
+            #[allow(clippy::cast_precision_loss)]
+            events.push(NapiEvent {
+                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+                actor_did: entry.actor_did.0.clone(),
                 timestamp: entry.timestamp as f64,
                 payload_json: serde_json::json!({
-                    "hash": hex::encode(entry.hash),
+                    "hash": hex::encode(leaf_hash),
                 })
                 .to_string(),
                 sequence: seq as f64,
-            })
-            .collect();
+            });
+        }
 
         return Ok(events);
     }
@@ -233,6 +240,19 @@ pub(crate) async fn event_log_verify_on(
         .ok()
         .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
     {
+        // Precompute the canonical leaf hash for each source event
+        // (`SHA-256(0x00 ‖ rmp_serde(Event))`) via the substrate helper so the
+        // synced UCAN-state tree commits to byte-identical leaves.
+        let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            leaf_hashes.push(scp_event_log::tree::leaf_hash(entry).map_err(|e| {
+                napi::Error::from(ScpNapiError::Context {
+                    message: format!("event leaf hash failed: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?);
+        }
+
         crate::runtime::with_context(bi, &context_id, |rt| {
             let existing_leaves = rt.core.event_log.leaves();
             let existing_count = existing_leaves.len();
@@ -241,20 +261,20 @@ pub(crate) async fn event_log_verify_on(
             // source (e.g. after reimport), clear and re-sync the entire tree.
             let prefix_matches = existing_leaves
                 .iter()
-                .zip(entries.iter())
-                .all(|(leaf, entry)| *leaf == entry.hash);
+                .zip(leaf_hashes.iter())
+                .all(|(leaf, hash)| leaf == hash);
 
             if !prefix_matches && existing_count > 0 {
                 // Leaves diverge — rebuild from scratch.
                 let ctx_id = rt.core.event_log.context_id().to_owned();
                 rt.core.event_log = scp_event_log::EventLog::new(ctx_id);
-                for entry in &entries {
-                    rt.core.event_log.push_leaf_raw(entry.hash);
+                for hash in &leaf_hashes {
+                    rt.core.event_log.push_leaf_raw(*hash);
                 }
             } else {
                 // Append-only: push entries that haven't been synced yet.
-                for entry in entries.iter().skip(existing_count) {
-                    rt.core.event_log.push_leaf_raw(entry.hash);
+                for hash in leaf_hashes.iter().skip(existing_count) {
+                    rt.core.event_log.push_leaf_raw(*hash);
                 }
             }
             Ok(())

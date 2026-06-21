@@ -130,16 +130,27 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`ContextCreationError`] if initialisation fails.
     fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
-    /// Appends a named event to the context's event log.
+    /// Appends a typed event to the context's event log.
     ///
     /// `actor_did` is the DID of the actor who produced this event (the sender
     /// for messages, the proposer for governance, the joiner for membership
     /// events). Pass an empty string when the actor is unknown or not
     /// applicable (e.g., system-initiated events).
     ///
-    /// `payload` is an optional structured JSON value included in the Merkle
-    /// hash. Used by governance actions to carry `target_did` and other
-    /// structured data for consequence triggers and participation records.
+    /// `event_type` is the closed-taxonomy [`scp_event_log::EventType`] variant
+    /// for this event. `payload` is the structured event payload included in
+    /// the Merkle leaf preimage. Parameterized events carry positional
+    /// `MessagePack` bytes built via [`scp_event_log::payload::encode_payload`];
+    /// non-parameterized events carry an empty [`scp_event_log::EventPayload`].
+    ///
+    /// `timestamp_secs` is the **committer-assigned** leaf timestamp in seconds
+    /// since the Unix epoch. For a commit-ordered event it is the `created_at`
+    /// of the signed SCP envelope carrying the commit, copied by every member
+    /// so that all honest members hash the identical leaf preimage (§7.3.1,
+    /// §9.9.3). For timer-triggered events (TTL/close, governance-freeze expiry,
+    /// deferred economic-policy application) it is the pre-computed convergent
+    /// deadline already held in context state — never a per-member local clock
+    /// reading, which would diverge and break the equal-count/equal-root test.
     ///
     /// # Errors
     ///
@@ -147,9 +158,10 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_event(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
-        payload: Option<&serde_json::Value>,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
@@ -175,17 +187,25 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_context_event(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
+        timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event, actor_did, None)
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+        self.append_event(
+            context_id,
+            event_type,
+            actor_did,
+            scp_event_log::EventPayload::default(),
+            timestamp_secs,
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
-    /// Appends a named event with an optional structured payload.
+    /// Appends a typed event with a structured payload.
     ///
     /// Like [`append_context_event`](Self::append_context_event) but accepts
-    /// an optional JSON payload that is included in the Merkle hash.
+    /// a structured [`scp_event_log::EventPayload`] included in the Merkle leaf
+    /// preimage (parameterized events).
     ///
     /// # Errors
     ///
@@ -193,11 +213,12 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_context_event_with_payload(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
-        payload: Option<&serde_json::Value>,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event, actor_did, payload)
+        self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -218,8 +239,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn event_log_entries(
         &self,
         context_id: &[u8; 32],
-    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
-    {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         let _ = context_id;
         Err(ContextError::EventLogFailed(
             "event log entry reading not supported by this provider".into(),
@@ -229,7 +249,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     // -- Export/import for context state portability (#363) -------------------
 
     /// Exports the event log entries for a context as serialized bytes
-    /// (MessagePack-encoded `Vec<EventLogEntry>`).
+    /// (MessagePack-encoded `Vec<scp_event_log::Event>`).
     ///
     /// # Errors
     ///
@@ -314,6 +334,86 @@ pub trait ContextEventLogProvider: Send + Sync {
         _policy: &scp_protocol::context::governance::PruningPolicy,
     ) -> Option<usize> {
         None
+    }
+
+    // -- Merkle proofs (ADR-011) ---------------------------------------------
+
+    /// Returns an RFC 6962 inclusion proof for the event at `leaf_index`.
+    ///
+    /// The default implementation reads the context's events via
+    /// [`event_log_entries`](Self::event_log_entries), replays them through the
+    /// canonical [`scp_event_log`] substrate to reconstruct the Merkle tree
+    /// (the same leaf preimage the provider committed to), and constructs the
+    /// proof against that tree. This is the single proof seam: there is no
+    /// second tree to keep in sync with the provider's log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, the leaf index is out of bounds, the log is empty, or the
+    /// replayed events fail hash-chain verification.
+    fn prove_event_inclusion(
+        &self,
+        context_id: &[u8; 32],
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        scp_event_log::proof::prove_inclusion(&log, leaf_index)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Returns an RFC 6962 consistency proof between the tree at `old_size`
+    /// and the current tree size.
+    ///
+    /// Reconstructs the Merkle tree the same way as
+    /// [`prove_event_inclusion`](Self::prove_event_inclusion).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, `old_size` is 0, `old_size` exceeds the current size, the log
+    /// is empty, or the replayed events fail hash-chain verification.
+    fn prove_event_consistency(
+        &self,
+        context_id: &[u8; 32],
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        let current_size = scp_event_log::tree::event_count(&log);
+        scp_event_log::proof::prove_consistency(&log, old_size, current_size)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Reconstructs the canonical [`scp_event_log::EventLog`] for a context by
+    /// replaying its events through the substrate.
+    ///
+    /// Shared by the proof methods. Returns an error if no log exists for the
+    /// context or the replayed events break the hash chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] on a missing log or a broken
+    /// chain.
+    fn rebuild_event_log_for_proof(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_event_log::EventLog, ContextError> {
+        let entries = self.event_log_entries(context_id)?.ok_or_else(|| {
+            ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        let mut log = scp_event_log::EventLog::new(hex::encode(context_id));
+        for event in &entries {
+            scp_event_log::tree::append_unsigned_event(&mut log, event).map_err(|e| {
+                ContextError::EventLogFailed(format!(
+                    "event log chain broken at sequence {}: {e}",
+                    event.sequence
+                ))
+            })?;
+        }
+        Ok(log)
     }
 }
 
@@ -635,6 +735,7 @@ pub async fn create_context(
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
     creator_did: &str,
+    creation_timestamp_secs: u64,
 ) -> Result<ContextHandle, ContextCreationError> {
     // ------------------------------------------------------------------
     // Phase 1 -- Validate (no side effects)
@@ -727,8 +828,15 @@ pub async fn create_context(
     }
 
     // Step 7: Append ContextCreated event.
-    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did, None)
-    {
+    if let Err(e) = event_log_provider.append_event(
+        &id_bytes,
+        scp_event_log::EventType::ContextCreated,
+        creator_did,
+        scp_event_log::EventPayload::default(),
+        // Creator-assigned creation time, copied by every member (§7.3.1,
+        // §9.9.3) — not each member's local `now()`.
+        creation_timestamp_secs,
+    ) {
         // Even though the handle is Active, we must roll back everything.
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
@@ -792,9 +900,10 @@ mod tests {
         fn append_event(
             &self,
             _: &[u8; 32],
-            _: &str,
+            _event_type: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

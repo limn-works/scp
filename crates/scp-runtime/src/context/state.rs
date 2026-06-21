@@ -239,9 +239,27 @@ pub struct PendingCeilingModification {
     pub new_capabilities: Vec<Capability>,
     /// Unix timestamp (seconds) when the notification period started.
     pub notified_at: u64,
-    /// Unix timestamp (seconds) when the notification period expires and
-    /// the new ceiling can be applied.
+    /// Convergent Unix timestamp (seconds) when the notification period
+    /// expires and the new ceiling can be applied. Anchored on the
+    /// committer-assigned proposal timestamp (`proposal.created_at`), so it
+    /// is identical across members — and is recorded as the convergent
+    /// `CeilingModified` leaf timestamp when the change is applied.
     pub effective_at: u64,
+    /// Local Unix timestamp (seconds) at which THIS member observed/processed
+    /// the originating governance commit. Unlike `effective_at` (which is
+    /// anchored on the proposer-chosen, hence backdatable, `proposal.created_at`),
+    /// this is the applying member's own clock at commit-processing time. It is
+    /// the non-backdatable floor of the notification window (see
+    /// [`Self::is_effective`]).
+    ///
+    /// SECURITY: this field is serialized into the signed export snapshot. The
+    /// non-backdatable invariant holds IN-PROCESS (it is set from the local
+    /// clock when the commit is processed) AND is RE-ESTABLISHED on the
+    /// untrusted import path: `import_context` re-pins `observed_at` to the
+    /// importing member's local clock, so a malicious exporter who backdates it
+    /// in a signed export cannot collapse the notification window on import. The
+    /// trusted RESTORE path (self-respawn) keeps it verbatim.
+    pub observed_at: u64,
     /// The governance proposal ID that approved this modification.
     pub proposal_id: ProposalId,
 }
@@ -249,9 +267,20 @@ pub struct PendingCeilingModification {
 impl PendingCeilingModification {
     /// Returns `true` if the notification period has expired and the
     /// modification can be applied.
+    ///
+    /// The gate is non-backdatable: it requires BOTH the convergent
+    /// `effective_at` (so all members activate at the same convergent instant)
+    /// AND `observed_at + NOTIFICATION_PERIOD` (so a proposer who backdates
+    /// `proposal.created_at` cannot collapse the mandatory notification window
+    /// below `NOTIFICATION_PERIOD` of locally observed wall-clock time). The
+    /// max of the two preserves convergence in the honest case while pinning a
+    /// proposer-independent lower bound in the malicious case (§5.3.2, §19.3).
     #[must_use]
-    pub const fn is_effective(&self, current_timestamp: u64) -> bool {
-        current_timestamp >= self.effective_at
+    pub fn is_effective(&self, current_timestamp: u64) -> bool {
+        let floor = self
+            .observed_at
+            .saturating_add(CEILING_CHANGE_NOTIFICATION_PERIOD_SECS);
+        current_timestamp >= self.effective_at.max(floor)
     }
 }
 
@@ -281,9 +310,27 @@ pub struct PendingEconomicPolicyChange {
     pub new_policy: EconomicPolicy,
     /// Unix timestamp (seconds) when the notification period started.
     pub notified_at: u64,
-    /// Unix timestamp (seconds) when the notification period expires and
-    /// the new policy can be applied.
+    /// Convergent Unix timestamp (seconds) when the notification period
+    /// expires and the new policy can be applied. Anchored on the
+    /// committer-assigned proposal timestamp (`proposal.created_at`), so it
+    /// is identical across members — and is recorded as the convergent
+    /// `EconomicPolicyApplied` leaf timestamp when the change is applied.
     pub effective_at: u64,
+    /// Local Unix timestamp (seconds) at which THIS member observed/processed
+    /// the originating governance commit. Unlike `effective_at` (which is
+    /// anchored on the proposer-chosen, hence backdatable, `proposal.created_at`),
+    /// this is the applying member's own clock at commit-processing time. It is
+    /// the non-backdatable floor of the 24-hour notification window (see
+    /// [`Self::is_effective`]).
+    ///
+    /// SECURITY: this field is serialized into the signed export snapshot. The
+    /// non-backdatable invariant holds IN-PROCESS (it is set from the local
+    /// clock when the commit is processed) AND is RE-ESTABLISHED on the
+    /// untrusted import path: `import_context` re-pins `observed_at` to the
+    /// importing member's local clock, so a malicious exporter who backdates it
+    /// in a signed export cannot collapse the 24-hour window on import. The
+    /// trusted RESTORE path (self-respawn) keeps it verbatim.
+    pub observed_at: u64,
     /// The governance proposal ID that approved this change.
     pub proposal_id: ProposalId,
 }
@@ -291,9 +338,22 @@ pub struct PendingEconomicPolicyChange {
 impl PendingEconomicPolicyChange {
     /// Returns `true` if the notification period has expired and the
     /// new policy can be applied.
+    ///
+    /// The gate is non-backdatable: it requires BOTH the convergent
+    /// `effective_at` (so all members activate at the same convergent instant)
+    /// AND `observed_at + NOTIFICATION_PERIOD` (so a proposer who backdates
+    /// `proposal.created_at` cannot collapse the mandatory 24-hour notification
+    /// window below `NOTIFICATION_PERIOD` of locally observed wall-clock time).
+    /// Spec §19.3: economic-policy changes "MUST NOT take effect sooner than 24
+    /// hours after the `EconomicPolicyChanged` event is committed to the event
+    /// log" — the floor anchors that 24 hours on local commit-processing time,
+    /// which a proposer cannot move.
     #[must_use]
-    pub const fn is_effective(&self, current_timestamp: u64) -> bool {
-        current_timestamp >= self.effective_at
+    pub fn is_effective(&self, current_timestamp: u64) -> bool {
+        let floor = self
+            .observed_at
+            .saturating_add(ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS);
+        current_timestamp >= self.effective_at.max(floor)
     }
 }
 
@@ -516,29 +576,30 @@ pub struct ContextSnapshot {
     /// received `event_log_data` and compares it to THIS signed value
     /// (`validate_export_for_import`).
     ///
-    /// **Security scope — chain head, not history completeness.** This root
-    /// is the event-log hash-*chain* HEAD (the last entry's `hash`), not a
-    /// Merkle-tree commitment over a fixed entry set. The chain verifier is
-    /// pruning-tolerant: it does not validate the first entry's `prev_hash`
-    /// (see `verify_merkle_chain`). The signature therefore guarantees that no
-    /// entry can be added, modified, reordered, or forged and that the head is
-    /// authentic — but it does NOT attest full-history *completeness*. A holder
-    /// of a valid signed export can present a contiguous *suffix* of the log
-    /// (dropping the oldest entries) and it still verifies against this signed
-    /// head.
+    /// **Security scope — full-history completeness AND integrity.** This root
+    /// is the RFC 6962 `tree::root` over ALL event-log entries (ADR-050), not a
+    /// hash-chain head. `recompute_event_log_root` recomputes it by replaying every
+    /// entry through `append_unsigned_event`, validating each leaf's `sequence`
+    /// against the running count and its `prev_hash` against the prior leaf
+    /// (genesis for the first entry). A PREFIX-truncated log (oldest entries
+    /// dropped) is rejected outright — the new first entry's non-zero
+    /// `sequence` and non-genesis `prev_hash` fail the replay — while any
+    /// suffix-truncated, reordered, removed-middle, or added/modified/forged log
+    /// yields a different root than this signed value and fails the
+    /// constant-time compare in `validate_export_for_import`. The signature thus
+    /// attests that no entry can be added, modified, reordered, dropped, or
+    /// forged: truncation forgery is CLOSED, not merely detected.
     ///
-    /// This is NOT purely an audit-history concern. The imported pre-import
-    /// event-log entries are currently consumed by post-import enforcement: on
-    /// the first live action `event_log_entries_for_consequences` reads them as
-    /// "Source 1" to drive consequence evaluation and participation/standing.
-    /// A front-truncated (oldest-dropped) but validly-signed-head log can
-    /// therefore lower consequence counts and suppress an auto-suspend/demote/
-    /// ban — but only for consequence rules whose `window` exceeds the age of
-    /// the dropped entries. Under the default 1-5 minute matrix windows the
-    /// droppable old entries are already out-of-window, so this is inert by
-    /// default. Making import a true cold-start for enforcement (imported
-    /// history audit-only) is tracked as a planned hardening; until then do not
-    /// treat front-truncation as having no authoritative-state effect.
+    /// This completeness guarantee matters for enforcement, not just audit. The
+    /// imported pre-import event-log entries are consumed by post-import
+    /// enforcement: on the first live action `event_log_entries_for_consequences`
+    /// reads them as "Source 1" to drive consequence evaluation and
+    /// participation/standing. Because the full, signed-over leaf set is the
+    /// only set that verifies, an importer cannot silently suppress consequences
+    /// by truncating history. A legitimately pruned log still verifies because
+    /// `prune_before_checkpoint` re-anchors the retained tail to genesis and
+    /// renumbers sequences from 0, making the exported pruned log itself a valid
+    /// genesis-rooted prefix.
     ///
     /// All zeros when no event log is included (e.g. `ExportScope::Public`,
     /// broadcast-only contexts, or the live snapshot before export). Populated
@@ -1535,6 +1596,7 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::ConsequenceTriggered { .. }
         | ContextEvent::ConsequenceEnforced { .. }
         | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::PaymentReceived { .. }
         | ContextEvent::CommitBroadcastPending { .. }
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }
@@ -1831,4 +1893,165 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 /// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
 pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
     scp_protocol::context::context_id_bytes(context_id)
+}
+
+#[cfg(test)]
+mod notification_window_backdating_tests {
+    //! Regression: a proposer who backdates `proposal.created_at` MUST NOT be
+    //! able to collapse the mandatory notification window for deferred
+    //! economic-policy (§19.3) or ceiling (§5.3.2) changes.
+    //!
+    //! The convergent activation deadline `effective_at = proposal.created_at +
+    //! PERIOD` is proposer-controlled (`created_at` is signature-bound only
+    //! against third parties, freely chosen by the proposer themselves). If the
+    //! apply gate were a bare `current >= effective_at`, a malicious admin could
+    //! backdate `created_at` by `>= PERIOD` so `effective_at <= commit time` and
+    //! the change would become effective on the first apply tick — zero
+    //! notification. `is_effective` therefore also enforces a non-backdatable
+    //! floor `observed_at + PERIOD`, where `observed_at` is the applying
+    //! member's local clock at commit-processing time.
+
+    use super::{
+        CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+        PendingCeilingModification, PendingEconomicPolicyChange,
+    };
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    /// Minimal valid economic policy for gate tests (values are irrelevant to
+    /// the timing gate under test).
+    fn sample_policy() -> EconomicPolicy {
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode(*b"USD\0"),
+                per_message: Some(Amount(1)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["test".to_owned()],
+            pricing_formula: None,
+            payee: scp_identity::DID::from("did:dht:z6MkPayee".to_owned()),
+        }
+    }
+
+    /// Builds a pending economic-policy change exactly as
+    /// `execute_set_economic_policy` does: `effective_at = proposal_created_at +
+    /// PERIOD` (convergent, proposer-controlled) and `observed_at = local now`
+    /// (non-backdatable). `proposal_created_at` is what the attacker controls.
+    fn pending_economic(
+        proposal_created_at: u64,
+        local_observed_at: u64,
+    ) -> PendingEconomicPolicyChange {
+        PendingEconomicPolicyChange {
+            new_policy: sample_policy(),
+            notified_at: proposal_created_at,
+            effective_at: proposal_created_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+            observed_at: local_observed_at,
+            proposal_id: [0u8; 32],
+        }
+    }
+
+    /// Builds a pending ceiling modification exactly as
+    /// `execute_modify_ceiling` does.
+    fn pending_ceiling(
+        proposal_created_at: u64,
+        local_observed_at: u64,
+    ) -> PendingCeilingModification {
+        PendingCeilingModification {
+            new_capabilities: Vec::new(),
+            notified_at: proposal_created_at,
+            effective_at: proposal_created_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+            observed_at: local_observed_at,
+            proposal_id: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn economic_policy_backdated_proposal_cannot_collapse_window() {
+        // Honest local commit-processing time.
+        let observed = 1_000_000_000u64;
+        // Attacker backdates `created_at` by a full PERIOD so the naive
+        // `effective_at` already lies at/below `observed` (commit time).
+        let backdated_created_at = observed - ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        let pending = pending_economic(backdated_created_at, observed);
+
+        // Sanity: the proposer-controlled `effective_at` is <= commit time, so a
+        // bare `current >= effective_at` gate would fire immediately.
+        assert!(
+            pending.effective_at <= observed,
+            "test setup: backdated effective_at must be at or before commit time"
+        );
+
+        // The hardened gate must REFUSE to apply at commit time and for every
+        // instant up to (but not including) `observed + PERIOD`.
+        assert!(
+            !pending.is_effective(observed),
+            "backdated proposal must NOT be effective at commit time"
+        );
+        assert!(
+            !pending.is_effective(observed + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS - 1),
+            "backdated proposal must NOT be effective one second before the local floor"
+        );
+        // Exactly at the local non-backdatable floor it becomes effective — the
+        // full notification window measured from local commit-processing time.
+        assert!(
+            pending.is_effective(observed + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS),
+            "the window must elapse exactly PERIOD after local commit-processing time"
+        );
+    }
+
+    #[test]
+    fn economic_policy_honest_proposal_still_converges_on_effective_at() {
+        // Honest proposer: `created_at` ~ commit time, so `effective_at`
+        // (convergent leaf base) is the binding deadline and the local floor is
+        // never the controlling bound. Activation tracks the convergent
+        // `effective_at` exactly — no regression to cross-member convergence.
+        let created_at = 2_000_000_000u64;
+        // A member processing the commit slightly later than `created_at`.
+        let observed = created_at + 5;
+        let pending = pending_economic(created_at, observed);
+
+        let effective_at = created_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        // The local floor (`observed + PERIOD`) is only 5s past `effective_at`,
+        // so honest members converge to within their clock skew of the
+        // convergent deadline — and never activate BEFORE `effective_at`.
+        assert!(!pending.is_effective(effective_at - 1));
+        assert!(pending.is_effective(observed + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS));
+    }
+
+    #[test]
+    fn ceiling_backdated_proposal_cannot_collapse_window() {
+        let observed = 1_500_000_000u64;
+        let backdated_created_at = observed - CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+        let pending = pending_ceiling(backdated_created_at, observed);
+
+        assert!(
+            pending.effective_at <= observed,
+            "test setup: backdated effective_at must be at or before commit time"
+        );
+        assert!(
+            !pending.is_effective(observed),
+            "backdated ceiling proposal must NOT be effective at commit time"
+        );
+        assert!(
+            !pending.is_effective(observed + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS - 1),
+            "backdated ceiling proposal must NOT be effective before the local floor"
+        );
+        assert!(
+            pending.is_effective(observed + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS),
+            "ceiling window must elapse exactly PERIOD after local commit-processing time"
+        );
+    }
+
+    #[test]
+    fn ceiling_honest_proposal_tracks_effective_at() {
+        let created_at = 3_000_000_000u64;
+        let observed = created_at + 5;
+        let pending = pending_ceiling(created_at, observed);
+        let effective_at = created_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+        assert!(!pending.is_effective(effective_at - 1));
+        assert!(pending.is_effective(observed + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS));
+    }
 }

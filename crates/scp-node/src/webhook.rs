@@ -652,6 +652,7 @@ pub fn map_context_event(
         | ContextEvent::ConsequenceTriggered { .. }
         | ContextEvent::ConsequenceEnforced { .. }
         | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::PaymentReceived { .. }
         | ContextEvent::CommitBroadcastPending { .. }
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }

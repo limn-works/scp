@@ -103,38 +103,6 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // `spawn_actor_with_state`.
 
 // ---------------------------------------------------------------------------
-// §6.2.4 cross-context saga nonce-dedup TTL construction guard
-// ---------------------------------------------------------------------------
-
-/// Mechanically assert that a freshly-constructed cross-context nonce-dedup
-/// cache carries the PRODUCTION saga TTL
-/// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS))
-/// — the longer-than-skew anti-replay window the spec REQUIRES (spec §6.2.4
-/// *Window relationship*, BLACK-XCTX-01).
-///
-/// Called at every spawn / restore site here that builds B's
-/// `xctx_nonce_dedup`, so a future regression to the default-TTL
-/// [`NonceDedup::new`](scp_protocol::crypto::sender_keys::NonceDedup::new) —
-/// whose 300s window is COTERMINOUS with the skew tolerance, the exact
-/// coterminous condition the spec forbids — is caught at construction rather
-/// than silently re-opening the replay gap. A `debug_assert` survives
-/// refactors: any builder that swaps in the wrong TTL trips it under test /
-/// debug builds. Lives in this (non-handler) lifecycle module — never on the
-/// actor handler path — so it does not run inside an actor's mailbox future
-/// (ADR-049 §10 handler panic ban applies to handlers, not these bootstrap
-/// constructors).
-#[track_caller]
-fn debug_assert_saga_dedup_ttl(dedup: &scp_protocol::crypto::sender_keys::NonceDedup) {
-    debug_assert_eq!(
-        dedup.ttl_secs(),
-        crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
-        "cross-context nonce-dedup cache MUST be built with the production saga TTL \
-         (strictly longer than the freshness skew); a default-TTL NonceDedup::new() re-opens \
-         the coterminous-window replay gap (spec §6.2.4 Window relationship, BLACK-XCTX-01)"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
 
@@ -368,8 +336,19 @@ pub async fn leave_context(
     let should_close = state.membership.count() == 0;
 
     // Append MemberLeft event to event log.
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberLeft", member_did.as_ref())?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberLeft,
+        member_did.as_ref(),
+        // Committer-assigned: the leaving member's clock — the source of the
+        // `created_at` on its outgoing leave commit. This is the
+        // convergent-by-construction value WHEN cross-member leaf replication
+        // lands: the receive-side append path is currently dormant, so this
+        // leaf is committer-appended-only and is NOT yet replicated to other
+        // members. Cross-member convergence of membership leaves is the
+        // forward step under ADR-051 (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
+    )?;
     state.checkpoint_events_since += 1;
 
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
@@ -509,9 +488,21 @@ pub async fn close_context_with_key(
     let role_state = state.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
-    // gate (async).
-    let result =
-        ttl::close_context(handle, initiator_did, &role_state, deps.event_log.as_ref()).await?;
+    // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
+    // from its own clock — the same value stamped on the outgoing close
+    // commit. This is the convergent-by-construction value WHEN cross-member
+    // leaf replication lands; the receive-side append path is currently
+    // dormant, so the leaf is committer-appended-only and is NOT yet
+    // replicated to other members. Cross-member convergence is the forward
+    // step under ADR-051 (§7.3.1, §9.9.3).
+    let result = ttl::close_context(
+        handle,
+        initiator_did,
+        &role_state,
+        deps.event_log.as_ref(),
+        deps.clock.now_secs(),
+    )
+    .await?;
 
     // Fix C: Re-check ContextClose capability after the state transition
     // committed. If capability was revoked between the gate and the
@@ -860,10 +851,19 @@ pub async fn join_context(
     // joiner for an unacknowledged join. VOID the escrow here (gated on
     // `auth.is_some()`) before returning — mirroring the money-ordering rule the
     // persist-failure branch below already follows.
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())
-    {
+    if let Err(e) = deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberJoined,
+        member_did.as_ref(),
+        // Committer-assigned: the joining member's clock (captured once above as
+        // `now_secs`) — the source of the `created_at` on its outgoing join
+        // commit. Convergent-by-construction WHEN cross-member leaf replication
+        // lands; the receive-side append path is currently dormant, so this
+        // leaf is committer-appended-only and is NOT yet replicated to other
+        // members. Cross-member convergence is the forward step under ADR-051
+        // (§7.3.1, §9.9.3).
+        now_secs,
+    ) {
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
@@ -1038,17 +1038,16 @@ pub async fn capture_join_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
-            state, deps, a, member_did, context_id,
-        )
-        .await
+        && let Err(e) =
+            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
     {
         // H8: do NOT rollback budget — service was delivered (member joined).
         tracing::warn!(
             context_id,
             "payment capture failed after successful join: {e}"
         );
-        // H19: append durable audit record to event log + receive buffer.
+        // H19: surface the capture failure as a local `ContextEvent` (no durable
+        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
         record_payment_capture_failure(
             state,
             deps,
@@ -1061,9 +1060,18 @@ pub async fn capture_join_payment(
     }
 }
 
-/// Append a `PaymentCaptureFailed` durable event log entry plus the
-/// matching receive-buffer push. Actor-shape inline replacement for
+/// Surface a `PaymentCaptureFailed` as a local `ContextEvent` (receive-buffer
+/// push + `event_tx` notification). Actor-shape inline replacement for
 /// `manager_methods::record_payment_capture_failure`.
+///
+/// Per ADR-051 §6 / the phase-2.md ADR-011 amendment exclusion taxonomy §2, the
+/// payment receipts (`PaymentReceived` / `PaymentCaptureFailed`) are per-payee,
+/// non-convergent events appended by their payee alone — they are excluded from
+/// the canonical Merkle log so two honest members derive the same
+/// `event_log_merkle_root` (§9.9.3). The former durable
+/// `EventType::PaymentCaptureFailed` append (and its `checkpoint_events_since`
+/// increment) is removed; the `ContextEvent::PaymentCaptureFailed` emission
+/// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
     state: &mut PerContextState,
@@ -1074,24 +1082,6 @@ fn record_payment_capture_failure(
     error_msg: &str,
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload = serde_json::json!({
-        "action": action,
-        "error": error_msg,
-        "cost": cost.map(scp_protocol::economy::types::Amount::value),
-    });
-    if let Err(log_err) = deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        "PaymentCaptureFailed",
-        actor_did.as_ref(),
-        Some(&payload),
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append PaymentCaptureFailed to event log: {log_err}"
-        );
-    }
-    state.checkpoint_events_since += 1;
     let event = ContextEvent::PaymentCaptureFailed {
         action: action.to_owned(),
         actor_did: actor_did.clone(),
@@ -1157,6 +1147,16 @@ pub async fn create_context(
         &creator_did,
         Arc::clone(&deps.key_resolver),
     )?;
+    // Creator assigns the ContextCreated leaf timestamp from its own clock.
+    // This is the convergent-by-construction value WHEN cross-member leaf
+    // replication lands (every member would copy it); the receive-side append
+    // path is currently dormant, so the leaf is committer-appended-only —
+    // cross-member convergence is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3). Independently of replication, the same value is stored on
+    // `PerContextState::creation_timestamp_secs` below and used LOCALLY by
+    // every member as the base for the TTL expiry deadline
+    // (= creation + params.ttl), which IS computed identically on each member.
+    let creation_timestamp_secs = deps.clock.now_secs();
     let handle = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
@@ -1164,6 +1164,7 @@ pub async fn create_context(
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
         creator_did.as_ref(),
+        creation_timestamp_secs,
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
@@ -1206,6 +1207,9 @@ pub async fn create_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // Convergent creator-assigned creation time — the same value stamped on
+        // the ContextCreated leaf above. Base for the convergent TTL deadline.
+        creation_timestamp_secs,
         generation: 0, // assigned by SupervisorHandle::insert_context.
         handle: handle.clone(),
         membership,
@@ -1249,6 +1253,7 @@ pub async fn create_context(
         },
         role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context,
         migration_state: None,
         epoch: EpochState {
@@ -1276,7 +1281,6 @@ pub async fn create_context(
         checkpoint_last_time_secs: deps.clock.now_secs(),
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
-        merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         // §9.10.4: pseudonym routing axis. Encrypted contexts carry the
         // member's pseudonym + an empty peer registry; broadcast contexts
         // carry no pseudonym state.
@@ -1311,7 +1315,6 @@ pub async fn create_context(
         event_log: None,
         mode,
     };
-    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: the create path
     // no longer writes the legacy contexts DashMap. It hands the freshly
@@ -1374,7 +1377,9 @@ pub async fn finalize_create(
         // installs the timer task on its own state (registry + mailbox
         // tick — no DashMap reach).
         deps.supervisor
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            // Create path: anchor the convergent expiry deadline on the
+            // creator-assigned creation timestamp + params.ttl.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
             .await;
     }
 }
@@ -1736,6 +1741,36 @@ pub async fn import_context(
         "import",
     );
 
+    // SECURITY (§5.3.2, §19.3): re-pin the non-backdatable notification-window
+    // floor on the UNTRUSTED import path. `observed_at` is the local
+    // commit-processing clock that anchors the mandatory notification window's
+    // lower bound (`is_effective` gates on `effective_at.max(observed_at +
+    // PERIOD)`). It rides verbatim in the signed export snapshot, so a malicious
+    // exporter could backdate BOTH `effective_at` (proposer-controlled) and
+    // `observed_at` to collapse the window to zero on import. We therefore
+    // re-pin `observed_at` to THIS importing member's local clock, restarting
+    // the window from import time (conservative/safe). This mirrors the
+    // `creation_timestamp_secs` re-pin and the `cooldown_until` sanitization
+    // above. The RESTORE path (trusted self-respawn) keeps `observed_at`
+    // verbatim — re-pinning there would let a crash-loop re-arm the window
+    // forever.
+    let sanitized_pending_ceiling_modification = export
+        .snapshot
+        .pending_ceiling_modification
+        .clone()
+        .map(|mut p| {
+            p.observed_at = now_for_validation;
+            p
+        });
+    let sanitized_pending_economic_policy_change = export
+        .snapshot
+        .pending_economic_policy_change
+        .clone()
+        .map(|mut p| {
+            p.observed_at = now_for_validation;
+            p
+        });
+
     // ADR-049 Phase 2A finalization keystone: import path is encrypted-only
     // (`broadcast_context: None` below). Derive the actor's `members` set
     // from the imported membership snapshot — `members()` enumerates the
@@ -1757,12 +1792,19 @@ pub async fn import_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // The signed export snapshot does not yet carry the convergent
+        // creation timestamp (a forward step under ADR-051), so set this to
+        // the local instantiation time. It is NOT used as a convergent
+        // deadline base on the import path: the TTL timer is armed with
+        // `anchor_deadline_to_creation = false` (local-clock arming) below.
+        creation_timestamp_secs: deps.clock.now_secs(),
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
         membership: export.snapshot.membership,
         members: actor_members,
         role_state: export.snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context: None,
         migration_state: None,
         governance: GovernanceState {
@@ -1787,8 +1829,11 @@ pub async fn import_context(
             deadlock: DeadlockDetectionState::default(),
             threshold_signers: export.snapshot.threshold_signers,
             threshold_value: export.snapshot.threshold_value,
-            pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
-            pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
+            // SECURITY: `observed_at` re-pinned to local import time (see the
+            // sanitization above) so a backdated signed export cannot collapse
+            // the §5.3.2 / §19.3 notification window on import.
+            pending_ceiling_modification: sanitized_pending_ceiling_modification,
+            pending_economic_policy_change: sanitized_pending_economic_policy_change,
             registered_tools: export.snapshot.registered_tools,
             tool_interfaces: export.snapshot.tool_interfaces,
             pruning_policy: export.snapshot.pruning_policy,
@@ -1852,7 +1897,6 @@ pub async fn import_context(
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
         // Fresh Merkle tree for imported contexts.
-        merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         // §9.10.4: the importer derives their OWN pseudonym — the exporter's
         // is local-instance state with no meaning here. The peer registry
         // starts empty; the importer re-announces and learns peers' pseudonyms
@@ -1897,7 +1941,6 @@ pub async fn import_context(
         event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
-    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // 7. Register the imported context as an owned-state actor.
     //
@@ -1934,7 +1977,12 @@ pub async fn import_context(
     if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration)
+            // Import path: arm relative to the local clock. The signed export
+            // snapshot does not yet carry the convergent creation timestamp, so
+            // the importer cannot reconstruct the convergent `creation + ttl`
+            // deadline; carrying it through the signed snapshot (and its
+            // cross-bridge byte-parity + KAT) is a forward step under ADR-051.
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, false)
             .await;
     }
 
@@ -2218,6 +2266,12 @@ pub async fn restore_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // The persisted snapshot does not yet carry the convergent creation
+        // timestamp (a forward step under ADR-051), so set this to the local
+        // instantiation time. It is NOT used as a convergent deadline base on
+        // the restore path: the TTL timer is re-armed with
+        // `anchor_deadline_to_creation = false` (local-clock arming) below.
+        creation_timestamp_secs: deps.clock.now_secs(),
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
         // (AtomicU64; first spawn = 1) before the state crosses into the
@@ -2277,6 +2331,7 @@ pub async fn restore_context(
         },
         role_state: ctx_snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context: broadcast_ctx,
         migration_state: ctx_snapshot.migration_state,
         epoch: EpochState {
@@ -2304,7 +2359,6 @@ pub async fn restore_context(
         checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
-        merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         routing: restored_routing,
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
@@ -2357,7 +2411,6 @@ pub async fn restore_context(
         event_log: None,
         mode,
     };
-    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: restore mirrors
     // create — hand the rehydrated `PerContextState` directly to
@@ -2381,7 +2434,11 @@ pub async fn restore_context(
     if let Some(remaining_secs) = ttl_remaining {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            // Restore path: arm relative to the local clock. The persisted
+            // snapshot does not yet carry the convergent creation timestamp, so
+            // the convergent `creation + ttl` deadline cannot be reconstructed
+            // on reload; persisting it is a forward step under ADR-051.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, false)
             .await;
     }
 
@@ -2740,9 +2797,10 @@ mod restore_reconcile_tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -2764,9 +2822,10 @@ mod restore_reconcile_tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::EventLogFailed(
                 "fixture: event-log append deliberately fails".to_owned(),
@@ -3143,6 +3202,7 @@ mod restore_reconcile_tests {
                 adapter_id: "recording".to_owned(),
                 adapter_proof: vec![],
                 timestamp: 1_000_001,
+                anchored: false,
                 signature: vec![],
             })
         }
@@ -3487,17 +3547,20 @@ mod restore_reconcile_tests {
         );
     }
 
-    /// ADR-049 §9 (round-9 leak fix) — BEHAVIORAL. `finalize_send` reserves a
-    /// per-sender sequence in its caller (`send_message`), and OWNS the sequence
-    /// rollback on every error exit. Its FIRST statement is the `MessageSent`
-    /// `append_context_event`; before this fix that `?` returned BEFORE the
-    /// relocated rollbacks, so an event-log append failure leaked the reserved
-    /// sequence → a per-sender gap → a receiver `SequenceGapForceClose`. This
-    /// test drives a WORKING persistence + a FAILING event-log append directly
-    /// through `finalize_send` and asserts the reserved sequence returns to its
-    /// pre-reservation baseline EXACTLY ONCE (no leak, no double-rollback).
+    /// M12 / ADR-051 §6 (phase-2.md ADR-011 amendment exclusion taxonomy §2) —
+    /// BEHAVIORAL. `MessageSent` is NO LONGER a durable Merkle leaf: it is a
+    /// per-author, non-convergent event surfaced only as the local
+    /// `ContextEvent::MessageSent`, so two honest members derive the same
+    /// `event_log_merkle_root` (§9.9.3). Because `finalize_send` no longer issues
+    /// a `MessageSent` `append_context_event`, a FAILING event-log append can no
+    /// longer make `finalize_send` return `Err` for a plain send, and there is no
+    /// append-failure sequence rollback. This test drives a WORKING persistence +
+    /// a FAILING event-log append directly through `finalize_send` and asserts the
+    /// send SUCCEEDS and the reserved sequence stays CONSUMED (the next
+    /// reservation reissues 2) — pinning that the durable `MessageSent` append
+    /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
-    async fn finalize_send_rolls_back_sequence_on_event_log_append_failure() {
+    async fn finalize_send_succeeds_without_durable_message_sent_append() {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
         ));
@@ -3548,9 +3611,10 @@ mod restore_reconcile_tests {
             .expect("sender is a member");
         assert_eq!(reserved, 1, "first reservation yields sequence 1");
 
-        // Encrypted (non-broadcast) send: the failing append must roll the
-        // reservation back. `signing_key = None` → the post-append checkpoint
-        // path is skipped, but the append fails first regardless.
+        // Encrypted (non-broadcast) send: with `MessageSent` no longer a durable
+        // leaf (M12), the FAILING event-log append is never invoked by
+        // `finalize_send` for this send, so it SUCCEEDS. `signing_key = None`
+        // skips the post-send checkpoint path.
         let result = crate::context::messaging_helpers::finalize_send(
             &mut state,
             &deps,
@@ -3565,23 +3629,21 @@ mod restore_reconcile_tests {
         );
 
         assert!(
-            matches!(result, Err(ContextError::EventLogFailed(_))),
-            "a failing event-log append must surface as EventLogFailed: got {result:?}"
+            result.is_ok(),
+            "with MessageSent excluded from the durable log (M12), a failing \
+             event-log append must NOT fail finalize_send: got {result:?}"
         );
 
-        // The reservation must have been rolled back EXACTLY ONCE: the next
-        // reservation returns 1 again. A leak would make it return 2; a
-        // double-rollback (saturating_sub past the floor) would also return 1
-        // here but only because it underflowed — so additionally assert the
-        // pre-reservation reissue is stable across two calls.
-        let next_after_failure = state
+        // The reserved sequence stays CONSUMED — there is no append-failure
+        // rollback anymore — so the next reservation reissues 2.
+        let next_after_send = state
             .membership
             .next_sequence_number(sender.as_ref())
             .expect("sender is still a member");
         assert_eq!(
-            next_after_failure, 1,
-            "the reserved sequence must roll back to baseline exactly once, so the \
-             next reservation reissues 1 (a leak would reissue 2)"
+            next_after_send, 2,
+            "the reserved sequence stays consumed (no durable MessageSent append, \
+             no append-failure rollback), so the next reservation reissues 2"
         );
     }
 
@@ -3619,7 +3681,7 @@ mod restore_reconcile_tests {
             .expect("join_context must commit the economy ticket before the append");
         // The MemberJoined append is the next fallible step after the commit.
         let append_idx = body
-            .find("\"MemberJoined\"")
+            .find("EventType::MemberJoined")
             .expect("join_context must append a MemberJoined event");
         assert!(
             commit_idx < append_idx,
@@ -3645,6 +3707,224 @@ mod restore_reconcile_tests {
             "the MemberJoined append-failure branch (between the ticket commit and \
              the fail-closed persist) must void the escrow so a failing append \
              releases the hold instead of leaking it (ADR-049 §9 round-9)"
+        );
+    }
+
+    /// Wave B convergence: `complete_paid_action` records the receipt in the
+    /// per-context local `payment_receipts` buffer and surfaces a local
+    /// `ContextEvent::PaymentReceived`, but mints NO durable Merkle leaf — so
+    /// `checkpoint_events_since` (which counts durable leaves) stays at 0. A
+    /// per-payee `PaymentReceived` leaf would diverge across honest members and
+    /// break §9.9.3 (ADR-051 §6 / phase-2.md exclusion taxonomy §2).
+    #[tokio::test]
+    async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkPayConverge".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_: &DID, _| None);
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(RecordingPaymentAdapter {
+                captured: Arc::clone(&captured),
+                voided: Arc::clone(&voided),
+            });
+
+        let admin = DID("did:dht:z6MkPayConvergeAdmin".to_owned());
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(OkEventLog),
+            key_resolver,
+            None,
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage(),
+        );
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-pay-converge".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now_secs,
+            admin.clone(),
+        );
+        // A per-message cost so a paid action authorizes + captures.
+        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
+            locked: false,
+            cost_schedule: scp_protocol::economy::types::CostSchedule {
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                per_message: Some(scp_protocol::economy::types::Amount(10)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["recording".to_owned()],
+            pricing_formula: None,
+            payee: admin.clone(),
+        });
+
+        // Sanity: no receipts and no durable leaves yet.
+        assert!(state.payment_receipts.is_empty());
+        assert_eq!(state.checkpoint_events_since, 0);
+
+        let payer = DID("did:dht:z6MkPayer".to_owned());
+        let auth = crate::context::economy_helpers::authorize_paid_action(
+            &mut state,
+            &deps,
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            &payer,
+            &context_id,
+        )
+        .await
+        .expect("authorize_paid_action")
+        .expect("a paid action is authorized for a per_message policy");
+
+        let receipt = crate::context::economy_helpers::complete_paid_action(
+            &mut state,
+            &deps,
+            auth,
+            &context_id,
+        )
+        .await
+        .expect("complete_paid_action")
+        .expect("a receipt is produced on capture");
+
+        // The receipt is recorded in the local buffer (spec §19.11).
+        assert_eq!(state.payment_receipts.len(), 1);
+        assert_eq!(state.payment_receipts[0].receipt_id, receipt.receipt_id);
+
+        // NO durable Merkle leaf was minted — the counter is untouched.
+        assert_eq!(
+            state.checkpoint_events_since, 0,
+            "PaymentReceived must mint no durable leaf (ADR-051 §6 / §9.9.3)"
+        );
+
+        // A local `ContextEvent::PaymentReceived` was surfaced, carrying both
+        // payer and payee from the receipt, with anchored == false.
+        let events = state.receive_buffer.drain();
+        let found = events.iter().find_map(|e| match e {
+            ContextEvent::PaymentReceived {
+                payer,
+                payee,
+                anchored,
+                ..
+            } => Some((payer.clone(), payee.clone(), *anchored)),
+            _ => None,
+        });
+        let (ev_payer, ev_payee, ev_anchored) =
+            found.expect("a local PaymentReceived event is emitted");
+        assert_eq!(ev_payer, receipt.payer);
+        assert_eq!(ev_payee, receipt.payee);
+        assert!(
+            !ev_anchored,
+            "the surfaced receipt is unanchored pre-ADR-051"
+        );
+
+        // The capture ran exactly once and nothing was voided.
+        assert_eq!(captured.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(voided.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // ---------------------------------------------------------------
+        // Bounded ring: oldest-evicted at DEFAULT_BUFFER_CAPACITY.
+        // ---------------------------------------------------------------
+        // Pre-fill the buffer to exactly capacity with synthetic markers,
+        // tagging the OLDEST so we can prove it is the one evicted. The
+        // single real receipt captured above is dropped to make room.
+        let cap = scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY;
+        state.payment_receipts.clear();
+        let oldest_id = [0x01u8; 32];
+        for i in 0..cap {
+            let mut id = [0u8; 32];
+            id[0] = u8::try_from(i % 256).expect("i % 256 fits u8");
+            id[1] = u8::try_from((i / 256) % 256).expect("fits u8");
+            // The very first inserted marker carries the sentinel id so its
+            // eviction is unambiguous.
+            let id = if i == 0 { oldest_id } else { id };
+            state
+                .payment_receipts
+                .push_back(crate::economy::adapter::PaymentReceipt {
+                    receipt_id: id,
+                    payer: payer.clone(),
+                    payee: admin.clone(),
+                    amount: scp_protocol::economy::types::Amount(1),
+                    currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                    action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+                    context_id: Some(context_id.clone()),
+                    adapter_id: "recording".to_owned(),
+                    adapter_proof: Vec::new(),
+                    timestamp: i as u64,
+                    anchored: false,
+                    signature: Vec::new(),
+                });
+        }
+        assert_eq!(
+            state.payment_receipts.len(),
+            cap,
+            "buffer is pre-filled to exactly capacity"
+        );
+        assert!(
+            state
+                .payment_receipts
+                .iter()
+                .any(|r| r.receipt_id == oldest_id),
+            "the oldest sentinel is present before the over-capacity push"
+        );
+
+        // One more real capture pushes past capacity, evicting the oldest.
+        let auth2 = crate::context::economy_helpers::authorize_paid_action(
+            &mut state,
+            &deps,
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            &payer,
+            &context_id,
+        )
+        .await
+        .expect("authorize_paid_action (2)")
+        .expect("a paid action is authorized for a per_message policy (2)");
+        let receipt2 = crate::context::economy_helpers::complete_paid_action(
+            &mut state,
+            &deps,
+            auth2,
+            &context_id,
+        )
+        .await
+        .expect("complete_paid_action (2)")
+        .expect("a receipt is produced on capture (2)");
+
+        // Length is held at the bound — oldest-evicted, not unbounded growth.
+        assert_eq!(
+            state.payment_receipts.len(),
+            cap,
+            "an over-capacity push must hold the buffer at DEFAULT_BUFFER_CAPACITY (oldest-evicted)"
+        );
+        // The oldest sentinel is gone.
+        assert!(
+            !state
+                .payment_receipts
+                .iter()
+                .any(|r| r.receipt_id == oldest_id),
+            "the oldest receipt must be evicted once the buffer is full"
+        );
+        // The newest real receipt is at the back.
+        assert_eq!(
+            state
+                .payment_receipts
+                .back()
+                .expect("buffer is non-empty")
+                .receipt_id,
+            receipt2.receipt_id,
+            "the newest receipt is pushed onto the back of the ring"
         );
     }
 }

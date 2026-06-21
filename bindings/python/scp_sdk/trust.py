@@ -529,6 +529,13 @@ class ParticipationProfile:
     #: Total tool invocations across all tool types.
     tool_invocation_count: int = 0
 
+    #: Whether ``tool_invocation_count`` is anchored in the canonical Merkle
+    #: log. ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf:
+    #: the count is computed from per-author local events, not the Merkle log
+    #: (§7.3.2; ADR-011 amendment exclusion taxonomy §2). Consumers MUST NOT
+    #: treat the count as Merkle-proven while this is ``False``.
+    tool_invocation_count_anchored: bool = False
+
     #: Number of contexts created.
     context_creation_count: int = 0
 
@@ -608,6 +615,7 @@ class ParticipationProfile:
             "governance_actions_against": self.governance_actions_against,
             "governance_actions_by": self.governance_actions_by,
             "tool_invocation_count": self.tool_invocation_count,
+            "tool_invocation_count_anchored": self.tool_invocation_count_anchored,
             "context_creation_count": self.context_creation_count,
             "role_progression_count": self.role_progression_count,
             "attestation_count": self.attestation_count,

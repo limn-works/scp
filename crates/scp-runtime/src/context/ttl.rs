@@ -578,6 +578,11 @@ pub async fn close_context(
     initiator_did: &DID,
     role_state: &ContextRoleState,
     event_log: &dyn ContextEventLogProvider,
+    // Convergent close timestamp recorded on the `ContextClosing` leaf: the
+    // initiator's close-commit time (the `created_at` of the outgoing close
+    // commit), copied by every member — never a per-member local `now()`
+    // (§7.3.1, §9.9.3).
+    timestamp_secs: u64,
 ) -> Result<CloseResult, ContextError> {
     let state = handle.state().await;
     if state != ContextState::Active {
@@ -600,7 +605,12 @@ pub async fn close_context(
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    event_log.append_context_event(&context_id_bytes, "ContextClosing", initiator_did.as_ref())?;
+    event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextClosing,
+        initiator_did.as_ref(),
+        timestamp_secs,
+    )?;
 
     Ok(CloseResult {
         should_generate_summary,
@@ -634,6 +644,11 @@ pub async fn finalize_close(
     crypto: &MlsCryptoProvider,
     transport: &dyn ContextTransportProvider,
     event_log: &dyn ContextEventLogProvider,
+    // Convergent close timestamp recorded on the `ContextClosed` leaf: the TTL
+    // deadline for a timer-driven close, or the committer's close-commit time
+    // for a governance close — never a per-member local `now()` (§7.3.1,
+    // §9.9.3).
+    timestamp_secs: u64,
 ) -> Result<(), ContextError> {
     // Validate state transition BEFORE destroying any key material.
     // Key destruction is irreversible — once zeroized, encrypted content
@@ -658,7 +673,12 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    event_log.append_context_event(&context_id_bytes, "ContextClosed", "system:close")?;
+    event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextClosed,
+        "system:close",
+        timestamp_secs,
+    )?;
 
     Ok(())
 }
@@ -685,8 +705,9 @@ pub async fn handle_ttl_expiry(
     handle: &ContextHandle,
     crypto: &MlsCryptoProvider,
     event_log: &dyn ContextEventLogProvider,
+    expiry_deadline_secs: u64,
 ) -> Result<(), ContextError> {
-    handle_ttl_expiry_with_transport(handle, crypto, None, event_log).await
+    handle_ttl_expiry_with_transport(handle, crypto, None, event_log, expiry_deadline_secs).await
 }
 
 /// Handles automatic TTL expiry with optional transport for relay deletion.
@@ -706,13 +727,22 @@ pub async fn handle_ttl_expiry_with_transport(
     crypto: &MlsCryptoProvider,
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
+    expiry_deadline_secs: u64,
 ) -> Result<(), ContextError> {
     let state = handle.state().await;
     if state != ContextState::Active && state != ContextState::Expired {
         return Err(ContextError::ContextNotActive);
     }
 
-    let result = try_ttl_expiry_cleanup(handle, crypto, transport, event_log, 0).await;
+    let result = try_ttl_expiry_cleanup(
+        handle,
+        crypto,
+        transport,
+        event_log,
+        0,
+        expiry_deadline_secs,
+    )
+    .await;
 
     if result.has_failures() {
         // Return the first error as a ContextError for backward compatibility.
@@ -746,6 +776,10 @@ pub async fn try_ttl_expiry_cleanup(
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
     prior_completed: u8,
+    // Timer-triggered expiry: the pre-computed convergent TTL deadline (every
+    // member holds the identical value), recorded on the `ContextExpired` leaf
+    // instead of a per-member local `now()` (§7.3.1, §9.9.3).
+    expiry_deadline_secs: u64,
 ) -> TtlExpiryResult {
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
@@ -836,7 +870,12 @@ pub async fn try_ttl_expiry_cleanup(
     // 3. Event log append — skip if already succeeded on a prior attempt to
     //    avoid duplicate ContextExpired entries in the Merkle log.
     if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        match event_log.append_context_event(&context_id_bytes, "ContextExpired", "system:timer") {
+        match event_log.append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextExpired,
+            "system:timer",
+            expiry_deadline_secs,
+        ) {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
             Err(e) => {
                 let msg = format!("failed to log ContextExpired event: {e}");
@@ -883,13 +922,21 @@ pub async fn run_ttl_expiry_with_retries(
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
     cancel: &Notify,
+    expiry_deadline_secs: u64,
 ) -> TtlExpiryResult {
     let context_id = handle.context_id().to_owned();
     let mut completed_steps: u8 = 0;
 
     for attempt in 0..TTL_EXPIRY_MAX_RETRIES {
-        let result =
-            try_ttl_expiry_cleanup(handle, crypto, transport, event_log, completed_steps).await;
+        let result = try_ttl_expiry_cleanup(
+            handle,
+            crypto,
+            transport,
+            event_log,
+            completed_steps,
+            expiry_deadline_secs,
+        )
+        .await;
         completed_steps = result.completed_steps;
 
         if result.is_complete() {
@@ -1039,9 +1086,19 @@ impl TtlTimer {
         transport: Option<Arc<dyn ContextTransportProvider>>,
         event_log: Arc<dyn ContextEventLogProvider>,
     ) {
-        // Record absolute deadline for persistence snapshots.
+        // Record the absolute deadline for persistence snapshots.
+        //
+        // NOTE: this `TtlTimer::spawn_with_transport` path computes the deadline
+        // from local arm-time `now + duration`, which is NOT convergent across
+        // members. The live actor timer
+        // (`ttl_close_helpers::spawn_ttl_timer`) supersedes this for production
+        // and anchors the convergent deadline on `creation_timestamp_secs +
+        // params.ttl` (§7.3.1, §9.9.3). This method survives only as a
+        // self-contained `TtlTimer` unit-test helper; do not treat its deadline
+        // as the convergent leaf timestamp.
         let now_secs = self.clock.now_secs();
-        self.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
+        let expiry_deadline_secs = now_secs.saturating_add(duration.as_secs());
+        self.deadline_unix_secs = Some(expiry_deadline_secs);
 
         let cancel = self.cancel.clone();
         let on_error = self.on_error.clone();
@@ -1056,6 +1113,7 @@ impl TtlTimer {
                         transport.as_deref(),
                         event_log.as_ref(),
                         &cancel,
+                        expiry_deadline_secs,
                     ).await;
 
                     if result.has_failures()
@@ -1294,9 +1352,10 @@ mod tests {
         fn append_event(
             &self,
             _cid: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -1331,7 +1390,14 @@ mod tests {
         let event_log = NullEventLog;
         let handle = active_handle("ctx-1", MemoryScope::Full).await;
         handle.transition_to(&ContextState::Closing).await.unwrap();
-        let res = finalize_close(&handle, crypto.as_ref(), &transport, &event_log).await;
+        let res = finalize_close(
+            &handle,
+            crypto.as_ref(),
+            &transport,
+            &event_log,
+            1_700_000_000,
+        )
+        .await;
         assert!(res.is_ok());
     }
 
@@ -1342,7 +1408,14 @@ mod tests {
         let event_log = NullEventLog;
         let handle = active_handle("ctx-eph", MemoryScope::Ephemeral).await;
         handle.transition_to(&ContextState::Closing).await.unwrap();
-        let res = finalize_close(&handle, crypto.as_ref(), &transport, &event_log).await;
+        let res = finalize_close(
+            &handle,
+            crypto.as_ref(),
+            &transport,
+            &event_log,
+            1_700_000_000,
+        )
+        .await;
         // Real MlsCryptoProvider is idempotent on destroy for unregistered ctxs.
         assert!(res.is_ok());
     }
@@ -1352,7 +1425,7 @@ mod tests {
         let crypto = mk_crypto();
         let event_log = NullEventLog;
         let handle = active_handle("ctx-ttl", MemoryScope::Full).await;
-        let res = handle_ttl_expiry(&handle, crypto.as_ref(), &event_log).await;
+        let res = handle_ttl_expiry(&handle, crypto.as_ref(), &event_log, 1_700_000_000).await;
         assert!(res.is_ok());
         assert_eq!(handle.state().await, ContextState::Expired);
     }
@@ -1363,7 +1436,7 @@ mod tests {
         let event_log = NullEventLog;
         let handle = ContextHandle::new("ctx-new".to_owned(), ContextParams::default());
         // Handle is in Creating state — not Active / Expired.
-        let res = handle_ttl_expiry(&handle, crypto.as_ref(), &event_log).await;
+        let res = handle_ttl_expiry(&handle, crypto.as_ref(), &event_log, 1_700_000_000).await;
         assert!(matches!(res, Err(ContextError::ContextNotActive)));
     }
 

@@ -1125,9 +1125,10 @@ mod mock_providers {
         fn append_event(
             &self,
             _ctx_id: &[u8; 32],
-            _event: &str,
+            _event_type: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

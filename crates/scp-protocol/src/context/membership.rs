@@ -714,6 +714,28 @@ pub enum ContextEvent {
         /// if known. `None` when no cost was charged (free context).
         cost: Option<u64>,
     },
+    /// A payment was captured by the payee for a paid action (spec §19.6.1).
+    ///
+    /// Per-payee application activity: surfaced as a LOCAL `ContextEvent` with NO
+    /// durable Merkle leaf (ADR-011 amendment exclusion taxonomy §2; convergent
+    /// only under ADR-051). `anchored` is false until then — consumers MUST NOT
+    /// treat the payment as Merkle-proven.
+    PaymentReceived {
+        /// The unique receipt identifier (32-byte digest).
+        receipt_id: [u8; 32],
+        /// The DID of the payer charged for the action.
+        payer: DID,
+        /// The DID of the payee who captured the payment and records the event.
+        payee: DID,
+        /// The captured amount.
+        amount: u64,
+        /// The action that was paid for (`"send_message"` or `"join_context"`).
+        action: String,
+        /// Whether this payment is anchored in the canonical Merkle log.
+        /// `false` until ADR-051 makes per-payee receipts convergent —
+        /// consumers MUST NOT treat an unanchored receipt as Merkle-proven.
+        anchored: bool,
+    },
     /// An MLS Commit broadcast attempt failed and the commit has been
     /// enqueued for persistent retry (PR #1606 C6).
     ///
@@ -848,6 +870,7 @@ impl ContextEvent {
             Self::ConsequenceTriggered { .. } => "ConsequenceTriggered",
             Self::ConsequenceEnforced { .. } => "ConsequenceEnforced",
             Self::PaymentCaptureFailed { .. } => "PaymentCaptureFailed",
+            Self::PaymentReceived { .. } => "PaymentReceived",
             Self::CommitBroadcastPending { .. } => "CommitBroadcastPending",
             Self::CommitBroadcastSucceeded { .. } => "CommitBroadcastSucceeded",
             Self::EquivocationDetected { .. } => "EquivocationDetected",

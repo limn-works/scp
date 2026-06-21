@@ -66,7 +66,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use scp_event_log::EventLog as MerkleEventLog;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_identity::DID;
 use scp_primitives::{Clock, SystemClock};
@@ -89,6 +88,7 @@ use crate::context::state::{
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::SagaPreparedState;
 use crate::crypto::mls::group::ScpMlsGroup;
+use crate::economy::adapter::PaymentReceipt;
 
 // ---------------------------------------------------------------------------
 // Lifecycle state (per-actor, actor-owned)
@@ -768,7 +768,25 @@ pub struct PerContextState {
     /// Unix-ms timestamp of first actor instantiation for this context.
     /// Preserved across respawn via snapshot — new actor instances for
     /// the same context share one `created_at`.
+    ///
+    /// This is a LOCAL instantiation timestamp (the creating/restoring
+    /// member's clock) and is NOT convergent across members — do not use
+    /// it as a base for any cross-member deadline. The convergent
+    /// creator-assigned creation time lives in
+    /// [`Self::creation_timestamp_secs`].
     pub created_at: u64,
+
+    /// Convergent creator-assigned context-creation timestamp (Unix
+    /// seconds). This is the identical value the creator stamped on the
+    /// `ContextCreated` event-log leaf and that every member copies
+    /// (§7.3.1, §9.9.3) — NOT each member's local `now()`. It is the
+    /// convergent base for deadlines derived from creation time (e.g. the
+    /// TTL expiry deadline = `creation_timestamp_secs + params.ttl`), so
+    /// every member computes the identical absolute deadline regardless of
+    /// when their local timer was armed. Carried through the export
+    /// snapshot so restore/import preserve the convergent base rather than
+    /// re-deriving from importer-local `now()`.
+    pub creation_timestamp_secs: u64,
 
     /// Monotonic generation counter inherited from legacy
     /// [`crate::context::state::PerContextState::generation`]
@@ -812,22 +830,35 @@ pub struct PerContextState {
     /// RFC-6962 Merkle event log. `None` until the first event; some
     /// actor constructions (test fixtures, mid-restore) run with it
     /// unset. Wraps [`scp_event_log::EventLog`] for the actor's
-    /// `EventLogPersistence` path; not the same as
-    /// [`Self::merkle_tree`] (the in-memory RFC-6962 tree legacy held
-    /// for proof generation).
+    /// `EventLogPersistence` path.
     pub event_log: Option<ContextEventLog>,
-
-    /// In-memory RFC-6962 Merkle tree (ADR-011) parallel to the
-    /// persisted event log. Used by `manager/messaging.rs` for O(log n)
-    /// inclusion / consistency proofs. Mirrors legacy
-    /// `state::PerContextState::merkle_tree`. Not persisted — rebuilt
-    /// from `MerkleEventLogProvider` on `restore_context` /
-    /// `import_context` per legacy comment.
-    pub merkle_tree: MerkleEventLog,
 
     /// Receive event buffer (bounded 1000-entry deque). Mirrors legacy
     /// `state::PerContextState::receive_buffer`.
     pub receive_buffer: ReceiveBuffer,
+
+    /// RECENT per-payee payment receipts captured in this context (spec
+    /// §19.11). Bounded, in-memory, lost on actor respawn — NOT the complete
+    /// persisted payment history.
+    ///
+    /// `PaymentReceived` is per-payee application activity, excluded from the
+    /// canonical Merkle log (ADR-011 amendment exclusion taxonomy §2). Receipts
+    /// are surfaced from this local buffer — NOT the durable event log — by the
+    /// `payment_history` query, so the count diverges per member without
+    /// perturbing the convergent `event_log_merkle_root` (§9.9.3).
+    ///
+    /// # Bounded ring (oldest-evicted)
+    ///
+    /// Capacity is capped at
+    /// [`DEFAULT_BUFFER_CAPACITY`](scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY)
+    /// — the same bound as the sibling `receive_buffer` ring — so a long-lived
+    /// paid context cannot grow this buffer without limit (memory-growth DoS).
+    /// When the buffer is full a new receipt evicts the oldest (`pop_front`
+    /// before `push_back`). This buffer is therefore a SLIDING WINDOW of the
+    /// most recent captures, NOT the authoritative payment ledger; the full
+    /// persisted history is a separate, store-backed surface (not yet wired —
+    /// see [`crate::economy::receipt::payment_history`]).
+    pub payment_receipts: VecDeque<PaymentReceipt>,
 
     // -----------------------------------------------------------------
     // Mode-specific state
@@ -940,30 +971,32 @@ pub struct PerContextState {
 
     /// Set of distinct divergent checkpoints `(event_count, merkle_root)`
     /// already recorded per remote checkpoint sender DID (§9.9.3 replay
-    /// defense, secondary guard). A re-presented divergence whose
-    /// `(count, remote_merkle_root)` is already in the sender's set is a
-    /// no-op in `compare_remote_checkpoint`: it neither re-appends an
-    /// `EquivocationDetected` event nor re-bumps `checkpoint_events_since`.
-    /// A NEW root at an already-seen count is treated as fresh evidence —
-    /// two members can equivocate with different forged roots at the same
-    /// height, and each is a distinct §9.9.4 security event.
+    /// defense). A re-presented divergence whose `(count, remote_merkle_root)`
+    /// is already in the sender's set is a no-op in
+    /// `compare_remote_checkpoint`. A NEW root at an already-seen count is
+    /// treated as fresh evidence — two members can equivocate with different
+    /// forged roots at the same height, and each is a distinct §9.9.4 security
+    /// event.
     ///
-    /// PRIMARY replay-idempotency does NOT come from this map. Recording a
-    /// divergence appends an `EquivocationDetected` event to the durable
-    /// event log, which advances `local_count` (the `event_log_entries`
-    /// length read in `compare_remote_checkpoint`); a re-delivered
-    /// checkpoint at the same remote count then routes to the Ahead/Behind
-    /// arm and never re-reaches the `Equal`/dedup path. That count-advance
-    /// is durable across respawn (the event log is persisted), so replay
-    /// stays blocked even though this in-memory set resets to empty on
-    /// respawn. This set is the secondary belt-and-suspenders guard against
-    /// an exact-divergence re-record within a single process lifetime.
+    /// This in-memory set is the SOLE dedup mechanism. A divergence is NOT
+    /// appended to the durable Merkle event log: an equivocation record is
+    /// minted locally by the receiver and is not part of the
+    /// sender-authenticated leaf sequence, so logging it would let two honest
+    /// receivers compute divergent roots for the same context and
+    /// false-positive the very §9.9.3 detection it records. Because there is no
+    /// durable append, there is no `local_count` advance and therefore no
+    /// durable cross-respawn backstop: the set resets to empty when a new actor
+    /// instance respawns. The bounded consequence is that the FIRST
+    /// re-presentation of a previously-seen divergence after a respawn re-emits
+    /// one duplicate alert — an acceptable, bounded duplicate notification of a
+    /// real §9.9.4 event, not a correctness or replay-amplification bug.
     ///
-    /// Bounded per sender at
-    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries:
-    /// once a sender's set is full the alert is still EMITTED (a §9.9.4
-    /// security event is never silently discarded) but no further entry is
-    /// inserted, capping the memory a malicious sender can pin.
+    /// Emission of the §9.9.4 alert is ALWAYS-ON; only INSERTION into this set
+    /// is cap-gated. Bounded per sender at
+    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries: once a
+    /// sender's set is full the alert is still EMITTED (a §9.9.4 security event
+    /// is never silently discarded) but no further `(count, root)` is inserted,
+    /// capping the memory a malicious sender can pin.
     pub last_seen_remote_checkpoint: HashMap<DID, HashSet<(u64, [u8; 32])>>,
 
     // -----------------------------------------------------------------
@@ -1270,14 +1303,18 @@ impl PerContextState {
         Self {
             context_id,
             created_at,
+            // Test fixtures reuse the local instantiation timestamp as the
+            // convergent creation time; production sources it from the
+            // creator-assigned `ContextCreated` leaf value.
+            creation_timestamp_secs: created_at,
             generation: 0,
             handle,
             membership: MembershipState::new(),
             members: HashSet::new(),
             role_state: empty_role_state_for_test(),
             event_log: None,
-            merkle_tree: MerkleEventLog::new(context_id_str.to_owned()),
             receive_buffer: ReceiveBuffer::new(),
+            payment_receipts: VecDeque::new(),
             broadcast_context: None,
             migration_state: None,
             governance: GovernanceState::new_fresh_for_actor(context_id_str, admin_did, clock),
@@ -1495,14 +1532,15 @@ mod tests {
         let PerContextState {
             context_id,
             created_at,
+            creation_timestamp_secs,
             generation,
             handle,
             membership,
             members,
             role_state,
             event_log,
-            merkle_tree,
             receive_buffer,
+            payment_receipts,
             broadcast_context,
             migration_state,
             governance,
@@ -1535,6 +1573,9 @@ mod tests {
         // Identity + lifetime.
         assert_eq!(context_id, [3u8; 32]);
         assert_eq!(created_at, 12);
+        // Test fixture mirrors the convergent creation time onto the local
+        // instantiation timestamp.
+        assert_eq!(creation_timestamp_secs, 12);
         assert_eq!(generation, 0);
         assert_eq!(handle.context_id().len(), 64);
 
@@ -1545,8 +1586,8 @@ mod tests {
 
         // Event buffers + logs.
         assert!(event_log.is_none());
-        assert_eq!(merkle_tree.leaves().len(), 0);
         assert_eq!(receive_buffer.len(), 0);
+        assert!(payment_receipts.is_empty());
 
         // Mode-specific metadata.
         assert!(broadcast_context.is_none());
@@ -1615,14 +1656,15 @@ mod tests {
         let PerContextState {
             context_id: _,
             created_at: _,
+            creation_timestamp_secs: _,
             generation: _,
             handle: _,
             membership: _,
             members: _,
             role_state: _,
             event_log: _,
-            merkle_tree: _,
             receive_buffer: _,
+            payment_receipts: _,
             broadcast_context: _,
             migration_state: _,
             governance: _,

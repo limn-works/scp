@@ -1043,11 +1043,12 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
     fn append_event(
         &self,
         _: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         _actor_did: &str,
-        _payload: Option<&serde_json::Value>,
+        _payload: scp_event_log::EventPayload,
+        _timestamp_secs: u64,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        self.events.lock().unwrap().push(event.to_owned());
+        self.events.lock().unwrap().push(format!("{event_type:?}"));
         Ok(())
     }
     fn destroy_event_log(

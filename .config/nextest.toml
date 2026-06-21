@@ -1,0 +1,38 @@
+# nextest configuration — https://nexte.st/docs/configuration/
+#
+# Resource-contended test isolation.
+#
+# The per-identity KeyPackage supervisor poison/respawn tests
+# (`crates/scp-runtime/src/context/supervisor/supervisor.rs`) drive a
+# KeyPackage actor to its crash-poison budget and then wait — via the
+# test-only bounded `poll_until` helper — for the BACKGROUND supervisor
+# watchdog task to observe each induced panic and settle the sliding
+# `CrashWindow` poison state. The supervisor budget/poison/watchdog logic
+# itself is deterministic; only the WALL-CLOCK latency until the watchdog
+# tokio task is scheduled is timing-sensitive.
+#
+# These tests are `#[tokio::test]` (current-thread runtime). Under the full
+# `cargo nextest run --workspace` load (every core saturated by ~9.4k tests)
+# the watchdog task can be starved long enough that `poll_until` exhausts its
+# bounded ceiling before the poison settles, producing an intermittent
+# false failure. CI runs nextest with NO retries, so this hard-fails
+# intermittently.
+#
+# Confining just these three watchdog-latency-sensitive tests to a serial
+# group keeps spare scheduler capacity for their background watchdog tasks
+# without slowing the rest of the suite. This is the canonical nextest remedy
+# for resource-contended tests and does not weaken any test's own timeout or
+# assertions. It is scoped to ONLY these tests (verified via
+# `cargo nextest list`); the synchronous `CrashWindow` unit tests and the
+# `TestClock`-driven respawn tests are deterministic and are intentionally
+# NOT included.
+
+[test-groups]
+# Run at most one of these watchdog-latency-sensitive tests at a time so the
+# background supervisor watchdog task is never CPU-starved past the bounded
+# `poll_until` ceiling.
+supervisor-watchdog-poison = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(scp-runtime) & test(/^context::supervisor::supervisor::tests::(kp_actor_poisons_after_budget|clear_kp_poison_recovers_poisoned_actor|kp_actor_watchdog_records_panic_and_respawns)$/)'
+test-group = 'supervisor-watchdog-poison'

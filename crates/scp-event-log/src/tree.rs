@@ -81,11 +81,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     verify_event_signature(event)?;
 
     // 4. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
-    let serialized = serialize_event_for_hashing(event)?;
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(&serialized);
-    let leaf_hash: [u8; 32] = hasher.finalize().into();
+    let leaf_hash = leaf_hash(event)?;
 
     // 5. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
@@ -190,11 +186,7 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
     }
 
     // 3. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
-    let serialized = serialize_event_for_hashing(event)?;
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(&serialized);
-    let leaf_hash: [u8; 32] = hasher.finalize().into();
+    let leaf_hash = leaf_hash(event)?;
 
     // 4. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
@@ -287,6 +279,26 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
     // The leaf hash is a commitment to the complete event (including its
     // signature), which is the standard approach in event logs.
     rmp_serde::to_vec(event).map_err(|e| EventLogError::SerializationFailed(e.to_string()))
+}
+
+/// Computes the RFC 6962 leaf hash for an event: `SHA-256(0x00 ‖ rmp_serde(event))`.
+///
+/// This is the canonical Merkle leaf preimage used by both [`append`] and
+/// [`append_unsigned_event`]. It is exposed so consumers that hold an
+/// [`Event`] (e.g. FFI bridge event-log surfaces) can reproduce the exact leaf
+/// hash a verifier would compute, without re-deriving the domain-separation
+/// scheme. The `0x00` prefix provides RFC 6962 §2.1 domain separation from
+/// interior nodes (which use `0x01`).
+///
+/// # Errors
+///
+/// Returns [`EventLogError::SerializationFailed`] if event serialization fails.
+pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
+    let serialized = serialize_event_for_hashing(event)?;
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(&serialized);
+    Ok(hasher.finalize().into())
 }
 
 /// Verifies the Ed25519 signature of an event against the actor's DID.
@@ -428,8 +440,10 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
         // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
-        // are assigned in ADR declaration order. Tags 0-35 above are protocol
-        // constants and MUST NOT change.
+        // are assigned in ADR declaration order, with tag 59 retired (see the
+        // PseudonymAnnounced removal note below). Tags 76..=77 (below) are the
+        // ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above are
+        // protocol constants and MUST NOT change.
         EventType::AdminTransferred => 36,
         EventType::CeilingModified => 37,
         EventType::CeilingModificationPending => 38,
@@ -453,7 +467,10 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::PruningPolicyModified => 56,
         EventType::CommitBroadcasted => 57,
         EventType::CommitBroadcastPending => 58,
-        EventType::PseudonymAnnounced => 59,
+        // 59 retired: PseudonymAnnounced removed — a §9.10.4 routing-bootstrap
+        // ContextEvent signal, not a durable Merkle event (ADR-011 Amendment).
+        // The tag value is intentionally left as a gap so every other variant's
+        // canonical tag (and the §25 KAT preimages) stays byte-stable.
         EventType::ContextTombstoned => 60,
         EventType::ContextMigrationCancelled => 61,
         EventType::TtlExtended => 62,
@@ -470,6 +487,11 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RecoveryEpochAdvanced => 73,
         EventType::AppBound => 74,
         EventType::AppUnbound => 75,
+        // Cross-context tool-call saga (ADR-011 Amendment §6 carve-out). Tags
+        // 76..=77 are the next free values after the current max (75); tag 59
+        // stays retired. These are convergent commit-ordered durable leaves.
+        EventType::CrossContextToolInvoked => 76,
+        EventType::CrossContextDivergenceMarker => 77,
     }
 }
 
@@ -989,7 +1011,7 @@ mod tests {
         let mut prev_hash = GENESIS_PREV_HASH;
         for (i, event_type) in event_types.iter().enumerate() {
             let event = sign_event(
-                event_type.clone(),
+                *event_type,
                 &did,
                 1_000_000 + i as u64,
                 i as u64,
@@ -1285,13 +1307,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // Closed-taxonomy tag invariants (ADR-011 native↔WASM unification):
     //   - tags 0-35 are protocol constants and MUST NOT change;
-    //   - the 40 unification variants occupy tags 36..=75;
-    //   - all 76 tags are distinct.
+    //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
+    //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
+    //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
+    //   - all 77 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 76] = [
+    const ALL_EVENT_TYPES: [EventType; 77] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1351,7 +1375,6 @@ mod tests {
         EventType::PruningPolicyModified,
         EventType::CommitBroadcasted,
         EventType::CommitBroadcastPending,
-        EventType::PseudonymAnnounced,
         EventType::ContextTombstoned,
         EventType::ContextMigrationCancelled,
         EventType::TtlExtended,
@@ -1368,18 +1391,26 @@ mod tests {
         EventType::RecoveryEpochAdvanced,
         EventType::AppBound,
         EventType::AppUnbound,
+        EventType::CrossContextToolInvoked,
+        EventType::CrossContextDivergenceMarker,
     ];
 
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 76, "taxonomy must enumerate all 76 variants");
+        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            76,
-            "all 76 EventType tags must be distinct (no two variants share a tag)"
+            77,
+            "all 77 EventType tags must be distinct (no two variants share a tag)"
+        );
+        // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
+        // space is therefore 0..=75 minus {59}. This is the only gap.
+        assert!(
+            !tags.contains(&59),
+            "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
         );
     }
 
@@ -1428,9 +1459,11 @@ mod tests {
     }
 
     #[test]
-    fn unification_variant_tags_occupy_36_through_75() {
-        // The 40 native↔WASM unification variants occupy tags 36..=75 in ADR
-        // declaration order.
+    fn unification_variant_tags_occupy_36_through_77() {
+        // The 39 native↔WASM unification variants occupy tags 36..=75 in ADR
+        // declaration order, with tag 59 retired (PseudonymAnnounced removed).
+        // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
+        // 76..=77.
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
         assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
         assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
@@ -1454,7 +1487,7 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::PruningPolicyModified), 56);
         assert_eq!(event_type_tag(&EventType::CommitBroadcasted), 57);
         assert_eq!(event_type_tag(&EventType::CommitBroadcastPending), 58);
-        assert_eq!(event_type_tag(&EventType::PseudonymAnnounced), 59);
+        // Tag 59 retired: PseudonymAnnounced removed (routing-bootstrap signal).
         assert_eq!(event_type_tag(&EventType::ContextTombstoned), 60);
         assert_eq!(event_type_tag(&EventType::ContextMigrationCancelled), 61);
         assert_eq!(event_type_tag(&EventType::TtlExtended), 62);
@@ -1474,6 +1507,10 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::RecoveryEpochAdvanced), 73);
         assert_eq!(event_type_tag(&EventType::AppBound), 74);
         assert_eq!(event_type_tag(&EventType::AppUnbound), 75);
+        // Cross-context-saga carve-out (ADR-011 Amendment §6): the next free
+        // tags after 75 (tag 59 stays retired).
+        assert_eq!(event_type_tag(&EventType::CrossContextToolInvoked), 76);
+        assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
     }
 
     #[test]

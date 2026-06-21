@@ -410,9 +410,13 @@ pub enum MessagingCommand {
 
     /// Compare a remote consistency checkpoint against local event-log
     /// state for equivocation detection (§9.9.3, ADR-011 AC-8). Mutating
-    /// — emits `ContextEvent::EquivocationDetected` into the receive
-    /// buffer and appends an `EquivocationDetected` event to the log when
-    /// the comparison is `Divergent`.
+    /// — surfaces a divergence by minting an `EquivocationDetected` record
+    /// into the receive buffer (and broadcasting it) when the comparison is
+    /// `Divergent`. The record is NOT appended to the durable Merkle log: it
+    /// is a receiver-local mint outside the sender-authenticated leaf
+    /// sequence, so persisting it would let two honest receivers compute
+    /// divergent roots and false-positive the very §9.9.3 detection it
+    /// records (deduped per distinct divergent checkpoint per sender).
     ///
     /// Delegates to
     /// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint).
@@ -2054,6 +2058,17 @@ pub struct TtlTimerPayload {
     /// `StartTtlTimer`; the replacement duration for
     /// `ResetTtlTimer`.
     pub duration: std::time::Duration,
+    /// When `true` (the initial-create `StartTtlTimer` path), the handler
+    /// records a CONVERGENT expiry deadline anchored on the actor's
+    /// `creation_timestamp_secs + params.ttl` — every member computes the
+    /// identical absolute deadline, so the `ContextExpired`/`ContextClosed`
+    /// leaf timestamp is convergent-by-construction (§7.3.1, §9.9.3). When
+    /// `false` (e.g. the restore/import path, whose persisted snapshot does
+    /// not yet carry the convergent creation time — a forward step under
+    /// ADR-051), the deadline is armed relative to the local clock (the prior
+    /// behaviour). Ignored by `ResetTtlTimer`, which never anchors to
+    /// creation.
+    pub anchor_deadline_to_creation: bool,
 }
 
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
@@ -2470,9 +2485,7 @@ pub enum QueriesCommand {
         context_id_bytes: [u8; 32],
         /// Oneshot reply channel. `Ok(None)` iff no log exists for the
         /// context.
-        reply: oneshot::Sender<
-            Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>,
-        >,
+        reply: oneshot::Sender<Result<Option<Vec<scp_event_log::Event>>, ContextError>>,
     },
 
     /// Local MLS epoch for the context (§9.12). Read-only.
@@ -2504,6 +2517,22 @@ pub enum QueriesCommand {
         context_id: String,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+    /// Payment receipts captured in this context (spec §19.11). Read-only.
+    ///
+    /// Reads the actor-owned `state.payment_receipts` local buffer (NOT the
+    /// durable Merkle log — `PaymentReceived` is per-payee, excluded from the
+    /// canonical log per ADR-011 amendment exclusion taxonomy §2), applies the
+    /// optional [`ReceiptFilter`](crate::economy::receipt::ReceiptFilter), and
+    /// replies with the matching receipts. Empty `Vec` iff the context is
+    /// unknown (soft default, matching the other read variants).
+    PaymentHistory {
+        /// Context identifier string.
+        context_id: String,
+        /// Optional filter (payer / payee / time range). `None` returns all.
+        filter: Option<crate::economy::receipt::ReceiptFilter>,
+        /// Oneshot reply channel carrying the matching receipts.
+        reply: oneshot::Sender<Result<Vec<crate::economy::adapter::PaymentReceipt>, ContextError>>,
     },
 
     // -------------------------------------------------------------------
@@ -2883,6 +2912,13 @@ pub enum SagaPhaseMessage {
         committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
         /// The committed-side event id.
         committed_event_id: String,
+        /// CONVERGENT committer-assigned leaf timestamp (seconds) for the
+        /// divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000` —
+        /// the same convergent instant the committed-side `ToolInvoked` leaf
+        /// carries (spec §6.2.4 *Recorded timestamp*). Passed per-call so the
+        /// marker leaf is byte-identical across honest members (§9.9.3), never a
+        /// per-member actor-local clock read.
+        committed_timestamp_secs: u64,
         /// The local (emitting) side's Active Signing Key. The actor holds no
         /// key (ADR-049); the FSM passes the key authorized for this context
         /// per-call. Zeroizes on drop.

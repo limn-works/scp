@@ -342,6 +342,11 @@ type DivergenceMarkerPlan = (
         [u8; 32],
         crate::context::actor::commands::SigningKeyBytes,
     ); 2],
+    // CONVERGENT committer-assigned leaf-timestamp (seconds) for the
+    // divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000`, the
+    // same convergent instant the committed-side `ToolInvoked` leaf carries
+    // (spec §6.2.4 *Recorded timestamp*).
+    u64,
 );
 
 /// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
@@ -3299,7 +3304,8 @@ impl Supervisor {
             | QueriesCommand::PendingCommits { .. }
             | QueriesCommand::CommitFault { .. }
             | QueriesCommand::LocalMlsEpoch { .. }
-            | QueriesCommand::NeedsReconnect { .. } => {
+            | QueriesCommand::NeedsReconnect { .. }
+            | QueriesCommand::PaymentHistory { .. } => {
                 reply_with_soft_default(cmd);
             }
             // EventLogEntries never reaches this method — `dispatch_query`
@@ -6867,6 +6873,16 @@ impl Supervisor {
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let target_context_id = ctx.target_context_id;
+        // INVARIANT (spec §6.2.4 *Staged nonce*): the caller-side
+        // `CrossContextToolInvoked` leaf and the `CrossContextDivergenceMarker`
+        // form one `nonce`-joined provenance edge, so they MUST carry the same
+        // nonce. `ctx.asserted_nonce` is byte-identical to B's
+        // `prepared_b.recorded_nonce` (which the marker uses) because Prepare-B
+        // copies the wire nonce verbatim into `recorded_nonce` (saga.rs, "B's
+        // staged copy of the 16-byte wire nonce") — the nonce is a public
+        // correlation token B copies, never derives. If B's `recorded_nonce`
+        // ever stops being a verbatim copy, source this from
+        // `prepared_b.recorded_nonce` too so both records share one origin.
         let nonce = ctx.asserted_nonce;
         let receipt_for_a = receipt_bytes.to_vec();
 
@@ -7031,7 +7047,7 @@ impl Supervisor {
         // `.await`s below (the ctx carries the non-`Sync` boxed executor, which
         // would otherwise poison this future's `Send` bound). The loop holds only
         // owned values.
-        let (committed_event_id, nonce, sides) = plan;
+        let (committed_event_id, nonce, sides, committed_timestamp_secs) = plan;
         let committed_side = CommittedSide::Target;
 
         for (label, context_id, signing_key_bytes) in sides {
@@ -7046,6 +7062,7 @@ impl Supervisor {
                             nonce,
                             committed_side,
                             committed_event_id: committed_event_id_for_send,
+                            committed_timestamp_secs,
                             signing_key: signing_key_bytes,
                             reply,
                         })
@@ -7110,6 +7127,18 @@ impl Supervisor {
     fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
         use crate::context::actor::commands::SigningKeyBytes;
         let committed_event_id = ctx.committed_b_tool_invoked_event_id.clone()?;
+        // B's VERIFIED staged provenance is the ONLY admissible source for the
+        // convergent marker-leaf nonce + timestamp. In the current FSM a
+        // committed B (`committed_event_id` is `Some`) always implies Prepare-B
+        // ran and `prepared_b` is set, so this `?` never trips on the live path.
+        // But the invariant is enforced by TYPES here, not by call-ordering: a
+        // future recovery path that runs this plan with `prepared_b: None` MUST
+        // NOT be able to substitute the caller-ASSERTED (untrusted, proposer-
+        // controlled) nonce / timestamp into a convergent durable leaf. Absent
+        // B's verified provenance there is no honest convergent value to mark
+        // with, so refuse to produce a marker plan — the caller already handles
+        // the `None`/skip outcome (no committed side ⇒ no divergence to record).
+        let prepared_b = ctx.prepared_b.as_ref()?;
         // Each side records the SAME (committed_side, committed_event_id, nonce)
         // — each into its own log under its OWN Active Signing Key. Only the
         // TARGET can have committed-then-diverged in the current FSM (Commit-B
@@ -7140,16 +7169,23 @@ impl Supervisor {
         // Source the STAGED `recorded_nonce` (B's captured copy of the wire
         // value) for symmetry with the signed receipt, which draws its `nonce`
         // from the same staged value (spec §6.2.4 *Staged nonce and recorded
-        // chain-depth*). A divergence marker can only exist once Commit-B landed
-        // (`committed_event_id` is `Some`), which implies Prepare-B ran and
-        // `prepared_b` is set — so this is the staged nonce in practice; the
-        // `asserted_nonce` fallback is defensive and equals the staged value by
-        // design (the nonce is a public correlation token B copies, not derives).
-        let marker_nonce = ctx
-            .prepared_b
-            .as_ref()
-            .map_or(ctx.asserted_nonce, |b| b.recorded_nonce);
-        Some((committed_event_id, marker_nonce, sides))
+        // chain-depth*). Drawn from B's VERIFIED provenance only — never the
+        // caller-asserted nonce (see the `prepared_b` guard above).
+        let marker_nonce = prepared_b.recorded_nonce;
+        // CONVERGENT marker-leaf timestamp: B's staged `recorded_timestamp_ms`
+        // (the same value signed into the receipt and written into the
+        // committed-side `ToolInvoked` leaf), in SECONDS. Drawing the marker
+        // leaf's timestamp from this single convergent instant (rather than each
+        // emitting actor's local clock — or, worse, the caller-asserted value)
+        // keeps the marker leaf byte-identical across honest members (§7.3.1,
+        // §9.9.3, §6.2.4 *Recorded timestamp*).
+        let committed_timestamp_secs = prepared_b.recorded_timestamp_ms / 1000;
+        Some((
+            committed_event_id,
+            marker_nonce,
+            sides,
+            committed_timestamp_secs,
+        ))
     }
 
     /// Record a supervisor-level divergence repair witness for an UNREACHABLE
@@ -8781,6 +8817,35 @@ impl Supervisor {
         }
     }
 
+    /// Returns the payment receipts captured in `context_id` (spec §19.11),
+    /// optionally narrowed by `filter`. Empty `Vec` iff the context is unknown.
+    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// Reads the actor-owned per-context local receipt buffer — `PaymentReceived`
+    /// is per-payee application activity excluded from the canonical Merkle log
+    /// (ADR-011 amendment exclusion taxonomy §2), so it is surfaced from the
+    /// local buffer rather than the durable event log.
+    #[must_use]
+    pub async fn payment_history(
+        &self,
+        context_id: &str,
+        filter: Option<crate::economy::receipt::ReceiptFilter>,
+    ) -> Vec<crate::economy::adapter::PaymentReceipt> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::PaymentHistory {
+            context_id: context_id.to_owned(),
+            filter,
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
+    }
+
     /// Returns the role assignment for `did` in `context_id`, or `None`
     /// if the member has no role. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
@@ -8915,8 +8980,7 @@ impl Supervisor {
     pub fn event_log_entries(
         &self,
         context_id_bytes: &[u8; 32],
-    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
-    {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         let event_log = self.event_log_ref().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::event_log_entries — event_log provider not configured".to_owned(),
@@ -10204,7 +10268,8 @@ impl Supervisor {
             | QueriesCommand::PendingCommits { context_id, .. }
             | QueriesCommand::CommitFault { context_id, .. }
             | QueriesCommand::LocalMlsEpoch { context_id, .. }
-            | QueriesCommand::NeedsReconnect { context_id, .. } => Some(context_id.as_str()),
+            | QueriesCommand::NeedsReconnect { context_id, .. }
+            | QueriesCommand::PaymentHistory { context_id, .. } => Some(context_id.as_str()),
             QueriesCommand::EventLogEntries { .. } => None,
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { context_id, .. }
@@ -10562,6 +10627,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // An unknown context has nothing to reconnect.
         QueriesCommand::NeedsReconnect { reply, .. } => {
             let _ = reply.send(Ok(false));
+        }
+        // An unknown context has no payment receipts (empty `Vec`).
+        QueriesCommand::PaymentHistory { reply, .. } => {
+            let _ = reply.send(Ok(Vec::new()));
         }
         // `EventLogEntries` does not take a per-context lock and never
         // reaches this fallback path; the top-level dispatch handles it
@@ -10959,9 +11028,10 @@ mod tests {
         fn append_event(
             &self,
             _context_id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -11193,6 +11263,7 @@ mod tests {
                 &ctx_key,
                 scp_protocol::context::ContextParams::default(),
                 std::time::Duration::from_millis(50),
+                true,
             )
             .await;
         assert_eq!(
@@ -11663,7 +11734,8 @@ mod tests {
 
         let creator = "did:key:forge-test-creator";
         let snapshot = import_test_snapshot("forge-ctx", creator);
-        let event_log_data = create_event_log_data(&[0x11u8; 32], &["ContextCreated"]);
+        let event_log_data =
+            create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         // Sign with the real creator key so the export is internally
         // consistent (exporter_did == creator_did, signature authentic
@@ -11713,7 +11785,8 @@ mod tests {
         let mut snapshot = import_test_snapshot("broadcast-ctx", creator);
         snapshot.context_params.mode = scp_protocol::context::ContextMode::Broadcast;
         snapshot.routing = crate::context::actor::state::ContextRouting::Broadcast;
-        let event_log_data = create_event_log_data(&[0x22u8; 32], &["ContextCreated"]);
+        let event_log_data =
+            create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let export = crate::context::export_import::create_export(
@@ -11802,7 +11875,8 @@ mod tests {
         // Event-log bytes keyed on the import path's own derivation so
         // the recomputed Merkle root matches what the importer expects.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
         crate::context::export_import::create_export(
             snapshot,
             event_log_data,
@@ -11932,15 +12006,149 @@ mod tests {
             .expect("pre-existing store handle is still live after the rejected import");
     }
 
+    /// SECURITY (§5.3.2, §19.3): a Full export whose `pending_economic_policy_change`
+    /// has a BACKDATED `observed_at` (and backdated `effective_at`) MUST NOT be
+    /// immediately effective on import. `import_context` re-pins `observed_at` to
+    /// the importing member's local clock, so the non-backdatable notification
+    /// window restarts from import time. Without the re-pin, a malicious exporter
+    /// who signs a backdated `observed_at` collapses the window to zero and the
+    /// policy applies on the first apply tick — exactly the bypass this guards.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_repins_observed_at_so_backdated_pending_change_is_not_effective() {
+        use crate::context::state::ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        use ed25519_dalek::Signer;
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+        // Deterministic import-time clock.
+        const IMPORT_TIME: u64 = 1_700_000_000;
+        let clock = Arc::new(TestClock::new(IMPORT_TIME));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let supervisor =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let creator = "did:key:repin-test-creator";
+        let context_id = "repin-observed-at-ctx";
+        let mut snapshot = import_test_snapshot(context_id, creator);
+
+        // Attacker backdates BOTH the convergent `effective_at` AND the
+        // non-backdatable floor `observed_at` to the distant past. Installed
+        // verbatim, `is_effective(IMPORT_TIME + 1)` would be true (window
+        // collapsed). `effective_at` is well below import time too, so only the
+        // re-pinned floor keeps the change pending.
+        let backdated = IMPORT_TIME - 10 * ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode(*b"USD\0"),
+                per_message: Some(Amount(1)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["test".to_owned()],
+            pricing_formula: None,
+            payee: DID("did:dht:z6MkPayee".to_owned()),
+        };
+        snapshot.pending_economic_policy_change =
+            Some(crate::context::state::PendingEconomicPolicyChange {
+                new_policy: policy,
+                notified_at: backdated,
+                effective_at: backdated + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+                observed_at: backdated,
+                proposal_id: [0u8; 32],
+            });
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        // Empty event-log data: `recompute_event_log_root([])` is `[0u8; 32]`,
+        // which matches `import_test_snapshot`'s signed `event_log_merkle_root`
+        // so the Merkle-binding check passes and the import succeeds.
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            Vec::new(),
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed full export");
+
+        // Fresh import (no live context for this id) — succeeds.
+        supervisor
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect("a valid signed full export imports successfully");
+
+        // At import_time + 1: the re-pinned floor is `IMPORT_TIME +
+        // ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS`, so the change is NOT yet
+        // effective despite the backdated `effective_at`. Without the re-pin
+        // this apply would return `true`.
+        let applied_early = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_governance_command(
+                    crate::context::actor::commands::GovernanceCommand::ApplyPendingEconomicPolicyChange {
+                        context_id: context_id.to_owned(),
+                        current_timestamp: IMPORT_TIME + 1,
+                        reply: tx,
+                    },
+                )
+                .await
+                .expect("apply dispatch routes to the imported actor");
+            rx.await.expect("apply handler replies").expect("apply ok")
+        };
+        assert!(
+            !applied_early,
+            "a backdated pending economic-policy change MUST NOT be effective just after import \
+             — `observed_at` is re-pinned to local import time, restarting the §19.3 window"
+        );
+
+        // At import_time + PERIOD: the re-pinned window has elapsed, so the
+        // change now applies. This proves the re-pin restarts (does not destroy)
+        // the window.
+        let applied_after_period = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_governance_command(
+                    crate::context::actor::commands::GovernanceCommand::ApplyPendingEconomicPolicyChange {
+                        context_id: context_id.to_owned(),
+                        current_timestamp: IMPORT_TIME
+                            + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS
+                            + 1,
+                        reply: tx,
+                    },
+                )
+                .await
+                .expect("apply dispatch routes to the imported actor");
+            rx.await.expect("apply handler replies").expect("apply ok")
+        };
+        assert!(
+            applied_after_period,
+            "the change MUST become effective once the re-pinned notification window \
+             (import_time + PERIOD) has elapsed"
+        );
+    }
+
     /// Helper mirroring `export_import::tests::create_event_log_data` —
     /// builds a Merkle event log byte payload via the provider.
-    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
+    fn create_event_log_data(
+        context_id_bytes: &[u8; 32],
+        event_types: &[scp_event_log::EventType],
+    ) -> Vec<u8> {
         use crate::context::builder::ContextEventLogProvider;
         let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
-        for name in event_names {
+        for event_type in event_types {
             provider
-                .append_event(context_id_bytes, name, "", None)
+                .append_event(
+                    context_id_bytes,
+                    *event_type,
+                    "",
+                    scp_event_log::EventPayload::default(),
+                    1_700_000_000,
+                )
                 .unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
@@ -12139,8 +12347,16 @@ mod tests {
     /// A KP-actor panic is caught by the watchdog, recorded payload-free in the
     /// per-identity crash window, and the actor is respawned — a subsequent
     /// `key_package_store_for` resolves a fresh, live handle.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_watchdog_records_panic_and_respawns() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpWatchdog".to_owned());
@@ -12188,8 +12404,16 @@ mod tests {
 
     /// Three KP-actor panics within the budget window poison the identity; the
     /// next `key_package_store_for` surfaces a typed `ContextPoisoned` error.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_poisons_after_budget() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpPoison".to_owned());
@@ -12231,8 +12455,16 @@ mod tests {
     /// reconciles from the journal), WITHOUT routing through the per-context
     /// snapshot respawn (there is no KP context-snapshot). After recovery the
     /// identity resolves a live handle again.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_kp_poison_recovers_poisoned_actor() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpClearPoison".to_owned());
@@ -13643,8 +13875,11 @@ mod tests {
             &ctx_key,
             &target,
             scp_protocol::context::governance::AccessScope::Both,
-            [1u8; 32],
-            admin.as_ref(),
+            crate::context::governance_helpers::CommitMeta {
+                pid: [1u8; 32],
+                actor_did: admin.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
         )
         .expect("execute_revoke (Both scope) must succeed");
 
@@ -14841,8 +15076,9 @@ mod tests {
     const XCTX_TARGET: [u8; 32] = [0x22u8; 32];
     const XCTX_TOOL: &str = "calculator-v1";
 
-    /// A recorded event-log append: `(context_id, event_name, actor_did, payload)`.
-    type RecordedEvent = ([u8; 32], String, String, Option<serde_json::Value>);
+    /// A recorded event-log append:
+    /// `(context_id, event_type, actor_did, payload_bytes, timestamp_secs)`.
+    type RecordedEvent = ([u8; 32], scp_event_log::EventType, String, Vec<u8>, u64);
 
     /// An event-log provider that RECORDS every append so a test can assert
     /// the dual `ToolInvoked` / `CrossContextToolInvoked` records (§6.2.4
@@ -14861,14 +15097,21 @@ mod tests {
         fn append_event(
             &self,
             id: &[u8; 32],
-            event: &str,
+            event_type: scp_event_log::EventType,
             actor: &str,
-            payload: Option<&serde_json::Value>,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             self.events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((*id, event.to_owned(), actor.to_owned(), payload.cloned()));
+                .push((
+                    *id,
+                    event_type,
+                    actor.to_owned(),
+                    payload.data,
+                    timestamp_secs,
+                ));
             Ok(())
         }
         fn destroy_event_log(
@@ -15271,23 +15514,32 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let nonce_hex = hex::encode(nonce);
+        // The committer-assigned (convergent) leaf timestamp both records MUST
+        // carry: B's signed `recorded_timestamp_ms`, in seconds. The two
+        // `nonce`-joined records date the one provenance edge identically, and
+        // every honest member reconstructs the same leaf (§7.3.1, §9.9.3).
+        let expected_leaf_secs = receipt.timestamp_ms / 1000;
         let tool_invoked = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_TARGET && name.starts_with("ToolInvoked:"))
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET && *event_type == scp_event_log::EventType::ToolInvoked
+            })
             .expect("target log must carry a ToolInvoked record");
         // The target's record carries B's re-derived chain depth + the saga id.
-        let ti_payload = tool_invoked.3.as_ref().expect("ToolInvoked payload");
+        let ti_payload: serde_json::Value =
+            serde_json::from_slice(&tool_invoked.3).expect("ToolInvoked payload");
         assert_eq!(ti_payload["chain_depth"], serde_json::json!(3));
+        // Convergent leaf timestamp (NOT a per-member clock read).
+        assert_eq!(tool_invoked.4, expected_leaf_secs);
         let xctx_invoked = events
             .iter()
-            .find(|(id, name, _, _)| {
-                *id == XCTX_CALLER && name.starts_with("CrossContextToolInvoked:")
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_CALLER
+                    && *event_type == scp_event_log::EventType::CrossContextToolInvoked
             })
             .expect("caller log must carry a CrossContextToolInvoked record");
-        let cci_payload = xctx_invoked
-            .3
-            .as_ref()
-            .expect("CrossContextToolInvoked payload");
+        let cci_payload: serde_json::Value =
+            serde_json::from_slice(&xctx_invoked.3).expect("CrossContextToolInvoked payload");
         // The two records share the correlation nonce (the join key) and the
         // caller record references the target ctx id.
         assert_eq!(cci_payload["nonce"], serde_json::json!(nonce_hex));
@@ -15295,6 +15547,9 @@ mod tests {
             cci_payload["target_context_id"],
             serde_json::json!(hex::encode(XCTX_TARGET))
         );
+        // The caller-side leaf dates the SAME convergent instant as the
+        // target's `ToolInvoked` leaf (drawn from B's signed receipt).
+        assert_eq!(xctx_invoked.4, expected_leaf_secs);
     }
 
     /// Prepare-B reject (confused deputy): the caller references a UCAN proof in
@@ -15730,11 +15985,45 @@ mod tests {
             })),
             executor_output: None,
             prepared_a: None,
-            prepared_b: None,
+            // A committed Commit-B (`committed_b_tool_invoked_event_id` is
+            // `Some`) always implies Prepare-B ran, so `prepared_b` is `Some` on
+            // the real FSM path. The marker draws its convergent nonce/timestamp
+            // from B's VERIFIED staged provenance here (never the caller-asserted
+            // values), so the staged copies mirror the asserted ones.
+            prepared_b: Some(crate::context::actor::commands::PreparedBFields {
+                recorded_timestamp_ms: 1_700_000_000,
+                recorded_nonce: nonce,
+                recorded_chain_depth: 3,
+            }),
             committed: None,
             committed_b_tool_invoked_event_id: Some(tool_invoked_event_id),
             reached_needs_repair: false,
         }
+    }
+
+    /// Security regression (black-hat): `divergence_marker_plan` MUST refuse to
+    /// mint a marker plan when `prepared_b` is absent — otherwise a future
+    /// recovery path could substitute the caller-ASSERTED (untrusted) nonce /
+    /// timestamp into a convergent durable marker leaf. With no verified
+    /// Commit-B provenance there is no honest convergent value, so the plan is
+    /// `None` (no marker emitted).
+    #[test]
+    fn divergence_marker_plan_refuses_without_verified_commit_b() {
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let mut ctx = divergence_ctx(
+            [0x42u8; 16],
+            "ToolInvoked:test".to_owned(),
+            &target_signing,
+            &caller_signing,
+            "did:dht:z6MkXctxDivCaller",
+        );
+        // Real path: committed Commit-B ⇒ prepared_b is Some ⇒ a plan exists.
+        assert!(Supervisor::divergence_marker_plan(&ctx).is_some());
+        // Synthetic unreachable case: committed event id present but no verified
+        // Prepare-B provenance ⇒ refuse to produce a plan (no untrusted fallback).
+        ctx.prepared_b = None;
+        assert!(Supervisor::divergence_marker_plan(&ctx).is_none());
     }
 
     /// NeedsRepair dual divergence marker (spec §6.2.4 "Dual event-log
@@ -15790,16 +16079,16 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
-
         // TARGET log carries a marker signed by the TARGET key.
-        let (_, _, _, target_payload) = events
+        let (_, _, _, target_payload, _) = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name)
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            })
             .expect("target log must carry a divergence marker");
         let target_marker: CrossContextDivergenceMarker =
-            serde_json::from_value(target_payload.clone().expect("marker payload"))
-                .expect("decode target marker");
+            serde_json::from_slice(target_payload).expect("decode target marker");
         assert_eq!(target_marker.committed_side, CommittedSide::Target);
         assert_eq!(target_marker.saga_id, saga_id.0);
         assert_eq!(target_marker.nonce, nonce);
@@ -15812,13 +16101,15 @@ mod tests {
         );
 
         // CALLER log carries a marker signed by the CALLER key.
-        let (_, _, _, caller_payload) = events
+        let (_, _, _, caller_payload, _) = events
             .iter()
-            .find(|(id, name, _, _)| *id == XCTX_CALLER && *name == marker_name)
+            .find(|(id, event_type, _, _, _)| {
+                *id == XCTX_CALLER
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            })
             .expect("caller log must carry a divergence marker");
         let caller_marker: CrossContextDivergenceMarker =
-            serde_json::from_value(caller_payload.clone().expect("marker payload"))
-                .expect("decode caller marker");
+            serde_json::from_slice(caller_payload).expect("decode caller marker");
         assert_eq!(caller_marker.committed_side, CommittedSide::Target);
         assert_eq!(caller_marker.saga_id, saga_id.0);
         assert_eq!(caller_marker.nonce, nonce);
@@ -15901,11 +16192,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
         assert!(
-            events
-                .iter()
-                .any(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name),
+            events.iter().any(|(id, event_type, _, _, _)| {
+                *id == XCTX_TARGET
+                    && *event_type == scp_event_log::EventType::CrossContextDivergenceMarker
+            }),
             "the reachable target side must still record its marker into its own log"
         );
     }

@@ -132,7 +132,8 @@ class Event:
     Mirrors ``PyEvent`` from ``_scp_core``.
     """
 
-    #: The event type (e.g., ``"ContextCreated"``, ``"MessageSent"``).
+    #: The event type (e.g., ``"ContextCreated"``, ``"MemberJoined"``,
+    #: ``"GovernanceActionExecuted"``).
     event_type: str
 
     #: The DID of the actor who produced this event.

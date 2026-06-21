@@ -20,7 +20,7 @@ pub mod event_log;
 pub mod persistence;
 
 pub use crate::crypto::mls::provider::MlsCryptoProvider;
-pub use event_log::{EventLogEntry, EventLogPersistence, MerkleEventLogProvider};
+pub use event_log::{EventLogPersistence, MerkleEventLogProvider};
 pub use persistence::{InMemoryPersistence, ProtocolRepositoryContextBridge};
 
 // Re-export the ProtocolRepository bridge for event log persistence.

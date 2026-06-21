@@ -2,6 +2,10 @@
 
 ## SCP Codebase Security Patterns
 
+### Event-Log Phase-2 Substrate Swap FINAL (16a2cd42b) -- 2026-06-20
+- See `eventlog-phase2-final-16a2cd42b.md`. ONE HIGH: bf9266777 made econ-policy/ceiling effective_at = proposal.created_at (PROPOSER-backdatable) + PERIOD; no clamp; breaks §19 commit-anchored 24h MUST; pre-Phase-2 used applying member's now() -> NEW regression. Rest CLEAN (merkle_root mirror removal neutral-or-stronger; committer-ts signed-bound).
+- FIX RE-VERIFIED (f234988bc) -- see `notification-window-backdating-fix-f234988bc.md`. Canonical import observed_at re-pin to local clock. Bypass CLOSED, no new regression. RESTORE-verbatim correct (self-respawn). WASM gov-leaf b"" parity + dedup contiguous-seq + convergent_consequence_timestamp move all clean. MERGE-GATING CONFIRMED.
+- FIX VERIFIED (4cad781e5) -- see `notification-window-backdating-fix-4cad781e5.md`. HIGH RESOLVED, no new regression. Added per-member observed_at floor: is_effective = current>=max(effective_at, observed_at+PERIOD); leaf still effective_at (convergent); observed_at self-attested only (Full export = creator self-sig, never cross-member compared); freeze residual sound (expiry removes BOTH proposals, no authz grant).
 ### ADR-039 MessageSigner refactor (f7fb2fa6, double-zero round 2) -- 2026-06-20 -- ZERO FINDINGS
 - MessageSigner<'a> enum (supervisor.rs ~395-440) pairs key+persona; key()/signing_key_id() total const matches, no panic. Supervisor::send_message now takes non-optional MessageSigner, sets payload signing_key=Some(...)+signing_key_id from one source.
 - Mailbox seam: SendMessagePayload still carries 2 fields, but set atomically by supervisor; handle_send_message (handlers/messaging.rs:245-254) passes them straight to messaging_helpers::send_message which RE-PAIRS into MessageSigner at entry (~697-718). No independent re-derivation => persona cannot desync from key. Round-1 attribution property intact end-to-end.
@@ -174,6 +178,14 @@
 - HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
 - MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
 - GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
+
+### ADR-051 Convergent Clock / Causal-DAG (2026-06-19)
+- See `adr051-convergent-clock.md`. APPROVE + 1 MEDIUM. Multi-vantage median (sender/node/relay/receiver-quorum),
+  clamped >= max(sender,relay-ingest), receiver-quorum anchored. Soft signal honestly stated; size-independent
+  (spread=latency not N); vantage stamps signed in SCP-CHECKPOINT-V2 preimage (forge-proof).
+- MEDIUM (track into impl program): ADR req#6 mandates machine-readable `anchored` flag but spec07
+  ParticipationProfile (L218) + spec19 PaymentReceipt got PROSE COMMENT only — no field. Interim is shipping
+  state, so anchored=false surfacing is load-bearing NOW. Add per-fact bool/bitmask when interim lands.
 
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi

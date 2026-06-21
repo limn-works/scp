@@ -58,7 +58,8 @@
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
 //!   Mutates `checkpoint_events_since` on divergent compare.
 //! - [`prove_event_inclusion`], [`prove_event_consistency`] — Merkle
-//!   proofs. `sync_merkle_tree` mutation runs first.
+//!   proofs. Delegate to the event-log provider, which builds the proof
+//!   directly against its own canonical tree (no per-context twin tree).
 //!
 //! Field-disjoint actor-shape entries used by other domains:
 //!
@@ -96,7 +97,6 @@ use zeroize::Zeroizing;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::providers::event_log::EventLogEntry;
 use crate::context::state::{self, CommitFaultMarker, PendingCommit};
 
 /// Maximum number of checkpoints retained per context. Older checkpoints
@@ -306,6 +306,21 @@ pub fn commit_fault(state: &PerContextState) -> Option<CommitFaultMarker> {
     state.commit_fault.clone()
 }
 
+/// Returns the payment receipts captured in this context (spec §19.11),
+/// optionally narrowed by `filter`.
+///
+/// Reads the actor-owned `state.payment_receipts` local buffer — NOT the
+/// durable Merkle log. `PaymentReceived` is per-payee application activity
+/// excluded from the canonical log (ADR-011 amendment exclusion taxonomy §2),
+/// so surfacing it from the local buffer is what keeps `event_log_merkle_root`
+/// convergent across honest members (§9.9.3).
+pub(super) fn payment_history(
+    state: &PerContextState,
+    filter: Option<&crate::economy::receipt::ReceiptFilter>,
+) -> Vec<crate::economy::adapter::PaymentReceipt> {
+    crate::economy::receipt::payment_history(&state.payment_receipts, filter)
+}
+
 // ===========================================================================
 // Receive buffer + degraded mode (actor-shape, mutating)
 // ===========================================================================
@@ -365,7 +380,7 @@ pub fn report_degraded_mode(
 pub fn event_log_entries(
     deps: &ActorDeps,
     context_id_bytes: &[u8; 32],
-) -> Result<Option<Vec<EventLogEntry>>, ContextError> {
+) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
     deps.event_log.event_log_entries(context_id_bytes)
 }
 
@@ -855,47 +870,42 @@ pub fn compare_remote_checkpoint(
         },
     };
 
-    // Emit (and persist) an EquivocationDetected event when divergent —
-    // deduped per distinct divergent checkpoint (replay defense).
+    // Record an EquivocationDetected event in the receive buffer when divergent
+    // (NOT appended to the durable Merkle log — see `record_equivocation_if_fresh`)
+    // — deduped per distinct divergent checkpoint (replay defense).
     if matches!(
         comparison,
         scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
     ) {
-        record_equivocation_if_fresh(
-            state,
-            deps,
-            context_id,
-            &context_id_bytes,
-            remote,
-            local_root,
-        );
+        record_equivocation_if_fresh(state, deps, context_id, remote, local_root);
     }
 
     Ok(comparison)
 }
 
 /// Records a divergent remote checkpoint as an `EquivocationDetected`
-/// event (receive buffer + event-log append with forensic roots), but
-/// only ONCE per distinct divergent checkpoint per remote sender.
+/// event in the in-memory receive buffer, but only ONCE per distinct
+/// divergent checkpoint per remote sender.
 ///
-/// Replay-idempotency layering:
+/// Replay idempotency — per-sender `(event_count, remote_merkle_root)` set
+/// (sole mechanism):
 ///
-/// - PRIMARY (durable): appending the `EquivocationDetected` event below
-///   advances the durable event-log length, which is exactly the
-///   `local_count` that `compare_remote_checkpoint` reads. So after a
-///   divergence is recorded at remote count `N`, `local_count` becomes
-///   `N + 1`; a re-delivered checkpoint at count `N` then routes to the
-///   Ahead/Behind arm and never re-reaches the `Equal`/dedup path. Because
-///   the event log is persisted, this protection survives respawn even
-///   though the in-memory set below resets to empty.
-/// - SECONDARY (this set, belt-and-suspenders): per remote sender DID we
-///   track the set of distinct `(event_count, remote_merkle_root)`
-///   divergences already recorded. A re-presentation whose
-///   `(count, root)` is already present is a no-op; a NEW root — even at
-///   an already-seen count — is fresh evidence (two members can equivocate
-///   with different forged roots at the same height; each is a distinct
-///   §9.9.4 security event). Keying on the root, not on a `>` timestamp
-///   monotone, is what makes that distinct-root case fire.
+/// The divergence is NOT appended to the durable Merkle event log: an
+/// equivocation record is minted locally by the receiver and is not part of
+/// the sender-authenticated leaf sequence, so logging it would let two honest
+/// receivers compute divergent roots for the same context and false-positive
+/// the very §9.9.3 detection it records. Because the append no longer advances
+/// `local_count`, the durable-length backstop that previously routed a
+/// re-delivered checkpoint to the Ahead/Behind arm is gone; the per-sender set
+/// below is therefore the SOLE dedup.
+///
+/// Per remote sender DID we track the set of distinct
+/// `(event_count, remote_merkle_root)` divergences already recorded. A
+/// re-presentation whose `(count, root)` is already present is a no-op; a NEW
+/// root — even at an already-seen count — is fresh evidence (two members can
+/// equivocate with different forged roots at the same height; each is a
+/// distinct §9.9.4 security event). Keying on the root, not on a `>` timestamp
+/// monotone, is what makes that distinct-root case fire.
 ///
 /// The per-sender set is bounded at
 /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] entries. Once full, the
@@ -906,7 +916,6 @@ fn record_equivocation_if_fresh(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     local_root: [u8; 32],
 ) {
@@ -944,29 +953,13 @@ fn record_equivocation_if_fresh(
         "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
     );
 
-    // Persist the divergent roots in the event-log payload so the
-    // conflicting histories are recoverable for forensics — the bare event
-    // name + sender DID alone would discard the evidence (§9.9.4: security
-    // events MUST NOT be silently discarded).
-    let payload = serde_json::json!({
-        "remote_sender_did": remote.sender_did.as_ref(),
-        "event_count": remote.event_count,
-        "local_merkle_root": hex::encode(local_root),
-        "remote_merkle_root": hex::encode(remote.merkle_root),
-        "remote_checkpoint_timestamp": remote.timestamp,
-    });
-    if let Err(e) = deps.event_log.append_context_event_with_payload(
-        context_id_bytes,
-        "EquivocationDetected",
-        remote.sender_did.as_ref(),
-        Some(&payload),
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append EquivocationDetected to event log: {e}"
-        );
-    }
-    state.checkpoint_events_since += 1;
+    // The divergence is surfaced through the in-memory receive buffer (and the
+    // broadcast channel) for SDK observation, carrying the full forensic roots.
+    // It is deliberately NOT appended to the durable Merkle event log: a
+    // receiver-minted EquivocationDetected leaf is not sender-authenticated, so
+    // appending it would let two honest receivers diverge their own roots and
+    // false-positive §9.9.3. The per-sender `(count, root)` set above is the
+    // sole replay-dedup.
     let event = ContextEvent::EquivocationDetected {
         context_id: context_id.to_owned(),
         remote_sender_did: remote.sender_did.clone(),
@@ -989,41 +982,41 @@ fn record_equivocation_if_fresh(
 /// Returns a Merkle inclusion proof for the event at `leaf_index` in
 /// the per-context RFC 6962 event log.
 ///
-/// Actor-shape — synchronizes the in-memory Merkle tree against the
-/// shared event-log provider before constructing the proof.
+/// Delegates to the event-log provider, which constructs the proof directly
+/// against its own canonical [`scp_event_log::EventLog`] (the single proof
+/// seam — there is no second per-context tree to keep in sync).
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] if the leaf index is out of
-/// bounds or the log is empty.
+/// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
+/// the leaf index is out of bounds, or the log is empty.
 pub fn prove_event_inclusion(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     leaf_index: u64,
 ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
-    sync_merkle_tree(context_id, state, deps.event_log.as_ref());
-    scp_event_log::proof::prove_inclusion(&state.merkle_tree, leaf_index)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    let context_id_bytes = state::context_id_to_bytes(context_id);
+    deps.event_log
+        .prove_event_inclusion(&context_id_bytes, leaf_index)
 }
 
 /// Returns a Merkle consistency proof between the tree at `old_size`
 /// and the current tree size.
 ///
+/// Delegates to the event-log provider (the single proof seam).
+///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] if `old_size` is 0, exceeds
-/// the current size, or the log is empty.
+/// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
+/// `old_size` is 0, `old_size` exceeds the current size, or the log is empty.
 pub fn prove_event_consistency(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     old_size: u64,
 ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
-    sync_merkle_tree(context_id, state, deps.event_log.as_ref());
-    let current_size = scp_event_log::tree::event_count(&state.merkle_tree);
-    scp_event_log::proof::prove_consistency(&state.merkle_tree, old_size, current_size)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    let context_id_bytes = state::context_id_to_bytes(context_id);
+    deps.event_log
+        .prove_event_consistency(&context_id_bytes, old_size)
 }
 
 /// Verifies a Merkle inclusion proof. Pure function — no state needed.
@@ -1036,35 +1029,6 @@ pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> b
 #[must_use]
 pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {
     scp_event_log::proof::verify_consistency(proof)
-}
-
-// ===========================================================================
-// Merkle tree synchronization (private helper)
-// ===========================================================================
-
-/// Synchronizes the per-context Merkle tree with the event-log provider.
-///
-/// Replays missing entries — each pre-computed hash is pushed as a raw
-/// leaf and the internal tree structure (RFC 6962 interior nodes) is
-/// rebuilt automatically by `push_leaf_raw`.
-fn sync_merkle_tree(
-    context_id: &str,
-    state: &mut PerContextState,
-    event_log: &dyn ContextEventLogProvider,
-) {
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    // event_count returns u64; on 32-bit targets the log size is bounded
-    // by available memory well below u32::MAX, so saturating is safe.
-    let tree_count =
-        usize::try_from(scp_event_log::tree::event_count(&state.merkle_tree)).unwrap_or(usize::MAX);
-
-    if let Ok(Some(entries)) = event_log.event_log_entries(&context_id_bytes)
-        && entries.len() > tree_count
-    {
-        for entry in entries.iter().skip(tree_count) {
-            state.merkle_tree.push_leaf_raw(entry.hash);
-        }
-    }
 }
 
 // ===========================================================================
@@ -1112,13 +1076,16 @@ pub async fn is_local_did(supervisor: &crate::context::supervisor::Supervisor, d
 #[cfg(test)]
 mod equivocation_dedup_tests {
     //! Focused unit coverage for the `record_equivocation_if_fresh` dedup
-    //! gate (§9.9.3 replay defense, secondary guard). The integration path
-    //! (`reconnect_sync.rs`) rarely reaches this gate because recording a
-    //! divergence appends an `EquivocationDetected` event, advancing
-    //! `local_count` so the same remote count routes to Ahead/Behind — so
-    //! the dedup gate's keyed-on-`(count, root)` behavior is asserted here
-    //! by constructing state directly and calling the helper at a stable
-    //! count, never advancing through `compare_remote_checkpoint`.
+    //! gate (§9.9.3 replay defense). The per-sender `(count, root)` set is the
+    //! SOLE dedup mechanism: a divergence is buffer-only and is NOT appended to
+    //! the durable Merkle log (a receiver-minted equivocation record is not
+    //! sender-authenticated, so logging it would let honest receivers diverge
+    //! their roots and false-positive the very detection it records). With no
+    //! durable append there is no `local_count` advance, so the gate's
+    //! keyed-on-`(count, root)` behavior is the only thing standing between a
+    //! re-presented divergence and a duplicate alert. These tests assert it by
+    //! constructing state directly and calling the helper at a stable count,
+    //! never advancing through `compare_remote_checkpoint`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::sync::Arc;
@@ -1132,8 +1099,9 @@ mod equivocation_dedup_tests {
     use crate::context::supervisor::supervisor::Supervisor;
 
     /// Event-log provider that counts `append_event` calls so the test can
-    /// assert how many `EquivocationDetected` events the dedup gate let
-    /// through. All other methods are no-ops (the gate only appends).
+    /// assert the dedup gate appends NOTHING to the durable Merkle log —
+    /// equivocation alerts are buffer-only (§9.9.3). All other methods are
+    /// no-ops.
     #[derive(Default)]
     struct CountingEventLog {
         appends: Arc<AtomicUsize>,
@@ -1150,9 +1118,10 @@ mod equivocation_dedup_tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             self.appends.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1235,24 +1204,24 @@ mod equivocation_dedup_tests {
     }
 
     /// (a) The same `(count, root)` recorded twice yields exactly ONE
-    /// event-log append and ONE buffered alert — the exact-divergence
-    /// replay is suppressed by the secondary dedup gate.
+    /// buffered alert — the exact-divergence replay is suppressed by the
+    /// per-sender `(count, root)` dedup set (now the SOLE dedup, since the
+    /// equivocation event is no longer appended to the durable Merkle log).
     #[tokio::test]
     async fn same_count_same_root_dedups_to_one() {
         let appends = Arc::new(AtomicUsize::new(0));
         let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
-        let ctx_bytes = [9u8; 32];
         let remote = checkpoint("did:example:bob", 5, [0xAB; 32]);
         let local_root = [0xCD; 32];
 
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &remote, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &remote, local_root);
         // Identical re-presentation: same sender, same count, same root.
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &remote, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &remote, local_root);
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            1,
-            "exact-divergence replay must append EquivocationDetected exactly once"
+            0,
+            "equivocation is buffer-only — it must NOT append a Merkle leaf (§9.9.3)"
         );
         assert_eq!(
             state.receive_buffer.drain_equivocation_alerts().len(),
@@ -1270,18 +1239,17 @@ mod equivocation_dedup_tests {
     async fn same_count_different_root_records_both() {
         let appends = Arc::new(AtomicUsize::new(0));
         let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
-        let ctx_bytes = [9u8; 32];
         let local_root = [0xCD; 32];
 
         let first = checkpoint("did:example:bob", 5, [0x11; 32]);
         let second = checkpoint("did:example:bob", 5, [0x22; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &first, local_root);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &second, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &first, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &second, local_root);
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            2,
-            "distinct forged roots at the same height are distinct §9.9.4 events — both record"
+            0,
+            "equivocation alerts are buffer-only — never appended to the Merkle log (§9.9.3)"
         );
         assert_eq!(
             state.receive_buffer.drain_equivocation_alerts().len(),
@@ -1291,16 +1259,13 @@ mod equivocation_dedup_tests {
     }
 
     /// (c) The per-sender set is bounded at `MAX_SEQUENTIAL_COMMITS`: once
-    /// the set is full the gate STILL EMITS the alert (a security event is
-    /// never silently discarded) but stops growing the set — so a later
-    /// EXACT replay of an evicted-from-set `(count, root)` is no longer
-    /// suppressed by the set (it appends again), proving the cap holds and
-    /// emission is never starved.
+    /// the set is full the gate STILL EMITS the buffered alert (a security
+    /// event is never silently discarded) but stops growing the set, proving
+    /// the cap holds and emission is never starved.
     #[tokio::test]
     async fn per_sender_set_is_bounded_and_still_emits() {
         let appends = Arc::new(AtomicUsize::new(0));
         let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
-        let ctx_bytes = [9u8; 32];
         let local_root = [0xCD; 32];
         let cap = scp_protocol::sync::MAX_SEQUENTIAL_COMMITS;
 
@@ -1309,13 +1274,13 @@ mod equivocation_dedup_tests {
         // later replay; because the set is full by then, that first
         // `(count, root)` is NOT retained, so the replay re-appends.
         let first = checkpoint("did:example:mallory", 0, [0x00; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &first, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &first, local_root);
         for i in 1..cap {
             let mut root = [0u8; 32];
             root[0] = (i & 0xFF) as u8;
             root[1] = ((i >> 8) & 0xFF) as u8;
             let cp = checkpoint("did:example:mallory", i, root);
-            record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &cp, local_root);
+            record_equivocation_if_fresh(&mut state, &deps, "ctx", &cp, local_root);
         }
 
         let seen_len = state
@@ -1327,15 +1292,24 @@ mod equivocation_dedup_tests {
             "the per-sender set must be capped at MAX_SEQUENTIAL_COMMITS"
         );
 
-        // One more distinct divergence past the cap: alert still EMITTED
-        // (append count keeps climbing) but the set does NOT grow.
-        let appends_before = appends.load(Ordering::SeqCst);
+        // Drain the alerts buffered while filling the set, so the post-cap
+        // emission is measured in isolation.
+        let _ = state.receive_buffer.drain_equivocation_alerts();
+
+        // One more distinct divergence past the cap: alert still EMITTED but
+        // the set does NOT grow. Equivocation is buffer-only, so observe the
+        // buffered alert rather than a Merkle append.
         let over = checkpoint("did:example:mallory", cap + 1, [0xFF; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &over, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &over, local_root);
+        assert_eq!(
+            state.receive_buffer.drain_equivocation_alerts().len(),
+            1,
+            "a divergence past the cap must STILL emit (never silently dropped, §9.9.4)"
+        );
         assert_eq!(
             appends.load(Ordering::SeqCst),
-            appends_before + 1,
-            "a divergence past the cap must STILL emit (never silently dropped, §9.9.4)"
+            0,
+            "equivocation is buffer-only — no Merkle append at any point (§9.9.3)"
         );
         let seen_len_after = state
             .last_seen_remote_checkpoint

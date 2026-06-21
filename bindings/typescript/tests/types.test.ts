@@ -286,6 +286,7 @@ describe("type definitions", () => {
       governanceActionsAgainst: 2,
       governanceActionsBy: 5,
       toolInvocationCount: 10,
+      toolInvocationCountAnchored: false,
       contextCreationCount: 3,
       roleProgressionCount: 1,
       attestationCount: 7,
@@ -299,6 +300,7 @@ describe("type definitions", () => {
     expect(profile.governanceActionsAgainst).toBe(2);
     expect(profile.governanceActionsBy).toBe(5);
     expect(profile.toolInvocationCount).toBe(10);
+    expect(profile.toolInvocationCountAnchored).toBe(false);
     expect(profile.contextCreationCount).toBe(3);
     expect(profile.roleProgressionCount).toBe(1);
     expect(profile.attestationCount).toBe(7);

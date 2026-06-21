@@ -171,7 +171,9 @@ Invalid transitions (must return error):
    - Assigns SCP sequence number (per-sender monotonic, spec section 9.8.5).
    - Encrypts with sender key (ADR-007), wraps in inner envelope (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
    - Sends via transport.
-   - Appends `MessageSent` event to event log.
+   - Emits a `MessageSent` `ContextEvent`. Per-author application activity is a
+     local signal, not a canonical Merkle leaf, until ADR-051's causal-DAG
+     ordering — see the ADR-011 amendment, exclusion taxonomy §2.
 
 9. **`TTL timer management`**
    - On context creation with TTL: spawn a tokio timer task.
@@ -737,6 +739,29 @@ pub struct Event {
    on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
    is unaffected.)
 
+   **Timestamp assignment (committer-assigned, copied by every member).** The
+   `timestamp` field is convergent by *assignment*, parallel to `sequence`: for a
+   commit-ordered event the committing member sets it to the `created_at` of the signed
+   SCP envelope carrying the commit (§9.8.2), and every member copies that one value
+   into its own leaf. Because all members hold the identical committed value, the leaf
+   is agreed by all of them — it is byte-identical across honest members (so the §9.9.3
+   equal-count/equal-root test stays sound), tamper-evident (covered by the committer's
+   envelope signature and the leaf hash), and bounded to real time within the ±5-minute
+   future skew tolerance of §9.8.2. The one thing members do *not* agree on is their
+   private physical clocks, which is precisely why a per-member local `now()` reading is
+   wrong here: there is no single such reading to agree on. This is the same convergence
+   principle stated for derived records in the amendment below (a field is convergent iff
+   its source is convergent): the source here is one signed envelope timestamp, not N
+   local clocks. For the timer-triggered events that carry no
+   commit envelope (TTL expiry/close, governance-freeze expiry, deferred
+   economic-policy application), the convergent `timestamp` is the pre-computed
+   deadline already held in convergent context state (the TTL deadline, the
+   freeze-expiry instant, the policy-application time), never local `now()` — for the
+   same reason velocity/rate-triggered consequences are excluded (a wall clock the
+   protocol neither has nor needs). The leaf timestamp's convergence does not make it
+   authoritative over log *order* (§9.8.3): the Merkle order is the orderer; the
+   timestamp is a convergent, bounded annotation carried on that order.
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventType {
@@ -748,10 +773,10 @@ pub enum EventType {
     MemberLeft,
     RoleAssigned,
     TokenRevoked,
-    MessageSent,
+    MessageSent,                  // per-author application activity; convergent canonical leaf in the ADR-051 end state, local ContextEvent until then
     ToolRegistered,
     ToolUpdated,
-    ToolInvoked,
+    ToolInvoked,                  // per-author application activity; see MessageSent (ADR-051 causal-DAG ordering)
     ToolVerified,
     ToolInterfaceEstablished,
     GovernanceAction,
@@ -780,7 +805,7 @@ pub enum EventType {
     ProvenanceReceived,
     // Governance-action-coverage event types (native↔WASM unification; see the
     // Amendment below). Each traces to a GovernanceAction (ADR-031 §2) or a
-    // §19 / §5.11A / §9.9 / §9.10 protocol action.
+    // §19 / §5.11A / §9.9 protocol action.
     AdminTransferred,             // TransferAdmin
     CeilingModified,              // ModifyCeiling applied
     CeilingModificationPending,   // ModifyCeiling delay-window start
@@ -804,7 +829,7 @@ pub enum EventType {
     PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
     CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
     CommitBroadcastPending,       // deferred-commit queue record
-    PseudonymAnnounced,           // §9.10.4 per-context pseudonym announcement
+    // (PseudonymAnnounced is NOT a durable EventType — see the exclusion list below.)
     // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters live
     // in EventPayload, never in the type name.
     ContextTombstoned,            // §5.11A.5 terminal migration; payload: destination_id, migration_proposal_id (actor_did = "system")
@@ -856,8 +881,9 @@ pub enum EventType {
    binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
    provenance (§7.3) — not governance actions alone. Each new
    variant carries its parameters in `EventPayload`; no parameter is ever baked
-   into the type name. Two `EventType`-shaped emissions are deliberately kept out
-   of the Merkle log (see the exclusion list below).
+   into the type name. The canonical Merkle log carries only **convergent**
+   events; per-member-observed emissions are kept out of it (see the convergence
+   model and exclusion taxonomy below).
 
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
@@ -868,23 +894,94 @@ pub enum EventType {
    > `merkle_root` (§23.16.1) and the signed-export `event_log_merkle_root`
    > binding (§23.16.8) are the RFC 6962 `tree::root`, NOT the hash-chain head.
    >
-   > **Events excluded from the Merkle log (target end state).** After this
-   > unification, the canonical Merkle log MUST NOT contain `MessageReceived`
-   > (per-recipient local observation; the canonical record is the sender's
-   > `MessageSent`) or `EquivocationDetected` (a local divergence alert, surfaced
-   > as `EquivocationAlert` §23.16.6 / `ContextEvent`). Logging per-recipient or
-   > detection events would make member root-sets non-convergent and defeat
-   > §9.9.3 equivocation detection. This is not yet a pre-existing property:
-   > the `scp-runtime` provider CURRENTLY appends both — `MessageReceived` on the
-   > message-receive path, and `EquivocationDetected` as a local
-   > divergence-alert append. The unification therefore REMOVES those two append
-   > sites, in the same spirit as the name-string defect corrections below; once
-   > removed, these are the **only** two exclusions and every other distinct
-   > event the `scp-runtime` provider appends maps to a typed variant above.
-   > Local-only `ContextEvent` notifications that never reach the
-   > Merkle log (e.g. `DegradedMode`, `BufferOverflow`, `SequenceGapDetected`,
-   > `WelcomeGenerated`, `CheckpointCosignatureRequired`) are receive-buffer
-   > signals, not log entries, and so are out of `EventType`'s scope entirely.
+   > **Convergence requirement (the §9.9.3 basis).** The canonical Merkle log is
+   > the substrate for relay-equivocation detection (§9.9.3): two honest members
+   > at the same log position MUST derive the same `tree::root` (equal event count
+   > for the totally-ordered commit prefix; equal causally-stable cut / frontier for
+   > DAG-ordered application leaves, per ADR-051 §5). The log therefore
+   > MUST contain **only convergent events** — those every honest member appends
+   > identically and in the same order, i.e. the MLS-commit-ordered stream
+   > (governance, membership, lifecycle, role, access, attestation, provenance,
+   > economic *governance actions* — policy changes, spending-UCAN grants/revocations,
+   > compromise recovery, app-binding). Per-member-observed
+   > emissions do not converge and are excluded. The governing rule for the whole
+   > trust subsystem: **a derived record is automatic *and* convergent iff its
+   > trigger input is convergent.**
+   >
+   > **Exclusion taxonomy.** Two categories are kept out of the Merkle log:
+   >
+   > 1. **Local signals (permanent — never an `EventType`).** `MessageReceived`
+   >    (a per-recipient observation), `EquivocationDetected` (a local divergence
+   >    alert, surfaced as `EquivocationAlert` §23.16.6 / `ContextEvent`), and
+   >    `PseudonymAnnounced` (a §9.10.4 routing-bootstrap signal). Each carries its
+   >    entire function through an in-process `ContextEvent` buffer notification
+   >    plus in-memory state (e.g. the pseudonym-registry `member_did → routing_id`
+   >    insert that enables pseudonym-only app-data fan-out) — never a durable leaf.
+   >    A durable append would be minted **per receiver, in per-receiver arrival
+   >    order** (late joiners never observe earlier ones; the WASM context manager
+   >    appends nothing on receive), so no two honest members would converge on the
+   >    same `tree::root` — the exact §9.9.3 non-convergence these exclusions guard
+   >    against. None has any durable consumer (no checkpoint, export, or proof
+   >    reads them). The `scp-runtime` provider previously appended all three; the
+   >    unification removes those append sites.
+   >
+   > 2. **Per-author application activity (interim — canonical in the ADR-051 end
+   >    state).** `MessageSent`, `ToolInvoked`, and the payment receipts
+   >    `PaymentReceived` / `PaymentCaptureFailed` (appended by the payee on
+   >    `adapter.capture()`) are appended only by their author/payee, keyed by a
+   >    *per-author* sequence, with no global order: each member's log holds only
+   >    its own author's events, so honest members diverge at equal count. They are
+   >    therefore excluded from the canonical log now and surfaced as local
+   >    `ContextEvent`s. **ADR-051 (causal-DAG application-event ordering)** gives
+   >    them a convergent canonical order — each event references the
+   >    DAG heads its author had observed (validated: must-resolve + must-include-
+   >    frontier), and every member linearizes the same DAG identically — at which
+   >    point they re-enter the canonical log as convergent leaves. Until ADR-051
+   >    lands they are local. (The §25 KAT vectors already carry no `MessageSent` /
+   >    `ToolInvoked` / `PaymentReceived` leaf, consistent with this.)
+   >
+   >    *Scope:* this covers the **intra-context, per-author** `ToolInvoked`
+   >    emission. The **cross-context tool-call saga** (§6) records its `ToolInvoked`
+   >    / `CrossContextToolInvoked` within the saga's MLS-Commit phase — commit-
+   >    ordered and *convergent*, canonical by design (its `tool_invoked_event_id`
+   >    is a signed `CrossContextToolReceipt` field) — and is **not** in this
+   >    per-author exclusion.
+   >
+   > **Consequence emission (auto-derived, never consensus).** The `Consequence*`
+   > variants remain in the taxonomy, but a consequence leaf is emitted by
+   > **deterministic auto-derivation from the convergent log**: every honest
+   > member, processing the same convergent event, evaluates the same rules over
+   > the same convergent state and appends the identical consequence leaf at the
+   > identical position — no per-receiver evaluation, no local receive-buffer or
+   > estimated-timestamp input, no proposer or vote. This preserves §7.3.7's
+   > "automatic, not governance-discretion" property *and* §9.9.3 convergence. By
+   > the convergence rule above, convergent-triggered rules (governance
+   > warning-counts, role / lifecycle) are durable and convergent now;
+   > **velocity / rate-triggered rules are NOT convergent records.** A *rate*
+   > (count ÷ time) would need a convergent clock, which the protocol neither has
+   > (no operator / transport-independent / offline ⇒ no trustless wall clock) nor
+   > needs. Rate-limiting is **local flow control** — each member throttles its own
+   > intake on its own clock (the live spam defense, §23.16.8) — not a recorded
+   > consequence. A durable **suspension** is a **governance consequence** (ADR-031)
+   > whose commit *is* both its execution and its record: there is no split between
+   > executing a consequence and recording it (that split was a phantom — flow
+   > control isn't a record, and a suspension's execution and record are one commit).
+   > A member observing sustained local throttling auto-proposes the suspension; it
+   > commits per the context's *declared* governance model (mechanical, not an ad-hoc
+   > vote — §7.3.7's "automatic, not governance-discretion" preserved). See ADR-051 §6.
+   >
+   > **Other derived per-author facts.** `tool_invocation_count` (§7.3.2) is a
+   > convergent *count* over the causal DAG (ADR-051) — no clock; interim-local
+   > (`anchored=false`) until that DAG lands. Economic `SenderVelocity` /
+   > `ContextMessageRate` pricing (§19.7) is enforced at `authorize()` by the payer's
+   > own SDK against a local spending ledger — local and self-metered, no convergent
+   > clock. Neither needs (nor gets) a convergent velocity clock.
+   >
+   > **Local-only `ContextEvent` notifications** that never reach the Merkle log
+   > (e.g. `MessageReceived`, `EquivocationDetected`, `PseudonymAnnounced`,
+   > `DegradedMode`, `BufferOverflow`, `SequenceGapDetected`, `WelcomeGenerated`,
+   > `CheckpointCosignatureRequired`) are receive-buffer signals, not log entries,
+   > and so are out of `EventType`'s scope entirely.
    >
    > **Name-string defects corrected by this amendment.** Several runtime call
    > sites passed parameters baked into the event *name* — either as `format!`

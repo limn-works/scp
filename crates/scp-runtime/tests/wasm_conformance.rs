@@ -1472,7 +1472,7 @@ fn provenance_hash_conformance_registry_with_payment() {
 }
 
 // ===========================================================================
-// Canonical event-type tag contract (closed 76-variant bijection)
+// Canonical event-type tag contract (closed 77-variant injection)
 //
 // `event_type_tag` (`scp_event_log::tree`) is a protocol constant used in two
 // places: (a) the NATIVE signed-event canonical hash —
@@ -1506,7 +1506,7 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     // is enumerated here independently of `scp_event_log`'s internal test-only
     // array so that adding a variant to the public enum without updating this
     // conformance list is itself a compile/assertion failure.
-    let all_variants: [EventType; 76] = [
+    let all_variants: [EventType; 77] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1566,7 +1566,6 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
         EventType::PruningPolicyModified,
         EventType::CommitBroadcasted,
         EventType::CommitBroadcastPending,
-        EventType::PseudonymAnnounced,
         EventType::ContextTombstoned,
         EventType::ContextMigrationCancelled,
         EventType::TtlExtended,
@@ -1583,44 +1582,51 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
         EventType::RecoveryEpochAdvanced,
         EventType::AppBound,
         EventType::AppUnbound,
+        EventType::CrossContextToolInvoked,
+        EventType::CrossContextDivergenceMarker,
     ];
 
-    // Exhaustiveness guard: the closed taxonomy is exactly 76 variants
-    // (canonical tags 0..=75). If a variant is added to the public `EventType`
-    // enum, this conformance list must grow to match — a stale list of 76 here
-    // would fail to exercise the new variant, so keeping this pinned forces the
-    // list to be maintained alongside the enum.
+    // Exhaustiveness guard: the closed taxonomy is exactly 77 variants
+    // (canonical tags 0..=77 with tag 59 retired — PseudonymAnnounced removed as
+    // a routing-bootstrap ContextEvent signal, not a durable event; tags 76..=77
+    // are the ADR-011 Amendment §6 cross-context-saga carve-out). If a variant
+    // is added to the public `EventType` enum, this conformance list must grow to
+    // match — a stale list of 77 here would fail to exercise the new variant, so
+    // keeping this pinned forces the list to be maintained alongside the enum.
     assert_eq!(
         all_variants.len(),
-        76,
-        "this conformance list must enumerate the full closed 76-variant \
+        77,
+        "this conformance list must enumerate the full closed 77-variant \
          EventType taxonomy — update it (and `scp-event-log/src/tree.rs` \
          `event_type_tag`) when an EventType variant is added"
     );
 
-    // Distinct-tag bijection: every canonical variant maps to a unique tag in
-    // 0..=75. A collision (two variants → one tag) or a gap would corrupt the
-    // native `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`)
-    // and the retention classification keyed on the tag in `pruning.rs` /
-    // `tiered_storage.rs`.
+    // Distinct-tag injection: every canonical variant maps to a unique tag in
+    // 0..=77. A collision (two variants → one tag) would corrupt the native
+    // `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`) and the
+    // retention classification keyed on the tag in `pruning.rs` /
+    // `tiered_storage.rs`. The mapping is injective but NOT onto: tag 59 is
+    // retired (PseudonymAnnounced removed), so the 77 live variants occupy
+    // 0..=77 minus {59}.
     let mut tags: Vec<u16> = all_variants.iter().map(event_type_tag).collect();
     assert_eq!(
         tags.len(),
-        76,
+        77,
         "expected one tag per canonical EventType variant"
     );
     tags.sort_unstable();
     tags.dedup();
     assert_eq!(
         tags.len(),
-        76,
-        "event_type_tag must be a bijection: all 76 EventType variants must map \
+        77,
+        "event_type_tag must be injective: all 77 EventType variants must map \
          to distinct tags — fix `scp-event-log/src/tree.rs` `event_type_tag`"
     );
 
-    // The bijection must cover the contiguous range 0..=75 with no holes, which
-    // (together with distinctness above) pins the exact canonical tag assignment
-    // the native signature preimage and retention classification depend on.
+    // The live tags span 0..=77 with exactly one hole at the retired tag 59
+    // (PseudonymAnnounced). Pinning the endpoints plus the single retired gap
+    // fixes the exact canonical tag assignment the native signature preimage and
+    // retention classification depend on.
     assert_eq!(
         tags.first().copied(),
         Some(0),
@@ -1628,9 +1634,23 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     );
     assert_eq!(
         tags.last().copied(),
-        Some(75),
-        "canonical event_type_tag range must end at 75 (76 contiguous tags)"
+        Some(77),
+        "canonical event_type_tag range must end at 77"
     );
+    assert!(
+        !tags.contains(&59),
+        "tag 59 is retired (PseudonymAnnounced removed) and must not be reused"
+    );
+    // Every tag in 0..=77 except the retired 59 must be present (no other holes).
+    for tag in 0u16..=77 {
+        if tag == 59 {
+            continue;
+        }
+        assert!(
+            tags.contains(&tag),
+            "canonical event_type_tag must cover {tag} (the only permitted hole is the retired tag 59)"
+        );
+    }
 }
 
 /// Confirms that `chain_depth: u8` (scp-core) and `chain_depth: u32` (WASM)
@@ -2035,6 +2055,569 @@ fn golden_event_leaf_hash() {
         root_hex, "b891621d6d19bc37e93a9acb4709fa5fe2bc7020836493b0a6b2b0415e99decb",
         "single-leaf Merkle root must match recorded golden vector; \
          a mismatch means Event serialization or leaf hashing has changed"
+    );
+}
+
+// ===========================================================================
+// Cross-impl event-log convergence (§9.9.3) — WASM ⇄ native parity
+//
+// Both the WASM bridge (`crates/scp-ffi/wasm/src/manager.rs`) and the native
+// scp-runtime provider build durable leaves through the SAME `scp_event_log`
+// crate (`tree::append_unsigned_event`, leaf = `SHA-256(0x00 || rmp_serde(
+// Event))`, root = RFC-6962 `tree::root`). The native-side soundness proof
+// lives in `crates/scp-runtime/tests/eventlog_convergence.rs`; this is its
+// cross-implementation analogue.
+//
+// The §9.9.3 invariant: two honest members at the same canonical log position
+// MUST derive byte-identical `tree::root`. The canonical log therefore carries
+// only CONVERGENT (MLS-commit-ordered) events. Per-author application activity
+// (`MessageSent`, `ToolInvoked`) is excluded (ADR-011 amendment exclusion
+// taxonomy, `.docs/adrs/phase-2.md` §2): it is surfaced as a local
+// `ContextEvent` with NO durable leaf. This test pins that a WASM-shaped member
+// and a native-shaped member who process the SAME convergent stream but perform
+// DIFFERENT amounts of per-author activity still converge to the SAME root —
+// because neither appends a per-author leaf — while a convergent event DOES
+// move the root (non-vacuity).
+// ===========================================================================
+
+/// Appends the convergent, commit-ordered stream every honest member appends
+/// identically and in the same order. Mirrors `append_convergent_stream` in
+/// the native `eventlog_convergence.rs`.
+fn append_convergent_stream_shared(log: &mut scp_event_log::EventLog, local_clock_offset: u64) {
+    use scp_event_log::tree::append_unsigned_event;
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    // `local_clock_offset` is IGNORED for the leaf timestamp: every member
+    // records the committer-assigned timestamp (here the deterministic
+    // `1_700_000_000 + sequence`, standing in for the signed commit envelope's
+    // `created_at`), so two members with different physical-clock skews still
+    // produce byte-identical leaves (§7.3.1, §9.9.3). The negative control feeds
+    // the offset into the leaf instead to prove per-member-local stamping
+    // diverges.
+    let _ = local_clock_offset;
+    let entries = [
+        (EventType::ContextCreated, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zBob"),
+    ];
+    for (event_type, actor) in entries {
+        let sequence = scp_event_log::tree::event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_000 + sequence,
+                sequence,
+                payload: EventPayload { data: Vec::new() },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("convergent append must succeed");
+    }
+}
+
+/// Like [`append_convergent_stream_shared`] but (incorrectly) stamps each leaf
+/// with a per-member LOCAL timestamp = committer value + the member's clock
+/// offset. Used only by the negative control to prove that per-member-local
+/// stamping — the pre-fix behavior — diverges at equal event count.
+fn append_stream_with_local_timestamps_shared(
+    log: &mut scp_event_log::EventLog,
+    local_clock_offset: u64,
+) {
+    use scp_event_log::tree::append_unsigned_event;
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    let entries = [
+        (EventType::ContextCreated, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zBob"),
+    ];
+    for (event_type, actor) in entries {
+        let sequence = scp_event_log::tree::event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_000 + sequence + local_clock_offset,
+                sequence,
+                payload: EventPayload { data: Vec::new() },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("convergent append must succeed");
+    }
+}
+
+#[test]
+fn wasm_and_native_members_converge_despite_divergent_per_author_activity() {
+    use scp_event_log::tree::root;
+
+    // Member A — the WASM-shaped member. Performs 3 local sends + 1 local
+    // tool-invoke: under the exclusion taxonomy these surface as local
+    // `ContextEvent`s only, so NOTHING is appended to A's durable log here.
+    // Member A's physical clock is +0s; member B's is skewed +250s. Under the
+    // committer-assigned rule the skew is IGNORED for the leaf, so it must not
+    // perturb either root.
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_a, 0);
+    // (3 sends + 1 tool-invoke happen as local ContextEvents — no durable leaf.)
+
+    // Member B — the native-shaped member. Performs 5 local sends + 2 local
+    // tool-invokes — also durable-leaf-free.
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_b, 250);
+    // (5 sends + 2 tool-invokes happen as local ContextEvents — no durable leaf.)
+
+    let root_a = root(&log_a);
+    let root_b = root(&log_b);
+
+    assert_eq!(
+        root_a, root_b,
+        "a WASM member and a native member with the same convergent stream MUST \
+         derive an identical Merkle root regardless of divergent per-author \
+         send / tool-invoke activity AND per-member physical-clock skew, because \
+         every leaf carries the committer-assigned timestamp (§9.9.3 cross-impl \
+         convergence)"
+    );
+    assert_ne!(
+        root_a, [0u8; 32],
+        "the convergent stream is non-empty, so the shared root must be non-zero"
+    );
+}
+
+#[test]
+fn wasm_and_native_members_diverge_under_per_member_local_timestamps() {
+    use scp_event_log::tree::root;
+
+    // Negative control / non-vacuity: if a WASM member and a native member
+    // stamped leaves with their OWN local clocks (committer value + per-member
+    // skew) instead of the committer-assigned timestamp — the pre-fix behavior —
+    // they would compute DIFFERENT roots at the SAME event count, the §9.9.3
+    // false positive the fix removes. Same event types, order, and count; only
+    // the timestamp source differs.
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_stream_with_local_timestamps_shared(&mut log_a, 0);
+
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_stream_with_local_timestamps_shared(&mut log_b, 250);
+
+    assert_ne!(
+        root(&log_a),
+        root(&log_b),
+        "per-member-local leaf timestamps MUST diverge at equal event count — \
+         the §9.9.3 false positive that committer-assigned timestamps eliminate \
+         across the WASM⇄native boundary"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REAL producer-path cross-impl leaf-byte parity (§9.9.3)
+//
+// The convergence proof above pins root-equality over the SHARED substrate.
+// These tests go further: they drive the REAL leaf-payload producers and pin
+// the canonical payload bytes as known-answer fixtures, so the WASM bridge's
+// tests (in `crates/scp-ffi/wasm/`) can assert the SAME fixtures from its own
+// real producer path. (The scp-runtime test crate cannot dev-depend on
+// `scp-ffi-wasm` — it is a wasm cdylib — so the cross-impl assertion is split:
+// native here, WASM there, against the same pinned bytes.)
+//
+// The leaf preimage is `SHA-256(0x00 || rmp_serde(Event))` where `Event.payload`
+// is `EventPayload { data: <these bytes> }`. If the two impls built different
+// payload bytes for the same logical event, the leaf hashes — and therefore the
+// Merkle root — would diverge and §9.9.3 would false-positive.
+// ---------------------------------------------------------------------------
+
+/// Canonical `GovernanceActionExecuted` leaf payload for a `RemoveMember`
+/// action targeting `did:dht:z6MkBobConverge`. Positional `MessagePack`
+/// 2-element fixarray `[target_did, action_type]` via
+/// `scp_event_log::payload::encode_payload`.
+///
+/// Both impls build this from the SAME shared `GovernanceActionExecutedPayload`
+/// via `encode_payload`. The fixture pins the bytes so a regression in either
+/// impl's field values (`target_did` / `action_type`) or encoder choice is caught.
+const FIXTURE_GOV_REMOVE_BOB_TARGET: &str = "did:dht:z6MkBobConverge";
+
+fn gov_action_executed_payload_bytes(target_did: &str, action_type: &str) -> Vec<u8> {
+    scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::GovernanceActionExecutedPayload {
+            target_did: target_did.to_owned(),
+            action_type: action_type.to_owned(),
+        },
+    )
+    .expect("governance payload must encode")
+    .data
+}
+
+#[test]
+fn cross_impl_governance_action_executed_leaf_bytes() {
+    use scp_event_log::EventPayload;
+    use scp_protocol::context::governance::GovernanceAction;
+    use scp_runtime::context::builder::ContextEventLogProvider;
+    use scp_runtime::context::providers::MerkleEventLogProvider;
+
+    // Drive native's REAL value extraction: the exact `GovernanceAction`
+    // accessors `finalize_governance_action` calls to populate the payload.
+    let action = GovernanceAction::RemoveMember {
+        did: scp_identity::DID::from(FIXTURE_GOV_REMOVE_BOB_TARGET.to_owned()),
+        reason: None,
+    };
+    let target_did = action
+        .target_did()
+        .map(|d| d.as_ref().to_owned())
+        .unwrap_or_default();
+    let action_type = action.variant_name().to_owned();
+    assert_eq!(target_did, FIXTURE_GOV_REMOVE_BOB_TARGET);
+    assert_eq!(action_type, "RemoveMember");
+
+    // The canonical payload bytes (known-answer fixture). The WASM bridge test
+    // `cross_impl_governance_action_executed_leaf_bytes_wasm` asserts the SAME
+    // bytes from its real producer path.
+    let native_payload = gov_action_executed_payload_bytes(&target_did, &action_type);
+
+    // Pin: positional MessagePack 2-element fixarray (0x92), then the two
+    // strings. This is the exact preimage payload native + WASM both emit.
+    assert_eq!(
+        native_payload[0] & 0xf0,
+        0x90,
+        "must be a MessagePack fixarray"
+    );
+    assert_eq!(native_payload[0] & 0x0f, 2, "fixarray of 2 fields");
+
+    // Drive native's REAL durable append + read the payload back out, proving
+    // the byte string is what actually lands in the canonical Merkle log.
+    let ctx: [u8; 32] = [0x6c; 32];
+    let log = MerkleEventLogProvider::new();
+    log.init_event_log(&ctx).unwrap();
+    log.append_context_event_with_payload(
+        &ctx,
+        EventType::GovernanceActionExecuted,
+        FIXTURE_GOV_REMOVE_BOB_TARGET,
+        EventPayload {
+            data: native_payload.clone(),
+        },
+        1_700_000_000,
+    )
+    .unwrap();
+    let entries = log.event_log_entries(&ctx).unwrap().unwrap();
+    let logged = entries
+        .iter()
+        .find(|e| e.event_type == EventType::GovernanceActionExecuted)
+        .expect("GovernanceActionExecuted leaf must be present");
+    assert_eq!(
+        logged.payload.data, native_payload,
+        "the payload that lands in native's real Merkle log must equal the \
+         shared producer's bytes"
+    );
+
+    // Decode round-trip from the leaf that actually landed in the log: the
+    // fields recover exactly (no silent corruption).
+    let decoded: scp_event_log::payload::GovernanceActionExecutedPayload =
+        scp_event_log::payload::decode_payload(&logged.payload).unwrap();
+    assert_eq!(decoded.target_did, FIXTURE_GOV_REMOVE_BOB_TARGET);
+    assert_eq!(decoded.action_type, "RemoveMember");
+}
+
+/// `GovernanceProposalCreated`, `GovernanceVoteCast`, and
+/// `GovernanceVoteWithdrawn` carry an EMPTY canonical leaf payload (§9.9.3).
+///
+/// Native appends all three via `append_context_event`, which calls
+/// `append_event` with `EventPayload::default()` (`data: []`). The `proposal_id`
+/// these events concern lives only in the buffer-only `ContextEvent`, NOT in the
+/// durable Merkle leaf. The WASM bridge test
+/// `cross_impl_governance_proposal_vote_leaf_is_empty_wasm` asserts the SAME
+/// empty leaf from its real `append_log_event` path; a WASM regression that
+/// stamps `proposal_id.as_bytes()` into the leaf would diverge the cross-platform
+/// `tree::root` and false-positive §9.9.3 equivocation. This test drives native's
+/// REAL durable append for each type and proves the landed leaf is empty.
+#[test]
+fn cross_impl_governance_proposal_vote_leaf_is_empty() {
+    use scp_runtime::context::builder::ContextEventLogProvider;
+    use scp_runtime::context::providers::MerkleEventLogProvider;
+
+    let ctx: [u8; 32] = [0x67; 32];
+    let log = MerkleEventLogProvider::new();
+    log.init_event_log(&ctx).unwrap();
+
+    // Drive native's REAL empty-payload append helper (`append_context_event`)
+    // for each governance proposal/vote EventType — the exact call shape
+    // `governance_helpers` uses for these three events.
+    for event_type in [
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+    ] {
+        log.append_context_event(&ctx, event_type, "did:dht:z6MkProposer", 1_700_000_000)
+            .unwrap();
+    }
+
+    let entries = log.event_log_entries(&ctx).unwrap().unwrap();
+    for event_type in [
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+    ] {
+        let logged = entries
+            .iter()
+            .find(|e| e.event_type == event_type)
+            .unwrap_or_else(|| panic!("{event_type:?} leaf must be present"));
+        assert!(
+            logged.payload.data.is_empty(),
+            "{event_type:?} canonical leaf payload MUST be empty (§9.9.3) — the \
+             proposal_id is buffer-only, never part of the durable Merkle leaf"
+        );
+    }
+}
+
+/// Canonical `TokenRevoked` leaf payload — JSON `{token_cid, revoker_did,
+/// context_id}`. Produced by the SHARED
+/// `scp_protocol::crypto::ucan::revoke::token_revoked_payload` that BOTH the
+/// FFI-common bridge path (`scp-ffi-common`'s `BridgeRevocationEventLogger`)
+/// and the WASM bridge's `ucan_revoke` now call.
+#[test]
+fn cross_impl_token_revoked_leaf_bytes() {
+    let context_id = "ctx-revoke-x";
+    let token_cid = "bafyTokenCidExample";
+    let revoker_did = "did:dht:z6MkRevoker";
+
+    let payload = scp_protocol::crypto::ucan::revoke::token_revoked_payload(
+        context_id,
+        token_cid,
+        revoker_did,
+    );
+
+    // Known-answer: JSON object. `serde_json::json!` builds a BTreeMap (no
+    // `preserve_order` feature is enabled in the workspace), so keys are
+    // emitted in SORTED order — `context_id`, `revoker_did`, `token_cid` — NOT
+    // construction order. This is deterministic and identical across native and
+    // WASM (same serde_json, same default features). The WASM bridge test
+    // asserts the SAME bytes from `scp_protocol::...::token_revoked_payload`.
+    let expected_json =
+        br#"{"context_id":"ctx-revoke-x","revoker_did":"did:dht:z6MkRevoker","token_cid":"bafyTokenCidExample"}"#;
+    assert_eq!(
+        payload, expected_json,
+        "TokenRevoked payload must be the canonical JSON byte string both bridges emit"
+    );
+}
+
+/// Canonical convergent `ConsequenceTriggered` leaf payload — JSON `{target_did,
+/// rule_index, trigger_kind, action_type}`. Produced by the SHARED
+/// `scp_event_log::payload::consequence_event_payload` that BOTH native's
+/// `emit_consequence_triggered` and the WASM consequence dispatcher call. The
+/// `trigger_kind` / `action_type` labels come from the SHARED
+/// `scp_protocol::trust::consequence::{trigger_kind_str, consequence_action_type}`.
+#[test]
+fn cross_impl_consequence_triggered_leaf_bytes() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceTrigger, EnforcementSeverity, consequence_action_type,
+        is_convergent_trigger, trigger_kind_str,
+    };
+
+    let subject = "did:dht:z6MkSubject";
+    // A convergent trigger (WarningCount) is the ONLY class that mints a durable
+    // leaf — drive the real label producers both impls use.
+    let trigger = ConsequenceTrigger::WarningCount;
+    assert!(
+        is_convergent_trigger(&trigger),
+        "WarningCount must be convergent (durable-leaf eligible)"
+    );
+    let action = ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess);
+
+    let trigger_kind = trigger_kind_str(&trigger);
+    let action_type = consequence_action_type(&action);
+    assert_eq!(trigger_kind, "WarningCount");
+    assert_eq!(action_type, "SuspendAccess");
+
+    let payload =
+        scp_event_log::payload::consequence_event_payload(subject, 3, &trigger_kind, action_type);
+
+    // Known-answer JSON. `serde_json::json!` emits keys in SORTED order
+    // (BTreeMap; no `preserve_order` feature) — `action_type`, `rule_index`,
+    // `target_did`, `trigger_kind` — deterministic and identical across native
+    // and WASM. The WASM consequence test asserts the SAME bytes.
+    let expected = br#"{"action_type":"SuspendAccess","rule_index":3,"target_did":"did:dht:z6MkSubject","trigger_kind":"WarningCount"}"#;
+    assert_eq!(
+        payload.data, expected,
+        "ConsequenceTriggered payload must be the canonical JSON byte string both impls emit"
+    );
+
+    // The Custom(key) trigger label MUST be the wire-stable `Custom:key`, NOT
+    // the `{:?}` Debug form — pin it, since divergence here would break
+    // recursive WarningCount/Custom matching across platforms.
+    let custom = ConsequenceTrigger::Custom("escalate".to_owned());
+    assert_eq!(trigger_kind_str(&custom), "Custom:escalate");
+}
+
+/// Asserts a convergent-trigger consequence and a non-convergent one diverge in
+/// durability: the gate `is_convergent_trigger` (shared, enum-keyed) decides
+/// leaf minting identically on both impls. Non-convergent (velocity/rate) MUST
+/// mint NO durable leaf, so it cannot perturb the cross-platform root.
+#[test]
+fn cross_impl_consequence_durability_gate_is_shared() {
+    use scp_protocol::trust::consequence::{ConsequenceTrigger, is_convergent_trigger};
+
+    assert!(is_convergent_trigger(&ConsequenceTrigger::WarningCount));
+    assert!(is_convergent_trigger(&ConsequenceTrigger::Custom(
+        "x".to_owned()
+    )));
+    assert!(!is_convergent_trigger(&ConsequenceTrigger::MessageVelocity));
+    assert!(!is_convergent_trigger(
+        &ConsequenceTrigger::ToolRateExceeded
+    ));
+}
+
+/// Build-time guard against a `serde_json/preserve_order` regression.
+///
+/// The `consequence_event_payload` and `token_revoked_payload` leaves above are
+/// canonical because `serde_json::json!` builds a `BTreeMap` (sorted keys) when
+/// the `preserve_order` feature is OFF — which is the workspace default today.
+/// If any dependency ever turned that feature ON (it is additive across the
+/// whole build), `json!` would switch to an insertion-ordered map and the
+/// emitted leaf bytes would silently shift, breaking the §25 cross-impl
+/// Merkle-root KATs with no other build-time signal.
+///
+/// This test pins the property DIRECTLY and independently of any payload's
+/// field values: it constructs a JSON object whose keys are inserted in
+/// REVERSE-sorted order and asserts the serialized bytes come out in SORTED
+/// order. A `preserve_order` flip makes this assertion fail FIRST with a message
+/// naming the cause, turning a silent KAT drift into a loud, self-explaining
+/// build break.
+#[test]
+fn serde_json_emits_sorted_keys_preserve_order_must_stay_off() {
+    // Keys inserted in reverse-sorted order: `z`, `m`, `a`. With sorted-key
+    // (BTreeMap) serialization the output is `{"a":..,"m":..,"z":..}`; with
+    // `preserve_order` ON it would be `{"z":..,"m":..,"a":..}`.
+    let value = serde_json::json!({
+        "z": 1,
+        "m": 2,
+        "a": 3,
+    });
+    let bytes = serde_json::to_vec(&value).expect("json must serialize");
+    assert_eq!(
+        bytes, br#"{"a":3,"m":2,"z":1}"#,
+        "serde_json must emit SORTED keys — a `preserve_order` (insertion-order) \
+         flip would silently shift convergent leaf bytes (consequence / \
+         TokenRevoked payloads) and break the §25 Merkle-root KATs. Keep the \
+         `preserve_order` feature OFF workspace-wide."
+    );
+}
+
+/// HONEST KNOWN-GAP MARKER (deliberately `#[ignore]`d — do NOT remove the
+/// attribute to make it "pass").
+///
+/// The leaf-byte parity fixed in this change covers the confirmed-divergent
+/// producers: `GovernanceActionExecuted`, `TokenRevoked`, `ToolRegistered`, and
+/// the convergent consequence leaves (`ConsequenceTriggered` /
+/// `ConsequenceEnforced` / `ConsequenceEnforcementFailed` /
+/// `ConsequenceEscalatedToSuspendAll`).
+///
+/// It does NOT cover full WASM ⇄ native parity across the ENTIRE governance /
+/// lifecycle `EventType` surface. The WASM bridge does not yet append durable
+/// leaves for roughly forty other typed events that the native runtime logs,
+/// among them: `RoleAssigned`, `AccessRevoked`, `SpendApproved`, the
+/// migration family (`ContextTombstoned`, `ContextMigrationCancelled`),
+/// the TTL family (`TtlExtended`, `TtlExtensionRejected`), the multisig
+/// threshold family (`AddSigner`, `RemoveSigner`, `ModifyThreshold`), the
+/// governance-proposal lifecycle (`GovernanceProposalCreated`,
+/// `GovernanceVoteCast`, `GovernanceProposalResolved`), and the app-binding
+/// pair (`AppBound`, `AppUnbound`).
+///
+/// Achieving byte-identical leaves for all of them is a dedicated
+/// cross-platform conformance effort: each event needs WASM to (a) append the
+/// leaf at all and (b) build its payload through the shared
+/// `scp_event_log::payload` producers. Until that lands, two members on
+/// different platforms can still diverge once any of those events occurs, so
+/// this test stays ignored rather than asserting a parity that does not hold.
+#[test]
+#[ignore = "full WASM↔native governance EventType leaf parity is a dedicated effort; \
+            ~40 typed events (RoleAssigned, AccessRevoked, SpendApproved, the \
+            migration/TTL/threshold/proposal families) are not yet appended by WASM"]
+fn wasm_native_full_governance_eventtype_parity_pending() {
+    // Intentionally unfulfilled. Enumerates a representative slice of the
+    // EventTypes WASM does not yet durably append in parity with native. When
+    // the dedicated effort wires them through the shared payload producers,
+    // promote this to a real per-EventType byte-parity assertion and drop the
+    // `#[ignore]`.
+    let unappended_by_wasm = [
+        EventType::RoleAssigned,
+        EventType::AccessRevoked,
+        EventType::SpendApproved,
+        EventType::ContextTombstoned,
+        EventType::TtlExtended,
+        EventType::SignerAdded,
+        EventType::ThresholdModified,
+        EventType::GovernanceProposalCreated,
+        EventType::AppBound,
+    ];
+    panic!(
+        "WASM↔native parity is not yet established for the full governance \
+         EventType surface ({} representative types not yet appended by WASM) — \
+         this marker is intentionally unfulfilled",
+        unappended_by_wasm.len()
+    );
+}
+
+#[test]
+fn cross_impl_per_author_leaf_would_break_convergence() {
+    use scp_event_log::tree::{append_unsigned_event, event_count, root};
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    // Non-vacuity control: if per-author `MessageSent` WERE durably appended
+    // (the pre-unification behaviour), the divergent counts (1 vs 2) make the
+    // roots differ. This proves the convergence test above is not trivially
+    // true and that a regression re-introducing per-author leaves is caught.
+    let append_message_sent = |log: &mut scp_event_log::EventLog, actor: &str| {
+        let sequence = event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type: EventType::MessageSent,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_100 + sequence,
+                sequence,
+                payload: EventPayload {
+                    data: b"msg".to_vec(),
+                },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("append must succeed");
+    };
+
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_a, 0);
+    append_message_sent(&mut log_a, "did:dht:zAlice");
+
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_b, 0);
+    append_message_sent(&mut log_b, "did:dht:zBob");
+    append_message_sent(&mut log_b, "did:dht:zBob");
+
+    assert_ne!(
+        root(&log_a),
+        root(&log_b),
+        "with per-author MessageSent leaves durably appended, divergent counts \
+         (1 vs 2) MUST make the roots differ — the non-convergence the exclusion \
+         taxonomy guards against"
     );
 }
 

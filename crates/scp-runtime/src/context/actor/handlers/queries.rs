@@ -228,6 +228,16 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::PaymentHistory {
+            context_id: _,
+            filter,
+            reply,
+        } => {
+            let answer = queries_helpers::payment_history(state, filter.as_ref());
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
         #[cfg(feature = "testing")]
         QueriesCommand::GetAccessKey {
             context_id,

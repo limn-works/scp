@@ -78,12 +78,17 @@ pub fn dispatch_consequences_for_subject(
     // dispatch_consequences` which does the same.
     let rules: Vec<ConsequenceRule> = ctx.consequence_rules().to_vec();
 
-    // Evaluate against the full event log (pure sync, no side effects).
-    // scp_event_log::EventLog::events() stores the full Event payload, so
-    // WASM has direct access to the data `evaluate_consequence_rules` needs.
+    // Evaluate against the merged event history (pure sync, no side effects):
+    // the durable Merkle log (convergent events) plus the recent receive
+    // buffer (per-author local `ContextEvent`s). This mirrors the native
+    // runtime's `event_log_entries_for_consequences`. After the ADR-011
+    // amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2) removed the
+    // per-author `MessageSent` / `ToolInvoked` Merkle leaves, velocity and
+    // tool-rate triggers MUST read those events from the receive buffer
+    // (Source 2) — local, per-receiver flow control needs no convergence.
     let triggered: Vec<TriggeredConsequence> = {
-        let events = ctx.event_log_events();
-        evaluate_consequence_rules(&rules, events, subject_did, now_secs)
+        let events = merged_consequence_events(ctx, now_secs);
+        evaluate_consequence_rules(&rules, &events, subject_did, now_secs)
     };
 
     let mut dispatcher = WasmConsequenceDispatcher { ctx };
@@ -94,6 +99,27 @@ pub fn dispatch_consequences_for_subject(
         now_secs,
         &triggered,
         &rules,
+    )
+}
+
+/// Collects the event history for consequence evaluation, merging the durable
+/// Merkle log with the recent receive buffer — the WASM adapter over the
+/// shared, convergence-critical
+/// [`scp_protocol::trust::consequence::merge_consequence_events`].
+///
+/// It acquires the two sources from the WASM-local `PerContextState`
+/// ([`PerContextState::event_log_events`] for Source 1,
+/// [`PerContextState::event_buffer_events`] for Source 2) and delegates the
+/// `EventType` projection + buffer-gate merge to the shared function so the
+/// WASM bridge and the native runtime produce byte-identical merged event sets
+/// (§9.9.3 equivocation detection). All constants, the projection match, the
+/// buffer gates, and the CONVERGENCE INVARIANT documentation live in that
+/// shared function — see it for the rationale.
+fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_event_log::Event> {
+    scp_protocol::trust::consequence::merge_consequence_events(
+        ctx.event_log_events(),
+        ctx.event_buffer_events(),
+        now_secs,
     )
 }
 
@@ -141,6 +167,34 @@ impl ConsequenceDispatcher for WasmConsequenceDispatcher<'_> {
 
     fn set_cooldown(&mut self, rule_index: usize, until: u64) {
         self.ctx.cooldown_until_insert(rule_index, until);
+    }
+
+    fn append_durable_consequence_leaf(
+        &mut self,
+        event_type: scp_event_log::EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+        trigger_timestamp_secs: u64,
+    ) {
+        // Mint the durable Merkle leaf via the shared payload builder so the
+        // preimage is byte-identical to the native runtime's
+        // (`scp_event_log::payload::consequence_event_payload`, actor "system").
+        // The shared `enforce_triggered` loop only invokes this for
+        // convergent-trigger consequences (ADR-051 §6) and BEFORE the matching
+        // `push_event` (H4 ordering), mirroring native's `emit_*` functions.
+        // `trigger_timestamp_secs` is the convergent triggering-event timestamp
+        // (shared `convergent_consequence_timestamp`), so the leaf timestamp is
+        // byte-identical to native (§7.3.1, §9.9.3).
+        self.ctx.append_consequence_leaf(
+            event_type,
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+            trigger_timestamp_secs,
+        );
     }
 }
 
@@ -240,7 +294,7 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
 mod tests {
     use super::{
         WasmConsequenceDispatcher, apply_assign_role, apply_suspend, apply_suspend_all,
-        dispatch_consequences_for_subject,
+        dispatch_consequences_for_subject, merged_consequence_events,
     };
     use crate::manager::make_bare_per_context_state;
     use scp_event_log::{DID as LogDID, EventType};
@@ -325,6 +379,58 @@ mod tests {
         assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:write"));
         // Other capabilities still allowed — Suspend is targeted.
         assert!(ctx.member_has_capability_pub("did:test:admin", "messages:read"));
+        let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
+        assert!(suspended.contains("messages:write"));
+    }
+
+    /// **E2-3b:** the velocity trigger fires from the RECEIVE BUFFER, not the
+    /// durable Merkle log. After the ADR-011 amendment exclusion taxonomy
+    /// (`.docs/adrs/phase-2.md` §2), `send_message` no longer appends a
+    /// `MessageSent` Merkle leaf — it surfaces a local
+    /// `ContextEvent::MessageSent` via `push_event`. This pins that
+    /// `dispatch_consequences_for_subject` still observes those per-author
+    /// events through `merged_consequence_events`' receive-buffer source, so
+    /// velocity rules keep firing (matching native flow control). The durable
+    /// event log is intentionally left EMPTY here.
+    #[test]
+    fn dispatch_velocity_fires_from_receive_buffer_not_durable_log() {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        ctx.test_insert_ceiling("messages:write");
+        ctx.test_insert_ceiling("messages:read");
+
+        ctx.test_push_consequence_rule(rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            },
+        )));
+
+        // Surface two per-author sends as LOCAL ContextEvents only (exactly
+        // what `send_message` does now) — NO durable leaf is appended.
+        ctx.push_event_pub(ContextEvent::MessageSent {
+            sender_did: LogDID("did:test:admin".to_owned()),
+            sequence_number: 0,
+            payload: b"hi".to_vec(),
+        });
+        ctx.push_event_pub(ContextEvent::MessageSent {
+            sender_did: LogDID("did:test:admin".to_owned()),
+            sequence_number: 1,
+            payload: b"hi".to_vec(),
+        });
+
+        // Precondition: the durable Merkle log is empty (no per-author leaf).
+        assert!(
+            ctx.event_log_events().is_empty(),
+            "per-author sends must NOT append durable Merkle leaves"
+        );
+
+        let dispatched = dispatch_consequences_for_subject(&mut ctx, "ctx", "did:test:admin", 1000);
+        assert_eq!(
+            dispatched, 1,
+            "velocity rule must fire from the receive-buffer MessageSent events"
+        );
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:write"));
         let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
         assert!(suspended.contains("messages:write"));
     }
@@ -651,5 +757,369 @@ mod tests {
         let applied = apply_suspend_all(&mut ctx, "did:test:admin");
         assert!(!applied);
         assert!(ctx.test_suspended_capabilities("did:test:admin").is_none());
+    }
+
+    // ----------------- EL01: convergent-source soundness -----------------
+
+    const SUBJECT: &str = "did:test:subject";
+
+    /// Builds a context whose durable Merkle log holds exactly ONE
+    /// `GovernanceAction` targeting `SUBJECT` (the convergent `WarningCount`
+    /// bucket), then pushes `message_count` per-author `MessageSent` events
+    /// PLUS one `GovernanceActionExecuted` `ContextEvent` into the receive
+    /// buffer. Differing `message_count` simulates members with different
+    /// local activity / buffer lengths.
+    fn ctx_with_local_activity(message_count: usize) -> super::PerContextState {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Durable convergent governance event (the only source from which a
+        // convergent event may be drawn).
+        let payload = serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT })).unwrap();
+        ctx.test_append_log_event_at(EventType::GovernanceAction, "did:test:admin", 990, &payload);
+
+        for seq in 0..message_count {
+            ctx.push_event_pub(ContextEvent::MessageSent {
+                sender_did: LogDID(SUBJECT.to_owned()),
+                sequence_number: seq as u64,
+                payload: Vec::new(),
+            });
+        }
+        // The same convergent governance event each honest member buffers
+        // locally after it is durably logged. Before the EL01 fix this was
+        // re-projected from the buffer and double-counted depending on buffer
+        // length; after the fix it is ignored here (Source 1 only).
+        ctx.push_event_pub(ContextEvent::GovernanceActionExecuted {
+            proposal_id: [0x11u8; 32],
+            action_summary: "SuspendMember".to_owned(),
+            executor_did: LogDID("did:test:admin".to_owned()),
+            resulting_epoch: Some(1),
+            target_did: Some(LogDID(SUBJECT.to_owned())),
+        });
+        ctx
+    }
+
+    fn governance_bucket_count(ctx: &super::PerContextState) -> usize {
+        merged_consequence_events(ctx, 1000)
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceAction)
+            .count()
+    }
+
+    /// **EL01 (WASM mirror):** two honest members with the SAME durable
+    /// governance history but DIFFERENT receive-buffer lengths MUST compute the
+    /// SAME governance-bucket count from `merged_consequence_events`, so a
+    /// `WarningCount` / `Custom` consequence fires (or not) identically and
+    /// mints the SAME durable leaf — preserving the §9.9.3 convergence
+    /// guarantee. Before the fix, the buffer's `GovernanceActionExecuted`
+    /// projection was double-counted on the quiet member and skipped on the
+    /// busy one (dedup keyed on member-local `buffer_len`).
+    #[test]
+    fn convergent_governance_count_is_independent_of_buffer_length() {
+        let quiet = governance_bucket_count(&ctx_with_local_activity(2));
+        let busy = governance_bucket_count(&ctx_with_local_activity(50));
+
+        assert_eq!(
+            quiet, busy,
+            "EL01: governance-bucket count MUST be identical across members \
+             regardless of receive-buffer length — convergent events come only \
+             from the durable log, never the per-member buffer (§9.9.3; ADR-051 §6)"
+        );
+        // Non-vacuity: exactly the single durable GovernanceAction is counted;
+        // the buffer's GovernanceActionExecuted contributes zero.
+        assert_eq!(
+            quiet, 1,
+            "EL01: exactly the single durable GovernanceAction must be counted; \
+             the per-member buffer must contribute zero convergent events"
+        );
+    }
+
+    /// Pins that per-author `MessageSent` events DO still flow from the buffer
+    /// (velocity/rate must keep working) — the EL01 fix narrowed the buffer
+    /// projection without disabling it.
+    #[test]
+    fn per_author_messages_still_flow_from_buffer() {
+        let ctx = ctx_with_local_activity(3);
+        let message_count = merged_consequence_events(&ctx, 1000)
+            .iter()
+            .filter(|e| e.event_type == EventType::MessageSent)
+            .count();
+        assert!(
+            message_count > 0,
+            "MessageSent is per-author and excluded from the durable log, so the \
+             receive buffer MUST remain its source for velocity/rate evaluation"
+        );
+    }
+}
+
+// ===========================================================================
+// Cross-impl leaf-byte parity (WASM side) — §9.9.3
+//
+// These assert the WASM bridge's REAL leaf-payload producer paths reproduce the
+// SAME canonical fixture bytes that the native scp-runtime test
+// (`crates/scp-runtime/tests/wasm_conformance.rs`,
+// `cross_impl_*_leaf_bytes`) pins from native's real producer paths. The split
+// is necessary because the scp-runtime test crate cannot dev-depend on this
+// wasm cdylib. Each side drives its OWN production code against the same known
+// answer; together they prove the two impls emit byte-identical leaves.
+// ===========================================================================
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cross_impl_leaf_parity {
+    /// `GovernanceActionExecuted`: WASM's real value extraction + shared
+    /// `GovernanceActionExecutedPayload` + `encode_payload` (the exact code at
+    /// `manager.rs`'s `execute_governance_action` append site) MUST reproduce
+    /// the positional-MessagePack fixture the native test pins.
+    #[test]
+    fn cross_impl_governance_action_executed_leaf_bytes_wasm() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        // Same logical action as the native fixture: RemoveMember(BOB).
+        let action = GovernanceAction::RemoveMember {
+            did: scp_event_log::DID::from("did:dht:z6MkBobConverge".to_owned()),
+            reason: None,
+        };
+        // The EXACT extraction the WASM append site performs.
+        let target_did = action
+            .target_did()
+            .map(|d| d.as_ref().to_owned())
+            .unwrap_or_default();
+        let action_type = action.variant_name().to_owned();
+
+        let payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did,
+                action_type,
+            },
+        )
+        .unwrap()
+        .data;
+
+        // Positional MessagePack 2-element fixarray. Decoding recovers the
+        // native fixture's fields exactly — proving byte parity with native.
+        let decoded: scp_event_log::payload::GovernanceActionExecutedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: payload.clone(),
+            })
+            .unwrap();
+        assert_eq!(decoded.target_did, "did:dht:z6MkBobConverge");
+        assert_eq!(decoded.action_type, "RemoveMember");
+        assert_eq!(payload[0] & 0xf0, 0x90, "must be a MessagePack fixarray");
+        assert_eq!(payload[0] & 0x0f, 2, "fixarray of 2 fields");
+    }
+
+    /// `TokenRevoked`: WASM's real producer (the same
+    /// `scp_protocol::crypto::ucan::revoke::token_revoked_payload` call its
+    /// `ucan_revoke` makes) MUST reproduce the native fixture JSON bytes.
+    #[test]
+    fn cross_impl_token_revoked_leaf_bytes_wasm() {
+        let payload = scp_protocol::crypto::ucan::revoke::token_revoked_payload(
+            "ctx-revoke-x",
+            "bafyTokenCidExample",
+            "did:dht:z6MkRevoker",
+        );
+        // SORTED-key JSON (serde_json BTreeMap; no preserve_order) — identical
+        // to the native test's pinned fixture.
+        let expected =
+            br#"{"context_id":"ctx-revoke-x","revoker_did":"did:dht:z6MkRevoker","token_cid":"bafyTokenCidExample"}"#;
+        assert_eq!(payload, expected);
+    }
+
+    /// Convergent `ConsequenceTriggered`: WASM's real producer (the same
+    /// `consequence_event_payload` + shared label functions its
+    /// `WasmConsequenceDispatcher::append_durable_consequence_leaf` uses) MUST
+    /// reproduce the native fixture JSON bytes.
+    #[test]
+    fn cross_impl_consequence_triggered_leaf_bytes_wasm() {
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceTrigger, EnforcementSeverity, consequence_action_type,
+            trigger_kind_str,
+        };
+
+        let trigger = ConsequenceTrigger::WarningCount;
+        let action = ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess);
+        let trigger_kind = trigger_kind_str(&trigger);
+        let action_type = consequence_action_type(&action);
+
+        let payload = scp_event_log::payload::consequence_event_payload(
+            "did:dht:z6MkSubject",
+            3,
+            &trigger_kind,
+            action_type,
+        );
+        let expected =
+            br#"{"action_type":"SuspendAccess","rule_index":3,"target_did":"did:dht:z6MkSubject","trigger_kind":"WarningCount"}"#;
+        assert_eq!(payload.data, expected);
+    }
+
+    /// `GovernanceProposalCreated` / `GovernanceVoteCast` /
+    /// `GovernanceVoteWithdrawn`: the WASM bridge's durable leaf MUST carry an
+    /// EMPTY payload, matching native's `append_context_event`
+    /// (`EventPayload::default()`). The native test
+    /// `cross_impl_governance_proposal_vote_leaf_is_empty` pins the SAME empty
+    /// leaf from native's real producer path.
+    ///
+    /// The production append sites pass `b""` (the `proposal_id` rides only in
+    /// the buffer-only `ContextEvent`). This test drives the WASM append path
+    /// with that production payload and asserts the landed leaf is empty; it ALSO
+    /// proves the regression is detectable by appending the pre-fix
+    /// `proposal_id.as_bytes()` payload to a parallel log and asserting the two
+    /// Merkle roots DIVERGE — i.e. a leaf that stamped the `proposal_id` would
+    /// produce a different `tree::root` and false-positive §9.9.3 equivocation
+    /// against native.
+    #[test]
+    fn cross_impl_governance_proposal_vote_leaf_is_empty_wasm() {
+        use crate::manager::make_bare_per_context_state;
+        use scp_event_log::EventType;
+
+        const GOVERNANCE_PROPOSAL_VOTE_EVENTS: [EventType; 3] = [
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+        ];
+        let proposal_id = "prop-converge-001";
+        let actor = "did:dht:z6MkProposer";
+
+        // Production path: append each governance event with the EMPTY payload
+        // the real `append_log_event` call sites now pass.
+        let mut empty_state = make_bare_per_context_state("ctx-gov-empty", actor);
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            empty_state.test_append_log_event_at(event_type, actor, 1_700_000_000, b"");
+        }
+
+        // Every durable governance leaf carries an empty payload — byte-parity
+        // with native's `append_context_event`.
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            let logged = empty_state
+                .event_log_events()
+                .iter()
+                .find(|e| e.event_type == event_type);
+            assert!(
+                logged.is_some_and(|e| e.payload.data.is_empty()),
+                "{event_type:?} WASM canonical leaf MUST be present with an EMPTY \
+                 payload (§9.9.3)"
+            );
+        }
+
+        // Regression detector: a parallel log that stamps `proposal_id.as_bytes()`
+        // (the pre-fix WASM behavior) MUST yield a DIFFERENT Merkle root, proving
+        // the empty-payload fix is load-bearing for native↔WASM convergence.
+        let mut stamped_state = make_bare_per_context_state("ctx-gov-stamped", actor);
+        for event_type in GOVERNANCE_PROPOSAL_VOTE_EVENTS {
+            stamped_state.test_append_log_event_at(
+                event_type,
+                actor,
+                1_700_000_000,
+                proposal_id.as_bytes(),
+            );
+        }
+        assert_ne!(
+            empty_state.test_event_log_root(),
+            stamped_state.test_event_log_root(),
+            "stamping proposal_id into the leaf MUST diverge the Merkle root — the \
+             empty-payload parity with native is what prevents a §9.9.3 \
+             false-positive equivocation across platforms"
+        );
+    }
+
+    /// Drives the REAL WASM governance production handlers end-to-end and
+    /// asserts the durable Merkle leaves they append carry an EMPTY payload.
+    ///
+    /// The sibling test `cross_impl_governance_proposal_vote_leaf_is_empty_wasm`
+    /// feeds a hand-written `b""` through the test-only append path, so it
+    /// cannot catch a regression at the production call sites
+    /// (`WasmContextManager::propose_governance_action`,
+    /// `approve_governance_proposal`, `withdraw_governance_vote`) where the
+    /// `b""` argument actually lives. This test calls those handlers directly
+    /// so that flipping any of them back to `proposal_id.as_bytes()` (the
+    /// pre-fix WASM behavior that bit native↔WASM parity twice) fails the
+    /// build instead of leaving the synthetic test green.
+    ///
+    /// A 4-member `majority` context has quorum 3. The proposer's own vote is
+    /// approval #1 and a single additional approval is #2 — both below quorum —
+    /// so the proposal stays `Pending` and no `execute_governance_action`
+    /// fires, keeping all three append sites (`GovernanceProposalCreated`,
+    /// `GovernanceVoteCast`, `GovernanceVoteWithdrawn`) reachable for real on
+    /// the native test target.
+    #[test]
+    fn real_governance_handlers_append_empty_leaves_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+        // `scp_event_log::DID` (re-exported from `scp_primitives`) is the same
+        // type `GovernanceAction::AddSigner.did` expects.
+
+        let context_id = "ctx-gov-real";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // Build a 4-member majority context (quorum = 3) so neither the
+        // proposer's vote nor one extra approval reaches quorum: the proposal
+        // stays Pending and no execution fires.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberD", "admin");
+        // Admins resolve capabilities through the ceiling — admit the
+        // governance propose/vote capabilities the handlers gate on.
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // "deadbeef" is valid hex (the handler hex-decodes proposal_id into a
+        // [u8; 32]) and is used verbatim as the pending-proposal map key.
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::AddSigner {
+            did: DID::from("did:dht:z6MkNewSigner".to_owned()),
+        };
+
+        // 1. Real propose handler → GovernanceProposalCreated leaf (b"").
+        let propose_result = mgr
+            .propose_governance_action(context_id, proposer, proposal_id, &action)
+            .unwrap();
+        assert_eq!(
+            propose_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1-of-3 quorum must leave the proposal Pending so no execution fires"
+        );
+
+        // 2. Real vote-cast handler → GovernanceVoteCast leaf (b"").
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .unwrap();
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2-of-3 quorum must still leave the proposal Pending"
+        );
+
+        // 3. Real vote-withdraw handler → GovernanceVoteWithdrawn leaf (b"").
+        mgr.withdraw_governance_vote(context_id, proposal_id, voter)
+            .unwrap();
+
+        // Every durable governance leaf the real handlers appended must carry
+        // an EMPTY payload — byte-parity with native's `append_context_event`
+        // (§9.9.3). A regression that stamps `proposal_id.as_bytes()` at any of
+        // the three call sites fails this assertion.
+        let logged = mgr.test_context_event_log_events(context_id);
+        for event_type in [
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+        ] {
+            let leaf = logged.iter().find(|e| e.event_type == event_type);
+            assert!(
+                leaf.is_some_and(|e| e.payload.data.is_empty()),
+                "{event_type:?} durable leaf from the REAL handler MUST be present \
+                 with an EMPTY payload (§9.9.3 native↔WASM parity)"
+            );
+        }
     }
 }

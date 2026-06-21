@@ -332,6 +332,7 @@ impl PaymentAdapter for TestAdapter {
             adapter_id: "test".to_owned(),
             adapter_proof,
             timestamp: now_secs(),
+            anchored: false,
             signature: Vec::new(), // Test adapter: no real signature.
         };
 
@@ -642,6 +643,7 @@ mod tests {
             adapter_id: "test".to_owned(),
             adapter_proof: vec![],
             timestamp: 0,
+            anchored: false,
             signature: vec![],
         };
 

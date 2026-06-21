@@ -743,13 +743,14 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
             event_log.leaves()[event_log.leaves().len() - 1]
         };
 
-        // Build payload: JSON object with token_cid, revoker_did, context_id.
-        let payload_json = serde_json::json!({
-            "token_cid": token_cid,
-            "revoker_did": revoker_did,
-            "context_id": context_id,
-        });
-        let payload_data = serde_json::to_vec(&payload_json).unwrap_or_default();
+        // Build payload via the shared producer so the leaf preimage is
+        // byte-identical to the WASM bridge's `ucan_revoke` (§9.9.3 cross-platform
+        // convergence). JSON object: {token_cid, revoker_did, context_id}.
+        let payload_data = scp_core::crypto::ucan::revoke::token_revoked_payload(
+            context_id,
+            token_cid,
+            revoker_did,
+        );
 
         // Unix timestamp seconds fit in u64 for centuries.
         #[allow(clippy::cast_possible_truncation)]

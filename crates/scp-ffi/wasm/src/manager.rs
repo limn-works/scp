@@ -427,7 +427,21 @@ impl PerContextState {
     ///
     /// This helper replaces the old `WasmEventLog::append_event(tag, did, payload)`
     /// API with the canonical scp-event-log implementation.
-    fn append_log_event(&mut self, event_type: EventType, actor_did: &str, payload: &[u8]) {
+    /// `timestamp_secs` is the **committer-assigned** convergent leaf timestamp
+    /// (Unix seconds), matching the native runtime: for a commit-ordered event
+    /// it is the `created_at` of the signed SCP envelope carrying the commit
+    /// (copied by every member); for a timer-triggered event it is the
+    /// pre-computed convergent deadline. It is NEVER each member's local
+    /// `crate::time::now_secs()`, which would diverge and break the
+    /// equal-count/equal-root equivocation test a WASM member and a native
+    /// member must both satisfy (§7.3.1, §9.9.3).
+    fn append_log_event(
+        &mut self,
+        event_type: EventType,
+        actor_did: &str,
+        payload: &[u8],
+        timestamp_secs: u64,
+    ) {
         let sequence = event_count(&self.event_log);
         let prev_hash = if self.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
@@ -437,7 +451,7 @@ impl PerContextState {
         let event = Event {
             event_type,
             actor_did: DID::from(actor_did.to_owned()),
-            timestamp: crate::time::now_secs(),
+            timestamp: timestamp_secs,
             sequence,
             payload: EventPayload {
                 data: payload.to_vec(),
@@ -578,6 +592,19 @@ impl PerContextState {
         self.event_log.events()
     }
 
+    /// Returns the recent receive-buffer events (local `ContextEvent`s) used
+    /// as a supplementary source for consequence evaluation.
+    ///
+    /// Per the ADR-011 amendment exclusion taxonomy
+    /// (`.docs/adrs/phase-2.md` §2), per-author application activity such as
+    /// `MessageSent` is no longer a durable Merkle leaf — it is surfaced only
+    /// as a local `ContextEvent` in this buffer. The consequence engine reads
+    /// velocity / rate triggers from here, mirroring the native runtime's
+    /// `event_log_entries_for_consequences` Source 2 (the receive buffer).
+    pub(crate) fn event_buffer_events(&self) -> &VecDeque<ContextEvent> {
+        &self.event_buffer
+    }
+
     /// Checks whether the subject is currently a member of the context.
     pub(crate) fn members_contains(&self, subject_did: &str) -> bool {
         self.members.contains_key(subject_did)
@@ -625,6 +652,37 @@ impl PerContextState {
         &self.ceiling_strings
     }
 
+    /// Appends a durable consequence-enforcement Merkle leaf (ADR-017, ADR-051
+    /// §6, H4). Called by [`crate::consequence::WasmConsequenceDispatcher`]'s
+    /// [`scp_protocol::trust::consequence::ConsequenceDispatcher::append_durable_consequence_leaf`]
+    /// override for convergent-trigger consequences only.
+    ///
+    /// The actor is the stable system sentinel `"system"` (matching the native
+    /// runtime's `CONSEQUENCE_ACTOR_DID`), and the payload is the shared
+    /// [`scp_event_log::payload::consequence_event_payload`] output, so the leaf
+    /// preimage is byte-identical to the native runtime's
+    /// (§9.9.3 equivocation-detection convergence).
+    pub(crate) fn append_consequence_leaf(
+        &mut self,
+        event_type: EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+        trigger_timestamp_secs: u64,
+    ) {
+        // Native uses CONSEQUENCE_ACTOR_DID = "system" as the actor for these
+        // leaves so the `WarningCount` trigger's `actor_did != subject_did`
+        // requirement holds for recursive rule evaluation.
+        let payload = scp_event_log::payload::consequence_event_payload(
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+        );
+        self.append_log_event(event_type, "system", &payload.data, trigger_timestamp_secs);
+    }
+
     // ---- Test-only helpers (compiled away in release builds) -------------
     //
     // These expose a minimal subset of the private internals needed by the
@@ -663,6 +721,13 @@ impl PerContextState {
             signature: vec![],
         };
         let _ = append_unsigned_event(&mut self.event_log, &event);
+    }
+
+    /// Test-only: the current Merkle root of this context's event log. Used by
+    /// cross-impl leaf-parity tests to prove a payload change perturbs the root.
+    #[cfg(test)]
+    pub(crate) fn test_event_log_root(&self) -> [u8; 32] {
+        scp_event_log::tree::root(&self.event_log)
     }
 
     /// Test-only: insert a member with the given role.
@@ -706,6 +771,13 @@ impl PerContextState {
     #[cfg(test)]
     pub(crate) fn test_insert_ceiling(&mut self, capability: &str) {
         self.ceiling_strings.insert(capability.to_owned());
+    }
+
+    /// Test-only: set the governance model string (e.g. `"majority"`), so
+    /// sibling-module tests can drive multi-admin proposal/vote flows.
+    #[cfg(test)]
+    pub(crate) fn test_set_governance(&mut self, model: &str) {
+        self.governance = model.to_owned();
     }
 
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
@@ -1141,6 +1213,29 @@ impl WasmContextManager {
         }
     }
 
+    /// Test-only: register a pre-built `PerContextState` under `context_id`.
+    /// Lets tests in sibling modules (e.g. `crate::consequence`) drive the
+    /// real lifecycle/governance handlers without reaching into the private
+    /// `contexts` field.
+    #[cfg(test)]
+    pub(crate) fn test_insert_context(&mut self, context_id: &str, ctx: PerContextState) {
+        self.contexts.insert(context_id.to_owned(), ctx);
+    }
+
+    /// Test-only: clone the durable event-log leaves for `context_id`. Lets
+    /// sibling-module tests assert on leaves the real handlers appended
+    /// without exposing the private `contexts` field.
+    #[cfg(test)]
+    pub(crate) fn test_context_event_log_events(
+        &self,
+        context_id: &str,
+    ) -> Vec<scp_event_log::Event> {
+        self.contexts
+            .get(context_id)
+            .map(|ctx| ctx.event_log_events().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Returns `true` if the context's stored economic policy requires payment.
     /// Returns `false` if the context is not found, not active, or has no/free policy.
     ///
@@ -1351,7 +1446,14 @@ impl WasmContextManager {
         // Append ContextCreated event to event log.
         // Safe: we just inserted the context above, so the key is present.
         if let Some(ctx) = self.contexts.get_mut(context_id) {
-            ctx.append_log_event(EventType::ContextCreated, creator_did, b"");
+            ctx.append_log_event(
+                EventType::ContextCreated,
+                creator_did,
+                b"",
+                // Creator-assigned creation time (this member is the creator);
+                // copied by every member (§7.3.1, §9.9.3).
+                crate::time::now_secs(),
+            );
         }
 
         Ok(())
@@ -1428,7 +1530,14 @@ impl WasmContextManager {
             role_name: "member".to_owned(),
         });
 
-        ctx.append_log_event(EventType::MemberJoined, member_did, b"");
+        ctx.append_log_event(
+            EventType::MemberJoined,
+            member_did,
+            b"",
+            // Committer-assigned: this member's clock, the source of the
+            // join commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1469,7 +1578,13 @@ impl WasmContextManager {
             member_did: DID(member_did.to_owned()),
         });
 
-        ctx.append_log_event(EventType::MemberLeft, member_did, b"");
+        ctx.append_log_event(
+            EventType::MemberLeft,
+            member_did,
+            b"",
+            // Committer-assigned: the leaving member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         // Auto-close if no members remain.
         if ctx.members.is_empty() {
@@ -1583,11 +1698,13 @@ impl WasmContextManager {
             payload: recorded_payload.as_bytes().to_vec(),
         });
 
-        ctx.append_log_event(
-            EventType::MessageSent,
-            sender_did,
-            recorded_payload.as_bytes(),
-        );
+        // Per-author application activity (MessageSent) is NOT appended to the
+        // canonical Merkle log: each author mints leaves in its own per-author
+        // sequence with no global order, so two honest members would derive
+        // different `tree::root` and §9.9.3 equivocation detection would break.
+        // It is surfaced only as a local `ContextEvent` (the `push_event`
+        // above). This matches the native scp-runtime exclusion and the
+        // ADR-011 amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2).
 
         // Evaluate and enforce consequence rules for the sender. Mirrors
         // `scp_runtime::context::manager::messaging::send_message` which
@@ -1639,7 +1756,14 @@ impl WasmContextManager {
             initiator_did: DID(initiator_did.to_owned()),
         });
 
-        ctx.append_log_event(EventType::ContextClosing, initiator_did, b"");
+        ctx.append_log_event(
+            EventType::ContextClosing,
+            initiator_did,
+            b"",
+            // Committer-assigned: the initiator's clock, source of the close
+            // commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1840,7 +1964,13 @@ impl WasmContextManager {
                 code: codes::CTX_2060.to_owned(),
             })?;
 
-        ctx.append_log_event(event_type, actor_did, prov_hash);
+        ctx.append_log_event(
+            event_type,
+            actor_did,
+            prov_hash,
+            // Committer-assigned: the attaching member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1883,7 +2013,17 @@ impl WasmContextManager {
         )?;
 
         let actor = ctx.creator_did.clone();
-        ctx.append_log_event(EventType::ToolRegistered, &actor, tool_id.as_bytes());
+        // Native appends ToolRegistered with an EMPTY payload
+        // (`append_context_event`, no payload) — match it so the leaf preimage
+        // is byte-identical across platforms (§9.9.3). The tool_id is NOT part
+        // of the canonical leaf.
+        ctx.append_log_event(
+            EventType::ToolRegistered,
+            &actor,
+            b"",
+            // Committer-assigned: the registering member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(tool_id)
     }
@@ -1940,7 +2080,6 @@ impl WasmContextManager {
         context_id: &str,
         tool_id: &str,
         input_json: &serde_json::Value,
-        identity_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -1985,7 +2124,15 @@ impl WasmContextManager {
             })
         };
 
-        ctx.append_log_event(EventType::ToolInvoked, identity_did, tool_id.as_bytes());
+        // `ToolInvoked` is per-author application activity (ADR-011 amendment
+        // exclusion taxonomy, `.docs/adrs/phase-2.md` §2): appended only by its
+        // author in a per-author sequence with no global order, so a durable
+        // leaf would make honest members diverge on `tree::root` and break
+        // §9.9.3 equivocation detection. Native scp-runtime appends no durable
+        // leaf and surfaces no local `ContextEvent` for intra-context tool
+        // invocations, so neither does WASM. (`tool_invocation_count` is
+        // recomputed from local events; it carries `anchored=false` until
+        // ADR-051's causal DAG makes the count convergent.)
 
         Ok(result)
     }
@@ -2565,7 +2712,23 @@ impl WasmContextManager {
 
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        ctx.append_log_event(EventType::TokenRevoked, revoker_did, token_cid.as_bytes());
+        // Durable TokenRevoked leaf. The payload MUST be the shared JSON
+        // {token_cid, revoker_did, context_id} producer so the leaf preimage is
+        // byte-identical to the native/PyO3/UniFFI/NAPI bridge path
+        // (`scp-ffi-common`'s `BridgeRevocationEventLogger`) — §9.9.3
+        // cross-platform convergence.
+        let payload = scp_protocol::crypto::ucan::revoke::token_revoked_payload(
+            context_id,
+            token_cid,
+            revoker_did,
+        );
+        ctx.append_log_event(
+            EventType::TokenRevoked,
+            revoker_did,
+            &payload,
+            // Committer-assigned: the revoker's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -2663,8 +2826,22 @@ impl WasmContextManager {
             }
         }
 
-        // Replay protection: check+mark atomically.
-        {
+        // Resolve the CONVERGENT `GovernanceActionExecuted` leaf timestamp
+        // BEFORE dispatch, while the proposal is still tracked. This is the
+        // executed proposal's signed `created_at`, copied identically by every
+        // member — byte-identical to the native runtime's
+        // `finalize_governance_action`, which sources `proposal.created_at`
+        // (§7.3.1, §9.9.3). The proposal lives in `pending_proposals`
+        // (pre-resolution) or `resolved_proposals` (post-resolution).
+        //
+        // Native CANNOT reach this leaf without a real proposal
+        // (`finalize_governance_action` takes `&GovernanceProposal`). WASM
+        // therefore guards the same invariant rather than silently stamping
+        // `0`: a missing proposal here would mint a leaf whose timestamp
+        // diverges from native's `created_at`, breaking cross-platform Merkle
+        // equivocation detection. Fail loudly so a future regression surfaces
+        // instead of corrupting the convergent log.
+        let proposal_created_at = {
             let ctx = self.require_active_context_mut(context_id)?;
             let now = crate::time::now_ms();
 
@@ -2675,6 +2852,19 @@ impl WasmContextManager {
                 });
             }
 
+            let created_at = ctx
+                .pending_proposals
+                .get(proposal_id)
+                .or_else(|| ctx.resolved_proposals.get(proposal_id))
+                .map(|p| p.created_at)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!(
+                        "governance proposal '{proposal_id}' is not tracked (pending or resolved); \
+                         cannot derive the convergent GovernanceActionExecuted leaf timestamp"
+                    ),
+                    code: codes::CTX_2041.to_owned(),
+                })?;
+
             // Evict expired proposals when over capacity.
             if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
                 let cutoff = now - WASM_PROPOSAL_TTL_MS;
@@ -2682,7 +2872,8 @@ impl WasmContextManager {
             }
 
             ctx.executed_proposals.insert(proposal_id.to_owned(), now);
-        }
+            created_at
+        };
 
         let result = self.dispatch_governance_action(context_id, action);
 
@@ -2697,6 +2888,12 @@ impl WasmContextManager {
         if result.is_ok()
             && let Some(ctx) = self.contexts.get_mut(context_id)
         {
+            // Convergent leaf timestamp for `GovernanceActionExecuted`: the
+            // executed proposal's signed `created_at`, captured above before
+            // dispatch (guarded against a missing proposal so this can never be
+            // a divergent `0`). Byte-identical to the native runtime's
+            // proposal-derived value (`finalize_governance_action`); never
+            // local `now()` (§7.3.1, §9.9.3).
             let action_summary = action.variant_name().to_owned();
             let proposal_id_bytes: [u8; 32] = {
                 let bytes = hex::decode(proposal_id).unwrap_or_default();
@@ -2713,10 +2910,29 @@ impl WasmContextManager {
                 resulting_epoch: None,
                 target_did: target_did.clone(),
             });
+            // Durable GovernanceActionExecuted leaf. The payload MUST be the
+            // shared `GovernanceActionExecutedPayload` (positional MessagePack
+            // via `encode_payload`) — byte-identical to the native runtime's
+            // `finalize_governance_action` construction — so cross-platform
+            // members derive equal Merkle roots (§9.9.3). `target_did` is the
+            // action's target (empty when untargeted); `action_type` is the
+            // `GovernanceAction` variant name.
+            let executed_payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did
+                        .as_ref()
+                        .map(|d| d.as_ref().to_owned())
+                        .unwrap_or_default(),
+                    action_type: action.variant_name().to_owned(),
+                },
+            )
+            .map(|p| p.data)
+            .unwrap_or_default();
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
                 initiator_did,
-                proposal_id.as_bytes(),
+                &executed_payload,
+                proposal_created_at,
             );
 
             // Evaluate and enforce consequence rules. Mirrors
@@ -3765,10 +3981,19 @@ impl WasmContextManager {
             resulting_epoch: None,
             target_did: action.target_did().cloned(),
         });
+        // SECURITY/§9.9.3: native appends GovernanceProposalCreated with an
+        // EMPTY payload (`append_context_event`, no payload) — match it so the
+        // leaf preimage is byte-identical across platforms. The proposal_id is
+        // NOT part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` pushed above (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceProposalCreated,
             proposer_did,
-            proposal_id.as_bytes(),
+            b"",
+            // Convergent: the proposal's signed `created_at` (set to `now_secs`
+            // above), copied by every member — matches the native runtime's
+            // proposal-derived leaf timestamp (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         if meets_quorum {
@@ -3871,21 +4096,28 @@ impl WasmContextManager {
                 });
             }
 
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
             proposal.approvals.push(SignedVote {
                 voter_did: DID(voter_did.to_owned()),
                 vote: VoteType::Approve,
-                timestamp: vote_ts,
+                timestamp: now_secs,
                 signature: Vec::new(),
             });
             proposal.approvals.len() >= required
         };
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteCast,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
+            // Convergent: the voter's signed vote `created_at` (= `now_secs`,
+            // the same value stamped on the SignedVote), copied by every member
+            // (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         let pid = proposal_id.to_owned();
@@ -3981,21 +4213,28 @@ impl WasmContextManager {
                 });
             }
 
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
             proposal.rejections.push(SignedVote {
                 voter_did: DID(voter_did.to_owned()),
                 vote: VoteType::Reject,
-                timestamp: vote_ts,
+                timestamp: now_secs,
                 signature: Vec::new(),
             });
             total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
         };
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteCast,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
+            // Convergent: the voter's signed vote `created_at` (= `now_secs`,
+            // the same value stamped on the SignedVote), copied by every member
+            // (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         let can_still_reach_quorum = {
@@ -4061,10 +4300,18 @@ impl WasmContextManager {
             });
         }
 
+        // SECURITY/§9.9.3: native appends GovernanceVoteWithdrawn with an EMPTY
+        // payload (`append_context_event`, no payload) — match it so the leaf
+        // preimage is byte-identical across platforms. The proposal_id is NOT
+        // part of the canonical leaf; it rides only in the buffer-only
+        // `ContextEvent` (which is not a durable Merkle leaf).
         ctx.append_log_event(
             EventType::GovernanceVoteWithdrawn,
             voter_did,
-            proposal_id.as_bytes(),
+            b"",
+            // Committer-assigned: the withdrawing voter's clock, the source of
+            // the withdrawal commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
         );
 
         Ok(serde_json::json!({ "status": "Pending" }))
@@ -4292,11 +4539,10 @@ impl WasmContextManager {
             payload: payload_base64.as_bytes().to_vec(),
         });
 
-        ctx.append_log_event(
-            EventType::MessageSent,
-            author_did,
-            payload_base64.as_bytes(),
-        );
+        // Per-author broadcast activity is surfaced only as a local
+        // `ContextEvent` (above), never as a canonical Merkle leaf — same
+        // per-author exclusion as `send_message` (ADR-011 amendment exclusion
+        // taxonomy, `.docs/adrs/phase-2.md` §2).
 
         Ok(())
     }
@@ -4813,7 +5059,16 @@ impl WasmContextManager {
         "expired".clone_into(&mut ctx.state);
         ctx.push_event(ContextEvent::Expired);
 
-        ctx.append_log_event(EventType::ContextExpired, "", b"");
+        ctx.append_log_event(
+            EventType::ContextExpired,
+            "",
+            b"",
+            // Timer-triggered expiry: WASM tracks no separate convergent TTL
+            // deadline, so the expiry instant is the member's clock reading at
+            // fire time; a mixed native/WASM context derives the deadline
+            // identically from the shared TTL policy (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -5695,7 +5950,13 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast_context = None;
 
-        ctx.append_log_event(EventType::ContextClosed, "system", b"");
+        ctx.append_log_event(
+            EventType::ContextClosed,
+            "system",
+            b"",
+            // Convergent close instant (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -8032,8 +8293,10 @@ mod tests {
     /// **C2-E:** the C2 gate produces no false positive on free contexts.
     ///
     /// Native test runners cannot exercise the full `send_message` happy path
-    /// because `append_log_event` calls `crate::time::now_secs()`, which
-    /// panics under the wasm-bindgen stub on non-wasm targets (see C2-B).
+    /// because its consequence-dispatch step calls `crate::time::now_secs()`,
+    /// which panics under the wasm-bindgen stub on non-wasm targets (see C2-B).
+    /// (`send_message` no longer appends a durable `MessageSent` leaf — that
+    /// per-author event is surfaced only as a local `ContextEvent` now.)
     /// We instead set up a free context (no economic policy) and call
     /// `send_message` with a sender that is NOT a member: the C2 gate runs
     /// first, then the membership check returns `SCP-CTX-2019`. Observing

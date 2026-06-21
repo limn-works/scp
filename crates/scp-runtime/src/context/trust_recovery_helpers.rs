@@ -253,11 +253,28 @@ pub fn recovery_advance_epoch(
 
     // 5. Emit epoch advancement event to event log. Event log failures
     //    are non-fatal — recovery must not be blocked by logging issues.
-    if let Err(e) = deps.event_log.append_context_event(
-        &context_id_bytes,
-        "recovery/epoch_advanced",
-        "system:recovery",
-    ) {
+    let recovery_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::RecoveryEpochAdvancedPayload {
+            old_epoch,
+            new_epoch,
+        },
+    );
+    // Committer-assigned timestamp for the recovery epoch-advance commit: the
+    // initiator's clock — the source of the `created_at` on the broadcast MLS
+    // Commit, copied by every member (§7.3.1, §9.9.3).
+    let recovery_ts = deps.clock.now_secs();
+    if let Err(e) = recovery_payload
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+        .and_then(|payload| {
+            deps.event_log.append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::RecoveryEpochAdvanced,
+                "system:recovery",
+                payload,
+                recovery_ts,
+            )
+        })
+    {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
