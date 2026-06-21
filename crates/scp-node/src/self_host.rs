@@ -124,6 +124,13 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     pub hostname: String,
     /// The author's signing key handle (from `node.identity().identity()`).
     pub signing_key_handle: scp_platform::KeyHandle,
+    /// The REAL document-derived governance
+    /// [`KeyResolver`](scp_core::context::governance::KeyResolver) for the
+    /// co-located participant (ADR-053 / spec §10.17). Build it with
+    /// [`document_vm_key_resolver`] over a
+    /// [`DualLayerResolver`](scp_identity::DualLayerResolver) that shares the
+    /// node's [`DidCache`](scp_identity::DidCache); never the `|_, _| None` stub.
+    pub key_resolver: scp_core::context::governance::KeyResolver,
     /// The caller's key custody backend. Borrowed for the publish dispatch.
     pub custody: &'a C,
     /// The supervisor's `OpenMLS` storage adapter. The caller builds this over
@@ -261,6 +268,7 @@ where
         deploy_id,
         hostname,
         signing_key_handle,
+        key_resolver,
         custody,
         mls_storage,
         assets,
@@ -272,6 +280,7 @@ where
         context_id,
         hostname,
         signing_key_handle,
+        key_resolver,
         mls_storage,
     )
     .await?;
@@ -320,6 +329,7 @@ impl SelfHostDeployer {
         context_id: String,
         hostname: String,
         signing_key_handle: scp_platform::KeyHandle,
+        key_resolver: scp_core::context::governance::KeyResolver,
         mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Result<Self, SelfHostError>
     where
@@ -328,9 +338,11 @@ impl SelfHostDeployer {
         let author_did: scp_identity::DID = scp_identity::DID::from(node_did.clone());
 
         // Build the in-process supervisor on the node's OWN loopback relay and
-        // register the local DID + the broadcast context.
+        // register the local DID + the broadcast context. The supervisor carries
+        // the REAL document-derived governance resolver (ADR-053 / spec §10.17).
         let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, mls_storage).await?;
+            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, mls_storage)
+                .await?;
         node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
@@ -409,6 +421,62 @@ impl SelfHostDeployer {
     }
 }
 
+/// Builds the co-located participant's document-derived governance resolver.
+///
+/// Wraps a [`DidResolver`](scp_identity::resolver::DidResolver) into the
+/// governance [`KeyResolver`](scp_core::context::governance::KeyResolver) shape,
+/// per ADR-053 / spec §10.17.
+///
+/// The returned closure resolves a voter's DID document live (cache-backed —
+/// the `resolver` should share the node's [`DidCache`](scp_identity::DidCache),
+/// whose sequence check is the load-bearing anti-rollback guard) and extracts
+/// the Ed25519 verifying key for the *exact* signing key the caller claims
+/// (`#active` or `#agent`) via the hoisted, shared
+/// [`scp_identity::resolver::verifying_key_from_document`] (SHB-008) — the SAME
+/// helper the FFI bridges' `document_vm_key_resolver` consumes. This makes the
+/// bundled self-host participant a REAL participant: governance vote signatures
+/// are verified against each voter's document-derived key, never the
+/// `|_, _| None` stub the bundled path used to ship.
+///
+/// The async resolution is bridged to the sync `KeyResolver` signature exactly
+/// as the bridge's `IdentityBackedDidResolver::resolve_sync` does: inside a
+/// tokio runtime, [`block_in_place`](tokio::task::block_in_place) drives the
+/// resolve on `handle` without starving a worker thread; outside one (no
+/// current runtime), `handle.block_on` is used directly.
+///
+/// Per the `KeyResolver` contract, any resolution failure — unknown DID,
+/// missing verification method, network-unavailable, downgrade, or a malformed
+/// key — collapses to `None`, which the governance engine treats as a rejected
+/// vote (fail closed). `None` here is the per-lookup miss, NOT a global stub.
+///
+/// This is the canonical builder for a co-located (bundled-shape) participant's
+/// governance resolver. The production `host_site` path wires it over the node's
+/// shared cache/DHT client (see [`build_shared_cache_key_resolver`]); external
+/// callers constructing a [`DeploySiteParams`] (e.g. an integration test) build
+/// it the same way over their own
+/// [`DualLayerResolver`](scp_identity::DualLayerResolver).
+pub fn document_vm_key_resolver<R: scp_identity::resolver::DidResolver + 'static>(
+    resolver: Arc<R>,
+    handle: tokio::runtime::Handle,
+) -> scp_core::context::governance::KeyResolver {
+    Arc::new(
+        move |did: &scp_identity::DID, kid: scp_identity::SigningKeyId| {
+            let resolver = Arc::clone(&resolver);
+            let did_owned = did.as_ref().to_owned();
+            let handle = handle.clone();
+            // Bridge async -> sync exactly like IdentityBackedDidResolver::resolve_sync.
+            let resolve_outcome = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| handle.block_on(resolver.resolve(&did_owned)))
+            } else {
+                handle.block_on(resolver.resolve(&did_owned))
+            };
+            // Any error or absent document is a per-lookup miss (fail closed).
+            let doc = resolve_outcome.ok().flatten()?;
+            scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+        },
+    )
+}
+
 /// Builds an in-process [`Supervisor`](scp_core::context::supervisor::Supervisor)
 /// connected to the node's own loopback relay and registers `author_did` as a
 /// local DID.
@@ -416,10 +484,19 @@ impl SelfHostDeployer {
 /// The supervisor publishes encrypted envelopes onto the same relay whose blob
 /// storage the node's [`commit_deploy`](ApplicationNode::commit_deploy) scans,
 /// closing the publish -> commit loop in-process.
+///
+/// `key_resolver` is the REAL document-derived governance resolver (built via
+/// [`document_vm_key_resolver`] over a [`DualLayerResolver`](scp_identity::DualLayerResolver)
+/// that shares the node's [`DidCache`](scp_identity::DidCache)). It is passed
+/// straight into [`Supervisor::with_providers`], so the co-located participant
+/// verifies governance votes against each voter's published verification method
+/// — never the `|_, _| None` stub the bundled path used to ship (ADR-053 / spec
+/// §10.17).
 async fn connect_loopback_supervisor<S>(
     node: &ApplicationNode<S>,
     node_did: &str,
     author_did: &scp_identity::DID,
+    key_resolver: scp_core::context::governance::KeyResolver,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
@@ -449,11 +526,6 @@ where
     ));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
-    // Fail-closed resolver: the VM-aware document resolver lives in scp-ffi-common,
-    // which depends on scp-node (cycle), so wiring it needs the resolver hoisted to
-    // a shared lower-layer crate. Tracked as an SCP-AB-021 follow-up.
-    let key_resolver: scp_core::context::governance::KeyResolver =
-        Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
     let supervisor = scp_core::context::supervisor::Supervisor::with_providers(
@@ -1096,6 +1168,15 @@ where
         on_ready,
     };
 
+    // The co-located participant's governance resolver MUST share the node's
+    // `DidCache` (consistency + the load-bearing cache-level anti-rollback
+    // sequence guard) and resolve via the same DHT client the node uses. Each
+    // arm builds a `DualLayerResolver` over the concrete `DidDht`'s shared
+    // `cache()`/`dht_client()`, then lowers it to the object-safe governance
+    // `KeyResolver` (ADR-053 / spec §10.17, SHB-002). The `DhtMode::Memory` arm
+    // wires the in-memory client (the resolver only ever resolves the local
+    // participant's own published DID document there).
+    let handle = tokio::runtime::Handle::current();
     match dht_mode {
         DhtMode::Memory => {
             tracing::info!(
@@ -1104,7 +1185,12 @@ where
             );
             let (did_method, seq_init) =
                 build_memory_did_method(Arc::clone(&common.custody), cache, sequence_store);
-            serve_hosted_site(common, did_method, seq_init, shutdown).await
+            let key_resolver = build_shared_cache_key_resolver(
+                Arc::clone(did_method.dht_client()),
+                Arc::clone(did_method.cache()),
+                handle,
+            );
+            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
         }
         DhtMode::Production => {
             tracing::warn!(
@@ -1118,9 +1204,42 @@ where
                 sequence_store,
                 &dht_gateways,
             )?;
-            serve_hosted_site(common, did_method, seq_init, shutdown).await
+            let key_resolver = build_shared_cache_key_resolver(
+                Arc::clone(did_method.dht_client()),
+                Arc::clone(did_method.cache()),
+                handle,
+            );
+            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
         }
     }
+}
+
+/// Builds the co-located participant's document-derived governance
+/// [`KeyResolver`](scp_core::context::governance::KeyResolver) over a
+/// [`DualLayerResolver`](scp_identity::DualLayerResolver) that SHARES the node's
+/// [`DidCache`](scp_identity::DidCache) and resolves via the node's `dht_client`
+/// (ADR-053 / spec §10.17, SHB-002).
+///
+/// Sharing the cache is load-bearing: the cache-level sequence check inside
+/// [`resolve`](scp_identity::resolver::DidResolver::resolve) is the authoritative
+/// anti-rollback guard, and operating on the node's shared cache keeps the
+/// participant's view consistent with the node's. The relay layer is a
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
+/// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
+/// QUERY source, so DID resolution flows through the DHT layer (and cache).
+fn build_shared_cache_key_resolver<D: scp_identity::dht_client::DhtClient + 'static>(
+    dht_client: Arc<D>,
+    cache: Arc<DidCache>,
+    handle: tokio::runtime::Handle,
+) -> scp_core::context::governance::KeyResolver {
+    let relay = Arc::new(scp_identity::resolver::NoOpRelayQuerier);
+    let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+        relay,
+        dht_client,
+        cache,
+        Vec::new(),
+    ));
+    document_vm_key_resolver(resolver, handle)
 }
 
 /// The DHT-mode-independent inputs threaded from [`host_site_until`] into the
@@ -1152,6 +1271,7 @@ struct ServeHostedSite {
 async fn serve_hosted_site<D, F>(
     common: ServeHostedSite,
     did_method: Arc<D>,
+    key_resolver: scp_core::context::governance::KeyResolver,
     seq_init: SeqInitFn,
     shutdown: F,
 ) -> Result<(), HostSiteError>
@@ -1206,13 +1326,15 @@ where
     let asset_count = assets.len();
 
     // -- Build the deployer ONCE (one supervisor/group/key, reused for the
-    //    initial deploy and every refresh). --
+    //    initial deploy and every refresh). The co-located participant carries
+    //    the REAL document-derived governance resolver (ADR-053 / spec §10.17). --
     let deployer = match build_host_site_deployer(
         node.as_ref(),
         &storage_dir,
         &storage_key,
         &node_did,
         &context_id,
+        key_resolver,
     )
     .await
     {
@@ -1914,6 +2036,7 @@ async fn build_host_site_deployer<S>(
     storage_key: &Zeroizing<[u8; 32]>,
     node_did: &str,
     context_id: &str,
+    key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Result<SelfHostDeployer, HostSiteError>
 where
     S: scp_platform::EncryptedStorage + 'static,
@@ -1935,6 +2058,7 @@ where
         context_id.to_owned(),
         SELF_HOST_HOSTNAME.to_owned(),
         signing_key_handle,
+        key_resolver,
         mls_storage,
     )
     .await
@@ -2381,5 +2505,122 @@ mod tests {
         const PORT: u16 = 8443;
         // No mappers: nothing to remove. This must complete cleanly.
         release_self_host_mappings(None, None, PORT).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Co-located participant KeyResolver (ADR-053 / spec §10.17, SHB-002)
+    //
+    // Proves the bundled self-host participant's governance resolver is the REAL
+    // document-derived resolver — it resolves a registered DID's #active key and
+    // fails closed (None) for an unknown DID — NOT the `|_, _| None` stub the
+    // path used to ship.
+    // -----------------------------------------------------------------------
+
+    /// Seeds a self-certifying, BEP44-signed DID document into `dht`, returning
+    /// the DID and its `#active` verifying key. The DID is derived from (and the
+    /// document signed by) the identity key — the production self-certification
+    /// invariant the `DualLayerResolver` enforces.
+    async fn seed_self_host_identity(
+        dht: &InMemoryDhtClient,
+    ) -> (String, ed25519_dalek::VerifyingKey) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use scp_identity::DhtClient;
+
+        // Distinct identity (#0) and active (#active) keys.
+        let identity_signing = SigningKey::from_bytes(&[11u8; 32]);
+        let active_signing = SigningKey::from_bytes(&[22u8; 32]);
+        let identity_public = identity_signing.verifying_key();
+        let active_public = active_signing.verifying_key();
+
+        let did = scp_identity::did_from_ed25519_public_key(identity_public.as_bytes());
+        let pre_rotation_commitment: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(
+                SigningKey::from_bytes(&[33u8; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .into()
+        };
+        let doc = scp_identity::DidDocument::new(
+            &did,
+            identity_public.as_bytes(),
+            active_public.as_bytes(),
+            &pre_rotation_commitment,
+        );
+
+        // BEP44-sign the serialized document with the identity key (seq = 1).
+        let value = doc.to_json().expect("doc serializes").into_bytes();
+        let signable = scp_identity::dht::bep44_signable(&value, 1);
+        let signature: [u8; 64] = identity_signing.sign(&signable).to_bytes();
+        dht.publish(identity_public.as_bytes(), &signature, &value, 1)
+            .await
+            .expect("publish to in-memory DHT");
+
+        (did, active_public)
+    }
+
+    /// SHB-002: the co-located participant's `KeyResolver`, built via
+    /// [`document_vm_key_resolver`] over a `DualLayerResolver` sharing an
+    /// in-memory DHT + cache, resolves a registered DID's `#active` key and
+    /// returns `None` for an unknown DID — proving it is the REAL
+    /// document-derived resolver, not the constant-`None` stub.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_host_supervisor_keyresolver_resolves_active_key() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let cache = Arc::new(DidCache::new());
+
+        // Register a DID document into the shared in-memory DHT.
+        let (did, active_public) = seed_self_host_identity(&dht).await;
+
+        // Build the co-located participant resolver over the SHARED cache + DHT,
+        // exactly as the production `host_site` path wires it.
+        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::clone(&dht),
+            Arc::clone(&cache),
+            Vec::new(),
+        ));
+        let key_resolver = document_vm_key_resolver(resolver, tokio::runtime::Handle::current());
+
+        // A real resolver returns the document's #active key (NOT the None stub).
+        let active_result = tokio::task::spawn_blocking({
+            let key_resolver = Arc::clone(&key_resolver);
+            let did = did.clone();
+            move || {
+                key_resolver(
+                    &scp_identity::DID::from(did),
+                    scp_identity::SigningKeyId::Active,
+                )
+            }
+        })
+        .await
+        .expect("resolver task joins");
+        assert_eq!(
+            active_result,
+            Some(active_public),
+            "the co-located KeyResolver must resolve the registered DID's #active \
+             key (proves it is the real document-derived resolver, not |_,_| None)"
+        );
+
+        // An unknown DID fails closed (None) — also proving it is not a constant
+        // that returns the same key for every input.
+        let unknown_pk: [u8; 32] = [0x44; 32];
+        let unknown_did = scp_identity::did_from_ed25519_public_key(&unknown_pk);
+        let unknown = tokio::task::spawn_blocking({
+            let key_resolver = Arc::clone(&key_resolver);
+            move || {
+                key_resolver(
+                    &scp_identity::DID::from(unknown_did),
+                    scp_identity::SigningKeyId::Active,
+                )
+            }
+        })
+        .await
+        .expect("resolver task joins");
+        assert!(
+            unknown.is_none(),
+            "an unknown DID must resolve to None (fail closed)"
+        );
     }
 }

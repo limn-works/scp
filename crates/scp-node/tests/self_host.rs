@@ -103,7 +103,32 @@ struct BuiltNode {
     custody: Arc<SqliteKeyCustody>,
     storage_dir: std::path::PathBuf,
     storage_key: Zeroizing<[u8; 32]>,
+    /// The in-memory DHT client backing the node's DID method, retained so the
+    /// co-located participant's governance resolver can share it (and the node's
+    /// `DidCache`) — exactly as the production `host_site` path wires it. The
+    /// node publishes its own DID document into this client at build time, so a
+    /// resolver over it resolves the node DID.
+    dht_client: Arc<InMemoryDhtClient>,
+    /// The node's `DidCache`, shared with the co-located participant resolver
+    /// (the cache-level sequence check is the load-bearing anti-rollback guard).
+    cache: Arc<DidCache>,
     _tmp: tempfile::TempDir,
+}
+
+impl BuiltNode {
+    /// Builds the co-located participant's REAL document-derived governance
+    /// `KeyResolver` over a `DualLayerResolver` that SHARES this node's DHT
+    /// client and `DidCache` (ADR-053 / spec §10.17, SHB-002) — the same shape
+    /// the production `host_site` path uses, never the `|_, _| None` stub.
+    fn key_resolver(&self) -> scp_core::context::governance::KeyResolver {
+        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::clone(&self.dht_client),
+            Arc::clone(&self.cache),
+            Vec::new(),
+        ));
+        scp_node::document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
+    }
 }
 
 /// Builds a no-domain `ApplicationNode` over real encrypted `SQLite` storage via
@@ -119,11 +144,18 @@ async fn build_self_host_node() -> BuiltNode {
         SqliteStorage::new(&storage_dir, storage_key.as_ref()).expect("node SQLite should open");
     let custody = build_custody(&storage_dir, &storage_key).await;
 
-    // DID method over an in-memory DHT (offline; nothing published).
+    // DID method over an in-memory DHT (offline; nothing published externally).
+    // Retain clones of the DHT client + cache so the co-located participant's
+    // governance resolver can SHARE them (the node publishes its own DID
+    // document into this client at identity-generation time).
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
     let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+    let did_method = Arc::new(DidDht::with_client_and_signer(
+        Arc::clone(&dht_client),
+        Arc::clone(&cache),
+        sign_fn,
+    ));
 
     // Persistent, disk-backed blob storage — the SAME wiring the production
     // `--self-host` path uses (`run_self_host_with` calls `.blob_storage(...)`
@@ -171,6 +203,8 @@ async fn build_self_host_node() -> BuiltNode {
         custody,
         storage_dir,
         storage_key,
+        dht_client,
+        cache,
         _tmp: tmp,
     }
 }
@@ -185,13 +219,19 @@ async fn build_self_host_node() -> BuiltNode {
 // (this mirrors the production binary's `#[tokio::main]` multi-thread runtime).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
+    let built = build_self_host_node().await;
+    // The REAL document-derived governance resolver, sharing the node's cache +
+    // DHT client (ADR-053 / spec §10.17, SHB-002).
+    let key_resolver = built.key_resolver();
     let BuiltNode {
         node,
         custody,
         storage_dir,
         storage_key,
+        dht_client: _dht_client,
+        cache: _cache,
         _tmp,
-    } = build_self_host_node().await;
+    } = built;
     let node_did = node.identity().did().to_owned();
 
     // -- Supervisor MLS storage over a SECOND encrypted SQLite handle, exactly
@@ -229,6 +269,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         deploy_id: "selfhost-deploy-1".to_owned(),
         hostname: "selfhost.scp.local".to_owned(),
         signing_key_handle,
+        key_resolver,
         custody: custody.as_ref(),
         mls_storage,
         assets: &assets,
@@ -317,6 +358,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         context_id.to_owned(),
         "selfhost.scp.local".to_owned(),
         signing_key_handle,
+        built.key_resolver(),
         mls_storage,
     )
     .await
@@ -741,12 +783,18 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
         .await
         .expect("the shared root handle must be usable while the node also holds it");
 
-    // -- Custody + DID method (offline in-memory DHT), as in `build_self_host_node`. --
+    // -- Custody + DID method (offline in-memory DHT), as in `build_self_host_node`.
+    //    Retain clones of the DHT client + cache so the co-located participant's
+    //    governance resolver shares them (ADR-053 / spec §10.17, SHB-002). --
     let custody = build_custody(&storage_dir, &storage_key).await;
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
     let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+    let did_method = Arc::new(DidDht::with_client_and_signer(
+        Arc::clone(&dht_client),
+        Arc::clone(&cache),
+        sign_fn,
+    ));
 
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
@@ -777,6 +825,18 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
          lock conflict (os error 35)",
     );
 
+    // -- The REAL document-derived governance resolver over the node's shared
+    //    DHT client + cache (ADR-053 / spec §10.17, SHB-002). --
+    let key_resolver = {
+        let resolver = Arc::new(scp_identity::DualLayerResolver::new(
+            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::clone(&dht_client),
+            Arc::clone(&cache),
+            Vec::new(),
+        ));
+        scp_node::document_vm_key_resolver(resolver, tokio::runtime::Handle::current())
+    };
+
     // -- Deploy the embedded site and assert it serves end to end. The
     //    sequence-store-like owner is passed in so it stays alive across the
     //    deploy/serve — exactly one advisory-lock holder for the whole test. --
@@ -786,6 +846,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
         &storage_dir,
         &storage_key,
         "selfhost-shared-storage-deploy",
+        key_resolver,
     )
     .await;
 
@@ -806,6 +867,7 @@ async fn deploy_embedded_and_assert_serves<S>(
     storage_dir: &std::path::Path,
     storage_key: &Zeroizing<[u8; 32]>,
     deploy_id: &str,
+    key_resolver: scp_core::context::governance::KeyResolver,
 ) where
     S: scp_platform::EncryptedStorage + 'static,
 {
@@ -832,6 +894,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             deploy_id: deploy_id.to_owned(),
             hostname: "selfhost.scp.local".to_owned(),
             signing_key_handle,
+            key_resolver,
             custody,
             mls_storage,
             assets: &assets,
