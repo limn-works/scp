@@ -1205,11 +1205,20 @@ fn build_supervisor(
     // is dropped immediately; the retained sender keeps the channel open so
     // later subscribers (wired at node startup) observe subsequent events.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    // Wire the production VM-aware governance key resolver when a DID resolver
+    // is configured; otherwise fail closed with the always-`None` resolver so
+    // governance vote-signature verification is never silently permissive.
+    let key_resolver = bi
+        .core
+        .did_resolver()
+        .map_or_else(not_configured_key_resolver, |r| {
+            document_vm_key_resolver(std::sync::Arc::clone(r))
+        });
     Ok(scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
         transport,
         event_log,
-        not_configured_key_resolver(),
+        key_resolver,
         persistence,
         None,
         Some(event_tx),
@@ -1292,6 +1301,15 @@ where
 /// Delegates to [`scp_ffi_common::bridge_runtime::not_configured_key_resolver`].
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
+}
+
+/// Builds the production VM-aware governance key resolver from a DID resolver.
+///
+/// Delegates to [`scp_ffi_common::bridge_runtime::document_vm_key_resolver`].
+fn document_vm_key_resolver(
+    did_resolver: std::sync::Arc<scp_ffi_common::IdentityBackedDidResolver>,
+) -> scp_core::context::governance::KeyResolver {
+    scp_ffi_common::bridge_runtime::document_vm_key_resolver(did_resolver)
 }
 
 // ---------------------------------------------------------------------------

@@ -9396,12 +9396,27 @@ impl Scp {
                     })?;
 
                 let sender_did: scp_identity::DID = identity.did.clone().into();
+                // Every send path requires a signing key; `MessageSigner` is
+                // non-optional. Fail closed with a descriptive error when the
+                // key cannot be resolved rather than handing the send path a
+                // `None` it would only reject downstream.
+                let signing_key = resolved_signing_key.ok_or_else(|| ScpError::Crypto {
+                    msg: "signing key required for send: could not resolve the sender's signing \
+                          key from retained custody"
+                        .to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
+                })?;
                 manager
                     .send_message(
                         &core_handle,
                         &sender_did,
                         &payload,
-                        resolved_signing_key.as_ref(),
+                        // ADR-039: UniFFI bridge sends under the human `#active`
+                        // key today; per-message persona selection is out of
+                        // scope for this runtime-pipeline wiring (FFI is
+                        // mechanically widened only). `MessageSigner` pairs key +
+                        // persona so they cannot diverge.
+                        scp_core::context::supervisor::MessageSigner::Active(&signing_key),
                         None,
                         spending_ucan.as_ref(),
                     )

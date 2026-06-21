@@ -28,6 +28,7 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
+use scp_protocol::identity::SigningKeyId;
 
 use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
@@ -39,24 +40,31 @@ use crate::economy::integration::{self, IntegrationError};
 /// Adapts the [`KeyResolver`] closure that the `ContextManager` already
 /// holds for governance vote verification into a UCAN [`DidResolver`].
 ///
-/// The runtime models a single signing key per DID (`KeyResolver` returns
-/// `Option<VerifyingKey>`). Spending UCANs declare `kid: "#agent"` per
-/// ADR-039, but until full DID-document resolution is wired the runtime
-/// resolves both `#active` and `#agent` to the same key — the one the
-/// caller registered for the DID. This is the same model that governance
-/// uses for vote signature verification, so it never produces a different
-/// answer than the rest of the runtime.
+/// The [`KeyResolver`] is VM-aware (ADR-039): it takes a `(DID, SigningKeyId)`
+/// pair and returns the verifying key for that specific verification method.
+/// This adapter threads the UCAN `kid` header through to the resolver so that
+/// a spending UCAN declaring `kid: "#agent"` is verified against the agent key
+/// and one declaring (or defaulting to) `#active` is verified against the
+/// human key — they no longer collapse to a single key.
 ///
-/// When a DID has no key registered (the `noop_key_resolver` test path),
-/// resolution returns [`UcanError::MalformedToken`] which the spending
-/// UCAN validator surfaces as a signature failure — closing the C1 attack
-/// where a fabricated UCAN with no real signer was accepted.
+/// The bare [`resolve_public_key`](DidResolver::resolve_public_key) path (no
+/// `kid` in the header) resolves `#active`, the default verification method.
+/// [`resolve_public_key_by_kid`](DidResolver::resolve_public_key_by_kid) parses
+/// the `kid` fragment (`"#active"` / `"#agent"`) into a [`SigningKeyId`] and
+/// passes it to the resolver; an unrecognized fragment is rejected as
+/// [`UcanError::MalformedToken`].
 ///
-/// `pub(crate)` so the cross-context tool-invocation saga handler
-/// ([`crate::context::actor::handlers::saga`]) reuses the SAME DID→key
+/// When a DID has no key registered for the requested verification method (the
+/// `noop_key_resolver` test path, or a DID with no `#agent` key), resolution
+/// returns [`UcanError::MalformedToken`] which the spending UCAN validator
+/// surfaces as a signature failure — closing the C1 attack where a fabricated
+/// UCAN with no real signer was accepted.
+///
+/// Public so the cross-context tool-invocation saga handler
+/// ([`crate::context::actor::handlers::saga`]) reuses the SAME VM-aware DID→key
 /// adapter for its §7 UCAN re-validation (spec §6.2.4), rather than
-/// reimplementing the single-key `#active`/`#agent` collapse and so producing
-/// a divergent answer than the rest of the runtime.
+/// reimplementing the `#active`/`#agent` resolution and so producing a divergent
+/// answer than the rest of the runtime.
 pub struct KeyResolverDidResolver<'a> {
     key_resolver: &'a KeyResolver,
 }
@@ -69,8 +77,10 @@ impl<'a> KeyResolverDidResolver<'a> {
 
 impl DidResolver for KeyResolverDidResolver<'_> {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
+        // No `kid` in the header: resolve the default verification method
+        // (`#active`, the human signing key).
         let did_owned = scp_identity::DID::from(did.to_owned());
-        (self.key_resolver)(&did_owned)
+        (self.key_resolver)(&did_owned, SigningKeyId::Active)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
                 UcanError::MalformedToken(format!(
@@ -80,14 +90,26 @@ impl DidResolver for KeyResolverDidResolver<'_> {
             })
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, _kid: &str) -> Result<[u8; 32], UcanError> {
-        // Single-key model: the manager's KeyResolver does not differentiate
-        // between #active and #agent. Both fragments resolve to the same
-        // key. When the runtime grows full DID-document resolution this
-        // method will become kid-aware. For now we deliberately collapse so
-        // that signature verification still runs (closing C1) instead of
-        // silently being skipped.
-        self.resolve_public_key(did)
+    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
+        // VM-aware resolution (ADR-039): map the UCAN `kid` fragment to the
+        // verification method it names (via the single canonical parser), then
+        // resolve that specific key from the DID document. An unrecognized
+        // fragment is a malformed token.
+        let signing_key_id = SigningKeyId::from_fragment(kid).ok_or_else(|| {
+            UcanError::MalformedToken(format!(
+                "UCAN kid '{kid}' is not a known verification method \
+                 (expected \"#active\" or \"#agent\") for DID '{did}'"
+            ))
+        })?;
+        let did_owned = scp_identity::DID::from(did.to_owned());
+        (self.key_resolver)(&did_owned, signing_key_id)
+            .map(|vk| vk.to_bytes())
+            .ok_or_else(|| {
+                UcanError::MalformedToken(format!(
+                    "no public key registered for DID '{did}' verification method '{kid}' \
+                     (key_resolver returned None) — spending UCAN signature cannot be verified"
+                ))
+            })
     }
 }
 
@@ -300,11 +322,12 @@ pub struct EnforceEconomyRequest<'a> {
     pub revoked_spending_ucan_cids: &'a HashSet<String>,
     /// Resolver for the actor's UCAN signing key (C1, PR #1606).
     ///
-    /// The runtime models a single signing key per DID. Spending UCANs
-    /// declare `kid: "#agent"` per ADR-039, but until full DID-document
-    /// resolution is wired the runtime resolves both `#active` and
-    /// `#agent` to whatever the manager's `KeyResolver` returns. This is
-    /// the same resolver used for governance vote verification.
+    /// VM-aware per ADR-039: the [`KeyResolver`] takes a `(DID, SigningKeyId)`
+    /// pair, so a spending UCAN declaring `kid: "#agent"` is verified against
+    /// the agent key and one defaulting to `#active` against the human key.
+    /// The [`KeyResolverDidResolver`] adapter parses the UCAN `kid` header into
+    /// a [`SigningKeyId`] and threads it through. This is the same resolver
+    /// used for governance vote verification.
     pub key_resolver: &'a KeyResolver,
 }
 

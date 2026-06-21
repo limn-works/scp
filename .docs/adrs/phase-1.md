@@ -162,7 +162,7 @@ Two-layer envelope format:
 - `payload` — the actual message content (after bucket padding, Decision 3)
 - `provenance` — origin metadata (spec section 7.7)
 
-**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`
+**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`
 
 The `signing_key_id` field (ADR-039) identifies which verification method signed the envelope (e.g., `"#active"` or `"#agent"`). It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the correct public key from the sender's DID document.
 
@@ -206,7 +206,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - The `signing_key_id` parameter (ADR-039) identifies which verification method is signing (e.g., `"#active"` or `"#agent"`). Stored on the `InnerEnvelope` for verifier key resolution.
    - Computes `payload_hash = SHA256(payload)` — hash of the original plaintext BEFORE padding. Enables content-addressing and deduplication by recipients.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent.
-   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`.
+   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id))`.
    - Pads payload to next bucket boundary (256B, 1KB, 4KB, 16KB, 64KB, 256KB) AFTER signing.
    - Returns the complete inner envelope struct with all fields (including padded payload, `signing_key_id`) + signature.
 
@@ -228,7 +228,7 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
    - Resolves the correct public key from the sender's DID document using `inner_envelope.signing_key_id` (ADR-039). For example, `signing_key_id: "#active"` resolves to the `#active` verification method, `"#agent"` resolves to `#agent`.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
-   - Recomputes `SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)`.
+   - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash || signing_key_id)`.
    - Verifies the Ed25519 signature against the resolved public key.
    - A mismatch indicates either payload tampering, provenance tampering, or signing key mismatch — all MUST be rejected.
 

@@ -463,7 +463,8 @@ async fn context_manager_creates_usable_context() {
     println!("\n=== 5: ContextManager creates usable context ===\n");
 
     let network = FullStackNetwork::new();
-    let key_resolver: KeyResolver = Arc::new(|_did| None);
+    let key_resolver: KeyResolver =
+        Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None);
 
     let alice = network.create_node("did:dht:z6MkAliceUsability", key_resolver.clone());
     let bob = network.create_node("did:dht:z6MkBobUsability", key_resolver);
@@ -610,7 +611,8 @@ async fn context_create_produces_active_context_with_members() {
     println!("\n=== 6b: context_create produces active context ===\n");
 
     let network = FullStackNetwork::new();
-    let key_resolver: KeyResolver = Arc::new(|_did| None);
+    let key_resolver: KeyResolver =
+        Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None);
     let alice = network.create_node("did:dht:z6MkAlice6b", key_resolver.clone());
     let bob = network.create_node("did:dht:z6MkBob6b", key_resolver);
 

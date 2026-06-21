@@ -71,7 +71,9 @@ fn signing_key_for(did: &str) -> SigningKey {
 /// verification path in `compare_remote_checkpoint` succeed for legitimately
 /// signed peer checkpoints.
 fn deterministic_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID| Some(signing_key_for(did.as_ref()).verifying_key()))
+    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
+        Some(signing_key_for(did.as_ref()).verifying_key())
+    })
 }
 
 fn encrypted_params() -> ContextParams {

@@ -249,3 +249,28 @@ Notes:
 - Current callers correct; future callers may skip capability check
 - No compile-time enforcement of precondition
 - [Event-Log Substrate Swap Phase 2](eventlog_substrate_swap_phase2.md) — RFC6962 swap: export forgery CLOSED; equivocation detector false-positive under dormant cross-member replication; in-memory dedup wiped on respawn
+
+## ADR-039 Persona Attribution Wiring (branch claude/scp-network-architecture-7zq21l, ba06a8e0+7d4cdcf0)
+
+### BINDING IS SOUND (cryptographically)
+- signing_key_id IS in signed inner-envelope preimage: compute_canonical_hash line 557 (crates/scp-protocol/src/envelope/inner/mod.rs). Domain-separated, length-prefixed.
+- verify_inner_signature (330) reconstructs hash from inner.signing_key_id (370) = same value used for resolution at messaging_helpers.rs:309-310. Consistent.
+- context_id in preimage (549) -> no cross-context replay of persona claim.
+- MITM/relay/non-member cannot flip signing_key_id. Malicious sender cannot make agent msg appear #active UNLESS resolver returns same key for both VMs.
+- Test document_backed_resolver (agent_binding_pipeline_tests.rs:106) maps (DID,Active)/(DID,Agent) to DISTINCT keys; proves wrong-key rejection (test 302). Genuinely tested.
+
+### HIGH (wiring gap, not live-exploitable this diff): every PRODUCTION resolver collapses/returns None
+- self_host.rs:452-453, all FFI bridges, bridge_runtime.rs not_configured_key_resolver, bridge_instance.rs ALL return |_,_| None.
+- VM-aware guarantee wired through types but NO shipping resolver returns distinct keys. A lazy future resolver |did,_| lookup(did) reintroduces collapse silently -> agent msg verifies as #active. No mechanical check forbids ignoring the SigningKeyId arg.
+
+### MEDIUM: all FFI send paths hardcode SigningKeyId::Active
+- napi/context.rs, ffi/src/context.rs, uniffi/bridge.rs. No SDK lets an agent send under #agent. Persona-send is Rust-internal/test-only; accountability claim not expressible from any binding yet.
+
+### LOW (honest deferral, fail-closed): governance votes resolve #active unconditionally
+- mod.rs:1593, majority/multisig/unanimity. Attacker with only #agent key -> verify_vote fails -> vote REJECTED. No false-accept, no grief. Vote carries no signing_key_id (no downgrade vector).
+
+### economy kid-parse robust
+- economy_logic.rs:92 routes through from_fragment (identity.rs:200). Rejects "active"/"agent"/"#0"/""/"#unknown" -> MalformedToken. Exact byte match, no unicode/case coercion, no panic.
+
+### NIT: validate.rs:702-710 enforce_ucan_category_a hand-rolls kid match instead of from_fragment (pre-existing). Drift risk only.
+### CONTEXT: enforce_inner_envelope_category_a never called on live receive path (only sign.rs tests). Pre-existing, out of diff scope.

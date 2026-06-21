@@ -1062,7 +1062,9 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
 /// Deterministic key resolver for governance vote verification.
 fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
     std::sync::Arc::new(
-        |did: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
+        |did: &scp_identity::DID,
+         _kid: scp_identity::SigningKeyId|
+         -> Option<ed25519_dalek::VerifyingKey> {
             use ed25519_dalek::SigningKey;
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1214,21 +1216,42 @@ async fn application_layer_demo() {
 
     let alice_sk = demo_signing_key(&alice);
     manager
-        .send_message(&handle, &alice, msg1, Some(&alice_sk), None, None)
+        .send_message(
+            &handle,
+            &alice,
+            msg1,
+            scp_core::context::supervisor::MessageSigner::Active(&alice_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(msg1));
 
     let bob_sk = demo_signing_key(&bob);
     manager
-        .send_message(&handle, &bob, msg2, Some(&bob_sk), None, None)
+        .send_message(
+            &handle,
+            &bob,
+            msg2,
+            scp_core::context::supervisor::MessageSigner::Active(&bob_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     println!("  Bob sent:     \"{}\"", String::from_utf8_lossy(msg2));
 
     let charlie_sk = demo_signing_key(&charlie);
     manager
-        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None, None)
+        .send_message(
+            &handle,
+            &charlie,
+            msg3,
+            scp_core::context::supervisor::MessageSigner::Active(&charlie_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     println!("  Charlie sent: \"{}\"", String::from_utf8_lossy(msg3));

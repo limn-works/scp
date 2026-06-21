@@ -1138,9 +1138,10 @@
       "gate": "gate-integration",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "crates/scp-core/tests/agent_binding_integration.rs"
+        "crates/scp-runtime/tests/agent_binding_integration.rs",
+        "crates/scp-runtime/src/context/agent_binding_pipeline_tests.rs"
       ],
       "description": "End-to-end integration test exercising the full shared-DID agent binding lifecycle per ADR-039 acceptance criterion 20. The test proves: identity with agent key works, scoped UCAN minting works, MLS group operations with agent credentials work, message sending and verification works, agent key rotation works, Category A enforcement works, custody attestation works. This is the ultimate acceptance criterion for the agent binding feature: create identity with agent key, mint scoped UCAN, join MLS group with agent credential, send message, verify at recipient (correct key resolved), rotate agent key, verify credential update propagates, attempt Category A action with #agent (rejected), verify violation logged.",
       "acceptanceCriteria": [
@@ -1184,7 +1185,9 @@
           "section": "## ADR-039: Shared-DID Human-Agent Identity Model"
         }
       ],
-      "details": {}
+      "details": {
+        "note": "Status corrected from a falsely-set 'done' (commit ac26cc5c, 2026-03-04, which bulk-flipped 22 stories to done in the implementation commit without independent verification). The persona dimension of the live message pipeline is now genuinely implemented and tested end-to-end through the public Supervisor::send_message (crates/scp-runtime/src/context/agent_binding_pipeline_tests.rs), replacing the prior component-only test that bypassed the Supervisor. Remaining before done: agent-key rotation propagation through the pipeline, Category-A rejection + custody-violation logging on the live receive path, three-VM key-continuity fingerprint, one-DID-one-vote; plus a production DID-document-backed KeyResolver and FFI/SDK per-message persona exposure (gate-ffi-bridges; the four bridges currently pin #active)."
+      }
     },
     {
       "id": "SCP-AB-022",

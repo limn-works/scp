@@ -42,7 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Created identity: {}", identity.did);
 
     // ── 2. Build a ContextManager ─────────────────────────────────
-    let key_resolver: KeyResolver = Arc::new(|_did| None);
+    let key_resolver: KeyResolver =
+        Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None);
     let manager = ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport),

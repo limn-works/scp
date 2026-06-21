@@ -119,15 +119,17 @@ fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
 
 /// Mock key resolver: Alice=1, Bob=2, Carol=3.
 fn mock_resolver() -> KeyResolver {
-    Arc::new(|did: &scp_identity::DID| {
-        let did_str: &str = did.as_ref();
-        match did_str {
-            "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
-            "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
-            "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
-            _ => None,
-        }
-    })
+    Arc::new(
+        |did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
+                "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
+                "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
+                _ => None,
+            }
+        },
+    )
 }
 
 fn governance_context(

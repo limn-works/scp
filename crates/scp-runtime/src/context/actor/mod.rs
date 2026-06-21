@@ -1597,7 +1597,8 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None);
         let persistence: Box<dyn crate::context::persistence::ContextPersistence> =
             Box::new(TestPersistence);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =

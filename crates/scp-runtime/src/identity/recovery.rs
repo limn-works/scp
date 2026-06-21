@@ -2014,7 +2014,7 @@ mod tests {
             )),
             Box::new(TestTransport),
             Box::new(TestEventLog),
-            Arc::new(|_| None),
+            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None),
         )
     }
 

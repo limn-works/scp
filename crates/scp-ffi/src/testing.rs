@@ -70,7 +70,7 @@ where
 
 /// Returns a permissive key resolver that always returns `None`.
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did| None)
+    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------

@@ -2764,7 +2764,8 @@ mod tests {
     fn test_supervisor() -> Arc<Supervisor> {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
-        let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let key_resolver: scp_core::context::governance::KeyResolver =
+            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
         let test_did = "did:test:bridge-instance-test".to_owned();
         Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new(test_did)),
@@ -4148,7 +4149,8 @@ mod tests {
         // commit 12c.9g.3.6 — the FFI layer no longer touches
         // `ContextManager`). The supervisor populates its lifted-
         // provider slots and the manager attachment internally.
-        let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let key_resolver: scp_core::context::governance::KeyResolver =
+            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
             Box::new(scp_core::context::LocalTransportProvider),

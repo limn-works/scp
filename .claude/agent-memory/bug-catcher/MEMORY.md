@@ -10,6 +10,10 @@ Notes:
 
 - [UniFFI Swift checksum staleness](uniffi_checksum_staleness.md) — CRITICAL recurring: hand-edited throwing sig + stale checksum int → Swift SDK fatalError on init; detect by regen+diff. Found in 8bcd520c2 (#1543).
 
+### Known Bug Patterns (Jun 2026 — SCP-AB-021 KeyResolver VM-widening, ba06a8e0+7d4cdcf0)
+- **CLEAN review.** KeyResolver widened `Fn(&DID)->Opt<VK>` → `Fn(&DID,SigningKeyId)->Opt<VK>`. Threading verified end-to-end: Supervisor::send_message(param) → SendMessagePayload.signing_key_id → dispatch p.signing_key_id → handle_send_message → messaging_helpers::send_message → encrypt_and_send → build_encrypted_envelope (stamp). verify_and_unwrap reads inner.signing_key_id (wire value, correct). ~30 resolver sites pure signature widenings (single-persona test closures correctly ignore _kid). All FFI bridges + self_host pass SigningKeyId::Active (preserves prior hardcoded-Active inner-envelope behavior — NO regression). economy_logic resolve_public_key_by_kid parses kid via SigningKeyId::from_fragment; validate.rs verify_signature routes by header.kid presence — correct. from_fragment is sole canonical decoder, Deserialize routes through it. Test double Mutex poison handled via PoisonError::into_inner; capture-then-assert ordering correct; MLS-open distinguishes Application/Management/Control, asserts exactly 1 app ciphertext + content roundtrip. clippy allows justified.
+- **NOTE (pre-existing, NOT this diff):** Production resolvers (bridge_instance, self_host, bridge_runtime not_configured) all return None regardless of args. Real DID-doc VM resolution is unwired; only the in-crate pipeline test has a document_backed_resolver. Encrypted-context receive verification fails closed in real deployments. Documented as future work in diff comments.
+
 ### Key Files
 - `/Users/alec/Developer/limn/scp/.docs/specs/` — Full protocol specs.
 - `/Users/alec/Developer/limn/scp/.docs/architecture.md` — Build document (~1024 lines).

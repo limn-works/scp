@@ -7,6 +7,13 @@
 )]
 //! End-to-end integration test for shared-DID agent binding (ADR-039).
 //!
+//! NOTE: this is a *component-level* test — it hand-calls
+//! `create_inner_envelope` / `verify_inner_signature` / governance + attestation
+//! primitives in isolation. The *live-pipeline* counterpart, which drives the
+//! real `build_encrypted_envelope` send helper and the real `verify_and_unwrap`
+//! receive helper over a two-party MLS group, lives in
+//! `crates/scp-runtime/src/context/agent_binding_pipeline_tests.rs` (SCP-AB-021).
+//!
 //! Exercises the full agent binding flow:
 //!
 //! 1. Create a shared-DID identity with human (#active) and agent (#agent) keys.

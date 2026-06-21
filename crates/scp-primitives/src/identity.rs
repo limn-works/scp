@@ -188,6 +188,22 @@ impl SigningKeyId {
             Self::Agent => b"#agent",
         }
     }
+
+    /// Parses a DID document verification-method fragment reference
+    /// (`"#active"` / `"#agent"`) into the corresponding [`SigningKeyId`].
+    ///
+    /// The exact inverse of [`as_fragment`](Self::as_fragment). Returns `None`
+    /// for any unrecognized fragment. This is the single canonical string →
+    /// enum decoder; the `Deserialize` impl and every kid-parsing call site
+    /// should route through it so the permitted set stays closed in one place.
+    #[must_use]
+    pub fn from_fragment(fragment: &str) -> Option<Self> {
+        match fragment {
+            "#active" => Some(Self::Active),
+            "#agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
 }
 
 impl Default for SigningKeyId {
@@ -219,13 +235,11 @@ impl<'de> Deserialize<'de> for SigningKeyId {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "#active" => Ok(Self::Active),
-            "#agent" => Ok(Self::Agent),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown SigningKeyId: {other}, expected \"#active\" or \"#agent\""
-            ))),
-        }
+        Self::from_fragment(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown SigningKeyId: {s}, expected \"#active\" or \"#agent\""
+            ))
+        })
     }
 }
 
@@ -248,6 +262,21 @@ mod tests {
     fn signing_key_id_fragment_ref() {
         assert_eq!(SigningKeyId::Active.fragment_ref(), "#active");
         assert_eq!(SigningKeyId::Agent.fragment_ref(), "#agent");
+    }
+
+    #[test]
+    fn signing_key_id_from_fragment_roundtrips_and_rejects_unknown() {
+        // Exact inverse of `as_fragment` for the two known verification methods.
+        for kid in [SigningKeyId::Active, SigningKeyId::Agent] {
+            assert_eq!(SigningKeyId::from_fragment(kid.as_fragment()), Some(kid));
+        }
+        // Unrecognized fragments (including the bare names without `#`) are
+        // rejected — the permitted set is closed.
+        assert_eq!(SigningKeyId::from_fragment("active"), None);
+        assert_eq!(SigningKeyId::from_fragment("agent"), None);
+        assert_eq!(SigningKeyId::from_fragment("#0"), None);
+        assert_eq!(SigningKeyId::from_fragment("#unknown"), None);
+        assert_eq!(SigningKeyId::from_fragment(""), None);
     }
 
     #[test]
