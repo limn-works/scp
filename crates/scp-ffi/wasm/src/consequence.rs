@@ -1736,4 +1736,223 @@ mod cross_impl_leaf_parity {
              both bridges"
         );
     }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
+    ///
+    /// Native gates `CreateChildContext` on `Capability::ChildContextCreate` in
+    /// `execute_create_child_context` (`governance_helpers.rs`) via
+    /// `ceiling.contains(&Capability::ChildContextCreate)`. The capability is
+    /// absent from the default ceiling, so an out-of-ceiling proposal is
+    /// rejected and mints ZERO leaves. WASM previously returned `None` (ungated)
+    /// for this action — executing it where native rejected — a §9.9.3
+    /// divergence AND a security gap (running an action outside the ceiling).
+    /// WASM now mirrors native: `dispatch_ceiling_capability` returns
+    /// `Some("context_child:create")` (the `ucan_capability_name()` form that
+    /// `ceiling_strings` stores).
+    #[test]
+    fn cross_impl_out_of_ceiling_create_child_context_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-child-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "context_child:create" — the out-of-ceiling
+        // condition. Native's `execute_create_child_context` rejects the same way.
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // Shape mirrors the dispatch-roundtrip fixture in manager.rs tests.
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "CreateChildContext": {"params": {
+                "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+                "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+                "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+                "template_id": null
+            }}
+        }))
+        .expect("CreateChildContext action deserializes");
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling CreateChildContext (context_child:create not in ceiling) MUST be \
+             rejected — identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling CreateChildContext MUST mint ZERO GovernanceActionExecuted \
+             leaves on both bridges"
+        );
+    }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity for `CreateChildContext`: with
+    /// `context_child:create` IN the ceiling, the single-admin propose auto-
+    /// executes and mints EXACTLY ONE `GovernanceActionExecuted` leaf — matching
+    /// native, whose `execute_create_child_context` ceiling check passes.
+    #[test]
+    fn cross_impl_in_ceiling_create_child_context_executes_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-child-in-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // In-ceiling: the UCAN-format string `ceiling_strings` stores for
+        // `ChildContextCreate` (`Capability::ucan_capability_name()`).
+        ctx.test_insert_ceiling("context_child:create");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "CreateChildContext": {"params": {
+                "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+                "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+                "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+                "template_id": null
+            }}
+        }))
+        .expect("CreateChildContext action deserializes");
+
+        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
+            .expect("in-ceiling CreateChildContext auto-executes on single-admin propose");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 1,
+            "an in-ceiling CreateChildContext MUST mint EXACTLY ONE GovernanceActionExecuted leaf \
+             — identical to native (§9.9.3; ADR-031 §8)"
+        );
+    }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
+    ///
+    /// Native gates this on `Capability::ToolInterface` in
+    /// `execute_establish_tool_interface` (`governance_helpers.rs`) via
+    /// `ceiling.contains(&Capability::ToolInterface)`. Absent from the default
+    /// ceiling, so an out-of-ceiling proposal is rejected and mints ZERO leaves.
+    /// WASM previously returned `None` (ungated) — the same divergence/security
+    /// gap as `CreateChildContext`. WASM now returns `Some("tool:interface")`.
+    #[test]
+    fn cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-iface-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "tool:interface" — the out-of-ceiling
+        // condition. Native's `execute_establish_tool_interface` rejects likewise.
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "EstablishToolInterface": {"interface": {
+                "source_context": "ctx-src", "target_context": "ctx-tgt",
+                "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+                "approved_by_source": false, "approved_by_target": false,
+                "outbound_policy": null, "inbound_policy": null
+            }}
+        }))
+        .expect("EstablishToolInterface action deserializes");
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
+             rejected — identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO \
+             GovernanceActionExecuted leaves on both bridges"
+        );
+    }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity for `EstablishToolInterface`:
+    /// with `tool:interface` IN the ceiling, the single-admin propose auto-
+    /// executes and mints EXACTLY ONE `GovernanceActionExecuted` leaf — matching
+    /// native, whose `execute_establish_tool_interface` ceiling check passes.
+    #[test]
+    fn cross_impl_in_ceiling_establish_tool_interface_executes_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-iface-in-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // In-ceiling: `Capability::ToolInterface` is 2-segment, so its
+        // `ucan_capability_name()` form equals its `name()` form: "tool:interface".
+        ctx.test_insert_ceiling("tool:interface");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "EstablishToolInterface": {"interface": {
+                "source_context": "ctx-src", "target_context": "ctx-tgt",
+                "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+                "approved_by_source": false, "approved_by_target": false,
+                "outbound_policy": null, "inbound_policy": null
+            }}
+        }))
+        .expect("EstablishToolInterface action deserializes");
+
+        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
+            .expect("in-ceiling EstablishToolInterface auto-executes on single-admin propose");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 1,
+            "an in-ceiling EstablishToolInterface MUST mint EXACTLY ONE GovernanceActionExecuted \
+             leaf — identical to native (§9.9.3; ADR-031 §8)"
+        );
+    }
 }

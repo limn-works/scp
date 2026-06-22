@@ -702,6 +702,142 @@ async fn governance_out_of_ceiling_action_rejected_native() {
 }
 
 // =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
+// Native gates this on `Capability::ChildContextCreate` in
+// `execute_create_child_context` (`governance_helpers.rs`). With the capability
+// absent from the ceiling, native rejects and mints ZERO leaves — pinning the
+// convergent reject that the WASM bridge now also enforces
+// (`cross_impl_out_of_ceiling_create_child_context_rejected_wasm`). Previously
+// WASM EXECUTED this action (ungated), a §9.9.3 divergence and security gap.
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_create_child_context_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-child-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES ChildContextCreate (context:child:create).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Built via serde to mirror the WASM KAT fixture exactly.
+    let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+        "CreateChildContext": {"params": {
+            "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+            "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+            "template_id": null
+        }}
+    }))
+    .expect("CreateChildContext action deserializes");
+
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling CreateChildContext (context:child:create not in ceiling) MUST be \
+         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling CreateChildContext MUST mint ZERO GovernanceActionExecuted \
+         leaves on native"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
+// Native gates this on `Capability::ToolInterface` in
+// `execute_establish_tool_interface` (`governance_helpers.rs`). With the
+// capability absent from the ceiling, native rejects and mints ZERO leaves —
+// pinning the convergent reject the WASM bridge now also enforces
+// (`cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES ToolInterface (tool:interface).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+        "EstablishToolInterface": {"interface": {
+            "source_context": "ctx-src", "target_context": "ctx-tgt",
+            "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+            "approved_by_source": false, "approved_by_target": false,
+            "outbound_policy": null, "inbound_policy": null
+        }}
+    }))
+    .expect("EstablishToolInterface action deserializes");
+
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
+         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO GovernanceActionExecuted \
+         leaves on native"
+    );
+}
+
+// =========================================================================
 // AC-5: Unanimity — all members approve -> execute
 // =========================================================================
 

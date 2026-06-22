@@ -2879,13 +2879,64 @@ impl WasmContextManager {
     /// `CapabilityCeiling::contains` uses exact set membership for these
     /// capabilities (only `ToolInvoke` has wildcard special-casing).
     fn dispatch_ceiling_capability(action: &GovernanceAction) -> Option<&'static str> {
+        // EXHAUSTIVE match over every `GovernanceAction` variant — NO wildcard.
+        // This MUST mirror, one-for-one, native's per-action ceiling gates
+        // (`state.role_state.ceiling.contains(&Capability::X)`) in
+        // `governance_helpers.rs`. The exhaustive match is closed-by-construction:
+        // a newly-added `GovernanceAction` variant becomes a COMPILE ERROR here,
+        // forcing the author to decide its ceiling gate explicitly rather than
+        // silently inheriting `None` (a `_ => None` wildcard is exactly why
+        // `CreateChildContext` and `EstablishToolInterface` were previously
+        // ungated in WASM while native rejected them — a §9.9.3 divergence and a
+        // security gap). Strings are exact `Capability::ucan_capability_name()`
+        // outputs (the form `ceiling_strings` stores) and are matched with EXACT
+        // membership against `ceiling_strings`, because native's
+        // `CapabilityCeiling::contains` uses exact set membership for all these
+        // capabilities (only `ToolInvoke` has wildcard special-casing).
         match action {
+            // member:ban — native: execute_suspend_member, execute_revoke,
+            // execute_restore_access, and the inline SuspendAccess arm in
+            // dispatch_governance_action (governance_helpers.rs).
             GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
             | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. } => Some("member:ban"),
+            // tool:register — native: execute_register_tool.
             GovernanceAction::RegisterTool { .. } => Some("tool:register"),
-            _ => None,
+            // context_child:create — native: execute_create_child_context.
+            // `ChildContextCreate.name()` is the 3-segment "context:child:create",
+            // but `ceiling_strings` stores the UCAN form "context_child:create"
+            // (`Capability::ucan_capability_name()`), so we match on that.
+            GovernanceAction::CreateChildContext { .. } => Some("context_child:create"),
+            // tool:interface — native: execute_establish_tool_interface.
+            GovernanceAction::EstablishToolInterface { .. } => Some("tool:interface"),
+            // NOT ceiling-gated at dispatch in native — authorization is entirely
+            // at propose time. Returning `None` keeps WASM's accept/reject byte-
+            // identical to native (§9.9.3). Listed explicitly (no wildcard) so a
+            // future variant cannot silently default to ungated.
+            GovernanceAction::AddMember { .. }
+            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::ChangeRole { .. }
+            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::ModifyCeiling { .. }
+            | GovernanceAction::CloseContext { .. }
+            | GovernanceAction::ExtendTtl { .. }
+            | GovernanceAction::TransferAdmin { .. }
+            | GovernanceAction::ModifyPruningPolicy { .. }
+            | GovernanceAction::AddSigner { .. }
+            | GovernanceAction::RemoveSigner { .. }
+            | GovernanceAction::ModifyThreshold { .. }
+            | GovernanceAction::ResetMember { .. }
+            | GovernanceAction::ResolveConflict { .. }
+            | GovernanceAction::PromoteContext
+            | GovernanceAction::RotateContentKeys { .. }
+            | GovernanceAction::ReconfigureGovernance { .. }
+            | GovernanceAction::SetEconomicPolicy { .. }
+            | GovernanceAction::ApproveSpend { .. }
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ProposeContextMigration { .. }
+            | GovernanceAction::CancelContextMigration
+            | GovernanceAction::ModifyHardRateLimit { .. } => None,
         }
     }
 
