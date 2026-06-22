@@ -6364,13 +6364,17 @@ impl WasmContextManager {
         // regardless of which member's timer fired or what its local clock read
         // — NOT each member's local `crate::time::now_secs()`, which would
         // diverge the leaf at equal event count and trip §9.9.3 equivocation
-        // detection across native/WASM. This mirrors native `finalize_close`
-        // (`ttl_close_helpers.rs`), which stamps
-        // `state.ttl.timer.deadline_unix_secs.unwrap_or_else(|| now_secs())`:
-        // `deadline_unix_secs` holds `creation + ttl` (auto-reflecting any
-        // TTL extension, which mutates `ttl_seconds` here / `deadline_unix_secs`
-        // there by the same delta), and falls back to the closer's clock only
-        // for a governance/explicit close of a no-TTL context. WASM mirrors that
+        // detection across native/WASM. This mirrors native: the convergent
+        // close timestamp is computed in the CALLER `ttl_close_helpers.rs`'s
+        // `finalize_close` as
+        // `state.ttl.timer.deadline_unix_secs.unwrap_or_else(|| now_secs())`
+        // and passed as the pre-computed `timestamp_secs` argument into
+        // `ttl::finalize_close` (`crates/scp-runtime/src/context/ttl.rs`), which
+        // stamps it onto the `ContextClosed` leaf. `deadline_unix_secs` holds
+        // `creation + ttl` (auto-reflecting any TTL extension, which mutates
+        // `ttl_seconds` here / `deadline_unix_secs` there by the same delta), and
+        // falls back to the closer's clock only for a governance/explicit close
+        // of a no-TTL context. WASM mirrors that
         // exactly via `convergent_ttl_deadline_secs(creation, ttl_seconds)`:
         // `Some(ttl) => creation + ttl`, else local `now_secs()`. Identical to
         // `handle_ttl_expiry`'s `expiry_leaf_secs` so a close and an expiry of
