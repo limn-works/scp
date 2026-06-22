@@ -300,6 +300,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
     let grace_entries = ctx.epoch.grace_store.to_grace_entries();
     ContextSnapshot {
         context_id: ctx.handle.context_id().to_owned(),
+        creation_timestamp_secs: ctx.creation_timestamp_secs,
         state,
         context_params: ctx.handle.params().clone(),
         membership: ctx.membership.clone(),

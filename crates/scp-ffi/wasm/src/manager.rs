@@ -333,6 +333,19 @@ pub(crate) struct PerContextState {
     /// MLS encryption + sender key state. `Some` for encrypted contexts,
     /// `None` for broadcast-only or unencrypted contexts.
     crypto: Option<crate::crypto::WasmCryptoState>,
+    /// Convergent creator-assigned context-creation timestamp (Unix seconds).
+    ///
+    /// The same value this member stamped on the `ContextCreated` event-log leaf
+    /// at `create_context` (creator), or restored from the export snapshot on
+    /// `import_context` (§7.3.1, §9.9.3). Used as the convergent base for the TTL
+    /// expiry deadline (`creation_timestamp_secs + ttl_seconds`) recorded on the
+    /// `ContextExpired` leaf, so a TTL-fired close converges across members
+    /// instead of stamping each member's local fire-time `now()`.
+    ///
+    /// `0` when no convergent creation time is known (e.g. the bare test-helper
+    /// state). The WASM bridge keeps its own independent representation — it is
+    /// NOT byte-parity with the native `ContextSnapshot`.
+    creation_timestamp_secs: u64,
 }
 
 /// A stateful tool session for the WASM bridge.
@@ -1200,6 +1213,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         consequence_rules: Vec::new(),
         cooldown_until: HashMap::new(),
         crypto: None,
+        creation_timestamp_secs: 0,
     }
 }
 
@@ -1404,6 +1418,12 @@ impl WasmContextManager {
             },
         );
 
+        // Creator-assigned creation time (this member is the creator). Bound
+        // once so the `ContextCreated` leaf timestamp below and the stored
+        // convergent `creation_timestamp_secs` are the identical value every
+        // member copies (§7.3.1, §9.9.3).
+        let creation_timestamp_secs = crate::time::now_secs();
+
         let per_context = PerContextState {
             state: "active".to_owned(),
             params_json: params.clone(),
@@ -1439,6 +1459,7 @@ impl WasmContextManager {
             consequence_rules,
             cooldown_until: HashMap::new(),
             crypto,
+            creation_timestamp_secs,
         };
 
         self.contexts.insert(context_id.to_owned(), per_context);
@@ -1451,8 +1472,9 @@ impl WasmContextManager {
                 creator_did,
                 b"",
                 // Creator-assigned creation time (this member is the creator);
-                // copied by every member (§7.3.1, §9.9.3).
-                crate::time::now_secs(),
+                // copied by every member (§7.3.1, §9.9.3). Identical to the
+                // stored `creation_timestamp_secs`.
+                creation_timestamp_secs,
             );
         }
 
@@ -5059,16 +5081,18 @@ impl WasmContextManager {
         "expired".clone_into(&mut ctx.state);
         ctx.push_event(ContextEvent::Expired);
 
-        ctx.append_log_event(
-            EventType::ContextExpired,
-            "",
-            b"",
-            // Timer-triggered expiry: WASM tracks no separate convergent TTL
-            // deadline, so the expiry instant is the member's clock reading at
-            // fire time; a mixed native/WASM context derives the deadline
-            // identically from the shared TTL policy (§7.3.1, §9.9.3).
-            crate::time::now_secs(),
-        );
+        // Stamp the CONVERGENT expiry deadline (`creation_timestamp_secs +
+        // ttl_seconds`) on the `ContextExpired` leaf when both are known, so a
+        // mixed native/WASM context records the identical timestamp regardless
+        // of which member's timer fired or when its local clock read (§7.3.1,
+        // §9.9.3). Falls back to the member's fire-time `now()` only when no
+        // convergent base is available (no recorded creation time or no TTL).
+        let expiry_leaf_secs = match (ctx.creation_timestamp_secs, ctx.ttl_seconds) {
+            (creation, Some(ttl)) if creation != 0 => creation.saturating_add(ttl),
+            _ => crate::time::now_secs(),
+        };
+
+        ctx.append_log_event(EventType::ContextExpired, "", b"", expiry_leaf_secs);
 
         Ok(())
     }
@@ -5422,6 +5446,7 @@ impl WasmContextManager {
             pruning_policy: ctx.pruning_policy.clone(),
             economic_policy_locked: ctx.economic_policy_locked,
             hard_rate_limit_config: ctx.hard_rate_limit_config.clone(),
+            creation_timestamp_secs: ctx.creation_timestamp_secs,
         };
 
         // Canonicalize every set/map-derived array to sorted order before
@@ -5895,6 +5920,18 @@ impl WasmContextManager {
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
             crypto: None,
+            // Convergent creator-assigned creation time, restored from the
+            // signed snapshot so the imported TTL deadline base
+            // (`creation_timestamp_secs + ttl_seconds`) matches what every other
+            // member computes (§7.3.1, §9.9.3). Clamped to the importer's `now`
+            // (in seconds) for the same anti-forgery reason the nonce / executed-
+            // proposal timestamps above are clamped: a forged future creation
+            // time would only push the TTL deadline further out, so clamping to
+            // `now` keeps the bound no LATER than an honest member would compute
+            // (fail-safe). (The native bridge consumes this verbatim because it
+            // verifies the creator's Ed25519 signature over the snapshot before
+            // this point; the WASM bridge keeps its existing defensive clamp.)
+            creation_timestamp_secs: snap.creation_timestamp_secs.min(crate::time::now_secs()),
         };
 
         self.contexts.insert(context_id.clone(), ctx);
@@ -6338,6 +6375,16 @@ struct WasmContextExportSnapshot {
     /// `None` means the default Matrix-style config applies.
     #[serde(default)]
     hard_rate_limit_config: Option<String>,
+    /// Convergent creator-assigned context-creation timestamp (Unix seconds).
+    ///
+    /// Mirrors the live `PerContextState.creation_timestamp_secs` so the
+    /// convergent TTL deadline base (`creation_timestamp_secs + ttl_seconds`)
+    /// survives export/import rather than being re-derived from importer-local
+    /// `now()`. This is the WASM bridge's independent DTO field — NOT byte-parity
+    /// with the native `ContextSnapshot` (the WASM export keeps its own digest).
+    /// `#[serde(default)]` so pre-field envelopes deserialize as `0`.
+    #[serde(default)]
+    creation_timestamp_secs: u64,
 }
 
 /// Serializable member entry for export.
@@ -7294,6 +7341,7 @@ mod tests {
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
             crypto: None,
+            creation_timestamp_secs: 0,
         };
 
         let mut mgr = WasmContextManager::new();
@@ -7405,6 +7453,7 @@ mod tests {
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
             crypto: None,
+            creation_timestamp_secs: 0,
         };
         let mut mgr = WasmContextManager::new();
         mgr.contexts.insert(context_id.to_owned(), ctx);
@@ -7661,6 +7710,7 @@ mod tests {
             pruning_policy: None,
             economic_policy_locked: false,
             hard_rate_limit_config: None,
+            creation_timestamp_secs: 0,
         }
     }
 
@@ -8407,6 +8457,99 @@ mod tests {
         assert!(
             mgr.contexts[context_id].economic_policy.is_none(),
             "rejected SetEconomicPolicy must not mutate stored policy"
+        );
+    }
+
+    /// `handle_ttl_expiry` stamps the CONVERGENT deadline
+    /// (`creation_timestamp_secs + ttl_seconds`) on the `ContextExpired` leaf,
+    /// not the member's local fire-time `now()`. Two members whose timers fire
+    /// at different wall-clock instants therefore record the IDENTICAL leaf
+    /// timestamp and, with identical prior history, the identical event-log
+    /// root — the cross-member equivocation property a WASM and a native member
+    /// must both satisfy (§7.3.1, §9.9.3).
+    #[test]
+    fn test_wasm_ttl_expiry_stamps_convergent_deadline() {
+        let creation = 1_700_000_000_u64;
+        let ttl = 86_400_u64;
+
+        // Two independent members of the "same" context: same convergent
+        // creation time and TTL, but their `handle_ttl_expiry` calls happen at
+        // different real instants (separated by the work between them).
+        let build = |id: &str| {
+            let mut mgr = WasmContextManager::new();
+            let mut state = make_bare_per_context_state(id, "did:dht:zcreator");
+            state.creation_timestamp_secs = creation;
+            state.ttl_seconds = Some(ttl);
+            mgr.contexts.insert(id.to_owned(), state);
+            mgr
+        };
+
+        let id = "ctx-ttl-converge";
+        let mut alice = build(id);
+        let mut bob = build(id);
+
+        alice.handle_ttl_expiry(id).expect("alice ttl expiry");
+        // (any amount of local wall-clock passes here)
+        bob.handle_ttl_expiry(id).expect("bob ttl expiry");
+
+        let alice_root = scp_event_log::tree::root(&alice.contexts[id].event_log);
+        let bob_root = scp_event_log::tree::root(&bob.contexts[id].event_log);
+        assert_eq!(
+            alice_root, bob_root,
+            "ContextExpired leaves stamped with the convergent creation+ttl deadline must yield \
+             identical event-log roots regardless of local fire time"
+        );
+
+        // Both contexts transitioned to expired.
+        assert_eq!(alice.contexts[id].state, "expired");
+        assert_eq!(bob.contexts[id].state, "expired");
+    }
+
+    /// When no convergent base is available (creation time is `0`),
+    /// `handle_ttl_expiry` falls back to the member's local clock rather than
+    /// stamping a nonsensical `0 + ttl` deadline.
+    #[test]
+    fn test_wasm_ttl_expiry_falls_back_without_creation_time() {
+        let id = "ctx-ttl-fallback";
+        let mut mgr = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(id, "did:dht:zcreator");
+        // No convergent creation time recorded; TTL present.
+        state.creation_timestamp_secs = 0;
+        state.ttl_seconds = Some(3600);
+        mgr.contexts.insert(id.to_owned(), state);
+
+        // Must succeed (fall back to local now()) and transition to expired.
+        mgr.handle_ttl_expiry(id).expect("ttl expiry fallback");
+        assert_eq!(mgr.contexts[id].state, "expired");
+    }
+
+    /// The export DTO field round-trips through serde and defaults to `0` when
+    /// a pre-field envelope omits it (`#[serde(default)]`). The WASM bridge
+    /// keeps its own independent DTO — this is not byte-parity with native.
+    #[test]
+    fn test_wasm_snapshot_creation_timestamp_serde_roundtrip_and_default() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.creation_timestamp_secs = 1_711_000_777;
+
+        let json = serde_json::to_value(&snap).expect("serialize snapshot");
+        let restored: WasmContextExportSnapshot =
+            serde_json::from_value(json.clone()).expect("deserialize snapshot");
+        assert_eq!(
+            restored.creation_timestamp_secs, 1_711_000_777,
+            "creation_timestamp_secs must round-trip through the WASM export DTO"
+        );
+
+        // Legacy envelope: strip the field; it must default to 0.
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .expect("snapshot is a JSON object")
+            .remove("creation_timestamp_secs");
+        let restored_legacy: WasmContextExportSnapshot =
+            serde_json::from_value(legacy).expect("legacy snapshot must deserialize");
+        assert_eq!(
+            restored_legacy.creation_timestamp_secs, 0,
+            "a pre-field WASM envelope must default creation_timestamp_secs to 0"
         );
     }
 }

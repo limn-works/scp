@@ -723,6 +723,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
 
     Ok(ContextSnapshot {
         context_id: snapshot.context_id.clone(),
+        // Carry through the convergent creator-assigned creation time: it is
+        // non-sensitive convergent metadata (the same value on the public
+        // `ContextCreated` leaf), and a public-scope importer still needs it to
+        // arm a convergent TTL deadline.
+        creation_timestamp_secs: snapshot.creation_timestamp_secs,
         state: snapshot.state.clone(),
         context_params: snapshot.context_params.clone(),
         membership: MembershipState::new(),
@@ -955,6 +960,7 @@ mod tests {
 
         ContextSnapshot {
             context_id: context_id.to_owned(),
+            creation_timestamp_secs: 1_700_000_000,
             state: ContextState::Active,
             context_params: ContextParams::default(),
             membership: MembershipState::new(),
@@ -2731,6 +2737,102 @@ mod tests {
         assert_ne!(
             actual, with_sync_domain,
             "export digest must differ from a digest computed with the sync-delta separator"
+        );
+    }
+
+    /// The convergent `creation_timestamp_secs` survives a JCS round-trip
+    /// (serialize → canonical-JSON → deserialize) verbatim, so the signed
+    /// snapshot the importer reconstructs carries the same convergent TTL base
+    /// the exporter signed.
+    #[test]
+    fn creation_timestamp_secs_round_trips_through_jcs() {
+        let mut snapshot = test_snapshot("ctx-creation-ts-roundtrip");
+        snapshot.creation_timestamp_secs = 1_711_000_000;
+
+        let json = scp_protocol::jcs::to_vec(&snapshot).expect("JCS serialize");
+        let restored: ContextSnapshot =
+            serde_json::from_slice(&json).expect("deserialize JCS bytes");
+
+        assert_eq!(
+            restored.creation_timestamp_secs, 1_711_000_000,
+            "creation_timestamp_secs must round-trip verbatim through the signed JCS snapshot"
+        );
+    }
+
+    /// A legacy snapshot persisted before this field existed (its JSON omits
+    /// `creation_timestamp_secs`) deserializes with the field defaulted to `0`
+    /// via `#[serde(default)]`, never failing the import.
+    #[test]
+    fn creation_timestamp_secs_defaults_to_zero_for_legacy_snapshot() {
+        let snapshot = test_snapshot("ctx-creation-ts-legacy");
+        let mut value = serde_json::to_value(&snapshot).expect("to_value");
+
+        // Simulate a pre-field snapshot: strip the key entirely.
+        value
+            .as_object_mut()
+            .expect("snapshot serializes to a JSON object")
+            .remove("creation_timestamp_secs");
+        assert!(
+            value.get("creation_timestamp_secs").is_none(),
+            "the legacy snapshot JSON must not carry the field"
+        );
+
+        let restored: ContextSnapshot =
+            serde_json::from_value(value).expect("legacy snapshot must deserialize");
+        assert_eq!(
+            restored.creation_timestamp_secs, 0,
+            "a legacy snapshot without the field must default to 0"
+        );
+    }
+
+    /// `strip_snapshot_for_public` carries the convergent creation time through
+    /// to the public projection: it is non-sensitive convergent metadata (the
+    /// same value on the public `ContextCreated` leaf), and a public-scope
+    /// importer still needs it to arm a convergent TTL deadline.
+    #[test]
+    fn public_strip_carries_creation_timestamp_through() {
+        let mut snapshot = test_snapshot("ctx-creation-ts-public-strip");
+        snapshot.creation_timestamp_secs = 1_711_222_333;
+
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal role state");
+
+        assert_eq!(
+            stripped.creation_timestamp_secs, 1_711_222_333,
+            "public strip must carry the convergent creation time through verbatim"
+        );
+    }
+
+    /// Two members whose local clocks are skewed compute the IDENTICAL absolute
+    /// TTL expiry deadline from the SAME convergent `creation_timestamp_secs`
+    /// carried in the snapshot — i.e. the deadline is a function of the signed
+    /// creation time and the TTL only, never of importer-local `now()`. This is
+    /// the convergence the import/restore arming (`anchor_deadline_to_creation =
+    /// true`) relies on.
+    #[test]
+    fn skewed_importers_derive_identical_ttl_deadline_from_snapshot() {
+        use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
+
+        let mut snapshot = test_snapshot("ctx-creation-ts-converge");
+        snapshot.creation_timestamp_secs = 1_700_000_000;
+        let ttl_secs = 86_400_u64; // 1 day
+
+        // The deadline is derived from the snapshot's convergent creation time +
+        // TTL. Two importers reading the SAME snapshot field (regardless of their
+        // own clocks) get the same value.
+        let alice_deadline =
+            convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl_secs));
+        let bob_deadline =
+            convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl_secs));
+
+        assert_eq!(
+            alice_deadline, bob_deadline,
+            "importers reading the same convergent creation time must agree on the deadline"
+        );
+        assert_eq!(
+            alice_deadline,
+            Some(1_700_000_000 + 86_400),
+            "the deadline must be creation_timestamp_secs + ttl, not a local-clock value"
         );
     }
 }

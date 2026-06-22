@@ -755,6 +755,7 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
 
     crate::context::state::ContextSnapshot {
         context_id: state.handle.context_id().to_owned(),
+        creation_timestamp_secs: state.creation_timestamp_secs,
         state: context_state_value,
         context_params: state.handle.params().clone(),
         membership: state.membership.clone(),

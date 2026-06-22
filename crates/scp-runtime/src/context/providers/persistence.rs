@@ -186,6 +186,7 @@ mod tests {
 
         ContextSnapshot {
             context_id: context_id.to_owned(),
+            creation_timestamp_secs: 1_700_000_000,
             state: ContextState::Active,
             context_params: ContextParams::default(),
             membership: MembershipState::default(),
@@ -286,6 +287,27 @@ mod tests {
         let mut list = persistence.list_persisted_contexts().unwrap();
         list.sort();
         assert_eq!(list, vec!["ctx-a", "ctx-b"]);
+    }
+
+    #[test]
+    fn persist_preserves_creation_timestamp_secs() {
+        let persistence = InMemoryPersistence::new();
+        let mut snapshot = test_snapshot("ctx-creation-ts");
+        snapshot.creation_timestamp_secs = 1_711_000_555;
+
+        persistence
+            .persist_context("ctx-creation-ts", &snapshot)
+            .unwrap();
+
+        let loaded = persistence
+            .load_context("ctx-creation-ts")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.creation_timestamp_secs, 1_711_000_555,
+            "the convergent creation time must survive persist → load so restore re-arms a \
+             convergent TTL deadline"
+        );
     }
 
     #[test]

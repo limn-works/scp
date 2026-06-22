@@ -1792,12 +1792,19 @@ pub async fn import_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
-        // The signed export snapshot does not yet carry the convergent
-        // creation timestamp (a forward step under ADR-051), so set this to
-        // the local instantiation time. It is NOT used as a convergent
-        // deadline base on the import path: the TTL timer is armed with
-        // `anchor_deadline_to_creation = false` (local-clock arming) below.
-        creation_timestamp_secs: deps.clock.now_secs(),
+        // Convergent creator-assigned creation time, consumed VERBATIM from the
+        // creator-signed export snapshot (§7.3.1, §9.9.3). The signature and the
+        // `exporter_did == creator_did` binding were verified in
+        // `validate_export_for_import` before we reach this builder, so the value
+        // is authenticated. We do NOT re-pin it to importer-local `now()`
+        // (unlike the `pending_*` `observed_at` timestamps below): its only
+        // consumer is the TTL expiry deadline (`creation + ttl`, an UPPER bound),
+        // where backdating only shortens the lifetime (fail-safe) and
+        // future-dating is bounded by `ttl`. Re-pinning would re-introduce the
+        // import-time divergence this field exists to close. The TTL timer is
+        // armed with `anchor_deadline_to_creation = true` (convergent arming)
+        // below.
+        creation_timestamp_secs: export.snapshot.creation_timestamp_secs,
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
         membership: export.snapshot.membership,
@@ -1977,12 +1984,15 @@ pub async fn import_context(
     if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            // Import path: arm relative to the local clock. The signed export
-            // snapshot does not yet carry the convergent creation timestamp, so
-            // the importer cannot reconstruct the convergent `creation + ttl`
-            // deadline; carrying it through the signed snapshot (and its
-            // cross-bridge byte-parity + KAT) is a forward step under ADR-051.
-            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, false)
+            // Import path: arm the CONVERGENT deadline. The signed export
+            // snapshot now carries the creator-assigned `creation_timestamp_secs`
+            // (consumed verbatim above), so the importer reconstructs the
+            // identical `creation + ttl` deadline every member computes (§7.3.1,
+            // §9.9.3). `duration` remains the local sleep interval (= the
+            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
+            // the convergent value, so a timer-fired `ContextExpired`/
+            // `ContextClosed` leaf no longer diverges by importer-local skew.
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, true)
             .await;
     }
 
@@ -2266,12 +2276,15 @@ pub async fn restore_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
-        // The persisted snapshot does not yet carry the convergent creation
-        // timestamp (a forward step under ADR-051), so set this to the local
-        // instantiation time. It is NOT used as a convergent deadline base on
-        // the restore path: the TTL timer is re-armed with
-        // `anchor_deadline_to_creation = false` (local-clock arming) below.
-        creation_timestamp_secs: deps.clock.now_secs(),
+        // Convergent creator-assigned creation time, restored VERBATIM from the
+        // persisted snapshot (same-node crash recovery). Carrying it forward —
+        // rather than re-deriving from local `now()` — keeps the re-armed TTL
+        // expiry deadline (`creation + ttl`) identical to what the context had
+        // before the restart, so the timer-fired `ContextExpired`/`ContextClosed`
+        // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
+        // re-armed with `anchor_deadline_to_creation = true` (convergent arming)
+        // below.
+        creation_timestamp_secs: ctx_snapshot.creation_timestamp_secs,
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
         // (AtomicU64; first spawn = 1) before the state crosses into the
@@ -2434,11 +2447,14 @@ pub async fn restore_context(
     if let Some(remaining_secs) = ttl_remaining {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            // Restore path: arm relative to the local clock. The persisted
-            // snapshot does not yet carry the convergent creation timestamp, so
-            // the convergent `creation + ttl` deadline cannot be reconstructed
-            // on reload; persisting it is a forward step under ADR-051.
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, false)
+            // Restore path: arm the CONVERGENT deadline. The persisted snapshot
+            // now carries the creator-assigned `creation_timestamp_secs`
+            // (restored verbatim above), so the reloaded timer records the same
+            // `creation + ttl` deadline it had before the restart (§7.3.1,
+            // §9.9.3). `duration` remains the local sleep interval (= the
+            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
+            // the convergent value.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
             .await;
     }
 

@@ -131,13 +131,16 @@ async fn handle_start_ttl_timer(
     anchor_deadline_to_creation: bool,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Initial-create path: derive the CONVERGENT expiry deadline from the
-    // actor-owned convergent creation timestamp + the TTL duration in the
-    // context params (both convergent across members), so the timer-fired
-    // `ContextExpired`/`ContextClosed` leaf timestamp converges
-    // (§7.3.1, §9.9.3). Restore/import pass `false` because their persisted
-    // snapshot does not yet carry the convergent creation time (ADR-051);
-    // those arm relative to the local clock (`None`).
+    // Derive the CONVERGENT expiry deadline from the actor-owned convergent
+    // creation timestamp + the TTL duration in the context params (both
+    // convergent across members), so the timer-fired
+    // `ContextExpired`/`ContextClosed` leaf timestamp converges (§7.3.1,
+    // §9.9.3). The initial-create, restore, and import paths all pass `true`:
+    // the snapshot now carries the convergent creation time, so
+    // `state.creation_timestamp_secs` is the authentic creator-assigned value on
+    // every path (verbatim from the creator-signed snapshot on import). Callers
+    // that genuinely have no convergent base pass `false` and arm relative to
+    // the local clock (`None`).
     let deadline_override = if anchor_deadline_to_creation {
         crate::context::ttl_close_helpers::convergent_ttl_deadline_secs(
             state.creation_timestamp_secs,
