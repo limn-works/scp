@@ -75,18 +75,24 @@
 //! The best-effort combinator and the compensation closures run with NO
 //! subsequent fail-closed persist, so a Class-S mutation made through their view
 //! would escape the §9 invariant. [`ClassCMut`] (and its governance sub-view
-//! [`GovernanceClassCMut`]) close this by exposing NO `&mut` to any
-//! Class-S-CONTAINING struct — no `&mut PerContextState`, `&mut GovernanceState`,
-//! `&mut ClassSState`, or `&mut GovernanceClassS`. Every `&mut` accessor returns
-//! a specifically-Class-C field; governance is reached only field-granularly.
-//! With no `&mut` PATH to Class-S, a Class-S mutation on the
-//! best-effort/compensation path is a COMPILE error. This does NOT rely on field
-//! privatization — and could not: the combinator module and the handler modules
-//! are co-descendants of `context::actor`, so no `pub(in PATH)` visibility
-//! separates them (a handler could always name `class_s` through a whole-struct
-//! `&mut` if one were handed out). Field privatization (a later step) concerns
-//! only the [`ClassSCell::state_mut`] escape hatch and [`ClassSMut`]'s
-//! `pub(crate)` reach, NOT this view, which is already airtight.
+//! [`GovernanceClassCMut`]) close this by holding ONLY FIELD-GRANULAR
+//! references — never a whole `&mut PerContextState` or `&mut GovernanceState`.
+//! On construction each view destructures the `&mut` it is built from into a
+//! `&mut` per writable Class-C / structural field plus a shared `&` to the
+//! Class-S sub-structs (and `membership`). Because no whole-bucket `&mut` is
+//! held anywhere, there is NOTHING of type `&mut PerContextState` /
+//! `&mut GovernanceState` / `&mut ClassSState` / `&mut GovernanceClassS` for any
+//! accessor to return — a future "convenience" accessor like
+//! `fn rest_mut(&mut self) -> &mut PerContextState` simply cannot be written, so
+//! a Class-S mutation on the best-effort / compensation path is a COMPILE error.
+//! This is STRUCTURAL, not a convention to be followed: it does not rely on
+//! field privatization — and could not, because the combinator module and the
+//! handler modules are co-descendants of `context::actor`, so no `pub(in PATH)`
+//! visibility separates them (a handler could always name `class_s` through a
+//! whole-struct `&mut` if one were ever handed out — but none is). Field
+//! privatization (a later step) concerns only the [`ClassSCell::state_mut`]
+//! escape hatch and [`ClassSMut`]'s `pub(crate)` reach, NOT this view, which is
+//! already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
 //!   log adapter on [`ActorDeps`]); if `after` fails, restore the snapshot and
@@ -234,14 +240,16 @@ impl<'a> ClassSMut<'a> {
     ///
     /// [`ClassCMut`] — handed to the BEST-EFFORT combinator and to the
     /// compensation closures, which run with NO subsequent fail-closed persist —
-    /// **may NOT** hand out such a `&mut`, and therefore has NO `rest_mut` (and no
-    /// `governance_mut`) at all. It is field-granular: every accessor returns a
-    /// `&mut` to a specifically-Class-C field (or a [`GovernanceClassCMut`]
-    /// sub-view), so there is no `&mut` PATH from it to any Class-S-containing
-    /// struct — a Class-S mutation on the best-effort/compensation path is a
-    /// COMPILE error by construction, independent of any future field
-    /// privatization. The asymmetry is the whole point: the view that persists
-    /// fail-closed may reach Class-S; the view that does not, structurally cannot.
+    /// **may NOT** hand out such a `&mut`, and CANNOT have a `rest_mut` (or a
+    /// `governance_mut`): it holds no whole `&mut PerContextState` /
+    /// `&mut GovernanceState`, only field-granular references (a `&mut` per
+    /// Class-C field, a shared `&` to Class-S). There is therefore no value of
+    /// that type for such an accessor to return — a Class-S mutation on the
+    /// best-effort / compensation path is a COMPILE error by construction,
+    /// independent of any future field privatization. The asymmetry is the whole
+    /// point: the view that persists fail-closed holds the whole `&mut` and may
+    /// reach Class-S; the view that does not persist fail-closed holds no whole
+    /// `&mut` and so structurally cannot.
     pub(crate) const fn rest_mut(&mut self) -> &mut PerContextState {
         self.state
     }
@@ -269,72 +277,129 @@ impl Deref for ClassSMut<'_> {
 /// a Class-S mutation made through this view would NOT be fail-closed-persisted,
 /// re-opening the replay / re-spend / re-grant window the §9 invariant closes.
 ///
-/// # Airtight BY CONSTRUCTION (not by field privatization)
+/// # Airtight BY CONSTRUCTION — no whole `&mut PerContextState` to return
 ///
 /// The combinator module (`context::actor::class_s`) and the handler modules
 /// (`context::actor::handlers::*`) are co-descendants of `context::actor`; no
-/// `pub(in PATH)` visibility separates them, so field privatization CANNOT make
-/// the Class-S fields unnameable from a handler — a handler could always write
-/// `view.rest_mut().class_s…` or `view.governance_mut().class_s…` if those
-/// accessors existed. Therefore this view exposes NO `&mut` to any
-/// Class-S-CONTAINING struct: not `&mut PerContextState`, not
-/// `&mut GovernanceState`, not `&mut ClassSState`, not `&mut GovernanceClassS`.
-/// Every `&mut` accessor returns a specifically-Class-C field, and governance is
-/// reached only through the field-granular [`GovernanceClassCMut`] sub-view
-/// (which likewise exposes no `&mut self.gov` whole and no `class_s` accessor).
-/// With no `&mut` PATH to a Class-S-containing struct, a Class-S mutation from
-/// this view is a COMPILE error — independent of any future field privatization
-/// (which concerns only the `state_mut` escape hatch and [`ClassSMut`]'s
-/// `pub(crate)` reach, NOT this view). Reads via [`Deref`] are still whole-state
-/// (reads don't mutate, so they cannot violate the invariant).
+/// `pub(in PATH)` visibility separates them, so field privatization could NOT
+/// make the Class-S fields unnameable from a handler — a handler could always
+/// write `view.rest_mut().class_s…` or `view.governance_mut().class_s…` if those
+/// accessors existed and returned a whole `&mut`. This view closes that
+/// STRUCTURALLY rather than by convention: it does not hold a whole
+/// `&mut PerContextState` at all. On construction it destructures the underlying
+/// `&mut PerContextState` ONCE into disjoint field references — a `&mut` to each
+/// writable Class-C / structural field, a `&` (shared, read-only) to the
+/// Class-S [`ClassSState`] and to `membership`, and a [`GovernanceClassCMut`]
+/// sub-view for the Class-C governance fields. There is therefore NO whole
+/// `&mut PerContextState`, no `&mut GovernanceState`, no `&mut ClassSState`, and
+/// no `&mut GovernanceClassS` held anywhere — so a future "convenience"
+/// accessor like `fn rest_mut(&mut self) -> &mut PerContextState` CANNOT be
+/// written (there is nothing of that type to return), and a Class-S mutation
+/// from this view is a COMPILE error by construction. Reads of `class_s` go
+/// through the field-granular `&`-returning read accessor [`Self::class_s`]
+/// (there is no whole-state [`Deref`]); reads don't mutate, so a shared `&` to
+/// Class-S cannot violate the invariant.
 ///
 /// # Disjoint-borrow support (`ConsequenceStateSplit`)
 ///
 /// [`crate::context::governance_logic::ConsequenceStateSplit`] needs FIVE
 /// simultaneous disjoint borrows of distinct [`PerContextState`] fields
 /// (`governance`, `&mut role_state`, `&membership`, `&mut receive_buffer`,
-/// `&mut checkpoint_events_since`). A single `&mut PerContextState` cannot be
-/// reborrowed five ways through method calls (each `&mut self` method borrows the
-/// WHOLE state), so [`Self::split_class_c`] destructures the underlying `&mut`
-/// ONCE into independent field references the borrow checker accepts in parallel
-/// (with the governance reference wrapped in a [`GovernanceClassCMut`] so it,
-/// too, cannot reach Class-S).
+/// `&mut checkpoint_events_since`). The view ALREADY holds these as disjoint
+/// field references (the construction destructured them apart), so
+/// [`Self::split_class_c`] simply reborrows them into a [`ClassCSplit`] — all
+/// five live simultaneously (with the governance reference wrapped in a
+/// [`GovernanceClassCMut`] so it, too, cannot reach Class-S).
 pub(crate) struct ClassCMut<'a> {
-    /// The borrowed actor state. Private; mutated only through the field-granular
-    /// accessors / [`Self::split_class_c`], none of which reach Class-S.
-    state: &'a mut PerContextState,
+    /// `&mut` to the active-member DID set (Class-C / structural).
+    members: &'a mut HashSet<DID>,
+    /// `&mut` to the receive event buffer (Class-C / structural).
+    receive_buffer: &'a mut ReceiveBuffer,
+    /// `&mut` to the role / ceiling / assignment state (Class-C / structural).
+    role_state: &'a mut ContextRoleState,
+    /// `&mut` to the checkpoint counter (Class-C / structural).
+    checkpoint_events_since: &'a mut u64,
+    /// Shared `&` to the membership record — read-only on the consequence /
+    /// best-effort path (needed by [`Self::split_class_c`]).
+    membership: &'a MembershipState,
+    /// Shared `&` to the Class-S [`ClassSState`] sub-struct — READ ONLY through
+    /// this view (no `&mut` to it anywhere here), so reads work without a
+    /// whole-state `Deref` and a Class-S MUTATION is structurally impossible.
+    class_s: &'a ClassSState,
+    /// Field-granular Class-C governance sub-view (holds no whole
+    /// `&mut GovernanceState`, no `class_s` reach).
+    governance: GovernanceClassCMut<'a>,
 }
 
-/// RESTRICTED mutable view over a [`GovernanceState`] that exposes ONLY its
-/// Class-C governance fields — there is **no** accessor returning
-/// `&mut GovernanceState` (the whole bucket) and **no** accessor reaching
+/// RESTRICTED mutable view over the Class-C governance fields of a
+/// [`GovernanceState`]. It holds those fields as SEPARATE field-granular
+/// references — it does **not** hold a whole `&mut GovernanceState`, so there is
+/// no whole-bucket `&mut` for any accessor to return and no way to reach
 /// `governance.class_s` ([`GovernanceClassS`]).
 ///
 /// Produced by [`ClassCMut::governance_class_c_mut`] and held by the
 /// `governance` field of [`ClassCSplit`]. It is the governance counterpart of
 /// [`ClassCMut`]'s airtightness: because the best-effort / compensation paths do
 /// not persist fail-closed, they must not reach any Class-S-containing struct,
-/// and `GovernanceState` CONTAINS one (`governance.class_s`). Handing out
+/// and `GovernanceState` CONTAINS one (`governance.class_s`). A whole
 /// `&mut GovernanceState` would let a handler write `gov.class_s.threshold_value
-/// = …` with no fail-closed persist; this view never does. Reads of the whole
-/// governance bucket go through [`Deref`] (reads cannot violate §9); the only
-/// `&mut` it grants is to individual Class-C governance fields.
+/// = …` with no fail-closed persist; this view holds no such reference, so that
+/// is a COMPILE error BY CONSTRUCTION, not merely a documented prohibition.
+///
+/// # Airtight BY CONSTRUCTION — no whole `&mut` to return
+///
+/// The struct destructures the `&mut GovernanceState` it is built from into
+/// disjoint references the moment it is constructed: a `&mut` to each of the
+/// four writable Class-C fields, plus a shared `&` to the `next_proposal_seq`
+/// counter that callers read. There is therefore no whole-bucket `&mut`
+/// anywhere in the view, and no `class_s` reference at all — so a future
+/// "convenience" accessor like `fn gov_mut(&mut self) -> &mut GovernanceState`
+/// CANNOT be written (there is nothing of that type to return). Reads of
+/// Class-C fields go through the field-granular `&`-returning read accessors
+/// ([`Self::next_proposal_seq`]); there is no [`Deref`] to the whole bucket.
 pub(crate) struct GovernanceClassCMut<'a> {
-    /// The borrowed governance bucket. Private so the ONLY mutable reach is
-    /// through the field-granular Class-C accessors — never a whole
-    /// `&mut self.gov` and never `&mut self.gov.class_s`.
-    gov: &'a mut GovernanceState,
+    /// `&mut` to the per-sender velocity tracker (§19.7).
+    velocity_tracker: &'a mut scp_protocol::economy::antispam::SenderVelocityTracker,
+    /// `&mut` to the per-member cumulative budget tracker (§19.5).
+    budget_tracker: &'a mut MemberBudgetTracker,
+    /// `&mut` to the consequence-rule cooldown map.
+    cooldown_until: &'a mut HashMap<usize, u64>,
+    /// `&mut` to the mutable economic policy (§19.3).
+    economic_policy: &'a mut Option<EconomicPolicy>,
+    /// Shared `&` to the monotonic proposal sequence counter — READ ONLY through
+    /// this view (callers inspect it; the best-effort path never bumps it). Held
+    /// as a field-granular `&` so reads work with no whole-bucket `Deref`.
+    next_proposal_seq: &'a u64,
 }
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the Class-C governance field accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`) get their first PRODUCTION callers at the `ConsequenceStateSplit` / economy-compensation migration. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the Class-C governance field accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`) get their first PRODUCTION callers at the `ConsequenceStateSplit` / economy-compensation migration. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
-    /// Wrap a borrowed [`GovernanceState`]. Crate-internal: constructed only by
-    /// [`ClassCMut`] (directly or via [`ClassCMut::split_class_c`]).
+    /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
+    /// disjoint field references this view holds. Crate-internal: constructed
+    /// only by [`ClassCMut`] (directly or via [`ClassCMut::split_class_c`]).
+    ///
+    /// The single destructuring `let` is what makes the airtightness structural:
+    /// the whole `&mut GovernanceState` is consumed here and only field-granular
+    /// references survive, so the view never holds a whole-bucket `&mut`.
     const fn new(gov: &'a mut GovernanceState) -> Self {
-        Self { gov }
+        let GovernanceState {
+            velocity_tracker,
+            budget_tracker,
+            cooldown_until,
+            economic_policy,
+            next_proposal_seq,
+            ..
+        } = gov;
+        Self {
+            velocity_tracker,
+            budget_tracker,
+            cooldown_until,
+            economic_policy,
+            next_proposal_seq,
+        }
     }
 
     /// `&mut` access to the per-sender velocity tracker (§19.7 anti-spam /
@@ -343,36 +408,48 @@ impl<'a> GovernanceClassCMut<'a> {
     pub(crate) const fn velocity_tracker_mut(
         &mut self,
     ) -> &mut scp_protocol::economy::antispam::SenderVelocityTracker {
-        &mut self.gov.velocity_tracker
+        self.velocity_tracker
     }
 
     /// `&mut` access to the per-member cumulative budget tracker (§19.5). Class-C:
     /// the consequence/economy reservation it records is reversed by the
     /// compensation hook when a persist does not land.
     pub(crate) const fn budget_tracker_mut(&mut self) -> &mut MemberBudgetTracker {
-        &mut self.gov.budget_tracker
+        self.budget_tracker
     }
 
     /// `&mut` access to the consequence-rule cooldown map (`rule_index` → Unix
     /// seconds until re-fire is allowed). Class-C structural liveness state.
     pub(crate) const fn cooldown_until_mut(&mut self) -> &mut HashMap<usize, u64> {
-        &mut self.gov.cooldown_until
+        self.cooldown_until
     }
 
     /// `&mut` access to the mutable economic policy (§19.3). Class-C governance
     /// configuration.
     pub(crate) const fn economic_policy_mut(&mut self) -> &mut Option<EconomicPolicy> {
-        &mut self.gov.economic_policy
+        self.economic_policy
     }
-}
 
-impl Deref for GovernanceClassCMut<'_> {
-    type Target = GovernanceState;
+    /// Read accessor for the monotonic proposal sequence counter
+    /// ([`GovernanceState::next_proposal_seq`]). Field-granular `&`-read,
+    /// replacing the removed whole-bucket [`Deref`] read.
+    pub(crate) const fn next_proposal_seq(&self) -> u64 {
+        *self.next_proposal_seq
+    }
 
-    /// Immutable reads of the whole governance bucket (reads cannot violate the
-    /// §9 fail-closed invariant).
-    fn deref(&self) -> &GovernanceState {
-        self.gov
+    /// Reborrow this view into a shorter-lived [`GovernanceClassCMut`] over the
+    /// same fields. Used by [`ClassCMut::split_class_c`] to hand an OWNED
+    /// sub-view (not a reference) into a [`ClassCSplit`] without giving up the
+    /// `ClassCMut`'s own borrow. Each held `&mut` is reborrowed (`&mut **`); the
+    /// shared `&` is copied.
+    const fn reborrow(&mut self) -> GovernanceClassCMut<'_> {
+        GovernanceClassCMut {
+            velocity_tracker: &mut *self.velocity_tracker,
+            budget_tracker: &mut *self.budget_tracker,
+            cooldown_until: &mut *self.cooldown_until,
+            economic_policy: &mut *self.economic_policy,
+            next_proposal_seq: self.next_proposal_seq,
+        }
     }
 }
 
@@ -407,13 +484,39 @@ pub(crate) struct ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
-    /// Wrap a borrowed [`PerContextState`]. Crate-internal: only the combinators
+    /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
+    /// field references this view holds. Crate-internal: only the combinators
     /// construct a view.
+    ///
+    /// The single destructuring `let` is what makes the airtightness structural:
+    /// the whole `&mut PerContextState` is consumed here and only field-granular
+    /// references survive (a `&mut` per writable Class-C / structural field, a
+    /// shared `&` to Class-S and membership, and a [`GovernanceClassCMut`] over
+    /// the governance bucket). The view never holds a whole-state `&mut`, so no
+    /// accessor can return one.
     const fn new(state: &'a mut PerContextState) -> Self {
-        Self { state }
+        let PerContextState {
+            members,
+            receive_buffer,
+            role_state,
+            checkpoint_events_since,
+            membership,
+            class_s,
+            governance,
+            ..
+        } = state;
+        Self {
+            members,
+            receive_buffer,
+            role_state,
+            checkpoint_events_since,
+            membership,
+            class_s,
+            governance: GovernanceClassCMut::new(governance),
+        }
     }
 
     /// Field-granular `&mut` access to the governance bucket via a
@@ -421,61 +524,63 @@ impl<'a> ClassCMut<'a> {
     /// governance fields and CANNOT reach `governance.class_s`. This is the ONLY
     /// governance reach on this view — there is deliberately no `governance_mut`
     /// returning `&mut GovernanceState`, because that whole-bucket `&mut` would be
-    /// a `&mut` path to a Class-S-containing struct (see the type doc).
-    pub(crate) const fn governance_class_c_mut(&mut self) -> GovernanceClassCMut<'_> {
-        GovernanceClassCMut::new(&mut self.state.governance)
+    /// a `&mut` path to a Class-S-containing struct (see the type doc). Returns a
+    /// REBORROW of the held sub-view so it stays usable afterwards.
+    pub(crate) const fn governance_class_c_mut(&mut self) -> &mut GovernanceClassCMut<'a> {
+        &mut self.governance
     }
 
     /// `&mut` access to the active-member DID set (Class-C / structural). Safe to
     /// hand out directly: `HashSet<DID>` contains no Class-S sub-struct.
     pub(crate) const fn members_mut(&mut self) -> &mut HashSet<DID> {
-        &mut self.state.members
+        self.members
     }
 
     /// `&mut` access to the receive event buffer (Class-C / structural). Safe to
     /// hand out directly: it contains no Class-S sub-struct.
     pub(crate) const fn receive_buffer_mut(&mut self) -> &mut ReceiveBuffer {
-        &mut self.state.receive_buffer
+        self.receive_buffer
     }
 
     /// `&mut` access to the role / ceiling / assignment state (Class-C /
     /// structural). Safe to hand out directly: it contains no Class-S sub-struct.
     pub(crate) const fn role_state_mut(&mut self) -> &mut ContextRoleState {
-        &mut self.state.role_state
+        self.role_state
     }
 
-    // NOTE: This view intentionally has NO `rest_mut` / `governance_mut`
-    // (whole-`&mut PerContextState` / whole-`&mut GovernanceState`). Both would be
-    // `&mut` paths to a Class-S-containing struct, which the best-effort /
-    // compensation paths must not have (see the `ClassCMut` type doc). More
-    // field-granular SAFE accessors (for other Class-C / structural
-    // `PerContextState` fields — never `class_s` or `governance`) are added here
-    // as handlers migrate onto the best-effort combinator; each one returns a
-    // `&mut` to a field that provably contains no Class-S sub-struct.
+    /// READ-ONLY access to the Class-S [`ClassSState`] sub-struct. Field-granular
+    /// `&`-read, replacing the removed whole-state [`Deref`] read of `class_s`.
+    /// There is NO `&mut` counterpart on this view — a Class-S mutation from the
+    /// best-effort / compensation path is a compile error by construction.
+    pub(crate) const fn class_s(&self) -> &ClassSState {
+        self.class_s
+    }
 
-    /// Destructure into independent disjoint borrows of the Class-C structural
-    /// fields, for the [`crate::context::governance_logic::ConsequenceStateSplit`]
-    /// pattern. Borrows five DISTINCT fields of the underlying state so all five
-    /// references are live simultaneously (a single `&mut self` reborrow cannot
-    /// do this). None of the borrowed fields is Class-S: governance is wrapped in
-    /// a [`GovernanceClassCMut`] so even it cannot reach `governance.class_s`.
+    // NOTE: This view intentionally holds NO whole `&mut PerContextState` /
+    // `&mut GovernanceState` and NO `&mut` to any Class-S-containing struct, so
+    // it CANNOT grow a `rest_mut` / `governance_mut` whole-bucket accessor (there
+    // is no value of that type to return). More field-granular SAFE accessors
+    // (for other Class-C / structural `PerContextState` fields — never `class_s`
+    // or whole `governance`) are added here as handlers migrate onto the
+    // best-effort combinator; each takes a field reference already destructured
+    // apart in `new`.
+
+    /// Reborrow the held disjoint Class-C structural fields into a
+    /// [`ClassCSplit`], for the
+    /// [`crate::context::governance_logic::ConsequenceStateSplit`] pattern. The
+    /// view ALREADY holds five distinct field references (destructured apart in
+    /// [`Self::new`]), so all five borrows are live simultaneously. None is
+    /// Class-S: governance is the field-granular [`GovernanceClassCMut`] (which
+    /// cannot reach `governance.class_s`), and `class_s` itself is not handed out
+    /// here (the split is for the structural consequence path).
     pub(crate) const fn split_class_c(&mut self) -> ClassCSplit<'_> {
         ClassCSplit {
-            governance: GovernanceClassCMut::new(&mut self.state.governance),
-            role_state: &mut self.state.role_state,
-            membership: &self.state.membership,
-            receive_buffer: &mut self.state.receive_buffer,
-            checkpoint_events_since: &mut self.state.checkpoint_events_since,
+            governance: self.governance.reborrow(),
+            role_state: &mut *self.role_state,
+            membership: self.membership,
+            receive_buffer: &mut *self.receive_buffer,
+            checkpoint_events_since: &mut *self.checkpoint_events_since,
         }
-    }
-}
-
-impl Deref for ClassCMut<'_> {
-    type Target = PerContextState;
-
-    /// Immutable reads of the whole state.
-    fn deref(&self) -> &PerContextState {
-        self.state
     }
 }
 
@@ -993,14 +1098,24 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Compile-time airtightness guard (ADR-049 §9): the best-effort / compensation
-    // views — and the cell itself — MUST NOT implement `DerefMut`. A `DerefMut` impl
-    // would hand out a `&mut` to a Class-S-containing struct on a path that does not
-    // persist fail-closed, silently re-opening every Class-S bypass the field-granular
-    // view design closes by construction. If anyone ever adds `impl DerefMut` for one
-    // of these, this assertion fails to compile.
-    static_assertions::assert_not_impl_any!(ClassCMut<'static>: core::ops::DerefMut);
-    static_assertions::assert_not_impl_any!(GovernanceClassCMut<'static>: core::ops::DerefMut);
+    // Compile-time airtightness guard (ADR-049 §9): [`ClassSCell`] MUST NOT
+    // implement `DerefMut`. The cell `Deref`s to `&PerContextState` (reads), and
+    // that single read direction is load-bearing — a `DerefMut` would hand out a
+    // `&mut PerContextState` outside any persist combinator, re-opening every
+    // Class-S bypass the combinator boundary closes. If anyone ever adds
+    // `impl DerefMut for ClassSCell`, this assertion fails to compile.
+    //
+    // The best-effort / compensation views (`ClassCMut`, `GovernanceClassCMut`)
+    // need NO such guard anymore: they no longer `Deref` at all (the whole-bucket
+    // `Deref` was removed). They hold ONLY field-granular references — a `&mut`
+    // per writable Class-C field plus shared `&` to Class-S / membership — so
+    // there is no whole `&mut PerContextState` / `&mut GovernanceState` for any
+    // accessor (or `DerefMut`) to return. A whole-bucket mutable accessor is
+    // therefore UNCOMPILABLE BY CONSTRUCTION, not merely a documented
+    // prohibition, and the former `assert_not_impl_any!(…: DerefMut)` guards on
+    // those two views are now moot (a type with no `Deref` cannot misuse
+    // `DerefMut` the same way). Only `ClassSCell`'s no-`DerefMut` remains a
+    // guarded invariant.
     static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
 
     /// Minimal event log provider — accepts every call (the combinator paths do
@@ -1517,8 +1632,10 @@ mod tests {
                 async move |external, classc: ClassCMut<'_>, _deps: &ActorDeps| {
                     assert_eq!(external, "escrow-handle");
                     // The Class-S in-state restore has already run, so the
-                    // ClassCMut view reads an empty saga_pending.
-                    comp_flag.store(classc.saga_pending().is_empty(), Ordering::SeqCst);
+                    // ClassCMut view reads an empty saga_pending — via the
+                    // field-granular `class_s()` read accessor (the view no
+                    // longer Derefs to the whole state).
+                    comp_flag.store(classc.class_s().saga_pending.is_empty(), Ordering::SeqCst);
                 },
             )
             .await;
@@ -1616,11 +1733,12 @@ mod tests {
                 },
                 async move |external: DID, mut classc: ClassCMut<'_>, _deps: &ActorDeps| {
                     // Class-S kept: the nonce is still recorded when we compensate
-                    // (read via Deref to `&PerContextState`; the restricted
-                    // `ClassCMut` view exposes no Class-S *mutator*).
+                    // (read via the field-granular `class_s()` read accessor; the
+                    // restricted `ClassCMut` view exposes no Class-S *mutator* and
+                    // no longer Derefs to the whole state).
                     kept_flag.store(
                         classc
-                            .class_s
+                            .class_s()
                             .xctx_nonce_dedup
                             .entries()
                             .contains_key(&[0x3Cu8; 16]),
@@ -2035,13 +2153,13 @@ mod tests {
             // they are independent mutable references.
             *split.checkpoint_events_since += 3;
             // Exercise the GovernanceClassCMut field-granular accessor (a Class-C
-            // field) AND a whole-bucket read via its Deref — neither can reach
-            // `governance.class_s`.
+            // field) AND a field-granular READ accessor — neither can reach
+            // `governance.class_s` (the whole-bucket Deref was removed).
             split
                 .governance
                 .cooldown_until_mut()
                 .insert(7usize, 1_700_000_999);
-            let _ = split.governance.next_proposal_seq;
+            let _ = split.governance.next_proposal_seq();
             let _ = &split.role_state;
             let _ = split.membership.count();
             let _ = split.receive_buffer.len();
@@ -2073,14 +2191,15 @@ mod tests {
         let ctx = ctx_hex(0x53);
 
         cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
-            let mut gov = view.governance_class_c_mut();
+            let gov = view.governance_class_c_mut();
             // Mutate a Class-C governance field through the field-granular
             // accessor.
             gov.cooldown_until_mut().insert(3usize, 1_700_000_500);
-            // Read the whole governance bucket via Deref (reads cannot violate the
-            // fail-closed invariant). There is no `&mut self.gov` / `class_s`
-            // accessor to reach Class-S.
-            let _ = gov.next_proposal_seq;
+            // Read a Class-C governance field via the field-granular read
+            // accessor (reads cannot violate the fail-closed invariant). There is
+            // no `&mut self.gov` / `class_s` accessor to reach Class-S, and the
+            // whole-bucket Deref was removed.
+            let _ = gov.next_proposal_seq();
         });
 
         assert_eq!(
@@ -2107,7 +2226,7 @@ mod tests {
         let sender_for_closure = sender.clone();
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
-            let mut gov = view.governance_class_c_mut();
+            let gov = view.governance_class_c_mut();
             let vt = gov.velocity_tracker_mut();
             vt.record_message(&sender_for_closure, 1_700_000_000);
         });
