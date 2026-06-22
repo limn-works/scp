@@ -689,17 +689,25 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async identityCreate(custody: string = "in_memory"): Promise<Identity> {
-    const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
-    const raw = await (this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>)(
-      custody,
-    );
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (
+        this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>
+      )(custody);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -791,17 +799,25 @@ export class SCP {
       },
       custodyType: (keyId: string): string => provider.custodyType(keyId),
     };
-    const raw = await (
-      this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
-    )(adapter);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (
+        this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
+      )(adapter);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityLoad(did: string): Promise<Identity> {
-    const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // The five identity-lifecycle operations below act on the identity HANDLE,
@@ -917,7 +933,11 @@ export class SCP {
   }
 
   async identityResolve(did: string): Promise<unknown> {
-    return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+    try {
+      return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityRemove(did: string): void {
@@ -929,13 +949,21 @@ export class SCP {
   }
 
   async identityAttestDevice(did: string): Promise<string> {
-    return await (this.#native.identityAttestDevice as (d: string) => Promise<string>)(did);
+    try {
+      return await (this.#native.identityAttestDevice as (d: string) => Promise<string>)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
-    return await (
-      this.#native.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
-    )(did, tokenBase64);
+    try {
+      return await (
+        this.#native.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
+      )(did, tokenBase64);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityCreateLinkAttestation(
@@ -946,16 +974,20 @@ export class SCP {
     verificationMethod: string,
     platformId?: string | null,
   ): Promise<string> {
-    return await (
-      this.#native.identityCreateLinkAttestation as (
-        d: string,
-        p: string,
-        h: string,
-        pr: string,
-        vm: string,
-        pid: string | null | undefined,
-      ) => Promise<string>
-    )(did, platform, handle, proof, verificationMethod, platformId ?? null);
+    try {
+      return await (
+        this.#native.identityCreateLinkAttestation as (
+          d: string,
+          p: string,
+          h: string,
+          pr: string,
+          vm: string,
+          pid: string | null | undefined,
+        ) => Promise<string>
+      )(did, platform, handle, proof, verificationMethod, platformId ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityLinkAttestations(did: string): string {
