@@ -666,7 +666,8 @@ async fn handle_execute_governance_action_actor(
     let execute_fut = async move {
         // Direct-execute command (no quorum-crossing voter in the payload): the
         // executor is the proposer, matching the auto-execute convention where
-        // proposer == committer (ADR-031 §7.3.1 / §8). The quorum-approval path
+        // proposer == committer (ADR-031 §8 "executor DID" / spec §7.3.1
+        // "committing member"). The quorum-approval path
         // that distinguishes voter from proposer lives in
         // `vote_on_proposal_inner`, not this direct entry point.
         let executor_did = proposal.proposer_did.clone();
