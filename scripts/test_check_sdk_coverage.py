@@ -305,13 +305,15 @@ def test_gate_passes_with_valid_coverage_exemption(tmp_path: Path) -> None:
     """Gate exits 0 when a true cell has a valid coverage_exemption and
     another SDK provides static verification."""
     # Create a fake TypeScript source file that exports the operation symbol.
-    # The auto-generated camelCase variant of "verified_op_zzz" is
-    # "verifiedOpZzz" — the gate checks exact and auto-generated candidates.
+    # The gate no longer accepts bare camelCase ("verifiedOpZzz"); it requires
+    # the domain-prefixed form.  For domain="Fake", op="verified_op_zzz" the
+    # auto-generated camelCase candidate is "fakeVerifiedOpZzz"
+    # (_to_camel("fake_verified_op_zzz")).
     ts_src_dir = tmp_path / "ts_src"
     ts_src_dir.mkdir()
     ts_file = ts_src_dir / "index.ts"
     ts_file.write_text(
-        "export function verifiedOpZzz(): void {}\n",
+        "export function fakeVerifiedOpZzz(): void {}\n",
         encoding="utf-8",
     )
 

@@ -100,11 +100,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["verifyLinkAttestation"],
     },
     # Context validation helpers
-    ("Context", "validate_params"): {
-        "python": ["validate_context_params"],
-        "typescript": ["validateContextParams"],
-        "kotlin": ["validateContextParams"],
-    },
     ("Context", "metadata_record_serialize"): {
         "python": ["metadata_record_to_json"],
         "typescript": ["metadataRecordToJson"],
@@ -128,6 +123,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Messaging", "subscribe"): {
         "python": ["receive", "context_receive"],
         "typescript": ["receive", "contextSubscribe"],
+        "kotlin": ["subscribe"],
     },
     # Messaging -- validate_broadcast_key has _hex suffix in some SDKs
     ("Messaging", "validate_broadcast_key"): {
@@ -135,53 +131,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["validateBroadcastKeyHex"],
         "kotlin": ["validateBroadcastKeyHex"],
         "swift": ["validateBroadcastKeyHex"],
-    },
-    # Tools -- TypeScript uses domain-prefixed naming (toolXxx on SCP class)
-    ("Tools", "register"): {
-        "typescript": ["toolRegister"],
-    },
-    ("Tools", "invoke"): {
-        "python": ["tool_invoke"],
-        "typescript": ["toolInvoke"],
-    },
-    ("Tools", "verify"): {
-        "python": ["tool_verify"],
-        "typescript": ["toolVerify"],
-    },
-    ("Tools", "invoke_cross_context"): {
-        "python": ["tool_invoke_cross_context"],
-        "typescript": ["toolInvokeCrossContext"],
-        "swift": ["toolInvokeCrossContext"],
-    },
-    ("Tools", "session_create"): {
-        "python": ["tool_session_create"],
-        "typescript": ["toolSessionCreate"],
-        "swift": ["toolSessionCreate"],
-    },
-    ("Tools", "session_invoke"): {
-        "python": ["tool_session_invoke"],
-        "typescript": ["toolSessionInvoke"],
-        "swift": ["toolSessionInvoke"],
-    },
-    ("Tools", "session_close"): {
-        "python": ["tool_session_close"],
-        "typescript": ["toolSessionClose"],
-        "swift": ["toolSessionClose"],
-    },
-    ("Tools", "interface_expose"): {
-        "python": ["tool_interface_expose"],
-        "typescript": ["toolInterfaceExpose"],
-        "swift": ["exposeToolInterface"],
-    },
-    ("Tools", "interface_accept"): {
-        "python": ["tool_interface_accept"],
-        "typescript": ["toolInterfaceAccept"],
-        "swift": ["acceptToolInterface"],
-    },
-    ("Tools", "interface_revoke"): {
-        "python": ["tool_interface_revoke"],
-        "typescript": ["toolInterfaceRevoke"],
-        "swift": ["revokeToolInterface"],
     },
     # Governance -- uses different naming in all SDKs.
     # Per-action variants dispatch through one generic method; there is no
@@ -225,37 +174,57 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["contextGovernanceListProposals"],
     },
     ("Governance", "apply_pending_ceiling_modification"): {
+        "python": ["apply_pending_ceiling_modification"],
         "typescript": ["contextApplyPendingCeilingModification"],
+        "kotlin": ["applyPendingCeilingModification"],
+        "swift": ["applyPendingCeilingModification"],
     },
     ("Governance", "finalize_close"): {
+        "python": ["finalize_close"],
         "typescript": ["contextFinalizeClose"],
+        "kotlin": ["finalizeClose"],
+        "swift": ["finalizeClose"],
     },
     ("Governance", "create_governance_checkpoint"): {
+        "python": ["create_governance_checkpoint"],
         "typescript": ["contextCreateGovernanceCheckpoint"],
+        "kotlin": ["createGovernanceCheckpoint"],
+        "swift": ["createGovernanceCheckpoint"],
     },
     ("Governance", "add_checkpoint_cosignature"): {
+        "python": ["add_checkpoint_cosignature"],
         "typescript": ["contextAddCheckpointCosignature"],
+        "kotlin": ["addCheckpointCosignature"],
+        "swift": ["addCheckpointCosignature"],
     },
     ("Governance", "member_count"): {
         "python": ["member_count", "context_member_count"],
         "typescript": ["contextMemberCount"],
+        "kotlin": ["memberCount"],
+        "swift": ["memberCount"],
     },
     ("Governance", "is_member"): {
         "python": ["is_member", "context_is_member"],
         "typescript": ["contextIsMember"],
+        "kotlin": ["isMember"],
+        "swift": ["isMember"],
     },
     ("Governance", "member_role"): {
         "python": ["context_member_role"],
         "typescript": ["contextMemberRole"],
+        "kotlin": ["memberRole"],
+        "swift": ["memberRole"],
     },
     # Governance rows whose method lives under context_* in Python / TypeScript.
     ("Governance", "handle_ttl_expiry"): {
         "python": ["context_handle_ttl_expiry"],
         "typescript": ["contextHandleTtlExpiry"],
+        "swift": ["handleTtlExpiry"],
     },
     ("Governance", "propose_ttl_extension"): {
         "python": ["context_propose_ttl_extension"],
         "typescript": ["contextProposeTtlExtension"],
+        "swift": ["proposeTtlExtension"],
     },
     # Governance -- new GovernanceAction variants dispatched via the existing
     # execute_action / propose_action entry points.
@@ -310,10 +279,14 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("EventLog", "verify"): {
         "python": ["event_log_verify"],
         "typescript": ["eventLogVerify"],
+        "kotlin": ["verify"],
+        "swift": ["verify"],
     },
     ("EventLog", "checkpoint"): {
+        "python": ["Checkpoint"],
         "typescript": ["eventLogCheckpoint"],
         "kotlin": ["eventLogCheckpoint"],
+        "swift": ["Checkpoint"],
     },
     ("EventLog", "checkpoint_by_did"): {
         "python": ["event_log_checkpoint_by_did"],
@@ -322,6 +295,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["eventLogCheckpointByDid"],
     },
     ("EventLog", "signed_checkpoint"): {
+        "python": ["SignedCheckpoint"],
         "typescript": ["eventLogCheckpoint"],
         "kotlin": ["eventLogCheckpoint"],
         "swift": ["generateEventLogCheckpoint"],
@@ -332,6 +306,15 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     ("Transport", "status"): {
         "python": ["relay_status"],
+    },
+    # configure_local_transport already carries partial domain prefix in the op
+    # name; the auto-generated domain_snake 'transport_configure_local_transport'
+    # is not what the SDKs expose.
+    ("Transport", "configure_local_transport"): {
+        "python": ["configure_local_transport"],
+        "typescript": ["configureLocalTransport"],
+        "kotlin": ["configureLocalTransport"],
+        "swift": ["configureLocalTransport"],
     },
     # Media
     ("Media", "check_capability"): {
@@ -346,23 +329,30 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["contextDiscover"],
     },
     ("Discovery", "scope_register"): {
-        "swift": ["registerScope"],
+        "python": ["scope_register"],
+        "typescript": ["scopeRegister"],
+        "kotlin": ["scopeRegister"],
+        "swift": ["scopeRegister"],
     },
     ("Discovery", "scope_lookup"): {
-        "swift": ["lookupScope"],
+        "python": ["scope_lookup"],
+        "typescript": ["scopeLookup"],
+        "kotlin": ["scopeLookup"],
+        "swift": ["scopeLookup"],
     },
     ("Discovery", "scope_deregister"): {
-        "swift": ["deregisterScope"],
+        "python": ["scope_deregister"],
+        "typescript": ["scopeDeregister"],
+        "kotlin": ["scopeDeregister"],
+        "swift": ["scopeDeregister"],
     },
     # Sync
     ("Sync", "get_policy"): {
+        "python": ["get_policy"],
         "typescript": ["getSyncPolicy"],
     },
-    # Provenance
-    ("Provenance", "evaluate_quality"): {
-        "python": ["evaluate_provenance_quality"],
-        "typescript": ["evaluateProvenanceQuality"],
-        "swift": ["evaluateProvenanceQuality"],
+    ("Sync", "classify_offline"): {
+        "python": ["classify_offline"],
     },
     # UCAN -- TypeScript uses validateUcan/mintUcan/revokeUcan/delegateUcan
     ("UCAN", "validate"): {
@@ -377,69 +367,478 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("UCAN", "delegate"): {
         "typescript": ["delegateUcan"],
     },
-    # Bridge -- register is surfaced as BridgeRegistration type in TS and
-    # `register` function in Python/Swift/Kotlin bridge modules.
-    ("Bridge", "register"): {
-        "typescript": ["BridgeRegistration", "createNativeBridge", "createWasmBridge"],
-    },
     # MCP
     ("MCP", "serve"): {
         "python": ["serve_mcp", "McpServer"],
+        "typescript": ["serve"],
+        "swift": ["serve"],
     },
     ("MCP", "connect_client"): {
         "python": ["McpClient"],
         "typescript": ["mcpClientConnectStdio", "mcpClientConnectSse"],
         "swift": ["McpClient", "connect"],
     },
-    # Server -- methods live on Relay/Node classes
+    # Identity -- Swift uses bare method names without domain prefix
+    ("Identity", "add_agent_key"): {
+        "swift": ["addAgentKey"],
+    },
+    ("Identity", "rotate_agent_key"): {
+        "swift": ["rotateAgentKey"],
+    },
+    ("Identity", "remove_agent_key"): {
+        "swift": ["removeAgentKey"],
+    },
+    # Identity -- identity_remove / identity_remove_if_present already carry the
+    # domain prefix in the op name itself; the auto-generated domain_snake form
+    # would be 'identity_identity_remove' (double-prefix), so explicit aliases
+    # are required.
+    ("Identity", "identity_remove"): {
+        "python": ["identity_remove"],
+        "typescript": ["identityRemove"],
+        "kotlin": ["identityRemove"],
+        "swift": ["identityRemove"],
+    },
+    ("Identity", "identity_remove_if_present"): {
+        "python": ["identity_remove_if_present"],
+        "typescript": ["identityRemoveIfPresent"],
+        "kotlin": ["identityRemoveIfPresent"],
+        "swift": ["identityRemoveIfPresent"],
+    },
+    # Context -- bare method names used across SDKs
+    ("Context", "reconnect"): {
+        "python": ["reconnect"],
+        "typescript": ["reconnect"],
+        "kotlin": ["reconnect"],
+    },
+    ("Context", "set_economic_policy"): {
+        "python": ["set_economic_policy"],
+    },
+    ("Context", "get_economic_policy"): {
+        "python": ["get_economic_policy"],
+    },
+    ("Context", "validate_params"): {
+        "python": ["validate_context_params"],
+        "typescript": ["validateContextParams"],
+        "kotlin": ["validateContextParams"],
+        "swift": ["validateParams"],
+    },
+    ("Context", "validate_admission"): {
+        "python": ["validate_admission"],
+        "typescript": ["validateAdmission"],
+        "kotlin": ["validateAdmission"],
+        "swift": ["validateAdmission"],
+    },
+    ("Context", "evaluate_invitation"): {
+        "python": ["evaluate_invitation"],
+        "typescript": ["evaluateInvitation"],
+        "kotlin": ["evaluateInvitation"],
+        "swift": ["evaluateInvitation"],
+    },
+    ("Context", "validate_capability_declaration"): {
+        "python": ["validate_capability_declaration"],
+        "typescript": ["validateCapabilityDeclaration"],
+        "swift": ["validateCapabilityDeclaration"],
+    },
+    ("Context", "template_get_params"): {
+        "python": ["template_get_params"],
+        "typescript": ["templateGetParams"],
+        "kotlin": ["templateGetParams"],
+        "swift": ["templateGetParams"],
+    },
+    ("Context", "validate_against_template"): {
+        "python": ["validate_against_template"],
+        "typescript": ["validateAgainstTemplate"],
+        "kotlin": ["validateAgainstTemplate"],
+        "swift": ["validateAgainstTemplate"],
+    },
+    # Messaging -- broadcast operations use bare names in all SDKs
+    ("Messaging", "broadcast_subscribe"): {
+        "python": ["broadcast_subscribe"],
+        "typescript": ["broadcastSubscribe"],
+        "kotlin": ["broadcastSubscribe"],
+        "swift": ["broadcastSubscribe"],
+    },
+    ("Messaging", "broadcast_publish"): {
+        "python": ["broadcast_publish"],
+        "typescript": ["broadcastPublish"],
+        "kotlin": ["broadcastPublish"],
+        "swift": ["broadcastPublish"],
+    },
+    ("Messaging", "broadcast_publish_asset"): {
+        "python": ["broadcast_publish_asset"],
+        "typescript": ["broadcastPublishAsset"],
+        "kotlin": ["broadcastPublishAsset"],
+        "swift": ["broadcastPublishAsset"],
+    },
+    ("Messaging", "broadcast_publish_assets"): {
+        "python": ["broadcast_publish_assets"],
+        "typescript": ["broadcastPublishAssets"],
+        "kotlin": ["broadcastPublishAssets"],
+        "swift": ["broadcastPublishAssets"],
+    },
+    ("Messaging", "broadcast_block_subscriber"): {
+        "python": ["broadcast_block_subscriber"],
+        "typescript": ["broadcastBlockSubscriber"],
+        "kotlin": ["broadcastBlockSubscriber"],
+        "swift": ["broadcastBlockSubscriber"],
+    },
+    ("Messaging", "broadcast_unblock_subscriber"): {
+        "python": ["broadcast_unblock_subscriber"],
+        "typescript": ["broadcastUnblockSubscriber"],
+        "kotlin": ["broadcastUnblockSubscriber"],
+        "swift": ["broadcastUnblockSubscriber"],
+    },
+    ("Messaging", "broadcast_handle_key_request"): {
+        "python": ["broadcast_handle_key_request"],
+        "typescript": ["broadcastHandleKeyRequest"],
+        "kotlin": ["broadcastHandleKeyRequest"],
+        "swift": ["broadcastHandleKeyRequest"],
+    },
+    # Tools -- Kotlin/Swift use bare method names without domain prefix
+    ("Tools", "register"): {
+        "python": ["tool_register"],
+        "typescript": ["toolRegister"],
+        "kotlin": ["register"],
+        "swift": ["register"],
+    },
+    ("Tools", "invoke"): {
+        "python": ["tool_invoke"],
+        "typescript": ["toolInvoke"],
+        "kotlin": ["invoke"],
+        "swift": ["invoke"],
+    },
+    ("Tools", "verify"): {
+        "python": ["tool_verify"],
+        "typescript": ["toolVerify"],
+        "kotlin": ["verify"],
+        "swift": ["verify"],
+    },
+    ("Tools", "invoke_cross_context"): {
+        "python": ["tool_invoke_cross_context"],
+        "typescript": ["toolInvokeCrossContext"],
+        "kotlin": ["invokeCrossContext"],
+        "swift": ["toolInvokeCrossContext"],
+    },
+    ("Tools", "session_create"): {
+        "python": ["tool_session_create"],
+        "typescript": ["toolSessionCreate"],
+        "kotlin": ["sessionCreate"],
+        "swift": ["toolSessionCreate"],
+    },
+    ("Tools", "session_invoke"): {
+        "python": ["tool_session_invoke"],
+        "typescript": ["toolSessionInvoke"],
+        "kotlin": ["sessionInvoke"],
+        "swift": ["toolSessionInvoke"],
+    },
+    ("Tools", "session_close"): {
+        "python": ["tool_session_close"],
+        "typescript": ["toolSessionClose"],
+        "kotlin": ["sessionClose"],
+        "swift": ["toolSessionClose"],
+    },
+    ("Tools", "interface_expose"): {
+        "python": ["tool_interface_expose"],
+        "typescript": ["toolInterfaceExpose"],
+        "kotlin": ["interfaceExpose"],
+        "swift": ["exposeToolInterface"],
+    },
+    ("Tools", "interface_accept"): {
+        "python": ["tool_interface_accept"],
+        "typescript": ["toolInterfaceAccept"],
+        "kotlin": ["interfaceAccept"],
+        "swift": ["acceptToolInterface"],
+    },
+    ("Tools", "interface_revoke"): {
+        "python": ["tool_interface_revoke"],
+        "typescript": ["toolInterfaceRevoke"],
+        "kotlin": ["interfaceRevoke"],
+        "swift": ["revokeToolInterface"],
+    },
+    # Trust -- bare names in all SDKs
+    ("Trust", "evaluate_trust"): {
+        "python": ["evaluate_trust"],
+        "typescript": ["evaluateTrust"],
+        "swift": ["evaluateTrust"],
+    },
+    ("Trust", "aggregate_trust_input"): {
+        "python": ["aggregate_trust_input"],
+        "typescript": ["aggregateTrustInput"],
+        "kotlin": ["aggregateTrustInput"],
+        "swift": ["aggregateTrustInput"],
+    },
+    ("Trust", "verify_participation_requirements"): {
+        "python": ["verify_participation_requirements"],
+        "typescript": ["verifyParticipationRequirements"],
+        "kotlin": ["verifyParticipationRequirements"],
+        "swift": ["verifyParticipationRequirements"],
+    },
+    # Discovery -- bare/different names across SDKs
+    ("Discovery", "parse_address"): {
+        "python": ["parse_address"],
+        "typescript": ["parseAddress"],
+    },
+    ("Discovery", "create_query"): {
+        "python": ["create_query"],
+        "typescript": ["createQuery"],
+    },
+    ("Discovery", "normalize_address"): {
+        "python": ["normalize_address"],
+        "typescript": ["normalizeAddress"],
+    },
+    ("Discovery", "address_resolve"): {
+        "python": ["address_resolve"],
+        "typescript": ["addressResolve"],
+        "kotlin": ["addressResolve"],
+        "swift": ["addressResolve"],
+    },
+    ("Discovery", "petname_set"): {
+        "python": ["petname_set"],
+        "typescript": ["petnameSet"],
+        "kotlin": ["petnameSet"],
+        "swift": ["petnameSet"],
+    },
+    ("Discovery", "petname_remove"): {
+        "python": ["petname_remove"],
+        "typescript": ["petnameRemove"],
+        "kotlin": ["petnameRemove"],
+        "swift": ["petnameRemove"],
+    },
+    ("Discovery", "petname_set_context"): {
+        "python": ["petname_set_context"],
+        "typescript": ["petnameSetContext"],
+        "kotlin": ["petnameSetContext"],
+        "swift": ["petnameSetContext"],
+    },
+    ("Discovery", "petname_remove_context"): {
+        "python": ["petname_remove_context"],
+        "typescript": ["petnameRemoveContext"],
+        "kotlin": ["petnameRemoveContext"],
+        "swift": ["petnameRemoveContext"],
+    },
+    ("Discovery", "petname_resolve_did"): {
+        "python": ["petname_resolve_did"],
+        "typescript": ["petnameResolveDid"],
+        "kotlin": ["petnameResolveDid"],
+        "swift": ["petnameResolveDid"],
+    },
+    ("Discovery", "petname_resolve_context"): {
+        "python": ["petname_resolve_context"],
+        "typescript": ["petnameResolveContext"],
+        "kotlin": ["petnameResolveContext"],
+        "swift": ["petnameResolveContext"],
+    },
+    ("Discovery", "petname_get_for_did"): {
+        "python": ["petname_get_for_did"],
+        "typescript": ["petnameGetForDid"],
+        "kotlin": ["petnameGetForDid"],
+        "swift": ["petnameGetForDid"],
+    },
+    ("Discovery", "petname_get_for_context"): {
+        "python": ["petname_get_for_context"],
+        "typescript": ["petnameGetForContext"],
+        "kotlin": ["petnameGetForContext"],
+        "swift": ["petnameGetForContext"],
+    },
+    ("Discovery", "petname_apply_event"): {
+        "python": ["petname_apply_event"],
+        "typescript": ["petnameApplyEvent"],
+        "kotlin": ["petnameApplyEvent"],
+        "swift": ["petnameApplyEvent"],
+    },
+    ("Discovery", "petname_did_count"): {
+        "python": ["petname_did_count"],
+        "typescript": ["petnameDidCount"],
+        "kotlin": ["petnameDidCount"],
+        "swift": ["petnameDidCount"],
+    },
+    ("Discovery", "petname_context_count"): {
+        "python": ["petname_context_count"],
+        "typescript": ["petnameContextCount"],
+        "kotlin": ["petnameContextCount"],
+        "swift": ["petnameContextCount"],
+    },
+    ("Discovery", "handle_register"): {
+        "python": ["handle_register"],
+        "typescript": ["handleRegister"],
+        "kotlin": ["handleRegister"],
+        "swift": ["handleRegister"],
+    },
+    ("Discovery", "handle_lookup"): {
+        "python": ["handle_lookup"],
+        "typescript": ["handleLookup"],
+        "kotlin": ["handleLookup"],
+        "swift": ["handleLookup"],
+    },
+    ("Discovery", "handle_deregister"): {
+        "python": ["handle_deregister"],
+        "typescript": ["handleDeregister"],
+        "kotlin": ["handleDeregister"],
+        "swift": ["handleDeregister"],
+    },
+    # Economy -- Python SDK uses bare names (no domain prefix)
+    ("Economy", "estimate_cost"): {
+        "python": ["estimate_cost"],
+    },
+    ("Economy", "policy_requires_payment"): {
+        "python": ["policy_requires_payment"],
+    },
+    ("Economy", "auto_accept_blocked"): {
+        "python": ["auto_accept_blocked"],
+    },
+    ("Economy", "check_policy_lock"): {
+        "python": ["check_policy_lock"],
+    },
+    ("Economy", "validate_policy_change"): {
+        "python": ["validate_policy_change"],
+    },
+    ("Economy", "evaluate_formula"): {
+        "python": ["evaluate_formula"],
+    },
+    # Sync -- Python uses bare get_policy (no domain prefix)
+    # (TypeScript getSyncPolicy is already in the entry above)
+    # Provenance -- Kotlin uses bare evaluateQuality
+    ("Provenance", "evaluate_quality"): {
+        "python": ["evaluate_provenance_quality"],
+        "typescript": ["evaluateProvenanceQuality"],
+        "kotlin": ["evaluateQuality"],
+        "swift": ["evaluateProvenanceQuality"],
+    },
+    # Media -- Python SDK uses bare names without domain prefix
+    ("Media", "initiate_session"): {
+        "python": ["initiate_session"],
+    },
+    ("Media", "activate_session"): {
+        "python": ["activate_session"],
+    },
+    ("Media", "join_session"): {
+        "python": ["join_session"],
+    },
+    ("Media", "end_session"): {
+        "python": ["end_session"],
+    },
+    ("Media", "create_offer"): {
+        "python": ["create_offer"],
+    },
+    ("Media", "create_answer"): {
+        "python": ["create_answer"],
+    },
+    ("Media", "create_ice_candidate"): {
+        "python": ["create_ice_candidate"],
+    },
+    ("Media", "create_session_end"): {
+        "python": ["create_session_end"],
+    },
+    ("Media", "send_signaling"): {
+        "python": ["send_signaling"],
+    },
+    ("Media", "verify_sender_attribution"): {
+        "python": ["verify_sender_attribution"],
+    },
+    # Auth -- scpid_* ops already carry the domain prefix in the op name;
+    # the auto-generated domain_snake form would be 'auth_scpid_*' (wrong).
+    ("Auth", "scpid_challenge"): {
+        "python": ["scpid_challenge"],
+        "typescript": ["scpidChallenge"],
+        "kotlin": ["scpidChallenge"],
+        "swift": ["scpidChallenge"],
+    },
+    ("Auth", "scpid_sign"): {
+        "python": ["scpid_sign"],
+        "typescript": ["scpidSign"],
+        "kotlin": ["scpidSign"],
+        "swift": ["scpidSign"],
+    },
+    ("Auth", "scpid_verify"): {
+        "python": ["scpid_verify"],
+        "typescript": ["scpidVerify"],
+        "kotlin": ["scpidVerify"],
+        "swift": ["scpidVerify"],
+    },
+    # Lifecycle -- suspend/resume use bare names in all SDKs
+    ("Lifecycle", "suspend"): {
+        "python": ["suspend"],
+        "typescript": ["suspend"],
+        "kotlin": ["suspendInstance"],
+        "swift": ["suspend"],
+    },
+    ("Lifecycle", "resume"): {
+        "python": ["resume"],
+        "typescript": ["resume"],
+        "kotlin": ["resume"],
+        "swift": ["resume"],
+    },
+    # Bridge -- Python uses bare 'register' and 'evaluate_trust'
+    ("Bridge", "register"): {
+        "python": ["register"],
+        "typescript": ["BridgeRegistration", "createNativeBridge", "createWasmBridge"],
+    },
+    ("Bridge", "evaluate_trust"): {
+        "python": ["evaluate_trust"],
+    },
+    # Server -- Kotlin uses domain-prefixed bare names (e.g. relayStartInMemory);
+    # Python uses domain-prefixed snake_case (relay_start_in_memory);
+    # TypeScript uses domain-prefixed camelCase (relayStartInMemory).
+    # The op names already carry the sub-domain prefix (relay_/node_) so
+    # auto-generated domain_snake would be 'server_relay_start_in_memory' (wrong).
     ("Server", "relay_start_in_memory"): {
-        "python": ["start_in_memory"],
-        "typescript": ["startInMemory"],
+        "python": ["relay_start_in_memory", "start_in_memory"],
+        "typescript": ["relayStartInMemory", "startInMemory"],
+        "kotlin": ["relayStartInMemory"],
         "swift": ["startInMemory"],
     },
     ("Server", "relay_start_local"): {
-        "python": ["start_local"],
-        "typescript": ["startLocal"],
+        "python": ["relay_start_local", "start_local"],
+        "typescript": ["relayStartLocal", "startLocal"],
+        "kotlin": ["relayStartLocal"],
         "swift": ["startLocal"],
     },
     ("Server", "relay_shutdown"): {
         "python": ["shutdown"],
         "typescript": ["shutdown"],
+        "kotlin": ["relayShutdown"],
         "swift": ["shutdown"],
     },
     ("Server", "node_start_in_memory"): {
-        "python": ["start_in_memory"],
-        "typescript": ["startInMemory"],
+        "python": ["node_start_in_memory", "start_in_memory"],
+        "typescript": ["nodeStartInMemory", "startInMemory"],
+        "kotlin": ["nodeStartInMemory"],
         "swift": ["startInMemory"],
     },
     ("Server", "node_start_local"): {
-        "python": ["start_local"],
-        "typescript": ["startLocal"],
+        "python": ["node_start_local", "start_local"],
+        "typescript": ["nodeStartLocal", "startLocal"],
+        "kotlin": ["nodeStartLocal"],
         "swift": ["startLocal"],
     },
     ("Server", "node_shutdown"): {
         "python": ["shutdown"],
         "typescript": ["shutdown"],
+        "kotlin": ["nodeShutdown"],
         "swift": ["shutdown"],
     },
     ("Server", "node_enable_site_projection"): {
         "python": ["enable_site_projection"],
         "typescript": ["enableSiteProjection"],
+        "kotlin": ["nodeEnableSiteProjection"],
         "swift": ["enableSiteProjection"],
     },
     ("Server", "node_commit_deploy"): {
         "python": ["commit_deploy"],
         "typescript": ["commitDeploy"],
+        "kotlin": ["nodeCommitDeploy"],
         "swift": ["commitDeploy"],
     },
     ("Server", "node_rollback_deploy"): {
         "python": ["rollback_deploy"],
         "typescript": ["rollbackDeploy"],
+        "kotlin": ["nodeRollbackDeploy"],
         "swift": ["rollbackDeploy"],
     },
     ("Server", "node_disable_site_projection"): {
         "python": ["disable_site_projection"],
         "typescript": ["disableSiteProjection"],
+        "kotlin": ["nodeDisableSiteProjection"],
         "swift": ["disableSiteProjection"],
     },
     # Context -- receive needs mapping in Kotlin
@@ -455,10 +854,16 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["contextCreate"],
     },
     ("Context", "restore_context"): {
+        "python": ["restore_context"],
         "typescript": ["contextRestore"],
+        "kotlin": ["restoreContext"],
+        "swift": ["restoreContext"],
     },
     ("Context", "restore_all_contexts"): {
+        "python": ["restore_all_contexts"],
         "typescript": ["contextRestoreAll"],
+        "kotlin": ["restoreAllContexts"],
+        "swift": ["restoreAllContexts"],
     },
     ("Context", "import_context"): {
         "swift": ["contextImport"],
@@ -529,9 +934,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["transportAddRelay", "configureRelayTransport"],
         "swift": ["addRelay"],
         "kotlin": ["addRelay"],
-    },
-    ("Lifecycle", "suspend"): {
-        "kotlin": ["suspendInstance"],
     },
 }
 
@@ -1035,29 +1437,21 @@ def _check_operation_in_sdk(
             if alias in sdk_symbols:
                 return True
 
-    # 2. Generate name variants and check exact match
+    # 2. Generate name variants and check exact match.
+    #    Only domain-prefixed forms are checked here.  Bare op_name/camel/pascal
+    #    candidates were removed because they accepted any unrelated SDK symbol
+    #    that happened to share the operation name (e.g. a `migrate` helper
+    #    anywhere in the codebase satisfied `Identity/migrate`).  All legitimate
+    #    cross-SDK name irregularities — where the SDK uses a name that is not
+    #    the domain-prefixed form — must be registered in the ALIASES table above.
     camel = _to_camel(op_name)
-    pascal = _to_pascal(op_name)
 
     # Domain-prefixed variants
     domain_lower = domain.lower()
     domain_snake = f"{domain_lower}_{op_name}"
     domain_camel = _to_camel(domain_snake)
 
-    # NOTE: The candidate list includes bare op_name/camelCase/PascalCase.
-    # These are necessary because Swift/Kotlin SDKs use bare method names
-    # (e.g. Swift: `addAgentKey`, Kotlin: `isMember`) rather than
-    # domain-prefixed forms. The tradeoff is that a fabricated op whose name
-    # collides with an unrelated SDK symbol will pass the gate — this is the
-    # name-existence vs name-resolution limitation documented in
-    # .docs/lessons/ast-gate-checks-definition-not-name-resolution.md.
-    # Cross-SDK name irregularities and all ops where domain-scoped matching
-    # is insufficient must use explicit ALIASES entries above.
     candidates = [
-        # Raw operation names
-        op_name,  # send_message
-        camel,  # sendMessage
-        pascal,  # SendMessage
         # Domain-prefixed
         domain_snake,  # messaging_send_message
         domain_camel,  # messagingSendMessage
