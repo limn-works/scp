@@ -47,8 +47,8 @@ pub use projection::{
 };
 pub use self_host::{
     Asset, DeploySiteParams, HostSiteConfig, HostSiteError, HostSiteReady, SelfHostDeployer,
-    SelfHostError, content_type_for, deploy_site, embedded_assets, host_site, host_site_until,
-    routing_id_hex,
+    SelfHostError, colocated_document_vm_key_resolver, content_type_for, deploy_site,
+    embedded_assets, host_site, host_site_until, routing_id_hex,
 };
 
 // `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase

@@ -450,13 +450,22 @@ impl IdentityBackedDidResolver {
         // Per-instance anti-rollback ratchet (defense-in-depth — see the
         // "Downgrade protection" note above; the cache-level guard is load-bearing).
         self.check_sequence(did, resolved.seq)?;
-        let bytes = Self::extract_public_key(&resolved, key_id.fragment())?;
-        ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|e| {
-            ResolutionError::InvalidDocument(format!(
-                "verification method '#{}' for {did} is not a valid Ed25519 public key: {e}",
-                key_id.fragment()
-            ))
-        })
+        // Pure document→key extraction is hoisted to scp-identity
+        // (`verifying_key_from_document`, keyed by `SigningKeyId`) so this bridge
+        // and the co-located scp-node self-host participant share ONE tested
+        // helper (ADR-053 / spec §10.17, SHB-008). The helper collapses a missing
+        // verification method, an undecodable key, or an invalid curve point to
+        // `None`; this VM-aware accessor maps that miss to the structured
+        // `InvalidDocument` its callers branch on.
+        scp_identity::resolver::verifying_key_from_document(&resolved.document, key_id).ok_or_else(
+            || {
+                ResolutionError::InvalidDocument(format!(
+                    "verification method '#{}' for {did} is absent, undecodable, or not a \
+                     valid Ed25519 public key",
+                    key_id.fragment()
+                ))
+            },
+        )
     }
 }
 
@@ -1162,6 +1171,36 @@ mod tests {
         assert!(
             key_resolver(&unknown_did, scp_identity::SigningKeyId::Agent).is_none(),
             "unknown DID (Agent) must resolve to None"
+        );
+    }
+
+    /// SHB-008: the bridge `KeyResolver` resolves a registered document's Active
+    /// key via the hoisted `scp_identity::resolver::verifying_key_from_document`
+    /// helper — proving the extraction was relocated to scp-identity with the
+    /// bridge's observable behavior unchanged (`Some(active_vk)` for a known DID's
+    /// `#active` signing key).
+    #[test]
+    fn bridge_keyresolver_resolves_via_hoisted_helper() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let identity = rt.block_on(async { seed_identity(&dht, false).await });
+
+        // The bridge KeyResolver is built exactly as production wires it.
+        let did_resolver = identity_resolver_over(Arc::clone(&dht), rt.handle().clone());
+        let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
+
+        let did = scp_identity::DID::from(identity.did.clone());
+        let active = key_resolver(&did, scp_identity::SigningKeyId::Active);
+        assert_eq!(
+            active,
+            Some(identity.active_vk),
+            "the bridge KeyResolver (now backed by the hoisted \
+             verifying_key_from_document helper) must return Some(active_vk) for a \
+             registered document's #active key"
         );
     }
 }
