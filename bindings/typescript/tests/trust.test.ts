@@ -397,6 +397,28 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     }
     expect(threw).toBe(true);
   });
+
+  it("PERM-3030 handle-affinity error re-throws instead of being classified", async () => {
+    // PERM-3030 errors indicate caller misuse (handle belongs to a different SCP
+    // instance) and must propagate to the caller rather than being silently
+    // mapped to a failed CapabilityValidation. Mirrors Python's
+    // test_evaluate_trust_reraises_perm_3030_handle_affinity_error.
+    const { scp, native, context } = mountWithContext();
+    const perm3030 = new Error(
+      "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance",
+    );
+    native.__stub("ucanValidate", () => Promise.reject(perm3030));
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    let threw = false;
+    try {
+      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+    } catch (err) {
+      threw = true;
+      expect(err).toBe(perm3030);
+    }
+    expect(threw).toBe(true);
+  });
 });
 
 describe("evaluateTrust — Layer 2 behavioral record", () => {
