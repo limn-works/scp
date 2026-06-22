@@ -1152,21 +1152,11 @@ mod cross_impl_leaf_parity {
         actor_did: &str,
         timestamp: u64,
     ) -> [u8; 32] {
-        use scp_event_log::tree::{append_unsigned_event, root};
-        use scp_event_log::{DID, Event, EventLog, EventPayload};
-
-        let mut log = EventLog::new(context_id.to_owned());
-        let event = Event {
-            event_type,
-            actor_did: DID::from(actor_did.to_owned()),
-            timestamp,
-            sequence: 0,
-            payload: EventPayload { data: Vec::new() },
-            prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
-            signature: Vec::new(),
-        };
-        append_unsigned_event(&mut log, &event).expect("reference system leaf append");
-        root(&log)
+        // A system leaf is exactly a payload leaf with an EMPTY payload — the
+        // `EventPayload { data: Vec::new() }` an empty `&[]` produces is
+        // byte-identical, so forward to the payload reference to keep a single
+        // source of preimage truth.
+        native_reference_single_payload_leaf_root(context_id, event_type, actor_did, timestamp, &[])
     }
 
     /// Reconstructs the native-reference leaf bytes for a single
