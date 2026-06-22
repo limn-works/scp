@@ -934,7 +934,11 @@ export class SCP {
     // gate-defang). Surface stays async for SDK ABI stability; the underlying
     // call is sync.
     const fn = nativeFreeFn<(j: string, k: string) => boolean>("identityVerifyLinkAttestation");
-    return fn(attestationJson, issuerPublicKeyHex);
+    try {
+      return fn(attestationJson, issuerPublicKeyHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
