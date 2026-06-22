@@ -1,4 +1,4 @@
-# ADR-051: Pre-Rotation Key Custody — Substrate Isolation for Callback Custody
+# ADR-053: Pre-Rotation Key Custody — Substrate Isolation for Callback Custody
 
 **Status:** Proposed
 **Date:** 2026-06-14
