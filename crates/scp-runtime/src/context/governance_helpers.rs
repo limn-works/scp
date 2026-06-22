@@ -1783,10 +1783,6 @@ pub fn execute_add_signer(
     did: &DID,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `threshold_signers` combinator; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1794,56 +1790,68 @@ pub fn execute_add_signer(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: adding a threshold signer is an UPWARD governance
+    // grant. Migrating onto `commit_class_s_keep` STRENGTHENS the prior
+    // best-effort persist to fail-closed (keep-direction): on persist failure
+    // the in-memory grant STAYS granted — a granted-and-kept signer is the
+    // fail-closed-correct direction (un-granting an already-acknowledged signer
+    // is the unsafe move). The Class-S `threshold_signers.push` and the Class-C
+    // capability/token grants ride the SAME fail-closed persist (both inside the
+    // closure); the reject-before-mutate guards return `Err` (no persist).
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-    if state.governance.class_s.threshold_signers.contains(did) {
-        return Err(ContextError::PermissionDenied(format!(
-            "DID is already a signer: {did}"
-        )));
-    }
-    if state.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
-        return Err(ContextError::LimitExceeded(format!(
-            "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
-        )));
-    }
-    state.governance.class_s.threshold_signers.push(did.clone());
-
-    let creator_did = state.role_state.creator_did.clone();
-    let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
-    for cap in &capabilities {
-        let att = roles::UcanAttestation {
-            with: format!("scp:ctx:{context_id}/{cap}"),
-            can: "invoke".to_owned(),
-        };
-        let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&*deps.clock);
-        let token = roles::UcanToken {
-            iss: creator_did.clone(),
-            aud: did.to_string(),
-            att: vec![att],
-            nnc: nonce,
-        };
-        state
-            .role_state
-            .member_capabilities
-            .entry(did.to_string())
-            .or_default()
-            .insert(cap.clone());
-        if let Some(info) = state.membership.get_mut(did) {
-            info.tokens.push(token);
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
         }
-    }
+        if view.governance.class_s.threshold_signers.contains(did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "DID is already a signer: {did}"
+            )));
+        }
+        if view.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+            return Err(ContextError::LimitExceeded(format!(
+                "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
+            )));
+        }
+        view.governance_class_s_mut()
+            .threshold_signers
+            .push(did.clone());
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        let state = view.rest_mut();
+        let creator_did = state.role_state.creator_did.clone();
+        let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+        for cap in &capabilities {
+            let att = roles::UcanAttestation {
+                with: format!("scp:ctx:{context_id}/{cap}"),
+                can: "invoke".to_owned(),
+            };
+            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&*deps.clock);
+            let token = roles::UcanToken {
+                iss: creator_did.clone(),
+                aud: did.to_string(),
+                att: vec![att],
+                nnc: nonce,
+            };
+            state
+                .role_state
+                .member_capabilities
+                .entry(did.to_string())
+                .or_default()
+                .insert(cap.clone());
+            if let Some(info) = state.membership.get_mut(did) {
+                info.tokens.push(token);
+            }
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerAdded,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1858,10 +1866,6 @@ pub fn execute_remove_signer(
     did: &DID,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `threshold_signers` combinator; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1869,56 +1873,65 @@ pub fn execute_remove_signer(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: removing a threshold signer TIGHTENS governance
+    // authorization. `commit_class_s_keep` is the keep-direction: on persist
+    // failure the removal STAYS removed — re-admitting an already-acknowledged
+    // removed signer is the unsafe direction, so keeping the tightening is
+    // fail-closed-correct. (The prior fail-closed persist is preserved; only the
+    // rollback DIRECTION on persist failure is the keep choice.) The Class-S
+    // `threshold_signers.retain` rides the same fail-closed persist as the
+    // Class-C capability/token strip. The reject-before-mutate guards return
+    // `Err` from inside the closure (no persist); the threshold-floor guard
+    // undoes its own `retain` before returning, exactly as before.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    let before = state.governance.class_s.threshold_signers.len();
-    state
-        .governance
-        .class_s
-        .threshold_signers
-        .retain(|s| s != did);
-    if state.governance.class_s.threshold_signers.len() == before {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-    if state.governance.class_s.threshold_value > 0 {
-        let remaining =
-            u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-        if state.governance.class_s.threshold_value > remaining {
-            state.governance.class_s.threshold_signers.push(did.clone());
-            return Err(ContextError::PermissionDenied(format!(
-                "removing signer would leave {remaining} signers < threshold {}",
-                state.governance.class_s.threshold_value
-            )));
+        let before = view.governance.class_s.threshold_signers.len();
+        view.governance_class_s_mut()
+            .threshold_signers
+            .retain(|s| s != did);
+        if view.governance.class_s.threshold_signers.len() == before {
+            return Err(ContextError::MemberNotFound(did.to_string()));
         }
-    }
+        if view.governance.class_s.threshold_value > 0 {
+            let remaining =
+                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            if view.governance.class_s.threshold_value > remaining {
+                let threshold_value = view.governance.class_s.threshold_value;
+                view.governance_class_s_mut()
+                    .threshold_signers
+                    .push(did.clone());
+                return Err(ContextError::PermissionDenied(format!(
+                    "removing signer would leave {remaining} signers < threshold {threshold_value}"
+                )));
+            }
+        }
 
-    if let Some(caps) = state.role_state.member_capabilities.get_mut(did.as_ref()) {
-        caps.retain(|c| {
-            !matches!(
-                c,
-                Capability::GovernancePropose | Capability::GovernanceVote
-            )
-        });
-    }
-    if let Some(info) = state.membership.get_mut(did) {
-        info.tokens.retain(|t| {
-            !t.att.iter().any(|a| {
-                a.with.contains("governance:propose") || a.with.contains("governance:vote")
-            })
-        });
-    }
-
-    // ADR-049 §9 Class S: removing a threshold signer tightens governance
-    // authorization — persist fail-closed so a crash cannot re-admit a removed
-    // signer.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        let state = view.rest_mut();
+        if let Some(caps) = state.role_state.member_capabilities.get_mut(did.as_ref()) {
+            caps.retain(|c| {
+                !matches!(
+                    c,
+                    Capability::GovernancePropose | Capability::GovernanceVote
+                )
+            });
+        }
+        if let Some(info) = state.membership.get_mut(did) {
+            info.tokens.retain(|t| {
+                !t.att.iter().any(|a| {
+                    a.with.contains("governance:propose") || a.with.contains("governance:vote")
+                })
+            });
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerRemoved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1933,10 +1946,6 @@ pub fn execute_modify_threshold(
     new_threshold: u32,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `threshold_value` combinator; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1944,28 +1953,31 @@ pub fn execute_modify_threshold(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    let signer_count =
-        u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-    if new_threshold == 0 || new_threshold > signer_count {
-        return Err(ContextError::PermissionDenied(format!(
-            "threshold must be 1..={signer_count}, got {new_threshold}"
-        )));
-    }
-    state.governance.class_s.threshold_value = new_threshold;
-
     // ADR-049 §9 Class S: changing the governance threshold is an
-    // authorization-control transition — persist fail-closed so a crash cannot
-    // revert to a weaker threshold the caller was told had changed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization-control transition. The reject-before-mutate guards run
+    // inside the closure (returning `Err` skips the persist and drops the
+    // snapshot); on persist failure the combinator RESTORES `threshold_value`
+    // so the caller never observes success for an undurable change.
+    cell.commit_class_s_restore(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        let signer_count =
+            u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+        if new_threshold == 0 || new_threshold > signer_count {
+            return Err(ContextError::PermissionDenied(format!(
+                "threshold must be 1..={signer_count}, got {new_threshold}"
+            )));
+        }
+        view.governance_class_s_mut().threshold_value = new_threshold;
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ThresholdModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -2136,10 +2148,6 @@ pub fn execute_resolve_conflict(
     resolution: &scp_protocol::context::governance::ConflictResolution,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `executed_proposals` combinator; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2147,105 +2155,103 @@ pub fn execute_resolve_conflict(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    let (freeze_a, freeze_b, _) = state.governance.freeze.ok_or_else(|| {
-        ContextError::PermissionDenied(
-            "context is not in governance freeze state — no conflict to resolve".into(),
-        )
-    })?;
-    let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
-        || (*proposal_a == freeze_b && *proposal_b == freeze_a);
-    if !proposals_match {
-        return Err(ContextError::PermissionDenied(
-            "ResolveConflict proposals do not match the governance freeze".into(),
-        ));
-    }
-
-    let action_a = state
-        .governance
-        .approved_proposals
-        .get(proposal_a)
-        .map(|(p, _, _)| &p.action);
-    let action_b = state
-        .governance
-        .approved_proposals
-        .get(proposal_b)
-        .map(|(p, _, _)| &p.action);
-
-    let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
-        return Err(ContextError::PermissionDenied(
-            "one or both conflict proposals are not in the approved set — \
-             cannot verify conflict"
-                .into(),
-        ));
-    };
-
-    let proposer_a = &state.governance.approved_proposals[proposal_a]
-        .0
-        .proposer_did;
-    let proposer_b = &state.governance.approved_proposals[proposal_b]
-        .0
-        .proposer_did;
-    if !scp_protocol::sync::conflict_resolution::actions_conflict(
-        act_a, proposer_a, act_b, proposer_b,
-    ) {
-        return Err(ContextError::PermissionDenied(
-            "the specified proposals do not conflict per \
-             sync::conflict_resolution::actions_conflict"
-                .into(),
-        ));
-    }
-
-    match resolution {
-        scp_protocol::context::governance::ConflictResolution::AcceptProposal { winner_id } => {
-            let loser = if *winner_id == *proposal_a {
-                proposal_b
-            } else if *winner_id == *proposal_b {
-                proposal_a
-            } else {
-                return Err(ContextError::PermissionDenied(format!(
-                    "winner_id {winner_id:?} is not one of the conflicting proposals"
-                )));
-            };
-            let now = deps.clock.now_secs();
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*loser, now);
-        }
-        scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
-            let now = deps.clock.now_secs();
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*proposal_a, now);
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*proposal_b, now);
-        }
-    }
-
-    state.governance.freeze = None;
-
     // ADR-049 §9 Class S: `executed_proposals` is security-critical replay-
     // protection state that does NOT survive an actor crash (it lives in the
-    // actor-owned `GovernanceState`). Persist fail-closed BEFORE acknowledging
-    // the resolution — if the persist fails, return an error rather than
-    // reporting success on a mutation an actor crash could roll back (which
-    // would let an already-resolved/superseded proposal be re-executed).
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // actor-owned `GovernanceState`). `commit_class_s_keep` persists fail-closed
+    // BEFORE acknowledging the resolution — un-recording an executed-proposal
+    // marker re-opens the replay window (the canonical keep criterion), so on
+    // persist failure the markers STAY recorded and the persist error is
+    // returned. All reject-before-mutate guards return `Err` from inside the
+    // closure (no persist runs); `governance.freeze = None` (Class-C) rides the
+    // same fail-closed persist.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        let (freeze_a, freeze_b, _) = view.governance.freeze.ok_or_else(|| {
+            ContextError::PermissionDenied(
+                "context is not in governance freeze state — no conflict to resolve".into(),
+            )
+        })?;
+        let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
+            || (*proposal_a == freeze_b && *proposal_b == freeze_a);
+        if !proposals_match {
+            return Err(ContextError::PermissionDenied(
+                "ResolveConflict proposals do not match the governance freeze".into(),
+            ));
+        }
+
+        let action_a = view
+            .governance
+            .approved_proposals
+            .get(proposal_a)
+            .map(|(p, _, _)| &p.action);
+        let action_b = view
+            .governance
+            .approved_proposals
+            .get(proposal_b)
+            .map(|(p, _, _)| &p.action);
+
+        let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
+            return Err(ContextError::PermissionDenied(
+                "one or both conflict proposals are not in the approved set — \
+                 cannot verify conflict"
+                    .into(),
+            ));
+        };
+
+        let proposer_a = &view.governance.approved_proposals[proposal_a]
+            .0
+            .proposer_did;
+        let proposer_b = &view.governance.approved_proposals[proposal_b]
+            .0
+            .proposer_did;
+        if !scp_protocol::sync::conflict_resolution::actions_conflict(
+            act_a, proposer_a, act_b, proposer_b,
+        ) {
+            return Err(ContextError::PermissionDenied(
+                "the specified proposals do not conflict per \
+                 sync::conflict_resolution::actions_conflict"
+                    .into(),
+            ));
+        }
+
+        match resolution {
+            scp_protocol::context::governance::ConflictResolution::AcceptProposal { winner_id } => {
+                let loser = if *winner_id == *proposal_a {
+                    proposal_b
+                } else if *winner_id == *proposal_b {
+                    proposal_a
+                } else {
+                    return Err(ContextError::PermissionDenied(format!(
+                        "winner_id {winner_id:?} is not one of the conflicting proposals"
+                    )));
+                };
+                let now = deps.clock.now_secs();
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*loser, now);
+            }
+            scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
+                let now = deps.clock.now_secs();
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*proposal_a, now);
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*proposal_b, now);
+            }
+        }
+
+        view.rest_mut().governance.freeze = None;
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceConflictResolved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -2414,10 +2420,6 @@ pub fn execute_reconfigure_governance(
     justification: &scp_protocol::context::governance::DeadlockJustification,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `threshold_signers` / `threshold_value` combinators; for now the
-    // bare `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2437,65 +2439,61 @@ pub fn execute_reconfigure_governance(
 
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
+    // is an authorization-control transition — persist fail-closed so a crash
+    // cannot revert to the prior governance configuration after the
+    // reconfiguration was acknowledged. The combinator's own Class-S
+    // snapshot/restore SUBSUMES the former hand-rolled `original_signers` /
+    // `original_threshold` save+rollback: a validation failure returns `Err`
+    // from inside the closure (snapshot dropped, nothing persisted), and a
+    // persist failure restores both Class-S sub-structs.
+    cell.commit_class_s_restore(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    let original_signers = state.governance.class_s.threshold_signers.clone();
-    let original_threshold = state.governance.class_s.threshold_value;
-
-    let reconfigure_result: Result<(), ContextError> = (|| {
         for change in changes {
             match change {
                 scp_protocol::context::governance::GovernanceReconfigAction::RemoveInactiveSigner {
                     did,
                 } => {
-                    state.governance.class_s.threshold_signers.retain(|s| s != did);
+                    view.governance_class_s_mut()
+                        .threshold_signers
+                        .retain(|s| s != did);
                 }
                 scp_protocol::context::governance::GovernanceReconfigAction::ReduceThreshold {
                     new_threshold,
                 } => {
-                    let signer_count = u32::try_from(state.governance.class_s.threshold_signers.len())
-                        .unwrap_or(u32::MAX);
+                    let signer_count =
+                        u32::try_from(view.governance.class_s.threshold_signers.len())
+                            .unwrap_or(u32::MAX);
                     if *new_threshold == 0 || *new_threshold > signer_count {
                         return Err(ContextError::PermissionDenied(format!(
                             "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
                         )));
                     }
-                    state.governance.class_s.threshold_value = *new_threshold;
+                    view.governance_class_s_mut().threshold_value = *new_threshold;
                 }
             }
         }
 
-        if state.governance.class_s.threshold_value > 0 {
+        if view.governance.class_s.threshold_value > 0 {
             let remaining =
-                u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-            if state.governance.class_s.threshold_value > remaining {
+                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            if view.governance.class_s.threshold_value > remaining {
                 return Err(ContextError::PermissionDenied(format!(
                     "reconfiguration left {remaining} signers < threshold {}",
-                    state.governance.class_s.threshold_value,
+                    view.governance.class_s.threshold_value,
                 )));
             }
         }
         Ok(())
-    })();
-
-    if let Err(e) = reconfigure_result {
-        state.governance.class_s.threshold_signers = original_signers;
-        state.governance.class_s.threshold_value = original_threshold;
-        return Err(e);
-    }
-
-    // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
-    // is an authorization-control transition — persist fail-closed so a crash
-    // cannot revert to the prior governance configuration after the
-    // reconfiguration was acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceReconfigured,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
