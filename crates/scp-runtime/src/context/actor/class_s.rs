@@ -182,9 +182,11 @@ use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastConte
 use scp_protocol::context::governance::{
     GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
 };
-use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
+use scp_protocol::context::membership::{MemberInfo, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::ToolRegistration;
-use scp_protocol::context::roles::ContextRoleState;
+use scp_protocol::context::roles::{
+    Capability, CapabilityCeiling, ContextRoleState, RoleAssignment, RoleDefinition, UcanToken,
+};
 use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::economy::antispam::{
@@ -314,8 +316,10 @@ impl Deref for ClassSMut<'_> {
 /// STRUCTURALLY rather than by convention: it does not hold a whole
 /// `&mut PerContextState` at all. On construction it destructures the underlying
 /// `&mut PerContextState` ONCE into disjoint field references — a `&mut` to each
-/// writable Class-C / structural field, a `&` (shared, read-only) to the
-/// Class-S [`ClassSState`] and to `membership`, and a [`GovernanceClassCMut`]
+/// writable Class-C / structural field (including the `membership` roster, whose
+/// only mutable reach is the restricted [`MembershipClassCMut`] sub-view — no
+/// `remove_member`, the downward-auth Class-S removal), a `&` (shared,
+/// read-only) to the Class-S [`ClassSState`], and a [`GovernanceClassCMut`]
 /// sub-view for the Class-C governance fields. There is therefore NO whole
 /// `&mut PerContextState`, no `&mut GovernanceState`, no `&mut ClassSState`, and
 /// no `&mut GovernanceClassS` held anywhere — so a future "convenience"
@@ -404,9 +408,15 @@ pub(crate) struct ClassCMut<'a> {
     lifecycle_state: &'a mut ContextLifecycleState,
     /// `&mut` to the mode-specific state (Class-C / structural).
     mode: &'a mut ContextModeState,
-    /// Shared `&` to the membership record — read-only on the consequence /
-    /// best-effort path (needed by [`Self::split_class_c`]).
-    membership: &'a MembershipState,
+    /// `&mut` to the authoritative membership roster (Class-C / structural).
+    /// `MembershipState` contains NO Class-S sub-struct — member REMOVAL is a
+    /// downward-auth Class-S *operation*, not a Class-S *field* — so a `&mut` to
+    /// the roster is safe to hold HERE PROVIDED the only mutable reach exposed
+    /// is the restricted [`MembershipClassCMut`] sub-view (no `remove_member`,
+    /// no whole `&mut`); see [`Self::membership_class_c_mut`]. The consequence /
+    /// `split_class_c` path reborrows it SHARED (`&*`), so its read-only use is
+    /// unchanged.
+    membership: &'a mut MembershipState,
     /// Shared `&` to the Class-S [`ClassSState`] sub-struct — READ ONLY through
     /// this view (no `&mut` to it anywhere here), so reads work without a
     /// whole-state `Deref` and a Class-S MUTATION is structurally impossible.
@@ -768,6 +778,259 @@ impl<'a> GovernanceClassCMut<'a> {
     }
 }
 
+/// RESTRICTED mutable view over the Class-C / structural fields of a
+/// [`ContextRoleState`]. It holds those fields as SEPARATE field-granular
+/// references — it does **not** hold a whole `&mut ContextRoleState`, so there
+/// is no whole-bucket `&mut` for any accessor to return and no `&mut` path to
+/// the **downward-authorization** fields (`ceiling`, `suspended_capabilities`).
+///
+/// # Why `ContextRoleState` is dual-use, and what this view closes
+///
+/// [`ContextRoleState`] is DUAL-USE (ADR-049 §9): it carries Class-C structural
+/// state (role definitions, assignments, the member set, derived capabilities)
+/// AND Class-S downward-authorization state that MUST be mutated only through a
+/// fail-closed-persisting combinator:
+///
+/// - `ceiling` — the immutable capability ceiling. A ceiling MODIFICATION is a
+///   downward-authorization governance leaf (`PendingCeilingModification`,
+///   §5.3.2) that must be fail-closed: a coalesce-window rollback of a ceiling
+///   tightening would silently re-widen the authorization envelope a caller
+///   already observed as narrowed. Exposed READ-ONLY here.
+/// - `suspended_capabilities` — the per-member capability suspension / blocklist
+///   set. A suspension is a downward-authorization leaf (the application-level
+///   block enforced by `member_has_capability`): rolling a suspension back
+///   re-grants a capability the caller observed as denied. Exposed READ-ONLY
+///   here.
+///
+/// The plain `ClassCMut::role_state_mut()` hands out a whole
+/// `&mut ContextRoleState`, through which the best-effort / compensation path
+/// could mutate `ceiling` / `suspended_capabilities` with NO fail-closed
+/// persist — a §9 bypass. This view closes that the same way
+/// [`GovernanceClassCMut`] closes the `governance.class_s` bypass: it holds no
+/// whole `&mut ContextRoleState`, only a `&mut` per Class-C field plus a shared
+/// `&` to the two downward-auth fields.
+///
+/// # Airtight BY CONSTRUCTION — no whole `&mut` to return
+///
+/// On construction it destructures the `&mut ContextRoleState` ONCE into
+/// disjoint references — a `&mut` to each writable Class-C field, a shared `&`
+/// to `ceiling` and `suspended_capabilities`, and (for completeness, since they
+/// are stable structural identity) shared `&` reads of `context_id` /
+/// `creator_did`. There is therefore NO whole `&mut ContextRoleState`, so a
+/// future "convenience" accessor returning one CANNOT be written. Reads of the
+/// downward-auth fields go through the `&`-returning read accessors; reads
+/// cannot violate the invariant.
+pub(crate) struct RoleStateClassCMut<'a> {
+    /// Shared `&` to the context's identifier (structural identity, stable).
+    context_id: &'a str,
+    /// Shared `&` to the creator DID (structural identity, stable).
+    creator_did: &'a str,
+    /// Shared `&` to the immutable capability ceiling — DOWNWARD-AUTH Class-S,
+    /// read-only here (modifications are fail-closed governance, §5.3.2).
+    ceiling: &'a CapabilityCeiling,
+    /// `&mut` to all role definitions (Class-C / structural governance config).
+    role_definitions: &'a mut HashMap<String, RoleDefinition>,
+    /// `&mut` to the current role assignments (Class-C / structural).
+    assignments: &'a mut HashMap<String, RoleAssignment>,
+    /// `&mut` to the member DID set (Class-C / structural).
+    members: &'a mut HashSet<String>,
+    /// `&mut` to the per-member derived capability sets (Class-C / structural —
+    /// derived from `assignments`, not a downward-auth witness).
+    member_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
+    /// Shared `&` to the per-member capability SUSPENSION set — DOWNWARD-AUTH
+    /// Class-S, read-only here (suspend/restore is fail-closed governance).
+    suspended_capabilities: &'a HashMap<String, HashSet<Capability>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C role-state accessors (`context_id`, `creator_did`, `ceiling`, `role_definitions_mut`, `assignments_mut`, `members_mut`, `member_capabilities_mut`, `suspended_capabilities`) get their first PRODUCTION callers when the structural role-state mutation handlers migrate off the whole-`&mut` `role_state_mut`. Exercised by this module's unit tests now."
+)]
+impl<'a> RoleStateClassCMut<'a> {
+    /// Wrap a borrowed [`ContextRoleState`] by DESTRUCTURING it into the disjoint
+    /// field references this view holds. Crate-internal: constructed only by
+    /// [`ClassCMut::role_state_class_c_mut`].
+    ///
+    /// The single destructuring `let` is what makes the airtightness structural:
+    /// the whole `&mut ContextRoleState` is consumed here and only field-granular
+    /// references survive, so the view never holds a whole-bucket `&mut`.
+    fn new(role_state: &'a mut ContextRoleState) -> Self {
+        // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above).
+        // When adding a field here: any DOWNWARD-AUTHORIZATION field (one whose
+        // governance leaf mutates it through a fail-closed combinator —
+        // `ceiling`, `suspended_capabilities`) MUST be bound a shared `&` (the
+        // `Self` field is `&'a …`, so the `&mut` match-ergonomic binding
+        // reborrows down to `&`), NEVER handed out `&mut`. If a field's status is
+        // unclear, expose it READ-ONLY (the safe default). Every Class-C /
+        // structural field below is a `&mut`.
+        let ContextRoleState {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        } = role_state;
+        Self {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        }
+    }
+
+    /// Read the context identifier (structural identity).
+    pub(crate) const fn context_id(&self) -> &str {
+        self.context_id
+    }
+
+    /// Read the creator DID (structural identity).
+    pub(crate) const fn creator_did(&self) -> &str {
+        self.creator_did
+    }
+
+    /// READ-ONLY access to the immutable capability ceiling. DOWNWARD-AUTH
+    /// Class-S: ceiling modifications are fail-closed governance (§5.3.2), so
+    /// there is deliberately no `&mut` counterpart on this view.
+    pub(crate) const fn ceiling(&self) -> &CapabilityCeiling {
+        self.ceiling
+    }
+
+    /// `&mut` access to the role definitions map (Class-C / structural
+    /// governance configuration).
+    pub(crate) const fn role_definitions_mut(&mut self) -> &mut HashMap<String, RoleDefinition> {
+        self.role_definitions
+    }
+
+    /// `&mut` access to the current role assignments (Class-C / structural).
+    pub(crate) const fn assignments_mut(&mut self) -> &mut HashMap<String, RoleAssignment> {
+        self.assignments
+    }
+
+    /// `&mut` access to the member DID set (Class-C / structural). NOT a
+    /// downward-auth witness: a coalesce-window rollback of a structural member
+    /// add re-derives from the durable membership flow.
+    pub(crate) const fn members_mut(&mut self) -> &mut HashSet<String> {
+        self.members
+    }
+
+    /// `&mut` access to the per-member derived capability sets (Class-C /
+    /// structural — derived from `assignments`). The downward-auth DENIAL
+    /// witness is `suspended_capabilities`, which is read-only on this view.
+    pub(crate) const fn member_capabilities_mut(
+        &mut self,
+    ) -> &mut HashMap<String, HashSet<Capability>> {
+        self.member_capabilities
+    }
+
+    /// READ-ONLY access to the per-member capability suspension / blocklist set.
+    /// DOWNWARD-AUTH Class-S: suspend/restore is fail-closed governance, so
+    /// there is deliberately no `&mut` counterpart on this view.
+    pub(crate) const fn suspended_capabilities(&self) -> &HashMap<String, HashSet<Capability>> {
+        self.suspended_capabilities
+    }
+}
+
+/// RESTRICTED mutable view over the Class-C / structural mutation surface of a
+/// [`MembershipState`]. It holds a `&mut MembershipState` but exposes ONLY the
+/// structural mutators (member ADD, per-member sequence bookkeeping) — it does
+/// **not** expose a `remove_member`-equivalent or any whole-`&mut` accessor.
+///
+/// # Why `MembershipState` is dual-use, and what this view closes
+///
+/// [`MembershipState`] is DUAL-USE (ADR-049 §9): member ADD and the per-member
+/// sequence-number bookkeeping (`next_sequence_number` /
+/// `rollback_sequence_number`) are Class-C structural mutations whose
+/// coalesce-window rollback is acceptable, but member REMOVAL is a
+/// downward-authorization Class-S transition — removing a member from the
+/// authoritative roster must be fail-closed (a coalesce-window rollback would
+/// silently re-admit a member the caller observed as removed). The plain
+/// `ClassCMut::members_mut()` (the `HashSet<DID>` active set) is a DIFFERENT
+/// structure; this view governs the authoritative [`MembershipState`] roster,
+/// whose `remove_member` is the downward-auth leaf.
+///
+/// Unlike [`RoleStateClassCMut`] / [`GovernanceClassCMut`], this view CANNOT be
+/// made airtight by field-destructuring: [`MembershipState`]'s single `members`
+/// field is PRIVATE to its defining module, so it cannot be named (and the
+/// whole removal/add/sequence logic lives behind methods). The airtightness is
+/// therefore method-granular instead of field-granular: the view holds the
+/// `&mut MembershipState` but FORWARDS only the structural-mutation methods and
+/// the read methods — it never exposes `remove_member`, and (because the held
+/// `&mut` is private and never returned) no accessor can hand out a whole
+/// `&mut MembershipState` for a caller to call `remove_member` through. A future
+/// "convenience" `fn inner_mut(&mut self) -> &mut MembershipState` would
+/// re-open the bypass and MUST NOT be added — the closed method surface is the
+/// contract.
+pub(crate) struct MembershipClassCMut<'a> {
+    /// The borrowed roster. Private — the only mutable reach is through the
+    /// forwarded STRUCTURAL methods below (never `remove_member`, never a whole
+    /// `&mut`).
+    membership: &'a mut MembershipState,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 scaffolding: the structural membership accessors (`add_member`, `next_sequence_number`, `rollback_sequence_number`, `get_mut`, `count`, `contains`, `get`) get their first PRODUCTION callers when the structural membership-mutation handlers migrate off the whole-`&mut` `members_mut`. Exercised by this module's unit tests now."
+)]
+impl<'a> MembershipClassCMut<'a> {
+    /// Wrap a borrowed [`MembershipState`]. Crate-internal: constructed only by
+    /// [`ClassCMut::membership_class_c_mut`].
+    const fn new(membership: &'a mut MembershipState) -> Self {
+        Self { membership }
+    }
+
+    /// Add a member with the given role and tokens (Class-C / structural). A
+    /// coalesce-window rollback of an add re-derives from the durable membership
+    /// flow — best-effort acceptable. Forwards [`MembershipState::add_member`].
+    pub(crate) fn add_member(&mut self, did: DID, role_name: String, tokens: Vec<UcanToken>) {
+        self.membership.add_member(did, role_name, tokens);
+    }
+
+    /// Increment and return the next per-sender sequence number (Class-C /
+    /// §9.8.5). Forwards [`MembershipState::next_sequence_number`].
+    pub(crate) fn next_sequence_number(&mut self, sender_did: &str) -> Option<u64> {
+        self.membership.next_sequence_number(sender_did)
+    }
+
+    /// Roll back the last per-sender sequence increment (Class-C / §9.8.5).
+    /// Forwards [`MembershipState::rollback_sequence_number`].
+    pub(crate) fn rollback_sequence_number(&mut self, sender_did: &str) {
+        self.membership.rollback_sequence_number(sender_did);
+    }
+
+    /// `&mut` access to a specific member's metadata, if present (Class-C /
+    /// structural per-member bookkeeping). Forwards
+    /// [`MembershipState::get_mut`]. NOTE: this cannot remove a member (it
+    /// returns `Option<&mut MemberInfo>`, not the roster), so it is not a
+    /// downward-auth removal path.
+    pub(crate) fn get_mut(&mut self, did: &str) -> Option<&mut MemberInfo> {
+        self.membership.get_mut(did)
+    }
+
+    /// Number of members (read). Forwards [`MembershipState::count`].
+    pub(crate) fn count(&self) -> usize {
+        self.membership.count()
+    }
+
+    /// Whether the given DID is a member (read). Forwards
+    /// [`MembershipState::contains`].
+    pub(crate) fn contains(&self, did: &str) -> bool {
+        self.membership.contains(did)
+    }
+
+    /// Read a specific member's metadata, if present. Forwards
+    /// [`MembershipState::get`].
+    pub(crate) fn get(&self, did: &str) -> Option<&MemberInfo> {
+        self.membership.get(did)
+    }
+}
+
 /// Independent disjoint `&mut`/`&` borrows of the Class-C / structural fields of
 /// a [`PerContextState`], produced by [`ClassCMut::split_class_c`].
 ///
@@ -801,7 +1064,7 @@ pub(crate) struct ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -819,9 +1082,13 @@ impl<'a> ClassCMut<'a> {
         // adding a field here: any field that is, or transitively contains, a
         // Class-S sub-struct (`ClassSState` / `GovernanceClassS`) MUST be bound a
         // shared `&` (coerced at the `Self { .. }` init), or wrapped in a sub-view
-        // — NEVER handed out `&mut`. Today: `class_s` and `membership` are bound
-        // and stored as shared `&` (the `Self` fields are `&'a …`, so the `&mut`
-        // ergonomic binding reborrows down to `&`), and `governance` is wrapped in
+        // — NEVER handed out `&mut`. Today: `class_s` is bound and stored as a
+        // shared `&` (the `Self` field is `&'a …`, so the `&mut` ergonomic
+        // binding reborrows down to `&`); `membership` is kept `&mut` BUT
+        // `MembershipState` contains NO Class-S sub-struct (member REMOVAL is a
+        // Class-S *operation*, exposed nowhere on this view — `membership_class_c_mut`
+        // hands out a restricted `MembershipClassCMut` with no `remove_member`
+        // and no whole `&mut`); and `governance` is wrapped in
         // `GovernanceClassCMut` (its own `class_s` falls into that sub-view's `..`
         // rest). Every other field is a Class-C / structural `&mut`.
         let PerContextState {
@@ -922,10 +1189,43 @@ impl<'a> ClassCMut<'a> {
         self.receive_buffer
     }
 
-    /// `&mut` access to the role / ceiling / assignment state (Class-C /
-    /// structural). Safe to hand out directly: it contains no Class-S sub-struct.
+    /// `&mut` access to the whole role / ceiling / assignment state.
+    ///
+    /// **Slated for deletion.** [`ContextRoleState`] is DUAL-USE: it carries
+    /// Class-C structural fields AND the downward-authorization Class-S fields
+    /// `ceiling` / `suspended_capabilities`, which MUST be mutated only through a
+    /// fail-closed-persisting combinator (§5.3.2 ceiling modification, §9
+    /// suspension). This whole-`&mut` accessor can reach those, so the
+    /// best-effort / compensation path could mutate them with no fail-closed
+    /// persist — a §9 bypass. A later finalize step deletes this accessor once
+    /// all callers move to the restricted [`Self::role_state_class_c_mut`] (which
+    /// exposes `&mut` ONLY for the structural fields and a shared `&` read for
+    /// the downward-auth ones). It is KEPT for now so this phase stays
+    /// compile-green; do NOT add new callers.
     pub(crate) const fn role_state_mut(&mut self) -> &mut ContextRoleState {
         self.role_state
+    }
+
+    /// RESTRICTED Class-C view over the dual-use [`ContextRoleState`]: a
+    /// [`RoleStateClassCMut`] that exposes `&mut` ONLY for the structural /
+    /// Class-C fields (role definitions, assignments, the member set, derived
+    /// capabilities) and a shared `&` READ for the downward-authorization
+    /// Class-S fields (`ceiling`, `suspended_capabilities`). Use this — NOT
+    /// [`Self::role_state_mut`] — for best-effort / compensation structural
+    /// mutations of the role state, so a §9 downward-auth bypass is a compile
+    /// error by construction.
+    pub(crate) fn role_state_class_c_mut(&mut self) -> RoleStateClassCMut<'_> {
+        RoleStateClassCMut::new(self.role_state)
+    }
+
+    /// RESTRICTED Class-C view over the dual-use [`MembershipState`] roster: a
+    /// [`MembershipClassCMut`] that forwards ONLY the structural mutators (member
+    /// ADD, per-member sequence bookkeeping) and the reads — it exposes NO
+    /// `remove_member` (member REMOVAL is a downward-auth Class-S transition that
+    /// must be fail-closed) and no whole `&mut MembershipState`. Use this for
+    /// best-effort / compensation structural mutations of the roster.
+    pub(crate) const fn membership_class_c_mut(&mut self) -> MembershipClassCMut<'_> {
+        MembershipClassCMut::new(self.membership)
     }
 
     /// `&mut` access to the events-since-last-checkpoint counter (Class-C /
@@ -1138,7 +1438,9 @@ impl<'a> ClassCMut<'a> {
         ClassCSplit {
             governance: self.governance.reborrow(),
             role_state: &mut *self.role_state,
-            membership: self.membership,
+            // SHARED reborrow: the consequence/split path reads membership only,
+            // so the held `&mut` is narrowed to `&` here (unchanged behaviour).
+            membership: &*self.membership,
             receive_buffer: &mut *self.receive_buffer,
             checkpoint_events_since: &mut *self.checkpoint_events_since,
         }
@@ -1634,6 +1936,132 @@ impl ClassSCell {
     ) {
         f(ClassCMut::new(&mut self.state));
         persist_state_best_effort(&self.state, deps, context_id);
+    }
+
+    /// NON-PERSISTING Class-C view (ADR-049 §9): construct a [`ClassCMut`]
+    /// directly — the same restricted, airtight view
+    /// [`Self::commit_class_c_best_effort`] hands to its closure — but perform
+    /// NO persist.
+    ///
+    /// # When to use this vs [`Self::commit_class_c_best_effort`]
+    ///
+    /// Most actor dispatch-arm Class-C mutations rely on the run-loop's
+    /// COALESCED persist, NOT a per-site persist: the run loop (`mod.rs`) tracks
+    /// a `dirty` flag (set from the handler's `Outcome.mutated`) and flushes a
+    /// single `persist_snapshot` after a ≤50 ms `COALESCE_INTERVAL`. Those sites
+    /// must mutate Class-C state WITHOUT injecting a persist of their own —
+    /// routing them through [`Self::commit_class_c_best_effort`] would add a
+    /// per-site best-effort persist they do not have today, a behaviour change
+    /// (an extra durable write per mutation).
+    ///
+    /// - Use `class_c_view` when the run loop will coalesce-persist the mutation
+    ///   (the handler reports `mutated`, the loop flushes). NO persist happens
+    ///   here; the view is the ONLY thing returned.
+    /// - Use [`Self::commit_class_c_best_effort`] when the site must persist
+    ///   immediately, best-effort, AT the mutation (e.g. a site with no
+    ///   coalescing run-loop behind it).
+    ///
+    /// # Airtight — same view, same guarantee
+    ///
+    /// The returned [`ClassCMut`] is structurally identical to the one
+    /// [`Self::commit_class_c_best_effort`] hands out: it holds NO whole
+    /// `&mut PerContextState`, only field-granular references with a shared `&`
+    /// read of Class-S — so it CANNOT mutate Class-S. The absence of a persist
+    /// here is therefore safe: a Class-C mutation through this view is exactly
+    /// the kind whose coalesce-window rollback is acceptable, and a Class-S
+    /// mutation is a COMPILE error by construction (the view exposes no Class-S
+    /// mutator), so no fail-closed-requiring transition can escape unpersisted.
+    ///
+    /// `dead_code` allow: scaffolding — the first production caller is a
+    /// coalesced-persist dispatch arm that migrates off `state_mut`. Exercised
+    /// by this module's unit tests now.
+    #[allow(dead_code)]
+    pub(crate) const fn class_c_view(&mut self) -> ClassCMut<'_> {
+        ClassCMut::new(&mut self.state)
+    }
+
+    /// Mutate Class-S state through a [`ClassSMut`] view and persist
+    /// **fail-closed** ONCE, KEEPING one part of the Class-S mutation while
+    /// RESTORING another on persist failure (ADR-049 §9, keep-one / restore-one
+    /// split).
+    ///
+    /// # Decision criterion vs the other combinators
+    ///
+    /// The all-or-nothing combinators take a single rollback DIRECTION over the
+    /// whole Class-S snapshot: [`Self::commit_class_s_keep`] keeps everything,
+    /// [`Self::commit_class_s_restore`] restores everything. Some single sites
+    /// stage TWO Class-S fields with OPPOSITE directions under ONE persist — a
+    /// shape no all-or-nothing combinator expresses. This combinator is for
+    /// exactly that: it snapshots ONLY the to-be-RESTORED portion before `f`,
+    /// runs `f` (which mutates BOTH the kept and the restored field), persists
+    /// fail-closed, and on persist FAILURE restores JUST the snapshotted portion
+    /// (rolling that field back) while LEAVING the kept field as `f` mutated it,
+    /// then returns the persist error.
+    ///
+    /// This is the shape of the cross-context `prepare_b` staging site
+    /// (§6.2.4): under one fail-closed persist it
+    /// - RECORDS an accepted replay nonce in `xctx_nonce_dedup` — KEEP direction
+    ///   (un-recording it re-opens the replay window the dedup cache closes), and
+    /// - STAGES the prepared projection into `saga_pending` — RESTORE direction
+    ///   (a staged slot that did not durably land must be removed so a retry
+    ///   re-stages cleanly).
+    ///
+    /// The caller supplies `snapshot_restore_field` (capture the restore-targeted
+    /// portion BEFORE `f`) and `restore_on_failure` (apply that capture back on
+    /// persist failure), so the split is expressed at the call site over the
+    /// EXACT fields the site keeps vs restores. The combinator owns the
+    /// fail-closed persist and the reject-vs-persist-failure distinction.
+    ///
+    /// # `f`-reject vs persist-failure (CRITICAL)
+    ///
+    /// An `f` REJECT (`Err`) returns immediately and runs NEITHER the persist NOR
+    /// `restore_on_failure` — a rejected operation staged no durable-relevant
+    /// mutation, so there is nothing to persist and nothing to roll back. ONLY a
+    /// persist FAILURE (after a successful `f`) runs `restore_on_failure`. This
+    /// matches `prepare_b`: a check reject must surface as a clean error with no
+    /// `saga_pending` remove, distinct from a persist failure that staged the
+    /// slot and must then roll it back.
+    ///
+    /// Sequence:
+    /// 1. Capture the restore portion: `snap = snapshot_restore_field(&state)`.
+    /// 2. Run `f(view)`. If `f` returns `Err(e)`, return `Err(e)` immediately —
+    ///    NO persist, NO `restore_on_failure`.
+    /// 3. On `Ok(value)`, persist fail-closed.
+    ///    - On persist SUCCESS return `Ok(value)` — both fields are durable.
+    ///    - On persist FAILURE run `restore_on_failure(&mut state.class_s, snap)`
+    ///      (rolling back ONLY the restore-targeted field; the kept field stays
+    ///      as `f` left it), then return the persist error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
+    /// `restore_on_failure`, with the KEPT field retained).
+    ///
+    /// `dead_code` allow: scaffolding — the first production caller is the
+    /// `prepare_b` staging site's `state_mut`-deletion migration. Exercised by
+    /// this module's unit tests now.
+    #[allow(dead_code)]
+    pub(crate) fn commit_class_s_keep_restore_split<T, S>(
+        &mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+        snapshot_restore_field: impl FnOnce(&ClassSState) -> S,
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+        restore_on_failure: impl FnOnce(&mut ClassSState, S),
+    ) -> Result<T, ContextError> {
+        // Capture ONLY the restore-targeted portion BEFORE f (the kept portion is
+        // deliberately NOT snapshotted — keep-direction has nothing to restore).
+        let restore_snap = snapshot_restore_field(&self.state.class_s);
+        let value = f(ClassSMut::new(&mut self.state))?;
+        match persist_state_fail_closed(&self.state, deps, context_id) {
+            Ok(()) => Ok(value),
+            Err(persist_err) => {
+                // Roll back JUST the restore-targeted field; the kept field stays
+                // as f mutated it (fail-closed direction).
+                restore_on_failure(&mut self.state.class_s, restore_snap);
+                Err(persist_err)
+            }
+        }
     }
 
     /// Restore both Class-S sub-structs from their snapshots. The governance
@@ -3263,6 +3691,260 @@ mod tests {
         assert!(
             cell.role_state.members.contains(&member_for_assert),
             "member inserted through role_state_mut"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // class_c_view (Add #1 — non-persisting Class-C view)
+    // ------------------------------------------------------------------
+
+    /// `class_c_view` hands out the same restricted `ClassCMut` and performs NO
+    /// persist (the run loop coalesce-persists instead). A Class-C mutation
+    /// through it lands in memory; zero persists occur.
+    #[tokio::test]
+    async fn class_c_view_mutates_without_persisting() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x71));
+        // `deps` is unused by `class_c_view` itself (no persist); kept to mirror
+        // the other tests' setup and to prove no persist runs.
+        let _ = &deps;
+        let member = DID("did:example:class-c-view-member".to_owned());
+
+        {
+            let mut view = cell.class_c_view();
+            view.members_mut().insert(member.clone());
+        }
+
+        assert!(
+            cell.members.contains(&member),
+            "class_c_view mutation applied in memory"
+        );
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "class_c_view performs NO persist (run loop coalesces)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // role_state_class_c_mut (Add #2 — restricted ContextRoleState view)
+    // ------------------------------------------------------------------
+
+    /// `RoleStateClassCMut` exposes `&mut` for the STRUCTURAL fields (members,
+    /// assignments, role definitions, derived capabilities) and reads the
+    /// downward-auth fields (`ceiling`, `suspended_capabilities`) — observed via
+    /// `commit_class_c_best_effort`.
+    #[tokio::test]
+    async fn role_state_class_c_mut_mutates_structural_and_reads_downward_auth() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x72));
+        let ctx = ctx_hex(0x72);
+        let member = "did:example:rs-classc-member".to_owned();
+        let member_for_f = member.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            let mut rs = view.role_state_class_c_mut();
+            // Structural &mut: add a member to the role-state member set.
+            rs.members_mut().insert(member_for_f);
+            // Read-only downward-auth accessors are reachable and return refs.
+            let _ceiling: &CapabilityCeiling = rs.ceiling();
+            let _suspended = rs.suspended_capabilities();
+            let _ = rs.context_id();
+            let _ = rs.creator_did();
+            // Other structural &mut accessors compile/reach their fields.
+            let _ = rs.role_definitions_mut().len();
+            let _ = rs.assignments_mut().len();
+            let _ = rs.member_capabilities_mut().len();
+        });
+
+        assert!(
+            cell.role_state.members.contains(&member),
+            "structural member add landed through role_state_class_c_mut"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // membership_class_c_mut (Add #2 — restricted MembershipState view)
+    // ------------------------------------------------------------------
+
+    /// `MembershipClassCMut` forwards the STRUCTURAL membership mutators (add,
+    /// sequence bookkeeping) and reads — observed via `commit_class_c_best_effort`.
+    /// It deliberately exposes NO `remove_member`.
+    #[tokio::test]
+    async fn membership_class_c_mut_adds_and_bumps_sequence() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x73));
+        let ctx = ctx_hex(0x73);
+        let member = DID("did:example:membership-classc".to_owned());
+        let member_for_f = member.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            let mut m = view.membership_class_c_mut();
+            m.add_member(member_for_f.clone(), "member".to_owned(), Vec::new());
+            assert!(
+                m.contains(member_for_f.0.as_str()),
+                "member present after add"
+            );
+            // Sequence bookkeeping (Class-C) is reachable and monotonic.
+            let first = m.next_sequence_number(member_for_f.0.as_str());
+            assert_eq!(first, Some(1));
+            m.rollback_sequence_number(member_for_f.0.as_str());
+            // `get_mut` reaches per-member metadata (not a removal path).
+            assert!(m.get_mut(member_for_f.0.as_str()).is_some());
+            let _ = m.get(member_for_f.0.as_str());
+            let _ = m.count();
+        });
+
+        assert!(
+            cell.membership.contains(member.0.as_str()),
+            "member added through membership_class_c_mut"
+        );
+        assert_eq!(
+            cell.membership
+                .get(member.0.as_str())
+                .map(|info| info.sequence_number),
+            Some(0),
+            "sequence bumped then rolled back through the restricted view"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // commit_class_s_keep_restore_split (Add #3 — keep-one / restore-one)
+    // ------------------------------------------------------------------
+
+    /// On persist SUCCESS, the split combinator keeps BOTH fields and returns
+    /// `Ok(value)`.
+    #[tokio::test]
+    async fn keep_restore_split_persists_and_keeps_both_on_success() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x74));
+        let ctx = ctx_hex(0x74);
+        let saga_a = saga("saga-split-ok");
+        let saga_for_f = saga_a.clone();
+
+        let value = cell
+            .commit_class_s_keep_restore_split(
+                &deps,
+                &ctx,
+                // Snapshot ONLY the restore-targeted field (saga_pending).
+                |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+                move |mut view| {
+                    let cs = view.class_s_mut();
+                    cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
+                    cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
+                    Ok(42u32)
+                },
+                |class_s, keys_before| {
+                    // Restore = remove any saga_pending key not present before.
+                    class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+                },
+            )
+            .expect("persist succeeds ⇒ Ok");
+
+        assert_eq!(value, 42);
+        assert!(
+            cell.class_s.saga_pending.contains_key(&saga_a),
+            "restore field kept on persist success"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "kept field kept on persist success"
+        );
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one persist"
+        );
+    }
+
+    /// (key behaviour) On persist FAILURE, the split combinator RESTORES the
+    /// restore-targeted field (`saga_pending`) while KEEPING the kept field
+    /// (`xctx_nonce_dedup`), and returns the persist error.
+    #[tokio::test]
+    async fn keep_restore_split_restores_one_keeps_other_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x75));
+        let ctx = ctx_hex(0x75);
+        let saga_for_f = saga("saga-split-fail");
+
+        let result = cell.commit_class_s_keep_restore_split(
+            &deps,
+            &ctx,
+            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+            move |mut view| {
+                let cs = view.class_s_mut();
+                cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
+                cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
+                Ok(())
+            },
+            |class_s, keys_before| {
+                class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "persist failure surfaces; got {result:?}"
+        );
+        assert!(
+            cell.class_s.saga_pending.is_empty(),
+            "RESTORE field rolled back on persist failure"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x3Cu8; 16]),
+            "KEEP field retained on persist failure (fail-closed direction)"
+        );
+    }
+
+    /// `f`-reject runs NEITHER the persist NOR `restore_on_failure`.
+    #[tokio::test]
+    async fn keep_restore_split_f_reject_no_persist_no_restore() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x76));
+        let ctx = ctx_hex(0x76);
+        let restore_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let restore_flag = Arc::clone(&restore_ran);
+
+        let result: Result<(), ContextError> = cell.commit_class_s_keep_restore_split(
+            &deps,
+            &ctx,
+            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+            |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
+            move |_class_s, _snap: Vec<_>| {
+                restore_flag.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "f's error propagates unchanged; got {result:?}"
+        );
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "no persist runs when f rejects"
+        );
+        assert!(
+            !restore_ran.load(Ordering::SeqCst),
+            "restore_on_failure does NOT run on f-reject (only on persist failure)"
         );
     }
 
