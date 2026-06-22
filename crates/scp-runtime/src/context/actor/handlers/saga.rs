@@ -1486,8 +1486,8 @@ fn commit_b_first_settle(
             let err = ContextError::EventLogFailed(format!(
                 "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
             ));
-            state.xctx_committed_outputs.remove(saga_id);
-            state.saga_pending.insert(
+            state.class_s.xctx_committed_outputs.remove(saga_id);
+            state.class_s.saga_pending.insert(
                 saga_id.clone(),
                 SagaPreparedState::CrossContextToolInvocation(prepared),
             );
@@ -1791,7 +1791,10 @@ async fn commit_a(
     ) {
         Ok(leaf) => leaf,
         Err(err) => {
-            state.xctx_committed_invocations.remove(&req.saga_id);
+            state
+                .class_s
+                .xctx_committed_invocations
+                .remove(&req.saga_id);
             if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
                 let sketch = outcome_error_sketch(&persist_err);
                 let _ = reply.send(Err(persist_err));

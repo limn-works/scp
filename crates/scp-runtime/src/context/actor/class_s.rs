@@ -1152,9 +1152,10 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event_type: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -1339,7 +1340,7 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
