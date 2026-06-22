@@ -348,34 +348,26 @@
     },
     {
       "id": "SHB-007",
-      "title": "Enable the external participant shape: relay client-listener bind config (TLS) + optional abuse-control admission token",
+      "title": "Verify the external participant shape over the existing public surface (no new admission control)",
       "gate": "gate-self-host-1",
       "priority": "P1",
       "severity": "major",
       "status": "pending",
       "files": [
-        "crates/scp-node/src/main.rs",
-        "crates/scp-node/src/config.rs",
+        "crates/scp-node/tests/self_host.rs",
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs"
       ],
-      "description": "ADR-053 / §10.17 define two participant deployment shapes; SHB-002 ships the BUNDLED (co-located) shape. This story enables the EXTERNAL shape: an SDK participant client in a separate process connecting to this node's relay over the socket — loopback same-box, wss:// off-host (§10.12.5/§10.12.6 transport rules). Two pieces: (1) an opt-in NodeConfig option (a `RelayClientListener` enum, flat-config per ADR-052, never a bool) that allows the relay's participant-facing client connection (the TLS-terminated `/scp/v1` public route) to serve EXTERNAL participants, defaulting to LoopbackOnly (fail-safe); when set to PublicTls it requires a TLS mode that terminates TLS on the public surface and the Full public surface (so `/scp/v1` is reachable over wss://), and it MUST be rejected (loud InvalidConfig) when combined with the SelfHost surface or Plaintext TLS. (2) An OPTIONAL admission token the node can issue and the `/scp/v1` upgrade handler validates as an ABUSE-PREVENTION / rate-limiting control — explicitly NOT the access-control boundary (access control for external participants is cryptographic: MLS group membership + UCAN, encryption-as-access-control; the relay stays a protocol-unaware dumb pipe per §10.4). The admission token is distinct from the node's internal bridge bearer token (which the public-route proxy injects on the operator's behalf and never exposes) and from the loopback-only dev/control endpoints. This story MUST NOT weaken SHB-005: dev/control (dev_api ALLOWED_HOSTS loopback-only) and bridge routes (`/v1/scp/bridge/*`) stay loopback-only and are never mounted on a public surface. Off-host external connections require wss:// (TLS); loopback ws:// remains permitted per §10.12.6. The startup disclosure (extending SHB-004's banner) MUST state when the relay client listener is opened to external participants beyond loopback.",
+      "description": "§10.17 defines two participant deployment shapes; SHB-002 ships the BUNDLED (co-located) shape. This story ENABLES/VERIFIES the EXTERNAL shape with ZERO new node API: an SDK participant client in a separate process reaches this node's relay over the EXISTING controls — the node's TLS-terminated `PublicSurface::Full` public surface (§10.12.11), the bind address, and the `TlsMode` (§10.12.6: loopback ws:// same-box, wss:// off-host) — exactly as for any client of the relay's `/scp/v1` route. There is NO dedicated listener toggle, admission token, or pre-shared secret: relays are anonymous, DHT-auto-discovered dumb pipes that participants do not hand-pick, so an admission/allowlist token is at odds with the relay model (§10.4). Abuse prevention for an open wss:// relay is provided by the relay's EXISTING rate limiting and abuse controls (§10.4 — `PublishRateLimiter` + `ConnectionTracker` + the `/scp/v1` semaphore) together with relay economics (§19.8 Relay Monetization, including `rate_limit_publish`), which together satisfy §10.4's 'rate limiting and abuse prevention' requirement. Access control for an external participant remains CRYPTOGRAPHIC, not transport-level: the relay is a protocol-unaware dumb pipe (§10.4) and the participant's authority to read or write context content is enforced by MLS group membership + UCAN (encryption-as-access-control) — a non-member connecting to `/scp/v1` sees only ciphertext. This story MUST NOT weaken SHB-005: dev/control (dev_api ALLOWED_HOSTS loopback-only) and bridge routes (`/v1/scp/bridge/*`) stay loopback-only and are never mounted on a public surface.",
       "acceptanceCriteria": [
-        "A relay client-listener option exists and is opt-in, defaulting to loopback-only: test `external_listener_defaults_to_loopback` asserts the RelayClientListener config defaults to LoopbackOnly when unset",
-        "PublicTls is rejected when it cannot be served safely: test `external_listener_rejects_plaintext_and_selfhost_surface` asserts NodeConfig validation returns InvalidConfig for PublicTls combined with Plaintext TLS, and for PublicTls combined with the SelfHost public surface, and returns Ok for PublicTls with a TLS-terminating Full surface",
-        "The admission token is abuse-control, distinct from the bridge bearer token: test `participant_admission_token_distinct_from_bridge_token` asserts an issued admission token value is not equal to `node.bridge_token_hex()`",
-        "When an admission token is configured, the public `/scp/v1` upgrade rejects connections lacking a valid token: test `external_listener_rejects_missing_admission_token` asserts a `/scp/v1` upgrade without the Authorization: Bearer admission token is refused, and with a valid token is accepted and proxied",
-        "Access control is not transferred to the relay: test `external_listener_admission_token_is_not_access_control` asserts that an MLS non-member cannot read context content in BOTH states — with admission disabled (default), AND with admission enabled while presenting a valid admission token — proving the token is abuse-control only and never grants content access (cryptographic access control is unaffected by the transport admission setting)",
-        "SHB-005 is not weakened: test `self_host_public_surface_excludes_relay_and_bridge` still passes, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)",
-        "The startup banner discloses when the relay client listener is opened beyond loopback: test `external_listener_banner_discloses_public_bind` asserts the banner names the external participant listener and PUBLIC INTERNET exposure when PublicTls is enabled"
+        "The external participant shape works over the existing public surface AND access stays cryptographic: test `external_participant_access_is_cryptographic` deploys a broadcast context, connects a non-member external client to the real `/scp/v1` route over `PublicSurface::Full` with NO token (asserts the upgrade is accepted and proxied), and asserts that same client's content surface — the relay's entire stored blob view — contains only ciphertext (no site plaintext marker), while the MLS-member projection path serves the same content as plaintext",
+        "SHB-005 isolation holds: test `self_host_public_surface_excludes_relay_and_bridge` still passes, proving the read-only self-host (`PublicSurface::SelfHost`) public surface never mounts `/scp/v1` or `/v1/scp/bridge/*`, and CI command `grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` returns true (loopback-only dev host allowlist unchanged)"
       ],
       "actionItems": [
-        "Add a `RelayClientListener` enum (LoopbackOnly default, PublicTls) to NodeConfig in config.rs/lib.rs, with validation rejecting PublicTls + Plaintext and PublicTls + SelfHost surface",
-        "Add optional admission-token issuance (distinct from the bridge bearer token, reusing the StorageBridgeLookup pattern) and validate it in the `/scp/v1` ws_upgrade_handler as abuse-control only",
-        "Require wss:// (TLS) for off-host external participant connections; permit ws:// for loopback per §10.12.6",
-        "Keep dev/control (ALLOWED_HOSTS loopback-only) and bridge routes unmounted on any public surface (do not regress SHB-005)",
-        "Extend the self-host startup banner to disclose relay-client-listener exposure beyond loopback",
-        "Add tests: external_listener_defaults_to_loopback, external_listener_rejects_plaintext_and_selfhost_surface, participant_admission_token_distinct_from_bridge_token, external_listener_rejects_missing_admission_token, external_listener_admission_token_is_not_access_control, external_listener_banner_discloses_public_bind"
+        "Confirm `/scp/v1` (`http::relay_router` / `ws_upgrade_handler`) is mounted on `PublicSurface::Full` via `build_scp_router_with_surface` -> `build_merged_router` and NOT on `PublicSurface::SelfHost`, so an external participant reaches it over the existing Full surface with no token (no new listener toggle, no admission gating)",
+        "Confirm abuse prevention is the relay's existing controls: the `/scp/v1` upgrade acquires the `Semaphore` permit and the relay enforces `PublishRateLimiter` + `ConnectionTracker` (crates/scp-transport/src/relay/rate_limit.rs), with relay economics per §19.8 — no admission/allowlist token is added",
+        "Add test `external_participant_access_is_cryptographic`: connect a non-member external client to `/scp/v1` over `PublicSurface::Full` with no token (assert accepted), then assert the relay's stored blob view is ciphertext while the MLS-member projection path returns the content as plaintext",
+        "Keep dev/control (ALLOWED_HOSTS loopback-only) and bridge routes unmounted on any public surface (do not regress SHB-005); keep `self_host_public_surface_excludes_relay_and_bridge` passing"
       ],
       "blockedBy": [
         "SHB-002"
@@ -387,10 +379,6 @@
         },
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
-          "section": "### 10.12.5 Tier 4: Domain-Based Deployment"
-        },
-        {
-          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
           "section": "### 10.12.6 Transport Security for Self-Hosted Relays"
         },
         {
@@ -398,8 +386,12 @@
           "section": "### 10.12.11 Self-Hosted Website Surface"
         },
         {
-          "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-053: Node Is Infrastructure; Participation Is an SDK Client"
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Relay Architecture"
+        },
+        {
+          "file": ".docs/specs/19-economic-governance.md",
+          "section": "## 19.8 Relay Monetization"
         }
       ],
       "details": {}

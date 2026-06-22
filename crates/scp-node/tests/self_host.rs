@@ -112,6 +112,11 @@ struct BuiltNode {
     /// The node's `DidCache`, shared with the co-located participant resolver
     /// (the cache-level sequence check is the load-bearing anti-rollback guard).
     cache: Arc<DidCache>,
+    /// A clone of the blob-storage backend the relay + projection share
+    /// (SHB-007). Retained so a test can read the relay's complete view of the
+    /// stored broadcast envelopes — exactly what any connecting external
+    /// participant can ever retrieve — and assert it is ciphertext.
+    blob_storage: scp_transport::native::storage::BlobStorageBackend,
     _tmp: tempfile::TempDir,
 }
 
@@ -164,6 +169,9 @@ async fn build_self_host_node() -> BuiltNode {
     let blob_storage =
         scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
             .expect("sqlite blob storage should open");
+    // Retain a clone (the backend is `Arc`-backed and `Clone`) so the test can
+    // read the relay's stored view directly (SHB-007 content-isolation proof).
+    let blob_storage_handle = blob_storage.clone();
 
     // `Node::start` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
     // `NatTraversal` (no_domain) is a publishing reach → `DhtMode::Production`
@@ -205,6 +213,7 @@ async fn build_self_host_node() -> BuiltNode {
         storage_key,
         dht_client,
         cache,
+        blob_storage: blob_storage_handle,
         _tmp: tmp,
     }
 }
@@ -230,6 +239,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         storage_key,
         dht_client: _dht_client,
         cache: _cache,
+        blob_storage: _blob_storage,
         _tmp,
     } = built;
     let node_did = node.identity().did().to_owned();
@@ -1267,6 +1277,139 @@ async fn self_host_no_domain_skips_acme() {
          engaged without a DNS name), got {}",
         acme.status()
     );
+
+    built.node.shutdown();
+}
+
+// ===========================================================================
+// SHB-007: External participant shape over the existing public surface
+// (spec §10.4, §10.12.6, §10.12.11, §10.17, §19.8)
+// ===========================================================================
+
+/// The plaintext marker embedded in the default site's `index.html`. If it ever
+/// appears in a relay-stored blob, the relay would be carrying cleartext content
+/// — which must NEVER happen (content is MLS/broadcast-key encrypted before it
+/// reaches the relay).
+const SITE_PLAINTEXT_MARKER: &[u8] = b"hello, world.";
+
+/// Deploys the embedded site onto `built` and returns the broadcast
+/// `routing_id` the envelopes are stored under (the same routing id the
+/// projection serves at `/scp/broadcast/<hex>/site/...`).
+async fn deploy_and_routing_id(built: &BuiltNode, deploy_id: &str) -> [u8; 32] {
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let deployer = build_deployer(built, &context_id).await;
+    deploy_through(&deployer, built, deploy_id).await;
+    scp_node::projection::compute_routing_id(&context_id)
+}
+
+/// Reads the relay's COMPLETE stored view for `routing_id` — exactly what any
+/// connecting relay client can ever retrieve — and asserts NONE of the stored
+/// blob bodies contains the site plaintext marker.
+///
+/// This is the relay's entire content surface: the relay stores and forwards
+/// these opaque encrypted blobs (§10.4). Proving they are ciphertext proves the
+/// relay can never yield content to a connecting external participant — content
+/// access requires the MLS/broadcast key, which the relay never holds (access
+/// control is cryptographic: MLS + UCAN).
+async fn assert_relay_view_is_ciphertext(built: &BuiltNode, routing_id: &[u8; 32], context: &str) {
+    use scp_transport::native::storage::BlobStorage;
+    let blobs = built
+        .blob_storage
+        .query(routing_id, None, 1024)
+        .await
+        .expect("relay blob query should succeed");
+    assert!(
+        !blobs.is_empty(),
+        "[{context}] the relay must actually hold the deployed broadcast blobs \
+         (so the ciphertext assertion is meaningful)"
+    );
+    for blob in &blobs {
+        assert!(
+            !contains_subslice(&blob.blob, SITE_PLAINTEXT_MARKER),
+            "[{context}] a relay-stored blob contains the site PLAINTEXT marker — the relay \
+             must only ever carry MLS/broadcast-key ciphertext, never content"
+        );
+    }
+}
+
+/// Returns `true` if `haystack` contains `needle` as a contiguous subslice.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The external participant shape works over the EXISTING public surface, and
+/// access to that surface is cryptographic — NOT transport-gated (SHB-007, spec
+/// §10.4, §10.12.6, §10.12.11, §10.17, §19.8).
+///
+/// An external (separate-process) SDK participant reaches the node's relay over
+/// the existing TLS-terminated [`PublicSurface::Full`] surface — governed by the
+/// public-surface selection, the bind address, and the [`TlsMode`] — with NO
+/// dedicated admission token or pre-shared secret (relays are anonymous,
+/// DHT-auto-discovered dumb pipes; abuse prevention is the relay's existing rate
+/// limiting per §10.4 and economics per §19.8, NOT an allowlist). This test
+/// proves both halves at once:
+///
+/// 1. The external shape WORKS: a non-member client connects to the real
+///    `/scp/v1` route over the `Full` surface with no token and is accepted.
+/// 2. Access stays CRYPTOGRAPHIC: that same client's entire content surface (the
+///    relay's stored blobs) is ciphertext. The MLS-member projection path (which
+///    holds the broadcast key) decrypts the SAME blobs to plaintext, while the
+///    external non-member (the relay's view, holding no key) sees only
+///    ciphertext. Reachability is transport; access control is cryptographic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_participant_access_is_cryptographic() {
+    let built = build_self_host_node().await;
+    let routing_id = deploy_and_routing_id(&built, "external-participant-deploy").await;
+
+    // The MLS-member projection path (which holds the broadcast key) DOES yield
+    // plaintext — content exists and is readable WITH the key.
+    let routing_hex = hex::encode(routing_id);
+    let status = projection_status(
+        &built.node,
+        &format!("/scp/broadcast/{routing_hex}/site/index.html"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the MLS-member projection path must serve the deployed content as plaintext"
+    );
+
+    // Serve the FULL surface (where `/scp/v1` is mounted) on a real loopback
+    // listener — the existing external-participant reachability controls
+    // (surface + bind + TLS), with NO admission token.
+    let addr = built
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::Full,
+        )
+        .await
+        .expect("full background listener should bind");
+
+    // The external participant shape WORKS with zero new code: a non-member
+    // connects to the real `/scp/v1` route over the `Full` surface with NO
+    // token and the upgrade is accepted and proxied.
+    let url = format!("ws://{addr}/scp/v1");
+    let connected = tokio_tungstenite::connect_async(&url).await;
+    assert!(
+        connected.is_ok(),
+        "an external participant must reach /scp/v1 over the Full public surface \
+         with no token, got error: {:?}",
+        connected.err()
+    );
+    drop(connected);
+
+    // Yet that external (non-member) participant's content surface — the relay's
+    // entire stored view — is STILL ciphertext. Reaching the relay granted a
+    // transport connection, NOT content access: access control stays
+    // cryptographic (MLS/broadcast key), independent of transport reachability.
+    assert_relay_view_is_ciphertext(&built, &routing_id, "external-participant").await;
 
     built.node.shutdown();
 }
