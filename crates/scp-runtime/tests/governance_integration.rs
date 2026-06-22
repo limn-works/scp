@@ -563,6 +563,145 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
 }
 
 // =========================================================================
+// §9.9.3 native↔WASM ACCEPT-decision parity: a quorum-crossing eligible voter
+// who is NOT the proposer and holds no per-action capability still causes the
+// action to execute and mint EXACTLY ONE GovernanceActionExecuted leaf.
+//
+// Native `execute_governance_action` performs NO per-member action-capability
+// check (only status / context-id / replay / commit-fault). The WASM bridge
+// previously gated on `member_has_capability(voter, action_cap)` at execute,
+// which a vote-eligible-but-action-less voter fails — minting 0 where native
+// mints 1. That per-member check has been removed from WASM so both bridges
+// mint exactly 1. This native test pins the "native mints 1" half (the WASM
+// half is `cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-majority-voter-no-action-cap";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Majority {
+            eligible_voters: vec![alice(), bob(), carol()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // ChangeRole has NO native per-action ceiling gate; `role:assign` is in the
+    // ceiling. `bob` is an eligible voter who is NOT a member and holds no
+    // per-action capability of his own — yet his quorum-crossing vote commits
+    // the action, because native does not check the committing member's
+    // action capability at execute.
+    let action = GovernanceAction::ChangeRole {
+        did: alice(),
+        new_role: "observer".into(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+
+    // Alice's approval is #1 of quorum 2 — still Pending.
+    let (status_after_alice, _) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(status_after_alice, ProposalStatus::Pending);
+
+    // Bob's approval is #2 — crosses majority quorum and COMMITS the action.
+    let sk_bob = signing_key_for_did(&bob());
+    let (status, _events) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(status, ProposalStatus::Approved);
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 1,
+        "native MUST mint EXACTLY ONE GovernanceActionExecuted leaf for a quorum-crossing voter \
+         lacking the action capability — the convergent target the WASM bridge must match (§9.9.3)"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity: an action whose required
+// capability is NOT in the context ceiling is rejected, minting no
+// GovernanceActionExecuted leaf. `RevokeAccess` is gated on `member:ban` in
+// native (`execute_revoke`). With `member:ban` absent from the ceiling, native
+// rejects — the WASM bridge now applies the same per-action ceiling gate
+// (`cross_impl_out_of_ceiling_action_rejected_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_action_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES `member:ban` (MemberBan).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // SingleAdmin auto-executes on propose, so the per-action ceiling gate is
+    // reached synchronously and the propose call surfaces the rejection.
+    let action = GovernanceAction::RevokeAccess {
+        did: bob(),
+        access: AccessScope::Both,
+    };
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected by native — \
+         the convergent reject decision the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling action MUST mint ZERO GovernanceActionExecuted leaves on native"
+    );
+}
+
+// =========================================================================
 // AC-5: Unanimity — all members approve -> execute
 // =========================================================================
 

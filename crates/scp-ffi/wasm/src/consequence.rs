@@ -1601,4 +1601,149 @@ mod cross_impl_leaf_parity {
              (divergent) leaf actor_did"
         );
     }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity: an eligible voter who holds
+    /// `governance:vote` but LACKS the action capability (`role:assign`, here
+    /// suspended) crosses quorum and the action executes, minting EXACTLY ONE
+    /// `GovernanceActionExecuted` leaf with the voter as actor.
+    ///
+    /// This is the exact regression the per-member execute-time capability check
+    /// caused: native `execute_governance_action` performs NO per-member action
+    /// check (only status / context-id / replay / commit-fault), so native mints
+    /// one leaf. WASM previously gated on
+    /// `member_has_capability(voter, role:assign)` at execute, which a
+    /// vote-eligible-but-action-suspended voter fails — minting zero where native
+    /// mints one. `ChangeRole` has NO native per-action ceiling gate, so removing
+    /// the per-member check converges the decision: both mint exactly one leaf.
+    #[test]
+    fn cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-vote-only-voter";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // 3-member majority: quorum = 3/2 + 1 = 2. Proposer self-vote = #1
+        // (Pending); the voter's approval = #2 → crosses quorum → executes.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(proposer, "admin");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        ctx.test_insert_ceiling("role:assign");
+        // The voter is an ELIGIBLE VOTER (governance:vote intact) but LACKS the
+        // action capability: `role:assign` is suspended for them. The pre-fix
+        // per-member execute check tested exactly `member_has_capability(voter,
+        // role:assign)`, which now returns false (suspension is checked first),
+        // so it would have rejected and minted 0 leaves. `governance:vote` is
+        // NOT suspended, so voting still succeeds.
+        ctx.test_insert_suspended_capability(voter, "role:assign");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkMemberC".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        mgr.propose_governance_action(context_id, proposer, proposal_id, &action)
+            .expect("propose by an admin proposer with governance:propose succeeds");
+
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .expect("vote-eligible voter (governance:vote intact) crosses quorum and commits");
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "voter approval crosses majority quorum (2 of 2) and commits the action"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed: Vec<_> = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .collect();
+        assert_eq!(
+            executed.len(),
+            1,
+            "a vote-eligible voter lacking the action capability MUST still mint EXACTLY ONE \
+             GovernanceActionExecuted leaf — identical to native, which has no per-member \
+             execute-time check (§9.9.3; ADR-031 §8)"
+        );
+        assert_eq!(
+            executed[0].actor_did.as_ref(),
+            voter,
+            "the single GovernanceActionExecuted leaf actor_did is the quorum-crossing voter \
+             (executor), matching native"
+        );
+    }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity: a governance action whose
+    /// required capability is NOT in the context ceiling is rejected IDENTICALLY
+    /// on both bridges — no `GovernanceActionExecuted` leaf is minted.
+    ///
+    /// `RevokeAccess` is gated on `member:ban` in native's `execute_revoke`
+    /// (`governance_helpers.rs`) via `ceiling.contains(&Capability::MemberBan)`.
+    /// `member:ban` is absent from the default ceiling, so native rejects when it
+    /// is not explicitly added. WASM now mirrors this with a per-action
+    /// CONTEXT-CEILING gate in `dispatch_governance_action`, so both reject and
+    /// neither mints a leaf.
+    #[test]
+    fn cross_impl_out_of_ceiling_action_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::DID;
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let context_id = "ctx-gov-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+        let target = "did:dht:z6MkTarget";
+
+        // SingleAdmin governance (quorum 0): the admin proposer auto-executes on
+        // propose, so the dispatch ceiling gate fires synchronously and the
+        // propose call surfaces the rejection.
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_member(target, "member");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "member:ban" into the ceiling — this is the
+        // out-of-ceiling condition. Native's `execute_revoke` rejects the same
+        // way (`ceiling.contains(&Capability::MemberBan)` is false).
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action = GovernanceAction::RevokeAccess {
+            did: DID::from(target.to_owned()),
+            access: AccessScope::Both,
+        };
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafebabe", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected — \
+             identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling action MUST mint ZERO GovernanceActionExecuted leaves on \
+             both bridges"
+        );
+    }
 }

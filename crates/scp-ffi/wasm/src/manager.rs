@@ -787,6 +787,19 @@ impl PerContextState {
         self.suspended_capabilities.get(did)
     }
 
+    /// Test-only: suspend a single capability (UCAN-format string) for a
+    /// member, so sibling-module cross-impl tests can construct a member that
+    /// holds `governance:vote` (eligible voter) while lacking a specific action
+    /// capability (e.g. `role:assign`). Mirrors the production effect of
+    /// `apply_suspend` populating `suspended_capabilities`.
+    #[cfg(test)]
+    pub(crate) fn test_insert_suspended_capability(&mut self, did: &str, capability: &str) {
+        self.suspended_capabilities
+            .entry(did.to_owned())
+            .or_default()
+            .insert(capability.to_owned());
+    }
+
     /// Test-only: push a consequence rule onto the context's declared rules.
     #[cfg(test)]
     pub(crate) fn test_push_consequence_rule(
@@ -2841,44 +2854,38 @@ impl WasmContextManager {
     /// Maps each `GovernanceAction` variant to the capability that
     /// the initiator must hold. Uses the UCAN `{resource}:{action}` format,
     /// matching `member_has_capability` and the ceiling strings.
-    fn required_capability_for_action(action: &GovernanceAction) -> &'static str {
+    /// Returns the context-ceiling capability a governance action requires at
+    /// DISPATCH time, in WASM `ceiling_strings` (UCAN) format — or `None` if the
+    /// action is NOT ceiling-gated at dispatch.
+    ///
+    /// This mirrors EXACTLY the native runtime's per-action ceiling gates in
+    /// `dispatch_governance_action` / its per-action `execute_*` helpers
+    /// (`governance_helpers.rs`), which gate on `ceiling.contains(&Capability::X)`
+    /// — NOT on the committing member's role. Native gates precisely these five:
+    ///
+    /// - `SuspendCapability` (`execute_suspend_member`)  → `member:ban`
+    /// - `SuspendAccess`     (inline `dispatch_governance_action`) → `member:ban`
+    /// - `RevokeAccess`      (`execute_revoke`)          → `member:ban`
+    /// - `RestoreAccess`     (`execute_restore_access`)  → `member:ban`
+    /// - `RegisterTool`      (`execute_register_tool`)   → `tool:register`
+    ///
+    /// All OTHER actions have NO per-action ceiling gate in native — their
+    /// authorization is entirely at propose time. Returning `None` for them
+    /// keeps WASM's accept/reject decision byte-identical to native (§9.9.3).
+    ///
+    /// The strings are exact `Capability::ucan_capability_name()` outputs
+    /// (`member:ban`, `tool:register`) and are matched against `ceiling_strings`
+    /// with EXACT membership — no wildcard expansion — because native's
+    /// `CapabilityCeiling::contains` uses exact set membership for these
+    /// capabilities (only `ToolInvoke` has wildcard special-casing).
+    fn dispatch_ceiling_capability(action: &GovernanceAction) -> Option<&'static str> {
         match action {
-            GovernanceAction::AddMember { .. } | GovernanceAction::RestoreAccess { .. } => {
-                "member:invite"
-            }
-
-            GovernanceAction::RemoveMember { .. }
-            | GovernanceAction::SuspendCapability { .. }
+            GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
             | GovernanceAction::RevokeAccess { .. }
-            | GovernanceAction::ResetMember { .. } => "member:remove",
-
-            GovernanceAction::ChangeRole { .. } => "role:assign",
-
-            GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
-            | GovernanceAction::EstablishToolInterface { .. } => "tool:register",
-
-            GovernanceAction::CloseContext { .. } => "context:close",
-
-            GovernanceAction::ModifyCeiling { .. }
-            | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::PromoteContext
-            | GovernanceAction::CreateChildContext { .. }
-            | GovernanceAction::ModifyPruningPolicy { .. }
-            | GovernanceAction::AddSigner { .. }
-            | GovernanceAction::RemoveSigner { .. }
-            | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::ResolveConflict { .. }
-            | GovernanceAction::RotateContentKeys { .. }
-            | GovernanceAction::ReconfigureGovernance { .. }
-            | GovernanceAction::SetEconomicPolicy { .. }
-            | GovernanceAction::ApproveSpend { .. }
-            | GovernanceAction::LockEconomicPolicy
-            | GovernanceAction::ModifyHardRateLimit { .. }
-            | GovernanceAction::ProposeContextMigration { .. }
-            | GovernanceAction::CancelContextMigration => "governance:propose",
+            | GovernanceAction::RestoreAccess { .. } => Some("member:ban"),
+            GovernanceAction::RegisterTool { .. } => Some("tool:register"),
+            _ => None,
         }
     }
 
@@ -2992,20 +2999,20 @@ impl WasmContextManager {
         // before it can be executed.
         self.require_proposal_approved(context_id, proposal_id)?;
 
-        // Authorization: check that initiator has the required capability
-        // for this governance action. Matches close_context's pattern.
-        {
-            let ctx = self.require_active_context_mut(context_id)?;
-            let required = Self::required_capability_for_action(action);
-            if !ctx.member_has_capability(initiator_did, required) {
-                return Err(ScpWasmError::Permission {
-                    message: format!(
-                        "member {initiator_did} does not have '{required}' capability required for this governance action"
-                    ),
-                    code: codes::PERM_3000.to_owned(),
-                });
-            }
-        }
+        // NO per-MEMBER capability check at execute time. The native runtime's
+        // `execute_governance_action` (`governance_helpers.rs`) gates ONLY on
+        // status==Approved, context-id match, replay (`executed_proposals`), and
+        // `check_commit_fault` — it performs NO per-member action-capability
+        // check at execute. Authorization is enforced at PROPOSE time
+        // (proposer needs `governance:propose` + action within ceiling) and, for
+        // the ban/tool-register class, by a per-action CONTEXT-CEILING gate
+        // inside `dispatch_governance_action` (matching native's per-action
+        // `ceiling.contains(&Capability::X)` gates). A per-member check here
+        // diverged from native: on the quorum path the committing member is the
+        // quorum-crossing VOTER, who only needs `governance:vote` — gating on the
+        // action capability (e.g. `role:assign`) would make WASM mint ZERO
+        // `GovernanceActionExecuted` leaves where native mints ONE, breaking
+        // §9.9.3 native↔WASM accept/reject convergence (ADR-031 §8).
 
         // Resolve the CONVERGENT `GovernanceActionExecuted` leaf timestamp
         // BEFORE dispatch, while the proposal is still tracked. This is the
@@ -3158,6 +3165,25 @@ impl WasmContextManager {
         context_id: &str,
         action: &GovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
+        // Per-action CONTEXT-CEILING gate, identical to native's per-action
+        // `ceiling.contains(&Capability::X)` gates in `dispatch_governance_action`
+        // / the `execute_*` helpers (`governance_helpers.rs`). Gates on the
+        // CEILING only — NOT on the committing member's role — so an
+        // out-of-ceiling action is rejected byte-identically on both bridges and
+        // an in-ceiling action executes (and mints its leaves) on both (§9.9.3,
+        // ADR-031 §8). Actions with no native ceiling gate return `None` and skip
+        // this check (their authorization lives entirely at propose time).
+        if let Some(required) = Self::dispatch_ceiling_capability(action) {
+            let ctx = self.require_active_context(context_id)?;
+            if !ctx.ceiling_strings.contains(required) {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "context ceiling does not include '{required}' capability required for this governance action"
+                    ),
+                    code: codes::PERM_3000.to_owned(),
+                });
+            }
+        }
         match action {
             GovernanceAction::AddMember { did, role } => {
                 self.dispatch_add_member(context_id, did, role)
