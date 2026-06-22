@@ -2861,13 +2861,16 @@ impl WasmContextManager {
     /// This mirrors EXACTLY the native runtime's per-action ceiling gates in
     /// `dispatch_governance_action` / its per-action `execute_*` helpers
     /// (`governance_helpers.rs`), which gate on `ceiling.contains(&Capability::X)`
-    /// — NOT on the committing member's role. Native gates precisely these five:
+    /// — NOT on the committing member's role. Native gates precisely these seven
+    /// actions across four capabilities:
     ///
-    /// - `SuspendCapability` (`execute_suspend_member`)  → `member:ban`
-    /// - `SuspendAccess`     (inline `dispatch_governance_action`) → `member:ban`
-    /// - `RevokeAccess`      (`execute_revoke`)          → `member:ban`
-    /// - `RestoreAccess`     (`execute_restore_access`)  → `member:ban`
-    /// - `RegisterTool`      (`execute_register_tool`)   → `tool:register`
+    /// - `SuspendCapability`  (`execute_suspend_member`)        → `member:ban`
+    /// - `SuspendAccess`      (inline `dispatch_governance_action`) → `member:ban`
+    /// - `RevokeAccess`       (`execute_revoke`)                 → `member:ban`
+    /// - `RestoreAccess`      (`execute_restore_access`)         → `member:ban`
+    /// - `RegisterTool`       (`execute_register_tool`)          → `tool:register`
+    /// - `CreateChildContext` (`execute_create_child_context`)  → `context_child:create`
+    /// - `EstablishToolInterface` (`execute_establish_tool_interface`) → `tool:interface`
     ///
     /// All OTHER actions have NO per-action ceiling gate in native — their
     /// authorization is entirely at propose time. Returning `None` for them
@@ -3011,15 +3014,17 @@ impl WasmContextManager {
     /// Executes a governance action. Mirrors the native runtime's
     /// `execute_governance_action` (`governance_helpers.rs`).
     ///
-    /// Validates that the proposal is `Approved`, that the initiator has the
-    /// required capability for the action, that the proposal is not a replay,
-    /// dispatches to the appropriate action handler, and records the proposal
-    /// as executed.
+    /// Validates that the proposal is `Approved`, that the proposal is not a
+    /// replay, dispatches to the appropriate action handler (which applies the
+    /// per-action context-ceiling gate), and records the proposal as executed.
+    /// There is NO per-member capability check at execute time (matches native).
     ///
-    /// `initiator_did` is the AUTH SUBJECT — the member whose capability is
-    /// checked (and the consequence subject). `executor_did` is the COMMITTING
-    /// member — the DID stamped as the `GovernanceActionExecuted` leaf
-    /// `actor_did` and the buffer event `executor_did`. These are deliberately
+    /// `initiator_did` is the CONSEQUENCE SUBJECT — the member the action's
+    /// effect is attributed to. It is NOT capability-checked here; authorization
+    /// is enforced at propose/vote time and by the per-action ceiling gate at
+    /// dispatch. `executor_did` is the COMMITTING member — the DID stamped as
+    /// the `GovernanceActionExecuted` leaf `actor_did` and the buffer event
+    /// `executor_did`. These are deliberately
     /// SEPARATE (ADR-031 §8 "executor DID" / §7.3.1 "committing member" /
     /// ADR-051 §6): the native runtime takes the executor explicitly, and the
     /// leaf `actor_did` is convergence-critical (§9.9.3 native↔WASM byte parity).
@@ -6252,8 +6257,17 @@ impl WasmContextManager {
         // further down) because the convergent TTL deadline base
         // (`creation_timestamp_secs + ttl_seconds`) must be byte-identical across
         // members and bridges (§9.9.3); clamping it would diverge the
-        // `ContextExpired` leaf. A forged future creation time only shortens the
-        // effective deadline (fail-safe), so it needs no clamp here.
+        // `ContextExpired` leaf. Consuming it verbatim is safe NOT because of any
+        // fail-safe direction (a forged FUTURE creation time would in fact LENGTHEN
+        // `creation + ttl`, pushing the deadline later — the opposite of fail-safe).
+        // It is safe because by the time we reach this code the whole snapshot —
+        // `creation_timestamp_secs` included — has already been bound to the creator:
+        // `deserialize_and_verify_envelope` enforces `exporter_did == creator_did`,
+        // verifies the Ed25519 snapshot signature over the JCS-canonical snapshot
+        // against the creator DID's resolved key, and (for self-imports) the
+        // defense-in-depth HMAC. Forging `creation_timestamp_secs` therefore requires
+        // the creator's signing key. §9.9.3 additionally requires the value verbatim
+        // for cross-member/bridge convergence, so clamping is forbidden regardless.
         let now_ms_for_clamp = crate::time::now_ms();
         let ctx = PerContextState {
             state: snap.state.clone(),

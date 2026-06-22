@@ -699,10 +699,15 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// Delegates to `WasmContextManager::execute_governance_action`.
 /// All 24 `GovernanceAction` variants are dispatchable.
 ///
-/// Authorization is enforced: the `initiator_did` must be a member with
-/// the capability required for the specific governance action. For example,
-/// `RemoveMember` requires `member:remove` (admin-only by default),
-/// `ChangeRole` requires `role_assign:*`, etc.
+/// Authorization is NOT a per-member execute-time capability check. The
+/// proposal must already be `Approved` (enforced by `require_proposal_approved`)
+/// — authorization was established at propose/vote time (the proposer needs
+/// `governance:propose` and the action must be within the context ceiling).
+/// At dispatch, the per-action context-ceiling gate (`dispatch_ceiling_capability`)
+/// gates the ban/tool-register/child-context/tool-interface class on the
+/// context ceiling — NOT on the caller's role. `initiator_did` is the
+/// consequence subject, NOT capability-checked here. This mirrors the native
+/// runtime exactly (§9.9.3 native↔WASM convergence).
 ///
 /// # Arguments
 ///
@@ -765,10 +770,13 @@ pub fn context_execute_governance(
             // PROPOSER, NOT the caller `initiator_did` — matching the native
             // direct-execute handler, which stamps `proposal.proposer_did`
             // (§9.9.3 native↔WASM convergence; ADR-031 §8 "executor DID").
-            // `initiator_did` remains the AUTH SUBJECT (capability checked
-            // inside `execute_governance_action`); only the leaf actor_did
-            // converges to the proposer. Resolve the proposer from the tracked
-            // proposal the executed leaf is derived from.
+            // `initiator_did` is the CONSEQUENCE SUBJECT only — nothing inside
+            // `execute_governance_action` checks its capability. Safety derives
+            // from `require_proposal_approved` (status==Approved), the replay
+            // guard (`executed_proposals`), propose-time authorization, and the
+            // per-action context-ceiling gate (`dispatch_ceiling_capability`).
+            // Only the leaf actor_did converges to the proposer. Resolve the
+            // proposer from the tracked proposal the executed leaf is derived from.
             let executor_did = mgr.proposal_proposer_did(&context_id, &proposal_id)?;
             mgr.execute_governance_action(
                 &context_id,
