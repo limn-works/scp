@@ -1,6 +1,6 @@
 # A Mock Test That Inverts Real Behavior Is a Silent Future Blocker
 
-**Context**: `bindings/typescript/test/identity-lifecycle.test.ts` asserted
+**Context**: `bindings/typescript/tests/identity-lifecycle.test.ts` asserted
 `migrated.did === identity.did` for `identityMigrate`. The NAPI bridge's actual behavior is
 the **opposite**: migration produces a *new* DID (the Rust `migrate_returns_new_did` test
 asserts the two DIDs differ, per spec §9.12). The TS test only passed because it is

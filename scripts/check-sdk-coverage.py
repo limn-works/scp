@@ -1424,7 +1424,7 @@ def _check_operation_in_sdk(
     Strategy (in order):
       1. Explicit aliases from the ALIASES table
       2. Exact match against auto-generated name variants
-         (snake_case, camelCase, PascalCase, domain-prefixed)
+         (snake_case, camelCase, domain-prefixed)
 
     Returns True if any check succeeds.
 
