@@ -2835,4 +2835,58 @@ mod tests {
             "the deadline must be creation_timestamp_secs + ttl, not a local-clock value"
         );
     }
+
+    /// Cross-bridge convergence with a FUTURE-dated creation time: when the
+    /// signed snapshot's `creation_timestamp_secs` is strictly GREATER than the
+    /// importer's local `now` (legitimate clock skew within the ±5-min tolerance,
+    /// or a creator that stamped a slightly-future creation), the native importer
+    /// consumes the field VERBATIM (it does NOT clamp to importer-`now`) and arms
+    /// `creation + ttl`. This mirrors the WASM importer's post-fix verbatim path
+    /// (`handle_ttl_expiry` stamps `creation.saturating_add(ttl)` with no `now`
+    /// clamp), so a mixed native/WASM context records the IDENTICAL
+    /// `ContextExpired` leaf and converges its event-log root at equal event
+    /// count. A residual importer-`now` clamp on either side would stamp the
+    /// SHORTER `now + ttl`, diverging the leaf (§7.3.1, §9.9.3).
+    #[test]
+    fn future_dated_creation_is_consumed_verbatim_and_matches_wasm() {
+        use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
+
+        // Importer's local clock; the snapshot creation is 2 minutes in its
+        // future (well within the ±5-min skew tolerance).
+        let importer_now = 1_700_000_000_u64;
+        let creation = importer_now + 120;
+        let ttl = 86_400_u64;
+        assert!(
+            creation > importer_now,
+            "test precondition: snapshot creation must be in the importer's future"
+        );
+
+        let mut snapshot = test_snapshot("ctx-future-creation-verbatim");
+        snapshot.creation_timestamp_secs = creation;
+
+        // Native deadline from the verbatim snapshot field. There is no
+        // importer-`now` clamp anywhere on this path.
+        let native_deadline =
+            convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
+        assert_eq!(
+            native_deadline,
+            Some(creation + ttl),
+            "native must arm creation + ttl verbatim, NOT a clamped importer_now + ttl"
+        );
+        assert_ne!(
+            native_deadline,
+            Some(importer_now + ttl),
+            "a clamp to importer_now would have produced this SHORTER deadline — the bug FIX 1 closes"
+        );
+
+        // WASM importer math for the SAME field (mirrors `handle_ttl_expiry`'s
+        // `creation.saturating_add(ttl)` post-fix verbatim consumption).
+        let wasm_deadline = creation.saturating_add(ttl);
+        assert_eq!(
+            native_deadline,
+            Some(wasm_deadline),
+            "native and WASM importers of the same future-dated signed snapshot \
+             must derive the IDENTICAL TTL deadline"
+        );
+    }
 }
