@@ -468,103 +468,116 @@ pub async fn reserve_tool_economy(
     spending_ucan: Option<&UcanToken>,
     now_secs: u64,
 ) -> Result<ToolEconomyReservation, ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this
-    // `state_mut()` line with the spending-nonce-consume combinator; until then
-    // the bare `&mut PerContextState` keeps the body byte-for-byte unchanged.
-    let state = cell.state_mut();
+    // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
+    // + fail-closed persist on the PAID path are routed through
+    // `commit_class_s_keep_compensating` below; the pre-persist bookkeeping that
+    // runs regardless (hard rate limit, velocity, pre-check) still mutates the
+    // bare `&mut PerContextState` through the temporary `state_mut()` escape
+    // hatch, with the borrow released before the combinator call.
     let event_log = &deps.event_log;
     let key_resolver = &deps.key_resolver;
     let clock = deps.clock.as_ref();
     let payment_adapter = deps.payment_adapter.clone();
 
-    let handle = state.handle.clone();
-    let role_state = state.role_state.clone();
-
-    // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
-    // the tool path. try_consume before any Phase-1 bookkeeping.
-    if !state
-        .governance
-        .hard_rate_limit
-        .try_consume(invoker_did, now_secs)
+    let handle;
+    let role_state;
+    let velocity_token;
+    let metrics;
+    let economic_policy;
+    let action_cost;
     {
-        return Err(ContextError::RateLimited {
-            resource: "tool_invoke".to_owned(),
-            message: "hard rate limit exceeded for invoker".to_owned(),
-        });
-    }
+        let state = cell.state_mut();
 
-    let velocity_token = state
-        .governance
-        .velocity_tracker
-        .record_message(invoker_did, now_secs);
+        handle = state.handle.clone();
+        role_state = state.role_state.clone();
 
-    let velocity = state
-        .governance
-        .velocity_tracker
-        .get_velocity(invoker_did, now_secs);
-    let member_count = u64::try_from(state.membership.count()).unwrap_or(u64::MAX);
-    let aggregate = state
-        .governance
-        .velocity_tracker
-        .aggregate_velocity(now_secs);
-    let metrics = ObservableMetrics {
-        sender_velocity: velocity,
-        member_count,
-        context_message_rate: aggregate,
-        relay_queue_depth: 0,
-        time_of_day: now_secs % 86400,
-        storage_usage: 0,
-    };
+        // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
+        // the tool path. try_consume before any Phase-1 bookkeeping.
+        if !state
+            .governance
+            .hard_rate_limit
+            .try_consume(invoker_did, now_secs)
+        {
+            return Err(ContextError::RateLimited {
+                resource: "tool_invoke".to_owned(),
+                message: "hard rate limit exceeded for invoker".to_owned(),
+            });
+        }
 
-    let economic_policy = state.governance.economic_policy.clone();
-    let consequence_rules = state.governance.consequence_rules.clone();
-    let message_pricing = state.governance.message_pricing.clone();
+        velocity_token = state
+            .governance
+            .velocity_tracker
+            .record_message(invoker_did, now_secs);
 
-    let (events_snapshot, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
-            now_secs,
-            event_log.as_ref(),
-        );
-
-    let mut participation_cache: HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-    > = HashMap::new();
-
-    let action_cost = {
-        let economy = ToolEconomyContext {
-            economic_policy: economic_policy.as_ref(),
-            budget_tracker: &mut state.governance.budget_tracker,
-            spending_ucan,
-            context_id,
-            now: now_secs,
-            events: &events_snapshot,
-            convergent_now,
-            participation_cache: &mut participation_cache,
-            consequence_rules: &consequence_rules,
-            payment_adapter: payment_adapter.clone(),
-            metrics: metrics.clone(),
-            velocity_tracker: Some(&state.governance.velocity_tracker),
-            message_pricing: message_pricing.as_ref(),
+        let velocity = state
+            .governance
+            .velocity_tracker
+            .get_velocity(invoker_did, now_secs);
+        let member_count = u64::try_from(state.membership.count()).unwrap_or(u64::MAX);
+        let aggregate = state
+            .governance
+            .velocity_tracker
+            .aggregate_velocity(now_secs);
+        metrics = ObservableMetrics {
+            sender_velocity: velocity,
+            member_count,
+            context_message_rate: aggregate,
+            relay_queue_depth: 0,
+            time_of_day: now_secs % 86400,
+            storage_usage: 0,
         };
 
-        match economy_pre_check(&economy, invoker_did) {
-            Ok(cost) => cost,
-            Err(err) => {
-                state
-                    .governance
-                    .velocity_tracker
-                    .rollback(invoker_did, velocity_token);
-                state.governance.hard_rate_limit.refund(invoker_did);
-                return Err(invocation_error_to_context(err));
-            }
-        }
-    };
+        economic_policy = state.governance.economic_policy.clone();
+        let consequence_rules = state.governance.consequence_rules.clone();
+        let message_pricing = state.governance.message_pricing.clone();
 
-    if action_cost.0 > 0 {
-        let Some(spending) = spending_ucan else {
+        let (events_snapshot, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                &state.receive_buffer,
+                context_id,
+                now_secs,
+                event_log.as_ref(),
+            );
+
+        let mut participation_cache: HashMap<
+            String,
+            scp_protocol::trust::participation::ParticipationRecord,
+        > = HashMap::new();
+
+        action_cost = {
+            let economy = ToolEconomyContext {
+                economic_policy: economic_policy.as_ref(),
+                budget_tracker: &mut state.governance.budget_tracker,
+                spending_ucan,
+                context_id,
+                now: now_secs,
+                events: &events_snapshot,
+                convergent_now,
+                participation_cache: &mut participation_cache,
+                consequence_rules: &consequence_rules,
+                payment_adapter: payment_adapter.clone(),
+                metrics: metrics.clone(),
+                velocity_tracker: Some(&state.governance.velocity_tracker),
+                message_pricing: message_pricing.as_ref(),
+            };
+
+            match economy_pre_check(&economy, invoker_did) {
+                Ok(cost) => cost,
+                Err(err) => {
+                    state
+                        .governance
+                        .velocity_tracker
+                        .rollback(invoker_did, velocity_token);
+                    state.governance.hard_rate_limit.refund(invoker_did);
+                    return Err(invocation_error_to_context(err));
+                }
+            }
+        };
+
+        // The paid path requires a spending UCAN before any Class-S nonce work.
+        // Validated here (outside the combinator) so the velocity/hard-rate
+        // rollback for a missing UCAN runs without staging a Class-S mutation.
+        if action_cost.0 > 0 && spending_ucan.is_none() {
             state
                 .governance
                 .velocity_tracker
@@ -573,104 +586,157 @@ pub async fn reserve_tool_economy(
             return Err(ContextError::PermissionDenied(
                 "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
             ));
-        };
-        if let Err(err) = crate::context::economy_logic::validate_spending_ucan_or_error(
-            spending,
-            invoker_did,
-            context_id,
-            &mut state.governance.class_s.spending_nonce_tracker,
-            &state.governance.revoked_spending_ucan_cids,
-            key_resolver,
-            clock,
-        ) {
-            state
-                .governance
-                .velocity_tracker
-                .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
-            return Err(err);
         }
+        // `state` borrow ends here, releasing `cell` for the combinator call.
     }
 
+    // PAID path (`action_cost.0 > 0`, spending UCAN present): the spending-UCAN
+    // replay validation, budget charge, and spending-nonce consume are Class-S
+    // (+ Class-C) mutations that MUST be durably persisted fail-closed BEFORE
+    // the reservation is acknowledged — otherwise an actor crash in the ≤50ms
+    // coalesce window would roll the nonce consume back, letting the same
+    // spending UCAN nonce be replayed after the caller already saw the spend
+    // succeed. `commit_class_s_keep_compensating` performs that fail-closed
+    // persist: `f` consumes the nonce (Class-S — KEPT on persist failure, since
+    // un-consuming re-opens the replay window) and charges the in-memory budget
+    // (Class-C); on persist failure `on_persist_failure` REVERSES the Class-C
+    // budget reservation and the velocity tick (which did not durably land),
+    // while the consumed nonce is intentionally retained. The hard-rate-limit
+    // refund runs in the outer error arm below — `ClassCMut` holds no reference
+    // to the `hard_rate_limit` token bucket, so the persist-failure refund
+    // cannot be expressed through that view.
+    //
+    // FREE path (`action_cost.0 == 0`): no spending UCAN nonce is consumed and
+    // no budget is charged, so — exactly as before — NO fail-closed persist runs
+    // (the velocity tick / hard-rate consume ride the ordinary best-effort
+    // persist elsewhere); the combinator is skipped entirely.
     let deducted_cost = if action_cost.0 > 0 {
-        if state
-            .governance
-            .budget_tracker
-            .record_spend(invoker_did, action_cost)
-            .is_err()
-        {
-            let remaining = state.governance.budget_tracker.remaining(invoker_did).0;
-            state
-                .governance
-                .velocity_tracker
-                .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
-            return Err(invocation_error_to_context(
-                InvocationError::BudgetExceeded {
-                    did: invoker_did.to_string(),
-                    cost: action_cost.0,
-                    remaining,
+        let combinator_result = cell
+            .commit_class_s_keep_compensating(
+                deps,
+                context_id,
+                |mut view| {
+                    let state = view.rest_mut();
+                    // Spending UCAN replay validation (Class-S nonce dedup record).
+                    let spending = spending_ucan.ok_or_else(|| {
+                        ContextError::PermissionDenied(
+                            "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
+                        )
+                    })?;
+                    if let Err(err) =
+                        crate::context::economy_logic::validate_spending_ucan_or_error(
+                            spending,
+                            invoker_did,
+                            context_id,
+                            &mut state.governance.class_s.spending_nonce_tracker,
+                            &state.governance.revoked_spending_ucan_cids,
+                            key_resolver,
+                            clock,
+                        )
+                    {
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        // hard rate limit is refunded once in the outer error arm
+                        // (it is not reachable through the `ClassCMut` compensation
+                        // view, and a second refund would over-credit the bucket).
+                        return Err(err);
+                    }
+
+                    // Budget charge (Class-C). Reversed by `on_persist_failure`
+                    // if the persist does not land.
+                    if state
+                        .governance
+                        .budget_tracker
+                        .record_spend(invoker_did, action_cost)
+                        .is_err()
+                    {
+                        let remaining =
+                            state.governance.budget_tracker.remaining(invoker_did).0;
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        // hard rate limit refunded once in the outer error arm.
+                        return Err(invocation_error_to_context(
+                            InvocationError::BudgetExceeded {
+                                did: invoker_did.to_string(),
+                                cost: action_cost.0,
+                                remaining,
+                            },
+                        ));
+                    }
+                    let deducted_cost = Some(action_cost);
+
+                    // Spending-nonce consume (Class-S). On commit failure, roll
+                    // the just-charged budget + velocity back inline and reject
+                    // before any persist runs (hard rate limit refunded once in
+                    // the outer error arm).
+                    if let Err(e) =
+                        scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
+                            spending,
+                            &mut state.governance.class_s.spending_nonce_tracker,
+                        )
+                    {
+                        if let Some(cost) = deducted_cost {
+                            state
+                                .governance
+                                .budget_tracker
+                                .reverse_spend(invoker_did, cost);
+                        }
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(ContextError::PermissionDenied(format!(
+                            "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
+                        )));
+                    }
+
+                    // `value` = the deducted cost; `external` = the handle the
+                    // persist-failure reversal needs to reverse the Class-C
+                    // budget reservation.
+                    Ok((deducted_cost, deducted_cost))
                 },
-            ));
+                // KEEP-direction Class-S (nonce stays consumed). Reverse the
+                // Class-C budget reservation + velocity tick the failed persist
+                // did not make durable. `view` is a `ClassCMut` — it cannot
+                // re-touch Class-S (and cannot reach `hard_rate_limit`, which is
+                // refunded in the outer arm below).
+                async |charged_cost: Option<Amount>, mut view, _deps| {
+                    let gov = view.governance_class_c_mut();
+                    if let Some(cost) = charged_cost {
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
+                    }
+                    gov.velocity_tracker_mut()
+                        .rollback(invoker_did, velocity_token);
+                },
+            )
+            .await;
+
+        match combinator_result {
+            Ok(deducted_cost) => deducted_cost,
+            Err(err) => {
+                // Single hard-rate-limit refund site for every combinator error
+                // path (`f`-reject and persist-failure alike). `f` and
+                // `on_persist_failure` perform the velocity / budget reversals they
+                // can reach; the hard rate limit is NOT reachable through the
+                // `ClassCMut` compensation view, so its refund runs here — exactly
+                // once, matching the original inline single refund (a second refund
+                // would over-credit the token bucket).
+                cell.state_mut()
+                    .governance
+                    .hard_rate_limit
+                    .refund(invoker_did);
+                return Err(err);
+            }
         }
-        Some(action_cost)
     } else {
         None
     };
 
-    if deducted_cost.is_some()
-        && let Some(spending) = spending_ucan
-        && let Err(e) = scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
-            spending,
-            &mut state.governance.class_s.spending_nonce_tracker,
-        )
-    {
-        if let Some(cost) = deducted_cost {
-            state
-                .governance
-                .budget_tracker
-                .reverse_spend(invoker_did, cost);
-        }
-        state
-            .governance
-            .velocity_tracker
-            .rollback(invoker_did, velocity_token);
-        state.governance.hard_rate_limit.refund(invoker_did);
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
-        )));
-    }
-
-    // ADR-049 §9 Class S: the spending-nonce consume is security-critical
-    // monotonic state that does NOT survive an actor crash (it lives in the
-    // actor-owned `spending_nonce_tracker`). It MUST be durably persisted
-    // BEFORE this reservation is acknowledged to the caller — otherwise an
-    // actor crash in the ≤50ms coalesce window would roll the consume back,
-    // letting the same spending UCAN nonce be replayed after the caller already
-    // saw the spend succeed. Persist fail-closed: on a persist failure, reverse
-    // the budget/velocity/rate-limit reservation and return an error so the
-    // operation is NOT acknowledged. (The consumed nonce is intentionally NOT
-    // un-consumed — leaving it consumed is the conservative/fail-closed
-    // direction for replay protection; un-consuming would re-open the replay
-    // window, the exact failure this guard prevents.)
-    if deducted_cost.is_some()
-        && spending_ucan.is_some()
-        && let Err(persist_err) =
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)
-    {
-        if let Some(cost) = deducted_cost {
-            state
-                .governance
-                .budget_tracker
-                .reverse_spend(invoker_did, cost);
-        }
-        state
-            .governance
-            .velocity_tracker
-            .rollback(invoker_did, velocity_token);
-        state.governance.hard_rate_limit.refund(invoker_did);
-        return Err(persist_err);
-    }
+    let state = cell.state_mut();
 
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
         (Some(policy), Some(adapter)) => {
