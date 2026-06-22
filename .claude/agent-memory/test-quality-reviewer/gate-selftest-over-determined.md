@@ -49,4 +49,15 @@ tests 6 (all-exempted guard) and 8 (cell-value else-branch) — both fail when t
 disabled. All gate self-tests at this HEAD are sound and discriminating. The earlier "vacuous" critique
 is RESOLVED; do not re-flag it on this branch.
 
+**UPDATE (2026-06-22, HEAD 341df72cc — APPROVED):** re-reviewed at current HEAD (docstring-honesty commit
+on top of ed14e6c77). All gate self-tests remain sound. Mutation-verified Test 2 (unmatched-true) AND
+Test 9 (bare-name-not-prefixed) both fail when the unmatched-true error phrase is mutated; Test 8
+(cell-value else) fails when its phrase is mutated. RESIDUAL NIT (non-blocking): Test 6's phrase
+assertion is `("all SDKs claiming coverage" in out.lower()) OR ("all-exempted" in out.lower())`. The
+FIRST disjunct matches the real error line (1625) and IS discriminating; the SECOND disjunct matches the
+always-printed summary label `all-exempted ops: N` (1649) so it is vacuous on its own. Because it's an OR
+and the first disjunct fires on the real branch, the test is still mutation-robust via returncode (disabling
+the branch → rc 0 → fails). Tidy-up only: drop the `"all-exempted"` disjunct so the assertion is purely
+the discriminating error line. Not a blocker.
+
 Related: [[MEMORY]]

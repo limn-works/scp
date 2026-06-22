@@ -472,7 +472,7 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
     // because eventLogQuery bypasses mapBridgeError and throws plain Error objects.
     native.__stub("eventLogQuery", () =>
       Promise.reject(
-        new Error("[SCP-CTX-1001] context error: not a member — check membership status"),
+        new Error("[SCP-CTX-2001] context error: not a member — check membership status"),
       ),
     );
 
