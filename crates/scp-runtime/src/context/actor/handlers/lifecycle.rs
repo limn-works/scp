@@ -221,7 +221,7 @@ async fn dispatch_actor_inner(
             handle_clear_needs_reconnect_actor(cell.state_mut(), &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
-            handle_issue_mls_update_actor(cell.state_mut(), deps, &context_id, reply)
+            handle_issue_mls_update_actor(cell, deps, &context_id, reply)
         }
     }
 }
@@ -659,7 +659,7 @@ fn handle_clear_needs_reconnect_actor(
 /// Commit bytes for the caller to distribute to all members. Used by the
 /// reconnection driver's Phase 5.
 fn handle_issue_mls_update_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
@@ -667,7 +667,8 @@ fn handle_issue_mls_update_actor(
     use crate::context::state::context_id_to_bytes;
 
     // Broadcast contexts have no MLS group — an Update is meaningless.
-    if state.broadcast_context.is_some() {
+    // Pure read via `Deref` on the cell.
+    if cell.broadcast_context.is_some() {
         let _ = reply.send(Err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate on broadcast context {context_id} — no MLS group to ratchet"
         ))));
@@ -682,9 +683,13 @@ fn handle_issue_mls_update_actor(
 
     // advance_epoch ratchets the supervisor-owned MLS group to a new
     // epoch; mirror the local epoch onto actor-owned state so a
-    // subsequent LocalMlsEpoch query reflects the advance.
+    // subsequent LocalMlsEpoch query reflects the advance. This is a
+    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
+    // routes through the non-persisting `class_c_view`.
     let mutated = if result.is_ok() {
-        state.epoch.mls_epoch = state.epoch.mls_epoch.saturating_add(1);
+        let mut view = cell.class_c_view();
+        let epoch = view.epoch_mut();
+        epoch.mls_epoch = epoch.mls_epoch.saturating_add(1);
         true
     } else {
         false

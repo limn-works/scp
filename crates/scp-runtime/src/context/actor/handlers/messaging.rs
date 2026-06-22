@@ -96,10 +96,10 @@ pub(crate) async fn dispatch(
                 .await
         }
         MessagingCommand::DrainEvents { context_id, reply } => {
-            handle_drain_events(cell.state_mut(), &context_id, reply).await
+            handle_drain_events(cell, &context_id, reply).await
         }
         MessagingCommand::DrainEquivocationAlerts { context_id, reply } => {
-            handle_drain_equivocation_alerts(cell.state_mut(), &context_id, reply).await
+            handle_drain_equivocation_alerts(cell, &context_id, reply).await
         }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
@@ -120,7 +120,7 @@ pub(crate) async fn dispatch(
             member_did,
             pseudonym,
             reply,
-        } => handle_seed_peer_pseudonym(cell.state_mut(), member_did, pseudonym, reply),
+        } => handle_seed_peer_pseudonym(cell, member_did, pseudonym, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -169,19 +169,23 @@ pub(crate) async fn dispatch(
 /// match so the dispatcher stays a flat one-line-per-arm router.
 #[cfg(feature = "testing")]
 fn handle_seed_peer_pseudonym(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     member_did: scp_identity::DID,
     pseudonym: [u8; 32],
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let result = if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.insert(member_did, pseudonym);
-        Ok(())
-    } else {
-        Err(ContextError::NotPseudonymousContext {
-            context_id: state.handle.context_id().to_owned(),
-        })
-    };
+    // Pure read via `Deref` on the cell (the error branch needs the context id).
+    let context_id = cell.handle.context_id().to_owned();
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); route the
+    // peer-registry insert through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let result = view.routing_mut().peer_registry_mut().map_or(
+        Err(ContextError::NotPseudonymousContext { context_id }),
+        |reg| {
+            reg.insert(member_did, pseudonym);
+            Ok(())
+        },
+    );
     let _ = reply.send(result);
     Outcome::ok(())
 }
@@ -213,10 +217,11 @@ async fn handle_send_message(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // ADR-049 §9 Class-S cell seam: held so `send_message` (which reaches the
-    // spending-nonce leaf) receives it. The send-tracker bookkeeping re-derives
-    // the bare `&mut PerContextState`; the borrow ends before the cell-taking
-    // `send_message` call.
-    let state = cell.state_mut();
+    // spending-nonce leaf) receives it. The send-tracker bookkeeping is a
+    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
+    // routes through the non-persisting `class_c_view` — its `&mut` borrow ends
+    // before the cell-taking `send_message` call.
+    let mut view = cell.class_c_view();
     // Step 1: reserve + commit a sequence number against the
     // actor-owned tracker. The Phase 2A wire sequence is still driven
     // by `MembershipState::next_sequence_number` inside the helper —
@@ -228,9 +233,9 @@ async fn handle_send_message(
     // manually decrement to mirror the RAII rollback semantics; the
     // helper does not read `send_tracker` so the early commit is
     // observationally identical.
-    let high_water_before = state.send_tracker.last_issued();
+    let high_water_before = view.send_tracker_mut().last_issued();
     {
-        let reservation = SequenceReservation::reserve(&mut state.send_tracker);
+        let reservation = SequenceReservation::reserve(view.send_tracker_mut());
         reservation.commit();
     }
 
@@ -245,7 +250,7 @@ async fn handle_send_message(
         // Manual rollback — restore the high-water mark prior to
         // reservation. `from_persisted` rebuilds the tracker at the
         // given last-issued value.
-        state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+        *view.send_tracker_mut() = SendSequenceTracker::from_persisted(high_water_before);
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -276,13 +281,15 @@ async fn handle_send_message(
             (Outcome::ok_mutated(()), Ok(()))
         }
         Ok(Err(e)) => {
-            // Rollback on failure.
-            cell.state_mut().send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            // Rollback on failure (coalesced Class-C via `class_c_view`).
+            *cell.class_c_view().send_tracker_mut() =
+                SendSequenceTracker::from_persisted(high_water_before);
             let sketch = outcome_error_sketch(&e);
             (Outcome::err_mutated(sketch), Err(e))
         }
         Err(_elapsed) => {
-            cell.state_mut().send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            *cell.class_c_view().send_tracker_mut() =
+                SendSequenceTracker::from_persisted(high_water_before);
             let err = ContextError::TransportTimeout(format!(
                 "send_message exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
@@ -337,11 +344,14 @@ async fn handle_deliver_incoming(
 /// events on the reply channel; never propagates `ContextNotRegistered`
 /// because the actor IS the registration.
 async fn handle_drain_events(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let drain_fut = async { state.receive_buffer.drain() };
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
+    // receive buffer through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let drain_fut = async { view.receive_buffer_mut().drain() };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
@@ -367,11 +377,14 @@ async fn handle_drain_events(
 /// it so catch-up does not destroy buffered application traffic
 /// (messages, membership changes) that arrived during the sync.
 async fn handle_drain_equivocation_alerts(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let drain_fut = async { state.receive_buffer.drain_equivocation_alerts() };
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
+    // equivocation alerts through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let drain_fut = async { view.receive_buffer_mut().drain_equivocation_alerts() };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
