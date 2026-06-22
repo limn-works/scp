@@ -2063,6 +2063,142 @@ mod tests {
         );
     }
 
+    /// `GovernanceClassCMut::velocity_tracker_mut` hands out a `&mut` to the
+    /// per-sender velocity tracker; a recorded message is observable on the
+    /// underlying `cell.governance.velocity_tracker`.
+    #[tokio::test]
+    async fn best_effort_velocity_tracker_mut_records_through_view() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x54));
+        let ctx = ctx_hex(0x54);
+        let sender = DID("did:example:velocity-sender".to_owned());
+        let sender_for_closure = sender.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            let mut gov = view.governance_class_c_mut();
+            let vt = gov.velocity_tracker_mut();
+            vt.record_message(&sender_for_closure, 1_700_000_000);
+        });
+
+        assert_eq!(
+            cell.governance
+                .velocity_tracker
+                .get_velocity(&sender, 1_700_000_000),
+            1,
+            "velocity message recorded through velocity_tracker_mut"
+        );
+    }
+
+    /// `GovernanceClassCMut::budget_tracker_mut` hands out a `&mut` to the
+    /// per-member budget tracker; a grant is observable on the underlying
+    /// `cell.governance.budget_tracker`.
+    #[tokio::test]
+    async fn best_effort_budget_tracker_mut_grants_through_view() {
+        use scp_protocol::economy::types::Amount;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x55));
+        let ctx = ctx_hex(0x55);
+        let member = DID("did:example:budget-member".to_owned());
+        let member_for_closure = member.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            view.governance_class_c_mut()
+                .budget_tracker_mut()
+                .grant(&member_for_closure, Amount(500));
+        });
+
+        assert_eq!(
+            cell.governance.budget_tracker.remaining(&member),
+            Amount(500),
+            "budget grant landed through budget_tracker_mut"
+        );
+    }
+
+    /// `GovernanceClassCMut::economic_policy_mut` hands out a `&mut Option<…>`;
+    /// setting it to `Some(policy)` is observable on the underlying
+    /// `cell.governance.economic_policy`.
+    #[tokio::test]
+    async fn best_effort_economic_policy_mut_sets_through_view() {
+        use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x56));
+        let ctx = ctx_hex(0x56);
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID("did:example:payee".to_owned()),
+        };
+        let expected = policy.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            *view.governance_class_c_mut().economic_policy_mut() = Some(policy);
+        });
+
+        assert_eq!(
+            cell.governance.economic_policy,
+            Some(expected),
+            "economic policy set through economic_policy_mut"
+        );
+    }
+
+    /// `ClassCMut::receive_buffer_mut` hands out a `&mut ReceiveBuffer`; a pushed
+    /// event is observable on the underlying `cell.receive_buffer`.
+    #[tokio::test]
+    async fn best_effort_receive_buffer_mut_pushes_through_view() {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x57));
+        let ctx = ctx_hex(0x57);
+
+        let before = cell.receive_buffer.len();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, |mut view| {
+            view.receive_buffer_mut().push(ContextEvent::MemberLeft {
+                member_did: DID("did:example:left".to_owned()),
+            });
+        });
+
+        assert_eq!(
+            cell.receive_buffer.len(),
+            before + 1,
+            "event pushed through receive_buffer_mut"
+        );
+    }
+
+    /// `ClassCMut::role_state_mut` hands out a `&mut ContextRoleState`; a member
+    /// inserted into its `members` set is observable on the underlying
+    /// `cell.role_state`.
+    #[tokio::test]
+    async fn best_effort_role_state_mut_mutates_through_view() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x58));
+        let ctx = ctx_hex(0x58);
+        let member_did = "did:example:role-member".to_owned();
+        let member_for_assert = member_did.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            view.role_state_mut().members.insert(member_did);
+        });
+
+        assert!(
+            cell.role_state.members.contains(&member_for_assert),
+            "member inserted through role_state_mut"
+        );
+    }
+
     // ------------------------------------------------------------------
     // new / into_inner
     // ------------------------------------------------------------------
