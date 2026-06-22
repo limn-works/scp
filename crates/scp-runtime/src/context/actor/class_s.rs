@@ -319,10 +319,6 @@ pub(crate) struct ClassCMut<'a> {
 /// = …` with no fail-closed persist; this view never does. Reads of the whole
 /// governance bucket go through [`Deref`] (reads cannot violate §9); the only
 /// `&mut` it grants is to individual Class-C governance fields.
-#[allow(
-    dead_code,
-    reason = "ADR-049 §9 scaffolding: the Class-C governance field accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`) get their first PRODUCTION callers at the `ConsequenceStateSplit` / economy-compensation migration. Exercised by this module's unit tests now."
-)]
 pub(crate) struct GovernanceClassCMut<'a> {
     /// The borrowed governance bucket. Private so the ONLY mutable reach is
     /// through the field-granular Class-C accessors — never a whole
