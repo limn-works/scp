@@ -10,7 +10,7 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 from scp_sdk.errors import ScpError
 
@@ -22,11 +22,10 @@ from scp_sdk.errors import ScpError
 class _ResolutionPathDict(TypedDict, total=False):
     """Structured metadata recording which layer resolved an address (§22.7)."""
 
-    layer: str
-    """The resolution layer.
+    layer: Literal["Petname", "HandleRegistry", "Attestation", "Domain", "MultiLayerCorroborated"]
+    """The resolution layer (§22.11.3 ``ResolutionLayer``).
 
-    One of ``Petname``, ``HandleRegistry``, ``Attestation``, ``Domain``,
-    or ``MultiLayerCorroborated``.
+    Matches the TypeScript ``ResolutionLayer`` discriminated union.
     """
     source: str
     """Human-readable source identifier (context name, domain, platform)."""
@@ -39,13 +38,18 @@ class _ResolutionPathDict(TypedDict, total=False):
 class _TrustLevelDict(TypedDict, total=False):
     """Trust level of a discovery result (§22.7).
 
-    The ``kind`` field discriminates among:
-    ``DirectExchange``, ``LocalPetname``, ``DomainVerified``,
-    ``AttestationVerified``, ``HandleRegistryVerified``,
-    ``MultiLayerCorroborated``.
+    The ``kind`` field discriminates among the six trust-level variants
+    defined by §22.7, matching the TypeScript ``TrustLevel`` discriminated union.
     """
 
-    kind: str
+    kind: Literal[
+        "DirectExchange",
+        "LocalPetname",
+        "DomainVerified",
+        "AttestationVerified",
+        "HandleRegistryVerified",
+        "MultiLayerCorroborated",
+    ]
     sources: list[_ResolutionPathDict]
     """Only present when ``kind == "MultiLayerCorroborated"``."""
 

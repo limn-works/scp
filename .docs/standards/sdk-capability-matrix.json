@@ -1738,9 +1738,12 @@
         {
           "name": "register",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
+          }
         },
         {
           "name": "evaluate_trust",

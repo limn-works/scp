@@ -768,10 +768,11 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["resume"],
         "swift": ["resume"],
     },
-    # Bridge -- Python uses bare 'register' and 'evaluate_trust'
+    # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
+    # TypeScript does not expose bridge_register as a named public SDK function
+    # (matrix: typescript=false); the entry below covers only the SDKs that do.
     ("Bridge", "register"): {
         "python": ["register"],
-        "typescript": ["BridgeRegistration", "createNativeBridge", "createWasmBridge"],
     },
     ("Bridge", "evaluate_trust"): {
         "python": ["evaluate_trust"],
