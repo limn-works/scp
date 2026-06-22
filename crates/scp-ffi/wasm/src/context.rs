@@ -761,7 +761,22 @@ pub fn context_execute_governance(
         })?;
 
         let result = with_manager(|mgr| {
-            mgr.execute_governance_action(&context_id, &initiator_did, &proposal_id, &action)
+            // Direct-execute: the leaf actor_did (executor) is the proposal's
+            // PROPOSER, NOT the caller `initiator_did` — matching the native
+            // direct-execute handler, which stamps `proposal.proposer_did`
+            // (§9.9.3 native↔WASM convergence; ADR-031 §8 "executor DID").
+            // `initiator_did` remains the AUTH SUBJECT (capability checked
+            // inside `execute_governance_action`); only the leaf actor_did
+            // converges to the proposer. Resolve the proposer from the tracked
+            // proposal the executed leaf is derived from.
+            let executor_did = mgr.proposal_proposer_did(&context_id, &proposal_id)?;
+            mgr.execute_governance_action(
+                &context_id,
+                &initiator_did,
+                &executor_did,
+                &proposal_id,
+                &action,
+            )
         })
         .map_err(ScpWasmError::into_js)?;
 

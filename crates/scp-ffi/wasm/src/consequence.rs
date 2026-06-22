@@ -1169,6 +1169,239 @@ mod cross_impl_leaf_parity {
         root(&log)
     }
 
+    /// Reconstructs the native-reference leaf bytes for a single
+    /// payload-bearing event (e.g. `GovernanceActionExecuted`) from the SHARED
+    /// `scp_event_log` primitives — the exact preimage native's real producer
+    /// (`finalize_governance_action`) feeds `tree::append_unsigned_event`. Same
+    /// shape as [`native_reference_single_system_leaf_root`] but with a non-empty
+    /// payload, so the full leaf bytes (`actor_did` + payload + timestamp) are
+    /// pinned, not just the `actor_did` field.
+    #[cfg(test)]
+    fn native_reference_single_payload_leaf_root(
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) -> [u8; 32] {
+        use scp_event_log::tree::{append_unsigned_event, root};
+        use scp_event_log::{DID, Event, EventLog, EventPayload};
+
+        let mut log = EventLog::new(context_id.to_owned());
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence: 0,
+            payload: EventPayload {
+                data: payload.to_vec(),
+            },
+            prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+        append_unsigned_event(&mut log, &event).expect("reference payload leaf append");
+        root(&log)
+    }
+
+    /// §9.9.3 native↔WASM DIRECT-EXECUTE `GovernanceActionExecuted` parity.
+    /// The direct-FFI execute entry (`context_execute_governance`) stamps the
+    /// proposal's PROPOSER as the leaf `actor_did` (the executor) — NOT the
+    /// caller (`initiator_did`) — matching the native direct-execute handler
+    /// (`handle_execute_governance_action_actor`), which sets
+    /// `executor_did = proposal.proposer_did`. This drives the exact manager
+    /// call the fixed direct entry performs (auth subject = caller, executor =
+    /// `proposal_proposer_did(...)`) and pins the FULL single-leaf root against
+    /// the native-reference leaf bytes, with a non-vacuity control proving the
+    /// PRE-FIX caller-stamp diverged.
+    #[test]
+    fn cross_impl_governance_action_executed_direct_stamps_proposer_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        };
+
+        let context_id = "ctx-gov-direct-executor";
+        let proposer = "did:dht:z6MkDirectProposer";
+        let caller = "did:dht:z6MkDirectCaller"; // distinct from proposer
+        let proposal_id = "feedface";
+        let created_at = 1_700_500_500_u64;
+
+        // SingleAdmin context: the caller (an admin) executes directly. Both
+        // proposer and caller are admins so the caller's capability check
+        // passes while the executor (leaf actor_did) must still be the proposer.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(caller, "admin");
+        ctx.test_insert_member("did:dht:z6MkDirectTarget", "member");
+        ctx.test_insert_ceiling("role:assign");
+
+        // A target distinct from both proposer and caller keeps the leaf actor
+        // unambiguously the proposer.
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkDirectTarget".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        let proposal_id_bytes: [u8; 32] = {
+            let bytes = hex::decode(proposal_id).unwrap();
+            let mut arr = [0u8; 32];
+            let len = bytes.len().min(32);
+            arr[..len].copy_from_slice(&bytes[..len]);
+            arr
+        };
+        // Track the proposal as Approved (the direct-execute precondition).
+        let proposal = GovernanceProposal {
+            proposal_id: proposal_id_bytes,
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(proposer.to_owned()),
+            action: action.clone(),
+            status: ProposalStatus::Approved,
+            created_at,
+            voting_deadline: created_at + 3600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(proposer.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: created_at,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        ctx.test_insert_resolved_proposal(proposal_id.to_owned(), proposal);
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // EXACTLY what the fixed `context_execute_governance` direct entry does:
+        // resolve the proposer, then execute with auth-subject = caller,
+        // executor = proposer.
+        let resolved_proposer = mgr
+            .proposal_proposer_did(context_id, proposal_id)
+            .expect("proposer resolvable");
+        assert_eq!(resolved_proposer, proposer);
+        mgr.execute_governance_action(context_id, caller, &resolved_proposer, proposal_id, &action)
+            .expect("direct execute");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed_leaf = logged
+            .iter()
+            .find(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted leaf present after direct execute");
+        assert_eq!(
+            executed_leaf.actor_did.as_ref(),
+            proposer,
+            "direct-execute GovernanceActionExecuted leaf actor_did MUST be the proposal's \
+             proposer (the executor), NOT the caller (§9.9.3; native direct handler stamps \
+             proposal.proposer_did)"
+        );
+        assert_eq!(executed_leaf.timestamp, created_at);
+
+        // Full-leaf-bytes parity: the WASM real-producer root equals the
+        // native-reference leaf reconstructed from the shared primitives with
+        // the proposer actor, the convergent created_at, and the shared
+        // GovernanceActionExecutedPayload bytes.
+        let payload = WasmContextManager::encode_governance_action_executed_payload(
+            &action,
+            action.target_did(),
+        )
+        .expect("payload encodes");
+        assert_eq!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_payload_leaf_root(
+                context_id,
+                EventType::GovernanceActionExecuted,
+                proposer,
+                created_at,
+                &payload,
+            ),
+            "WASM direct-execute leaf MUST be byte-identical to native's proposer-stamped \
+             reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX caller (initiator) stamp would diverge.
+        assert_ne!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_payload_leaf_root(
+                context_id,
+                EventType::GovernanceActionExecuted,
+                caller,
+                created_at,
+                &payload,
+            ),
+            "the pre-fix caller-stamped actor_did MUST diverge from the aligned proposer-stamped \
+             leaf"
+        );
+    }
+
+    /// §9.9.3 native↔WASM `ContextClosed` TTL-DEADLINE parity. A TTL-driven
+    /// close MUST stamp the CONVERGENT TTL deadline (`creation + ttl`) on the
+    /// `ContextClosed` leaf — NOT each member's local `now()` — matching native
+    /// `finalize_close`, which stamps `deadline_unix_secs` (= `creation + ttl`)
+    /// for a timer-armed context. Pins the full single-leaf root against the
+    /// native-reference leaf, with a non-vacuity control proving the PRE-FIX
+    /// `now_secs()` behavior diverged.
+    #[test]
+    fn cross_impl_context_closed_stamps_convergent_ttl_deadline_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-close-ttl-deadline";
+        let creation = 1_700_000_000_u64;
+        let ttl = 86_400_u64;
+        let convergent_deadline = creation + ttl;
+
+        let mut state = make_bare_per_context_state(context_id, "did:dht:zcreator");
+        state.test_set_creation_timestamp_secs(creation);
+        state.test_set_ttl_seconds(Some(ttl));
+        // `finalize_close` requires the `closing` state.
+        state.test_set_state("closing");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, state);
+        mgr.finalize_close(context_id)
+            .expect("real WASM finalize_close producer");
+
+        let leaves = mgr.test_context_event_log_events(context_id);
+        let close_leaf = leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextClosed)
+            .expect("ContextClosed leaf present after finalize_close");
+        assert_eq!(
+            close_leaf.timestamp, convergent_deadline,
+            "TTL-driven ContextClosed leaf MUST stamp the convergent creation+ttl deadline, \
+             NOT local now() (§9.9.3)"
+        );
+
+        // Full-leaf-bytes parity at the convergent deadline.
+        assert_eq!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_system_leaf_root(
+                context_id,
+                EventType::ContextClosed,
+                "system:close",
+                convergent_deadline,
+            ),
+            "WASM ContextClosed real-producer leaf MUST be byte-identical to native's reference \
+             leaf at the convergent TTL deadline (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX `now_secs()` timestamp would diverge from the
+        // convergent deadline (the test clock's `now` is not `creation + ttl`).
+        let local_now = crate::time::now_secs();
+        assert_ne!(
+            local_now, convergent_deadline,
+            "test precondition: local now must differ from the convergent deadline"
+        );
+        assert_ne!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_system_leaf_root(
+                context_id,
+                EventType::ContextClosed,
+                "system:close",
+                local_now,
+            ),
+            "the pre-fix now()-stamped close leaf MUST diverge from the convergent-deadline leaf"
+        );
+    }
+
     /// §9.9.3 native↔WASM SYSTEM-LEAF parity. The WASM bridge's REAL producers
     /// (`handle_ttl_expiry` → `ContextExpired`, `finalize_close` →
     /// `ContextClosed`) MUST stamp the SAME descriptive `actor_did` sentinels

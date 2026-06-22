@@ -405,8 +405,17 @@ const WASM_REVOKED_TOKENS_CAP: usize = 100_000;
 /// Maximum number of executed proposals tracked per context before triggering eviction.
 const WASM_PROPOSAL_CAP: usize = 10_000;
 
-/// Executed proposal TTL in milliseconds (24 hours).
-const WASM_PROPOSAL_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+/// Executed-proposal replay-protection TTL in milliseconds (14 days).
+///
+/// SECURITY-CRITICAL replay window. MUST mirror the native runtime's
+/// `EXECUTED_PROPOSALS_TTL_SECS` (`crates/scp-runtime/src/context/state.rs` =
+/// `14 * 24 * 60 * 60` seconds). A shorter WASM window would let a direct
+/// re-execute of a durably-resolved (`Approved`) proposal slip past the
+/// emptied replay guard after the window and mint a SECOND
+/// `GovernanceActionExecuted` leaf that native — guarding for the full 14 days
+/// (and by the `status == Approved` precondition) — would reject, diverging the
+/// log across bridges (§9.9.3). Keep this in lock-step with the native const.
+const WASM_PROPOSAL_TTL_MS: f64 = 14.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
 /// Maximum number of resolved (approved/rejected) proposals per context.
 /// When at capacity, the oldest entry (by `created_at`) is evicted.
@@ -684,16 +693,23 @@ impl PerContextState {
         action_type: &str,
         trigger_timestamp_secs: u64,
     ) {
-        // Native uses CONSEQUENCE_ACTOR_DID = "system" as the actor for these
-        // leaves so the `WarningCount` trigger's `actor_did != subject_did`
-        // requirement holds for recursive rule evaluation.
+        // Native uses CONSEQUENCE_ACTOR_DID = SYSTEM_CONSEQUENCE_ACTOR ("system")
+        // as the actor for these leaves so the `WarningCount` trigger's
+        // `actor_did != subject_did` requirement holds for recursive rule
+        // evaluation. The shared const guarantees byte-identical sentinels
+        // across native and WASM (§9.9.3 cross-bridge convergence).
         let payload = scp_event_log::payload::consequence_event_payload(
             subject_did,
             rule_index,
             trigger_kind,
             action_type,
         );
-        self.append_log_event(event_type, "system", &payload.data, trigger_timestamp_secs);
+        self.append_log_event(
+            event_type,
+            scp_event_log::system_actors::SYSTEM_CONSEQUENCE_ACTOR,
+            &payload.data,
+            trigger_timestamp_secs,
+        );
     }
 
     // ---- Test-only helpers (compiled away in release builds) -------------
@@ -793,6 +809,18 @@ impl PerContextState {
         self.governance = model.to_owned();
     }
 
+    /// Test-only: insert a resolved (e.g. `Approved`) proposal directly, so
+    /// sibling-module cross-impl tests can drive the direct-execute path
+    /// (which requires the proposal tracked-and-`Approved`).
+    #[cfg(test)]
+    pub(crate) fn test_insert_resolved_proposal(
+        &mut self,
+        id: String,
+        proposal: GovernanceProposal,
+    ) {
+        self.insert_resolved_proposal(id, proposal);
+    }
+
     /// Test-only: set the lifecycle state string (e.g. `"closing"`), so
     /// sibling-module cross-impl tests can drive `finalize_close`.
     #[cfg(test)]
@@ -829,6 +857,13 @@ impl PerContextState {
             }
         }
         self.resolved_proposals.insert(id, proposal);
+    }
+
+    /// Removes a resolved proposal by id. Used to roll back a pending →
+    /// resolved move when the subsequent governance dispatch fails, so the
+    /// proposal remains retriable (parity with native retry semantics).
+    fn remove_resolved_proposal(&mut self, id: &str) -> Option<GovernanceProposal> {
+        self.resolved_proposals.remove(id)
     }
 }
 
@@ -2847,24 +2882,116 @@ impl WasmContextManager {
         }
     }
 
-    /// Executes a governance action. Mirrors `ContextManager::execute_governance_action`.
+    /// Asserts that the proposal `proposal_id` is tracked and `Approved`.
     ///
-    /// Validates that the initiator has the required capability for the
-    /// action, that the proposal is not a replay, dispatches to the
-    /// appropriate action handler, and records the proposal as executed.
+    /// Mirrors the native runtime's `execute_governance_action` precondition,
+    /// which rejects any non-`Approved` proposal before dispatch. WASM enforces
+    /// the same so a (re-)execute of a pending / rejected / unknown proposal can
+    /// never mint a `GovernanceActionExecuted` leaf that native would not
+    /// (§9.9.3). The committed proposal lives in `resolved_proposals` with
+    /// status `Approved`; a still-`Pending` proposal in `pending_proposals` is
+    /// NOT executable via the execute path.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active, the initiator lacks
-    /// the required capability, the proposal was already executed, or the
-    /// action fails.
+    /// Returns an error if the context is not active or the proposal is not
+    /// `Approved`.
+    fn require_proposal_approved(
+        &mut self,
+        context_id: &str,
+        proposal_id: &str,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        let status = ctx
+            .resolved_proposals
+            .get(proposal_id)
+            .or_else(|| ctx.pending_proposals.get(proposal_id))
+            .map(|p| p.status.clone());
+        if matches!(status, Some(ProposalStatus::Approved)) {
+            Ok(())
+        } else {
+            Err(ScpWasmError::Permission {
+                message: format!(
+                    "governance proposal '{proposal_id}' is not approved (status: {status:?}); \
+                     cannot execute"
+                ),
+                code: codes::PERM_3000.to_owned(),
+            })
+        }
+    }
+
+    /// Encodes the shared `GovernanceActionExecutedPayload` (positional
+    /// `MessagePack` via `encode_payload`) for the `GovernanceActionExecuted`
+    /// leaf — byte-identical to the native runtime's `finalize_governance_action`
+    /// construction so cross-platform members derive equal Merkle roots
+    /// (§9.9.3). `target_did` is the action's target (empty when untargeted);
+    /// `action_type` is the `GovernanceAction` variant name.
+    ///
+    /// # Errors
+    ///
+    /// FAILS CLOSED on encode error (mirrors native's `map_err(...)?`) so a
+    /// payload-encode failure never mints a divergent empty-payload leaf.
+    pub(crate) fn encode_governance_action_executed_payload(
+        action: &GovernanceAction,
+        target_did: Option<&DID>,
+    ) -> Result<Vec<u8>, ScpWasmError> {
+        scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did: target_did
+                    .map(|d| d.as_ref().to_owned())
+                    .unwrap_or_default(),
+                action_type: action.variant_name().to_owned(),
+            },
+        )
+        .map(|p| p.data)
+        .map_err(|e| ScpWasmError::Context {
+            message: format!("failed to encode GovernanceActionExecuted payload: {e}"),
+            code: codes::CTX_2001.to_owned(),
+        })
+    }
+
+    /// Executes a governance action. Mirrors the native runtime's
+    /// `execute_governance_action` (`governance_helpers.rs`).
+    ///
+    /// Validates that the proposal is `Approved`, that the initiator has the
+    /// required capability for the action, that the proposal is not a replay,
+    /// dispatches to the appropriate action handler, and records the proposal
+    /// as executed.
+    ///
+    /// `initiator_did` is the AUTH SUBJECT — the member whose capability is
+    /// checked (and the consequence subject). `executor_did` is the COMMITTING
+    /// member — the DID stamped as the `GovernanceActionExecuted` leaf
+    /// `actor_did` and the buffer event `executor_did`. These are deliberately
+    /// SEPARATE (ADR-031 §8 "executor DID" / §7.3.1 "committing member" /
+    /// ADR-051 §6): the native runtime takes the executor explicitly, and the
+    /// leaf `actor_did` is convergence-critical (§9.9.3 native↔WASM byte parity).
+    ///
+    /// - Quorum-approval path: `initiator_did == executor_did ==` the
+    ///   quorum-crossing voter (the committing member).
+    /// - Propose auto-execute (`SingleAdmin`) path: `initiator_did ==
+    ///   executor_did ==` the proposer (proposer == committer there).
+    /// - Direct-FFI execute path (`context_execute_governance`):
+    ///   `initiator_did ==` the caller (auth subject), `executor_did ==` the
+    ///   proposal's `proposer_did` — matching the native direct-execute handler
+    ///   which stamps `proposal.proposer_did` as the executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, the proposal is not
+    /// `Approved`, the initiator lacks the required capability, the proposal
+    /// was already executed, the proposal is not tracked, or the action fails.
     pub fn execute_governance_action(
         &mut self,
         context_id: &str,
         initiator_did: &str,
+        executor_did: &str,
         proposal_id: &str,
         action: &GovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
+        // Status precondition (mirrors native): a proposal must be `Approved`
+        // before it can be executed.
+        self.require_proposal_approved(context_id, proposal_id)?;
+
         // Authorization: check that initiator has the required capability
         // for this governance action. Matches close_context's pattern.
         {
@@ -2960,7 +3087,11 @@ impl WasmContextManager {
             ctx.push_event(ContextEvent::GovernanceActionExecuted {
                 proposal_id: proposal_id_bytes,
                 action_summary,
-                executor_did: DID(initiator_did.to_owned()),
+                // The buffer event's `executor_did` is the COMMITTING member
+                // (the executor), NOT the auth-subject `initiator_did` —
+                // matching native `finalize_governance_action` (§9.9.3; ADR-031
+                // §8 / §7.3.1 / ADR-051 §6).
+                executor_did: DID(executor_did.to_owned()),
                 resulting_epoch: None,
                 target_did: target_did.clone(),
             });
@@ -2971,20 +3102,25 @@ impl WasmContextManager {
             // members derive equal Merkle roots (§9.9.3). `target_did` is the
             // action's target (empty when untargeted); `action_type` is the
             // `GovernanceAction` variant name.
-            let executed_payload = scp_event_log::payload::encode_payload(
-                &scp_event_log::payload::GovernanceActionExecutedPayload {
-                    target_did: target_did
-                        .as_ref()
-                        .map(|d| d.as_ref().to_owned())
-                        .unwrap_or_default(),
-                    action_type: action.variant_name().to_owned(),
-                },
-            )
-            .map(|p| p.data)
-            .unwrap_or_default();
+            //
+            // FAIL CLOSED on encode error (mirrors native's `map_err(...)?`):
+            // never write an EMPTY-payload leaf, which would diverge from the
+            // native leaf bytes and corrupt the convergent log. The dispatch has
+            // already mutated state and the proposal is recorded executed — the
+            // same position native is in when its `finalize_governance_action`
+            // encode fails (it returns Err and writes no leaf, leaving the
+            // executed marker set). Propagate the error identically.
+            let executed_payload =
+                Self::encode_governance_action_executed_payload(action, target_did.as_ref())?;
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
-                initiator_did,
+                // Convergence-critical leaf `actor_did`: the COMMITTING member
+                // (the executor), NOT the auth-subject `initiator_did`. For the
+                // direct-FFI execute path the executor is the proposal's
+                // proposer (resolved by the caller); for quorum/auto it is the
+                // voter/proposer respectively — byte-identical to native
+                // (§9.9.3; ADR-031 §8 "executor DID").
+                executor_did,
                 &executed_payload,
                 proposal_created_at,
             );
@@ -3971,18 +4107,12 @@ impl WasmContextManager {
             Self::governance_quorum(ctx)
         };
 
-        // SingleAdmin or quorum=0: auto-approve and execute immediately.
-        if required == 0 {
-            let result =
-                self.execute_governance_action(context_id, proposer_did, proposal_id, action)?;
-            return Ok(serde_json::json!({
-                "proposal_id": proposal_id,
-                "status": "Approved",
-                "execution_result": result,
-            }));
-        }
-
-        // Multi-admin: create pending proposal. Proposer's vote counts as first approval.
+        // Build the proposal up front so even the SingleAdmin / quorum=0
+        // auto-execute path TRACKS it before executing (required since
+        // `execute_governance_action` resolves the convergent
+        // `GovernanceActionExecuted` leaf timestamp from the still-tracked
+        // proposal's `created_at` AND enforces the `status == Approved`
+        // precondition — both fail if the proposal was never inserted).
         let now = crate::time::now_ms();
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let now_secs = (now / 1000.0) as u64;
@@ -4013,6 +4143,46 @@ impl WasmContextManager {
             rejections: Vec::new(),
             created_at_epoch: None,
         };
+
+        // SingleAdmin or quorum=0: auto-approve and execute immediately. The
+        // proposer IS the committing member here, so the executor is the
+        // proposer (matches native's propose auto-execute). Insert the proposal
+        // as `Approved` into `resolved_proposals` BEFORE executing so it is
+        // tracked when `execute_governance_action` derives the convergent leaf
+        // timestamp and checks the status precondition.
+        if required == 0 {
+            let pid = proposal_id.to_owned();
+            let action_ref = proposal.action.clone();
+            let mut approved = proposal;
+            approved.status = ProposalStatus::Approved;
+            if let Some(ctx) = self.contexts.get_mut(context_id) {
+                ctx.insert_resolved_proposal(pid.clone(), approved);
+            }
+            match self.execute_governance_action(
+                context_id,
+                proposer_did,
+                proposer_did,
+                &pid,
+                &action_ref,
+            ) {
+                Ok(result) => {
+                    return Ok(serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "status": "Approved",
+                        "execution_result": result,
+                    }));
+                }
+                Err(e) => {
+                    // Dispatch failed: drop the durably-resolved proposal so the
+                    // proposer can retry (parity with native retry semantics —
+                    // a failed execution must not strand the proposal).
+                    if let Some(ctx) = self.contexts.get_mut(context_id) {
+                        ctx.remove_resolved_proposal(&pid);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -4061,19 +4231,41 @@ impl WasmContextManager {
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
-            if let Some(mut p) = proposal {
+            if let Some(p) = proposal {
                 let action_ref = p.action.clone();
-                p.status = ProposalStatus::Approved;
+                let pending_snapshot = p.clone();
+                let mut approved = p;
+                approved.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
-                    ctx.insert_resolved_proposal(pid.clone(), p);
+                    ctx.insert_resolved_proposal(pid.clone(), approved);
                 }
-                let result =
-                    self.execute_governance_action(context_id, proposer_did, &pid, &action_ref)?;
-                return Ok(serde_json::json!({
-                    "proposal_id": pid,
-                    "status": "Approved",
-                    "execution_result": result,
-                }));
+                // Proposer's own vote crossed quorum: proposer == committing
+                // member, so the executor is the proposer (auth subject and
+                // executor coincide here).
+                match self.execute_governance_action(
+                    context_id,
+                    proposer_did,
+                    proposer_did,
+                    &pid,
+                    &action_ref,
+                ) {
+                    Ok(result) => {
+                        return Ok(serde_json::json!({
+                            "proposal_id": pid,
+                            "status": "Approved",
+                            "execution_result": result,
+                        }));
+                    }
+                    Err(e) => {
+                        // Dispatch failed: roll back the pending → resolved move
+                        // so the proposal stays retriable (parity with native).
+                        if let Some(ctx) = self.contexts.get_mut(context_id) {
+                            ctx.remove_resolved_proposal(&pid);
+                            ctx.pending_proposals.insert(pid.clone(), pending_snapshot);
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -4191,25 +4383,52 @@ impl WasmContextManager {
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
-            if let Some(mut p) = proposal {
+            if let Some(p) = proposal {
                 let action_ref = p.action.clone();
-                p.status = ProposalStatus::Approved;
+                // Retain the PRE-MOVE proposal (status `Pending`) so the
+                // pending → resolved move can be rolled back if dispatch fails.
+                let pending_snapshot = p.clone();
+                let mut approved = p;
+                approved.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
-                    ctx.insert_resolved_proposal(pid.clone(), p);
+                    ctx.insert_resolved_proposal(pid.clone(), approved);
                 }
                 // The executor is the quorum-crossing VOTER (the committing
                 // member), NOT the proposer — `execute_governance_action`
-                // stamps `initiator_did` as the `GovernanceActionExecuted` leaf
+                // stamps the executor as the `GovernanceActionExecuted` leaf
                 // `actor_did` (ADR-031 §8 "executor DID" / §7.3.1 "committing
-                // member" / ADR-051 §6). Passing the proposer here would diverge
-                // the leaf from native's quorum path, which stamps the voter
-                // (§9.9.3 native↔WASM convergence).
-                let result =
-                    self.execute_governance_action(context_id, voter_did, &pid, &action_ref)?;
-                return Ok(serde_json::json!({
-                    "status": "Approved",
-                    "execution_result": result,
-                }));
+                // member" / ADR-051 §6). The voter is both the auth subject and
+                // the executor here. Passing the proposer would diverge the leaf
+                // from native's quorum path, which stamps the voter (§9.9.3
+                // native↔WASM convergence).
+                match self.execute_governance_action(
+                    context_id,
+                    voter_did,
+                    voter_did,
+                    &pid,
+                    &action_ref,
+                ) {
+                    Ok(result) => {
+                        return Ok(serde_json::json!({
+                            "status": "Approved",
+                            "execution_result": result,
+                        }));
+                    }
+                    Err(e) => {
+                        // Dispatch failed. Roll back the pending → resolved move
+                        // so the proposal is retriable (matches native, which
+                        // leaves the proposal `Approved`-and-retriable: it never
+                        // durably resolves a proposal whose execution failed).
+                        // Without this, WASM would strand the proposal in
+                        // `resolved_proposals` (gone from `pending_proposals`),
+                        // unable to be re-executed.
+                        if let Some(ctx) = self.contexts.get_mut(context_id) {
+                            ctx.remove_resolved_proposal(&pid);
+                            ctx.pending_proposals.insert(pid.clone(), pending_snapshot);
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -4413,6 +4632,41 @@ impl WasmContextManager {
             })?;
 
         Ok(Self::proposal_to_json(proposal_id, proposal))
+    }
+
+    /// Returns the `proposer_did` of a tracked governance proposal (pending or
+    /// resolved), or an error if it is not found.
+    ///
+    /// Used by the direct-FFI execute path (`context_execute_governance`) to
+    /// resolve the proposal's proposer so it can be stamped as the
+    /// `GovernanceActionExecuted` leaf `actor_did` — the executor — matching the
+    /// native direct-execute handler, which stamps `proposal.proposer_did`
+    /// (§9.9.3 native↔WASM convergence; ADR-031 §8).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context or proposal is not found.
+    pub fn proposal_proposer_did(
+        &self,
+        context_id: &str,
+        proposal_id: &str,
+    ) -> Result<String, ScpWasmError> {
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context {context_id} not found"),
+                code: codes::CTX_2045.to_owned(),
+            })?;
+
+        ctx.pending_proposals
+            .get(proposal_id)
+            .or_else(|| ctx.resolved_proposals.get(proposal_id))
+            .map(|p| p.proposer_did.0.clone())
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("proposal {proposal_id} not found"),
+                code: codes::CTX_2045.to_owned(),
+            })
     }
 
     /// Lists all governance proposals (pending and resolved) for a context.
@@ -5150,7 +5404,7 @@ impl WasmContextManager {
 
         ctx.append_log_event(
             EventType::ContextExpired,
-            "system:timer",
+            scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
             b"",
             expiry_leaf_secs,
         );
@@ -6064,12 +6318,33 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast_context = None;
 
+        // Convergent `ContextClosed` leaf timestamp. For a TTL-driven close this
+        // MUST be the CONVERGENT TTL deadline (`creation_timestamp_secs +
+        // ttl_seconds`) — the identical absolute value every member computes
+        // regardless of which member's timer fired or what its local clock read
+        // — NOT each member's local `crate::time::now_secs()`, which would
+        // diverge the leaf at equal event count and trip §9.9.3 equivocation
+        // detection across native/WASM. This mirrors native `finalize_close`
+        // (`ttl_close_helpers.rs`), which stamps
+        // `state.ttl.timer.deadline_unix_secs.unwrap_or_else(|| now_secs())`:
+        // `deadline_unix_secs` holds `creation + ttl` (auto-reflecting any
+        // TTL extension, which mutates `ttl_seconds` here / `deadline_unix_secs`
+        // there by the same delta), and falls back to the closer's clock only
+        // for a governance/explicit close of a no-TTL context. WASM mirrors that
+        // exactly via `convergent_ttl_deadline_secs(creation, ttl_seconds)`:
+        // `Some(ttl) => creation + ttl`, else local `now_secs()`. Identical to
+        // `handle_ttl_expiry`'s `expiry_leaf_secs` so a close and an expiry of
+        // the same TTL context stamp the same convergent instant.
+        let close_leaf_secs = match ctx.ttl_seconds {
+            Some(ttl) => ctx.creation_timestamp_secs.saturating_add(ttl),
+            None => crate::time::now_secs(),
+        };
+
         ctx.append_log_event(
             EventType::ContextClosed,
-            "system:close",
+            scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
             b"",
-            // Convergent close instant (§7.3.1, §9.9.3).
-            crate::time::now_secs(),
+            close_leaf_secs,
         );
 
         Ok(())
