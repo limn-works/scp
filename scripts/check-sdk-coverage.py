@@ -2,7 +2,10 @@
 """check-sdk-coverage.py -- CI gate enforcing SDK capability matrix conformance.
 
 Reads `.docs/standards/sdk-capability-matrix.json` and validates:
-  1. Every entry marked `true` has corresponding code in the SDK source.
+  1. Every entry marked `true` has a matching symbol name in the SDK source.
+     (Semantic correctness — that the symbol implements the capability — is a
+     human-review invariant enforced by code review of the enforcement-labeled
+     files, not by this gate.)
   2. Every entry marked `false` has an `exemptions` entry with a reason.
 
 Detection strategy per SDK (AST-based via tree-sitter):
@@ -75,7 +78,8 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Explicit alias table: (domain, operation) -> {sdk: [search_strings]}
 # Only needed when the auto-generated patterns fail to match the actual code.
 # Every entry has been verified against actual SDK source: the named symbol
-# exists and implements the capability.
+# exists (name-existence check). Semantic correctness is a human-review
+# invariant; the gate cannot verify that a symbol implements the capability.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
