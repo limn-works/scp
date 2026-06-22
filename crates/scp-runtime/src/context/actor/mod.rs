@@ -463,11 +463,14 @@ impl ContextActor {
             )
         };
 
-        // PR1 scaffolding: obtain the bare `&mut PerContextState` via the
-        // temporary `state_mut()` escape hatch and pass it to handlers EXACTLY
-        // as before. No handler is migrated to the `ClassSCell` combinators in
-        // PR1, so dispatch behaviour is byte-for-byte unchanged.
-        let outcome = Self::dispatch_state(cell.state_mut(), &deps, cmd).await;
+        // Class-S migration seam: `dispatch_state` now receives the
+        // `&mut ClassSCell` directly. Each match arm still unwraps to the
+        // bare `&mut PerContextState` via `state_mut()` exactly as before,
+        // so dispatch behaviour is byte-for-byte unchanged. Later migration
+        // PRs flip individual domains to receive the cell so they can call
+        // the fail-closed `commit_class_s_*` / `commit_class_c_best_effort`
+        // combinators instead of mutating the bare state directly.
+        let outcome = Self::dispatch_state(&mut cell, &deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;
         }
@@ -490,7 +493,7 @@ impl ContextActor {
     /// Returns the handler's [`Outcome`]; the run-loop reads
     /// `outcome.mutated` to decide whether to set `self.dirty`.
     async fn dispatch_state(
-        state: &mut state::PerContextState,
+        cell: &mut class_s::ClassSCell,
         deps: &deps::ActorDeps,
         cmd: ContextCommand,
     ) -> Outcome<()> {
@@ -503,7 +506,7 @@ impl ContextActor {
                 // migration window. The send-sequence tracker
                 // (`state.send_tracker`) is reserved internally inside
                 // the handler.
-                handlers::messaging::dispatch(state, deps, sub).await
+                handlers::messaging::dispatch(cell.state_mut(), deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
                 // Phase 2A.9 — lifecycle domain migrated to actor-shape
@@ -516,7 +519,7 @@ impl ContextActor {
                 // queries_helpers. `_supervisor` is unused on this arm
                 // because the shim escape happens through the
                 // capability-reduced handle inside the dispatch body.
-                Box::pin(handlers::lifecycle::dispatch(state, deps, sub)).await
+                Box::pin(handlers::lifecycle::dispatch(cell.state_mut(), deps, sub)).await
             }
             ContextCommand::Governance(sub) => {
                 // Phase 2A.8 — governance domain partially migrated to
@@ -528,14 +531,14 @@ impl ContextActor {
                 // the escape happens through the capability-reduced
                 // handle. Removed in Phase 2A finalization with the
                 // rest of the supervisor shim.
-                Box::pin(handlers::governance::dispatch(state, deps, sub)).await
+                Box::pin(handlers::governance::dispatch(cell.state_mut(), deps, sub)).await
             }
             ContextCommand::Broadcast(sub) => {
                 // Phase 2A.5 — broadcast domain migrated to the
                 // actor-shape handler for non-publish commands.
                 // Publish variants still require the custody-generic
                 // supervisor shim because `KeyCustody` is not dyn-safe.
-                Box::pin(handlers::broadcast::dispatch(state, deps, sub)).await
+                Box::pin(handlers::broadcast::dispatch(cell.state_mut(), deps, sub)).await
             }
             ContextCommand::Economy(sub) => {
                 // Phase 2A.3 — economy domain migrated to the
@@ -543,7 +546,7 @@ impl ContextActor {
                 // back to `dispatch_from_shim` for callers that do not
                 // have a target context actor during the migration
                 // window.
-                handlers::economy::dispatch(state, deps, sub).await
+                handlers::economy::dispatch(cell.state_mut(), deps, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
                 // Phase 2A.1 — trust_recovery domain migrated to
@@ -553,7 +556,12 @@ impl ContextActor {
                 // intercepted on the supervisor before this arm
                 // executes (it never reaches the per-context actor
                 // mailbox).
-                Box::pin(handlers::trust_recovery::dispatch(state, deps, sub)).await
+                Box::pin(handlers::trust_recovery::dispatch(
+                    cell.state_mut(),
+                    deps,
+                    sub,
+                ))
+                .await
             }
             ContextCommand::Standing(sub) => {
                 // Phase 2A.2 — standing domain migrated to the
@@ -569,7 +577,7 @@ impl ContextActor {
                 // back to `dispatch_from_shim` when no per-context
                 // actor exists for the target context during the
                 // migration window.
-                handlers::ttl_close::dispatch(state, deps, sub).await
+                handlers::ttl_close::dispatch(cell.state_mut(), deps, sub).await
             }
             ContextCommand::Tools(sub) => {
                 // Phase 2A.4 -- tools domain migrated to the
@@ -577,7 +585,7 @@ impl ContextActor {
                 // helpers. Supervisor dispatch still falls back to
                 // `dispatch_from_shim` for missing actors during the
                 // migration window.
-                handlers::tools::dispatch(state, deps, sub).await
+                handlers::tools::dispatch(cell.state_mut(), deps, sub).await
             }
             // Phase 2A.10 — queries domain migrated to the actor-shape
             // handler. The actor's owned `state` + `deps.event_log` +
@@ -589,10 +597,14 @@ impl ContextActor {
             // [`Supervisor::dispatch_queries_direct`] when no actor
             // exists (the prior locked-DashMap shim was deleted in the
             // Phase 2A finalization queries+lifecycle session).
-            ContextCommand::Queries(sub) => handlers::queries::dispatch(state, deps, sub).await,
+            ContextCommand::Queries(sub) => {
+                handlers::queries::dispatch(cell.state_mut(), deps, sub).await
+            }
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
-            ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(state, deps, msg).await,
+            ContextCommand::SagaPhase(msg) => {
+                handlers::saga::dispatch(cell.state_mut(), deps, msg).await
+            }
             // Test-only fault injection (ADR-049 §10 watchdog tests). The
             // `panic!` lives here in `actor/mod.rs` — deliberately NOT in
             // any `handlers/*.rs` module — so the production handler
@@ -611,7 +623,7 @@ impl ContextActor {
                 }
             }
             ContextCommand::LifecycleControl(sub) => {
-                handlers::lifecycle_control::dispatch(state, deps, sub).await
+                handlers::lifecycle_control::dispatch(cell.state_mut(), deps, sub).await
             }
         }
     }
