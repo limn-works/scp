@@ -259,8 +259,7 @@ pub async fn leave_context(
             &CommitOperation::LeaveContext {
                 member_did: member_did.clone(),
             },
-            member_did.as_ref(),
-        )?;
+        );
 
         // Rotate the local sender key and distribute to remaining members
         // (§9.16.4). M23: Non-fatal — MLS removal above is the hard

@@ -122,7 +122,10 @@ pub fn commit_retry_backoff(failed_attempts: u32) -> u64 {
 /// The variant identifies which mutation produced the commit so that the
 /// `CommitBroadcastPending` / `CommitBroadcastSucceeded` / `CommitBroadcastFailed`
 /// events emitted by the retry queue carry meaningful labels for SDK
-/// consumers and the durable event log.
+/// consumers. These are surfaced as local `ContextEvent`s only — per the
+/// phase-2.md ADR-011-amendment exclusion taxonomy (per-committer
+/// broadcast-retry bookkeeping) they are NOT durably appended to the
+/// canonical Merkle event log (§9.9.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitOperation {
     /// Commit produced by `execute_remove_member` for the given target DID.
