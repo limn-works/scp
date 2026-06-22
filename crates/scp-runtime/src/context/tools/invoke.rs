@@ -145,6 +145,12 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     pub now: u64,
     /// Event log entries for consequence evaluation.
     pub events: &'a [scp_event_log::Event],
+    /// Convergent window anchor (max timestamp of the Source-1 durable log,
+    /// captured before the buffer merge). Anchors the evidence window for
+    /// convergent-trigger consequence rules so the durable leaf is byte-identical
+    /// across skewed members (§9.9.3); derived from the same call to
+    /// `event_log_entries_for_consequences` that produced `events`.
+    pub convergent_now: u64,
     /// Participation cache for proposer eligibility evaluation.
     pub participation_cache: &'a mut std::collections::HashMap<
         String,
@@ -581,6 +587,7 @@ fn economy_post_check<S: BuildHasher>(
         invoker_did,
         economy.context_id,
         economy.now,
+        economy.convergent_now,
         economy.participation_cache,
         economy.consequence_rules,
     )
@@ -816,6 +823,7 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
     invoker_did: &DID,
     context_id: &str,
     now: u64,
+    convergent_now: u64,
     participation_cache: &mut std::collections::HashMap<
         String,
         scp_protocol::trust::participation::ParticipationRecord,
@@ -839,7 +847,13 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
     // Evaluate consequence rules after tool execution (#1531).
     // The caller is responsible for enforcing triggered consequences via
     // enforce_triggered_consequences on the PerContextState.
-    evaluate_consequence_rules(consequence_rules, events, invoker_did.as_ref(), now)
+    evaluate_consequence_rules(
+        consequence_rules,
+        events,
+        invoker_did.as_ref(),
+        now,
+        convergent_now,
+    )
 }
 
 /// Validates the spending side of AND-composition for paid tool invocations
@@ -1934,6 +1948,7 @@ mod tests {
             context_id: "ctx-invoke-test",
             now: 0,
             events: &[],
+            convergent_now: 0,
             participation_cache: &mut participation,
             consequence_rules: &[],
             payment_adapter: None,

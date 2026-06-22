@@ -499,7 +499,7 @@ async fn consequence_rules_evaluation() {
         make_event(EventType::ToolInvoked, alice, 990, 4, b"tool-b".to_vec()),
     ];
 
-    let triggered = evaluate_consequence_rules(&rules, &events, alice, 1000);
+    let triggered = evaluate_consequence_rules(&rules, &events, alice, 1000, 1000);
 
     assert_eq!(triggered.len(), 2);
     assert_eq!(triggered[0].rule_index, 0);

@@ -241,12 +241,15 @@ pub fn post_join_bookkeeping(
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
-    let join_events = super::governance_logic::event_log_entries_for_consequences(
-        receive_buffer,
-        context_id,
-        now,
-        event_log,
-    );
+    // Participation-record path consumes only the merged event set;
+    // the consequence window anchor is not used here.
+    let (join_events, _convergent_now) =
+        super::governance_logic::event_log_entries_for_consequences(
+            receive_buffer,
+            context_id,
+            now,
+            event_log,
+        );
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &join_events,

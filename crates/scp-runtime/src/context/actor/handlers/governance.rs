@@ -777,7 +777,9 @@ fn handle_evaluate_periodic_consequences_actor(
     let context_id = state.handle.context_id().to_owned();
     let member_dids: Vec<scp_identity::DID> =
         state.membership.members().map(|m| m.did.clone()).collect();
-    let events = event_log_entries_for_consequences(
+    // Periodic sweep: one convergent window anchor shared across all members
+    // so every honest member's durable consequence leaf converges (§9.9.3).
+    let (events, convergent_now) = event_log_entries_for_consequences(
         &state.receive_buffer,
         &context_id,
         now,
@@ -786,7 +788,8 @@ fn handle_evaluate_periodic_consequences_actor(
 
     let mut results: Vec<(scp_identity::DID, Vec<TriggeredConsequence>)> = Vec::new();
     for member_did in member_dids {
-        let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+        let triggered =
+            evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now, convergent_now);
         if !triggered.is_empty() {
             results.push((member_did, triggered));
         }

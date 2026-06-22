@@ -87,8 +87,22 @@ pub fn dispatch_consequences_for_subject(
     // tool-rate triggers MUST read those events from the receive buffer
     // (Source 2) — local, per-receiver flow control needs no convergence.
     let triggered: Vec<TriggeredConsequence> = {
+        // Convergent window anchor for convergent-trigger rules: max timestamp of
+        // the Source-1 durable log (`event_log_events`), taken BEFORE the buffer
+        // merge — never from the merged set, which mixes in Source-2 buffer events
+        // carrying local-clock estimated timestamps. This mirrors the native
+        // runtime's `event_log_entries_for_consequences` `convergent_now` so both
+        // produce a byte-identical durable `ConsequenceTriggered` leaf under skewed
+        // local clocks (§9.9.3). Empty log -> `now_secs` fallback (no convergent-
+        // trigger evidence exists to anchor).
+        let convergent_now = ctx
+            .event_log_events()
+            .iter()
+            .map(|e| e.timestamp)
+            .max()
+            .unwrap_or(now_secs);
         let events = merged_consequence_events(ctx, now_secs);
-        evaluate_consequence_rules(&rules, &events, subject_did, now_secs)
+        evaluate_consequence_rules(&rules, &events, subject_did, now_secs, convergent_now)
     };
 
     let mut dispatcher = WasmConsequenceDispatcher { ctx };
