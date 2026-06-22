@@ -11663,6 +11663,7 @@ mod tests {
 
         crate::context::state::ContextSnapshot {
             context_id: context_id.to_owned(),
+            creation_timestamp_secs: 1_700_000_000,
             state: ContextState::Active,
             context_params: ContextParams::default(),
             membership: MembershipState::new(),

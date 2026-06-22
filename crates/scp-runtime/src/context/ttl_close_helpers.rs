@@ -245,10 +245,12 @@ pub async fn start_ttl_timer(
     // Convergent absolute expiry deadline (Unix seconds), if the caller can
     // supply one. The initial-create path passes
     // `Some(creation_timestamp_secs + params.ttl)`; the governance ExtendTtl
-    // path passes its already-convergent extended deadline. `None` (e.g. the
-    // restore/import path, whose persisted snapshot does not yet carry the
-    // convergent creation time — see ADR-051) arms relative to the local
-    // clock. `duration` is always the local sleep interval.
+    // path passes its already-convergent extended deadline; the restore/import
+    // path now also passes `Some(creation_timestamp_secs + ttl)`, since the
+    // signed snapshot carries the convergent creator-assigned creation time and
+    // both paths arm with `anchor_deadline_to_creation = true`. `None` arms
+    // relative to the local clock (used only when no convergent creation time is
+    // available). `duration` is always the local sleep interval.
     deadline_override: Option<u64>,
     handle: ContextHandle,
 ) {
@@ -531,6 +533,7 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
 
     crate::context::state::ContextSnapshot {
         context_id: state.handle.context_id().to_owned(),
+        creation_timestamp_secs: state.creation_timestamp_secs,
         state: context_state_value,
         context_params: state.handle.params().clone(),
         membership: state.membership.clone(),

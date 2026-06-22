@@ -557,6 +557,42 @@ pub struct ProposalOutcome {
 pub struct ContextSnapshot {
     /// The context's unique identifier.
     pub context_id: String,
+    /// Convergent creator-assigned context-creation timestamp (Unix seconds).
+    ///
+    /// Copied verbatim from
+    /// [`PerContextState::creation_timestamp_secs`](crate::context::actor::state::PerContextState::creation_timestamp_secs)
+    /// at snapshot time — the identical value the creator stamped on the
+    /// `ContextCreated` event-log leaf (§7.3.1, §9.9.3), NOT any member's local
+    /// `now()`. Persisting it through the snapshot lets `restore_context` and
+    /// `import_context` re-arm the TTL timer against the CONVERGENT deadline
+    /// (`creation_timestamp_secs + params.ttl`) instead of re-deriving from
+    /// importer-local `now()`, so the timer-fired `ContextExpired`/`ContextClosed`
+    /// leaf converges across members (the live create path is already convergent;
+    /// restore/import previously diverged — ADR-051).
+    ///
+    /// # Security — consumed VERBATIM, never re-pinned
+    ///
+    /// On `import_context` the value lives inside the creator-signed JCS snapshot
+    /// preimage; import verifies the creator's signature and
+    /// `exporter_did == creator_did` BEFORE consuming it
+    /// (`validate_export_for_import`). Its ONLY consumer is the TTL expiry
+    /// deadline, which is an UPPER bound on the context's lifetime
+    /// (`creation.saturating_add(ttl)`): backdating only SHORTENS the window
+    /// (fail-safe — the context expires no later than a member with an honest
+    /// clock would compute), and future-dating is bounded by `ttl`. No consumer
+    /// uses it as a window LOWER bound or to extend any grace/notification
+    /// period, so — unlike `pending_*` `observed_at` timestamps, which gate the
+    /// §5.3.2 / §19.3 notification windows and ARE re-pinned to local import time
+    /// — this field is moved through verbatim. Re-pinning it to importer-local
+    /// `now()` would re-introduce the very divergence this field exists to close.
+    ///
+    /// `#[serde(default)]` so legacy snapshots (persisted before this field
+    /// existed) deserialize as `0`. A `0` here means "no convergent creation
+    /// time recorded"; the resulting deadline `0 + ttl` is in the distant past,
+    /// so a TTL-bearing legacy context expires immediately on restore — the
+    /// fail-safe direction, consistent with the upper-bound semantics above.
+    #[serde(default)]
+    pub creation_timestamp_secs: u64,
     /// The context's lifecycle state at the time of snapshot.
     pub state: ContextState,
     /// The context's creation parameters (immutable after creation).
