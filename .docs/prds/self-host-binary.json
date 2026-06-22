@@ -352,7 +352,7 @@
       "gate": "gate-self-host-1",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/tests/self_host.rs",
         "crates/scp-node/src/lib.rs",
