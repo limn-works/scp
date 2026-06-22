@@ -30,8 +30,8 @@ class ResolutionPathDict(TypedDict):
     """
     source: str
     """Human-readable source identifier (context name, domain, platform)."""
-    source_id: NotRequired[str | None]
-    """Context ID (hex), present only for the ``HandleRegistry`` layer."""
+    source_id: str | None
+    """Context ID (hex), or ``None`` for non-``HandleRegistry`` layers."""
     resolved_at: int
     """Unix timestamp (seconds) when resolution occurred."""
 
