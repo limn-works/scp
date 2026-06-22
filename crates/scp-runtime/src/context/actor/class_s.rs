@@ -357,6 +357,12 @@ pub(crate) struct ClassCMut<'a> {
 /// CANNOT be written (there is nothing of that type to return). Reads of
 /// Class-C fields go through the field-granular `&`-returning read accessors
 /// ([`Self::next_proposal_seq`]); there is no [`Deref`] to the whole bucket.
+///
+/// This safe-Rust guarantee is backstopped by the crate-root
+/// `#![forbid(unsafe_code)]` (`scp-runtime/src/lib.rs`): the only type-system
+/// escape — a `*const _ as *mut _` cast on the shared `class_s` read reference —
+/// requires an `unsafe` block, which `forbid` rejects crate-wide and cannot be
+/// locally re-enabled. Weakening that attribute would re-open this vector.
 pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
     velocity_tracker: &'a mut scp_protocol::economy::antispam::SenderVelocityTracker,
@@ -470,7 +476,9 @@ pub(crate) struct ClassCSplit<'a> {
     /// `GovernanceState` contains the Class-S sub-struct `class_s`, and the
     /// consequence/best-effort path does not persist fail-closed, so it must have
     /// no `&mut` path to it. [`GovernanceClassCMut`] exposes only the Class-C
-    /// governance fields and reads via [`Deref`] — airtight by construction.
+    /// governance fields and reads via field-granular `&`-accessors (e.g.
+    /// [`GovernanceClassCMut::next_proposal_seq`]); it holds no whole
+    /// `&mut GovernanceState` — airtight by that field-granular construction.
     pub(crate) governance: GovernanceClassCMut<'a>,
     /// `&mut` role / ceiling / assignment state.
     pub(crate) role_state: &'a mut ContextRoleState,
@@ -525,7 +533,7 @@ impl<'a> ClassCMut<'a> {
     /// governance reach on this view — there is deliberately no `governance_mut`
     /// returning `&mut GovernanceState`, because that whole-bucket `&mut` would be
     /// a `&mut` path to a Class-S-containing struct (see the type doc). Returns a
-    /// REBORROW of the held sub-view so it stays usable afterwards.
+    /// `&mut` to the held [`GovernanceClassCMut`] sub-view.
     pub(crate) const fn governance_class_c_mut(&mut self) -> &mut GovernanceClassCMut<'a> {
         &mut self.governance
     }
@@ -2178,8 +2186,8 @@ mod tests {
 
     /// `ClassCMut::governance_class_c_mut` yields a `GovernanceClassCMut` whose
     /// field-granular accessors mutate a Class-C governance field, and whose
-    /// `Deref` reads the whole governance bucket — with no `&mut` path to
-    /// `governance.class_s`.
+    /// field-granular read accessor (`next_proposal_seq`) reads a Class-C
+    /// governance field — with no `&mut` path to `governance.class_s`.
     #[tokio::test]
     async fn best_effort_governance_class_c_mut_mutates_class_c_field() {
         let persist_calls = Arc::new(AtomicUsize::new(0));
