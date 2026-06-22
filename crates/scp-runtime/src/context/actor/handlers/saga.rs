@@ -479,9 +479,6 @@ async fn prepare_a(
             }
         };
 
-    // Re-derive the bare state for the remaining (not-yet-migrated) mutations.
-    let state = cell.state_mut();
-
     // 4. Stage the DURABLE caller-reservation reversal record (spec §6.2.4
     //    "Reservation release on every terminal path"), keyed by `SagaId`,
     //    BEFORE the fail-closed persist so the deduction and the means to
@@ -494,26 +491,50 @@ async fn prepare_a(
     //    it does not double-charge: the live paths CONSUME (remove without
     //    re-reversing) the record, and the record's own reversal runs only when
     //    the carrier is absent — the two paths are mutually exclusive.
+    //
+    //    `to_caller_reservation_record(&self)` only BORROWS the ticket, so
+    //    `reservation` stays owned in this scope across the combinator — it is
+    //    returned to the supervisor on success or rolled back below on failure.
     let record = reservation.ticket.to_caller_reservation_record(now_secs);
-    state
-        .class_s
-        .xctx_caller_reservations
-        .insert(saga_id.clone(), record);
 
     // 5. Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9): the
     //    reserve mutated actor-owned velocity / rate-limit / budget bookkeeping
     //    and the durable reversal record above; a crash in the coalesce window
     //    must not acknowledge a Prepare-A whose staged reservation did not
-    //    durably land. On persist failure the reservation is ROLLED BACK (the
-    //    §6.2.4 "Reservation release on every terminal path" RAII contract: the
-    //    ToolEconomyTicket MUST be settled or rolled back, never merely dropped)
-    //    so the staged escrow/rate-limit/velocity/budget are released — nothing
-    //    applied — and the just-staged record is removed (it described a
-    //    reservation that is now reversed in-memory and was never durably
-    //    persisted, so leaving it would let a later crash-abort double-reverse).
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_id_hex) {
-        state.class_s.xctx_caller_reservations.remove(saga_id);
-        crate::context::tools_helpers::rollback_tool_economy(state, deps, reservation.ticket).await;
+    //    durably land. `commit_class_s_restore` stages the record in `f` and, on
+    //    persist failure, RESTORES Class-S — un-inserting the just-staged record
+    //    (matching the prior manual `xctx_caller_reservations.remove`: the record
+    //    described a reservation that is now reversed in-memory and was never
+    //    durably persisted, so leaving it would let a later crash-abort
+    //    double-reverse).
+    //
+    //    The economy rollback that completes the §6.2.4 "Reservation release on
+    //    every terminal path" RAII contract (the `ToolEconomyTicket` MUST be
+    //    settled or rolled back, never merely dropped — releasing the staged
+    //    escrow/rate-limit/velocity/budget) is Class-C + EXTERNAL (escrow void)
+    //    and runs AFTER the combinator on the Err arm, exactly as before. It is
+    //    kept outside the combinator — not folded into a `compensate` closure —
+    //    because the `#[must_use]` `reservation.ticket` it consumes must survive
+    //    onto the SUCCESS path too (it is replied to the supervisor); a
+    //    `commit_class_s_compensating` splits the success value `T` from the
+    //    compensation handle `X` and drops `X` on success, which would drop the
+    //    carrier and trip its unbalanced-drop guard. See FLAG-PREPARE-A below.
+    if let Err(persist_err) = cell.commit_class_s_restore(deps, &context_id_hex, |mut view| {
+        view.class_s_mut()
+            .xctx_caller_reservations
+            .insert(saga_id.clone(), record);
+        Ok(())
+    }) {
+        // Combinator already un-inserted the record (Class-S restore). Complete
+        // the RAII release: reverse the Class-C economy + void the external
+        // escrow from the still-owned reservation, exactly as the prior inline
+        // path did.
+        crate::context::tools_helpers::rollback_tool_economy(
+            cell.state_mut(),
+            deps,
+            reservation.ticket,
+        )
+        .await;
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -829,12 +850,6 @@ async fn prepare_b(
     let recorded_chain_depth = req.asserted_chain_depth.saturating_add(1);
     let now_secs = deps.clock.now_secs();
 
-    // Record the accepted nonce in B's dedup cache (freshness state lives on B).
-    state
-        .class_s
-        .xctx_nonce_dedup
-        .record(req.asserted_nonce, now_secs);
-
     // Stage the eight-field public-metadata projection into saga_pending.
     let prepared = CrossContextToolInvocationPrepared {
         caller_context_id: req.caller_context_id,
@@ -849,26 +864,59 @@ async fn prepare_b(
         recorded_nonce,
         recorded_chain_depth,
     };
-    state.class_s.saga_pending.insert(
-        req.saga_id.clone(),
-        SagaPreparedState::CrossContextToolInvocation(prepared),
-    );
 
-    // Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9 line 144):
-    // a crash that rolled the staged slot back behind an acked Prepare-B would
-    // orphan the supervisor saga journal's reservation linkage. On persist
-    // failure, roll the staged slot + nonce back and surface the error.
+    // ── FLAG-PREPARE-B (keep+restore SPLIT — reviewer sign-off) ──────────────
+    // Prepare-B stages TWO Class-S fields under ONE fail-closed persist with
+    // OPPOSITE rollback directions:
+    //   (a) `xctx_nonce_dedup.record` — KEEP on persist failure. Un-recording an
+    //       accepted nonce re-opens the §6.2.4 replay window the dedup cache
+    //       exists to close (the fail-closed direction).
+    //   (b) `saga_pending.insert` — RESTORE on persist failure. A staged slot
+    //       that did not durably land must be removed so a retry re-stages
+    //       cleanly and no orphaned reservation linkage survives.
+    // No single combinator expresses keep-one-field / restore-another (the
+    // snapshot/restore is all-or-nothing over the Class-S sub-structs — see
+    // `class_s.rs` module docs "Intra-Class-S keep-one-field / restore-another
+    // split"). The module docs offer two faithful options: (1) DECOMPOSE into a
+    // sequential `commit_class_s_keep` (nonce) then `commit_class_s_restore`
+    // (slot) — but that is TWO fail-closed persists where there is ONE today, a
+    // behaviour change whose intermediate-crash state would need its own
+    // recovery proof; or (2) preserve the CURRENT single-persist behaviour. The
+    // task directive is to preserve current behaviour, so this picks (2):
+    // `commit_class_s_keep` performs the SINGLE fail-closed persist and KEEPS
+    // both fields on failure (correct for the nonce); the slot's RESTORE
+    // direction is then completed by removing it from `saga_pending` AFTER the
+    // combinator on the Err arm — byte-identical to the prior inline
+    // `saga_pending.remove(&req.saga_id)`. That post-combinator remove is a
+    // rollback of an UNPERSISTED forward mutation toward the durable state
+    // (which holds neither field, the persist having failed), not a new forward
+    // Class-S transition, so it needs no persist of its own.
     let target_hex = hex_context_id(&req.target_context_id);
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-        state.class_s.saga_pending.remove(&req.saga_id);
+    let saga_id = req.saga_id.clone();
+    if let Err(persist_err) = cell.commit_class_s_keep(deps, &target_hex, |mut view| {
+        let class_s = view.class_s_mut();
+        // (a) Record the accepted nonce in B's dedup cache (freshness state
+        //     lives on B) — KEEP direction.
+        class_s
+            .xctx_nonce_dedup
+            .record(req.asserted_nonce, now_secs);
+        // (b) Stage the prepared projection — RESTORE direction (completed on
+        //     the Err arm below).
+        class_s.saga_pending.insert(
+            saga_id.clone(),
+            SagaPreparedState::CrossContextToolInvocation(prepared),
+        );
+        Ok(())
+    }) {
+        // Complete the slot's RESTORE direction: roll the just-staged slot back
+        // so a retry re-stages cleanly (matching the prior inline remove). The
+        // nonce stays recorded (KEEP — the combinator did not restore it).
+        cell.state_mut().class_s.saga_pending.remove(&req.saga_id);
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
-        // The nonce stays recorded (fail-closed direction for replay
-        // protection — un-recording would re-open the replay window the dedup
-        // cache exists to close). The persist just FAILED, so this recorded
-        // nonce did NOT durably land; report mutated so the actor flags the
-        // in-memory mutation as diverged-from-durable (it does not claim the
-        // state persisted).
+        // The persist just FAILED, so the recorded nonce did NOT durably land;
+        // report mutated so the actor flags the in-memory mutation as
+        // diverged-from-durable (it does not claim the state persisted).
         return Outcome::err_mutated(sketch);
     }
 
@@ -1317,7 +1365,7 @@ async fn commit_b_settle(
         return reemit_committed_settle(committed, reply);
     }
 
-    match commit_b_first_settle(cell, deps, saga_id, &output_bytes, target_signing_key) {
+    match commit_b_first_settle(cell, deps, saga_id, &output_bytes, target_signing_key).await {
         Ok(outcome) => {
             let _ = reply.send(Ok(outcome));
             Outcome::ok_mutated(())
@@ -1372,30 +1420,54 @@ fn reemit_committed_settle(
 /// `mutated == false` for the pre-append failures (no staged slot — 13031; or
 /// receipt signing — 13032-13034), `true` once the `ToolInvoked` append has
 /// run (the event log was touched even if the durable capture was rolled back).
-fn commit_b_first_settle(
+// Sync wrapper preserved for the existing call shape; the body is now `async`
+// (the combinators are `async`-friendly but the persists here are sync — the
+// `async` keyword is required because `commit_b_settle` awaits this). See the
+// FLAG below for why this site uses a TWO-combinator decomposition rather than
+// the single `commit_class_s_then_append`.
+//
+// ── FLAG-COMMIT-B (then_append NOT used — persist-fail direction mismatch) ───
+// The roadmap maps this site to `commit_class_s_then_append` (Class-S commit in
+// `f`, event-log append in `after`). That combinator's PERSIST-FAILURE arm
+// KEEPS the Class-S mutation in memory and reports `durability_diverged: true`
+// (its doc step 3: "the restore is the caller's call … matches `*_keep`"). But
+// `commit_b_first_settle`'s persist-failure arm must RESTORE — it removes the
+// just-inserted `xctx_committed_outputs` capture and RE-INSERTS the owned
+// `saga_pending` slot so a retried settle sees `ReadyToExecute` and re-runs.
+// Keeping the capture (the `then_append` behaviour) would make the next
+// `commit_b_reserve` report `AlreadyCommitted` against an in-memory-only capture
+// and SKIP the `ToolInvoked` append forever — a missing convergent leaf on an
+// in-process retry after a survived persist failure. `then_append` exposes no
+// way to recover the owned `prepared` on its persist-failure arm (the
+// `append_input` is dropped by the early `?`), and `CrossContextToolInvocationPrepared`
+// is deliberately NOT `Clone` (§9.4.3 non-derive barrier), so the slot cannot be
+// reconstructed afterward. The faithful, behaviour-preserving form is therefore
+// a TWO-combinator decomposition:
+//   (1) `commit_class_s_restore` — capture (remove slot, sign, insert outputs) +
+//       fail-closed persist; on persist failure RESTORE (snapshot taken before
+//       `f` ⇒ slot back, capture gone) — byte-identical to the prior inline
+//       persist-failure rollback, reported `(false, persist_err)`.
+//   (2) the event-log append runs AFTER (1) succeeds; on append failure the
+//       compensating rollback (remove capture, re-insert the owned slot) + its
+//       RE-PERSIST is wrapped in `commit_class_s_keep` — keep-on-persist-failure
+//       matches the prior `(true, persist_err)` (re-persist failed ⇒ capture
+//       stays durable) / `(false, original_err)` (re-persist succeeded) mapping.
+// No Class-S mutation is left outside a combinator.
+async fn commit_b_first_settle(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     saga_id: &SagaId,
     output_bytes: &[u8],
     target_signing_key: &SigningKeyBytes,
 ) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `saga_pending` / `xctx_committed_outputs` combinators; for now the
-    // bare `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
-    // MOVE the staged slot OUT up front so we own the original
-    // `SagaPreparedState` — on a persist-failure rollback we RE-INSERT the owned
-    // original verbatim (no lossy reconstruction). The slot is restored on every
-    // failure path below, so a rejected settle leaves `saga_pending` exactly as
-    // it was found.
-    let removed = state.class_s.saga_pending.remove(saga_id);
-    let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) = removed else {
-        // Not a cross-context staged slot (or absent): put back whatever we
-        // removed (an unrelated variant) and reject. `mutated = false` — the
-        // remove+reinsert is a no-op round-trip.
-        if let Some(other) = removed {
-            state.class_s.saga_pending.insert(saga_id.clone(), other);
-        }
+    // Peek the staged slot to derive the persist `context_id` (target hex) BEFORE
+    // the capture combinator (which needs `context_id` up front) and to reject the
+    // no-slot / wrong-variant case as `(false, 13031)` with NO persist — exactly
+    // as the prior inline remove+match did (the authoritative move-out happens
+    // inside `f` below).
+    let Some(SagaPreparedState::CrossContextToolInvocation(peek)) =
+        cell.class_s.saga_pending.get(saga_id)
+    else {
         return Err((
             false,
             ContextError::InvalidState(format!(
@@ -1405,78 +1477,142 @@ fn commit_b_first_settle(
             )),
         ));
     };
+    let target_hex = hex_context_id(&peek.target_context_id);
 
-    // Build the signed receipt from STAGED provenance + the captured output.
-    // Pre-append: a signing failure leaves state untouched (mutated = false) —
-    // re-insert the owned original first.
-    let event_id = tool_invoked_event_id(saga_id);
-    let receipt = match build_signed_receipt(&prepared, output_bytes, &event_id, target_signing_key)
-    {
-        Ok(r) => r,
-        Err(e) => {
-            state.class_s.saga_pending.insert(
-                saga_id.clone(),
-                SagaPreparedState::CrossContextToolInvocation(prepared),
-            );
-            return Err((false, e));
-        }
-    };
-    // The receipt's JCS output bytes are the canonical preimage A re-hashes.
-    let canonical_output = receipt.output_jcs.clone();
+    // (1) CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
+    //
+    // `f` MOVES the staged slot out (owning the original `SagaPreparedState` for a
+    // lossless rollback), signs the receipt, and inserts the durable output
+    // capture. On a signing failure `f` re-inserts the owned original and returns
+    // the error (no persist). `commit_class_s_restore` snapshots Class-S BEFORE
+    // `f`, so its persist-failure RESTORE rolls the capture back and re-stages the
+    // slot verbatim (matching the prior inline rollback). Both the `f`-error
+    // (13031 already handled above, or signing 13032-13034) and the persist
+    // failure surface as `(false, err)` — `mutated = false` (no event-log touch).
+    //
+    // `f` returns the data the post-persist append + reply need, plus the OWNED
+    // `prepared` so the append-failure compensation in (2) can re-insert the slot.
+    let captured = cell.commit_class_s_restore(deps, &target_hex, |mut view| {
+        let saga_pending = &mut view.class_s_mut().saga_pending;
+        // Move the staged slot OUT (owning the original for a lossless rollback).
+        // The peek above already proved a cross-context slot is present, so this
+        // match is infallible; the `else` is a defensive re-insert + 13031.
+        let removed = saga_pending.remove(saga_id);
+        let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) = removed else {
+            if let Some(other) = removed {
+                saga_pending.insert(saga_id.clone(), other);
+            }
+            return Err(ContextError::InvalidState(format!(
+                "SCP-SAGA-13031: Commit-B settle for saga '{}' found no staged cross-context \
+                 tool-invocation prepared state",
+                saga_id.0
+            )));
+        };
 
-    // Snapshot the fields the ToolInvoked record needs. `recorded_chain_depth` /
-    // `recorded_timestamp_ms` are B's staged values (never re-read from wire).
-    let caller_did_str = prepared.caller_did.0.clone();
-    let target_context_id = prepared.target_context_id;
-    let caller_context_id = prepared.caller_context_id;
-    let tool_registration_id = prepared.tool_registration_id.clone();
-    let target_hex = hex_context_id(&target_context_id);
+        // Build the signed receipt from STAGED provenance + the captured output.
+        // A signing failure leaves state as found (re-insert the owned original).
+        let event_id = tool_invoked_event_id(saga_id);
+        let receipt =
+            match build_signed_receipt(&prepared, output_bytes, &event_id, target_signing_key) {
+                Ok(r) => r,
+                Err(e) => {
+                    view.class_s_mut().saga_pending.insert(
+                        saga_id.clone(),
+                        SagaPreparedState::CrossContextToolInvocation(prepared),
+                    );
+                    return Err(e);
+                }
+            };
+        // The receipt's JCS output bytes are the canonical preimage A re-hashes.
+        let canonical_output = receipt.output_jcs.clone();
 
-    // Order matters (provenance-integrity): the durable output capture +
-    // Class-S persist land BEFORE the `ToolInvoked` event-log append. The
-    // event log is a SEPARATE provider not covered by `persist_state_fail_closed`
-    // and the append is NOT provider-idempotent, so appending FIRST would
-    // double-append on a persist-failure retry: a persist failure rolls the
-    // capture back and re-stages the slot, the next reserve reports
-    // `ReadyToExecute`, and `commit_b_first_settle` re-runs — re-appending a
-    // SECOND `ToolInvoked` for one saga. Appending only after the capture +
-    // persist succeed makes a persist failure leave NO orphan log entry, so the
-    // retry produces exactly one `ToolInvoked`.
+        // Snapshot the fields the ToolInvoked record needs. `recorded_chain_depth`
+        // / `recorded_timestamp_ms` are B's staged values (never re-read from
+        // wire).
+        let caller_did_str = prepared.caller_did.0.clone();
+        let target_context_id = prepared.target_context_id;
+        let caller_context_id = prepared.caller_context_id;
+        let tool_registration_id = prepared.tool_registration_id.clone();
 
-    // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
-    // "Exactly-once execution with durable output capture"). The staged slot was
-    // already removed up front (the session reservation is now applied via the
-    // capture). No event-log mutation yet — a failure before the append is
-    // recoverable by re-inserting the owned staged slot.
-    state.class_s.xctx_committed_outputs.insert(
-        saga_id.clone(),
-        CommittedToolInvocation {
-            receipt: receipt.clone(),
-            output_bytes: canonical_output.clone(),
-            tool_invoked_event_id: event_id.clone(),
-        },
-    );
+        // Order matters (provenance-integrity): the durable output capture +
+        // Class-S persist land BEFORE the `ToolInvoked` event-log append. The
+        // event log is a SEPARATE provider not covered by
+        // `persist_state_fail_closed` and the append is NOT provider-idempotent,
+        // so appending FIRST would double-append on a persist-failure retry: a
+        // persist failure rolls the capture back and re-stages the slot, the next
+        // reserve reports `ReadyToExecute`, and `commit_b_first_settle` re-runs —
+        // re-appending a SECOND `ToolInvoked` for one saga. Appending only after
+        // the capture + persist succeed makes a persist failure leave NO orphan
+        // log entry, so the retry produces exactly one `ToolInvoked`.
 
-    // Class-S sync-persist fail-closed BEFORE acking (ADR-049 §9): the durable
-    // output capture MUST land before the caller learns Commit-B succeeded, or a
-    // crash in the coalesce window would re-invoke the tool on replay. On persist
-    // failure roll the capture back and RE-INSERT the OWNED original staged slot
-    // verbatim so a retry re-runs settle. No `ToolInvoked` was appended yet, so
-    // the retry cannot double-append. `mutated = false`: nothing durable landed
-    // (the in-memory capture was just rolled back, no event-log touch).
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-        state.class_s.xctx_committed_outputs.remove(saga_id);
-        state.class_s.saga_pending.insert(
+        // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
+        // "Exactly-once execution with durable output capture"). The staged slot
+        // was already removed up front (the session reservation is now applied via
+        // the capture). No event-log mutation yet — a failure before the append is
+        // recoverable by re-inserting the owned staged slot.
+        view.class_s_mut().xctx_committed_outputs.insert(
             saga_id.clone(),
-            SagaPreparedState::CrossContextToolInvocation(prepared),
+            CommittedToolInvocation {
+                receipt: receipt.clone(),
+                output_bytes: canonical_output.clone(),
+                tool_invoked_event_id: event_id.clone(),
+            },
         );
-        return Err((false, persist_err));
-    }
+
+        Ok(CommitBCaptured {
+            prepared,
+            receipt,
+            canonical_output,
+            event_id,
+            caller_did_str,
+            target_context_id,
+            caller_context_id,
+            tool_registration_id,
+        })
+    });
+
+    // Both `f`-error and persist-failure surface as `(false, err)` (mutated =
+    // false). `commit_class_s_restore` already restored Class-S on persist
+    // failure (capture rolled back, slot re-staged).
+    let captured_fields = match captured {
+        Ok(c) => c,
+        Err(err) => return Err((false, err)),
+    };
+
+    // (2) Append `ToolInvoked` + finalize (split out to keep this helper within
+    // the per-function line budget).
+    commit_b_settle_finalize(cell, deps, saga_id, &target_hex, captured_fields).await
+}
+
+/// Post-capture half of [`commit_b_first_settle`] (step 2): append the
+/// `ToolInvoked` event-log leaf, and on append failure roll the capture back +
+/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`].
+/// Split out of [`commit_b_first_settle`] only to stay within the per-function
+/// line budget — the behaviour is exactly the prior inline append path. See
+/// FLAG-COMMIT-B on the capture side for why this is a two-combinator
+/// decomposition rather than `commit_class_s_then_append`.
+async fn commit_b_settle_finalize(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    target_hex: &str,
+    captured: CommitBCaptured,
+) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
+    let CommitBCaptured {
+        prepared,
+        receipt,
+        canonical_output,
+        event_id,
+        caller_did_str,
+        target_context_id,
+        caller_context_id,
+        tool_registration_id,
+    } = captured;
 
     // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
-    // caller ctx id / caller DID actor / B's re-derived depth + staged
-    // timestamp. Runs ONLY after the capture + persist landed, so it appears
-    // exactly once across retries.
+    // caller ctx id / caller DID actor / B's re-derived depth + staged timestamp.
+    // Runs ONLY after the capture + persist landed, so it appears exactly once
+    // across retries.
     let tool_invoked_payload = serde_json::json!({
         "saga_id": saga_id.0,
         "tool_invoked_event_id": event_id,
@@ -1492,50 +1628,47 @@ fn commit_b_first_settle(
     // staged value B also wrote into the receipt and that a replayed Commit
     // reproduces byte-for-byte — never a fresh Commit-time `now()`, so two honest
     // members reconstruct the identical leaf (§7.3.1, §9.9.3).
-    let tool_invoked_payload_bytes = match serde_json::to_vec(&tool_invoked_payload) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let err = ContextError::EventLogFailed(format!(
-                "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
-            ));
-            state.class_s.xctx_committed_outputs.remove(saga_id);
-            state.class_s.saga_pending.insert(
+    let append_result = match serde_json::to_vec(&tool_invoked_payload) {
+        Ok(tool_invoked_payload_bytes) => deps.event_log.append_context_event_with_payload(
+            &target_context_id,
+            scp_event_log::EventType::ToolInvoked,
+            &caller_did_str,
+            scp_event_log::EventPayload {
+                data: tool_invoked_payload_bytes,
+            },
+            receipt.timestamp_ms / 1000,
+        ),
+        Err(e) => Err(ContextError::EventLogFailed(format!(
+            "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
+        ))),
+    };
+
+    if let Err(append_err) = append_result {
+        // The append (or its payload encode) failed AFTER the capture+persist
+        // landed. Roll the capture back and re-stage the owned slot, then
+        // RE-PERSIST so the rolled-back state is durable — otherwise the next
+        // reserve would see the already-persisted capture, report
+        // `AlreadyCommitted`, and SKIP the append forever (a missing
+        // `ToolInvoked`). With the compensating re-persist, the retry sees
+        // `ReadyToExecute` and re-runs settle, appending exactly once. The
+        // rollback+re-persist is a fail-closed Class-S commit of the rolled-back
+        // state — `commit_class_s_keep` keeps it on a re-persist failure (matching
+        // the prior `(true, persist_err)`: capture stays durable, a genuine
+        // fail-closed terminal the operator / crash-recovery sweep reconciles);
+        // on re-persist success the original append error surfaces as
+        // `(false, append_err)`.
+        return match cell.commit_class_s_keep(deps, target_hex, |mut view| {
+            let class_s = view.class_s_mut();
+            class_s.xctx_committed_outputs.remove(saga_id);
+            class_s.saga_pending.insert(
                 saga_id.clone(),
                 SagaPreparedState::CrossContextToolInvocation(prepared),
             );
-            if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-                return Err((true, persist_err));
-            }
-            return Err((false, err));
-        }
-    };
-    if let Err(e) = deps.event_log.append_context_event_with_payload(
-        &target_context_id,
-        scp_event_log::EventType::ToolInvoked,
-        &caller_did_str,
-        scp_event_log::EventPayload {
-            data: tool_invoked_payload_bytes,
-        },
-        receipt.timestamp_ms / 1000,
-    ) {
-        // The append failed AFTER the capture+persist landed. Roll the capture
-        // back and re-stage the owned slot, then RE-PERSIST so the rolled-back
-        // state is durable — otherwise the next reserve would see the
-        // already-persisted capture, report `AlreadyCommitted`, and SKIP the
-        // append forever (a missing `ToolInvoked`). With the compensating
-        // re-persist, the retry sees `ReadyToExecute` and re-runs settle,
-        // appending exactly once. If the compensating persist ALSO fails the
-        // capture stays durable (a genuine fail-closed terminal — the operator /
-        // crash-recovery sweep reconciles), reported `mutated`.
-        state.class_s.xctx_committed_outputs.remove(saga_id);
-        state.class_s.saga_pending.insert(
-            saga_id.clone(),
-            SagaPreparedState::CrossContextToolInvocation(prepared),
-        );
-        if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-            return Err((true, persist_err));
-        }
-        return Err((false, e));
+            Ok(())
+        }) {
+            Ok(()) => Err((false, append_err)),
+            Err(persist_err) => Err((true, persist_err)),
+        };
     }
 
     // The capture + persist + append all landed; serializing the receipt for the
@@ -1547,6 +1680,22 @@ fn commit_b_first_settle(
         output_bytes: canonical_output,
         tool_invoked_event_id: event_id,
     })
+}
+
+/// The data `commit_b_first_settle`'s capture combinator (`f`) produces for the
+/// post-persist event-log append + reply: the OWNED original `prepared` (so the
+/// append-failure compensation can re-stage the slot losslessly), the signed
+/// receipt + canonical output + stable event id, and the `ToolInvoked` record
+/// fields. Lives only between the two combinators in that one helper.
+struct CommitBCaptured {
+    prepared: CrossContextToolInvocationPrepared,
+    receipt: CrossContextToolReceipt,
+    canonical_output: Vec<u8>,
+    event_id: String,
+    caller_did_str: String,
+    target_context_id: [u8; 32],
+    caller_context_id: [u8; 32],
+    tool_registration_id: String,
 }
 
 /// Sign the [`CrossContextToolReceipt`] over the staged B-recorded provenance +
@@ -1694,19 +1843,13 @@ async fn commit_a(
 ) -> Outcome<()> {
     use crate::context::tools_helpers::{ToolSettleRequest, settle_tool_economy};
 
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `xctx_committed_invocations` / `xctx_caller_reservations`
-    // combinators; for now the bare `&mut PerContextState` keeps the body
-    // unchanged.
-    let state = cell.state_mut();
-
     let caller_hex = hex_context_id(&req.caller_context_id);
 
     // Idempotency: a prior Commit-A already recorded this saga. Re-ack as a
     // no-op; the reservation handed back on replay is released (RAII) rather
     // than double-settled. (`xctx_committed_invocations` records committed A-side
     // sagas; absent ⇒ first Commit-A.)
-    if state
+    if cell
         .class_s
         .xctx_committed_invocations
         .contains(&req.saga_id)
@@ -1717,18 +1860,30 @@ async fn commit_a(
         // corrupt the WRONG context. On a mismatch the helper voids only the
         // external escrow and consumes the ticket (mirrors `settle_tool_economy`).
         crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-            state,
+            cell.state_mut(),
             deps,
             req.reservation.reservation.generation,
             req.reservation.reservation.ticket,
         )
         .await;
+        // ── FLAG-COMMIT-A-REPLAY (Class-S remove deliberately NOT persisted) ──
         // The durable reversal record (if still present) was consumed at the
         // FIRST Commit-A; remove any straggler so it cannot reverse settled
         // state. A removal here is rare (the first Commit-A already removed it),
-        // so it is not folded into a persist decision — `xctx_committed_invocations`
-        // already witnesses the committed terminal durably.
-        let _ = state.class_s.xctx_caller_reservations.remove(&req.saga_id);
+        // so it is NOT folded into a persist decision — `xctx_committed_invocations`
+        // already witnesses the committed terminal durably, and this arm replies
+        // `Ok(())` with NO persist today. Wrapping this `remove` in any combinator
+        // would introduce a fail-closed persist that does not exist here — a
+        // behaviour change (an extra persist that could itself FAIL, turning this
+        // idempotent `Ok` re-ack into an error). So this lone Class-S mutation is
+        // deliberately kept on `state_mut()` to preserve the no-persist re-ack
+        // exactly. This is the documented "rare straggler" outlier, NOT the main
+        // Commit-A transaction (which IS migrated onto combinators below).
+        let _ = cell
+            .state_mut()
+            .class_s
+            .xctx_caller_reservations
+            .remove(&req.saga_id);
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
@@ -1740,8 +1895,14 @@ async fn commit_a(
         generation: req.reservation.reservation.generation,
         ticket: req.reservation.reservation.ticket,
     };
-    if let Err(err) =
-        settle_tool_economy(state, deps, &caller_hex, &req.caller_did, settle_request).await
+    if let Err(err) = settle_tool_economy(
+        cell.state_mut(),
+        deps,
+        &caller_hex,
+        &req.caller_did,
+        settle_request,
+    )
+    .await
     {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -1760,98 +1921,104 @@ async fn commit_a(
     // surface, a silent one-sided A-record. Appending only AFTER the witness +
     // persist succeed makes a persist failure leave NO orphan log entry.
 
-    // Record the committed A-side saga (the idempotency witness) and Class-S
-    // persist fail-closed BEFORE the append: a crash that rolled the settle/marker
-    // back behind an acked Commit-A would double-settle on replay. On persist
-    // failure roll the witness back; the settle already mutated owned economy
-    // (`mutated = true`) but NO `CrossContextToolInvoked` was appended, so there
-    // is no orphan log entry — the FSM retry re-acks from the (now-absent) witness
-    // and the saga resolves correctly with no silent one-sided A-record.
-    state
-        .class_s
-        .xctx_committed_invocations
-        .insert(req.saga_id.clone());
-    // Consume the durable caller-reservation record in the SAME Class-S snapshot
-    // as the commit witness: the reservation has just been SETTLED via the
-    // carrier, so a surviving record would let a later spurious abort reverse
-    // already-settled state. Re-stash it on a persist failure so the
-    // witness-insert + record-removal roll back together (both are part of the
-    // single fail-closed snapshot — the saga is then retried from a clean state).
-    let consumed_record = state.class_s.xctx_caller_reservations.remove(&req.saga_id);
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
-        state
-            .class_s
+    // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
+    // the idempotency witness + Class-S persist land BEFORE the
+    // `CrossContextToolInvoked` event-log append. The same persist-fail-direction
+    // mismatch as `commit_b_first_settle` applies here, so this site uses the SAME
+    // two-combinator decomposition — see FLAG-COMMIT-B. `commit_class_s_then_append`
+    // would KEEP the witness on a persist failure; Commit-A must RESTORE it (roll
+    // the witness back AND re-stash the consumed record). Decomposition:
+    //   (1) `commit_class_s_restore` — insert the witness + remove the durable
+    //       caller-reservation record, fail-closed persist; on persist failure
+    //       RESTORE both (witness un-inserted, record re-inserted) — byte-identical
+    //       to the prior inline rollback, reported `err_mutated` (the settle above
+    //       already mutated owned economy).
+    //   (2) the leaf build + append run AFTER (1); on either failure the
+    //       compensation rolls back the WITNESS ONLY (the consumed record stays
+    //       consumed — matching the prior leaf/append arms, which re-insert the
+    //       witness but NOT the record) and re-persists via `commit_class_s_keep`
+    //       (keep on re-persist failure ⇒ witness stays durable, the prior
+    //       `err_mutated` terminal).
+
+    // (1) Record the committed A-side saga (the idempotency witness) and consume
+    // the durable caller-reservation record in the SAME Class-S snapshot, then
+    // persist fail-closed BEFORE the append. A crash that rolled the settle/marker
+    // back behind an acked Commit-A would double-settle on replay; the consumed
+    // record (the reservation was just SETTLED via the carrier) must go in the
+    // same snapshot so a surviving record can never let a later spurious abort
+    // reverse already-settled state. On persist failure `commit_class_s_restore`
+    // rolls BOTH back together (witness removed, record re-inserted) and the saga
+    // is retried from a clean state. The settle already mutated owned economy and
+    // NO `CrossContextToolInvoked` was appended, so the failure is reported
+    // `err_mutated` with no orphan log entry.
+    if let Err(persist_err) = cell.commit_class_s_restore(deps, &caller_hex, |mut view| {
+        let class_s = view.class_s_mut();
+        class_s
             .xctx_committed_invocations
-            .remove(&req.saga_id);
-        if let Some(record) = consumed_record {
-            state
-                .class_s
-                .xctx_caller_reservations
-                .insert(req.saga_id.clone(), record);
-        }
+            .insert(req.saga_id.clone());
+        class_s.xctx_caller_reservations.remove(&req.saga_id);
+        Ok(())
+    }) {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
     }
 
-    // Build the convergent `CrossContextToolInvoked` leaf (timestamp + payload
+    // (2) Build the convergent `CrossContextToolInvoked` leaf (timestamp + payload
     // bytes) from the forwarded receipt + request. A malformed receipt or
-    // serialization failure here is a post-witness fault: roll the witness back
-    // and re-persist (identical compensation to the append-failure path below)
-    // so a retry re-runs Commit-A from a clean state rather than skipping the
-    // append forever.
-    let (invoked_leaf_secs, invoked_payload_bytes) = match cross_context_invoked_leaf(
+    // serialization failure here is a post-witness fault handled by the SAME
+    // witness-only rollback + re-persist as the append-failure path below.
+    let leaf = cross_context_invoked_leaf(
         &req.receipt,
         &req.saga_id.0,
         &req.target_context_id,
         &req.nonce,
         &req.output_bytes,
-    ) {
-        Ok(leaf) => leaf,
-        Err(err) => {
-            state
-                .class_s
+    );
+    let append_result = match leaf {
+        Ok((invoked_leaf_secs, invoked_payload_bytes)) => {
+            deps.event_log.append_context_event_with_payload(
+                &req.caller_context_id,
+                scp_event_log::EventType::CrossContextToolInvoked,
+                req.caller_did.as_ref(),
+                scp_event_log::EventPayload {
+                    data: invoked_payload_bytes,
+                },
+                invoked_leaf_secs,
+            )
+        }
+        Err(err) => Err(err),
+    };
+
+    if let Err(append_err) = append_result {
+        // The leaf build or append failed AFTER the witness + persist landed. Roll
+        // the WITNESS back (the consumed record stays consumed — the prior arms
+        // re-inserted the witness but NOT the record) and RE-PERSIST so the
+        // rolled-back state is durable — otherwise the next Commit-A would see the
+        // already-persisted witness, re-ack as committed, and SKIP the append
+        // forever (a missing `CrossContextToolInvoked`). With the compensating
+        // re-persist, a retry re-runs Commit-A and appends exactly once. The
+        // rollback+re-persist is a fail-closed Class-S commit — `commit_class_s_keep`
+        // keeps it on a re-persist failure (witness stays durable, a genuine
+        // fail-closed terminal the operator / crash-recovery sweep reconciles).
+        // Mirrors `commit_b_first_settle`'s append-failure compensation. Both arms
+        // reply + return `err_mutated`.
+        let (reply_err, sketch) = match cell.commit_class_s_keep(deps, &caller_hex, |mut view| {
+            view.class_s_mut()
                 .xctx_committed_invocations
                 .remove(&req.saga_id);
-            if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
-                let sketch = outcome_error_sketch(&persist_err);
-                let _ = reply.send(Err(persist_err));
-                return Outcome::err_mutated(sketch);
+            Ok(())
+        }) {
+            Ok(()) => {
+                let sketch = outcome_error_sketch(&append_err);
+                (append_err, sketch)
             }
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            return Outcome::err_mutated(sketch);
-        }
-    };
-    if let Err(err) = deps.event_log.append_context_event_with_payload(
-        &req.caller_context_id,
-        scp_event_log::EventType::CrossContextToolInvoked,
-        req.caller_did.as_ref(),
-        scp_event_log::EventPayload {
-            data: invoked_payload_bytes,
-        },
-        invoked_leaf_secs,
-    ) {
-        // The append failed AFTER the witness + persist landed. Roll the witness
-        // back and RE-PERSIST so the rolled-back state is durable — otherwise the
-        // next Commit-A would see the already-persisted witness, re-ack as
-        // committed, and SKIP the append forever (a missing
-        // `CrossContextToolInvoked`). With the compensating re-persist, a retry
-        // re-runs Commit-A and appends exactly once. If the compensating persist
-        // ALSO fails the witness stays durable (a genuine fail-closed terminal —
-        // the operator / crash-recovery sweep reconciles), reported `mutated`.
-        // Mirrors `commit_b_first_settle`'s append-failure compensation.
-        state
-            .class_s
-            .xctx_committed_invocations
-            .remove(&req.saga_id);
-        if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
-            let sketch = outcome_error_sketch(&persist_err);
-            let _ = reply.send(Err(persist_err));
-            return Outcome::err_mutated(sketch);
-        }
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
+            Err(persist_err) => {
+                let sketch = outcome_error_sketch(&persist_err);
+                (persist_err, sketch)
+            }
+        };
+        let _ = reply.send(Err(reply_err));
         return Outcome::err_mutated(sketch);
     }
 
@@ -1925,11 +2092,28 @@ async fn abort(
     reservation: Option<PreparedAFields>,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `xctx_caller_reservations` / `saga_pending` combinators; for now
-    // the bare `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
-    let context_hex = hex_context_id(&state.context_id);
+    // ── FLAG-ABORT (keep direction + inline Class-S removes — reviewer sign-off) ─
+    // Abort does NOT cleanly fit one combinator. Its caller-side
+    // `xctx_caller_reservations` removes are INTERLEAVED with order-critical async
+    // EXTERNAL effects (escrow void via `rollback_tool_economy_generation_checked`
+    // / `reverse_caller_reservation_record`): the `None` (crash-recovery) arm must
+    // REMOVE the record to obtain it, THEN async-reverse FROM it; and the whole
+    // reversal must run BEFORE the fail-closed persist so the crash-window
+    // void→persist ordering is preserved (persist-then-void would change the
+    // crash-window semantics). A sync combinator `f` cannot host the async
+    // reversal, so those Class-S removes stay inline on `state_mut()` here — they
+    // are nonetheless fail-closed-persisted by the `commit_class_s_keep` that
+    // follows (the persist they always shared). Only the deferrable, async-free
+    // `saga_pending` clear is hoisted into the combinator `f`.
+    //
+    // KEEP direction: on a persist FAILURE today's abort does NOT roll anything
+    // back — the reversal + removes + slot clear stay applied and it returns
+    // `err_mutated` (the durable deduction was already persisted at Prepare-A, so
+    // the in-memory refund must NOT be un-applied — un-applying would re-open the
+    // over-charge a respawn-from-durable would itself fix). So this is `*_keep`,
+    // NOT `*_restore` (the roadmap's default-suggested combinator for abort) —
+    // flagged here as a deliberate, behaviour-preserving deviation.
+    let context_hex = hex_context_id(&cell.context_id);
 
     // CALLER side: release the held escrow + outbound-RL reservation (RAII). The
     // durable `xctx_caller_reservations` record is CONSUMED on every caller-side
@@ -1980,7 +2164,7 @@ async fn abort(
         Some(prepared) => {
             let carrier_ran =
                 crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-                    state,
+                    cell.state_mut(),
                     deps,
                     prepared.reservation.generation,
                     prepared.reservation.ticket,
@@ -1998,11 +2182,12 @@ async fn abort(
             // once and the record is removed exactly once.
             let local_ran = if carrier_ran {
                 true
-            } else if let Some(record) =
-                state.class_s.xctx_caller_reservations.get(saga_id).cloned()
+            } else if let Some(record) = cell.class_s.xctx_caller_reservations.get(saga_id).cloned()
             {
                 crate::context::tools_helpers::reverse_caller_reservation_record(
-                    state, deps, &record,
+                    cell.state_mut(),
+                    deps,
+                    &record,
                 )
                 .await
             } else {
@@ -2012,8 +2197,10 @@ async fn abort(
             };
             // Consume the durable record. Its removal is an owned mutation that
             // MUST be persisted so a later spurious crash-abort cannot reverse an
-            // already-released reservation from a stale record.
-            let consumed = state
+            // already-released reservation from a stale record. Inline (see
+            // FLAG-ABORT) — it is fail-closed-persisted by the combinator below.
+            let consumed = cell
+                .state_mut()
                 .class_s
                 .xctx_caller_reservations
                 .remove(saga_id)
@@ -2031,11 +2218,20 @@ async fn abort(
             // reverses are rehydrated from ONE snapshot into the same
             // `context_id`-routed actor, keyed by `record.actor_did` + the
             // `SagaId` — not on a generation check. Returns whether the local
-            // reversal ran (always `true` for a present record on this path).
-            match state.class_s.xctx_caller_reservations.remove(saga_id) {
+            // reversal ran (always `true` for a present record on this path). The
+            // remove must precede the async reverse (it yields the record), so it
+            // stays inline (see FLAG-ABORT) — persisted by the combinator below.
+            match cell
+                .state_mut()
+                .class_s
+                .xctx_caller_reservations
+                .remove(saga_id)
+            {
                 Some(record) => {
                     let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
-                        state, deps, &record,
+                        cell.state_mut(),
+                        deps,
+                        &record,
                     )
                     .await;
                     (ran, true)
@@ -2045,9 +2241,12 @@ async fn abort(
         }
     };
 
-    // TARGET side: clear the staged tool-session slot (releases the session
-    // reservation). Idempotent — a missing slot is a clean no-op.
-    let had_slot = state.class_s.saga_pending.remove(saga_id).is_some();
+    // TARGET side: whether a staged tool-session slot is present (cleared below).
+    // Peeked (not yet removed) so the no-mutation gate can decide BEFORE the
+    // combinator; the actual clear is the combinator `f`'s Class-S mutation. A
+    // missing slot is a clean no-op (the gate skips the combinator, and there is
+    // nothing to remove).
+    let had_slot = cell.class_s.saga_pending.contains_key(saga_id);
 
     // Persist if the caller-side owned economy was refunded (`local_rollback_ran`),
     // a durable caller record was consumed (`had_caller_record_consumed` — its
@@ -2065,10 +2264,19 @@ async fn abort(
         return Outcome::ok(());
     }
 
-    // Class-S sync-persist fail-closed before acking: the refunded economy
-    // and/or cleared slot MUST durably land so a crash respawn neither
-    // over-charges the caller nor re-stages a stale saga.
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_hex) {
+    // Class-S sync-persist fail-closed before acking, KEEPING the in-memory
+    // reversal/removals on a persist failure (the refunded economy + consumed
+    // record + cleared slot stay applied — un-applying would re-open the
+    // over-charge a respawn-from-durable already corrects). `commit_class_s_keep`
+    // clears the staged slot in `f` (the deferrable, async-free Class-S mutation)
+    // and performs the single fail-closed persist that also covers the inline
+    // caller-reservation removes above. On failure it returns the persist error
+    // without restoring — byte-identical to the prior inline persist-failure
+    // arm's `err_mutated`.
+    if let Err(persist_err) = cell.commit_class_s_keep(deps, &context_hex, |mut view| {
+        view.class_s_mut().saga_pending.remove(saga_id);
+        Ok(())
+    }) {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
