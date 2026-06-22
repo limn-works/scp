@@ -793,6 +793,27 @@ impl PerContextState {
         self.governance = model.to_owned();
     }
 
+    /// Test-only: set the lifecycle state string (e.g. `"closing"`), so
+    /// sibling-module cross-impl tests can drive `finalize_close`.
+    #[cfg(test)]
+    pub(crate) fn test_set_state(&mut self, state: &str) {
+        self.state = state.to_owned();
+    }
+
+    /// Test-only: set the convergent creation timestamp (seconds), the TTL
+    /// deadline base for `handle_ttl_expiry`.
+    #[cfg(test)]
+    pub(crate) fn test_set_creation_timestamp_secs(&mut self, secs: u64) {
+        self.creation_timestamp_secs = secs;
+    }
+
+    /// Test-only: set the TTL window (seconds). With a creation timestamp this
+    /// fixes the convergent `ContextExpired` leaf timestamp.
+    #[cfg(test)]
+    pub(crate) fn test_set_ttl_seconds(&mut self, ttl: Option<u64>) {
+        self.ttl_seconds = ttl;
+    }
+
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
     /// at [`WASM_RESOLVED_PROPOSAL_CAP`].
     fn insert_resolved_proposal(&mut self, id: String, proposal: GovernanceProposal) {
@@ -1247,6 +1268,17 @@ impl WasmContextManager {
         self.contexts
             .get(context_id)
             .map(|ctx| ctx.event_log_events().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: the current Merkle root of a registered context's event log.
+    /// Used by cross-impl system-leaf parity tests to compare the WASM
+    /// real-producer root against the native-reference single-leaf root.
+    #[cfg(test)]
+    pub(crate) fn test_context_event_log_root(&self, context_id: &str) -> [u8; 32] {
+        self.contexts
+            .get(context_id)
+            .map(PerContextState::test_event_log_root)
             .unwrap_or_default()
     }
 
@@ -5102,7 +5134,12 @@ impl WasmContextManager {
             None => crate::time::now_secs(),
         };
 
-        ctx.append_log_event(EventType::ContextExpired, "", b"", expiry_leaf_secs);
+        ctx.append_log_event(
+            EventType::ContextExpired,
+            "system:timer",
+            b"",
+            expiry_leaf_secs,
+        );
 
         Ok(())
     }
@@ -5848,8 +5885,16 @@ impl WasmContextManager {
             })
         });
 
-        // Clamp timestamps to `now` so snapshot forgery cannot push them
-        // into the future and evade TTL eviction.
+        // Clamp ONLY the anti-replay timestamps to `now` so snapshot forgery
+        // cannot push them into the future: the per-nonce `seen_nonces_v3`
+        // `inserted_at_ms` and the per-proposal `executed_at_ms` (both `.min(now)`
+        // below). `ttl_seconds` and `creation_timestamp_secs` are NOT clamped —
+        // `creation_timestamp_secs` is consumed VERBATIM (see the assignment
+        // further down) because the convergent TTL deadline base
+        // (`creation_timestamp_secs + ttl_seconds`) must be byte-identical across
+        // members and bridges (§9.9.3); clamping it would diverge the
+        // `ContextExpired` leaf. A forged future creation time only shortens the
+        // effective deadline (fail-safe), so it needs no clamp here.
         let now_ms_for_clamp = crate::time::now_ms();
         let ctx = PerContextState {
             state: snap.state.clone(),
@@ -6007,7 +6052,7 @@ impl WasmContextManager {
 
         ctx.append_log_event(
             EventType::ContextClosed,
-            "system",
+            "system:close",
             b"",
             // Convergent close instant (§7.3.1, §9.9.3).
             crate::time::now_secs(),

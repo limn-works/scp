@@ -878,7 +878,7 @@ mod tests {
 // answer; together they prove the two impls emit byte-identical leaves.
 // ===========================================================================
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod cross_impl_leaf_parity {
     /// `GovernanceActionExecuted`: WASM's real value extraction + shared
     /// `GovernanceActionExecutedPayload` + `encode_payload` (the exact code at
@@ -1135,5 +1135,154 @@ mod cross_impl_leaf_parity {
                  with an EMPTY payload (§9.9.3 native↔WASM parity)"
             );
         }
+    }
+
+    /// Reconstructs the native-reference leaf bytes for a single system event
+    /// from the SHARED `scp_event_log` primitives — the exact preimage native's
+    /// real producer (`ttl.rs`'s `handle_ttl_expiry` / `finalize_close`) feeds
+    /// `tree::append_unsigned_event`: `Event { event_type, actor_did,
+    /// timestamp, sequence: 0, payload: empty, prev_hash: GENESIS, signature:
+    /// [] }`. The leaf hash is `SHA-256(0x00 ‖ rmp_serde(Event))`, so a single
+    /// such append's `tree::root` is exactly that leaf hash. The WASM real
+    /// producer must reproduce this byte-for-byte.
+    #[cfg(test)]
+    fn native_reference_single_system_leaf_root(
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        timestamp: u64,
+    ) -> [u8; 32] {
+        use scp_event_log::tree::{append_unsigned_event, root};
+        use scp_event_log::{DID, Event, EventLog, EventPayload};
+
+        let mut log = EventLog::new(context_id.to_owned());
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence: 0,
+            payload: EventPayload { data: Vec::new() },
+            prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+        append_unsigned_event(&mut log, &event).expect("reference system leaf append");
+        root(&log)
+    }
+
+    /// §9.9.3 native↔WASM SYSTEM-LEAF parity. The WASM bridge's REAL producers
+    /// (`handle_ttl_expiry` → `ContextExpired`, `finalize_close` →
+    /// `ContextClosed`) MUST stamp the SAME descriptive `actor_did` sentinels
+    /// native's `ttl.rs` stamps (`"system:timer"` / `"system:close"`), at the
+    /// same convergent timestamp — so the same event produces a byte-identical
+    /// leaf hash and therefore an identical single-leaf Merkle root.
+    ///
+    /// A non-vacuity control proves the assertion bites: a leaf reconstructed
+    /// with the PRE-FIX sentinels (`""` for expiry, `"system"` for close) yields
+    /// a DIFFERENT root, i.e. the old WASM bytes diverged from native.
+    #[test]
+    fn cross_impl_system_leaf_actor_did_parity_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+
+        // ---- ContextExpired (TTL fire) ----
+        let creation = 1_700_000_000_u64;
+        let ttl = 86_400_u64;
+        let expiry_ts = creation + ttl; // the convergent deadline WASM stamps.
+
+        let expiry_ctx = "ctx-sysleaf-expiry";
+        let mut expiry_state = make_bare_per_context_state(expiry_ctx, "did:dht:zcreator");
+        expiry_state.test_set_creation_timestamp_secs(creation);
+        expiry_state.test_set_ttl_seconds(Some(ttl));
+        let mut expiry_mgr = WasmContextManager::new();
+        expiry_mgr.test_insert_context(expiry_ctx, expiry_state);
+        expiry_mgr
+            .handle_ttl_expiry(expiry_ctx)
+            .expect("real WASM ttl-expiry producer");
+
+        let expiry_leaves = expiry_mgr.test_context_event_log_events(expiry_ctx);
+        let expiry_leaf = expiry_leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextExpired)
+            .expect("ContextExpired leaf present after handle_ttl_expiry");
+        assert_eq!(
+            expiry_leaf.actor_did.as_ref(),
+            "system:timer",
+            "WASM ContextExpired leaf MUST stamp the native sentinel \"system:timer\" (§9.9.3)"
+        );
+        assert_eq!(expiry_leaf.timestamp, expiry_ts);
+
+        // The WASM real-producer root equals the native-reference single-leaf
+        // root reconstructed from the shared primitives.
+        assert_eq!(
+            expiry_mgr.test_context_event_log_root(expiry_ctx),
+            native_reference_single_system_leaf_root(
+                expiry_ctx,
+                EventType::ContextExpired,
+                "system:timer",
+                expiry_ts,
+            ),
+            "WASM ContextExpired real-producer leaf MUST be byte-identical to native's \
+             \"system:timer\" reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX empty sentinel would diverge.
+        assert_ne!(
+            expiry_mgr.test_context_event_log_root(expiry_ctx),
+            native_reference_single_system_leaf_root(
+                expiry_ctx,
+                EventType::ContextExpired,
+                "",
+                expiry_ts,
+            ),
+            "the pre-fix empty actor_did MUST diverge from the aligned \"system:timer\" leaf"
+        );
+
+        // ---- ContextClosed (finalize close) ----
+        let close_ctx = "ctx-sysleaf-close";
+        let mut close_state = make_bare_per_context_state(close_ctx, "did:dht:zcreator");
+        // `finalize_close` requires the context to be in the `closing` state.
+        close_state.test_set_state("closing");
+        let mut close_mgr = WasmContextManager::new();
+        close_mgr.test_insert_context(close_ctx, close_state);
+        close_mgr
+            .finalize_close(close_ctx)
+            .expect("real WASM finalize_close producer");
+
+        let close_leaves = close_mgr.test_context_event_log_events(close_ctx);
+        let close_leaf = close_leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextClosed)
+            .expect("ContextClosed leaf present after finalize_close");
+        assert_eq!(
+            close_leaf.actor_did.as_ref(),
+            "system:close",
+            "WASM ContextClosed leaf MUST stamp the native sentinel \"system:close\" (§9.9.3)"
+        );
+
+        // `finalize_close` stamps `now_secs()`; pin the parity + non-vacuity at
+        // that landed timestamp (read back from the real leaf) so the leaf-byte
+        // comparison is independent of the test clock.
+        let close_ts = close_leaf.timestamp;
+        assert_eq!(
+            close_mgr.test_context_event_log_root(close_ctx),
+            native_reference_single_system_leaf_root(
+                close_ctx,
+                EventType::ContextClosed,
+                "system:close",
+                close_ts,
+            ),
+            "WASM ContextClosed real-producer leaf MUST be byte-identical to native's \
+             \"system:close\" reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX `"system"` sentinel would diverge.
+        assert_ne!(
+            close_mgr.test_context_event_log_root(close_ctx),
+            native_reference_single_system_leaf_root(
+                close_ctx,
+                EventType::ContextClosed,
+                "system",
+                close_ts,
+            ),
+            "the pre-fix \"system\" actor_did MUST diverge from the aligned \"system:close\" leaf"
+        );
     }
 }
