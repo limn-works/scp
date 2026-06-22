@@ -664,12 +664,19 @@ async fn handle_execute_governance_action_actor(
     let proposal = payload.proposal;
 
     let execute_fut = async move {
+        // Direct-execute command (no quorum-crossing voter in the payload): the
+        // executor is the proposer, matching the auto-execute convention where
+        // proposer == committer (ADR-031 §7.3.1 / §8). The quorum-approval path
+        // that distinguishes voter from proposer lives in
+        // `vote_on_proposal_inner`, not this direct entry point.
+        let executor_did = proposal.proposer_did.clone();
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
                 state,
                 deps,
                 &payload.context_id,
                 &proposal,
+                &executor_did,
             ),
         )
         .await

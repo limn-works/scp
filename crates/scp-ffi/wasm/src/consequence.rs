@@ -1285,4 +1285,87 @@ mod cross_impl_leaf_parity {
             "the pre-fix \"system\" actor_did MUST diverge from the aligned \"system:close\" leaf"
         );
     }
+
+    /// §9.9.3 native↔WASM `GovernanceActionExecuted` EXECUTOR-stamp parity.
+    /// Drives the REAL WASM quorum-approval handlers: a 3-member `majority`
+    /// context (quorum = 2) where the proposer's self-vote is approval #1
+    /// (Pending) and a SECOND admin's approval is #2 — crossing quorum and
+    /// committing the action. The committing member (the quorum-crossing VOTER)
+    /// — NOT the proposer — MUST be stamped as the `GovernanceActionExecuted`
+    /// leaf `actor_did` (ADR-031 §8 "executor DID" / §7.3.1 "committing member"
+    /// / ADR-051 §6). Native's `vote_on_proposal_inner` stamps the same voter;
+    /// stamping the proposer (the pre-fix behavior) would diverge the leaf.
+    #[test]
+    fn cross_impl_governance_action_executed_stamps_executor_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-executor";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // 3-member majority: quorum = 3/2 + 1 = 2. Proposer self-vote = #1
+        // (Pending); the voter's approval = #2 → crosses quorum → executes,
+        // with the VOTER as the committing member.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(proposer, "admin");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // A target action distinct from both proposer and voter keeps the
+        // leaf actor (executor) unambiguously the voter, not the target.
+        ctx.test_insert_ceiling("role:assign");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkMemberC".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        let propose_result = mgr
+            .propose_governance_action(context_id, proposer, proposal_id, &action)
+            .unwrap();
+        assert_eq!(
+            propose_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "proposer self-vote (1 of quorum 2) must leave the proposal Pending"
+        );
+
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .unwrap();
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "voter approval crosses majority quorum (2 of 2) and commits the action"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed_leaf = logged
+            .iter()
+            .find(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted leaf present after quorum-crossing approval");
+        assert_eq!(
+            executed_leaf.actor_did.as_ref(),
+            voter,
+            "the GovernanceActionExecuted leaf actor_did MUST be the quorum-crossing executor \
+             (voter), NOT the proposer (§9.9.3 native↔WASM convergence; ADR-031 §8 executor DID)"
+        );
+        assert_ne!(
+            executed_leaf.actor_did.as_ref(),
+            proposer,
+            "non-vacuity: proposer != voter, so stamping the proposer would be a distinct \
+             (divergent) leaf actor_did"
+        );
+    }
 }

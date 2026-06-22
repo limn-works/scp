@@ -4051,20 +4051,24 @@ impl WasmContextManager {
         );
 
         if meets_quorum {
-            // Remove from pending and execute.
+            // Move pending → resolved (marking Approved) BEFORE executing, so
+            // the proposal is still tracked when `execute_governance_action`
+            // resolves the convergent `GovernanceActionExecuted` leaf timestamp
+            // from `proposal.created_at` (it looks up pending-or-resolved). On
+            // auto-execute the proposer IS the committing member, so the
+            // executor is the proposer (matches native's propose auto-execute).
             let proposal = self
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(mut p) = proposal {
                 let action_ref = p.action.clone();
-                let result =
-                    self.execute_governance_action(context_id, proposer_did, &pid, &action_ref)?;
-                // Move to resolved_proposals for later retrieval.
                 p.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
                     ctx.insert_resolved_proposal(pid.clone(), p);
                 }
+                let result =
+                    self.execute_governance_action(context_id, proposer_did, &pid, &action_ref)?;
                 return Ok(serde_json::json!({
                     "proposal_id": pid,
                     "status": "Approved",
@@ -4177,21 +4181,31 @@ impl WasmContextManager {
         let pid = proposal_id.to_owned();
 
         if meets_quorum {
-            // Remove from pending and execute.
+            // Move pending → resolved (marking Approved) BEFORE executing, so
+            // the proposal is still tracked when `execute_governance_action`
+            // resolves the convergent `GovernanceActionExecuted` leaf timestamp
+            // from `proposal.created_at` (it looks up pending-or-resolved). If
+            // it were removed first, execute would fail its
+            // proposal-is-tracked guard and could never mint the executed leaf.
             let proposal = self
                 .contexts
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(mut p) = proposal {
                 let action_ref = p.action.clone();
-                let proposer = p.proposer_did.0.clone();
-                let result =
-                    self.execute_governance_action(context_id, &proposer, &pid, &action_ref)?;
-                // Move to resolved_proposals for later retrieval.
                 p.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
                     ctx.insert_resolved_proposal(pid.clone(), p);
                 }
+                // The executor is the quorum-crossing VOTER (the committing
+                // member), NOT the proposer — `execute_governance_action`
+                // stamps `initiator_did` as the `GovernanceActionExecuted` leaf
+                // `actor_did` (ADR-031 §8 "executor DID" / §7.3.1 "committing
+                // member" / ADR-051 §6). Passing the proposer here would diverge
+                // the leaf from native's quorum path, which stamps the voter
+                // (§9.9.3 native↔WASM convergence).
+                let result =
+                    self.execute_governance_action(context_id, voter_did, &pid, &action_ref)?;
                 return Ok(serde_json::json!({
                     "status": "Approved",
                     "execution_result": result,
