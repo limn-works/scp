@@ -27,7 +27,8 @@ use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_e
 /// also satisfies the `WarningCount` trigger's `actor_did != subject_did`
 /// requirement so subsequent rule evaluation can match prior enforcements
 /// against the same target.
-pub(super) const CONSEQUENCE_ACTOR_DID: &str = "system";
+pub(super) const CONSEQUENCE_ACTOR_DID: &str =
+    scp_event_log::system_actors::SYSTEM_CONSEQUENCE_ACTOR;
 
 // The canonical wire-stable `trigger_kind` / `action_type` labels and the
 // durable consequence-leaf payload bytes are produced by SHARED code so the

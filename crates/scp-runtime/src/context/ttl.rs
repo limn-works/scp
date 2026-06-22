@@ -676,7 +676,7 @@ pub async fn finalize_close(
     event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextClosed,
-        "system:close",
+        scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
         timestamp_secs,
     )?;
 
@@ -873,7 +873,7 @@ pub async fn try_ttl_expiry_cleanup(
         match event_log.append_context_event(
             &context_id_bytes,
             scp_event_log::EventType::ContextExpired,
-            "system:timer",
+            scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
             expiry_deadline_secs,
         ) {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
