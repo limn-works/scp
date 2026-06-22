@@ -409,10 +409,24 @@ async fn prepare_a(
 ) -> Outcome<()> {
     let context_id_hex = hex_context_id(caller_context_id);
 
-    // ADR-049 §9 Class-S cell seam: the cell is held so the spending-nonce-bearing
-    // `reserve_tool_economy` leaf receives it; every other mutation in this body
-    // re-derives the bare `&mut PerContextState` via `cell.state_mut()` so the NLL
-    // borrow ends before the next `cell`-taking call. Behaviour is unchanged.
+    // ── FLAG-PREPARE-A-SEAM (read gate + step-2 Class-C consume) ─────────────
+    // The cell is held so the spending-nonce-bearing `reserve_tool_economy` leaf
+    // receives it (it routes its OWN Class-S consume through a combinator); this
+    // `state` re-derives the bare `&mut PerContextState` for (1) the read-only
+    // outbound-caller gate and (2) the §6.2.0.2 outbound-rate window consume on
+    // `governance.tool_interfaces` (Class-C). Like FLAG-PREPARE-B-CHECKS, the
+    // consume is BLOCKED from a combinator under the saga.rs-only, behaviour-
+    // preserving constraint: on the SUCCESS path it carries NO own persist (it
+    // falls through to the `reserve_tool_economy` / staging combinators, which
+    // persist it), so any combinator wrapper would add an extra durable write; on
+    // the over-budget REJECT path it persists fail-closed + replies `err_mutated`
+    // (the partial-increment-durably-lands arm), a CONDITIONAL persist that no
+    // combinator's fixed persist-on-`Ok` / persist-never shape expresses. So the
+    // gate + consume stay on the bare `&mut PerContextState`; the NLL borrow ends
+    // before the next `cell`-taking call. Terminal-PR fix mirrors
+    // FLAG-PREPARE-B-CHECKS: a view-only `ClassCMut` accessor that mutates
+    // Class-C WITHOUT a persist (deferring it) lets the consume reach
+    // `governance.tool_interfaces` without `state_mut()`. Behaviour is unchanged.
     let state = cell.state_mut();
 
     // 1. Caller must hold `tool:interface` AND be in the interface's outbound
@@ -462,8 +476,7 @@ async fn prepare_a(
     //    gate and §7 proof live on B's Prepare-B side.
     let now_secs = deps.clock.now_secs();
     // `reserve_tool_economy` is the spending-nonce-bearing leaf and takes the
-    // cell; the prior `state` borrow has ended (NLL) so `cell` is free here. The
-    // post-reserve body re-derives the bare `&mut PerContextState` below.
+    // cell; the prior `state` borrow has ended (NLL) so `cell` is free here.
     let reservation =
         match reserve_tool_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await {
             Ok(reservation) => reservation,
@@ -472,7 +485,9 @@ async fn prepare_a(
                 // every failure branch, so no escrow/velocity/budget leaked. The
                 // §6.2.0.2 budget consumed above is NOT rolled back (non-refundable
                 // at initiation); persist so it durably lands, then reply.
-                let _ = persist_state_fail_closed(cell.state_mut(), deps, &context_id_hex);
+                // `persist_state_fail_closed` takes a SHARED `&PerContextState`, so
+                // this reads through the cell's `Deref` (`&*cell`) — no `state_mut()`.
+                let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex);
                 let sketch = outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 return Outcome::err_mutated(sketch);
@@ -529,6 +544,20 @@ async fn prepare_a(
         // the RAII release: reverse the Class-C economy + void the external
         // escrow from the still-owned reservation, exactly as the prior inline
         // path did.
+        // ── FLAG-PREPARE-A-ROLLBACK (out-of-scope async helper) ──────────────
+        // `rollback_tool_economy` takes a bare `&mut PerContextState`, mutates
+        // Class-C governance fields (`velocity_tracker` / `budget_tracker` /
+        // `hard_rate_limit`), and `.await`s an EXTERNAL escrow void. A combinator
+        // closure is SYNC, so this cannot run inside one; the combinator async
+        // hooks (`compensate` / `on_persist_failure`) hand a `ClassCMut`, but
+        // `rollback_tool_economy` is defined in `tools_helpers.rs` and takes a
+        // whole `&mut PerContextState` — re-deriving that from a `ClassCMut` is
+        // impossible. BLOCKED until the terminal PR re-signatures the economy
+        // helpers (`rollback_tool_economy` / `settle_tool_economy` /
+        // `rollback_tool_economy_generation_checked` /
+        // `reverse_caller_reservation_record`) to take the field-granular
+        // `ClassCMut` governance accessors instead of `&mut PerContextState`
+        // (out of scope: lives in `tools_helpers.rs`, not saga.rs).
         crate::context::tools_helpers::rollback_tool_economy(
             cell.state_mut(),
             deps,
@@ -829,12 +858,37 @@ async fn prepare_b(
     req: PrepareBRequest,
     reply: tokio::sync::oneshot::Sender<Result<PreparedBFields, ContextError>>,
 ) -> Outcome<()> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the `xctx_nonce_dedup` / `saga_pending` combinators; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
+    // ── FLAG-PREPARE-B-CHECKS (read gate + step-7 Class-C consume) ───────────
+    // This `state_mut()` backs the read-only validation gate (checks 1–6) AND
+    // the ONE Class-C mutation `run_prepare_b_checks` performs: step 7, the
+    // §6.2.0.2 inbound-rate sliding-window consume on `governance.tool_interfaces`.
+    // It is BLOCKED from migrating onto a combinator under this saga.rs-only,
+    // behaviour-preserving constraint, because the consume's two requirements
+    // are jointly unsatisfiable by any existing combinator:
+    //   (i)  it must NOT carry its own persist — on the success path its window
+    //        increment is persisted by the SUBSEQUENT `commit_class_s_keep`
+    //        staging combinator (one persist covers window + nonce + slot).
+    //        Routing it through `commit_class_c_best_effort` would add a SECOND
+    //        (best-effort) persist; through `commit_class_s_keep` a SECOND
+    //        (fail-closed) persist — either an extra durable write, a behaviour
+    //        change.
+    //   (ii) a check REJECT must surface as `Outcome::err` (no mutation, no slot
+    //        staged), DISTINCT from a later persist failure's `Outcome::err_mutated`
+    //        (slot staged, then rolled back). A combinator returns a single
+    //        `Result<T, ContextError>` that does NOT distinguish an `f`-reject
+    //        from a persist failure, so folding the gate into the staging
+    //        combinator's closure would CONFLATE the two arms and mis-map a
+    //        clean reject to `err_mutated` + a spurious `saga_pending.remove`.
+    // So the gate + consume stay on the bare `&mut PerContextState` here, OUTSIDE
+    // the staging combinator that follows. Terminal-PR fix (in `class_s.rs`):
+    // either a `commit_class_c_no_persist(|ClassCMut|) -> R` view-only accessor
+    // (mutate Class-C, defer the persist to a later combinator) so the consume
+    // can reach `governance.tool_interfaces` through `ClassCMut` without its own
+    // persist, OR a typed combinator error that distinguishes f-reject from
+    // persist-failure so the whole handler can fold into one combinator.
     let state = cell.state_mut();
     // Run every read-only check first (no state mutation, no `.await` holding a
-    // `&PerContextState` borrow). Helper returns the inputs needed to stage.
+    // `&PerContextState` borrow), then the step-7 inbound-rate consume.
     if let Err(err) = run_prepare_b_checks(state, deps, &req) {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -874,23 +928,31 @@ async fn prepare_b(
     //   (b) `saga_pending.insert` — RESTORE on persist failure. A staged slot
     //       that did not durably land must be removed so a retry re-stages
     //       cleanly and no orphaned reservation linkage survives.
-    // No single combinator expresses keep-one-field / restore-another (the
-    // snapshot/restore is all-or-nothing over the Class-S sub-structs — see
-    // `class_s.rs` module docs "Intra-Class-S keep-one-field / restore-another
-    // split"). The module docs offer two faithful options: (1) DECOMPOSE into a
-    // sequential `commit_class_s_keep` (nonce) then `commit_class_s_restore`
-    // (slot) — but that is TWO fail-closed persists where there is ONE today, a
-    // behaviour change whose intermediate-crash state would need its own
-    // recovery proof; or (2) preserve the CURRENT single-persist behaviour. The
-    // task directive is to preserve current behaviour, so this picks (2):
+    // No single EXISTING combinator expresses keep-one-field / restore-another:
+    // the `*_restore` snapshot/restore is all-or-nothing over the Class-S
+    // sub-structs, and `*_keep_compensating`'s `on_persist_failure` hook is
+    // handed a `ClassCMut` that STRUCTURALLY cannot reach `saga_pending`
+    // (Class-S) to remove it (see `class_s.rs` module docs "Intra-Class-S
+    // keep-one-field / restore-another split"). The faithful options are: (1)
+    // DECOMPOSE into a sequential `commit_class_s_keep` (nonce) then
+    // `commit_class_s_restore` (slot) — TWO fail-closed persists where there is
+    // ONE today, a behaviour change whose intermediate-crash state (nonce
+    // durable, slot not) would need its own recovery proof; (2) ADD a new
+    // field-granular keep-one/restore-another combinator to `class_s.rs` —
+    // OUT OF SCOPE for this saga.rs-only migration (and the cleanest terminal
+    // fix); or (3) preserve the CURRENT single-persist behaviour. The directive
+    // is to preserve current behaviour with no extra persist, so this keeps (3):
     // `commit_class_s_keep` performs the SINGLE fail-closed persist and KEEPS
     // both fields on failure (correct for the nonce); the slot's RESTORE
     // direction is then completed by removing it from `saga_pending` AFTER the
-    // combinator on the Err arm — byte-identical to the prior inline
-    // `saga_pending.remove(&req.saga_id)`. That post-combinator remove is a
-    // rollback of an UNPERSISTED forward mutation toward the durable state
-    // (which holds neither field, the persist having failed), not a new forward
-    // Class-S transition, so it needs no persist of its own.
+    // combinator on the Err arm. That post-combinator remove is a rollback of an
+    // UNPERSISTED forward mutation toward the durable state (which holds neither
+    // field, the persist having failed), not a new forward Class-S transition,
+    // so it needs no persist of its own. It is the LONE residual `state_mut()`
+    // in this handler and is BLOCKED from migration until option (2) lands in
+    // `class_s.rs` (the terminal `state_mut()`-deletion PR): minimal new shape =
+    // `commit_class_s_keep_restore_split(keep: |&mut ClassSState|, restore_on_fail:
+    // |&mut ClassSState|)` that snapshots ONLY the restore-targeted field.
     let target_hex = hex_context_id(&req.target_context_id);
     let saga_id = req.saga_id.clone();
     if let Err(persist_err) = cell.commit_class_s_keep(deps, &target_hex, |mut view| {
