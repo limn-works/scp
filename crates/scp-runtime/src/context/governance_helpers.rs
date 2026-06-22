@@ -4478,8 +4478,13 @@ pub fn finalize_governance_action(
         }
     }
 
-    // 4. Persist the updated context state (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // 4. Persistence is no longer performed here. ADR-049 §9 (authorized
+    // strengthening): the caller `execute_governance_action` now persists the
+    // whole post-finalize state via the deferred `ClassSCommitToken`'s
+    // FAIL-CLOSED `commit` (previously this was a best-effort persist), so the
+    // `executed_proposals` replay marker and every other finalize mutation are
+    // durable before the governance action is acknowledged. `state`, `deps`, and
+    // `context_id` remain used above (MLS-epoch / event-log append / cache).
 
     Ok(())
 }
@@ -4539,39 +4544,57 @@ pub async fn execute_governance_action(
         ));
     }
     let now = deps.clock.now_secs();
-    state
-        .governance
-        .class_s
-        .executed_proposals
-        .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
-    state
-        .governance
-        .class_s
-        .executed_proposals
-        .insert(proposal.proposal_id, now);
 
     // Governance action costing: no PaidActionType::GovernanceAction
     // variant exists yet. Governance actions are free until the economy
     // spec adds a governance cost tier. Tracked by #1537.
 
-    // The top `state` borrow has ended (NLL); hand the cell to the dispatch
-    // chain so the governance leaves it reaches can later migrate.
+    // ADR-049 §9 Class S: route the `executed_proposals` replay-marker
+    // (retain TTL + insert) through the DEFERRED-persist combinator. The mark is
+    // applied in memory now; its fail-closed persist is DEFERRED until the
+    // dispatch + finalize either succeed (committed below) or abort (the marker
+    // is un-marked, then the removal is itself committed fail-closed —
+    // keep-direction: the replay window must be closed durably whichever way it
+    // resolves). The top `state` borrow has ended (NLL) so the cell is free for
+    // the combinator and the downstream dispatch chain.
+    let ((), token) = cell.begin_class_s(context_id, |mut view| {
+        let class_s = view.governance_class_s_mut();
+        class_s
+            .executed_proposals
+            .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
+        class_s.executed_proposals.insert(proposal.proposal_id, now);
+        Ok(())
+    })?;
+
     let result = match dispatch_governance_action(cell, deps, context_id, proposal).await {
         Ok(r) => r,
         Err(e) => {
             // Roll back the executed marker on dispatch failure so the
             // proposal can be retried (e.g. after a transient crypto
-            // error).
+            // error), THEN persist that removal fail-closed (keep-direction:
+            // the un-mark must be durable so a crash cannot resurrect the
+            // marker and block the retry). The marker removal is the Class-S
+            // mutation the token now covers.
             cell.state_mut()
                 .governance
                 .class_s
                 .executed_proposals
                 .remove(&proposal.proposal_id);
+            token.commit(&*cell, deps, context_id)?;
             return Err(e);
         }
     };
 
-    finalize_governance_action(cell.state_mut(), deps, context_id, proposal)?;
+    // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
+    // own persist was best-effort; the executed-marker durability now rides the
+    // token's FAIL-CLOSED `commit` here instead. On a finalize error we still
+    // commit the token (keep-direction — the executed marker stays set and must
+    // persist) and surface the finalize error.
+    if let Err(e) = finalize_governance_action(cell.state_mut(), deps, context_id, proposal) {
+        token.commit(&*cell, deps, context_id)?;
+        return Err(e);
+    }
+    token.commit(&*cell, deps, context_id)?;
 
     Ok(result)
 }

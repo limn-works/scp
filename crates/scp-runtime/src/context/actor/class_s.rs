@@ -1107,6 +1107,221 @@ impl ClassSCell {
         self.state.class_s.restore(class_s_snap);
         self.state.governance.class_s.restore(gov_snap, &deps.clock);
     }
+
+    /// Run an EARLY Class-S mutation through a [`ClassSMut`] view and DEFER the
+    /// fail-closed persist, returning the mutation's value paired with a linear
+    /// [`ClassSCommitToken`] the caller MUST later [`commit`](ClassSCommitToken::commit)
+    /// (ADR-049 §9, keep-direction).
+    ///
+    /// # Why this combinator exists (deferred-persist Class-S sites)
+    ///
+    /// The persist-on-return combinators ([`Self::commit_class_s_keep`] etc.)
+    /// persist *immediately* when `f` returns. Some Class-S sites cannot do
+    /// that: they consume the security-critical state EARLY (e.g. a spending-UCAN
+    /// nonce burned in the economy-enforcement phase) but only learn whether the
+    /// whole operation will be acknowledged MUCH LATER, after intervening async
+    /// work (escrow authorization, MLS membership mutation, transport fan-out).
+    /// Persisting at `f`-return would durably commit the consume before those
+    /// steps could still abort and unwind it; deferring lets the SINGLE final
+    /// persist cover the consume regardless of which terminal path runs.
+    ///
+    /// `begin_class_s` performs the EARLY mutation now (through the same
+    /// fail-closed-capable [`ClassSMut`] view the persist-on-return combinators
+    /// use) but does NOT persist. Instead it hands back a [`ClassSCommitToken`]:
+    /// a `#[must_use]` linear handle whose [`commit`](ClassSCommitToken::commit)
+    /// performs the deferred [`persist_state_fail_closed`]. Every terminal path
+    /// the operation can take after `begin_class_s` MUST `commit` the token —
+    /// keep-direction: the burned nonce / executed marker must become durable on
+    /// EVERY exit, success or abort (un-persisting it would re-open the replay /
+    /// re-spend / re-execute window). There is deliberately NO `discard`/abort
+    /// helper.
+    ///
+    /// The `#[must_use]` attribute + the token's `Drop` guard (which
+    /// `debug_assert!`s + `tracing::error!`s on an un-`commit`-ed drop, exactly
+    /// mirroring [`crate::context::economy_logic::EconomyTicket`]) are the
+    /// backstop: a path that forgets to `commit` fails CI loudly rather than
+    /// silently acknowledging an unpersisted Class-S consume.
+    ///
+    /// Sequence:
+    /// 1. Run `f(view)`. If `f` returns `Err(e)`, return `Err(e)` immediately and
+    ///    issue NO token — a rejected operation staged no consume to discharge.
+    /// 2. On `Ok(value)`, return `(value, token)` WITHOUT persisting. The caller
+    ///    owns the deferred persist via [`ClassSCommitToken::commit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error (no token issued).
+    pub(crate) fn begin_class_s<T>(
+        &mut self,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+    ) -> Result<(T, ClassSCommitToken), ContextError> {
+        let value = f(ClassSMut::new(&mut self.state))?;
+        Ok((value, ClassSCommitToken::new(context_id)))
+    }
+
+    /// Like [`Self::begin_class_s`], but the early mutation is CONDITIONAL: `f`
+    /// reports (via the `bool` of its `Ok((value, did_mutate))`) whether a
+    /// Class-S mutation actually happened, and a [`ClassSCommitToken`] is issued
+    /// ONLY when it did (ADR-049 §9, keep-direction).
+    ///
+    /// The deferred-persist economy sites are conditional by nature: the
+    /// enforcement helper consumes a spending-UCAN nonce only on the PAID branch
+    /// (a non-zero cost AND a spending UCAN present); a FREE / best-effort send or
+    /// join burns no nonce. Returning `Ok((value, false))` from `f` on the free
+    /// branch yields `(value, None)` so that path stays token-free and keeps its
+    /// existing best-effort persist — only the paid branch (`Ok((value, true))`)
+    /// produces a token whose [`commit`](ClassSCommitToken::commit) must
+    /// fail-close.
+    ///
+    /// Sequence:
+    /// 1. Run `f(view)` → `Ok((value, did_mutate))` or `Err(e)`. On `Err`, return
+    ///    it and issue NO token.
+    /// 2. On `Ok((value, true))`, return `(value, Some(token))` (deferred persist
+    ///    is the caller's obligation). On `Ok((value, false))`, return
+    ///    `(value, None)` — no Class-S transition occurred, nothing to persist
+    ///    fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error (no token issued).
+    pub(crate) fn begin_class_s_conditional<T>(
+        &mut self,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<(T, bool), ContextError>,
+    ) -> Result<(T, Option<ClassSCommitToken>), ContextError> {
+        let (value, did_mutate) = f(ClassSMut::new(&mut self.state))?;
+        let token = if did_mutate {
+            Some(ClassSCommitToken::new(context_id))
+        } else {
+            None
+        };
+        Ok((value, token))
+    }
+}
+
+/// A `#[must_use]` linear handle for a DEFERRED Class-S fail-closed persist
+/// (ADR-049 §9, keep-direction).
+///
+/// Issued by [`ClassSCell::begin_class_s`] /
+/// [`ClassSCell::begin_class_s_conditional`] AFTER an early Class-S mutation
+/// (e.g. a burned spending-UCAN nonce, an inserted `executed_proposals` marker)
+/// has been applied IN MEMORY but NOT yet persisted. The holder MUST eventually
+/// call [`Self::commit`] on EVERY terminal path the operation can take —
+/// success or abort — so the mutation becomes durable before the operation is
+/// acknowledged.
+///
+/// # Why keep-direction, and why no `discard`
+///
+/// The deferred mutation is security-critical monotonic state whose un-recording
+/// is the UNSAFE direction: un-burning a consumed nonce re-opens a replay /
+/// double-spend window; un-marking an executed proposal re-opens a re-execute
+/// window. So there is no `discard`/abort variant — every path that reached
+/// `begin_*` commits, persisting the consume fail-closed even when the
+/// surrounding operation is aborting for an UNRELATED reason. On a persist
+/// failure the [`Self::commit`] does NOT roll the Class-S mutation back; it
+/// propagates the error so the CALLER runs its existing Class-C / external
+/// reversal (escrow void, economy-ticket rollback, sequence rollback) while the
+/// consume stays consumed.
+///
+/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`]
+///
+/// Like [`crate::context::economy_logic::EconomyTicket`], this handle carries a
+/// `consumed` flag set true by [`Self::commit`], and a [`Drop`] guard that
+/// `debug_assert!`s + `tracing::error!`s if it is dropped un-`commit`-ed. The
+/// `#[must_use]` makes a dropped-without-commit path a compile-time warning and
+/// the `Drop` guard makes it a loud CI failure — the same belt-and-braces
+/// guarantee `EconomyTicket` uses so a forgotten discharge cannot silently
+/// acknowledge an unpersisted Class-S consume. It carries NO snapshot
+/// (keep-direction has nothing to restore).
+#[must_use = "ClassSCommitToken must be committed — dropping leaves a Class-S consume (e.g. a burned spending nonce) unpersisted, re-opening a replay/re-spend window on crash"]
+pub(crate) struct ClassSCommitToken {
+    /// The context whose state the deferred persist targets. Checked against the
+    /// `context_id` passed to [`Self::commit`] via `debug_assert_eq!` so a token
+    /// cannot be committed against the wrong context's state.
+    context_id: String,
+    /// Set `true` by [`Self::commit`] BEFORE the persist runs, so the `Drop`
+    /// guard treats the obligation as discharged even when the persist itself
+    /// returns `Err` (keep-direction: the consume stays in memory and the error
+    /// propagates to the caller's reversal).
+    consumed: bool,
+}
+
+impl ClassSCommitToken {
+    /// Construct an un-consumed token for `context_id`. Crate-internal: only the
+    /// `begin_*` combinators mint one.
+    fn new(context_id: &str) -> Self {
+        Self {
+            context_id: context_id.to_owned(),
+            consumed: false,
+        }
+    }
+
+    /// Discharge the deferred obligation: persist the actor state **fail-closed**
+    /// (ADR-049 §9), KEEPING the Class-S mutation even if the persist fails.
+    ///
+    /// Takes `state: &PerContextState` rather than being a method on
+    /// [`ClassSCell`] DELIBERATELY: the deferred-persist sites hold a bare
+    /// `&mut PerContextState` (re-derived from the cell's `state_mut()` escape
+    /// hatch) across the intervening async work, so the commit point has no cell
+    /// to call through — it persists the state it is handed.
+    ///
+    /// Sequence:
+    /// 1. `debug_assert_eq!` the token's `context_id` against the caller's, so a
+    ///    token cannot be committed against another context's state.
+    /// 2. Set `self.consumed = true` BEFORE persisting — so even if the persist
+    ///    returns `Err`, the `Drop` guard sees the obligation as discharged (the
+    ///    error is the caller's to surface; the consume is intentionally KEPT).
+    /// 3. [`persist_state_fail_closed`]. On failure the Class-S mutation is NOT
+    ///    rolled back (keep-direction); the error propagates so the caller runs
+    ///    its existing Class-C reversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PersistenceFailed`] when the durable write fails
+    /// (the in-memory Class-S mutation is retained — keep-direction).
+    pub(crate) fn commit(
+        mut self,
+        state: &PerContextState,
+        deps: &ActorDeps,
+        context_id: &str,
+    ) -> Result<(), ContextError> {
+        debug_assert_eq!(
+            self.context_id, context_id,
+            "ClassSCommitToken committed against the wrong context",
+        );
+        // Discharge the Drop obligation BEFORE the persist so a persist Err still
+        // counts as committed (keep-direction: the consume stays, the error
+        // propagates to the caller's reversal).
+        self.consumed = true;
+        persist_state_fail_closed(state, deps, context_id)
+    }
+
+    /// Mint a pre-consumed-context token for tests that drive a deferred-persist
+    /// site's commit point directly (e.g. the `finalize_send` unit tests).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(context_id: &str) -> Self {
+        Self::new(context_id)
+    }
+}
+
+impl Drop for ClassSCommitToken {
+    fn drop(&mut self) {
+        if !self.consumed {
+            // Error-level log so a leaked obligation is visible in production,
+            // and a debug-assert so CI fails loudly — parity with EconomyTicket.
+            tracing::error!(
+                context_id = %self.context_id,
+                "ClassSCommitToken dropped without commit — a Class-S consume \
+                 (e.g. a burned spending nonce) may be unpersisted (ADR-049 §9)"
+            );
+            debug_assert!(
+                false,
+                "ClassSCommitToken dropped without commit for context {}",
+                self.context_id
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1401,6 +1616,145 @@ mod tests {
             recorded_nonce: [0x3Cu8; 16],
             recorded_chain_depth: 1,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // begin_class_s / begin_class_s_conditional + ClassSCommitToken
+    // ------------------------------------------------------------------
+
+    /// `begin_class_s` runs the early mutation, issues a token, and does NOT
+    /// persist; the deferred `commit` performs exactly one fail-closed persist.
+    #[tokio::test]
+    async fn begin_class_s_defers_persist_until_commit() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x61));
+        let ctx = ctx_hex(0x61);
+
+        let (value, token) = cell
+            .begin_class_s(&ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x6Au8; 16], 0);
+                Ok("early")
+            })
+            .expect("f Ok ⇒ (value, token)");
+        assert_eq!(value, "early");
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "begin_class_s must NOT persist"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x6Au8; 16]),
+            "early mutation applied in memory"
+        );
+
+        // The deferred commit persists fail-closed (exactly once).
+        token
+            .commit(&cell, &deps, &ctx)
+            .expect("commit persists fail-closed ⇒ Ok");
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "commit performs the single deferred persist"
+        );
+    }
+
+    /// `begin_class_s` issues NO token when `f` errs — a rejected operation
+    /// staged no consume to discharge.
+    #[tokio::test]
+    async fn begin_class_s_issues_no_token_on_f_error() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x62));
+        let ctx = ctx_hex(0x62);
+
+        let result: Result<((), ClassSCommitToken), ContextError> = cell
+            .begin_class_s(&ctx, |_view| {
+                Err(ContextError::PermissionDenied("no".into()))
+            });
+        assert!(matches!(result, Err(ContextError::PermissionDenied(_))));
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "no persist on f-error (no token issued, so nothing to drop unconsumed)"
+        );
+        // Note: `result` is `Err`, so no token exists — no Drop obligation.
+        drop(deps);
+    }
+
+    /// The token's `commit` KEEPS the Class-S mutation on persist failure
+    /// (keep-direction) and surfaces the persist error.
+    #[tokio::test]
+    async fn commit_keeps_mutation_and_surfaces_error_on_persist_failure() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x63));
+        let ctx = ctx_hex(0x63);
+
+        let (_v, token) = cell
+            .begin_class_s(&ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x6Bu8; 16], 0);
+                Ok(())
+            })
+            .expect("f Ok");
+        let err = token
+            .commit(&cell, &deps, &ctx)
+            .expect_err("FailPersistence ⇒ commit Err");
+        assert!(matches!(err, ContextError::PersistenceFailed(_)));
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x6Bu8; 16]),
+            "keep-direction: consume retained on persist failure"
+        );
+    }
+
+    /// `begin_class_s_conditional` issues a token only when `f` reports a
+    /// mutation happened (`true`).
+    #[tokio::test]
+    async fn conditional_issues_token_only_when_mutation_happened() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x64));
+        let ctx = ctx_hex(0x64);
+
+        // Mutation happened ⇒ Some(token).
+        let (v, token) = cell
+            .begin_class_s_conditional(&ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x6Cu8; 16], 0);
+                Ok((1u8, true))
+            })
+            .expect("Ok");
+        assert_eq!(v, 1);
+        let token = token.expect("did_mutate=true ⇒ Some(token)");
+        token.commit(&cell, &deps, &ctx).expect("commit Ok");
+
+        // No mutation ⇒ None (free/best-effort path stays token-free).
+        let (v2, token2) = cell
+            .begin_class_s_conditional(&ctx, |_view| Ok((2u8, false)))
+            .expect("Ok");
+        assert_eq!(v2, 2);
+        assert!(
+            token2.is_none(),
+            "did_mutate=false ⇒ None (no deferred fail-closed obligation)"
+        );
+    }
+
+    /// A token dropped without `commit` trips the `Drop` `debug_assert!`
+    /// (keep-direction backstop, parity with `EconomyTicket`).
+    #[test]
+    #[should_panic(expected = "dropped without commit")]
+    fn token_dropped_without_commit_panics_in_debug() {
+        let token = ClassSCommitToken::new_for_test(&ctx_hex(0x65));
+        drop(token);
     }
 
     // ------------------------------------------------------------------

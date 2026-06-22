@@ -213,8 +213,17 @@ pub fn build_encrypted_envelope(
 
 /// Enforces economic policy for message sends (#1537, #1593).
 ///
-/// Actor-shape variant: takes `&mut PerContextState` directly, no
-/// supervisor lock dance.
+/// Actor-shape variant: takes the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+/// and routes the spending-nonce consume through
+/// [`begin_class_s_conditional`](crate::context::actor::class_s::ClassSCell::begin_class_s_conditional)
+/// so the consume is DEFERRED-persisted (ADR-049 §9, keep-direction). The
+/// returned [`ClassSCommitToken`](crate::context::actor::class_s::ClassSCommitToken)
+/// is `Some` ONLY on the PAID branch (a non-zero cost was charged AND a spending
+/// UCAN was presented — i.e. `enforce_economy` actually burned a nonce); the
+/// free / best-effort branch returns `None` so the caller's existing best-effort
+/// persist is kept. `send_message` threads the token down to `finalize_send`,
+/// which discharges it (or each early-abort path commits it before its
+/// Class-C reversal).
 pub fn enforce_send_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     sender_did: &DID,
@@ -223,38 +232,94 @@ pub fn enforce_send_economy(
     context_id: &str,
     clock: &dyn Clock,
     key_resolver: &KeyResolver,
-) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
-    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
-    // with the spending-nonce-consume combinator; for now the bare
-    // `&mut PerContextState` keeps the body unchanged.
-    let state = cell.state_mut();
-    let pricing_default =
-        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
-    let member_count = state.membership.count();
-    let governance = &mut state.governance;
-    let pricing = governance
-        .message_pricing
-        .as_ref()
-        .unwrap_or(&pricing_default);
-    crate::context::economy_logic::enforce_economy(
-        crate::context::economy_logic::EnforceEconomyRequest {
-            economic_policy: governance.economic_policy.as_ref(),
-            budget_tracker: &mut governance.budget_tracker,
-            velocity_tracker: &governance.velocity_tracker,
-            member_count,
-            action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
-            actor_did: sender_did,
-            now,
-            spending_ucan,
-            action_label: "messages:write",
-            context_id,
-            clock,
-            pricing,
-            nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
-            revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-            key_resolver,
+) -> Result<
+    (
+        Option<scp_protocol::economy::types::Amount>,
+        Option<crate::context::actor::class_s::ClassSCommitToken>,
+    ),
+    ContextError,
+> {
+    cell.begin_class_s_conditional(context_id, |mut view| {
+        let state = view.rest_mut();
+        let pricing_default =
+            scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+        let member_count = state.membership.count();
+        let governance = &mut state.governance;
+        let pricing = governance
+            .message_pricing
+            .as_ref()
+            .unwrap_or(&pricing_default);
+        let cost = crate::context::economy_logic::enforce_economy(
+            crate::context::economy_logic::EnforceEconomyRequest {
+                economic_policy: governance.economic_policy.as_ref(),
+                budget_tracker: &mut governance.budget_tracker,
+                velocity_tracker: &governance.velocity_tracker,
+                member_count,
+                action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+                actor_did: sender_did,
+                now,
+                spending_ucan,
+                action_label: "messages:write",
+                context_id,
+                clock,
+                pricing,
+                nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
+                revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+                key_resolver,
+            },
+        )?;
+        // A spending-UCAN nonce is burned (Class-S consume) iff `enforce_economy`
+        // charged a non-zero cost AND a spending UCAN was presented — the same
+        // gating the deferred fail-closed persist uses. The free / zero-cost
+        // branch burns no nonce, so it issues no token.
+        let did_consume_nonce = cost.is_some() && spending_ucan.is_some();
+        Ok((cost, did_consume_nonce))
+    })
+}
+
+/// Discharge a deferred spending-nonce [`ClassSCommitToken`] on a `send_message`
+/// EARLY-ABORT path (ADR-049 §9, keep-direction) and return the error to
+/// propagate.
+///
+/// The early-abort paths in `send_message` occur AFTER `enforce_send_economy`
+/// burned the spending-UCAN nonce but BEFORE `finalize_send`. The burned nonce
+/// MUST be persisted fail-closed on these paths too (keep-direction: a crash in
+/// the coalesce window must not un-burn it and re-open replay), so each commits
+/// the token here BEFORE its existing escrow-void + economy-ticket rollback.
+///
+/// Returns the error the abort path should propagate:
+/// - token `None` (the consume did not happen — free / pre-consume abort) ⇒ the
+///   original `abort_err` unchanged;
+/// - token `Some` and its fail-closed persist SUCCEEDS ⇒ the original
+///   `abort_err` (the consume is now durable; the send still aborts for its own
+///   reason);
+/// - token `Some` and its fail-closed persist FAILS ⇒ the
+///   [`ContextError::PersistenceFailed`] (fail-closed: a durability failure of
+///   the burned nonce takes precedence, mirroring `finalize_send`'s persist-fail
+///   arm). The consume is KEPT in memory either way.
+///
+/// The caller runs its existing Class-C reversal (escrow void, ticket rollback,
+/// sequence rollback) AFTER this returns, regardless of which error comes back.
+///
+/// Shared with the join path (`lifecycle_helpers::join_context`), whose
+/// pre-finalize abort paths have the identical keep-direction obligation.
+///
+/// Internal cross-module helper — `pub` only so the sibling `crate::context`
+/// dispatch modules can call it; not part of the SDK surface.
+pub fn commit_send_nonce_token_on_abort(
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    abort_err: ContextError,
+) -> ContextError {
+    match token {
+        None => abort_err,
+        Some(t) => match t.commit(state, deps, context_id) {
+            Ok(()) => abort_err,
+            Err(persist_err) => persist_err,
         },
-    )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +900,13 @@ pub async fn send_message(
     // `enforce_send_economy` is the spending-nonce-bearing leaf and takes the
     // cell; the top `state` borrow has ended (NLL) so `cell` is free here. The
     // arms + remaining body re-derive the bare `&mut PerContextState`.
-    let deducted_cost = match enforce_send_economy(
+    // `enforce_send_economy` routes the spending-nonce consume through the
+    // DEFERRED-persist combinator (ADR-049 §9): it returns the cost plus an
+    // `Option<ClassSCommitToken>` that is `Some` only on the PAID (nonce-burning)
+    // branch. That token's fail-closed persist is owed on EVERY terminal path
+    // below (keep-direction) — the Err arm here issues NO token (nothing was
+    // consumed), so it is unchanged.
+    let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
         cell,
         sender_did,
         now_secs,
@@ -844,10 +915,11 @@ pub async fn send_message(
         &*deps.clock,
         &deps.key_resolver,
     ) {
-        Ok(cost) => cost,
+        Ok(cost_and_token) => cost_and_token,
         Err(e) => {
             // Roll back velocity + hard-rate-limit. No EconomyTicket
-            // exists yet; rollback inline against actor-owned state.
+            // exists yet; rollback inline against actor-owned state. No token
+            // was issued (the consume did not happen), so nothing to commit.
             let state = cell.state_mut();
             state
                 .governance
@@ -878,11 +950,20 @@ pub async fn send_message(
                 {
                     Ok(env) => env,
                     Err(e) => {
+                        // Keep-direction (ADR-049 §9): persist the burned nonce
+                        // fail-closed before the existing Class-C reversal.
+                        let err = commit_send_nonce_token_on_abort(
+                            spending_nonce_token.take(),
+                            state,
+                            deps,
+                            &context_id,
+                            e,
+                        );
                         crate::context::economy_logic::rollback_economy_ticket_inline(
                             &mut state.governance,
                             ticket,
                         );
-                        return Err(e);
+                        return Err(err);
                     }
                 };
             // Broadcast: SHA-256(context_id) per spec §5.14.
@@ -897,13 +978,22 @@ pub async fn send_message(
         } else {
             // Encrypted: assign sequence under actor-owned tracker.
             let Some(seq) = state.membership.next_sequence_number(sender_did) else {
+                // Keep-direction (ADR-049 §9): persist the burned nonce
+                // fail-closed before the existing Class-C reversal.
+                let err = commit_send_nonce_token_on_abort(
+                    spending_nonce_token.take(),
+                    state,
+                    deps,
+                    &context_id,
+                    ContextError::MemberNotFound(format!(
+                        "cannot assign sequence: {sender_did} is not a member"
+                    )),
+                );
                 crate::context::economy_logic::rollback_economy_ticket_inline(
                     &mut state.governance,
                     ticket,
                 );
-                return Err(ContextError::MemberNotFound(format!(
-                    "cannot assign sequence: {sender_did} is not a member"
-                )));
+                return Err(err);
             };
             // §9.10.4: encrypted contexts fan out to each member's pseudonym
             // routing ID. App data embeds NO correlating routing value: the
@@ -955,15 +1045,24 @@ pub async fn send_message(
                     // so callers can distinguish "peers have not announced
                     // yet; retry later" from a transport failure, and roll
                     // back the economy ticket + sequence reservation.
+                    // Keep-direction (ADR-049 §9): persist the burned nonce
+                    // fail-closed before the existing Class-C reversal.
+                    let err = commit_send_nonce_token_on_abort(
+                        spending_nonce_token.take(),
+                        state,
+                        deps,
+                        &context_id,
+                        ContextError::PseudonymRegistryEmpty {
+                            context_id: context_id.clone(),
+                            member_count,
+                        },
+                    );
                     crate::context::economy_logic::rollback_economy_ticket_inline(
                         &mut state.governance,
                         ticket,
                     );
                     state.membership.rollback_sequence_number(sender_did);
-                    return Err(ContextError::PseudonymRegistryEmpty {
-                        context_id: context_id.clone(),
-                        member_count,
-                    });
+                    return Err(err);
                 }
                 peer_pseudonyms
             };
@@ -992,18 +1091,36 @@ pub async fn send_message(
     // multi-member empty-registry case hard-fails above with
     // `PseudonymRegistryEmpty` before reaching here.
     if !is_broadcast && send_routing_ids.is_empty() {
+        // Keep-direction (ADR-049 §9): even on this no-charge no-op exit, a
+        // spending-UCAN nonce burned in Phase 1 MUST persist fail-closed — a
+        // crash in the coalesce window must not un-burn it and re-open replay.
+        // Commit the token first; if its persist fails, surface that error
+        // (fail-closed) instead of the no-op `Ok(())`. The Class-C reversal
+        // (ticket + sequence) runs regardless.
+        let nonce_persist = spending_nonce_token
+            .take()
+            .map_or(Ok(()), |t| t.commit(state, deps, &context_id));
         crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
             ticket,
         );
         state.membership.rollback_sequence_number(sender_did);
-        return Ok(());
+        return nonce_persist;
     }
 
     // Payment flow: authorize (hold) before action.
     let auth = match authorize_send_payment(state, deps, &context_id, sender_did).await {
         Ok(auth) => auth,
         Err(e) => {
+            // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+            // before the existing Class-C reversal.
+            let err = commit_send_nonce_token_on_abort(
+                spending_nonce_token.take(),
+                state,
+                deps,
+                &context_id,
+                e,
+            );
             crate::context::economy_logic::rollback_economy_ticket_inline(
                 &mut state.governance,
                 ticket,
@@ -1011,7 +1128,7 @@ pub async fn send_message(
             if !is_broadcast {
                 state.membership.rollback_sequence_number(sender_did);
             }
-            return Err(e);
+            return Err(err);
         }
     };
 
@@ -1030,6 +1147,17 @@ pub async fn send_message(
         MessageType::Content,
     );
     if let Err(e) = phase2_result {
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // BEFORE the existing escrow-void + ticket rollback. If the persist
+        // fails, surface that error (fail-closed); the Class-C reversal runs
+        // either way.
+        let err = commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            state,
+            deps,
+            &context_id,
+            e,
+        );
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
@@ -1041,7 +1169,7 @@ pub async fn send_message(
         if !is_broadcast {
             state.membership.rollback_sequence_number(sender_did);
         }
-        return Err(e);
+        return Err(err);
     }
 
     // Phase 3: finalize, then capture escrow + commit ticket.
@@ -1064,8 +1192,16 @@ pub async fn send_message(
     // fail-closed direction; un-consuming would re-open the replay window) and
     // surfacing the error so the caller does not observe a phantom success.
     // Non-spending / free sends keep the best-effort persist inside
-    // `finalize_send` (the common path is not regressed).
-    let spending_nonce_committed = deducted_cost.is_some() && spending_ucan.is_some();
+    // `finalize_send` (the common path is not regressed). The deferred
+    // [`ClassSCommitToken`] carries the fail-closed-persist obligation: it is
+    // `Some` exactly on the paid (nonce-burning) branch, so the assertion below
+    // pins the token's presence to the legacy `deducted_cost.is_some() &&
+    // spending_ucan.is_some()` gating.
+    debug_assert_eq!(
+        spending_nonce_token.is_some(),
+        deducted_cost.is_some() && spending_ucan.is_some(),
+        "spending-nonce token must be Some iff a paid send burned a nonce",
+    );
     if let Err(e) = finalize_send(
         state,
         deps,
@@ -1078,7 +1214,7 @@ pub async fn send_message(
         // human/device-originated `#active` signals; they need only the raw
         // key, which we hand over from the one `MessageSigner`.
         Some(signer.key()),
-        spending_nonce_committed,
+        spending_nonce_token.take(),
         is_broadcast,
     ) {
         // Fail-closed persist of the Class-S nonce consume failed. Reverse the
@@ -1768,15 +1904,18 @@ fn record_send_participation(
 /// stays `async` because it threads through escrow / transport awaits
 /// before `finalize_send`.
 ///
-/// `spending_nonce_committed` selects the ADR-049 §9 persistence class for the
-/// final snapshot (BLACK-001): when `true` (a paid send committed a spending-
-/// UCAN nonce in Phase 1 — `enforce_send_economy` mutated the actor-owned
+/// `token` carries the ADR-049 §9 deferred-persist obligation for this send
+/// (BLACK-001): it is `Some` when a paid send burned a spending-UCAN nonce in
+/// Phase 1 (`enforce_send_economy` mutated the actor-owned
 /// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
-/// actor crash), the persist is FAIL-CLOSED: a persist failure returns
+/// actor crash), and `None` for a free / non-spending send. When `Some`, the
+/// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
 /// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
 /// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
-/// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
-/// the persist stays best-effort (Class C) — the common path is not regressed.
+/// path in `reserve_tool_economy`. When `None`, the persist stays best-effort
+/// (Class C) — the common path is not regressed. The token is consumed on EVERY
+/// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
+/// expiry must still persist the burned nonce, keep-direction).
 ///
 /// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
 ///
@@ -1808,7 +1947,7 @@ pub fn finalize_send(
     sequence: u64,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
-    spending_nonce_committed: bool,
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
     // M12: `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 /
@@ -1830,11 +1969,12 @@ pub fn finalize_send(
         if !is_broadcast {
             state.membership.rollback_sequence_number(sender_did);
         }
-        // A spending-UCAN nonce committed in Phase 1 stays CONSUMED (a late TTL
-        // expiry must not freshen it); persist it fail-closed so a crash before
-        // coalesce cannot roll the consume back (ADR-049 §9 Class S).
-        if spending_nonce_committed {
-            persist_state_fail_closed(state, deps, context_id)?;
+        // A spending-UCAN nonce burned in Phase 1 stays CONSUMED (a late TTL
+        // expiry must not freshen it); commit its deferred token so it persists
+        // fail-closed — a crash before coalesce cannot roll the consume back
+        // (ADR-049 §9 Class S, keep-direction). A free send carries no token.
+        if let Some(t) = token {
+            t.commit(state, deps, context_id)?;
         }
         return Ok(());
     }
@@ -1906,14 +2046,7 @@ pub fn finalize_send(
     state.checkpoint_events_since += 1;
     create_and_broadcast_checkpoint_if_due(state, deps, context_id, sender_did, signing_key, now);
 
-    persist_finalized_send(
-        state,
-        deps,
-        context_id,
-        sender_did,
-        spending_nonce_committed,
-        is_broadcast,
-    )
+    persist_finalized_send(state, deps, context_id, sender_did, token, is_broadcast)
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
@@ -1980,18 +2113,24 @@ fn persist_finalized_send(
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
-    spending_nonce_committed: bool,
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
-    if spending_nonce_committed {
-        if let Err(e) = persist_state_fail_closed(state, deps, context_id) {
-            if !is_broadcast {
-                state.membership.rollback_sequence_number(sender_did);
+    match token {
+        // Paid send: commit the deferred token — its `commit` performs the
+        // fail-closed persist (ADR-049 §9 Class S, keep-direction). On failure
+        // roll the reserved sequence back (this fn owns that rollback; the caller
+        // does not double-revert) and surface the error.
+        Some(t) => {
+            if let Err(e) = t.commit(state, deps, context_id) {
+                if !is_broadcast {
+                    state.membership.rollback_sequence_number(sender_did);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
-    } else {
-        persist_state_best_effort(state, deps, context_id);
+        // Free / non-spending send: best-effort persist (Class C — not regressed).
+        None => persist_state_best_effort(state, deps, context_id),
     }
     Ok(())
 }

@@ -697,29 +697,51 @@ pub async fn join_context(
         .velocity_tracker
         .record_message(&member_did, now_secs);
 
-    let member_count = state.membership.count();
-    let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy(
-        &mut state.governance,
-        member_count,
-        &member_did,
-        now_secs,
-        spending_ucan,
-        &context_id,
-        &*deps.clock,
-        &deps.key_resolver,
-    ) {
-        Ok(cost) => cost,
-        Err(e) => {
-            // No ticket exists yet — roll back inline against actor-owned
-            // state.
-            state
-                .governance
-                .velocity_tracker
-                .rollback(&member_did, velocity_token);
-            state.governance.hard_rate_limit.refund(&member_did);
-            return Err(e);
-        }
-    };
+    // ADR-049 §9 Class S: route the join-path spending-nonce consume through the
+    // DEFERRED-persist combinator. `enforce_join_economy` burns the nonce inside
+    // the `begin_class_s_conditional` closure; the returned `Option<ClassSCommitToken>`
+    // is `Some` only on the PAID branch (a non-zero cost AND a spending UCAN —
+    // the same gating the Phase-5 fail-closed persist uses) and is held across
+    // the MLS / membership `.await`s below, committed at Phase 5 (or by each
+    // pre-finalize abort path, keep-direction). The `state` borrow taken at the
+    // top of this fn ends here (NLL) so the cell is free for the combinator; the
+    // remaining body re-derives `state = cell.state_mut()` immediately after.
+    let (deducted_cost, mut spending_nonce_token) =
+        match cell.begin_class_s_conditional(&context_id, |mut view| {
+            let state = view.rest_mut();
+            let member_count = state.membership.count();
+            let governance = &mut state.governance;
+            let cost = crate::context::lifecycle_logic::enforce_join_economy(
+                governance,
+                member_count,
+                &member_did,
+                now_secs,
+                spending_ucan,
+                &context_id,
+                &*deps.clock,
+                &deps.key_resolver,
+            )?;
+            // A spending-UCAN nonce is burned iff a non-zero cost was charged AND
+            // a spending UCAN was presented — the same gating the Phase-5
+            // fail-closed persist uses.
+            let did_consume_nonce = cost.is_some() && spending_ucan.is_some();
+            Ok((cost, did_consume_nonce))
+        }) {
+            Ok(cost_and_token) => cost_and_token,
+            Err(e) => {
+                // No ticket and no token exist yet (the consume did not happen) —
+                // roll back inline against actor-owned state.
+                let state = cell.state_mut();
+                state
+                    .governance
+                    .velocity_tracker
+                    .rollback(&member_did, velocity_token);
+                state.governance.hard_rate_limit.refund(&member_did);
+                return Err(e);
+            }
+        };
+    // Re-derive the bare state for the remaining (not-yet-migrated) mutations.
+    let state = cell.state_mut();
     // F4: wrap the Phase 1 state in an EconomyTicket so every
     // downstream error path (adapter, MLS, sender-key) is forced
     // to roll back velocity + hard_rate_limit + budget, not just
@@ -745,11 +767,20 @@ pub async fn join_context(
     {
         Ok(auth) => auth,
         Err(payment_err) => {
+            // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+            // before the existing Class-C reversal.
+            let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+                spending_nonce_token.take(),
+                state,
+                deps,
+                &context_id,
+                payment_err,
+            );
             crate::context::economy_logic::rollback_economy_ticket_inline(
                 &mut state.governance,
                 ticket,
             );
-            return Err(payment_err);
+            return Err(err);
         }
     };
 
@@ -762,6 +793,15 @@ pub async fn join_context(
     {
         Ok(output) => output,
         Err(e) => {
+            // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+            // before the existing escrow-void + ticket rollback.
+            let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+                spending_nonce_token.take(),
+                state,
+                deps,
+                &context_id,
+                e,
+            );
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
                     .await;
@@ -770,7 +810,7 @@ pub async fn join_context(
                 &mut state.governance,
                 ticket,
             );
-            return Err(e);
+            return Err(err);
         }
     };
 
@@ -783,6 +823,15 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            state,
+            deps,
+            &context_id,
+            e,
+        );
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
@@ -790,7 +839,7 @@ pub async fn join_context(
             &mut state.governance,
             ticket,
         );
-        return Err(e);
+        return Err(err);
     }
 
     // Drain pending HPKE-sealed sender key distribution messages and
@@ -803,6 +852,15 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            state,
+            deps,
+            &context_id,
+            e,
+        );
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
@@ -810,7 +868,7 @@ pub async fn join_context(
             &mut state.governance,
             ticket,
         );
-        return Err(e);
+        return Err(err);
     }
 
     // Phase 4: Membership mutation. On failure: void escrow + rollback
@@ -820,6 +878,15 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            state,
+            deps,
+            &context_id,
+            e,
+        );
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
@@ -827,7 +894,7 @@ pub async fn join_context(
             &mut state.governance,
             ticket,
         );
-        return Err(e);
+        return Err(err);
     }
 
     // Phase 4.5: Store local pseudonym after membership mutation succeeds.
@@ -870,10 +937,20 @@ pub async fn join_context(
         // (§7.3.1, §9.9.3).
         now_secs,
     ) {
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before voiding the escrow hold (mirrors the money-ordering rule
+        // below). The membership / MLS state already applied is NOT reversed.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            state,
+            deps,
+            &context_id,
+            e,
+        );
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
-        return Err(e);
+        return Err(err);
     }
     state.checkpoint_events_since += 1;
 
@@ -903,13 +980,20 @@ pub async fn join_context(
     // persist failure we VOID the escrow hold instead (releasing the funds) so
     // the charge is atomic with durability; the consumed nonce stays consumed,
     // so the joiner's retry is idempotent and they are charged at most once.
-    if deducted_cost.is_some() && spending_ucan.is_some() {
-        if let Err(e) =
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)
-        {
-            // Durability failed before the charge was captured — release the
-            // escrow hold so the joiner is not charged for an unacknowledged
-            // join, and surface the error. The consumed nonce stays consumed.
+    // The deferred token is `Some` exactly on the paid (nonce-burning) branch —
+    // the same gating the legacy `deducted_cost.is_some() && spending_ucan.is_some()`
+    // expressed.
+    debug_assert_eq!(
+        spending_nonce_token.is_some(),
+        deducted_cost.is_some() && spending_ucan.is_some(),
+        "spending-nonce token must be Some iff a paid join burned a nonce",
+    );
+    if let Some(t) = spending_nonce_token.take() {
+        // Paid join: commit the deferred token (fail-closed persist, ADR-049 §9
+        // keep-direction). On failure release the escrow hold so the joiner is
+        // not charged for an unacknowledged join, then surface the error. The
+        // consumed nonce stays consumed.
+        if let Err(e) = t.commit(state, deps, &context_id) {
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
                     .await;
@@ -3568,9 +3652,14 @@ mod restore_reconcile_tests {
             .expect("join_context_membership follows join_context");
         let body = &rest[..end_rel];
 
+        // ADR-049 §9: the paid path's fail-closed persist now rides the deferred
+        // `ClassSCommitToken`'s `commit` (which calls `persist_state_fail_closed`
+        // internally) rather than an inline `persist_state_fail_closed` call. The
+        // Phase-5 commit site is the `t.commit(state, deps, &context_id)` below;
+        // the ordering invariant is asserted relative to it.
         let persist_idx = body
-            .find("persist_state_fail_closed(state, deps, &context_id)")
-            .expect("join_context must fail-closed persist on the paid path");
+            .find("t.commit(state, deps, &context_id)")
+            .expect("join_context must commit the deferred fail-closed token on the paid path");
         let capture_idx = body
             .find("capture_join_payment(")
             .expect("join_context must capture the escrow");
@@ -3672,7 +3761,7 @@ mod restore_reconcile_tests {
             reserved,
             b"payload",
             None,
-            false, // spending_nonce_committed
+            None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
         );
 
@@ -3737,10 +3826,12 @@ mod restore_reconcile_tests {
         );
 
         // The fail-closed persist runs after the append; the append-failure
-        // branch sits strictly between commit and that persist.
+        // branch sits strictly between commit and that persist. ADR-049 §9: the
+        // paid path's fail-closed persist now rides the deferred token's
+        // `t.commit(state, deps, &context_id)` (Phase 5).
         let persist_idx = body
-            .find("persist_state_fail_closed(state, deps, &context_id)")
-            .expect("join_context must fail-closed persist on the paid path");
+            .find("t.commit(state, deps, &context_id)")
+            .expect("join_context must commit the deferred fail-closed token on the paid path");
         assert!(
             append_idx < persist_idx,
             "the MemberJoined append must precede the fail-closed persist"

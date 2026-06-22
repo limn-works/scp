@@ -14465,9 +14465,9 @@ mod tests {
     /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
     /// persist GATING is fail-closed, structurally identical to the tool-invoke
     /// path. Asserted against the PRODUCTION `finalize_send`: with a persistence
-    /// backend that always fails, `finalize_send(spending_nonce_committed = true)`
-    /// returns an error (the paid send is NOT acknowledged while its
-    /// nonce-consume is unpersisted), whereas `spending_nonce_committed = false`
+    /// backend that always fails, `finalize_send` with a `Some(ClassSCommitToken)`
+    /// (a paid send) returns an error (the paid send is NOT acknowledged while
+    /// its nonce-consume is unpersisted), whereas a `None` token
     /// (a free / non-spending send) swallows the same failure and returns `Ok`
     /// (the common path stays best-effort, un-regressed).
     ///
@@ -14508,7 +14508,9 @@ mod tests {
             0,
             b"paid",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: a deferred spending-nonce token whose fail-closed
+            // commit drives the persist (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         );
         assert!(
@@ -14528,7 +14530,9 @@ mod tests {
             1,
             b"free",
             Some(&signing_key),
-            /* spending_nonce_committed = */ false,
+            // Free send: no token (previously the `false` bool) — keeps the
+            // best-effort persist, un-regressed.
+            None,
             /* is_broadcast = */ false,
         );
         assert!(
@@ -14567,7 +14571,7 @@ mod tests {
 
         // Seed the post-`commit_spending_ucan_nonce` tracker state (the same
         // shape `snapshot_entries` persists), then run the PRODUCTION send-path
-        // finalize with `spending_nonce_committed = true` — the exact gating the
+        // finalize with a `Some(ClassSCommitToken)` — the exact gating the
         // metered send path uses. This drives the real fail-closed persist.
         let consumed_nonce = "1700000000000-aabbccddeeff00112233445566778899".to_owned();
         let mut seed_entries = std::collections::HashMap::new();
@@ -14590,7 +14594,9 @@ mod tests {
             0,
             b"paid-send",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: deferred token whose fail-closed commit persists the
+            // consumed nonce (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         )
         .expect("fail-closed finalize of the send-path consumed nonce must succeed");
@@ -15046,7 +15052,9 @@ mod tests {
             reserved,
             b"paid",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: deferred token whose fail-closed commit fails here,
+            // driving the sequence-rollback path (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         );
         assert!(
