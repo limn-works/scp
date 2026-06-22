@@ -993,6 +993,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Compile-time airtightness guard (ADR-049 §9): the best-effort / compensation
+    // views — and the cell itself — MUST NOT implement `DerefMut`. A `DerefMut` impl
+    // would hand out a `&mut` to a Class-S-containing struct on a path that does not
+    // persist fail-closed, silently re-opening every Class-S bypass the field-granular
+    // view design closes by construction. If anyone ever adds `impl DerefMut` for one
+    // of these, this assertion fails to compile.
+    static_assertions::assert_not_impl_any!(ClassCMut<'static>: core::ops::DerefMut);
+    static_assertions::assert_not_impl_any!(GovernanceClassCMut<'static>: core::ops::DerefMut);
+    static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
+
     /// Minimal event log provider — accepts every call (the combinator paths do
     /// not touch the event log).
     struct TestEventLog;

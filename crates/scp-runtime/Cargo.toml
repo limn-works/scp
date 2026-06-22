@@ -73,6 +73,7 @@ scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
+static_assertions = { workspace = true }
 
 [[test]]
 name = "economy_integration"

@@ -75,6 +75,7 @@ arc-swap = "1"
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
+static_assertions = "1.1"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

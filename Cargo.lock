@@ -5494,6 +5494,7 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "sha2 0.10.9",
+ "static_assertions",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
