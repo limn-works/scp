@@ -3257,7 +3257,11 @@ impl WasmContextManager {
             GovernanceAction::ExtendTtl { additional_secs } => {
                 let ctx = self.require_active_context_mut(context_id)?;
                 if let Some(ref mut ttl) = ctx.ttl_seconds {
-                    *ttl += additional_secs;
+                    // Saturating add for exact parity with native
+                    // `execute_extend_ttl` (`governance_helpers.rs`), which
+                    // extends the TTL with a saturating base — and for u64
+                    // overflow safety (a plain `+=` panics in debug builds).
+                    *ttl = ttl.saturating_add(*additional_secs);
                 }
                 Ok(serde_json::json!({"action": "ExtendTtl", "additionalSecs": additional_secs}))
             }
@@ -5396,7 +5400,9 @@ impl WasmContextManager {
                 })
             },
             |ttl| {
-                *ttl += additional_secs;
+                // Saturating add for parity with native `execute_extend_ttl`
+                // and u64 overflow safety (a plain `+=` panics in debug builds).
+                *ttl = ttl.saturating_add(additional_secs);
                 Ok(true)
             },
         )
