@@ -1749,11 +1749,22 @@ pub async fn import_context(
     // exporter could backdate BOTH `effective_at` (proposer-controlled) and
     // `observed_at` to collapse the window to zero on import. We therefore
     // re-pin `observed_at` to THIS importing member's local clock, restarting
-    // the window from import time (conservative/safe). This mirrors the
-    // `creation_timestamp_secs` re-pin and the `cooldown_until` sanitization
-    // above. The RESTORE path (trusted self-respawn) keeps `observed_at`
-    // verbatim — re-pinning there would let a crash-loop re-arm the window
-    // forever.
+    // the window from import time (conservative/safe). This is the same
+    // re-pinning policy applied to the `cooldown_until` sanitization above.
+    //
+    // Note `observed_at` does NOT track `creation_timestamp_secs`, which is
+    // consumed VERBATIM from the signed snapshot below
+    // (`creation_timestamp_secs: export.snapshot.creation_timestamp_secs`): the
+    // two have opposite trust models. `creation_timestamp_secs` is the
+    // convergent creator-assigned value, authenticated by the snapshot
+    // signature and bounded above by the TTL (`creation + ttl`), so backdating
+    // only shortens the lifetime — verbatim is the convergent/fail-safe choice.
+    // `observed_at`, by contrast, is the LOWER bound of the notification window
+    // (`effective_at.max(observed_at + PERIOD)`), where a backdated value would
+    // COLLAPSE the window — so it must be re-pinned to a local,
+    // non-backdatable clock reading on the untrusted import path. The RESTORE
+    // path (trusted self-respawn) keeps `observed_at` verbatim — re-pinning
+    // there would let a crash-loop re-arm the window forever.
     let sanitized_pending_ceiling_modification = export
         .snapshot
         .pending_ceiling_modification

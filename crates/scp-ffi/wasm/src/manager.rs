@@ -5082,14 +5082,24 @@ impl WasmContextManager {
         ctx.push_event(ContextEvent::Expired);
 
         // Stamp the CONVERGENT expiry deadline (`creation_timestamp_secs +
-        // ttl_seconds`) on the `ContextExpired` leaf when both are known, so a
+        // ttl_seconds`) on the `ContextExpired` leaf whenever a TTL is set, so a
         // mixed native/WASM context records the identical timestamp regardless
         // of which member's timer fired or when its local clock read (§7.3.1,
-        // §9.9.3). Falls back to the member's fire-time `now()` only when no
-        // convergent base is available (no recorded creation time or no TTL).
-        let expiry_leaf_secs = match (ctx.creation_timestamp_secs, ctx.ttl_seconds) {
-            (creation, Some(ttl)) if creation != 0 => creation.saturating_add(ttl),
-            _ => crate::time::now_secs(),
+        // §9.9.3). This mirrors the native `convergent_ttl_deadline_secs`
+        // (`ttl_close_helpers.rs`): `Some(ttl) => creation.saturating_add(ttl)`
+        // with NO `creation == 0` guard. A legacy snapshot whose
+        // `creation_timestamp_secs` defaulted to `0` therefore yields the
+        // deadline `0 + ttl` on BOTH bridges — convergent, and in the distant
+        // past (the fail-safe direction: the upper-bound deadline only shortens,
+        // so the context expires no later than an honest-clock member would
+        // compute). A residual `creation == 0 => now()` special-case here would
+        // make WASM stamp the local fire-time while native stamps `0 + ttl`,
+        // diverging the `ContextExpired` leaf at equal event count — the very
+        // §9.9.3 divergence this convergent stamping exists to eliminate. The
+        // `now()` fallback applies ONLY to the genuinely-no-TTL case.
+        let expiry_leaf_secs = match ctx.ttl_seconds {
+            Some(ttl) => ctx.creation_timestamp_secs.saturating_add(ttl),
+            None => crate::time::now_secs(),
         };
 
         ctx.append_log_event(EventType::ContextExpired, "", b"", expiry_leaf_secs);
@@ -8513,22 +8523,50 @@ mod tests {
         assert_eq!(bob.contexts[id].state, "expired");
     }
 
-    /// When no convergent base is available (creation time is `0`),
-    /// `handle_ttl_expiry` falls back to the member's local clock rather than
-    /// stamping a nonsensical `0 + ttl` deadline.
+    /// Legacy snapshot convergence: a `creation_timestamp_secs` of `0` (the
+    /// `#[serde(default)]` value a pre-field envelope deserializes to) is still
+    /// a TTL base, NOT a "no convergent base" sentinel. With a TTL present,
+    /// `handle_ttl_expiry` MUST stamp the convergent `0 + ttl` deadline — NOT
+    /// the member's local `now()` — so it matches native
+    /// `convergent_ttl_deadline_secs(0, Some(ttl))` (`ttl_close_helpers.rs`),
+    /// which has no `creation == 0` guard either. A residual `creation == 0 =>
+    /// now()` special-case in WASM would make WASM stamp the local fire-time
+    /// while native stamps `0 + ttl`, diverging the `ContextExpired` leaf — and
+    /// thus the event-log root — at equal event count in a mixed native+WASM
+    /// context importing the same legacy snapshot (§7.3.1, §9.9.3). The `now()`
+    /// fallback is reserved for the genuinely-no-TTL (`ttl_seconds == None`)
+    /// case.
     #[test]
-    fn test_wasm_ttl_expiry_falls_back_without_creation_time() {
-        let id = "ctx-ttl-fallback";
+    fn test_wasm_ttl_expiry_stamps_zero_plus_ttl_for_legacy_creation() {
+        let id = "ctx-ttl-legacy-zero";
+        let ttl = 3600_u64;
         let mut mgr = WasmContextManager::new();
         let mut state = make_bare_per_context_state(id, "did:dht:zcreator");
-        // No convergent creation time recorded; TTL present.
+        // Legacy snapshot: creation time defaulted to 0; TTL present.
         state.creation_timestamp_secs = 0;
-        state.ttl_seconds = Some(3600);
+        state.ttl_seconds = Some(ttl);
         mgr.contexts.insert(id.to_owned(), state);
 
-        // Must succeed (fall back to local now()) and transition to expired.
-        mgr.handle_ttl_expiry(id).expect("ttl expiry fallback");
+        mgr.handle_ttl_expiry(id)
+            .expect("ttl expiry with legacy zero creation");
         assert_eq!(mgr.contexts[id].state, "expired");
+
+        // The leaf must carry the convergent `0 + ttl` deadline, matching
+        // native `convergent_ttl_deadline_secs(0, Some(ttl))` — NOT `now() +
+        // ttl` and NOT `now()`.
+        let native_deadline = 0_u64.saturating_add(ttl);
+        let leaf = mgr.contexts[id]
+            .event_log
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.event_type == EventType::ContextExpired)
+            .expect("ContextExpired leaf must be present after handle_ttl_expiry");
+        assert_eq!(
+            leaf.timestamp, native_deadline,
+            "WASM must stamp the convergent 0 + ttl deadline for a legacy (creation == 0) \
+             snapshot, matching native, NOT a local now()-derived timestamp"
+        );
     }
 
     /// The export DTO field round-trips through serde and defaults to `0` when
