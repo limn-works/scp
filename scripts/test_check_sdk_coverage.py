@@ -450,9 +450,13 @@ def test_gate_fails_on_invalid_false_entry_exemption_reason(tmp_path: Path) -> N
     ts_src_dir = tmp_path / "ts_src"
     ts_src_dir.mkdir()
     ts_file = ts_src_dir / "index.ts"
-    # Provide a real symbol so python=True is statically verified.
+    # Provide the domain-prefixed symbol so typescript=True is statically
+    # verified.  For domain="Fake", op="invalid_exempt_op_zzz" the
+    # auto-generated candidate is "fakeInvalidExemptOpZzz".  The bare form
+    # "invalidExemptOpZzz" is NOT a valid candidate after the domain-prefix
+    # enforcement change, so only the prefixed form satisfies the gate.
     ts_file.write_text(
-        "export function invalidExemptOpZzz(): void {}\n",
+        "export function fakeInvalidExemptOpZzz(): void {}\n",
         encoding="utf-8",
     )
 
@@ -557,4 +561,201 @@ def test_gate_fails_on_unexpected_cell_value(tmp_path: Path) -> None:
     )
     assert "unexpected cell value" in result.stdout, (
         f"Expected 'unexpected cell value' error phrase in stdout.\nstdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Gate exits 1 when only the bare camelCase form is exported
+#          (domain-prefix-only enforcement regression test)
+#
+# The PR's core security fix removed bare-name candidates from
+# _check_operation_in_sdk.  Before the fix, exporting only the bare camel
+# form ("verifiedOpZzz") was accepted as coverage for "Fake/verified_op_zzz"
+# because the old code checked the bare camelCase candidate.  After the fix,
+# only the domain-prefixed form ("fakeVerifiedOpZzz") is accepted.
+#
+# This test MUST FAIL if bare-name candidates are re-added to
+# _check_operation_in_sdk (mutation-robustness property).
+# ---------------------------------------------------------------------------
+
+
+def test_bare_name_does_not_satisfy_domain_prefixed_op(tmp_path: Path) -> None:
+    """Exporting only the bare camelCase form must NOT satisfy a domain-prefixed op.
+
+    For domain="Fake", op="verified_op_zzz" the required SDK symbol is
+    "fakeVerifiedOpZzz" (domain-prefixed camelCase).  A file that exports only
+    "verifiedOpZzz" (bare form, no domain prefix) must cause the gate to exit 1
+    with 'no matching SDK symbol was found'.
+
+    Mutation test: re-adding a bare-camel candidate to _check_operation_in_sdk
+    would make this test fail (the bare form would satisfy the check and the
+    gate would exit 0 instead of 1).
+    """
+    ts_src_dir = tmp_path / "ts_src"
+    ts_src_dir.mkdir()
+    ts_file = ts_src_dir / "index.ts"
+    # Export ONLY the bare camel form — NOT the domain-prefixed "fakeVerifiedOpZzz".
+    ts_file.write_text(
+        "export function verifiedOpZzz(): void {}\n",
+        encoding="utf-8",
+    )
+
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "verified_op_zzz",
+                        # typescript: True — symbol must be statically found
+                        "typescript": True,
+                        # Other SDKs: false + valid exemptions (no noise from them)
+                        "python": False,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "python": "Not yet implemented in Python SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(
+        tmp_path,
+        matrix_file,
+        sdk_paths={"typescript": ts_src_dir},
+    )
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1: bare 'verifiedOpZzz' must not satisfy "
+        f"domain-prefixed op 'Fake/verified_op_zzz'. Got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "no matching SDK symbol was found" in result.stdout, (
+        f"Expected 'no matching SDK symbol was found' in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: ALIASES table enables non-standard symbol names
+#
+# When an op's SDK symbol does not follow the auto-generated naming convention,
+# an explicit ALIASES entry allows the gate to find it.  This test verifies:
+#   a) With the alias present: gate exits 0 (custom symbol satisfies coverage)
+#   b) Without the alias:      gate exits 1 (custom symbol is not found)
+# ---------------------------------------------------------------------------
+
+
+def test_aliases_enable_non_standard_symbol_names(tmp_path: Path) -> None:
+    """ALIASES table entries enable coverage for non-standard symbol names.
+
+    Without an alias, a TypeScript export named "myCustomSymbol" does NOT
+    satisfy "Fake/custom_op" (which would need "fakeCustomOp" by convention).
+    With an alias mapping ("Fake", "custom_op") -> {"typescript": ["myCustomSymbol"]},
+    the gate accepts it and exits 0.
+    """
+    ts_src_dir = tmp_path / "ts_src"
+    ts_src_dir.mkdir()
+    ts_file = ts_src_dir / "index.ts"
+    # Export a non-standard symbol name (not the auto-generated "fakeCustomOp").
+    ts_file.write_text(
+        "export function myCustomSymbol(): void {}\n",
+        encoding="utf-8",
+    )
+
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "custom_op",
+                        "typescript": True,
+                        "python": False,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "python": "Not yet implemented in Python SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    # --- Part a: WITH the alias → gate must exit 0 ---
+    wrapper_with_alias = tmp_path / "run_with_alias.py"
+    wrapper_with_alias.write_text(
+        "\n".join([
+            "import sys",
+            "import importlib.util",
+            "from pathlib import Path",
+            "",
+            f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
+            "_mod = importlib.util.module_from_spec(_spec)",
+            "_spec.loader.exec_module(_mod)",
+            "",
+            f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
+            f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
+            # Inject a custom alias so "myCustomSymbol" satisfies "Fake/custom_op"
+            "_mod.ALIASES[('Fake', 'custom_op')] = {'typescript': ['myCustomSymbol']}",
+            "sys.exit(_mod.main())",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    result_with = subprocess.run(
+        [sys.executable, str(wrapper_with_alias)],
+        capture_output=True,
+        text=True,
+    )
+    assert result_with.returncode == 0, (
+        f"Gate should exit 0 when ALIASES maps 'myCustomSymbol' for Fake/custom_op. "
+        f"Got {result_with.returncode}.\n"
+        f"stdout:\n{result_with.stdout}\nstderr:\n{result_with.stderr}"
+    )
+
+    # --- Part b: WITHOUT the alias → gate must exit 1 ---
+    wrapper_no_alias = tmp_path / "run_no_alias.py"
+    wrapper_no_alias.write_text(
+        "\n".join([
+            "import sys",
+            "import importlib.util",
+            "from pathlib import Path",
+            "",
+            f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
+            "_mod = importlib.util.module_from_spec(_spec)",
+            "_spec.loader.exec_module(_mod)",
+            "",
+            f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
+            f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
+            # No alias added: "myCustomSymbol" is not a valid candidate for "Fake/custom_op"
+            "sys.exit(_mod.main())",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    result_without = subprocess.run(
+        [sys.executable, str(wrapper_no_alias)],
+        capture_output=True,
+        text=True,
+    )
+    assert result_without.returncode == 1, (
+        f"Gate should exit 1 when no ALIASES entry maps 'myCustomSymbol' for Fake/custom_op. "
+        f"Got {result_without.returncode}.\n"
+        f"stdout:\n{result_without.stdout}\nstderr:\n{result_without.stderr}"
+    )
+    assert "no matching SDK symbol was found" in result_without.stdout, (
+        f"Expected 'no matching SDK symbol was found' in stdout.\n"
+        f"stdout:\n{result_without.stdout}"
     )
