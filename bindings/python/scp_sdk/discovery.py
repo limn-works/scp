@@ -10,6 +10,7 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal, TypedDict, cast
 
 from scp_sdk.errors import ScpError
@@ -198,8 +199,6 @@ async def discover_contexts(query: str) -> list[DiscoveryResult]:
         ValidationError: If ``query`` is neither a DID nor an ``scp://`` URI.
         ContextError: If DID resolution or URI parsing fails.
     """
-    import asyncio
-
     bridge = _bridge()
     results = await asyncio.to_thread(bridge.context_discover, query)
     return [cast(DiscoveryResult, dict(item)) for item in results]
