@@ -647,8 +647,12 @@ pub fn event_log_entries_for_consequences(
     // the identical evidence set, eliminating the prior local-clock divergence that
     // caused false-positive §9.9.3 equivocation against honest members. It does NOT,
     // on its own, stop a malicious committer/quorum from future-dating governance
-    // actions to widen this window and mint a convergent `ConsequenceTriggered`
-    // against a victim. That residual is admin/quorum-gated (the governance actions
+    // actions in EITHER direction: (amplification) widen this window to sweep in
+    // extra evidence and mint a convergent `ConsequenceTriggered` against a victim,
+    // OR (suppression) push the max far ahead so `window_start` slides PAST genuine
+    // older evidence, dropping an attacker's own earned warnings out of the window
+    // to evade a consequence. Both share this root and the same fix.
+    // That residual is admin/quorum-gated (the governance actions
     // are real, signed, and attributable) and is the open tail of the convergent-
     // wall-clock RFC: bounding committer-assigned timestamps non-forgeably (BFT
     // median-time / accountability) is deferred to that work. A local-clock ceiling
