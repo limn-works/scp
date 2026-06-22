@@ -492,6 +492,7 @@ async fn prepare_a(
     //    the carrier is absent — the two paths are mutually exclusive.
     let record = reservation.ticket.to_caller_reservation_record(now_secs);
     state
+        .class_s
         .xctx_caller_reservations
         .insert(saga_id.clone(), record);
 
@@ -507,7 +508,7 @@ async fn prepare_a(
     //    reservation that is now reversed in-memory and was never durably
     //    persisted, so leaving it would let a later crash-abort double-reverse).
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_id_hex) {
-        state.xctx_caller_reservations.remove(saga_id);
+        state.class_s.xctx_caller_reservations.remove(saga_id);
         crate::context::tools_helpers::rollback_tool_economy(state, deps, reservation.ticket).await;
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
@@ -821,7 +822,10 @@ async fn prepare_b(
     let now_secs = deps.clock.now_secs();
 
     // Record the accepted nonce in B's dedup cache (freshness state lives on B).
-    state.xctx_nonce_dedup.record(req.asserted_nonce, now_secs);
+    state
+        .class_s
+        .xctx_nonce_dedup
+        .record(req.asserted_nonce, now_secs);
 
     // Stage the eight-field public-metadata projection into saga_pending.
     let prepared = CrossContextToolInvocationPrepared {
@@ -837,7 +841,7 @@ async fn prepare_b(
         recorded_nonce,
         recorded_chain_depth,
     };
-    state.saga_pending.insert(
+    state.class_s.saga_pending.insert(
         req.saga_id.clone(),
         SagaPreparedState::CrossContextToolInvocation(prepared),
     );
@@ -848,7 +852,7 @@ async fn prepare_b(
     // failure, roll the staged slot + nonce back and surface the error.
     let target_hex = hex_context_id(&req.target_context_id);
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-        state.saga_pending.remove(&req.saga_id);
+        state.class_s.saga_pending.remove(&req.saga_id);
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         // The nonce stays recorded (fail-closed direction for replay
@@ -1180,6 +1184,7 @@ fn validate_freshness(
 
     let now_secs = deps.clock.now_secs();
     if state
+        .class_s
         .xctx_nonce_dedup
         .is_replayed(&req.asserted_nonce, now_secs)
     {
@@ -1245,7 +1250,7 @@ fn commit_b_reserve(
     reply: CommitBReserveReply,
 ) -> Outcome<()> {
     // Replay short-circuit: a prior Commit-B already captured the output.
-    if let Some(committed) = state.xctx_committed_outputs.get(saga_id) {
+    if let Some(committed) = state.class_s.xctx_committed_outputs.get(saga_id) {
         let receipt = match jcs_receipt_bytes(&committed.receipt) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -1263,7 +1268,8 @@ fn commit_b_reserve(
     }
 
     // Not yet committed: the staged prepared MUST be present (Prepare-B ran).
-    if let Some(SagaPreparedState::CrossContextToolInvocation(_)) = state.saga_pending.get(saga_id)
+    if let Some(SagaPreparedState::CrossContextToolInvocation(_)) =
+        state.class_s.saga_pending.get(saga_id)
     {
         let _ = reply.send(Ok(CommitBReserveOutcome::ReadyToExecute));
         return Outcome::ok(());
@@ -1299,7 +1305,7 @@ async fn commit_b_settle(
     reply: CommitBSettleReply,
 ) -> Outcome<()> {
     // Replay: re-emit the stored capture byte-for-byte; never re-invoke / re-sign.
-    if let Some(committed) = state.xctx_committed_outputs.get(saga_id) {
+    if let Some(committed) = state.class_s.xctx_committed_outputs.get(saga_id) {
         return reemit_committed_settle(committed, reply);
     }
 
@@ -1370,13 +1376,13 @@ fn commit_b_first_settle(
     // original verbatim (no lossy reconstruction). The slot is restored on every
     // failure path below, so a rejected settle leaves `saga_pending` exactly as
     // it was found.
-    let removed = state.saga_pending.remove(saga_id);
+    let removed = state.class_s.saga_pending.remove(saga_id);
     let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) = removed else {
         // Not a cross-context staged slot (or absent): put back whatever we
         // removed (an unrelated variant) and reject. `mutated = false` — the
         // remove+reinsert is a no-op round-trip.
         if let Some(other) = removed {
-            state.saga_pending.insert(saga_id.clone(), other);
+            state.class_s.saga_pending.insert(saga_id.clone(), other);
         }
         return Err((
             false,
@@ -1396,7 +1402,7 @@ fn commit_b_first_settle(
     {
         Ok(r) => r,
         Err(e) => {
-            state.saga_pending.insert(
+            state.class_s.saga_pending.insert(
                 saga_id.clone(),
                 SagaPreparedState::CrossContextToolInvocation(prepared),
             );
@@ -1430,7 +1436,7 @@ fn commit_b_first_settle(
     // already removed up front (the session reservation is now applied via the
     // capture). No event-log mutation yet — a failure before the append is
     // recoverable by re-inserting the owned staged slot.
-    state.xctx_committed_outputs.insert(
+    state.class_s.xctx_committed_outputs.insert(
         saga_id.clone(),
         CommittedToolInvocation {
             receipt: receipt.clone(),
@@ -1447,8 +1453,8 @@ fn commit_b_first_settle(
     // the retry cannot double-append. `mutated = false`: nothing durable landed
     // (the in-memory capture was just rolled back, no event-log touch).
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
-        state.xctx_committed_outputs.remove(saga_id);
-        state.saga_pending.insert(
+        state.class_s.xctx_committed_outputs.remove(saga_id);
+        state.class_s.saga_pending.insert(
             saga_id.clone(),
             SagaPreparedState::CrossContextToolInvocation(prepared),
         );
@@ -1480,8 +1486,8 @@ fn commit_b_first_settle(
             let err = ContextError::EventLogFailed(format!(
                 "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
             ));
-            state.xctx_committed_outputs.remove(saga_id);
-            state.saga_pending.insert(
+            state.class_s.xctx_committed_outputs.remove(saga_id);
+            state.class_s.saga_pending.insert(
                 saga_id.clone(),
                 SagaPreparedState::CrossContextToolInvocation(prepared),
             );
@@ -1509,8 +1515,8 @@ fn commit_b_first_settle(
         // appending exactly once. If the compensating persist ALSO fails the
         // capture stays durable (a genuine fail-closed terminal — the operator /
         // crash-recovery sweep reconciles), reported `mutated`.
-        state.xctx_committed_outputs.remove(saga_id);
-        state.saga_pending.insert(
+        state.class_s.xctx_committed_outputs.remove(saga_id);
+        state.class_s.saga_pending.insert(
             saga_id.clone(),
             SagaPreparedState::CrossContextToolInvocation(prepared),
         );
@@ -1682,7 +1688,11 @@ async fn commit_a(
     // no-op; the reservation handed back on replay is released (RAII) rather
     // than double-settled. (`xctx_committed_invocations` records committed A-side
     // sagas; absent ⇒ first Commit-A.)
-    if state.xctx_committed_invocations.contains(&req.saga_id) {
+    if state
+        .class_s
+        .xctx_committed_invocations
+        .contains(&req.saga_id)
+    {
         // GENERATION-CHECKED rollback of the handed-back reservation: if this
         // actor was despawned+respawned between Prepare-A and this replayed
         // Commit-A, refunding against the new instance's owned state would
@@ -1700,7 +1710,7 @@ async fn commit_a(
         // state. A removal here is rare (the first Commit-A already removed it),
         // so it is not folded into a persist decision — `xctx_committed_invocations`
         // already witnesses the committed terminal durably.
-        let _ = state.xctx_caller_reservations.remove(&req.saga_id);
+        let _ = state.class_s.xctx_caller_reservations.remove(&req.saga_id);
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
@@ -1739,18 +1749,25 @@ async fn commit_a(
     // (`mutated = true`) but NO `CrossContextToolInvoked` was appended, so there
     // is no orphan log entry — the FSM retry re-acks from the (now-absent) witness
     // and the saga resolves correctly with no silent one-sided A-record.
-    state.xctx_committed_invocations.insert(req.saga_id.clone());
+    state
+        .class_s
+        .xctx_committed_invocations
+        .insert(req.saga_id.clone());
     // Consume the durable caller-reservation record in the SAME Class-S snapshot
     // as the commit witness: the reservation has just been SETTLED via the
     // carrier, so a surviving record would let a later spurious abort reverse
     // already-settled state. Re-stash it on a persist failure so the
     // witness-insert + record-removal roll back together (both are part of the
     // single fail-closed snapshot — the saga is then retried from a clean state).
-    let consumed_record = state.xctx_caller_reservations.remove(&req.saga_id);
+    let consumed_record = state.class_s.xctx_caller_reservations.remove(&req.saga_id);
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
-        state.xctx_committed_invocations.remove(&req.saga_id);
+        state
+            .class_s
+            .xctx_committed_invocations
+            .remove(&req.saga_id);
         if let Some(record) = consumed_record {
             state
+                .class_s
                 .xctx_caller_reservations
                 .insert(req.saga_id.clone(), record);
         }
@@ -1774,7 +1791,10 @@ async fn commit_a(
     ) {
         Ok(leaf) => leaf,
         Err(err) => {
-            state.xctx_committed_invocations.remove(&req.saga_id);
+            state
+                .class_s
+                .xctx_committed_invocations
+                .remove(&req.saga_id);
             if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
                 let sketch = outcome_error_sketch(&persist_err);
                 let _ = reply.send(Err(persist_err));
@@ -1803,7 +1823,10 @@ async fn commit_a(
         // ALSO fails the witness stays durable (a genuine fail-closed terminal —
         // the operator / crash-recovery sweep reconciles), reported `mutated`.
         // Mirrors `commit_b_first_settle`'s append-failure compensation.
-        state.xctx_committed_invocations.remove(&req.saga_id);
+        state
+            .class_s
+            .xctx_committed_invocations
+            .remove(&req.saga_id);
         if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
             let sketch = outcome_error_sketch(&persist_err);
             let _ = reply.send(Err(persist_err));
@@ -1830,7 +1853,7 @@ fn commit_a_check_witness(
     saga_id: &SagaId,
     reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let recorded = state.xctx_committed_invocations.contains(saga_id);
+    let recorded = state.class_s.xctx_committed_invocations.contains(saga_id);
     let _ = reply.send(Ok(recorded));
     Outcome::ok(())
 }
@@ -1953,7 +1976,9 @@ async fn abort(
             // once and the record is removed exactly once.
             let local_ran = if carrier_ran {
                 true
-            } else if let Some(record) = state.xctx_caller_reservations.get(saga_id).cloned() {
+            } else if let Some(record) =
+                state.class_s.xctx_caller_reservations.get(saga_id).cloned()
+            {
                 crate::context::tools_helpers::reverse_caller_reservation_record(
                     state, deps, &record,
                 )
@@ -1966,7 +1991,11 @@ async fn abort(
             // Consume the durable record. Its removal is an owned mutation that
             // MUST be persisted so a later spurious crash-abort cannot reverse an
             // already-released reservation from a stale record.
-            let consumed = state.xctx_caller_reservations.remove(saga_id).is_some();
+            let consumed = state
+                .class_s
+                .xctx_caller_reservations
+                .remove(saga_id)
+                .is_some();
             (local_ran, consumed)
         }
         None => {
@@ -1981,7 +2010,7 @@ async fn abort(
             // `context_id`-routed actor, keyed by `record.actor_did` + the
             // `SagaId` — not on a generation check. Returns whether the local
             // reversal ran (always `true` for a present record on this path).
-            match state.xctx_caller_reservations.remove(saga_id) {
+            match state.class_s.xctx_caller_reservations.remove(saga_id) {
                 Some(record) => {
                     let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
                         state, deps, &record,
@@ -1996,7 +2025,7 @@ async fn abort(
 
     // TARGET side: clear the staged tool-session slot (releases the session
     // reservation). Idempotent — a missing slot is a clean no-op.
-    let had_slot = state.saga_pending.remove(saga_id).is_some();
+    let had_slot = state.class_s.saga_pending.remove(saga_id).is_some();
 
     // Persist if the caller-side owned economy was refunded (`local_rollback_ran`),
     // a durable caller record was consumed (`had_caller_record_consumed` — its
@@ -2264,7 +2293,7 @@ mod tests {
     async fn test_fixture_seeds_production_saga_dedup_ttl() {
         let st = target_state(0x5B, OTHER, CALLER).await;
         assert_eq!(
-            st.xctx_nonce_dedup.ttl_secs(),
+            st.class_s.xctx_nonce_dedup.ttl_secs(),
             SAGA_NONCE_DEDUP_TTL_SECS,
             "the test fixture must seed the production saga dedup TTL, not NonceDedup::new()'s \
              default (which is coterminous with the skew tolerance)"
@@ -3152,6 +3181,7 @@ mod tests {
         // The eight-field prepared was staged into saga_pending with B-recorded
         // provenance, NOT the caller-asserted advisory depth.
         let staged = st
+            .class_s
             .saga_pending
             .get(&SagaId("saga-xctx-1".to_owned()))
             .unwrap();
@@ -3221,7 +3251,8 @@ mod tests {
         );
         // Nothing was staged.
         assert!(
-            !st.saga_pending
+            !st.class_s
+                .saga_pending
                 .contains_key(&SagaId("saga-xctx-1".to_owned())),
             "a rejected Prepare-B must not stage a prepared slot"
         );
@@ -3457,7 +3488,7 @@ mod tests {
             "expected SCP-SAGA-13013 confused-deputy rejection, got {err:?}"
         );
         // Nothing staged — the slot stays empty on rejection.
-        assert!(st.saga_pending.is_empty());
+        assert!(st.class_s.saga_pending.is_empty());
     }
 
     #[tokio::test]
@@ -3493,7 +3524,8 @@ mod tests {
         .await;
         let now_ms = deps.clock.now_millis();
         // Pre-seed the dedup cache with the request nonce.
-        st.xctx_nonce_dedup
+        st.class_s
+            .xctx_nonce_dedup
             .record([0x42; 16], deps.clock.now_secs());
 
         let (tx, rx) = oneshot::channel();
@@ -3537,7 +3569,10 @@ mod tests {
         assert!(out.result.is_ok(), "first prepare_b: {:?}", out.result);
         rx.await.unwrap().expect("first prepare_b accepts");
         assert!(
-            st.xctx_nonce_dedup.entries().contains_key(&replay_nonce),
+            st.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&replay_nonce),
             "the accepted nonce was recorded"
         );
 
@@ -3554,7 +3589,7 @@ mod tests {
         // `NonceDedup::from_entries_with_ttl` — the saga dedup TTL, strictly
         // longer than the freshness skew tolerance, is preserved on restore).
         let mut restored = target_state(0x6A, OTHER, CALLER).await;
-        restored.xctx_nonce_dedup =
+        restored.class_s.xctx_nonce_dedup =
             scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
                 snapshot.xctx_nonce_dedup,
                 SAGA_NONCE_DEDUP_TTL_SECS,
@@ -3601,6 +3636,7 @@ mod tests {
         prepare_a(&mut st, &deps, &saga, &[0x6B; 32], &caller, TOOL, tx).await;
         let prepared_a = rx.await.unwrap().expect("prepared-A");
         let staged = st
+            .class_s
             .xctx_caller_reservations
             .get(&saga)
             .expect("Prepare-A staged the durable record")
@@ -3632,10 +3668,10 @@ mod tests {
         // directly — caller economy is local, so same-node restore rehydrates it
         // verbatim).
         let mut restored = target_state(0x6B, OTHER, CALLER).await;
-        restored.xctx_caller_reservations = snapshot.xctx_caller_reservations.clone();
+        restored.class_s.xctx_caller_reservations = snapshot.xctx_caller_reservations.clone();
 
         assert_eq!(
-            restored.xctx_caller_reservations.get(&saga),
+            restored.class_s.xctx_caller_reservations.get(&saga),
             Some(&staged),
             "the restored state MUST rehydrate the caller-reservation record value-stable"
         );
@@ -3735,7 +3771,7 @@ mod tests {
         let err = rx.await.unwrap().expect_err("persist must fail-close");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         // The staged slot was rolled back on persist failure.
-        assert!(st.saga_pending.is_empty());
+        assert!(st.class_s.saga_pending.is_empty());
     }
 
     // --- Commit-B / Commit-A / Abort tests --------------------------------
@@ -3831,8 +3867,8 @@ mod tests {
         assert_eq!(receipt.nonce, [0x42; 16]);
         assert_eq!(receipt.tool_invoked_event_id, settled.tool_invoked_event_id);
         // The output was captured durably and the staged slot cleared.
-        assert!(st.xctx_committed_outputs.contains_key(&saga));
-        assert!(st.saga_pending.is_empty());
+        assert!(st.class_s.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.class_s.saga_pending.is_empty());
     }
 
     #[tokio::test]
@@ -3857,6 +3893,7 @@ mod tests {
         let first = rx.await.unwrap().expect("first settle");
         // Capture the durable event id; a replay must reproduce it.
         let captured_event_id = st
+            .class_s
             .xctx_committed_outputs
             .get(&saga)
             .unwrap()
@@ -3973,7 +4010,7 @@ mod tests {
         assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
         rx.await.unwrap().expect("commit-a ack");
         // The committed A-side saga is the idempotency witness.
-        assert!(st.xctx_committed_invocations.contains(&saga));
+        assert!(st.class_s.xctx_committed_invocations.contains(&saga));
 
         // Replay: a fresh reservation handed back is released (RAII); re-ack
         // without re-settling (the witness short-circuits).
@@ -4098,7 +4135,7 @@ mod tests {
         );
         // The witness is not left set — a retry re-acks from the absent witness.
         assert!(
-            !st.xctx_committed_invocations.contains(&saga),
+            !st.class_s.xctx_committed_invocations.contains(&saga),
             "the rolled-back witness must not survive a persist failure"
         );
     }
@@ -4116,14 +4153,14 @@ mod tests {
         let now_ms = deps.clock.now_millis();
         let saga = SagaId("saga-abort-b".to_owned());
         stage_prepared_b(&mut st, &deps, 0xC5, &saga.0, now_ms).await;
-        assert!(!st.saga_pending.is_empty());
+        assert!(!st.class_s.saga_pending.is_empty());
 
         // Abort on the B side (no reservation): clears the staged slot.
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st, &deps, &saga, None, tx).await;
         assert!(out.result.is_ok(), "abort: {:?}", out.result);
         rx.await.unwrap().expect("abort ack");
-        assert!(st.saga_pending.is_empty());
+        assert!(st.class_s.saga_pending.is_empty());
 
         // Idempotent: a second abort on the now-terminal saga is a clean no-op.
         let (tx, rx) = oneshot::channel();
@@ -4430,7 +4467,7 @@ mod tests {
         let prepared = rx.await.unwrap().expect("prepared-A");
         // Prepare-A staged the durable record + moved owned economy.
         assert!(
-            st.xctx_caller_reservations.contains_key(&saga),
+            st.class_s.xctx_caller_reservations.contains_key(&saga),
             "Prepare-A must stage a durable caller-reservation record"
         );
         let hrl_after_reserve = st
@@ -4471,7 +4508,7 @@ mod tests {
 
         // The record was consumed.
         assert!(
-            !st.xctx_caller_reservations.contains_key(&saga),
+            !st.class_s.xctx_caller_reservations.contains_key(&saga),
             "the durable record must be consumed on the mismatch abort"
         );
         // The refund was Class-S persisted (Prepare-A persisted the deduction;
@@ -4604,8 +4641,8 @@ mod tests {
         let err = rx.await.unwrap().expect_err("persist must fail-close");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         // The capture was rolled back; the staged slot restored for a retry.
-        assert!(!st.xctx_committed_outputs.contains_key(&saga));
-        assert!(st.saga_pending.contains_key(&saga));
+        assert!(!st.class_s.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.class_s.saga_pending.contains_key(&saga));
     }
 
     /// FIX 3 (provenance-integrity): a Commit-B persist FAILURE followed by a
@@ -4662,8 +4699,8 @@ mod tests {
             0,
             "a persist failure must NOT append ToolInvoked (append is sequenced after persist)"
         );
-        assert!(!st.xctx_committed_outputs.contains_key(&saga));
-        assert!(st.saga_pending.contains_key(&saga));
+        assert!(!st.class_s.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.class_s.saga_pending.contains_key(&saga));
 
         // RETRY settle on the SAME deps (the persistence now succeeds): capture
         // lands, persist succeeds, and `ToolInvoked` appends EXACTLY ONCE.
@@ -4680,8 +4717,8 @@ mod tests {
             1,
             "a persist-failure-then-retry Commit-B must append ToolInvoked EXACTLY ONCE"
         );
-        assert!(st.xctx_committed_outputs.contains_key(&saga));
-        assert!(!st.saga_pending.contains_key(&saga));
+        assert!(st.class_s.xctx_committed_outputs.contains_key(&saga));
+        assert!(!st.class_s.saga_pending.contains_key(&saga));
     }
 
     /// FIX 6 (simplifier): a Commit-B settle persist-failure rollback RE-INSERTS
@@ -4713,7 +4750,7 @@ mod tests {
             recorded_nonce: [0x42; 16],
             recorded_chain_depth: 3,
         };
-        st.saga_pending.insert(
+        st.class_s.saga_pending.insert(
             saga.clone(),
             SagaPreparedState::CrossContextToolInvocation(original),
         );
@@ -4742,7 +4779,7 @@ mod tests {
 
         // The restored slot preserves the FULL original — including the
         // `ucan_proof_id` the deleted lossy inverse would have dropped.
-        let restored = st.saga_pending.get(&saga).expect("slot restored");
+        let restored = st.class_s.saga_pending.get(&saga).expect("slot restored");
         let SagaPreparedState::CrossContextToolInvocation(p) = restored else {
             panic!("restored slot must be a cross-context prepared");
         };
@@ -4752,7 +4789,7 @@ mod tests {
         );
         assert_eq!(p.recorded_nonce, [0x42; 16]);
         assert_eq!(p.recorded_chain_depth, 3);
-        assert!(!st.xctx_committed_outputs.contains_key(&saga));
+        assert!(!st.class_s.xctx_committed_outputs.contains_key(&saga));
     }
 
     // -----------------------------------------------------------------------
@@ -4972,7 +5009,7 @@ mod tests {
         let prepared_a = rx.await.unwrap().expect("prepared-A");
         // The durable record landed.
         assert!(
-            st.xctx_caller_reservations.contains_key(&saga),
+            st.class_s.xctx_caller_reservations.contains_key(&saga),
             "Prepare-A must stage a durable caller-reservation record"
         );
         // The reservation moved owned economy state.
@@ -5035,7 +5072,7 @@ mod tests {
         );
         // The record is consumed.
         assert!(
-            !st.xctx_caller_reservations.contains_key(&saga),
+            !st.class_s.xctx_caller_reservations.contains_key(&saga),
             "the durable record must be consumed on the recovery abort"
         );
         // The durable deductions are reversed: hard-rate-limit back to full
@@ -5175,7 +5212,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         prepare_a(&mut st, &deps, &saga, &[0xDA; 32], &caller, TOOL, tx).await;
         let prepared_a = rx.await.unwrap().expect("prepared-A");
-        assert!(st.xctx_caller_reservations.contains_key(&saga));
+        assert!(st.class_s.xctx_caller_reservations.contains_key(&saga));
 
         // Live abort via the carrier.
         let (tx, rx) = oneshot::channel();
@@ -5186,7 +5223,7 @@ mod tests {
         // The record is consumed and the reversal ran EXACTLY once (state back
         // to pre-reserve, not over-refunded).
         assert!(
-            !st.xctx_caller_reservations.contains_key(&saga),
+            !st.class_s.xctx_caller_reservations.contains_key(&saga),
             "the live abort must consume the durable record"
         );
         let hrl_after = st
@@ -5252,7 +5289,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         prepare_a(&mut st, &deps, &saga, &[0xDB; 32], &caller, TOOL, tx).await;
         let prepared_a = rx.await.unwrap().expect("prepared-A");
-        assert!(st.xctx_caller_reservations.contains_key(&saga));
+        assert!(st.class_s.xctx_caller_reservations.contains_key(&saga));
         // After Prepare-A the hard-rate-limit token is consumed (below burst).
         let hrl_after_reserve = st
             .governance
@@ -5278,9 +5315,9 @@ mod tests {
         let out = commit_a(&mut st, &deps, req, tx).await;
         assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
         rx.await.unwrap().expect("commit-a ack");
-        assert!(st.xctx_committed_invocations.contains(&saga));
+        assert!(st.class_s.xctx_committed_invocations.contains(&saga));
         assert!(
-            !st.xctx_caller_reservations.contains_key(&saga),
+            !st.class_s.xctx_caller_reservations.contains_key(&saga),
             "Commit-A must consume the durable reservation record"
         );
         // Capture the settled hard-rate-limit state (the settle does NOT refund
@@ -5377,7 +5414,7 @@ mod tests {
         // path (supervisor `prepared_a == None` → `Abort { None }`) owns the
         // single LOCAL reversal, so the deduction must survive here.
         assert!(
-            st.xctx_caller_reservations.contains_key(&saga),
+            st.class_s.xctx_caller_reservations.contains_key(&saga),
             "the durable reservation record must survive a lost Prepare-A reply \
              (the abort reverses LOCAL from it)"
         );

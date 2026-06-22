@@ -14022,6 +14022,7 @@ mod tests {
         let executed_id = [0x11u8; 32];
         state
             .governance
+            .class_s
             .executed_proposals
             .insert(executed_id, 1_700_000_000);
 
@@ -14037,7 +14038,7 @@ mod tests {
         let mut nonce_entries = std::collections::HashMap::new();
         nonce_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
         let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        state.governance.spending_nonce_tracker =
+        state.governance.class_s.spending_nonce_tracker =
             scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
                 hex::encode(ctx_id_bytes),
                 nonce_clock,
@@ -14055,7 +14056,7 @@ mod tests {
         // snapshot round-trip through their sanctioned non-derive mirror.
         let xctx_saga_id =
             crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
-        state.saga_pending.insert(
+        state.class_s.saga_pending.insert(
             xctx_saga_id.clone(),
             crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextToolInvocation(
                 crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared {
@@ -14073,7 +14074,7 @@ mod tests {
         let standing_saga_id =
             crate::context::supervisor::saga_journal::SagaId("saga-class-s-standing".to_owned());
         let standing_derived = [0x9Du8; 32];
-        state.saga_pending.insert(
+        state.class_s.saga_pending.insert(
             standing_saga_id.clone(),
             crate::context::supervisor::saga_prepared_state::SagaPreparedState::StandingPairCreate(
                 crate::context::supervisor::saga_prepared_state::StandingPairCreatePrepared {
@@ -14109,7 +14110,7 @@ mod tests {
                 },
             )
             .expect("Class-S committed receipt signs");
-        state.xctx_committed_outputs.insert(
+        state.class_s.xctx_committed_outputs.insert(
             committed_saga_id.clone(),
             crate::context::supervisor::saga_prepared_state::CommittedToolInvocation {
                 receipt: committed_receipt.clone(),
@@ -14118,6 +14119,7 @@ mod tests {
             },
         );
         state
+            .class_s
             .xctx_committed_invocations
             .insert(committed_saga_id.clone());
 
@@ -14372,7 +14374,7 @@ mod tests {
         let mut seed_entries = std::collections::HashMap::new();
         seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
         let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        state.governance.spending_nonce_tracker =
+        state.governance.class_s.spending_nonce_tracker =
             scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
                 ctx_key.clone(),
                 nonce_clock,
@@ -14571,7 +14573,7 @@ mod tests {
         let mut seed_entries = std::collections::HashMap::new();
         seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
         let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        state.governance.spending_nonce_tracker =
+        state.governance.class_s.spending_nonce_tracker =
             scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
                 ctx_key.clone(),
                 nonce_clock,
@@ -14652,6 +14654,7 @@ mod tests {
         let executed_id = [0x42u8; 32];
         state
             .governance
+            .class_s
             .executed_proposals
             .insert(executed_id, 1_700_000_000);
         let deps = test_actor_deps(&sup).await;
@@ -14948,6 +14951,7 @@ mod tests {
         let proposal_id: scp_protocol::context::governance::ProposalId = [0xABu8; 32];
         state
             .governance
+            .class_s
             .executed_proposals
             .insert(proposal_id, 1_700_000_000);
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)

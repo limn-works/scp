@@ -1144,11 +1144,6 @@ pub struct VelocityTrackerSnapshot {
 pub(crate) struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
     pub(crate) engine: Box<dyn GovernanceEngine>,
-    /// Proposal IDs that have already been executed, mapped to the unix
-    /// timestamp (seconds) when they were marked executed. Prevents replay of
-    /// approved governance proposals (defense-in-depth). Entries older than
-    /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
-    pub(crate) executed_proposals: HashMap<ProposalId, u64>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
     ///
     /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
@@ -1178,10 +1173,6 @@ pub(crate) struct GovernanceState {
     pub(crate) timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
     pub(crate) deadlock: DeadlockDetectionState,
-    /// Governance threshold signers (for `ThresholdApproval` model).
-    pub(crate) threshold_signers: Vec<DID>,
-    /// Governance threshold value (quorum requirement).
-    pub(crate) threshold_value: u32,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pub(crate) pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Pending economic policy change awaiting notification period (§19.3).
@@ -1238,11 +1229,6 @@ pub(crate) struct GovernanceState {
     /// is enforced even when `economic_policy` is `None`. See ADR notes on
     /// the dormant anti-spam wiring fix.
     pub(crate) hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter,
-    /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
-    /// Validates that each spending UCAN nonce is used at most once, preventing
-    /// replay attacks where a valid spending UCAN is resubmitted.
-    pub(crate) spending_nonce_tracker:
-        scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
@@ -1260,6 +1246,130 @@ pub(crate) struct GovernanceState {
     /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
     /// Entries outside the sliding window are evicted on each check.
     pub(crate) proposal_timestamps: HashMap<String, Vec<u64>>,
+    /// Class-S governance state (ADR-049 §9): the downward-authorization /
+    /// anti-replay subset whose ≤50 ms coalesce-window rollback would re-open
+    /// a security window the caller already observed as closed. Grouped into
+    /// [`GovernanceClassS`] so the fail-closed-persist boundary is one named
+    /// sub-struct rather than four loose fields scattered through the
+    /// governance bucket. Fields remain `pub(crate)` — privatization behind a
+    /// mutator-combinator boundary is a LATER PR.
+    pub(crate) class_s: GovernanceClassS,
+}
+
+/// The Class-S subset of [`GovernanceState`] (ADR-049 §9).
+///
+/// Groups the four governance fields whose mutation is a security-critical
+/// downward-authorization or anti-replay transition that MUST be persisted
+/// fail-closed before the operation is acknowledged: the executed-proposals
+/// replay-marker map, the governance threshold signer set + quorum value, and
+/// the spending-UCAN nonce tracker. A ≤50 ms coalesce-window rollback of any
+/// of these re-opens a replay / re-grant the caller already saw closed.
+///
+/// This is a behaviour-neutral DATA SPLIT: the fields keep their `pub(crate)`
+/// visibility and existing call sites reach them through the lengthened path
+/// `governance.class_s.<field>`. Privatizing them behind a persist-on-commit
+/// mutator boundary (so the fail-closed invariant is a compile error to
+/// violate, retiring the source-text gate) is a separate later PR.
+///
+/// # `spending_nonce_tracker` is not `Clone`
+///
+/// [`NonceTracker`](scp_protocol::crypto::ucan::nonce::NonceTracker) holds a
+/// clock handle and is not `Clone`, so [`Self::snapshot`] / [`Self::restore`]
+/// project through its `snapshot_entries` / `from_snapshot` mirror (the
+/// `restore` side needs the clock threaded as a parameter). The other three
+/// fields are `Clone` and snapshot via a plain clone.
+pub(crate) struct GovernanceClassS {
+    /// Proposal IDs that have already been executed, mapped to the unix
+    /// timestamp (seconds) when they were marked executed. Prevents replay of
+    /// approved governance proposals (defense-in-depth). Entries older than
+    /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
+    pub(crate) executed_proposals: HashMap<ProposalId, u64>,
+    /// Governance threshold signers (for `ThresholdApproval` model).
+    pub(crate) threshold_signers: Vec<DID>,
+    /// Governance threshold value (quorum requirement).
+    pub(crate) threshold_value: u32,
+    /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
+    /// Validates that each spending UCAN nonce is used at most once, preventing
+    /// replay attacks where a valid spending UCAN is resubmitted.
+    pub(crate) spending_nonce_tracker:
+        scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+}
+
+/// Lossless, `Clone`-able mirror of [`GovernanceClassS`] (ADR-049 §9).
+///
+/// The live sub-struct cannot derive `Clone` because its
+/// `spending_nonce_tracker` holds a clock handle; this snapshot captures the
+/// tracker's `(context_id, entries)` so [`GovernanceClassS::restore`] can
+/// rebuild it from a caller-supplied clock. The other three fields are stored
+/// by clone. Used only for the in-memory snapshot/restore round-trip — the
+/// on-disk [`ContextSnapshot`] format is unchanged (these fields continue to
+/// serialize as their existing flat snapshot fields).
+#[derive(Debug, Clone)]
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 PR2a is a behaviour-neutral data split + mirror snapshot. The snapshot/restore mirror's first PRODUCTION consumer is the later privatization PR (restore wiring through the mutator-combinator boundary); for now it is exercised by the crate-internal lossless round-trip unit test. Mirrors the PR1 ClassSCell scaffolding precedent."
+)]
+pub(crate) struct GovernanceClassSSnapshot {
+    /// Mirror of [`GovernanceClassS::executed_proposals`].
+    pub(crate) executed_proposals: HashMap<ProposalId, u64>,
+    /// Mirror of [`GovernanceClassS::threshold_signers`].
+    pub(crate) threshold_signers: Vec<DID>,
+    /// Mirror of [`GovernanceClassS::threshold_value`].
+    pub(crate) threshold_value: u32,
+    /// Context id of the `spending_nonce_tracker`, needed to rebuild it on
+    /// restore via [`NonceTracker::from_snapshot`](scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot).
+    pub(crate) spending_nonce_tracker_context_id: String,
+    /// `(nonce → (first_seen_secs, token_expiry_secs))` entries of the
+    /// `spending_nonce_tracker`, projected via `snapshot_entries`.
+    pub(crate) spending_nonce_tracker_entries: HashMap<String, (u64, u64)>,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 PR2a is a behaviour-neutral data split + mirror snapshot. The snapshot/restore mirror's first PRODUCTION consumer is the later privatization PR (restore wiring through the mutator-combinator boundary); for now it is exercised by the crate-internal lossless round-trip unit test. Mirrors the PR1 ClassSCell scaffolding precedent."
+)]
+impl GovernanceClassS {
+    /// Project this Class-S governance subset onto its `Clone`-able mirror
+    /// (ADR-049 §9). Lossless with [`Self::restore`].
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> GovernanceClassSSnapshot {
+        GovernanceClassSSnapshot {
+            executed_proposals: self.executed_proposals.clone(),
+            threshold_signers: self.threshold_signers.clone(),
+            threshold_value: self.threshold_value,
+            spending_nonce_tracker_context_id: self.spending_nonce_tracker.context_id().to_owned(),
+            spending_nonce_tracker_entries: self.spending_nonce_tracker.snapshot_entries(),
+        }
+    }
+
+    /// Restore this Class-S governance subset from its mirror (ADR-049 §9),
+    /// rebuilding the `spending_nonce_tracker` from `clock`. Lossless inverse
+    /// of [`Self::snapshot`].
+    pub(crate) fn restore(&mut self, snap: GovernanceClassSSnapshot, clock: &Arc<dyn Clock>) {
+        // Rebuild the whole sub-struct via a struct LITERAL (field `:` form)
+        // rather than per-field assignment. This is pure same-snapshot
+        // rehydration, not an acknowledged downward-auth transition — using the
+        // literal keeps the ADR-049 §9 fail-closed gate's assignment marker
+        // (`threshold_value=`) out of this restore body, exactly as the
+        // `restore_context` struct-literal rehydration path already does.
+        let GovernanceClassSSnapshot {
+            executed_proposals,
+            threshold_signers,
+            threshold_value,
+            spending_nonce_tracker_context_id,
+            spending_nonce_tracker_entries,
+        } = snap;
+        *self = Self {
+            executed_proposals,
+            threshold_signers,
+            threshold_value,
+            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                spending_nonce_tracker_context_id,
+                Arc::clone(clock),
+                spending_nonce_tracker_entries,
+            ),
+        };
+    }
 }
 
 impl GovernanceState {
@@ -1430,14 +1540,11 @@ impl GovernanceState {
             Box::new(SingleAdminEngine::new(admin_did, resolver));
         Self {
             engine,
-            executed_proposals: HashMap::new(),
             approved_proposals: HashMap::new(),
             next_proposal_seq: 0,
             freeze: None,
             timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
             registered_tools: Vec::new(),
@@ -1455,12 +1562,17 @@ impl GovernanceState {
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
                 scp_protocol::economy::antispam::HardRateLimitConfig::default(),
             ),
-            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                context_id.to_owned(),
-                clock,
-            ),
             revoked_spending_ucan_cids: HashSet::new(),
             proposal_timestamps: HashMap::new(),
+            class_s: GovernanceClassS {
+                executed_proposals: HashMap::new(),
+                threshold_signers: Vec::new(),
+                threshold_value: 0,
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.to_owned(),
+                    clock,
+                ),
+            },
         }
     }
 }

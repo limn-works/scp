@@ -107,7 +107,7 @@ fn per_context_state_encrypted_public_fields_accessible() {
     // New actor-shape fields.
     assert_eq!(s.send_tracker.last_issued(), 0);
     let _ = s.recv_tracker.last_seen(&DID("did:example:eve".to_owned()));
-    assert_eq!(s.saga_pending.len(), 0);
+    assert_eq!(s.saga_pending().len(), 0);
     assert!(s.welcome_scratchpad.is_none());
     assert_eq!(s.lifecycle_state, ContextLifecycleState::Open);
 
