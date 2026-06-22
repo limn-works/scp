@@ -391,6 +391,12 @@ impl<'a> GovernanceClassCMut<'a> {
     /// the whole `&mut GovernanceState` is consumed here and only field-granular
     /// references survive, so the view never holds a whole-bucket `&mut`.
     const fn new(gov: &'a mut GovernanceState) -> Self {
+        // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above). When
+        // adding a field here: any field that is, or transitively contains, a
+        // Class-S sub-struct (`GovernanceClassS`) MUST be left to the `..` rest or
+        // bound a shared `&` — NEVER `&mut`. Today: `class_s: GovernanceClassS`
+        // falls into `..`, `next_proposal_seq` is a shared `&`, the four Class-C
+        // fields are `&mut`.
         let GovernanceState {
             velocity_tracker,
             budget_tracker,
@@ -506,6 +512,13 @@ impl<'a> ClassCMut<'a> {
     /// the governance bucket). The view never holds a whole-state `&mut`, so no
     /// accessor can return one.
     const fn new(state: &'a mut PerContextState) -> Self {
+        // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above). When
+        // adding a field here: any field that is, or transitively contains, a
+        // Class-S sub-struct (`ClassSState` / `GovernanceClassS`) MUST be left to
+        // the `..` rest, bound a shared `&`, or wrapped in a sub-view — NEVER
+        // `&mut`. Today: `class_s` and `membership` are shared `&`, and `governance`
+        // is wrapped in `GovernanceClassCMut` (its own `class_s` falls into that
+        // sub-view's `..` rest).
         let PerContextState {
             members,
             receive_buffer,
