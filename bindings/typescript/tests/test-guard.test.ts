@@ -79,9 +79,9 @@ describe("isTestEnvironment", () => {
     expect(typeof isTestEnvironment()).toBe("boolean");
   });
 
-  it("returns true in the bun test runner (BUN_TEST is set at test-suite load)", () => {
-    // bun test sets BUN_TEST in process.env before loading modules, so the
-    // frozen constant must reflect that.
+  it("returns true in the bun test runner (NODE_ENV=test is set at test-suite load)", () => {
+    // bun test sets NODE_ENV=test in process.env before loading modules, so
+    // the frozen constant must reflect that. BUN_TEST is NOT set by bun test.
     expect(isTestEnvironment()).toBe(true);
   });
 });
