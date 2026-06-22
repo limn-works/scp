@@ -516,12 +516,13 @@ pub async fn reserve_tool_economy(
     let consequence_rules = state.governance.consequence_rules.clone();
     let message_pricing = state.governance.message_pricing.clone();
 
-    let events_snapshot = crate::context::governance_logic::event_log_entries_for_consequences(
-        &state.receive_buffer,
-        context_id,
-        now_secs,
-        event_log.as_ref(),
-    );
+    let (events_snapshot, convergent_now) =
+        crate::context::governance_logic::event_log_entries_for_consequences(
+            &state.receive_buffer,
+            context_id,
+            now_secs,
+            event_log.as_ref(),
+        );
 
     let mut participation_cache: HashMap<
         String,
@@ -536,6 +537,7 @@ pub async fn reserve_tool_economy(
             context_id,
             now: now_secs,
             events: &events_snapshot,
+            convergent_now,
             participation_cache: &mut participation_cache,
             consequence_rules: &consequence_rules,
             payment_adapter: payment_adapter.clone(),
@@ -752,7 +754,7 @@ pub async fn settle_tool_economy_capture(
     let payment_adapter = deps.payment_adapter.clone();
 
     let now = clock.now_secs();
-    let events_for_consequences =
+    let (events_for_consequences, convergent_now) =
         crate::context::governance_logic::event_log_entries_for_consequences(
             &state.receive_buffer,
             context_id,
@@ -766,6 +768,7 @@ pub async fn settle_tool_economy_capture(
         invoker_did,
         context_id,
         now,
+        convergent_now,
         &mut state.governance.participation_cache,
         &consequence_rules,
     );

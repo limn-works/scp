@@ -691,13 +691,20 @@ pub fn run_buffered_post_delivery(
 
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let events = crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
+        let (events, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                &state.receive_buffer,
+                context_id,
+                now,
+                event_log,
+            );
+        let triggered = evaluate_consequence_rules(
+            &consequence_rules,
+            &events,
+            sender_did,
             now,
-            event_log,
+            convergent_now,
         );
-        let triggered = evaluate_consequence_rules(&consequence_rules, &events, sender_did, now);
         let member_did = DID(sender_did.to_owned());
         let mut split = crate::context::governance_logic::ConsequenceStateSplit {
             governance: &mut state.governance,
@@ -1832,15 +1839,21 @@ pub fn finalize_send(
     );
 
     // Consequence enforcement.
-    let send_events = crate::context::governance_logic::event_log_entries_for_consequences(
-        &state.receive_buffer,
-        context_id,
-        now,
-        &*deps.event_log,
-    );
+    let (send_events, convergent_now) =
+        crate::context::governance_logic::event_log_entries_for_consequences(
+            &state.receive_buffer,
+            context_id,
+            now,
+            &*deps.event_log,
+        );
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
-    let send_triggered =
-        evaluate_consequence_rules(&consequence_rules, &send_events, sender_did.as_ref(), now);
+    let send_triggered = evaluate_consequence_rules(
+        &consequence_rules,
+        &send_events,
+        sender_did.as_ref(),
+        now,
+        convergent_now,
+    );
     {
         let mut split = crate::context::governance_logic::ConsequenceStateSplit {
             governance: &mut state.governance,
@@ -2639,15 +2652,20 @@ pub fn deliver_message_and_drain_buffered(
             let consequence_rules: Vec<ConsequenceRule> =
                 state.governance.consequence_rules.clone();
             if !consequence_rules.is_empty() {
-                let recv_events =
+                let (recv_events, convergent_now) =
                     crate::context::governance_logic::event_log_entries_for_consequences(
                         &state.receive_buffer,
                         context_id,
                         now,
                         &*deps.event_log,
                     );
-                let recv_triggered =
-                    evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+                let recv_triggered = evaluate_consequence_rules(
+                    &consequence_rules,
+                    &recv_events,
+                    sender_did,
+                    now,
+                    convergent_now,
+                );
                 let recv_member_did = DID(sender_did.to_owned());
                 let mut split = crate::context::governance_logic::ConsequenceStateSplit {
                     governance: &mut state.governance,
@@ -2752,14 +2770,20 @@ pub fn deliver_message_and_drain_buffered(
     }
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
+        let (recv_events, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                &state.receive_buffer,
+                context_id,
+                now,
+                &*deps.event_log,
+            );
+        let recv_triggered = evaluate_consequence_rules(
+            &consequence_rules,
+            &recv_events,
+            sender_did,
             now,
-            &*deps.event_log,
+            convergent_now,
         );
-        let recv_triggered =
-            evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
         let recv_member_did = DID(sender_did.to_owned());
         let mut split = crate::context::governance_logic::ConsequenceStateSplit {
             governance: &mut state.governance,

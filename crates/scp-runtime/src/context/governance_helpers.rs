@@ -3172,7 +3172,9 @@ fn actor_check_proposer_eligibility(
         let merkle_root = event_log
             .event_log_merkle_root(&context_id_bytes)
             .unwrap_or([0u8; 32]);
-        let events =
+        // Participation-record path consumes only the merged event set;
+        // `convergent_now` (the consequence window anchor) is unused here.
+        let (events, _convergent_now) =
             event_log_entries_for_consequences(&state.receive_buffer, &context_id, now, event_log);
         if !events.is_empty() {
             match compute_participation_record(
@@ -4317,7 +4319,9 @@ pub fn finalize_governance_action(
         let now = deps.clock.now_secs();
         let rules = state.governance.consequence_rules.clone();
         if !rules.is_empty() {
-            let buf_events = event_log_entries_for_consequences(
+            // Proposer and target share one merged event set and one convergent
+            // window anchor so both evaluations are convergent across members.
+            let (buf_events, convergent_now) = event_log_entries_for_consequences(
                 &state.receive_buffer,
                 context_id,
                 now,
@@ -4328,6 +4332,7 @@ pub fn finalize_governance_action(
                 &buf_events,
                 proposal.proposer_did.as_ref(),
                 now,
+                convergent_now,
             );
             let triggered_target = if let Some(target) = proposal.action.target_did()
                 && target != &proposal.proposer_did
@@ -4339,6 +4344,7 @@ pub fn finalize_governance_action(
                         &buf_events,
                         target.as_ref(),
                         now,
+                        convergent_now,
                     ),
                 ))
             } else {
@@ -4393,7 +4399,8 @@ pub fn finalize_governance_action(
     // Update participation record after governance action (#1530).
     {
         let now = deps.clock.now_secs();
-        let gov_events = event_log_entries_for_consequences(
+        // Participation-record path: only the merged event set is consumed.
+        let (gov_events, _convergent_now) = event_log_entries_for_consequences(
             &state.receive_buffer,
             context_id,
             now,

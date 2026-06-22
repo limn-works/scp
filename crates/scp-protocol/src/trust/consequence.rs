@@ -430,7 +430,13 @@ pub struct ConsequenceRule {
     pub threshold: u64,
 
     /// The time window (in seconds) within which events are counted. Only
-    /// events with timestamps in `[now - window, now]` are considered.
+    /// events whose timestamp falls in `[anchor - window, anchor]` are
+    /// considered, where `anchor` depends on the trigger's convergence
+    /// ([`is_convergent_trigger`]): a **convergent** trigger (`WarningCount`,
+    /// `Custom`) anchors on the convergent event-log timestamp so its durable
+    /// leaf is byte-identical across skewed members (§9.9.3); a
+    /// **non-convergent** trigger (`MessageVelocity`, `ToolRateExceeded`)
+    /// anchors on the evaluating member's local clock, as local flow control.
     pub window: Duration,
 }
 
@@ -664,7 +670,7 @@ pub struct ConsequenceEvidence {
 /// Returned by [`evaluate_consequence_rules`] when a rule's trigger condition
 /// is met. Contains the index of the rule that fired, the action to take,
 /// and the events that constituted the triggering evidence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggeredConsequence {
     /// Index of the rule in the original rules slice that was triggered.
     pub rule_index: usize,
@@ -925,8 +931,20 @@ pub fn merge_consequence_events(
 ///   `&[Event]` rather than `&EventLog` because `EventLog` stores only leaf
 ///   hashes, not full events.
 /// - `subject_did` -- The DID of the participant being evaluated.
-/// - `now` -- The current time as a Unix timestamp in seconds. Used to compute
-///   the time window boundary for each rule.
+/// - `now` -- The current time as a Unix timestamp in seconds, read from the
+///   evaluating member's **local** clock. Used to compute the evidence window
+///   boundary for **non-convergent** triggers ([`is_convergent_trigger`] is
+///   `false`: `MessageVelocity`, `ToolRateExceeded`), which are local flow
+///   control and never mint a durable leaf, so a local-clock window is sound.
+/// - `convergent_now` -- The convergent window anchor (Unix seconds) used for
+///   **convergent** triggers ([`is_convergent_trigger`] is `true`: `WarningCount`,
+///   `Custom`). It must be the max timestamp of the convergent **Source-1
+///   durable log entries** — NOT a local clock, and NOT derived from the
+///   post-merge `events` (which include Source-2 buffer events carrying
+///   local-clock estimated timestamps). Anchoring convergent triggers to the
+///   convergent log makes the evidence window — and hence the durable
+///   `ConsequenceTriggered` leaf — byte-identical across honest members with
+///   skewed local clocks, eliminating the §9.9.3 equivocation false positive.
 ///
 /// # Returns
 ///
@@ -936,7 +954,12 @@ pub fn merge_consequence_events(
 /// # Design Notes
 ///
 /// - Pure computation -- no side effects, no storage.
-/// - The `now` parameter is passed explicitly (rather than using a `Clock`
+/// - The window anchor splits on the trigger's convergence: convergent triggers
+///   use `convergent_now` (window `[convergent_now - window, convergent_now]`),
+///   non-convergent triggers use the local `now` (window `[now - window, now]`).
+///   Everything downstream (`matches_trigger`, evidence collection, threshold,
+///   `convergent_consequence_timestamp`) is unchanged.
+/// - The clock parameters are passed explicitly (rather than using a `Clock`
 ///   trait) for simplicity and testability, following the pattern established
 ///   by `compute_participation_record`.
 /// - Custom triggers match `GovernanceAction` events whose payload starts
@@ -949,17 +972,27 @@ pub fn evaluate_consequence_rules(
     events: &[Event],
     subject_did: &str,
     now: u64,
+    convergent_now: u64,
 ) -> Vec<TriggeredConsequence> {
     let mut triggered = Vec::new();
 
     for (rule_index, rule) in rules.iter().enumerate() {
-        let window_start = now.saturating_sub(rule.window.as_secs());
+        // Convergent-trigger consequences mint a durable Merkle leaf, so their
+        // evidence window must anchor on the convergent log (`convergent_now`),
+        // not the evaluating member's skewed local clock. Non-convergent triggers
+        // are local flow control and keep the local-clock window.
+        let window_anchor = if is_convergent_trigger(&rule.trigger) {
+            convergent_now
+        } else {
+            now
+        };
+        let window_start = window_anchor.saturating_sub(rule.window.as_secs());
 
         let evidence: Vec<ConsequenceEvidence> = events
             .iter()
             .filter(|event| {
                 // Time window filter.
-                event.timestamp >= window_start && event.timestamp <= now
+                event.timestamp >= window_start && event.timestamp <= window_anchor
             })
             .filter(|event| matches_trigger(&rule.trigger, event, subject_did))
             .map(|event| ConsequenceEvidence {
@@ -1524,7 +1557,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 960, 2, vec![]),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].rule_index, 0);
@@ -1557,7 +1590,7 @@ mod tests {
             })
             .collect();
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action, suspend_all());
@@ -1599,7 +1632,7 @@ mod tests {
             ),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1609,6 +1642,109 @@ mod tests {
             }
         );
         assert_eq!(result[0].evidence.len(), 2);
+    }
+
+    /// Convergence pin (§9.9.3): a convergent-trigger rule (`WarningCount`)
+    /// evaluated by two honest members with the SAME convergent `events` but
+    /// DIFFERENT local clocks (`now_a` vs `now_b`) MUST produce byte-identical
+    /// results — including the same `convergent_consequence_timestamp` — as long
+    /// as both anchor on the SAME `convergent_now` (the max timestamp of the
+    /// convergent durable log). Before the fix, the evidence window keyed on the
+    /// local `now`, so skewed members selected different evidence subsets of the
+    /// same convergent events and minted divergent durable leaves.
+    #[test]
+    fn convergent_window_anchor_converges_under_skewed_local_clocks() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "observer".to_owned(),
+            },
+            threshold: 2,
+            window: Duration::from_mins(5),
+        }];
+
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+
+        // Identical convergent governance-action evidence on both members.
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                800,
+                0,
+                payload.clone(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                900,
+                1,
+                payload,
+            ),
+        ];
+
+        // Same convergent anchor (max log timestamp), skewed LOCAL clocks.
+        let convergent_now = 1000;
+        let now_a = 1000;
+        let now_b = 1250;
+
+        let result_a =
+            evaluate_consequence_rules(&rules, &events, "did:key:alice", now_a, convergent_now);
+        let result_b =
+            evaluate_consequence_rules(&rules, &events, "did:key:alice", now_b, convergent_now);
+
+        // Byte-identical triggered set — the durable leaf converges.
+        assert_eq!(result_a, result_b);
+        assert_eq!(result_a.len(), 1);
+        assert_eq!(result_a[0].evidence.len(), 2);
+        // The convergent leaf timestamp (highest-sequence evidence) is identical.
+        assert_eq!(
+            convergent_consequence_timestamp(&result_a[0]),
+            convergent_consequence_timestamp(&result_b[0]),
+        );
+    }
+
+    /// Non-vacuity control for
+    /// [`convergent_window_anchor_converges_under_skewed_local_clocks`]: if the
+    /// anchor itself were skewed (the pre-fix behaviour, here simulated by
+    /// passing each member's LOCAL clock AS `convergent_now`), an event whose
+    /// timestamp lies BETWEEN the two anchors falls inside one member's window
+    /// and outside the other's — so the results DIVERGE. This proves the
+    /// convergence in the positive test comes from the shared anchor, not from
+    /// the evidence happening to fall in every window regardless.
+    #[test]
+    fn convergent_window_skewed_anchor_diverges() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "observer".to_owned(),
+            },
+            threshold: 1,
+            window: Duration::from_mins(5),
+        }];
+
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+
+        // A single convergent event at ts=1100 — between the two skewed anchors.
+        let events = vec![make_event(
+            EventType::GovernanceAction,
+            "did:key:admin",
+            1100,
+            0,
+            payload,
+        )];
+
+        // Pre-fix simulation: anchor == local clock. Window = 300s.
+        //   anchor_a = 1000 -> window [700, 1000]  -> 1100 EXCLUDED -> no trigger
+        //   anchor_b = 1250 -> window [950, 1250]  -> 1100 INCLUDED -> trigger
+        let result_a = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
+        let result_b = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1250, 1250);
+
+        assert_ne!(result_a, result_b);
+        assert_eq!(result_a.len(), 0);
+        assert_eq!(result_b.len(), 1);
     }
 
     /// The `WarningCount` trigger must match events whose payload is a typed
@@ -1660,12 +1796,12 @@ mod tests {
             ),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
         assert_eq!(result.len(), 1, "typed payloads must drive WarningCount");
         assert_eq!(result[0].evidence.len(), 2);
 
         // A different subject must NOT match.
-        let none = evaluate_consequence_rules(&rules, &events, "did:key:bob", 1000);
+        let none = evaluate_consequence_rules(&rules, &events, "did:key:bob", 1000, 1000);
         assert!(none.is_empty(), "typed payload target_did must be exact");
     }
 
@@ -1687,7 +1823,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 960, 1, vec![]),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].evidence.len(), 2);
@@ -1711,7 +1847,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 960, 1, vec![]),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert!(result.is_empty());
     }
@@ -1736,7 +1872,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 960, 3, vec![]),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
         assert!(result.is_empty());
     }
 
@@ -1760,7 +1896,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:bob", 965, 3, vec![]),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
         assert!(result.is_empty());
     }
 
@@ -1797,7 +1933,7 @@ mod tests {
             ),
         ];
 
-        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000, 1000);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].rule_index, 0);
@@ -1817,7 +1953,7 @@ mod tests {
             window: Duration::from_mins(1),
         }];
 
-        let result = evaluate_consequence_rules(&rules, &[], "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&rules, &[], "did:key:alice", 1000, 1000);
         assert!(result.is_empty());
     }
 
@@ -1831,7 +1967,7 @@ mod tests {
             vec![],
         )];
 
-        let result = evaluate_consequence_rules(&[], &events, "did:key:alice", 1000);
+        let result = evaluate_consequence_rules(&[], &events, "did:key:alice", 1000, 1000);
         assert!(result.is_empty());
     }
 

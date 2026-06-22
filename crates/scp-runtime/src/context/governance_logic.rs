@@ -610,12 +610,23 @@ fn emit_failure_escalation(
 /// Takes a borrowed [`ReceiveBuffer`] directly so the caller may build it from
 /// sub-borrows of the unified [`PerContextState`] (ADR-049 §Decision 1) without
 /// holding the whole state across the merge.
+///
+/// Returns `(merged_events, convergent_now)` where `convergent_now` is the max
+/// timestamp of the **Source-1 durable log entries**, computed BEFORE the buffer
+/// merge. This is the convergent window anchor for convergent-trigger consequence
+/// rules in
+/// [`evaluate_consequence_rules`](scp_protocol::trust::consequence::evaluate_consequence_rules):
+/// it must derive from the convergent log alone, never from the merged set
+/// (which mixes in Source-2 buffer events carrying local-clock estimated
+/// timestamps and would therefore be skew-dependent and unsound). An empty log
+/// has no convergent-trigger evidence, so `convergent_now` falls back to `now`
+/// (the window is then irrelevant: no convergent events can match it).
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> Vec<scp_event_log::Event> {
+) -> (Vec<scp_event_log::Event>, u64) {
     // Source 1: Full event log history (persisted, with real timestamps and
     // actor_did). Acquired here from the provider; an unreadable/empty log
     // yields an empty slice (the merge then reflects only Source 2).
@@ -625,14 +636,41 @@ pub fn event_log_entries_for_consequences(
         Ok(None) | Err(_) => Vec::new(),
     };
 
+    // Convergent window anchor: max timestamp of the Source-1 durable log,
+    // captured BEFORE the merge. Empty log -> `now` fallback (sound: no
+    // convergent-trigger evidence exists to anchor).
+    //
+    // SECURITY (accepted limitation — convergent, not yet non-forgeable):
+    // these Source-1 leaf timestamps are committer-assigned (`proposal.created_at`,
+    // signature-bound but proposer-chosen and NOT future-bounded). Anchoring on
+    // their max makes the evidence window CONVERGENT — every honest member selects
+    // the identical evidence set, eliminating the prior local-clock divergence that
+    // caused false-positive §9.9.3 equivocation against honest members. It does NOT,
+    // on its own, stop a malicious committer/quorum from future-dating governance
+    // actions in EITHER direction: (amplification) widen this window to sweep in
+    // extra evidence and mint a convergent `ConsequenceTriggered` against a victim,
+    // OR (suppression) push the max far ahead so `window_start` slides PAST genuine
+    // older evidence, dropping an attacker's own earned warnings out of the window
+    // to evade a consequence. Both share this root and the same fix.
+    // That residual is admin/quorum-gated (the governance actions
+    // are real, signed, and attributable) and is the open tail of the convergent-
+    // wall-clock RFC: bounding committer-assigned timestamps non-forgeably (BFT
+    // median-time / accountability) is deferred to that work. A local-clock ceiling
+    // here would reintroduce the divergence this fix removes (the consequence
+    // outcome is a convergent durable leaf, not a local application gate), so it is
+    // deliberately NOT applied.
+    let convergent_now = log_entries.iter().map(|e| e.timestamp).max().unwrap_or(now);
+
     // Source 2: the receive buffer. Delegate the convergence-critical merge
     // (projection + buffer gates) to the shared function so native and WASM
     // stay byte-identical.
-    scp_protocol::trust::consequence::merge_consequence_events(
+    let merged = scp_protocol::trust::consequence::merge_consequence_events(
         &log_entries,
         receive_buffer.event_log_entries(),
         now,
-    )
+    );
+
+    (merged, convergent_now)
 }
 
 #[cfg(test)]
@@ -860,7 +898,8 @@ mod convergence_tests {
     /// `Custom` triggers match) in the merged consequence-evaluation event list.
     fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
         let (log, ctx) = convergent_log();
-        let merged = event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
+        let (merged, _convergent_now) =
+            event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
         merged
             .iter()
             .filter(|e| e.event_type == EventType::GovernanceAction)
@@ -921,7 +960,8 @@ mod convergence_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        let merged = event_log_entries_for_consequences(&buffer, &context_id_str, now, &log);
+        let (merged, _convergent_now) =
+            event_log_entries_for_consequences(&buffer, &context_id_str, now, &log);
         let message_count = merged
             .iter()
             .filter(|e| e.event_type == EventType::MessageSent)
