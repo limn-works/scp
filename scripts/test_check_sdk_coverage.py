@@ -1,17 +1,25 @@
 """Self-tests for check-sdk-coverage.py.
 
 Covers:
-  1. Gate exits 0 (PASS) on the real matrix.
-  2. Gate exits 1 when a true entry has no matching symbol and no exemption
-     (unmatched-true path, isolated from missing-SDK-key errors).
-  3. _extract_python_symbols correctly extracts a function name via tree-sitter.
-  4. _extract_python_symbols handles class with method names.
-  5. Gate exits 0 when a true entry has a valid coverage_exemption and at
-     least one other SDK is statically verified.
-  6. Gate exits 1 when every true cell for an op has a coverage_exemption but
-     none is statically verified (all-exempted guard).
-  7. Gate exits 1 when a cell value is neither a boolean nor null (e.g. the
-     string "true" instead of a JSON boolean true).
+  1.  Gate exits 0 (PASS) on the real matrix.
+  2.  Gate exits 1 when a true entry has no matching symbol and no exemption
+      (unmatched-true path, isolated from missing-SDK-key errors).
+  2b. Gate exits 1 when a matrix SDK key is missing from the cell object
+      (missing-SDK-key path).
+  3.  _extract_python_symbols correctly extracts a function name via tree-sitter.
+  4.  _extract_python_symbols handles class with method names.
+  5.  Gate exits 0 when a true entry has a valid coverage_exemption and at
+      least one other SDK is statically verified.
+  6.  Gate exits 1 when every true cell for an op has a coverage_exemption but
+      none is statically verified (all-exempted guard).
+  7.  Gate exits 1 when a cell's coverage_exemptions reason is blank or missing.
+  8.  Gate exits 1 when a cell value is neither a boolean nor null (e.g. the
+      string "true" instead of a JSON boolean true).
+  9.  A bare op-name symbol does not satisfy a domain-prefixed operation
+      (regression guard for the domain-prefix-only enforcement).
+  10. ALIASES entries enable non-standard SDK symbol names to satisfy coverage.
+  11. The absence of an ALIASES entry causes coverage to fail for symbols that
+      require explicit mapping.
 """
 
 from __future__ import annotations

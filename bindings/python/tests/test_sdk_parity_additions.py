@@ -118,8 +118,8 @@ async def test_evaluate_trust_reraises_perm_3030_handle_affinity_error() -> None
     # catches it and the `raise` re-raises it.
     mock_bridge.UcanError = type("UcanError", (Exception,), {})
     mock_bridge.ucan_validate.side_effect = mock_bridge.UcanError(perm3030_msg)
-    # Mark as mock so the test seam routes through mock_bridge directly.
-    mock_bridge._mock_name = "mock_bridge"
+    # MagicMock already carries _mock_name, so the test seam in trust.py
+    # routes through mock_bridge without any extra setup.
 
     scp = SCP.__new__(SCP)
     scp._native = MagicMock()

@@ -20,7 +20,7 @@ from scp_sdk.errors import ScpError
 # ---------------------------------------------------------------------------
 
 
-class _ResolutionPathDict(TypedDict, total=False):
+class ResolutionPathDict(TypedDict, total=False):
     """Structured metadata recording which layer resolved an address (§22.7)."""
 
     layer: Literal["Petname", "HandleRegistry", "Attestation", "Domain", "MultiLayerCorroborated"]
@@ -36,7 +36,7 @@ class _ResolutionPathDict(TypedDict, total=False):
     """Unix timestamp (seconds) when resolution occurred."""
 
 
-class _TrustLevelDict(TypedDict, total=False):
+class TrustLevelDict(TypedDict, total=False):
     """Trust level of a discovery result (§22.7).
 
     The ``kind`` field discriminates among the six trust-level variants
@@ -51,7 +51,7 @@ class _TrustLevelDict(TypedDict, total=False):
         "HandleRegistryVerified",
         "MultiLayerCorroborated",
     ]
-    sources: list[_ResolutionPathDict]
+    sources: list[ResolutionPathDict]
     """Only present when ``kind == "MultiLayerCorroborated"``."""
 
 
@@ -87,8 +87,8 @@ class DiscoveryResult(TypedDict, total=False):
     discovery_source: str
     mode: str | None
     metadata_summary: str | None
-    trust_level: _TrustLevelDict
-    resolution_path: _ResolutionPathDict
+    trust_level: TrustLevelDict
+    resolution_path: ResolutionPathDict
 
 
 def _bridge() -> Any:
@@ -206,6 +206,8 @@ async def discover_contexts(query: str) -> list[DiscoveryResult]:
 
 __all__ = [
     "DiscoveryResult",
+    "ResolutionPathDict",
+    "TrustLevelDict",
     "create_query",
     "discover_contexts",
     "normalize_address",
