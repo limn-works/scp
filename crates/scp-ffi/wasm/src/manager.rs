@@ -3091,34 +3091,28 @@ impl WasmContextManager {
                 arr
             };
             let target_did: Option<DID> = action.target_did().cloned();
-            ctx.push_event(ContextEvent::GovernanceActionExecuted {
-                proposal_id: proposal_id_bytes,
-                action_summary,
-                // The buffer event's `executor_did` is the COMMITTING member
-                // (the executor), NOT the auth-subject `initiator_did` —
-                // matching native `finalize_governance_action` (§9.9.3; ADR-031
-                // §8 / §7.3.1 / ADR-051 §6).
-                executor_did: DID(executor_did.to_owned()),
-                resulting_epoch: None,
-                target_did: target_did.clone(),
-            });
-            // Durable GovernanceActionExecuted leaf. The payload MUST be the
-            // shared `GovernanceActionExecutedPayload` (positional MessagePack
-            // via `encode_payload`) — byte-identical to the native runtime's
-            // `finalize_governance_action` construction — so cross-platform
-            // members derive equal Merkle roots (§9.9.3). `target_did` is the
-            // action's target (empty when untargeted); `action_type` is the
-            // `GovernanceAction` variant name.
+
+            // Encode the durable leaf payload FIRST, before any buffer event is
+            // pushed — matching native `finalize_governance_action`, which
+            // encodes the payload (`encode_payload(...)?`) BEFORE appending the
+            // leaf and BEFORE emitting the buffer `ContextEvent`. The payload
+            // MUST be the shared `GovernanceActionExecutedPayload` (positional
+            // MessagePack via `encode_payload`) — byte-identical to native — so
+            // cross-platform members derive equal Merkle roots (§9.9.3).
+            // `target_did` is the action's target (empty when untargeted);
+            // `action_type` is the `GovernanceAction` variant name.
             //
             // FAIL CLOSED on encode error (mirrors native's `map_err(...)?`):
-            // never write an EMPTY-payload leaf, which would diverge from the
-            // native leaf bytes and corrupt the convergent log. The dispatch has
-            // already mutated state and the proposal is recorded executed — the
-            // same position native is in when its `finalize_governance_action`
-            // encode fails (it returns Err and writes no leaf, leaving the
-            // executed marker set). Propagate the error identically.
+            // on failure return `Err` with NO buffer event and NO leaf — exactly
+            // native's position (it returns Err before `emit`, leaving the
+            // executed marker set). Doing the encode BEFORE `push_event` is what
+            // keeps the buffer-event side effect symmetric: a previous ordering
+            // pushed the buffer event first, so an encode failure left WASM with
+            // a buffer event native never emits.
             let executed_payload =
                 Self::encode_governance_action_executed_payload(action, target_did.as_ref())?;
+
+            // Durable GovernanceActionExecuted leaf.
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
                 // Convergence-critical leaf `actor_did`: the COMMITTING member
@@ -3131,6 +3125,20 @@ impl WasmContextManager {
                 &executed_payload,
                 proposal_created_at,
             );
+
+            // Buffer event LAST, mirroring native's post-leaf `emit(...)`.
+            ctx.push_event(ContextEvent::GovernanceActionExecuted {
+                proposal_id: proposal_id_bytes,
+                action_summary,
+                // The buffer event's `executor_did` is the COMMITTING member
+                // (the executor), NOT the auth-subject `initiator_did` —
+                // matching native `finalize_governance_action` (§9.9.3; ADR-031
+                // §8 "executor DID" / spec §7.3.1 "committing member" /
+                // ADR-051 §6).
+                executor_did: DID(executor_did.to_owned()),
+                resulting_epoch: None,
+                target_did: target_did.clone(),
+            });
 
             // Evaluate and enforce consequence rules. Mirrors
             // `scp_runtime::context::manager::governance::
