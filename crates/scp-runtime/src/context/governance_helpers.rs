@@ -3133,8 +3133,15 @@ pub async fn propose_governance_action_inner(
     // immediately — unless invalidated by conflict or in freeze.
     let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
         Some(
+            // Auto-execute (SingleAdmin / quorum==0): the proposer IS the
+            // committing member, so the executor is the proposer. Preserves the
+            // existing leaf bytes on this path.
             Box::pin(execute_governance_action(
-                state, deps, context_id, &proposal,
+                state,
+                deps,
+                context_id,
+                &proposal,
+                proposer_did,
             ))
             .await?,
         )
@@ -3439,8 +3446,14 @@ pub async fn vote_on_proposal_inner(
     if let Some(proposal) = proposal_for_execution {
         let in_freeze = state.governance.freeze.is_some();
         if !in_freeze && !invalidated_by_conflict {
+            // Quorum-approval path: the executor is THIS voter — the member
+            // whose approval crossed quorum and therefore committed the action
+            // (ADR-031 §7.3.1 "committing member"). This is the divergence-
+            // causing path: stamping the proposer here (the old behavior) made
+            // native disagree with WASM whenever proposer != quorum-crossing
+            // voter.
             Box::pin(execute_governance_action(
-                state, deps, context_id, &proposal,
+                state, deps, context_id, &proposal, voter_did,
             ))
             .await?;
         }
@@ -3969,9 +3982,15 @@ pub async fn dispatch_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
+    // The committing member (quorum-crossing voter, or proposer on
+    // auto-execute). Every per-action dispatch leaf (RoleAssigned,
+    // CeilingModified, etc.) is stamped with the executor — uniform with the
+    // `GovernanceActionExecuted` leaf and spec-correct per ADR-031 §8 /
+    // §7.3.1 / ADR-051 §6.
+    executor_did: &DID,
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
-    let actor = proposal.proposer_did.as_ref();
+    let actor = executor_did.as_ref();
     // Committer-assigned leaf timestamp: the proposal's signed `created_at`.
     // The value is identical and tamper-evident for every member that
     // processes the signed proposal (convergent-by-construction), never local
@@ -4224,6 +4243,14 @@ pub fn finalize_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
+    // The committing member — the DID whose approval crossed quorum (or, for
+    // auto-execute, the proposer). Stamped as the `GovernanceActionExecuted`
+    // leaf `actor_did` and the event's `executor_did` per ADR-031 §8
+    // ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6. This is
+    // DISTINCT from `proposal.proposer_did`, which remains the consequence
+    // SUBJECT below (a different semantic — see the consequence-evaluation
+    // block).
+    executor_did: &DID,
 ) -> Result<(), ContextError> {
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
@@ -4260,7 +4287,7 @@ pub fn finalize_governance_action(
     let executed_event = GovernanceEvent::GovernanceActionExecuted {
         proposal_id: proposal.proposal_id,
         action: Box::new(proposal.action.clone()),
-        executor_did: proposal.proposer_did.clone(),
+        executor_did: executor_did.clone(),
         resulting_epoch,
     };
 
@@ -4280,7 +4307,7 @@ pub fn finalize_governance_action(
     deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
         governance_event_label(&executed_event),
-        proposal.proposer_did.as_ref(),
+        executor_did.as_ref(),
         executed_payload,
         // Committer-assigned timestamp: the proposal's signed `created_at` —
         // identical and tamper-evident for every member that processes the
@@ -4298,7 +4325,7 @@ pub fn finalize_governance_action(
     let gov_event = ContextEvent::GovernanceActionExecuted {
         proposal_id: proposal.proposal_id,
         action_summary,
-        executor_did: proposal.proposer_did.clone(),
+        executor_did: executor_did.clone(),
         resulting_epoch,
         target_did,
     };
@@ -4470,6 +4497,13 @@ pub async fn execute_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
+    // The committing member — the DID whose approval crossed quorum (quorum
+    // path) or the proposer (auto-execute / SingleAdmin). Threaded through to
+    // both `dispatch_governance_action` (per-action leaves) and
+    // `finalize_governance_action` (the `GovernanceActionExecuted` leaf +
+    // event `executor_did`). Spec: ADR-031 §8 "executor DID" / §7.3.1
+    // "committing member" / ADR-051 §6.
+    executor_did: &DID,
 ) -> Result<GovernanceActionResult, ContextError> {
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
@@ -4515,22 +4549,23 @@ pub async fn execute_governance_action(
     // variant exists yet. Governance actions are free until the economy
     // spec adds a governance cost tier. Tracked by #1537.
 
-    let result = match dispatch_governance_action(state, deps, context_id, proposal).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Roll back the executed marker on dispatch failure so the
-            // proposal can be retried (e.g. after a transient crypto
-            // error).
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .remove(&proposal.proposal_id);
-            return Err(e);
-        }
-    };
+    let result =
+        match dispatch_governance_action(state, deps, context_id, proposal, executor_did).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back the executed marker on dispatch failure so the
+                // proposal can be retried (e.g. after a transient crypto
+                // error).
+                state
+                    .governance
+                    .class_s
+                    .executed_proposals
+                    .remove(&proposal.proposal_id);
+                return Err(e);
+            }
+        };
 
-    finalize_governance_action(state, deps, context_id, proposal)?;
+    finalize_governance_action(state, deps, context_id, proposal, executor_did)?;
 
     Ok(result)
 }

@@ -461,6 +461,383 @@ async fn ac4_majority_propose_approve_execute() {
 }
 
 // =========================================================================
+// §9.9.3 native↔WASM convergence: GovernanceActionExecuted leaf actor_did is
+// the EXECUTOR (the quorum-crossing committing member), NOT the proposer.
+//
+// ADR-031 §8 ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6.
+// The WASM bridge stamps `initiator_did` (the committing voter) on its
+// `GovernanceActionExecuted` leaf; native MUST do the same so the same logical
+// commit yields a byte-identical leaf actor_did — and therefore the same leaf
+// hash and Merkle root — across the two bridges. This drives the REAL native
+// quorum-approval path through the `Supervisor` with a REAL
+// `MerkleEventLogProvider`, then reads the landed leaf back out.
+// =========================================================================
+
+/// Like [`new_manager`] but wires a REAL `MerkleEventLogProvider` so the
+/// durable `GovernanceActionExecuted` leaf is actually recorded and can be
+/// queried via `Supervisor::event_log_entries`.
+fn new_manager_with_real_event_log() -> std::sync::Arc<Supervisor> {
+    use scp_runtime::context::providers::MerkleEventLogProvider;
+    scp_runtime::context::test_supervisor(
+        Arc::new(MlsCryptoProvider::new(
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+        )),
+        Box::new(MockTransport::connected()),
+        Box::new(MerkleEventLogProvider::new()),
+        mock_key_resolver(),
+    )
+}
+
+#[tokio::test]
+async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-majority-executor-leaf";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Majority {
+            eligible_voters: vec![alice(), bob(), carol()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // The action target is irrelevant to the leaf actor_did, which is the
+    // EXECUTOR. `alice` is the sole member at this point (eligible_voters is
+    // governance config, not membership), so target her role. The leaf actor
+    // must still be the quorum-crossing voter `bob`, not `alice`.
+    let action = GovernanceAction::ChangeRole {
+        did: alice(),
+        new_role: "observer".into(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+
+    // Alice's own approval is #1 of quorum 2 — still Pending.
+    let (status_after_alice, _) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(status_after_alice, ProposalStatus::Pending);
+
+    // Bob's approval is #2 — crosses majority quorum and COMMITS the action.
+    // Bob is therefore the executor (committing member), not alice.
+    let sk_bob = signing_key_for_did(&bob());
+    let (status, _events) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(status, ProposalStatus::Approved);
+
+    // Read the landed durable leaf back out of the real event log.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed_leaf = entries
+        .iter()
+        .find(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .expect("GovernanceActionExecuted leaf must be present after quorum-crossing approval");
+
+    assert_eq!(
+        executed_leaf.actor_did.as_ref(),
+        bob().as_ref(),
+        "the GovernanceActionExecuted leaf actor_did MUST be the quorum-crossing executor (bob), \
+         NOT the proposer (alice) — ADR-031 §8 executor DID; §9.9.3 native↔WASM convergence"
+    );
+    // Non-vacuity: alice (proposer) != bob (executor), so a proposer stamp
+    // would be a distinct, divergent leaf actor_did.
+    assert_ne!(
+        executed_leaf.actor_did.as_ref(),
+        alice().as_ref(),
+        "stamping the proposer would diverge from the WASM bridge, which stamps the committing voter"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM ACCEPT-decision parity: a quorum-crossing eligible voter
+// who is NOT the proposer and holds no per-action capability still causes the
+// action to execute and mint EXACTLY ONE GovernanceActionExecuted leaf.
+//
+// Native `execute_governance_action` performs NO per-member action-capability
+// check (only status / context-id / replay / commit-fault). The WASM bridge
+// previously gated on `member_has_capability(voter, action_cap)` at execute,
+// which a vote-eligible-but-action-less voter fails — minting 0 where native
+// mints 1. That per-member check has been removed from WASM so both bridges
+// mint exactly 1. This native test pins the "native mints 1" half (the WASM
+// half is `cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-majority-voter-no-action-cap";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Majority {
+            eligible_voters: vec![alice(), bob(), carol()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // ChangeRole has NO native per-action ceiling gate; `role:assign` is in the
+    // ceiling. `bob` is an eligible voter who is NOT a member and holds no
+    // per-action capability of his own — yet his quorum-crossing vote commits
+    // the action, because native does not check the committing member's
+    // action capability at execute.
+    let action = GovernanceAction::ChangeRole {
+        did: alice(),
+        new_role: "observer".into(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+
+    // Alice's approval is #1 of quorum 2 — still Pending.
+    let (status_after_alice, _) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(status_after_alice, ProposalStatus::Pending);
+
+    // Bob's approval is #2 — crosses majority quorum and COMMITS the action.
+    let sk_bob = signing_key_for_did(&bob());
+    let (status, _events) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(status, ProposalStatus::Approved);
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 1,
+        "native MUST mint EXACTLY ONE GovernanceActionExecuted leaf for a quorum-crossing voter \
+         lacking the action capability — the convergent target the WASM bridge must match (§9.9.3)"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity: an action whose required
+// capability is NOT in the context ceiling is rejected, minting no
+// GovernanceActionExecuted leaf. `RevokeAccess` is gated on `member:ban` in
+// native (`execute_revoke`). With `member:ban` absent from the ceiling, native
+// rejects — the WASM bridge now applies the same per-action ceiling gate
+// (`cross_impl_out_of_ceiling_action_rejected_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_action_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES `member:ban` (MemberBan).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // SingleAdmin auto-executes on propose, so the per-action ceiling gate is
+    // reached synchronously and the propose call surfaces the rejection.
+    let action = GovernanceAction::RevokeAccess {
+        did: bob(),
+        access: AccessScope::Both,
+    };
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected by native — \
+         the convergent reject decision the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling action MUST mint ZERO GovernanceActionExecuted leaves on native"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
+// Native gates this on `Capability::ChildContextCreate` in
+// `execute_create_child_context` (`governance_helpers.rs`). With the capability
+// absent from the ceiling, native rejects and mints ZERO leaves — pinning the
+// convergent reject that the WASM bridge now also enforces
+// (`cross_impl_out_of_ceiling_create_child_context_rejected_wasm`). Previously
+// WASM EXECUTED this action (ungated), a §9.9.3 divergence and security gap.
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_create_child_context_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-child-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES ChildContextCreate (context:child:create).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Built via serde to mirror the WASM KAT fixture exactly.
+    let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+        "CreateChildContext": {"params": {
+            "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+            "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+            "template_id": null
+        }}
+    }))
+    .expect("CreateChildContext action deserializes");
+
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling CreateChildContext (context:child:create not in ceiling) MUST be \
+         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling CreateChildContext MUST mint ZERO GovernanceActionExecuted \
+         leaves on native"
+    );
+}
+
+// =========================================================================
+// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
+// Native gates this on `Capability::ToolInterface` in
+// `execute_establish_tool_interface` (`governance_helpers.rs`). With the
+// capability absent from the ceiling, native rejects and mints ZERO leaves —
+// pinning the convergent reject the WASM bridge now also enforces
+// (`cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm`).
+// =========================================================================
+#[tokio::test]
+async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
+    // Ceiling deliberately EXCLUDES ToolInterface (tool:interface).
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+        "EstablishToolInterface": {"interface": {
+            "source_context": "ctx-src", "target_context": "ctx-tgt",
+            "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+            "approved_by_source": false, "approved_by_target": false,
+            "outbound_policy": null, "inbound_policy": null
+        }}
+    }))
+    .expect("EstablishToolInterface action deserializes");
+
+    let sk_alice = signing_key_for_did(&alice());
+    let result = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await;
+    assert!(
+        result.is_err(),
+        "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
+         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for an active context");
+    let executed = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed, 0,
+        "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO GovernanceActionExecuted \
+         leaves on native"
+    );
+}
+
+// =========================================================================
 // AC-5: Unanimity — all members approve -> execute
 // =========================================================================
 
