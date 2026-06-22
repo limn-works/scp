@@ -1195,8 +1195,7 @@ pub fn execute_remove_member(
         &CommitOperation::RemoveMember {
             target_did: did.clone(),
         },
-        actor_did,
-    )?;
+    );
 
     // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
@@ -2044,8 +2043,7 @@ pub fn execute_reset_member(
             target_did: did.clone(),
             is_remove: true,
         },
-        actor_did,
-    )?;
+    );
     try_broadcast_commit_or_enqueue(
         state,
         deps,
@@ -2055,8 +2053,7 @@ pub fn execute_reset_member(
             target_did: did.clone(),
             is_remove: false,
         },
-        actor_did,
-    )?;
+    );
 
     if let Err(e) = deps
         .crypto
@@ -2348,8 +2345,7 @@ pub fn execute_rotate_content_keys(
             &CommitOperation::RotateContentKeys {
                 reason: reason.map(String::from),
             },
-            actor_did,
-        )?;
+        );
     }
 
     // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
@@ -4517,42 +4513,31 @@ pub async fn execute_governance_action(
 /// Attempts to broadcast an MLS Commit and, on transport failure,
 /// enqueues the commit in the persistent retry queue (PR #1606 C6).
 ///
-/// # Errors
+/// Per the phase-2.md ADR-011-amendment exclusion taxonomy (per-committer
+/// broadcast-retry bookkeeping), the commit-broadcast lifecycle events
+/// (`CommitBroadcasted` / `CommitBroadcastPending`) are NOT durably appended
+/// to the canonical Merkle log: only the broadcasting member holds the notion,
+/// so two honest members diverge at equal event count (§9.9.3). They are
+/// surfaced as local `ContextEvent`s only (first-attempt success is not
+/// surfaced); no durable consumer reads them.
 ///
-/// Returns [`ContextError::EventLogFailed`] if the durable event log
-/// append fails.
-#[allow(
-    clippy::too_many_lines,
-    reason = "single-pipeline broadcast-enqueue scope — splitting fragments the failure path"
-)]
+/// Infallible: a transport-send failure is absorbed into the persistent
+/// retry queue (or a `commit_fault` marker when the queue is full) rather
+/// than propagated. Dropping the durable commit-lifecycle appends removed the
+/// function's only `Result`-returning path.
 pub fn try_broadcast_commit_or_enqueue(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
     operation: &CommitOperation,
-    actor_did: &str,
-) -> Result<(), ContextError> {
+) {
     if commit_bytes.is_empty() {
-        return Ok(());
+        return;
     }
-    // Committer-assigned timestamp for this member's own commit-lifecycle leaf:
-    // the committer's clock — the same source as the `created_at` it stamps on
-    // the outgoing commit envelope (§7.3.1, §9.9.3).
-    let commit_ts = deps.clock.now_secs();
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     match deps.transport.send_message(&routing_id, &commit_bytes) {
-        Ok(()) => {
-            let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log.append_context_event(
-                &context_id_bytes,
-                scp_event_log::EventType::CommitBroadcasted,
-                actor_did,
-                commit_ts,
-            )?;
-            state.checkpoint_events_since += 1;
-            Ok(())
-        }
+        Ok(()) => {}
         Err(e) => {
             let now = deps.clock.now_secs();
             let error_str = e.to_string();
@@ -4567,7 +4552,6 @@ pub fn try_broadcast_commit_or_enqueue(
                 next_attempt_at: now.saturating_add(backoff),
             };
             let label = operation.label();
-            let context_id_bytes = context_id_to_bytes(context_id);
 
             // N2: Cap the pending commits queue.
             if state.pending_commits.len() >= MAX_PENDING_COMMITS {
@@ -4587,7 +4571,7 @@ pub fn try_broadcast_commit_or_enqueue(
                     context_id,
                     deps,
                 );
-                return Ok(());
+                return;
             }
             state.pending_commits.push_back(pending);
             let label_for_event = label.clone();
@@ -4601,20 +4585,12 @@ pub fn try_broadcast_commit_or_enqueue(
                 context_id,
                 deps,
             );
-            deps.event_log.append_context_event(
-                &context_id_bytes,
-                scp_event_log::EventType::CommitBroadcastPending,
-                actor_did,
-                commit_ts,
-            )?;
-            state.checkpoint_events_since += 1;
             tracing::warn!(
                 context_id = %context_id,
                 operation = %label,
                 error = %error_str,
                 "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
             );
-            Ok(())
         }
     }
 }

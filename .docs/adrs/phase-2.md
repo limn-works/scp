@@ -947,6 +947,28 @@ pub enum EventType {
    >    is a signed `CrossContextToolReceipt` field) — and is **not** in this
    >    per-author exclusion.
    >
+   > 3. **Per-committer broadcast-retry bookkeeping (permanent — kept as an
+   >    `EventType`, never durably appended).** `CommitBroadcasted`,
+   >    `CommitBroadcastPending`, `CommitBroadcastSucceeded`, and
+   >    `CommitBroadcastFailed` track one member's *own* attempt to push an
+   >    MLS-Commit it authored onto the transport (and its persistent-retry queue,
+   >    PR #1606 C6). Only the **broadcasting committer** has any notion of these
+   >    events — a receiver that processes the resulting commit holds no record of
+   >    the sender's transport retries — so a committer appends them while
+   >    receivers append nothing, and the two diverge at equal `event_count`: the
+   >    exact §9.9.3 false-positive equivocation this exclusion removes. Unlike the
+   >    category-2 per-author application activity, these have **no convergent order
+   >    even under ADR-051** (a transport-send outcome is not a causal-DAG
+   >    application event; it has no cross-member referent to linearize), so they
+   >    are excluded **permanently**, not interim. They remain in the closed
+   >    `EventType` set (the 77-variant set is not narrowed) but are NEVER passed to
+   >    `append_context_event`; the three retry-sweep lifecycle states
+   >    (`CommitBroadcastSucceeded` / `CommitBroadcastPending` /
+   >    `CommitBroadcastFailed`) and the enqueue-time `CommitBroadcastPending` are
+   >    surfaced as local `ContextEvent`s (`CommitBroadcasted` first-attempt success
+   >    is not surfaced at all — a successful send is the unremarkable default). No
+   >    durable consumer (checkpoint, export, or proof) reads them.
+   >
    > **Consequence emission (auto-derived, never consensus).** The `Consequence*`
    > variants remain in the taxonomy, but a consequence leaf is emitted by
    > **deterministic auto-derivation from the convergent log**: every honest

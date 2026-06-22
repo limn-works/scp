@@ -261,6 +261,81 @@ fn negative_control_per_payee_payment_appends_break_convergence() {
 }
 
 #[test]
+fn two_honest_members_converge_despite_divergent_commit_broadcast_records() {
+    // Per-committer broadcast-retry bookkeeping (phase-2.md ADR-011-amendment
+    // exclusion taxonomy §3): `CommitBroadcasted` / `CommitBroadcastPending` /
+    // `CommitBroadcastSucceeded` / `CommitBroadcastFailed` track one member's
+    // OWN transport-send attempt for a commit it authored. Only the
+    // broadcasting committer holds the notion — a receiver that processes the
+    // resulting commit records nothing about the sender's retries. Under the
+    // exclusion these append NO durable leaf (surfaced as local
+    // `ContextEvent`s only). Two honest members who process the same convergent
+    // stream but whose own broadcast paths differ (e.g. one retried, one
+    // succeeded first-try) MUST still derive identical Merkle roots.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_a, 0);
+    // A is the committer: its commit broadcast succeeded first try — no durable
+    // leaf for `CommitBroadcasted`.
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_b, 250);
+    // B is a receiver: it processed the same commit but holds no broadcast
+    // record at all — also durable-leaf-free.
+
+    let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
+    let root_b = log_b.event_log_merkle_root(&CTX).unwrap();
+
+    assert_eq!(
+        root_a, root_b,
+        "two honest members with the same convergent event stream MUST derive \
+         identical event_log_merkle_root regardless of divergent per-committer \
+         commit-broadcast retry records (§9.9.3; phase-2.md exclusion taxonomy §3)"
+    );
+    assert_ne!(
+        root_a, [0u8; 32],
+        "the convergent stream is non-empty, so the shared root must be non-zero"
+    );
+}
+
+#[test]
+fn negative_control_per_committer_commit_broadcast_appends_break_convergence() {
+    // Pins that the commit-broadcast-convergence test above is not vacuous: if
+    // the per-committer broadcast lifecycle leaves WERE durably appended (the
+    // pre-fix behavior that caused the §9.9.3 false-positive equivocation), the
+    // committer's extra leaves make its root differ from a receiver who appends
+    // none. This proves the positive test would detect a regression that
+    // re-introduced a `CommitBroadcasted` / `CommitBroadcastFailed` durable
+    // append.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_a, 0);
+    // Committer-only divergence: re-introduce the durable broadcast records.
+    log_a
+        .append_context_event(&CTX, EventType::CommitBroadcasted, ALICE, 1_700_000_400)
+        .unwrap();
+    log_a
+        .append_context_event(&CTX, EventType::CommitBroadcastFailed, ALICE, 1_700_000_460)
+        .unwrap();
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_b, 250);
+    // Receiver appends none — divergent counts (4 vs 6).
+
+    let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
+    let root_b = log_b.event_log_merkle_root(&CTX).unwrap();
+
+    assert_ne!(
+        root_a, root_b,
+        "with per-committer commit-broadcast leaves durably appended, the \
+         committer (6 leaves) and receiver (4 leaves) MUST diverge — this is \
+         the §9.9.3 false-positive equivocation the exclusion removes"
+    );
+}
+
+#[test]
 fn committer_assigned_timestamp_converges_despite_clock_skew() {
     // The core property of the committer-assigned-timestamp fix: two honest
     // members who append the SAME convergent stream but whose physical clocks

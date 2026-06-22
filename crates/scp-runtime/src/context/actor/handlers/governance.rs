@@ -915,19 +915,25 @@ fn compute_commit_retry_outcomes(
 
 /// Phase B of [`handle_process_pending_commits_actor`]. Applies the
 /// outcomes to `state.pending_commits` under the actor's exclusive
-/// `&mut state` borrow. Pushes receive-buffer events and returns the
-/// labels that should be appended to the durable event log (Phase C).
+/// `&mut state` borrow. Pushes the per-committer broadcast-retry
+/// lifecycle events as local `ContextEvent`s only.
+///
+/// Per the phase-2.md ADR-011-amendment exclusion taxonomy (per-committer
+/// broadcast-retry bookkeeping), the `CommitBroadcastSucceeded` /
+/// `CommitBroadcastPending` / `CommitBroadcastFailed` lifecycle events are
+/// NOT durably appended to the canonical Merkle log: only the broadcasting
+/// member holds the notion, so two honest members would diverge at equal
+/// event count (§9.9.3). No durable consumer reads them.
 fn apply_commit_retry_outcomes(
     state: &mut crate::context::actor::state::PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     outcomes: Vec<CommitRetryOutcome>,
-) -> Vec<scp_event_log::EventType> {
+) {
     use scp_protocol::context::membership::ContextEvent;
 
     use crate::context::state::CommitFaultMarker;
 
-    let mut event_log_writes: Vec<scp_event_log::EventType> = Vec::new();
     let queue_len = state.pending_commits.len();
     let mut to_remove: Vec<usize> = Vec::new();
     for outcome in outcomes {
@@ -947,7 +953,6 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push(scp_event_log::EventType::CommitBroadcastSucceeded);
                 to_remove.push(outcome.index);
             }
             CommitRetryOutcomeKind::Retry {
@@ -970,7 +975,6 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push(scp_event_log::EventType::CommitBroadcastPending);
             }
             CommitRetryOutcomeKind::Failed {
                 reason,
@@ -993,7 +997,6 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push(scp_event_log::EventType::CommitBroadcastFailed);
                 to_remove.push(outcome.index);
             }
         }
@@ -1002,7 +1005,6 @@ fn apply_commit_retry_outcomes(
     for idx in to_remove {
         state.pending_commits.remove(idx);
     }
-    event_log_writes
 }
 
 /// Handle [`GovernanceCommand::ProcessPendingCommits`] (actor-shape).
@@ -1027,7 +1029,7 @@ async fn handle_process_pending_commits_actor(
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::state::{PendingCommit, context_id_to_bytes};
+    use crate::context::state::PendingCommit;
 
     if state.commit_fault.is_some() {
         let _ = reply.send(Ok(()));
@@ -1040,7 +1042,6 @@ async fn handle_process_pending_commits_actor(
     }
     let now = deps.clock.now_secs();
     let context_id = state.handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
 
     let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
     if outcomes.is_empty() {
@@ -1048,32 +1049,14 @@ async fn handle_process_pending_commits_actor(
         return Outcome::ok(());
     }
 
-    let event_log_writes = apply_commit_retry_outcomes(state, deps, &context_id, outcomes);
+    // Apply outcomes to the pending-commit queue and surface the per-committer
+    // broadcast-retry lifecycle as local `ContextEvent`s. Per the phase-2.md
+    // ADR-011-amendment exclusion taxonomy, these events are NOT durably
+    // appended to the canonical Merkle log (they are per-committer; only the
+    // broadcasting member holds the notion, so honest members would diverge at
+    // equal event count — §9.9.3).
+    apply_commit_retry_outcomes(state, deps, &context_id, outcomes);
 
-    // Phase C: append durable event log entries (event_log adapter is
-    // `Arc<dyn ...>`, takes no `&state` so the actor's borrow is not
-    // contended).
-    let mut retry_event_count: u64 = 0;
-    for label in event_log_writes {
-        if let Err(e) = deps
-            .event_log
-            // Committer-assigned timestamp for this member's own commit-retry
-            // lifecycle leaf: the committer's clock, the same source as the
-            // `created_at` it stamps on the (re)broadcast commit envelope
-            // (§7.3.1, §9.9.3).
-            .append_context_event(&context_id_bytes, label, "system", now)
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to append commit retry event to durable log"
-            );
-        }
-        retry_event_count += 1;
-    }
-    if retry_event_count > 0 {
-        state.checkpoint_events_since += retry_event_count;
-    }
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
 }
