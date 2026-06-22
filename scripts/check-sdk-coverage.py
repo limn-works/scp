@@ -494,6 +494,12 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["broadcastHandleKeyRequest"],
         "swift": ["broadcastHandleKeyRequest"],
     },
+    ("Messaging", "broadcast_open_key"): {
+        "python": ["broadcast_open_key"],
+        "typescript": ["broadcastOpenKey"],
+        "kotlin": ["broadcastOpenKey"],
+        "swift": ["broadcastOpenKey"],
+    },
     # Tools -- Kotlin/Swift use bare method names without domain prefix
     ("Tools", "register"): {
         "python": ["tool_register"],
@@ -958,11 +964,6 @@ def _to_camel(snake: str) -> str:
     """Convert snake_case to camelCase."""
     parts = snake.split("_")
     return parts[0] + "".join(p.capitalize() for p in parts[1:])
-
-
-def _to_pascal(snake: str) -> str:
-    """Convert snake_case to PascalCase."""
-    return "".join(p.capitalize() for p in snake.split("_"))
 
 
 # ---------------------------------------------------------------------------
