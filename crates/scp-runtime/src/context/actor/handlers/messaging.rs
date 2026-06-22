@@ -157,14 +157,7 @@ pub(crate) async fn dispatch(
             sender_did,
             signing_key,
             reply,
-        } => handle_send_heartbeat(
-            cell.state_mut(),
-            deps,
-            &context_id,
-            &sender_did,
-            &signing_key,
-            reply,
-        ),
+        } => handle_send_heartbeat(&*cell, deps, &context_id, &sender_did, &signing_key, reply),
     }
 }
 

@@ -153,7 +153,7 @@ async fn dispatch_actor_inner(
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context_actor(cell.state_mut(), deps, context_id, exporter_did, reply),
+        } => handle_export_context_actor(&*cell, deps, context_id, exporter_did, reply),
         LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
@@ -211,13 +211,11 @@ async fn dispatch_actor_inner(
             reply,
         ),
         LifecycleCommand::FlushSnapshot { reply } => {
-            handle_flush_snapshot_actor(cell.state_mut(), deps, reply)
+            handle_flush_snapshot_actor(&*cell, deps, reply)
         }
-        LifecycleCommand::ShutdownSelf { reply } => {
-            handle_shutdown_self_actor(cell.state_mut(), deps, reply)
-        }
+        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(&*cell, deps, reply),
         LifecycleCommand::ReportBufferLen { reply } => {
-            handle_report_buffer_len_actor(cell.state_mut(), reply)
+            handle_report_buffer_len_actor(&*cell, reply)
         }
         LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
             handle_clear_needs_reconnect_actor(cell.state_mut(), &context_id, reply)
