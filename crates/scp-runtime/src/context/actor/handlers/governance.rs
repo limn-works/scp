@@ -107,8 +107,7 @@ async fn dispatch_state(
             reply,
         } => handle_migration_state_actor(cell, reply),
         GovernanceCommand::TombstoneMigratedContext { context_id, reply } => {
-            handle_tombstone_migrated_context_actor(cell.state_mut(), deps, &context_id, reply)
-                .await
+            handle_tombstone_migrated_context_actor(cell, deps, &context_id, reply).await
         }
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
             handle_acknowledge_commit_fault_actor(cell.state_mut(), &context_id, reply)
@@ -135,7 +134,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_ceiling_modification_actor(
-                cell.state_mut(),
+                cell,
                 deps,
                 &context_id,
                 current_timestamp,
@@ -302,13 +301,13 @@ fn handle_migration_state_actor(
 
 /// Handle [`GovernanceCommand::TombstoneMigratedContext`] (actor-shape).
 async fn handle_tombstone_migrated_context_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let tombstone_fut =
-        crate::context::governance_helpers::tombstone_migrated_context(state, deps, context_id);
+        crate::context::governance_helpers::tombstone_migrated_context(cell, deps, context_id);
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
         Ok(Err(e)) => {
@@ -378,14 +377,14 @@ async fn handle_withdraw_governance_vote_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] (actor-shape).
 async fn handle_apply_pending_ceiling_modification_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
-        state,
+        cell,
         deps,
         context_id,
         current_timestamp,

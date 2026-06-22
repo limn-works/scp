@@ -257,14 +257,14 @@ pub fn migration_state(state: &PerContextState) -> Option<MigrationState> {
 ///   provider attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn tombstone_migrated_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
-    let handle_state = state
+    let handle_state = cell
         .handle
         .try_read_state()
         .ok_or(ContextError::ContextNotActive)?;
@@ -274,7 +274,7 @@ pub async fn tombstone_migrated_context(
         ));
     }
 
-    let migration = state.migration_state.as_ref().ok_or_else(|| {
+    let migration = cell.migration_state.as_ref().ok_or_else(|| {
         ContextError::PermissionDenied(
             "no migration state found despite MigratingOut state".to_owned(),
         )
@@ -294,8 +294,10 @@ pub async fn tombstone_migrated_context(
     // members), never local `now()` (§7.3.1, §9.9.3).
     let tombstone_ts = migration.grace_period_end;
 
-    state
-        .handle
+    // The handle FSM is an external effect; the `.await` runs BEFORE the fail-
+    // closed persist (the combinator closure is sync). A failed transition
+    // returns early, before any `state`-field mutation or persist.
+    cell.handle
         .transition_to(&ContextState::Tombstoned)
         .await
         .map_err(|_| {
@@ -304,23 +306,29 @@ pub async fn tombstone_migrated_context(
             )
         })?;
 
-    let tombstone_event = ContextEvent::ContextTombstoned {
-        destination_context_id: destination_id.clone(),
-        migration_proposal_id: migration_pid,
-    };
-    emit(state, tombstone_event, context_id, deps);
-
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    state.broadcast_context = None;
-    state.migration_state = None;
-    // M7: Participation decay on tombstone (#1530).
-    state.governance.decay_participation();
-
     // ADR-049 §9 Class S: tombstoning is a terminal lifecycle transition (the
-    // context is migrated out and must not silently re-open) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // context is migrated out and must not silently re-open) — route the in-state
+    // cleanup through `commit_class_s_keep` so it persists fail-closed (keep-
+    // direction: on persist failure the tombstone STAYS — silently re-opening a
+    // migrated-out context is the unsafe direction). The emit + timer/broadcast/
+    // migration/participation cleanup (Class-C) ride the fail-closed persist via
+    // `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        let tombstone_event = ContextEvent::ContextTombstoned {
+            destination_context_id: destination_id.clone(),
+            migration_proposal_id: migration_pid,
+        };
+        emit(state, tombstone_event, context_id, deps);
+
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        state.broadcast_context = None;
+        state.migration_state = None;
+        // M7: Participation decay on tombstone (#1530).
+        state.governance.decay_participation();
+        Ok(())
+    })?;
 
     let tombstone_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
@@ -335,7 +343,7 @@ pub async fn tombstone_migrated_context(
         tombstone_payload,
         tombstone_ts,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
 
     Ok(())
 }
@@ -432,25 +440,32 @@ pub async fn withdraw_governance_vote(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_ceiling_modification(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
-    let pending = match &state.governance.pending_ceiling_modification {
+    let pending = match &cell.governance.pending_ceiling_modification {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
 
-    state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
-    state.governance.pending_ceiling_modification = None;
-
     // ADR-049 §9 Class S: applying a ceiling modification is a downward-
-    // authorization transition (the effective capability ceiling lowers) —
-    // persist fail-closed so a crash cannot restore the prior, broader ceiling.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization transition (the effective capability ceiling lowers) — route
+    // the ceiling-lower + pending-clear through `commit_class_s_keep` so it
+    // persists fail-closed (keep-direction: on persist failure the lowered
+    // ceiling STAYS — restoring the prior, broader ceiling is the unsafe
+    // direction). The not-yet-effective early return above ran before any
+    // mutation. The `ceiling` set + pending clear (Class-C) ride the fail-closed
+    // persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
+        state.governance.pending_ceiling_modification = None;
+        Ok(())
+    })?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -462,7 +477,7 @@ pub async fn apply_pending_ceiling_modification(
         // never local `now()` (§7.3.1, §9.9.3).
         pending.effective_at,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
 
     Ok(true)
 }
@@ -717,7 +732,7 @@ fn fail_close_remove_member(
 
 /// Executes a `SuspendMember` governance action.
 pub fn execute_suspend_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -729,35 +744,43 @@ pub fn execute_suspend_member(
         actor_did,
         timestamp_secs,
     } = meta;
-    require_active(&state.handle)?;
-
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    state
-        .role_state
-        .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
-
-    emit(
-        state,
-        ContextEvent::CapabilitiesSuspended {
-            did: did.clone(),
-            capabilities: capabilities.to_vec(),
-        },
-        context_id,
-        deps,
-    );
 
     // ADR-049 §9 Class S: member suspension is a downward-authorization
-    // transition — persist fail-closed so a crash cannot un-suspend a member
-    // the caller was told was suspended.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // transition — route the `role_state` mutation + emit through
+    // `commit_class_s_keep` so it persists fail-closed (keep-direction: on
+    // persist failure the suspension STAYS applied — un-suspending a member the
+    // caller was told was suspended is the unsafe direction). The
+    // reject-before-mutate guards return `Err` from inside the closure (no
+    // persist runs); the `role_state` strip + emit (Class-C) ride the SAME
+    // fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        if !view.role_state.ceiling.contains(&Capability::MemberBan) {
+            return Err(ContextError::PermissionDenied(
+                "member:ban (MemberBan) capability not in ceiling".to_owned(),
+            ));
+        }
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        let state = view.rest_mut();
+        state
+            .role_state
+            .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
+
+        emit(
+            state,
+            ContextEvent::CapabilitiesSuspended {
+                did: did.clone(),
+                capabilities: capabilities.to_vec(),
+            },
+            context_id,
+            deps,
+        );
+        Ok(())
+    })?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -766,7 +789,7 @@ pub fn execute_suspend_member(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1112,7 +1135,7 @@ pub fn execute_add_member(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1125,102 +1148,112 @@ pub fn execute_remove_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    // H9: MLS group removal FIRST (hard security boundary).
-    let remove_output = deps
-        .crypto
-        .remove_member(&context_id_bytes, did)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    if let Err(e) = deps
-        .crypto
-        .remove_member_sender_key(&context_id_bytes, did.as_ref())
-    {
-        return fail_close_remove_member(
-            state,
-            deps,
-            context_id,
-            did,
-            "remove_member_sender_key",
-            &e.to_string(),
-        );
-    }
-
-    if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-        return fail_close_remove_member(
-            state,
-            deps,
-            context_id,
-            did,
-            "rotate_sender_key",
-            &e.to_string(),
-        );
-    }
-
-    state.membership.remove_member(did);
-    state.role_state.members.remove(did.as_ref());
-    state.role_state.assignments.remove(did.as_ref());
-    state.role_state.member_capabilities.remove(did.as_ref());
-
-    state
-        .access
-        .access_key_store
-        .remove(context_id, did.as_ref());
-
-    // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
-    // broadcast context (which carries no peer registry).
-    if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.remove(did);
-    }
-
-    emit(
-        state,
-        ContextEvent::MemberLeft {
-            member_did: did.clone(),
-        },
-        context_id,
-        deps,
-    );
-
-    try_broadcast_commit_or_enqueue(
-        state,
-        deps,
-        context_id,
-        remove_output.commit_bytes,
-        &CommitOperation::RemoveMember {
-            target_did: did.clone(),
-        },
-    );
-
-    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        deps,
-        context_id,
-        &context_id_bytes,
-    ) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to deliver rotated sender keys after member removal"
-        );
-    }
-
     // ADR-049 §9 Class S: member removal is a downward-authorization
-    // transition — persist fail-closed so a crash cannot re-admit a removed
-    // member.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // transition — route the membership/role_state strip (and the MLS commit
+    // boundary that precedes it) through `commit_class_s_keep` so the removal
+    // persists fail-closed (keep-direction: on persist failure the removal
+    // STAYS — re-admitting a removed member is the unsafe direction). The
+    // reject-before-mutate guard and the two MLS fail-close arms return `Err`
+    // from inside the closure (no persist runs — preserving today's behavior
+    // where the fail-close `commit_fault` marker is set but NOT persisted before
+    // the early return). All structural mutations + emit + broadcast + sender-
+    // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+
+        require_active(&state.handle)?;
+
+        if !state.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        // H9: MLS group removal FIRST (hard security boundary).
+        let remove_output = deps
+            .crypto
+            .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        if let Err(e) = deps
+            .crypto
+            .remove_member_sender_key(&context_id_bytes, did.as_ref())
+        {
+            return fail_close_remove_member(
+                state,
+                deps,
+                context_id,
+                did,
+                "remove_member_sender_key",
+                &e.to_string(),
+            );
+        }
+
+        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+            return fail_close_remove_member(
+                state,
+                deps,
+                context_id,
+                did,
+                "rotate_sender_key",
+                &e.to_string(),
+            );
+        }
+
+        state.membership.remove_member(did);
+        state.role_state.members.remove(did.as_ref());
+        state.role_state.assignments.remove(did.as_ref());
+        state.role_state.member_capabilities.remove(did.as_ref());
+
+        state
+            .access
+            .access_key_store
+            .remove(context_id, did.as_ref());
+
+        // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
+        // broadcast context (which carries no peer registry).
+        if let Some(reg) = state.routing.peer_registry_mut() {
+            reg.remove(did);
+        }
+
+        emit(
+            state,
+            ContextEvent::MemberLeft {
+                member_did: did.clone(),
+            },
+            context_id,
+            deps,
+        );
+
+        try_broadcast_commit_or_enqueue(
+            state,
+            deps,
+            context_id,
+            remove_output.commit_bytes,
+            &CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+        );
+
+        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            context_id,
+            &context_id_bytes,
+        ) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::MemberLeft,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1229,7 +1262,7 @@ pub fn execute_remove_member(
 // ---------------------------------------------------------------------------
 
 pub fn execute_change_role(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1243,31 +1276,37 @@ pub fn execute_change_role(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    let tokens = roles::system_assign_role(&mut state.role_state, did, new_role, &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    if let Some(info) = state.membership.get_mut(did) {
-        new_role.clone_into(&mut info.role_name);
-        info.tokens = tokens;
-    }
-
     // ADR-049 §9 Class S: a role change can be a demotion (downward
-    // authorization) — persist fail-closed so a crash cannot restore authority
-    // a demotion removed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization) — route the role assignment through `commit_class_s_keep`
+    // so it persists fail-closed (keep-direction: on persist failure the new
+    // role STAYS — restoring authority a demotion removed is the unsafe
+    // direction). The reject-before-mutate guards return `Err` from inside the
+    // closure (no persist runs); the `role_state` + membership mutation (Class-C)
+    // rides the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        let state = view.rest_mut();
+        let tokens = roles::system_assign_role(&mut state.role_state, did, new_role, &*deps.clock)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        if let Some(info) = state.membership.get_mut(did) {
+            new_role.clone_into(&mut info.role_name);
+            info.tokens = tokens;
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::RoleAssigned,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1320,7 +1359,7 @@ pub fn execute_register_tool(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_tool(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     tool_id: &str,
@@ -1333,26 +1372,31 @@ pub fn execute_remove_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    state
-        .governance
-        .registered_tools
-        .retain(|t| t.tool_id != tool_id);
-
     // ADR-049 §9 Class S: removing a registered tool revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
-    // `execute_register_tool`'s upward grant). Persist fail-closed so an actor
-    // crash in the ≤50ms coalesce window cannot roll the removal back and
-    // re-grant invocation of a tool the caller was told was removed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // `execute_register_tool`'s upward grant). Route through `commit_class_s_keep`
+    // so the removal persists fail-closed (keep-direction: on persist failure the
+    // tool STAYS removed — re-granting invocation of a tool the caller was told
+    // was removed is the unsafe direction). The reject-before-mutate guard
+    // returns `Err` from inside the closure (no persist runs); the
+    // `registered_tools` retain (Class-C) rides the SAME fail-closed persist via
+    // `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        view.rest_mut()
+            .governance
+            .registered_tools
+            .retain(|t| t.tool_id != tool_id);
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRemoved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1361,7 +1405,7 @@ pub fn execute_remove_tool(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_ceiling(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_ceiling: &[Capability],
@@ -1374,74 +1418,81 @@ pub fn execute_modify_ceiling(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: staging a pending ceiling modification is part of a
+    // ceiling-lowering decision chain (downward authorization) — route it
+    // through `commit_class_s_keep` so the pending record persists fail-closed
+    // (keep-direction: on persist failure the staged modification STAYS — losing
+    // a pending downward-authorization record is the unsafe direction). The
+    // reject-before-mutate guards return `Err` from inside the closure (no
+    // persist runs); the `pending_ceiling_modification` set + emit (Class-C) ride
+    // the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    if !matches!(
-        state.handle.params().ceiling_policy,
-        scp_protocol::context::params::CeilingPolicy::Governed
-    ) {
-        return Err(ContextError::PermissionDenied(
-            "ceiling_policy is not Governed".to_owned(),
-        ));
-    }
+        if !matches!(
+            state.handle.params().ceiling_policy,
+            scp_protocol::context::params::CeilingPolicy::Governed
+        ) {
+            return Err(ContextError::PermissionDenied(
+                "ceiling_policy is not Governed".to_owned(),
+            ));
+        }
 
-    if state.governance.pending_ceiling_modification.is_some() {
-        return Err(ContextError::PermissionDenied(
-            "a ceiling modification is already pending notification period".to_owned(),
-        ));
-    }
+        if state.governance.pending_ceiling_modification.is_some() {
+            return Err(ContextError::PermissionDenied(
+                "a ceiling modification is already pending notification period".to_owned(),
+            ));
+        }
 
-    // Convergent notification/activation window: anchor on the committer-
-    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
-    // copies the same value), never local `now()`. `effective_at =
-    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
-    // members, so the deferred ceiling change activates at the same instant
-    // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
-    // the `CeilingModified` leaf when the change applies.
-    //
-    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
-    // only against third parties — the proposer can backdate it freely. Used
-    // alone as the apply gate, a proposer could set `created_at` far in the
-    // past so `effective_at <= commit time` and collapse the mandatory
-    // notification window to zero. To keep activation convergent yet
-    // non-backdatable, also record `observed_at` — THIS member's local clock at
-    // commit-processing time (not proposer-controlled). `is_effective` requires
-    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
-    // never be shorter than `PERIOD` of locally observed time (§5.3.2).
-    let notified_at = timestamp_secs;
-    let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
-    let observed_at = deps.clock.now_secs();
-    state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
-        new_capabilities: new_ceiling.to_vec(),
-        notified_at,
-        effective_at,
-        observed_at,
-        proposal_id,
-    });
-
-    emit(
-        state,
-        ContextEvent::CeilingChangeNotification {
+        // Convergent notification/activation window: anchor on the committer-
+        // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+        // copies the same value), never local `now()`. `effective_at =
+        // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+        // members, so the deferred ceiling change activates at the same instant
+        // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
+        // the `CeilingModified` leaf when the change applies.
+        //
+        // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+        // only against third parties — the proposer can backdate it freely. Used
+        // alone as the apply gate, a proposer could set `created_at` far in the
+        // past so `effective_at <= commit time` and collapse the mandatory
+        // notification window to zero. To keep activation convergent yet
+        // non-backdatable, also record `observed_at` — THIS member's local clock at
+        // commit-processing time (not proposer-controlled). `is_effective` requires
+        // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+        // never be shorter than `PERIOD` of locally observed time (§5.3.2).
+        let notified_at = timestamp_secs;
+        let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+        let observed_at = deps.clock.now_secs();
+        state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
             new_capabilities: new_ceiling.to_vec(),
             notified_at,
             effective_at,
+            observed_at,
             proposal_id,
-        },
-        context_id,
-        deps,
-    );
+        });
 
-    // ADR-049 §9 Class S: the pending ceiling modification is part of a
-    // ceiling-lowering decision chain (downward authorization) — persist
-    // fail-closed so the pending record cannot be lost on a crash.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        emit(
+            state,
+            ContextEvent::CeilingChangeNotification {
+                new_capabilities: new_ceiling.to_vec(),
+                notified_at,
+                effective_at,
+                proposal_id,
+            },
+            context_id,
+            deps,
+        );
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::CeilingModificationPending,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1450,7 +1501,7 @@ pub fn execute_modify_ceiling(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_close_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _reason: Option<&str>,
@@ -1463,32 +1514,39 @@ pub async fn execute_close_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-    let handle = state.handle.clone();
+    require_active(&cell.handle)?;
+    let handle = cell.handle.clone();
 
-    // Transition to Closing via the state machine. The actor owns
-    // `state` so this is a single linear sequence.
+    // Transition to Closing via the state machine. The handle FSM is an external
+    // (cloned) effect, so the `.await` runs BEFORE the fail-closed persist (the
+    // combinator closure is sync). A failed transition returns early, before any
+    // `state`-field mutation or persist.
     handle
         .transition_to(&ContextState::Closing)
         .await
         .map_err(|_| ContextError::PermissionDenied("cannot transition to Closing".to_owned()))?;
 
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    state.broadcast_context = None;
-    state.governance.decay_participation();
-
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
-    // (a closed context must not silently re-open on a crash) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // (a closed context must not silently re-open on a crash) — route the in-
+    // state cleanup through `commit_class_s_keep` so it persists fail-closed
+    // (keep-direction: on persist failure the close STAYS — silently re-opening a
+    // closed context is the unsafe direction). The timer/broadcast/participation
+    // cleanup (Class-C) rides the fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        state.broadcast_context = None;
+        state.governance.decay_participation();
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextClosing,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -1608,7 +1666,7 @@ pub async fn execute_extend_ttl(
 // ---------------------------------------------------------------------------
 
 pub fn execute_transfer_admin(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_admin: &DID,
@@ -1621,45 +1679,52 @@ pub fn execute_transfer_admin(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(new_admin) {
-        return Err(ContextError::MemberNotFound(new_admin.to_string()));
-    }
-
-    let current_admins: Vec<String> = state
-        .role_state
-        .assignments
-        .iter()
-        .filter(|(_, a)| a.role_name == "admin")
-        .map(|(did, _)| did.clone())
-        .collect();
-    for admin_did in &current_admins {
-        roles::system_assign_role(&mut state.role_state, admin_did, "member", &*deps.clock)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-        if let Some(info) = state.membership.get_mut(admin_did) {
-            "member".clone_into(&mut info.role_name);
-        }
-    }
-    let tokens = roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-    if let Some(info) = state.membership.get_mut(new_admin) {
-        "admin".clone_into(&mut info.role_name);
-        info.tokens = tokens;
-    }
-
     // ADR-049 §9 Class S: admin transfer is an authorization transition (the
-    // prior admin loses admin authority) — persist fail-closed so a crash
-    // cannot restore the prior admin's authority after the transfer was
-    // acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // prior admin loses admin authority) — route the role reassignment through
+    // `commit_class_s_keep` so it persists fail-closed (keep-direction: on persist
+    // failure the transfer STAYS — restoring the prior admin's authority after
+    // the transfer was acknowledged is the unsafe direction). The reject-before-
+    // mutate guards return `Err` from inside the closure (no persist runs); the
+    // `role_state` + membership reassignment (Class-C) rides the SAME fail-closed
+    // persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
+
+        if !state.membership.contains(new_admin) {
+            return Err(ContextError::MemberNotFound(new_admin.to_string()));
+        }
+
+        let current_admins: Vec<String> = state
+            .role_state
+            .assignments
+            .iter()
+            .filter(|(_, a)| a.role_name == "admin")
+            .map(|(did, _)| did.clone())
+            .collect();
+        for admin_did in &current_admins {
+            roles::system_assign_role(&mut state.role_state, admin_did, "member", &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            if let Some(info) = state.membership.get_mut(admin_did) {
+                "member".clone_into(&mut info.role_name);
+            }
+        }
+        let tokens =
+            roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        if let Some(info) = state.membership.get_mut(new_admin) {
+            "admin".clone_into(&mut info.role_name);
+            info.tokens = tokens;
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::AdminTransferred,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -2318,7 +2383,7 @@ pub fn execute_promote_context(
 
 #[allow(clippy::too_many_lines)]
 pub fn execute_rotate_content_keys(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reason: Option<&str>,
@@ -2331,68 +2396,75 @@ pub fn execute_rotate_content_keys(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
+    // (the prior wrapping/content keys are superseded) — route the rotation
+    // through `commit_class_s_keep` so it persists fail-closed (keep-direction:
+    // on persist failure the rotation STAYS — reverting to the pre-rotation key
+    // state after the rotation was acknowledged is the unsafe direction). The
+    // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
+    // SAME fail-closed persist via `view.rest_mut()`. The closure returns the
+    // optional broadcast snapshot so its separate best-effort persist can run
+    // AFTER the fail-closed persist, exactly as before.
+    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
-        bc.rotate_all_author_keys()?;
-        let snap = Some(bc.to_snapshot());
-        (None, snap)
-    } else {
-        let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+        let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
+            bc.rotate_all_author_keys()?;
+            let snap = Some(bc.to_snapshot());
+            (None, snap)
+        } else {
+            let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-        let member_dids: Vec<String> = state
-            .membership
-            .member_dids()
-            .map(|d| d.0.clone())
-            .collect();
-        let current_epoch = state
-            .access
-            .access_key_store
-            .get_all(context_id)
-            .values()
-            .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
-            .max()
-            .unwrap_or(0);
-        let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-        let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-            context_id,
-            &did_refs,
-            current_epoch,
-        )
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        for new_key in rotation.new_keys {
-            let did = new_key.member_did().to_owned();
-            state.access.access_key_store.set(context_id, &did, new_key);
-        }
-        (Some(epoch_out), None)
-    };
+            let member_dids: Vec<String> = state
+                .membership
+                .member_dids()
+                .map(|d| d.0.clone())
+                .collect();
+            let current_epoch = state
+                .access
+                .access_key_store
+                .get_all(context_id)
+                .values()
+                .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                .max()
+                .unwrap_or(0);
+            let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+            let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                context_id,
+                &did_refs,
+                current_epoch,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            for new_key in rotation.new_keys {
+                let did = new_key.member_did().to_owned();
+                state.access.access_key_store.set(context_id, &did, new_key);
+            }
+            (Some(epoch_out), None)
+        };
 
-    emit(
-        state,
-        ContextEvent::ContentKeysRotated {
-            reason: reason.map(String::from),
-        },
-        context_id,
-        deps,
-    );
-
-    if let Some(epoch_out) = epoch_output {
-        try_broadcast_commit_or_enqueue(
+        emit(
             state,
-            deps,
-            context_id,
-            epoch_out.commit_bytes,
-            &CommitOperation::RotateContentKeys {
+            ContextEvent::ContentKeysRotated {
                 reason: reason.map(String::from),
             },
+            context_id,
+            deps,
         );
-    }
 
-    // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
-    // (the prior wrapping/content keys are superseded) — persist fail-closed so
-    // a crash cannot revert to the pre-rotation key state after the rotation
-    // was acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        if let Some(epoch_out) = epoch_output {
+            try_broadcast_commit_or_enqueue(
+                state,
+                deps,
+                context_id,
+                epoch_out.commit_bytes,
+                &CommitOperation::RotateContentKeys {
+                    reason: reason.map(String::from),
+                },
+            );
+        }
+        Ok(bc_snap)
+    })?;
     if let Some(ref snap) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, snap);
     }
@@ -2403,7 +2475,7 @@ pub fn execute_rotate_content_keys(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    cell.state_mut().checkpoint_events_since += 1;
     Ok(())
 }
 
@@ -3662,7 +3734,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::RotateContentKeys { reason } => {
             execute_rotate_content_keys(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3778,7 +3850,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveMember { did, .. } => {
             execute_remove_member(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3792,7 +3864,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ChangeRole { did, new_role } => {
             execute_change_role(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3821,7 +3893,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveTool { tool_id } => {
             execute_remove_tool(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 tool_id,
@@ -3835,7 +3907,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
             execute_modify_ceiling(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 new_ceiling,
@@ -3849,7 +3921,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CloseContext { reason } => {
             execute_close_context(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3864,7 +3936,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::TransferAdmin { new_admin } => {
             execute_transfer_admin(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 new_admin,
@@ -4012,7 +4084,7 @@ pub async fn dispatch_governance_action(
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
             execute_suspend_member(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4031,40 +4103,42 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::SuspendAccess { did } => {
-            // Suspend all capabilities for the member. This arm mutates Class-S /
-            // structural state inline (no threaded leaf), so re-derive the bare
-            // `&mut PerContextState` here; the borrow ends with the arm.
-            let state = cell.state_mut();
-            require_active(&state.handle)?;
+            // Suspend all capabilities for the member. ADR-049 §9 Class S:
+            // `suspend_all` strips a member's ENTIRE capability set — a downward-
+            // authorization transition, identical in shape to
+            // `execute_suspend_member`'s `suspend_capabilities`. Route through
+            // `commit_class_s_keep` so it persists fail-closed (keep-direction: on
+            // persist failure the ban STAYS — re-granting the suspended member's
+            // capabilities after the caller was told the ban applied is the unsafe
+            // direction). The reject-before-mutate guards return `Err` from inside
+            // the closure (no persist runs); the `suspend_all` + emit (Class-C)
+            // ride the SAME fail-closed persist via `view.rest_mut()`.
+            cell.commit_class_s_keep(deps, context_id, |mut view| {
+                let state = view.rest_mut();
+                require_active(&state.handle)?;
 
-            if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
-                ));
-            }
-            if !state.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
+                if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+                    return Err(ContextError::PermissionDenied(
+                        "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                    ));
+                }
+                if !state.membership.contains(did) {
+                    return Err(ContextError::MemberNotFound(did.to_string()));
+                }
 
-            state.role_state.suspend_all(did.as_ref());
+                state.role_state.suspend_all(did.as_ref());
 
-            emit(
-                state,
-                ContextEvent::CapabilitiesSuspended {
-                    did: did.clone(),
-                    capabilities: vec![],
-                },
-                context_id,
-                deps,
-            );
-
-            // ADR-049 §9 Class S: `suspend_all` strips a member's ENTIRE
-            // capability set — a downward-authorization transition, identical
-            // in shape to `execute_suspend_member`'s `suspend_capabilities`.
-            // Persist fail-closed so an actor crash in the ≤50ms coalesce
-            // window cannot roll the ban back and re-grant the suspended
-            // member's capabilities after the caller was told the ban applied.
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+                emit(
+                    state,
+                    ContextEvent::CapabilitiesSuspended {
+                        did: did.clone(),
+                        capabilities: vec![],
+                    },
+                    context_id,
+                    deps,
+                );
+                Ok(())
+            })?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log.append_context_event(
                 &context_id_bytes,
@@ -4072,7 +4146,7 @@ pub async fn dispatch_governance_action(
                 actor,
                 ts,
             )?;
-            state.checkpoint_events_since += 1;
+            cell.state_mut().checkpoint_events_since += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
