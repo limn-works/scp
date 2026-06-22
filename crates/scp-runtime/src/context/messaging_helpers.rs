@@ -216,7 +216,7 @@ pub fn build_encrypted_envelope(
 /// Actor-shape variant: takes `&mut PerContextState` directly, no
 /// supervisor lock dance.
 pub fn enforce_send_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     sender_did: &DID,
     now: u64,
     spending_ucan: Option<&UcanToken>,
@@ -224,6 +224,10 @@ pub fn enforce_send_economy(
     clock: &dyn Clock,
     key_resolver: &KeyResolver,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the spending-nonce-consume combinator; for now the bare
+    // `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let pricing_default =
         scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
     let member_count = state.membership.count();
@@ -753,7 +757,7 @@ pub fn run_buffered_post_delivery(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub async fn send_message(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
@@ -766,6 +770,10 @@ pub async fn send_message(
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
 
+    // ADR-049 §9 Class-S cell seam: the cell is held so the spending-nonce-bearing
+    // `enforce_send_economy` leaf receives it. The bulk of this body re-derives the
+    // bare `&mut PerContextState`; the borrow ends before the cell-taking call.
+    let state = cell.state_mut();
     state::require_active(&state.handle)?;
     // Fail-close on commit fault.
     governance_helpers::check_commit_fault_marker(state.commit_fault.as_ref())?;
@@ -824,8 +832,11 @@ pub async fn send_message(
         .velocity_tracker
         .record_message(sender_did, now_secs);
 
+    // `enforce_send_economy` is the spending-nonce-bearing leaf and takes the
+    // cell; the top `state` borrow has ended (NLL) so `cell` is free here. The
+    // arms + remaining body re-derive the bare `&mut PerContextState`.
     let deducted_cost = match enforce_send_economy(
-        state,
+        cell,
         sender_did,
         now_secs,
         spending_ucan,
@@ -837,6 +848,7 @@ pub async fn send_message(
         Err(e) => {
             // Roll back velocity + hard-rate-limit. No EconomyTicket
             // exists yet; rollback inline against actor-owned state.
+            let state = cell.state_mut();
             state
                 .governance
                 .velocity_tracker
@@ -845,6 +857,8 @@ pub async fn send_message(
             return Err(e);
         }
     };
+    // Re-derive the bare state for the remaining (not-yet-migrated) mutations.
+    let state = cell.state_mut();
     // F4: wrap Phase 1 economy state in an EconomyTicket.
     let ticket = crate::context::economy_logic::EconomyTicket {
         actor_did: sender_did.clone(),
@@ -2834,14 +2848,17 @@ pub fn deliver_message_and_drain_buffered(
 /// the announcing member's DID to their per-context pseudonym routing
 /// ID. Best-effort — internal log on transport / serialization failure.
 pub async fn send_pseudonym_announcement(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
     signing_key: &ed25519_dalek::SigningKey,
 ) {
     let context_id = handle.context_id().to_owned();
-    let Some(pseudonym) = state.routing.local_pseudonym() else {
+    // Read the routing pseudonym via Deref; the borrow ends before the
+    // cell-taking `send_message` call below (which reaches the spending-nonce
+    // leaf).
+    let Some(pseudonym) = cell.routing.local_pseudonym() else {
         return;
     };
     let announcement = state::PseudonymAnnouncement {
@@ -2857,7 +2874,7 @@ pub async fn send_pseudonym_announcement(
         return;
     };
     if let Err(e) = send_message(
-        state,
+        cell,
         deps,
         handle,
         sender_did,

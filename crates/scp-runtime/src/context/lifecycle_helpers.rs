@@ -621,13 +621,20 @@ pub async fn close_context_with_key(
 ///   `EconomyTicket` is rolled back.
 #[allow(clippy::too_many_lines)]
 pub async fn join_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     key_package: KeyPackage,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: held so the `enforce_join_economy`
+    // spending-nonce mutation (reached via `&mut state.governance` below) can
+    // later route through the fail-closed combinator. The bare
+    // `&mut PerContextState` is derived here once; `enforce_join_economy` takes a
+    // `&mut GovernanceState` sub-borrow, so no nested cell call exists in this
+    // body. Behaviour is unchanged.
+    let state = cell.state_mut();
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let member_did = key_package.owner_did.clone();
@@ -3505,8 +3512,10 @@ mod restore_reconcile_tests {
         // the persist failure is never reached and no escrow side effect runs.
         deps.persistence = Arc::new(FailingJoinPersistence);
 
+        // `join_context` now takes the Class-S cell; wrap the owned state.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = lifecycle_helpers::join_context(
-            &mut state,
+            &mut cell,
             &deps,
             &handle,
             key_package,

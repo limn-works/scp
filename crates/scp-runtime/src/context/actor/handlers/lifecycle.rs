@@ -72,17 +72,17 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `RevokeContextAccessKey`, `RestoreContextAccessKey`) call the
 /// actor-shape helpers in [`crate::context::queries_helpers`] (Phase
 /// 2A.10) directly on `&mut state` — no supervisor shim involved.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_actor_inner(state, deps, cmd)).await
+    Box::pin(dispatch_actor_inner(cell, deps, cmd)).await
 }
 
 #[allow(clippy::too_many_lines)]
 async fn dispatch_actor_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -109,8 +109,11 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
+            // JoinContext reaches the spending-nonce path (`enforce_join_economy`)
+            // via `join_context`, so it is threaded the cell; the other variants
+            // below take `state_mut()`.
             handle_join_context_actor(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -124,7 +127,7 @@ async fn dispatch_actor_inner(
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
             handle_leave_context_actor(
-                state,
+                cell.state_mut(),
                 deps,
                 p.context_id,
                 p.params,
@@ -136,14 +139,21 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context_actor(state, deps, p.context_id, p.params, p.initiator_did, reply)
-                .await
+            handle_close_context_actor(
+                cell.state_mut(),
+                deps,
+                p.context_id,
+                p.params,
+                p.initiator_did,
+                reply,
+            )
+            .await
         }
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context_actor(state, deps, context_id, exporter_did, reply),
+        } => handle_export_context_actor(cell.state_mut(), deps, context_id, exporter_did, reply),
         LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
@@ -170,7 +180,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_generate_context_access_key_actor(
-            state,
+            cell.state_mut(),
             &context_id,
             &member_did,
             &caller_did,
@@ -182,7 +192,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_revoke_context_access_key_actor(
-            state,
+            cell.state_mut(),
             &context_id,
             &member_did,
             &caller_did,
@@ -194,22 +204,26 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_restore_context_access_key_actor(
-            state,
+            cell.state_mut(),
             &context_id,
             &member_did,
             &caller_did,
             reply,
         ),
         LifecycleCommand::FlushSnapshot { reply } => {
-            handle_flush_snapshot_actor(state, deps, reply)
+            handle_flush_snapshot_actor(cell.state_mut(), deps, reply)
         }
-        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(state, deps, reply),
-        LifecycleCommand::ReportBufferLen { reply } => handle_report_buffer_len_actor(state, reply),
+        LifecycleCommand::ShutdownSelf { reply } => {
+            handle_shutdown_self_actor(cell.state_mut(), deps, reply)
+        }
+        LifecycleCommand::ReportBufferLen { reply } => {
+            handle_report_buffer_len_actor(cell.state_mut(), reply)
+        }
         LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
-            handle_clear_needs_reconnect_actor(state, &context_id, reply)
+            handle_clear_needs_reconnect_actor(cell.state_mut(), &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
-            handle_issue_mls_update_actor(state, deps, &context_id, reply)
+            handle_issue_mls_update_actor(cell.state_mut(), deps, &context_id, reply)
         }
     }
 }
@@ -220,7 +234,7 @@ async fn dispatch_actor_inner(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_join_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -240,7 +254,7 @@ async fn handle_join_context_actor(
     }
 
     let join_fut = crate::context::lifecycle_helpers::join_context(
-        state,
+        cell,
         deps,
         &handle,
         key_package,

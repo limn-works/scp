@@ -63,8 +63,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The migration-window shim — `dispatch_from_shim`, the
 /// supervisor-shape `handle_*` helpers, and the `*_legacy` bodies they
 /// delegated to — was removed at Phase 2A finalization.
-pub async fn dispatch(
-    state: &mut crate::context::actor::state::PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -73,7 +73,7 @@ pub async fn dispatch(
     // future each variant wraps) cross clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_state(state, deps, cmd)).await
+    Box::pin(dispatch_state(cell, deps, cmd)).await
 }
 
 /// Actor-shape variant dispatch. Every governance variant now takes
@@ -87,7 +87,7 @@ pub async fn dispatch(
               unified dispatch surface that pipeline-wiring tests assert"
 )]
 async fn dispatch_state(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -97,20 +97,21 @@ async fn dispatch_state(
             context_id: _,
             proposal_id,
             reply,
-        } => handle_get_proposal_actor(state, &proposal_id, reply),
+        } => handle_get_proposal_actor(cell, &proposal_id, reply),
         GovernanceCommand::ListProposals {
             context_id: _,
             reply,
-        } => handle_list_proposals_actor(state, reply),
+        } => handle_list_proposals_actor(cell, reply),
         GovernanceCommand::MigrationState {
             context_id: _,
             reply,
-        } => handle_migration_state_actor(state, reply),
+        } => handle_migration_state_actor(cell, reply),
         GovernanceCommand::TombstoneMigratedContext { context_id, reply } => {
-            handle_tombstone_migrated_context_actor(state, deps, &context_id, reply).await
+            handle_tombstone_migrated_context_actor(cell.state_mut(), deps, &context_id, reply)
+                .await
         }
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
-            handle_acknowledge_commit_fault_actor(state, &context_id, reply)
+            handle_acknowledge_commit_fault_actor(cell.state_mut(), &context_id, reply)
         }
         GovernanceCommand::WithdrawGovernanceVote {
             context_id,
@@ -119,7 +120,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_withdraw_governance_vote_actor(
-                state,
+                cell.state_mut(),
                 deps,
                 &context_id,
                 &proposal_id,
@@ -134,7 +135,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_ceiling_modification_actor(
-                state,
+                cell.state_mut(),
                 deps,
                 &context_id,
                 current_timestamp,
@@ -148,7 +149,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_economic_policy_change_actor(
-                state,
+                cell.state_mut(),
                 deps,
                 &context_id,
                 current_timestamp,
@@ -157,20 +158,25 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
+            // The Class-S cell is threaded into the execute-governance path so the
+            // downstream `execute_*` leaves it reaches can later migrate onto the
+            // fail-closed combinator.
             Box::pin(handle_execute_governance_action_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::ProposeGovernanceAction { payload, reply } => {
+            // Threaded as the cell: the auto-execute path inside reaches the
+            // governance leaves via `execute_governance_action`.
             Box::pin(handle_propose_governance_action_actor(
-                state, deps, *payload, reply, false,
+                cell, deps, *payload, reply, false,
             ))
             .await
         }
         GovernanceCommand::ProposeGovernanceActionChecked { payload, reply } => {
             Box::pin(handle_propose_governance_action_checked_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
@@ -180,33 +186,43 @@ async fn dispatch_state(
             reply,
         } => {
             Box::pin(handle_vote_on_proposal_actor(
-                state, deps, *payload, approve, reply,
+                cell, deps, *payload, approve, reply,
             ))
             .await
         }
         GovernanceCommand::ApproveGovernanceProposal { payload, reply } => {
             Box::pin(handle_approve_governance_proposal_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::RejectGovernanceProposal { payload, reply } => {
             Box::pin(handle_reject_governance_proposal_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(state, deps, reply)
+            handle_evaluate_periodic_consequences_actor(cell.state_mut(), deps, reply)
         }
         GovernanceCommand::ProcessPendingCommits { reply } => {
-            Box::pin(handle_process_pending_commits_actor(state, deps, reply)).await
+            Box::pin(handle_process_pending_commits_actor(
+                cell.state_mut(),
+                deps,
+                reply,
+            ))
+            .await
         }
         GovernanceCommand::EvaluateTimeouts { reply } => {
-            Box::pin(handle_evaluate_timeouts_actor(state, deps, reply)).await
+            Box::pin(handle_evaluate_timeouts_actor(
+                cell.state_mut(),
+                deps,
+                reply,
+            ))
+            .await
         }
         GovernanceCommand::StartTimeoutTask { reply } => {
-            handle_start_timeout_task_actor(state, deps, reply).await
+            handle_start_timeout_task_actor(cell.state_mut(), deps, reply).await
         }
         // Placeholder is a no-op handshake target reserved for mailbox
         // tests. Returns NotImplemented synchronously; no state mutation.
@@ -401,7 +417,7 @@ async fn handle_apply_pending_ceiling_modification_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] (actor-shape).
 async fn handle_propose_governance_action_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionReply,
@@ -423,7 +439,7 @@ async fn handle_propose_governance_action_actor(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_inner(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposer_did,
@@ -458,7 +474,7 @@ async fn handle_propose_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceActionChecked`] (actor-shape).
 async fn handle_propose_governance_action_checked_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionCheckedReply,
@@ -471,7 +487,7 @@ async fn handle_propose_governance_action_checked_actor(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_checked(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposer_did,
@@ -514,7 +530,7 @@ async fn handle_propose_governance_action_checked_actor(
 /// `GovernanceVote` capability path is reached through the dedicated
 /// `ApproveGovernanceProposal` / `RejectGovernanceProposal` commands.
 async fn handle_vote_on_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     approve: bool,
@@ -527,7 +543,7 @@ async fn handle_vote_on_proposal_actor(
 
     let vote_fut = async move {
         Box::pin(crate::context::governance_helpers::vote_on_proposal_inner(
-            state,
+            cell,
             deps,
             &p.context_id,
             &proposal_id,
@@ -561,7 +577,7 @@ async fn handle_vote_on_proposal_actor(
 
 /// Handle [`GovernanceCommand::ApproveGovernanceProposal`] (actor-shape).
 async fn handle_approve_governance_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -574,7 +590,7 @@ async fn handle_approve_governance_proposal_actor(
     let approve_fut = async move {
         Box::pin(
             crate::context::governance_helpers::approve_governance_proposal(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposal_id,
@@ -608,7 +624,7 @@ async fn handle_approve_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::RejectGovernanceProposal`] (actor-shape).
 async fn handle_reject_governance_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -621,7 +637,7 @@ async fn handle_reject_governance_proposal_actor(
     let reject_fut = async move {
         Box::pin(
             crate::context::governance_helpers::reject_governance_proposal(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposal_id,
@@ -655,7 +671,7 @@ async fn handle_reject_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] (actor-shape).
 async fn handle_execute_governance_action_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     payload: ExecuteGovernanceActionPayload,
     reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
@@ -666,7 +682,7 @@ async fn handle_execute_governance_action_actor(
     let execute_fut = async move {
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
-                state,
+                cell,
                 deps,
                 &payload.context_id,
                 &proposal,

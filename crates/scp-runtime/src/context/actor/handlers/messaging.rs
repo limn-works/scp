@@ -60,8 +60,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// actor-shape messaging helpers). The send-sequence tracker
 /// (`state.send_tracker`) is reserved internally inside
 /// [`handle_send_message`].
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
@@ -69,8 +69,11 @@ pub async fn dispatch(
         MessagingCommand::Placeholder { reply } => reply_not_implemented(reply),
         MessagingCommand::SendMessage { payload, reply } => {
             let p = *payload;
+            // SendMessage reaches the spending-nonce leaf
+            // (`enforce_send_economy`) via `send_message`, so it is threaded the
+            // cell; the read-only / non-nonce variants below take `state_mut()`.
             handle_send_message(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 p.params,
@@ -88,17 +91,20 @@ pub async fn dispatch(
             context_id,
             envelope_bytes,
             reply,
-        } => handle_deliver_incoming(state, deps, &context_id, &envelope_bytes, reply).await,
+        } => {
+            handle_deliver_incoming(cell.state_mut(), deps, &context_id, &envelope_bytes, reply)
+                .await
+        }
         MessagingCommand::DrainEvents { context_id, reply } => {
-            handle_drain_events(state, &context_id, reply).await
+            handle_drain_events(cell.state_mut(), &context_id, reply).await
         }
         MessagingCommand::DrainEquivocationAlerts { context_id, reply } => {
-            handle_drain_equivocation_alerts(state, &context_id, reply).await
+            handle_drain_equivocation_alerts(cell.state_mut(), &context_id, reply).await
         }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
             handle_send_pseudonym_announcement(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -114,14 +120,14 @@ pub async fn dispatch(
             member_did,
             pseudonym,
             reply,
-        } => handle_seed_peer_pseudonym(state, member_did, pseudonym, reply),
+        } => handle_seed_peer_pseudonym(cell.state_mut(), member_did, pseudonym, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
             unsupported_features,
             reply,
         } => handle_report_degraded_mode(
-            state,
+            cell.state_mut(),
             deps,
             &context_id,
             compat,
@@ -134,7 +140,7 @@ pub async fn dispatch(
             signing_key,
             reply,
         } => handle_build_local_checkpoint(
-            state,
+            cell.state_mut(),
             deps,
             &context_id,
             &sender_did,
@@ -145,13 +151,20 @@ pub async fn dispatch(
             context_id,
             remote,
             reply,
-        } => handle_compare_remote_checkpoint(state, deps, &context_id, &remote, reply),
+        } => handle_compare_remote_checkpoint(cell.state_mut(), deps, &context_id, &remote, reply),
         MessagingCommand::SendHeartbeat {
             context_id,
             sender_did,
             signing_key,
             reply,
-        } => handle_send_heartbeat(state, deps, &context_id, &sender_did, &signing_key, reply),
+        } => handle_send_heartbeat(
+            cell.state_mut(),
+            deps,
+            &context_id,
+            &sender_did,
+            &signing_key,
+            reply,
+        ),
     }
 }
 
@@ -194,7 +207,7 @@ fn handle_seed_peer_pseudonym(
 /// stays correct.
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_message(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
@@ -206,6 +219,11 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // ADR-049 §9 Class-S cell seam: held so `send_message` (which reaches the
+    // spending-nonce leaf) receives it. The send-tracker bookkeeping re-derives
+    // the bare `&mut PerContextState`; the borrow ends before the cell-taking
+    // `send_message` call.
+    let state = cell.state_mut();
     // Step 1: reserve + commit a sequence number against the
     // actor-owned tracker. The Phase 2A wire sequence is still driven
     // by `MembershipState::next_sequence_number` inside the helper —
@@ -244,8 +262,11 @@ async fn handle_send_message(
     // per-call transport-timeout budget.
     let sk = signing_key.map(crate::context::actor::commands::SigningKeyBytes::to_signing_key);
     let sk_ref = sk.as_ref();
+    // `send_message` is the spending-nonce-bearing path and takes the cell; the
+    // `state` borrow above has ended (NLL) so `cell` is free here. The failure
+    // arms re-derive the bare state for the send-tracker rollback.
     let send_fut = crate::context::messaging_helpers::send_message(
-        state,
+        cell,
         deps,
         &handle,
         sender_did,
@@ -263,12 +284,12 @@ async fn handle_send_message(
         }
         Ok(Err(e)) => {
             // Rollback on failure.
-            state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            cell.state_mut().send_tracker = SendSequenceTracker::from_persisted(high_water_before);
             let sketch = outcome_error_sketch(&e);
             (Outcome::err_mutated(sketch), Err(e))
         }
         Err(_elapsed) => {
-            state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            cell.state_mut().send_tracker = SendSequenceTracker::from_persisted(high_water_before);
             let err = ContextError::TransportTimeout(format!(
                 "send_message exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
@@ -376,7 +397,7 @@ async fn handle_drain_equivocation_alerts(
 
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`] (actor-shape).
 async fn handle_send_pseudonym_announcement(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -396,7 +417,7 @@ async fn handle_send_pseudonym_announcement(
 
     let sk = signing_key.to_signing_key();
     let send_fut = crate::context::messaging_helpers::send_pseudonym_announcement(
-        state, deps, &handle, sender_did, &sk,
+        cell, deps, &handle, sender_did, &sk,
     );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {

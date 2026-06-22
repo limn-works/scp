@@ -54,8 +54,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`ToolsCommand`] against actor-owned state and
 /// capability-reduced dependencies.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
@@ -66,9 +66,9 @@ pub async fn dispatch(
             now_secs,
             reply,
             ..
-        } => handle_try_consume_hard_rate_limit(state, &did, now_secs, reply).await,
+        } => handle_try_consume_hard_rate_limit(cell.state_mut(), &did, now_secs, reply).await,
         ToolsCommand::RefundHardRateLimit { did, reply, .. } => {
-            handle_refund_hard_rate_limit(state, &did, reply).await
+            handle_refund_hard_rate_limit(cell.state_mut(), &did, reply).await
         }
         ToolsCommand::ReserveToolEconomy {
             context_id,
@@ -78,7 +78,7 @@ pub async fn dispatch(
             reply,
         } => {
             handle_reserve_tool_economy(
-                state,
+                cell,
                 deps,
                 &context_id,
                 &invoker_did,
@@ -94,8 +94,15 @@ pub async fn dispatch(
             request,
             reply,
         } => {
-            handle_settle_tool_economy(state, deps, &context_id, &invoker_did, *request, reply)
-                .await
+            handle_settle_tool_economy(
+                cell.state_mut(),
+                deps,
+                &context_id,
+                &invoker_did,
+                *request,
+                reply,
+            )
+            .await
         }
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
@@ -180,7 +187,7 @@ async fn handle_refund_hard_rate_limit(
 /// `Send` reservation the supervisor carries across the executor.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_identity::DID,
@@ -191,7 +198,7 @@ async fn handle_reserve_tool_economy(
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::tools_helpers::reserve_tool_economy(
-        state,
+        cell,
         deps,
         context_id,
         invoker_did,

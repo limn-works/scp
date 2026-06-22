@@ -1777,12 +1777,16 @@ pub fn execute_modify_pruning_policy(
 // ---------------------------------------------------------------------------
 
 pub fn execute_add_signer(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the `threshold_signers` combinator; for now the bare
+    // `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1848,12 +1852,16 @@ pub fn execute_add_signer(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_signer(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the `threshold_signers` combinator; for now the bare
+    // `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1919,12 +1927,16 @@ pub fn execute_remove_signer(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_threshold(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_threshold: u32,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the `threshold_value` combinator; for now the bare
+    // `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2116,7 +2128,7 @@ pub fn execute_reset_member(
 )]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_resolve_conflict(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_a: &ProposalId,
@@ -2124,6 +2136,10 @@ pub fn execute_resolve_conflict(
     resolution: &scp_protocol::context::governance::ConflictResolution,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the `executed_proposals` combinator; for now the bare
+    // `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2391,13 +2407,17 @@ pub fn execute_rotate_content_keys(
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_reconfigure_governance(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
     justification: &scp_protocol::context::governance::DeadlockJustification,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this `state_mut()`
+    // with the `threshold_signers` / `threshold_value` combinators; for now the
+    // bare `&mut PerContextState` keeps the body unchanged.
+    let state = cell.state_mut();
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2976,7 +2996,7 @@ pub async fn execute_cancel_context_migration(
 /// submission (actor-owned state — no TOCTOU window).
 #[allow(clippy::too_many_lines)]
 pub async fn propose_governance_action_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -2991,6 +3011,10 @@ pub async fn propose_governance_action_inner(
     ),
     ContextError,
 > {
+    // ADR-049 §9 Class-S cell seam: held so the auto-execute path can hand the
+    // cell to `execute_governance_action`. The bulk of the body re-derives the
+    // bare `&mut PerContextState`; the borrow ends before the cell-taking call.
+    let state = cell.state_mut();
     // CancelContextMigration is allowed during MigratingOut (§5.11A);
     // all other actions require Active state.
     if matches!(action, GovernanceAction::CancelContextMigration) {
@@ -3132,17 +3156,18 @@ pub async fn propose_governance_action_inner(
     // If the proposal was auto-approved (SingleAdmin), execute
     // immediately — unless invalidated by conflict or in freeze.
     let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
-        Some(
-            Box::pin(execute_governance_action(
-                state, deps, context_id, &proposal,
-            ))
-            .await?,
-        )
+        // The top `state` borrow has ended (NLL); hand the cell to the execute
+        // path so the governance leaves it reaches can later migrate.
+        Some(Box::pin(execute_governance_action(cell, deps, context_id, &proposal)).await?)
     } else {
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(
+        cell.state_mut(),
+        deps,
+        context_id,
+    );
 
     Ok((proposal, events, execution_result))
 }
@@ -3295,7 +3320,7 @@ fn actor_check_proposer_eligibility(
 /// path as the proposal submission (no TOCTOU).
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action_checked(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -3303,7 +3328,7 @@ pub async fn propose_governance_action_checked(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalOutcome, ContextError> {
     let (proposal, _events, execution_result) = propose_governance_action_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposer_did,
@@ -3331,7 +3356,7 @@ pub async fn propose_governance_action_checked(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3340,6 +3365,10 @@ pub async fn vote_on_proposal_inner(
     signing_key: &ed25519_dalek::SigningKey,
     check_vote_capability: bool,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+    // ADR-049 §9 Class-S cell seam: held so the auto-execute path can hand the
+    // cell to `execute_governance_action`. The bulk of the body re-derives the
+    // bare `&mut PerContextState`; the borrow ends before the cell-taking call.
+    let state = cell.state_mut();
     require_active(&state.handle)?;
 
     let suspended = state
@@ -3437,16 +3466,19 @@ pub async fn vote_on_proposal_inner(
     });
 
     if let Some(proposal) = proposal_for_execution {
-        let in_freeze = state.governance.freeze.is_some();
+        let in_freeze = cell.governance.freeze.is_some();
         if !in_freeze && !invalidated_by_conflict {
-            Box::pin(execute_governance_action(
-                state, deps, context_id, &proposal,
-            ))
-            .await?;
+            // The top `state` borrow has ended (NLL); hand the cell to the execute
+            // path so the governance leaves it reaches can later migrate.
+            Box::pin(execute_governance_action(cell, deps, context_id, &proposal)).await?;
         }
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(
+        cell.state_mut(),
+        deps,
+        context_id,
+    );
 
     Ok((status, events))
 }
@@ -3468,7 +3500,7 @@ pub async fn vote_on_proposal_inner(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn approve_governance_proposal(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3476,7 +3508,7 @@ pub async fn approve_governance_proposal(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -3498,7 +3530,7 @@ pub async fn approve_governance_proposal(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn reject_governance_proposal(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3506,7 +3538,7 @@ pub async fn reject_governance_proposal(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -3527,7 +3559,7 @@ pub async fn reject_governance_proposal(
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
 pub fn dispatch_content_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -3541,7 +3573,7 @@ pub fn dispatch_content_governance_action(
     match action {
         GovernanceAction::AddSigner { did } => {
             execute_add_signer(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3555,7 +3587,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::RemoveSigner { did } => {
             execute_remove_signer(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3569,7 +3601,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
             execute_modify_threshold(
-                state,
+                cell,
                 deps,
                 context_id,
                 *new_threshold,
@@ -3583,7 +3615,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::EstablishToolInterface { interface } => {
             execute_establish_tool_interface(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 interface,
@@ -3597,7 +3629,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -3616,7 +3648,7 @@ pub fn dispatch_content_governance_action(
             resolution,
         } => {
             execute_resolve_conflict(
-                state,
+                cell,
                 deps,
                 context_id,
                 proposal_a,
@@ -3632,7 +3664,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::RotateContentKeys { reason } => {
             execute_rotate_content_keys(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3653,7 +3685,7 @@ pub fn dispatch_content_governance_action(
             justification,
         } => {
             execute_reconfigure_governance(
-                state,
+                cell,
                 deps,
                 context_id,
                 changes,
@@ -3719,7 +3751,7 @@ pub fn dispatch_content_governance_action(
 /// methods, returning typed [`GovernanceActionResult`] variants.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_context_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -3733,7 +3765,7 @@ pub async fn dispatch_context_governance_action(
     match action {
         GovernanceAction::AddMember { did, role } => {
             execute_add_member(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -3748,7 +3780,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveMember { did, .. } => {
             execute_remove_member(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -3762,7 +3794,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ChangeRole { did, new_role } => {
             execute_change_role(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -3777,7 +3809,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RegisterTool { registration } => {
             execute_register_tool(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 registration,
@@ -3791,7 +3823,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveTool { tool_id } => {
             execute_remove_tool(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 tool_id,
@@ -3805,7 +3837,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
             execute_modify_ceiling(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 new_ceiling,
@@ -3819,7 +3851,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CloseContext { reason } => {
             execute_close_context(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3834,7 +3866,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::TransferAdmin { new_admin } => {
             execute_transfer_admin(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 new_admin,
@@ -3848,7 +3880,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CreateChildContext { params } => {
             execute_create_child_context(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 params,
@@ -3862,7 +3894,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
             execute_modify_pruning_policy(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 new_policy,
@@ -3886,7 +3918,7 @@ pub async fn dispatch_context_governance_action(
             // future remains provably `Send` — see the function-level
             // doc for ADR-049 Phase 2A finalization rationale.
             let result = execute_propose_context_migration(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 new_context_params,
@@ -3904,7 +3936,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CancelContextMigration => {
             execute_cancel_context_migration(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 CommitMeta {
@@ -3924,7 +3956,7 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
         | GovernanceAction::ReconfigureGovernance { .. } => dispatch_content_governance_action(
-            state,
+            cell,
             deps,
             context_id,
             action,
@@ -3965,7 +3997,7 @@ pub async fn dispatch_context_governance_action(
 /// Dispatches an approved governance action to its implementation method.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
@@ -3982,7 +4014,7 @@ pub async fn dispatch_governance_action(
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
             execute_suspend_member(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -4001,7 +4033,10 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::SuspendAccess { did } => {
-            // Suspend all capabilities for the member.
+            // Suspend all capabilities for the member. This arm mutates Class-S /
+            // structural state inline (no threaded leaf), so re-derive the bare
+            // `&mut PerContextState` here; the borrow ends with the arm.
+            let state = cell.state_mut();
             require_active(&state.handle)?;
 
             if !state.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -4044,7 +4079,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::RevokeAccess { did, access } => {
             let r = execute_revoke(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -4063,7 +4098,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
             execute_restore_access(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 did,
@@ -4083,7 +4118,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::PromoteContext => {
             execute_promote_context(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 &proposal.approvals,
@@ -4097,7 +4132,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
             execute_extend_ttl(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 *additional_secs,
@@ -4113,7 +4148,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
             execute_set_economic_policy(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 policy,
@@ -4131,7 +4166,7 @@ pub async fn dispatch_governance_action(
             purpose,
         } => {
             execute_approve_spend(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 spender,
@@ -4147,7 +4182,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::LockEconomicPolicy => {
             execute_lock_economic_policy(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 CommitMeta {
@@ -4160,7 +4195,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
             execute_modify_hard_rate_limit(
-                state,
+                cell.state_mut(),
                 deps,
                 context_id,
                 new_config,
@@ -4194,7 +4229,7 @@ pub async fn dispatch_governance_action(
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration => {
             dispatch_context_governance_action(
-                state,
+                cell,
                 deps,
                 context_id,
                 &proposal.action,
@@ -4466,11 +4501,17 @@ pub fn finalize_governance_action(
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 #[instrument(skip_all, fields(context_id))]
 pub async fn execute_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
+    // ADR-049 §9 Class-S cell seam: this entry holds the cell so the
+    // `executed_proposals` replay-marker writes below — and the downstream
+    // governance leaves — can later route through the fail-closed combinator.
+    // The bare `&mut PerContextState` is re-derived in each block so the borrow
+    // ends before the next `cell`-taking dispatch call; behaviour is unchanged.
+    let state = cell.state_mut();
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
             "governance proposal is not approved (status: {:?})",
@@ -4515,13 +4556,15 @@ pub async fn execute_governance_action(
     // variant exists yet. Governance actions are free until the economy
     // spec adds a governance cost tier. Tracked by #1537.
 
-    let result = match dispatch_governance_action(state, deps, context_id, proposal).await {
+    // The top `state` borrow has ended (NLL); hand the cell to the dispatch
+    // chain so the governance leaves it reaches can later migrate.
+    let result = match dispatch_governance_action(cell, deps, context_id, proposal).await {
         Ok(r) => r,
         Err(e) => {
             // Roll back the executed marker on dispatch failure so the
             // proposal can be retried (e.g. after a transient crypto
             // error).
-            state
+            cell.state_mut()
                 .governance
                 .class_s
                 .executed_proposals
@@ -4530,7 +4573,7 @@ pub async fn execute_governance_action(
         }
     };
 
-    finalize_governance_action(state, deps, context_id, proposal)?;
+    finalize_governance_action(cell.state_mut(), deps, context_id, proposal)?;
 
     Ok(result)
 }

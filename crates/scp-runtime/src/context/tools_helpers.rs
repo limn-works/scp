@@ -461,13 +461,17 @@ impl std::fmt::Debug for ToolEconomyReservation {
 /// escrow-authorization failures.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
     now_secs: u64,
 ) -> Result<ToolEconomyReservation, ContextError> {
+    // ADR-049 §9 Class-S cell seam: a later migration replaces this
+    // `state_mut()` line with the spending-nonce-consume combinator; until then
+    // the bare `&mut PerContextState` keeps the body byte-for-byte unchanged.
+    let state = cell.state_mut();
     let event_log = &deps.event_log;
     let key_resolver = &deps.key_resolver;
     let clock = deps.clock.as_ref();
