@@ -11,7 +11,7 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from scp_sdk.errors import ScpError
 
@@ -20,7 +20,7 @@ from scp_sdk.errors import ScpError
 # ---------------------------------------------------------------------------
 
 
-class ResolutionPathDict(TypedDict, total=False):
+class ResolutionPathDict(TypedDict):
     """Structured metadata recording which layer resolved an address (§22.7)."""
 
     layer: Literal["Petname", "HandleRegistry", "Attestation", "Domain", "MultiLayerCorroborated"]
@@ -30,13 +30,13 @@ class ResolutionPathDict(TypedDict, total=False):
     """
     source: str
     """Human-readable source identifier (context name, domain, platform)."""
-    source_id: str | None
+    source_id: NotRequired[str | None]
     """Context ID (hex), present only for the ``HandleRegistry`` layer."""
     resolved_at: int
     """Unix timestamp (seconds) when resolution occurred."""
 
 
-class TrustLevelDict(TypedDict, total=False):
+class TrustLevelDict(TypedDict):
     """Trust level of a discovery result (§22.7).
 
     The ``kind`` field discriminates among the six trust-level variants
@@ -51,11 +51,11 @@ class TrustLevelDict(TypedDict, total=False):
         "HandleRegistryVerified",
         "MultiLayerCorroborated",
     ]
-    sources: list[ResolutionPathDict]
+    sources: NotRequired[list[ResolutionPathDict]]
     """Only present when ``kind == "MultiLayerCorroborated"``."""
 
 
-class DiscoveryResult(TypedDict, total=False):
+class DiscoveryResult(TypedDict):
     """A context discovery result (§22.2.1 ``AddressResolution``).
 
     Matches the shape of ``DiscoveryResult`` in the TypeScript SDK but uses

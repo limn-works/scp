@@ -521,7 +521,7 @@ export interface Bridge {
     issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
-  // Recovery and custody migration (spec §9.12)
+  // Recovery and custody migration (spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(
     did: string,
