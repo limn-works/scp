@@ -187,6 +187,12 @@
   ParticipationProfile (L218) + spec19 PaymentReceipt got PROSE COMMENT only — no field. Interim is shipping
   state, so anchored=false surfacing is load-bearing NOW. Add per-fact bool/bitmask when interim lands.
 
+### SDK Coverage Fail-Closed + Parity (fix/sdk-coverage-fail-closed-and-parity, b27ef7bff) -- 2026-06-21 -- APPROVED, ZERO FINDINGS
+- check-sdk-coverage.py fail-closed VERIFIED: missing SDK key=error; non-bool/None cell=error; true-but-no-symbol-no-exemption=error; all-exempted-no-verified-SDK=error; empty/blank exemption reason=error. Alias+candidate matching is exact `in sdk_symbols` set membership ONLY (substring/suffix fuzzy match REMOVED -- closed the ~23-fabricated-name bypass class). ALIASES map to REAL op-name symbols, can't fabricate. broadcast_open_key ALIASES entry present+correct (all 4 SDKs -> real symbols confirmed in code). Gate runs PASS 0 errors / 223 ops. 11 self-tests pass; CI now runs self-tests BEFORE gate (strengthened).
+- PERM-3030 re-raise (trust.py:770 startswith, trust.ts:461 /^\[SCP-PERM-3030\]/) anchored at START. Load-bearing: PyO3 maps HandleAffinityError->UcanError(PERM-3030) so `except UcanError` WOULD catch it; without re-raise it'd classify "unknown"->all-False false trust verdict masking caller instance-mismatch bug. _classify_ucan_error returns "unknown" for "handle belongs to..." (no prefix matches). HandleAffinityError Display SANITIZED (ids in Debug only, not user string) -- no info leak. thiserror fmt `[{code}] permission error: {msg}` => bracket at pos 0, anchor matches. Tested both SDKs (trust.test.ts:401, test_sdk_parity_additions.py:103).
+- test-guard.ts: _IS_TEST_ENVIRONMENT frozen at module load (IIFE reads process.env once); Object.hasOwn resists prototype pollution; guards __setBridgeForTests + __constructScpWithNativeForTests (native-bridge swap = priv-esc vector). Defense layered: frozen const + hasOwn + tsup DCE + package.json exports gating. Prototype-pollution + frozen-mutation tested (test-guard.test.ts:64).
+- FFI identity + MLS provider diffs = DOC-COMMENT ONLY (§3.2.1->§9.12,ADR-003§4b citation fix; ContextManager->actor wording). No logic change. discovery.py adds TypedDict/Literal + discover_contexts passthrough to bridge.context_discover (validation in Rust validate.rs; no injection/format-string/leak).
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no

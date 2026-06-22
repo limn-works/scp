@@ -4,6 +4,8 @@
 - [Cross-SDK shape parity](cross-sdk-shape-parity.md) — SCP agent-first tenet: identical API shape across all 4 bindings; recurring parity defects (return-type/param/signature/name-collision) to flag
 - [TS↔Python trust parity](ts-python-trust-parity.md) — four-layer trust + bridge-trust-tier + identity-lifecycle parity conventions; intentional divergences vs parity smells
 - [SDK coverage fail-closed + parity review](sdk_coverage_failclosed_parity_review.md) — fix/sdk-coverage-fail-closed-and-parity: identity-lifecycle+economyVerifyPaymentReceipts clean; MED discover_contexts TS/py signature split (singleton vs SCP-instance)
+- [SDK coverage fail-closed @57840faab](sdk_coverage_failclosed_parity_57840faab.md) — APPROVED; BridgeTrustLevel int Literal + discovery kind/layer Literals matched to Rust enums; PERM-3030 re-raise correct; ADR-051 provider agent-first; Python discover_contexts lacks TS variant validation
+- [SDK coverage fail-closed @341df72cc](sdk_coverage_failclosed_parity_341df72cc.md) — APPROVED; discovery TypedDicts now public + field-parity w/ TS; non-blocking nit total=False vs TS-required (DiscoveryResult/ResolutionPathDict should be total=True); PERM-3030 re-raise + BridgeTrustLevel verified; provider.rs comment-only; "ADR-053 PreRotationCustodyProvider" not in diff (renumber only)
 
 ## SCP SDK Standards Review (2026-02-22)
 - Reviewed all 10 files in `.docs/standards/` (sdk-common.md + 8 language files + conventions.md)

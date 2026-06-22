@@ -823,9 +823,13 @@ export class SCP {
    */
   async identityRotateKey(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
-    const raw = await bridge.identityRotateKey(identity._rawHandle);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await bridge.identityRotateKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -848,9 +852,13 @@ export class SCP {
    */
   async identityMigrate(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
-    const raw = await bridge.identityMigrate(identity._rawHandle);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await bridge.identityMigrate(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -863,9 +871,13 @@ export class SCP {
    */
   async identityAddAgentKey(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
-    const raw = await bridge.identityAddAgentKey(identity._rawHandle);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await bridge.identityAddAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -877,9 +889,13 @@ export class SCP {
    */
   async identityRotateAgentKey(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
-    const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -891,9 +907,13 @@ export class SCP {
    */
   async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
-    const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityResolve(did: string): Promise<unknown> {
