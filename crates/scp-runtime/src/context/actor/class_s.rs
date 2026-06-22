@@ -482,10 +482,10 @@ impl Deref for ClassCMut<'_> {
 /// Outcome of a [`ClassSCell::commit_class_s_then_append`] that did not complete
 /// cleanly (the post-persist `after` step failed, or a persist failed).
 ///
-/// `mutated` is a DURABILITY-DIVERGENCE flag, NOT an "in-memory changed relative
-/// to pre-`f`" flag. It answers the only question the caller needs: *could the
-/// durable (persisted) state disagree with the in-memory state this call
-/// returns?* See the field doc for the exact contract.
+/// `durability_diverged` is a DURABILITY-DIVERGENCE flag, NOT an "in-memory
+/// changed relative to pre-`f`" flag. It answers the only question the caller
+/// needs: *could the durable (persisted) state disagree with the in-memory state
+/// this call returns?* See the field doc for the exact contract.
 #[derive(Debug)]
 #[allow(
     dead_code,
@@ -510,9 +510,10 @@ pub(crate) struct AppendOutcomeError {
     ///
     /// This is deliberately NOT framed as "in-memory mutated relative to the
     /// pre-`f` snapshot": on the re-persist-fail arm the in-memory state HAS been
-    /// rolled back to pre-`f`, yet `mutated` is `true` because durability
-    /// diverged. Durability-divergence is the meaning the caller acts on.
-    pub(crate) mutated: bool,
+    /// rolled back to pre-`f`, yet `durability_diverged` is `true` because
+    /// durability diverged. Durability-divergence is the meaning the caller acts
+    /// on.
+    pub(crate) durability_diverged: bool,
     /// The error that terminated the operation (the `after` error, or the
     /// re-persist error if the rollback could not be made durable).
     pub(crate) err: ContextError,
@@ -871,27 +872,28 @@ impl ClassSCell {
     /// Sequence:
     /// 1. SNAPSHOT both Class-S sub-structs.
     /// 2. Run `f(view)` → `(value, append_input)`. If `f` errs, return
-    ///    `AppendOutcomeError { mutated: false, err }` (no persist ran).
+    ///    `AppendOutcomeError { durability_diverged: false, err }` (no persist
+    ///    ran).
     /// 3. Persist fail-closed. On failure return
-    ///    `AppendOutcomeError { mutated: true, err }` — `f`'s mutation is in
-    ///    memory but did not durably land (the restore is the caller's call; this
-    ///    matches `*_keep`'s "report divergence, keep mutation" and signals
-    ///    `mutated`).
+    ///    `AppendOutcomeError { durability_diverged: true, err }` — `f`'s mutation
+    ///    is in memory but did not durably land (the restore is the caller's call;
+    ///    this matches `*_keep`'s "report divergence, keep mutation" and signals
+    ///    `durability_diverged`).
     /// 4. Run `after(&append_input, &state, deps).await` (external append). On
     ///    `Ok` return `Ok(value)` — no re-persist, since the append wrote to an
     ///    external sink, not to `ContextSnapshot`-backed in-state. On
     ///    `Err(after_err)`: RESTORE both sub-structs, RE-PERSIST.
-    ///    - re-persist OK → `AppendOutcomeError { mutated: false, err: after_err }`
-    ///      (durable and in-memory both hold the pre-`f` value).
-    ///    - re-persist Err → `AppendOutcomeError { mutated: true, err: <re-persist
-    ///      err> }` (could not make the rollback durable — durable/in-memory
-    ///      divergence the caller must surface).
+    ///    - re-persist OK → `AppendOutcomeError { durability_diverged: false,
+    ///      err: after_err }` (durable and in-memory both hold the pre-`f` value).
+    ///    - re-persist Err → `AppendOutcomeError { durability_diverged: true,
+    ///      err: <re-persist err> }` (could not make the rollback durable —
+    ///      durable/in-memory divergence the caller must surface).
     ///
     /// # Errors
     ///
     /// Returns [`AppendOutcomeError`] carrying `f`'s error, the persist error, the
-    /// `after` error, or the re-persist error — with `mutated` set per the rules
-    /// above.
+    /// `after` error, or the re-persist error — with `durability_diverged` set per
+    /// the rules above.
     ///
     /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
     #[allow(dead_code)]
@@ -913,13 +915,13 @@ impl ClassSCell {
         let gov_snap = self.state.governance.class_s.snapshot();
         let (value, append_input) =
             f(ClassSMut::new(&mut self.state)).map_err(|err| AppendOutcomeError {
-                mutated: false,
+                durability_diverged: false,
                 err,
             })?;
         persist_state_fail_closed(&self.state, deps, context_id).map_err(|err| {
             AppendOutcomeError {
                 // `f`'s mutation is in memory but did not durably land.
-                mutated: true,
+                durability_diverged: true,
                 err,
             }
         })?;
@@ -933,12 +935,12 @@ impl ClassSCell {
                 match persist_state_fail_closed(&self.state, deps, context_id) {
                     // Rollback made durable: in-memory matches the pre-`f` value.
                     Ok(()) => Err(AppendOutcomeError {
-                        mutated: false,
+                        durability_diverged: false,
                         err: after_err,
                     }),
                     // Could not make the rollback durable: hard divergence.
                     Err(repersist_err) => Err(AppendOutcomeError {
-                        mutated: true,
+                        durability_diverged: true,
                         err: repersist_err,
                     }),
                 }
@@ -1127,7 +1129,8 @@ mod tests {
 
     /// Persistence that SUCCEEDS the first `persist_context` call then FAILS
     /// every subsequent one — lets `then_append` exercise "post-f persist OK,
-    /// rollback re-persist FAILS" (the hard-divergence `mutated == true` path).
+    /// rollback re-persist FAILS" (the hard-divergence `durability_diverged ==
+    /// true` path).
     struct SucceedThenFail {
         calls: Arc<AtomicUsize>,
     }
@@ -1785,7 +1788,8 @@ mod tests {
     }
 
     /// (key behaviour) `*_then_append` when `after` fails RESTORES + RE-PERSISTS
-    /// the snapshot and reports `mutated == false` (rollback made durable).
+    /// the snapshot and reports `durability_diverged == false` (rollback made
+    /// durable).
     #[tokio::test]
     async fn then_append_restores_and_repersists_on_after_failure() {
         // Persistence succeeds for the initial persist AND the re-persist.
@@ -1815,8 +1819,14 @@ mod tests {
             .await;
 
         match result {
-            Err(AppendOutcomeError { mutated, err }) => {
-                assert!(!mutated, "rollback re-persisted ⇒ mutated is false");
+            Err(AppendOutcomeError {
+                durability_diverged,
+                err,
+            }) => {
+                assert!(
+                    !durability_diverged,
+                    "rollback re-persisted ⇒ durability_diverged is false"
+                );
                 assert!(
                     matches!(err, ContextError::EventLogFailed(_)),
                     "carries the after error; got {err:?}"
@@ -1832,10 +1842,10 @@ mod tests {
         assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
     }
 
-    /// `*_then_append` reports `mutated == true` when the post-`f` persist itself
-    /// fails (the mutation is in memory but did not durably land).
+    /// `*_then_append` reports `durability_diverged == true` when the post-`f`
+    /// persist itself fails (the mutation is in memory but did not durably land).
     #[tokio::test]
-    async fn then_append_reports_mutated_on_initial_persist_failure() {
+    async fn then_append_reports_diverged_on_initial_persist_failure() {
         let deps = build_deps(Box::new(FailPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x43));
         let ctx = ctx_hex(0x43);
@@ -1861,8 +1871,14 @@ mod tests {
             .await;
 
         match result {
-            Err(AppendOutcomeError { mutated, err }) => {
-                assert!(mutated, "initial persist failed ⇒ mutated is true");
+            Err(AppendOutcomeError {
+                durability_diverged,
+                err,
+            }) => {
+                assert!(
+                    durability_diverged,
+                    "initial persist failed ⇒ durability_diverged is true"
+                );
                 assert!(matches!(err, ContextError::PersistenceFailed(_)));
             }
             Ok(()) => panic!("expected AppendOutcomeError"),
@@ -1874,9 +1890,10 @@ mod tests {
     }
 
     /// `*_then_append` when `after` fails AND the rollback re-persist also fails:
-    /// reports `mutated == true` (could not make the rollback durable).
+    /// reports `durability_diverged == true` (could not make the rollback
+    /// durable).
     #[tokio::test]
-    async fn then_append_reports_mutated_when_repersist_fails() {
+    async fn then_append_reports_diverged_when_repersist_fails() {
         // Fail ONLY the second persist (the re-persist): succeed the first
         // post-f persist, fail the rollback re-persist (see `SucceedThenFail`).
         let persist_calls = Arc::new(AtomicUsize::new(0));
@@ -1905,8 +1922,14 @@ mod tests {
             .await;
 
         match result {
-            Err(AppendOutcomeError { mutated, err }) => {
-                assert!(mutated, "re-persist failed ⇒ mutated is true");
+            Err(AppendOutcomeError {
+                durability_diverged,
+                err,
+            }) => {
+                assert!(
+                    durability_diverged,
+                    "re-persist failed ⇒ durability_diverged is true"
+                );
                 assert!(
                     matches!(err, ContextError::PersistenceFailed(_)),
                     "carries the re-persist error; got {err:?}"
@@ -1917,10 +1940,10 @@ mod tests {
         assert_eq!(persist_calls.load(Ordering::SeqCst), 2);
     }
 
-    /// `*_then_append` returns `AppendOutcomeError { mutated: false }` when `f`
-    /// itself rejects (no persist ran).
+    /// `*_then_append` returns `AppendOutcomeError { durability_diverged: false }`
+    /// when `f` itself rejects (no persist ran).
     #[tokio::test]
-    async fn then_append_reports_not_mutated_when_f_rejects() {
+    async fn then_append_reports_not_diverged_when_f_rejects() {
         let persist_calls = Arc::new(AtomicUsize::new(0));
         let deps = build_deps(Box::new(SpyPersistence {
             persist_calls: Arc::clone(&persist_calls),
@@ -1939,8 +1962,11 @@ mod tests {
             .await;
 
         match result {
-            Err(AppendOutcomeError { mutated, err }) => {
-                assert!(!mutated);
+            Err(AppendOutcomeError {
+                durability_diverged,
+                err,
+            }) => {
+                assert!(!durability_diverged);
                 assert!(matches!(err, ContextError::PermissionDenied(_)));
             }
             Ok(()) => panic!("expected AppendOutcomeError"),
