@@ -838,8 +838,8 @@ export class SCP {
    * @returns The updated {@link Identity} (same DID, new key).
    */
   async identityRotateKey(identity: Identity): Promise<Identity> {
-    const bridge = await getBridge(this);
     try {
+      const bridge = await getBridge(this);
       const raw = await bridge.identityRotateKey(identity._rawHandle);
       const { Identity: IdentityCls } = await import("./identity");
       return IdentityCls._fromHandle(this, raw);
@@ -867,8 +867,8 @@ export class SCP {
    * @returns The migrated {@link Identity} with a NEW DID.
    */
   async identityMigrate(identity: Identity): Promise<Identity> {
-    const bridge = await getBridge(this);
     try {
+      const bridge = await getBridge(this);
       const raw = await bridge.identityMigrate(identity._rawHandle);
       const { Identity: IdentityCls } = await import("./identity");
       return IdentityCls._fromHandle(this, raw);
@@ -886,8 +886,8 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityAddAgentKey(identity: Identity): Promise<Identity> {
-    const bridge = await getBridge(this);
     try {
+      const bridge = await getBridge(this);
       const raw = await bridge.identityAddAgentKey(identity._rawHandle);
       const { Identity: IdentityCls } = await import("./identity");
       return IdentityCls._fromHandle(this, raw);
@@ -904,8 +904,8 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityRotateAgentKey(identity: Identity): Promise<Identity> {
-    const bridge = await getBridge(this);
     try {
+      const bridge = await getBridge(this);
       const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
       const { Identity: IdentityCls } = await import("./identity");
       return IdentityCls._fromHandle(this, raw);
@@ -922,8 +922,8 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
-    const bridge = await getBridge(this);
     try {
+      const bridge = await getBridge(this);
       const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
       const { Identity: IdentityCls } = await import("./identity");
       return IdentityCls._fromHandle(this, raw);
