@@ -156,19 +156,45 @@
 //! persist-on-commit boundary). The escape hatch and these allows are removed in
 //! the final migration step.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 use super::deps::ActorDeps;
-use super::state::{ClassSState, PerContextState};
+use super::sequence::SendSequenceTracker;
+use super::state::{
+    BroadcastReservationId, ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState,
+    ContextRouting, PendingBroadcastPublish, PerContextState, RecvSequenceTracker,
+    WelcomeProcessing,
+};
+use crate::context::ContextHandle;
+use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
-use crate::context::state::{GovernanceClassS, GovernanceState};
+use crate::context::state::{
+    AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
+    MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
+    TtlState,
+};
+use crate::economy::adapter::PaymentReceipt;
+use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
+use scp_protocol::context::governance::{
+    GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
+};
 use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
+use scp_protocol::context::params::ToolRegistration;
 use scp_protocol::context::roles::ContextRoleState;
+use scp_protocol::context::tools::interface::ToolInterface;
+use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
+use scp_protocol::economy::antispam::{
+    ContextMessagePricingConfig, SenderVelocityTracker, TokenBucketLimiter,
+};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
+use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
+use scp_protocol::trust::consequence::ConsequenceRule;
+use scp_protocol::trust::participation::ParticipationRecord;
 
 /// Mutable view over a [`PerContextState`] that EXPOSES the Class-S sub-structs.
 ///
@@ -319,6 +345,65 @@ pub(crate) struct ClassCMut<'a> {
     role_state: &'a mut ContextRoleState,
     /// `&mut` to the checkpoint counter (Class-C / structural).
     checkpoint_events_since: &'a mut u64,
+    /// `&mut` to the deterministic context id (Class-C / structural identity).
+    context_id: &'a mut [u8; 32],
+    /// `&mut` to the local first-instantiation timestamp (Class-C / structural).
+    created_at: &'a mut u64,
+    /// `&mut` to the convergent creator-assigned creation timestamp (Class-C).
+    creation_timestamp_secs: &'a mut u64,
+    /// `&mut` to the monotonic generation counter (Class-C / structural).
+    generation: &'a mut u64,
+    /// `&mut` to the full-fat context handle (Class-C / structural).
+    handle: &'a mut ContextHandle,
+    /// `&mut` to the optional Merkle event log (Class-C / structural).
+    event_log: &'a mut Option<ContextEventLog>,
+    /// `&mut` to the bounded payment-receipt ring buffer (Class-C / §19.11).
+    payment_receipts: &'a mut VecDeque<PaymentReceipt>,
+    /// `&mut` to the optional broadcast-mode metadata (Class-C / §5.14).
+    broadcast_context: &'a mut Option<ProtocolBroadcastContext>,
+    /// `&mut` to the optional active migration state (Class-C / §5.11A).
+    migration_state: &'a mut Option<MigrationState>,
+    /// `&mut` to the MLS epoch + reconnection state (Class-C / §5.9, §23.11).
+    epoch: &'a mut EpochState,
+    /// `&mut` to the access-control / CEK-wrapping exclusion state (Class-C).
+    access: &'a mut AccessControlState,
+    /// `&mut` to the TTL timer + extension state (Class-C / SCP-021).
+    ttl: &'a mut TtlState,
+    /// `&mut` to the per-context routing strategy (Class-C / §9.10.4, §5.14).
+    routing: &'a mut ContextRouting,
+    /// `&mut` to the per-sender anti-replay sequence tracker (Class-C / §9.8.2).
+    sequence_tracker: &'a mut SequenceTracker,
+    /// `&mut` to the per-sender reorder buffer (Class-C / §9.8.5).
+    reorder_buffer: &'a mut ReorderBuffer,
+    /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
+    pending_commits: &'a mut VecDeque<PendingCommit>,
+    /// `&mut` to the commit-fault fail-close marker (Class-C / structural).
+    commit_fault: &'a mut Option<CommitFaultMarker>,
+    /// `&mut` to the last-checkpoint timestamp (Class-C / §9.9.3).
+    checkpoint_last_time_secs: &'a mut u64,
+    /// `&mut` to the locally generated consistency checkpoints (Class-C / §9.9.3).
+    checkpoints: &'a mut Vec<ConsistencyCheckpoint>,
+    /// `&mut` to the per-sender remote-checkpoint divergence dedup set (Class-C /
+    /// §9.9.3). Receiver-minted equivocation evidence, NOT a sender-authenticated
+    /// replay witness — coalesce-window rollback re-emits at most one bounded
+    /// duplicate alert, so best-effort is acceptable.
+    last_seen_remote_checkpoint: &'a mut HashMap<DID, HashSet<(u64, [u8; 32])>>,
+    /// `&mut` to the send-sequence counter with RAII rollback (Class-C).
+    send_tracker: &'a mut SendSequenceTracker,
+    /// `&mut` to the per-sender receive-sequence high-water marks (Class-C).
+    recv_tracker: &'a mut RecvSequenceTracker,
+    /// `&mut` to the reconstructable cross-context UCAN proof store (Class-C /
+    /// §6.2.4). Interface state repopulated when the tool interface is
+    /// re-established — explicitly NOT the Class-S freshness/replay witness.
+    xctx_ucan_proofs: &'a mut InMemoryProofResolver,
+    /// `&mut` to the in-flight broadcast-publish reservations (Class-C).
+    pending_broadcast_publishes: &'a mut HashMap<BroadcastReservationId, PendingBroadcastPublish>,
+    /// `&mut` to the multi-step Welcome scratchpad (Class-C / structural).
+    welcome_scratchpad: &'a mut Option<WelcomeProcessing>,
+    /// `&mut` to the actor-internal lifecycle state (Class-C / structural).
+    lifecycle_state: &'a mut ContextLifecycleState,
+    /// `&mut` to the mode-specific state (Class-C / structural).
+    mode: &'a mut ContextModeState,
     /// Shared `&` to the membership record — read-only on the consequence /
     /// best-effort path (needed by [`Self::split_class_c`]).
     membership: &'a MembershipState,
@@ -365,22 +450,56 @@ pub(crate) struct ClassCMut<'a> {
 /// locally re-enabled. Weakening that attribute would re-open this vector.
 pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
-    velocity_tracker: &'a mut scp_protocol::economy::antispam::SenderVelocityTracker,
+    velocity_tracker: &'a mut SenderVelocityTracker,
     /// `&mut` to the per-member cumulative budget tracker (§19.5).
     budget_tracker: &'a mut MemberBudgetTracker,
     /// `&mut` to the consequence-rule cooldown map.
     cooldown_until: &'a mut HashMap<usize, u64>,
     /// `&mut` to the mutable economic policy (§19.3).
     economic_policy: &'a mut Option<EconomicPolicy>,
-    /// Shared `&` to the monotonic proposal sequence counter — READ ONLY through
-    /// this view (callers inspect it; the best-effort path never bumps it). Held
-    /// as a field-granular `&` so reads work with no whole-bucket `Deref`.
-    next_proposal_seq: &'a u64,
+    /// `&mut` to the governance engine (ADR-031).
+    engine: &'a mut Box<dyn GovernanceEngine>,
+    /// `&mut` to the approved-proposals conflict-tracking map (ADR-031 §7).
+    approved_proposals: &'a mut HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// `&mut` to the monotonic proposal sequence counter (H10, ADR-031 §7).
+    next_proposal_seq: &'a mut u64,
+    /// `&mut` to the governance freeze state (ADR-031 §7).
+    freeze: &'a mut Option<(ProposalId, ProposalId, u64)>,
+    /// `&mut` to the governance timeout task handle (SCP-271, ADR-031 §5).
+    timeout_task: &'a mut GovernanceTimeoutTask,
+    /// `&mut` to the per-context deadlock detection state (ADR-031 §10).
+    deadlock: &'a mut DeadlockDetectionState,
+    /// `&mut` to the pending ceiling modification (M7, §5.3.2).
+    pending_ceiling_modification: &'a mut Option<PendingCeilingModification>,
+    /// `&mut` to the pending economic policy change (§19.3).
+    pending_economic_policy_change: &'a mut Option<PendingEconomicPolicyChange>,
+    /// `&mut` to the dynamically registered tools list (§5.9).
+    registered_tools: &'a mut Vec<ToolRegistration>,
+    /// `&mut` to the cross-context tool interfaces list (§6.2).
+    tool_interfaces: &'a mut Vec<ToolInterface>,
+    /// `&mut` to the pruning policy override (ADR-030 §6).
+    pruning_policy: &'a mut Option<PruningPolicy>,
+    /// `&mut` to the last-known-member set for departure detection.
+    last_known_members: &'a mut HashSet<DID>,
+    /// `&mut` to the pending governance-triggered epoch resets (ADR-029 Tier 3).
+    pending_epoch_resets: &'a mut Vec<DID>,
+    /// `&mut` to the consequence rules declared at creation (ADR-017).
+    consequence_rules: &'a mut Vec<ConsequenceRule>,
+    /// `&mut` to the per-member participation record cache (#1530 proposer eligibility).
+    participation_cache: &'a mut HashMap<String, ParticipationRecord>,
+    /// `&mut` to the per-DID escalating-cost message pricing config (§19.7).
+    message_pricing: &'a mut Option<ContextMessagePricingConfig>,
+    /// `&mut` to the defense-in-depth Matrix-style hard rate limiter (§19.7).
+    hard_rate_limit: &'a mut TokenBucketLimiter,
+    /// `&mut` to the per-context revoked spending-UCAN CID set (§19.5).
+    revoked_spending_ucan_cids: &'a mut HashSet<String>,
+    /// `&mut` to the per-member governance proposal timestamps (§9.3).
+    proposal_timestamps: &'a mut HashMap<String, Vec<u64>>,
 }
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the Class-C governance field accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`) get their first PRODUCTION callers at the `ConsequenceStateSplit` / economy-compensation migration. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `revoked_spending_ucan_cids_mut`, `proposal_timestamps_mut`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -393,16 +512,38 @@ impl<'a> GovernanceClassCMut<'a> {
     const fn new(gov: &'a mut GovernanceState) -> Self {
         // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above). When
         // adding a field here: any field that is, or transitively contains, a
-        // Class-S sub-struct (`GovernanceClassS`) MUST be left to the `..` rest or
-        // bound a shared `&` — NEVER `&mut`. Today: `class_s: GovernanceClassS`
-        // falls into `..`, `next_proposal_seq` is a shared `&`, the four Class-C
-        // fields are `&mut`.
+        // Class-S sub-struct (`GovernanceClassS`) MUST be left to the `..` rest —
+        // NEVER bound `&mut`, and never bound by name (match ergonomics on the
+        // `&mut GovernanceState` would make the binding `&mut`). Today the ONLY
+        // Class-S-containing field is `class_s: GovernanceClassS`, which stays in
+        // `..` so no `&mut` to it is ever produced. Every field named below is a
+        // Class-C / structural `&mut`.
         let GovernanceState {
             velocity_tracker,
             budget_tracker,
             cooldown_until,
             economic_policy,
+            engine,
+            approved_proposals,
             next_proposal_seq,
+            freeze,
+            timeout_task,
+            deadlock,
+            pending_ceiling_modification,
+            pending_economic_policy_change,
+            registered_tools,
+            tool_interfaces,
+            pruning_policy,
+            last_known_members,
+            pending_epoch_resets,
+            consequence_rules,
+            participation_cache,
+            message_pricing,
+            hard_rate_limit,
+            revoked_spending_ucan_cids,
+            proposal_timestamps,
+            // `class_s: GovernanceClassS` is the Class-S sub-struct — left to `..`
+            // so NO reference (mut or shared) to it is taken here.
             ..
         } = gov;
         Self {
@@ -410,16 +551,32 @@ impl<'a> GovernanceClassCMut<'a> {
             budget_tracker,
             cooldown_until,
             economic_policy,
+            engine,
+            approved_proposals,
             next_proposal_seq,
+            freeze,
+            timeout_task,
+            deadlock,
+            pending_ceiling_modification,
+            pending_economic_policy_change,
+            registered_tools,
+            tool_interfaces,
+            pruning_policy,
+            last_known_members,
+            pending_epoch_resets,
+            consequence_rules,
+            participation_cache,
+            message_pricing,
+            hard_rate_limit,
+            revoked_spending_ucan_cids,
+            proposal_timestamps,
         }
     }
 
     /// `&mut` access to the per-sender velocity tracker (§19.7 anti-spam /
     /// consequence evaluation). Class-C: a coalesce-window rollback of a velocity
     /// tick is acceptable.
-    pub(crate) const fn velocity_tracker_mut(
-        &mut self,
-    ) -> &mut scp_protocol::economy::antispam::SenderVelocityTracker {
+    pub(crate) const fn velocity_tracker_mut(&mut self) -> &mut SenderVelocityTracker {
         self.velocity_tracker
     }
 
@@ -443,10 +600,138 @@ impl<'a> GovernanceClassCMut<'a> {
     }
 
     /// Read accessor for the monotonic proposal sequence counter
-    /// ([`GovernanceState::next_proposal_seq`]). Field-granular `&`-read,
-    /// replacing the removed whole-bucket [`Deref`] read.
+    /// ([`GovernanceState::next_proposal_seq`]). Field-granular `&`-read of the
+    /// held `&mut`, replacing the removed whole-bucket [`Deref`] read. Callers
+    /// that only inspect the counter use this; the `&mut` write path is
+    /// [`Self::next_proposal_seq_mut`].
     pub(crate) const fn next_proposal_seq(&self) -> u64 {
         *self.next_proposal_seq
+    }
+
+    /// `&mut` access to the monotonic proposal sequence counter (H10, ADR-031 §7).
+    /// Class-C: the conflict-ordering counter is structural governance state, not
+    /// a Class-S replay/authorization witness.
+    pub(crate) const fn next_proposal_seq_mut(&mut self) -> &mut u64 {
+        self.next_proposal_seq
+    }
+
+    /// `&mut` access to the governance engine (ADR-031, §5.9). Class-C: the
+    /// engine's mutable bookkeeping is best-effort-rollback acceptable.
+    pub(crate) const fn engine_mut(&mut self) -> &mut Box<dyn GovernanceEngine> {
+        self.engine
+    }
+
+    /// `&mut` access to the approved-proposals conflict-tracking map (ADR-031 §7).
+    /// Class-C: a coalesce-window rollback re-derives from the durable proposal
+    /// flow; it is not a replay/authorization witness.
+    pub(crate) const fn approved_proposals_mut(
+        &mut self,
+    ) -> &mut HashMap<ProposalId, (GovernanceProposal, u64, u64)> {
+        self.approved_proposals
+    }
+
+    /// `&mut` access to the governance freeze state (ADR-031 §7). Class-C
+    /// structural liveness state.
+    pub(crate) const fn freeze_mut(&mut self) -> &mut Option<(ProposalId, ProposalId, u64)> {
+        self.freeze
+    }
+
+    /// `&mut` access to the governance timeout task handle (SCP-271, ADR-031 §5).
+    /// Class-C: a transient task handle, not durable authorization state.
+    pub(crate) const fn timeout_task_mut(&mut self) -> &mut GovernanceTimeoutTask {
+        self.timeout_task
+    }
+
+    /// `&mut` access to the per-context deadlock detection state (ADR-031 §10).
+    /// Class-C structural liveness state.
+    pub(crate) const fn deadlock_mut(&mut self) -> &mut DeadlockDetectionState {
+        self.deadlock
+    }
+
+    /// `&mut` access to the pending ceiling modification (M7, §5.3.2). Class-C
+    /// governance configuration awaiting its notification period.
+    pub(crate) const fn pending_ceiling_modification_mut(
+        &mut self,
+    ) -> &mut Option<PendingCeilingModification> {
+        self.pending_ceiling_modification
+    }
+
+    /// `&mut` access to the pending economic policy change (§19.3). Class-C
+    /// governance configuration awaiting its notification period.
+    pub(crate) const fn pending_economic_policy_change_mut(
+        &mut self,
+    ) -> &mut Option<PendingEconomicPolicyChange> {
+        self.pending_economic_policy_change
+    }
+
+    /// `&mut` access to the dynamically registered tools list (§5.9). Class-C
+    /// structural governance configuration.
+    pub(crate) const fn registered_tools_mut(&mut self) -> &mut Vec<ToolRegistration> {
+        self.registered_tools
+    }
+
+    /// `&mut` access to the cross-context tool interfaces list (§6.2). Class-C
+    /// structural governance configuration.
+    pub(crate) const fn tool_interfaces_mut(&mut self) -> &mut Vec<ToolInterface> {
+        self.tool_interfaces
+    }
+
+    /// `&mut` access to the pruning policy override (ADR-030 §6). Class-C
+    /// governance configuration.
+    pub(crate) const fn pruning_policy_mut(&mut self) -> &mut Option<PruningPolicy> {
+        self.pruning_policy
+    }
+
+    /// `&mut` access to the last-known-member set used for departure detection.
+    /// Class-C: a per-tick liveness cache, best-effort-rollback acceptable.
+    pub(crate) const fn last_known_members_mut(&mut self) -> &mut HashSet<DID> {
+        self.last_known_members
+    }
+
+    /// `&mut` access to the pending governance-triggered epoch resets (ADR-029
+    /// Tier 3). Class-C: a per-tick drain queue, not durable authorization state.
+    pub(crate) const fn pending_epoch_resets_mut(&mut self) -> &mut Vec<DID> {
+        self.pending_epoch_resets
+    }
+
+    /// `&mut` access to the consequence rules declared at creation (ADR-017).
+    /// Class-C structural governance configuration.
+    pub(crate) const fn consequence_rules_mut(&mut self) -> &mut Vec<ConsequenceRule> {
+        self.consequence_rules
+    }
+
+    /// `&mut` access to the per-member participation record cache (#1530 proposer
+    /// eligibility). Class-C: a derived cache, best-effort-rollback acceptable.
+    pub(crate) const fn participation_cache_mut(
+        &mut self,
+    ) -> &mut HashMap<String, ParticipationRecord> {
+        self.participation_cache
+    }
+
+    /// `&mut` access to the per-DID escalating-cost message pricing config (§19.7).
+    /// Class-C governance configuration.
+    pub(crate) const fn message_pricing_mut(&mut self) -> &mut Option<ContextMessagePricingConfig> {
+        self.message_pricing
+    }
+
+    /// `&mut` access to the defense-in-depth Matrix-style hard rate limiter
+    /// (§19.7). Class-C: a token-bucket whose coalesce-window rollback is
+    /// acceptable (defense-in-depth, layered atop §19.7 economic escalation).
+    pub(crate) const fn hard_rate_limit_mut(&mut self) -> &mut TokenBucketLimiter {
+        self.hard_rate_limit
+    }
+
+    /// `&mut` access to the per-context revoked spending-UCAN CID set (§19.5).
+    /// Class-C: governance-driven revocation list; not the replay-nonce witness
+    /// (that is Class-S `spending_nonce_tracker`).
+    pub(crate) const fn revoked_spending_ucan_cids_mut(&mut self) -> &mut HashSet<String> {
+        self.revoked_spending_ucan_cids
+    }
+
+    /// `&mut` access to the per-member governance proposal timestamps (§9.3
+    /// earned-capacity rate limiting). Class-C structural rate-limit state.
+    pub(crate) const fn proposal_timestamps_mut(&mut self) -> &mut HashMap<String, Vec<u64>> {
+        self.proposal_timestamps
     }
 
     /// Reborrow this view into a shorter-lived [`GovernanceClassCMut`] over the
@@ -460,7 +745,25 @@ impl<'a> GovernanceClassCMut<'a> {
             budget_tracker: &mut *self.budget_tracker,
             cooldown_until: &mut *self.cooldown_until,
             economic_policy: &mut *self.economic_policy,
-            next_proposal_seq: self.next_proposal_seq,
+            engine: &mut *self.engine,
+            approved_proposals: &mut *self.approved_proposals,
+            next_proposal_seq: &mut *self.next_proposal_seq,
+            freeze: &mut *self.freeze,
+            timeout_task: &mut *self.timeout_task,
+            deadlock: &mut *self.deadlock,
+            pending_ceiling_modification: &mut *self.pending_ceiling_modification,
+            pending_economic_policy_change: &mut *self.pending_economic_policy_change,
+            registered_tools: &mut *self.registered_tools,
+            tool_interfaces: &mut *self.tool_interfaces,
+            pruning_policy: &mut *self.pruning_policy,
+            last_known_members: &mut *self.last_known_members,
+            pending_epoch_resets: &mut *self.pending_epoch_resets,
+            consequence_rules: &mut *self.consequence_rules,
+            participation_cache: &mut *self.participation_cache,
+            message_pricing: &mut *self.message_pricing,
+            hard_rate_limit: &mut *self.hard_rate_limit,
+            revoked_spending_ucan_cids: &mut *self.revoked_spending_ucan_cids,
+            proposal_timestamps: &mut *self.proposal_timestamps,
         }
     }
 }
@@ -498,7 +801,7 @@ pub(crate) struct ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -514,16 +817,45 @@ impl<'a> ClassCMut<'a> {
     const fn new(state: &'a mut PerContextState) -> Self {
         // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above). When
         // adding a field here: any field that is, or transitively contains, a
-        // Class-S sub-struct (`ClassSState` / `GovernanceClassS`) MUST be left to
-        // the `..` rest, bound a shared `&`, or wrapped in a sub-view — NEVER
-        // `&mut`. Today: `class_s` and `membership` are shared `&`, and `governance`
-        // is wrapped in `GovernanceClassCMut` (its own `class_s` falls into that
-        // sub-view's `..` rest).
+        // Class-S sub-struct (`ClassSState` / `GovernanceClassS`) MUST be bound a
+        // shared `&` (coerced at the `Self { .. }` init), or wrapped in a sub-view
+        // — NEVER handed out `&mut`. Today: `class_s` and `membership` are bound
+        // and stored as shared `&` (the `Self` fields are `&'a …`, so the `&mut`
+        // ergonomic binding reborrows down to `&`), and `governance` is wrapped in
+        // `GovernanceClassCMut` (its own `class_s` falls into that sub-view's `..`
+        // rest). Every other field is a Class-C / structural `&mut`.
         let PerContextState {
             members,
             receive_buffer,
             role_state,
             checkpoint_events_since,
+            context_id,
+            created_at,
+            creation_timestamp_secs,
+            generation,
+            handle,
+            event_log,
+            payment_receipts,
+            broadcast_context,
+            migration_state,
+            epoch,
+            access,
+            ttl,
+            routing,
+            sequence_tracker,
+            reorder_buffer,
+            pending_commits,
+            commit_fault,
+            checkpoint_last_time_secs,
+            checkpoints,
+            last_seen_remote_checkpoint,
+            send_tracker,
+            recv_tracker,
+            xctx_ucan_proofs,
+            pending_broadcast_publishes,
+            welcome_scratchpad,
+            lifecycle_state,
+            mode,
             membership,
             class_s,
             governance,
@@ -534,6 +866,33 @@ impl<'a> ClassCMut<'a> {
             receive_buffer,
             role_state,
             checkpoint_events_since,
+            context_id,
+            created_at,
+            creation_timestamp_secs,
+            generation,
+            handle,
+            event_log,
+            payment_receipts,
+            broadcast_context,
+            migration_state,
+            epoch,
+            access,
+            ttl,
+            routing,
+            sequence_tracker,
+            reorder_buffer,
+            pending_commits,
+            commit_fault,
+            checkpoint_last_time_secs,
+            checkpoints,
+            last_seen_remote_checkpoint,
+            send_tracker,
+            recv_tracker,
+            xctx_ucan_proofs,
+            pending_broadcast_publishes,
+            welcome_scratchpad,
+            lifecycle_state,
+            mode,
             membership,
             class_s,
             governance: GovernanceClassCMut::new(governance),
@@ -567,6 +926,187 @@ impl<'a> ClassCMut<'a> {
     /// structural). Safe to hand out directly: it contains no Class-S sub-struct.
     pub(crate) const fn role_state_mut(&mut self) -> &mut ContextRoleState {
         self.role_state
+    }
+
+    /// `&mut` access to the events-since-last-checkpoint counter (Class-C /
+    /// §9.9.3). Bumped by consequence/checkpoint enforcement; best-effort
+    /// rollback acceptable.
+    pub(crate) const fn checkpoint_events_since_mut(&mut self) -> &mut u64 {
+        self.checkpoint_events_since
+    }
+
+    /// `&mut` access to the deterministic context id (Class-C / structural
+    /// identity). Stable for the actor's lifetime; exposed for parity completeness.
+    pub(crate) const fn context_id_mut(&mut self) -> &mut [u8; 32] {
+        self.context_id
+    }
+
+    /// `&mut` access to the local first-instantiation timestamp (Class-C /
+    /// structural). Best-effort rollback acceptable.
+    pub(crate) const fn created_at_mut(&mut self) -> &mut u64 {
+        self.created_at
+    }
+
+    /// `&mut` access to the convergent creator-assigned creation timestamp
+    /// (Class-C / structural, §7.3.1). Best-effort rollback acceptable.
+    pub(crate) const fn creation_timestamp_secs_mut(&mut self) -> &mut u64 {
+        self.creation_timestamp_secs
+    }
+
+    /// `&mut` access to the monotonic generation counter (Class-C / structural).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn generation_mut(&mut self) -> &mut u64 {
+        self.generation
+    }
+
+    /// `&mut` access to the full-fat context handle (creation params + lifecycle
+    /// FSM) (Class-C / structural). Best-effort rollback acceptable.
+    pub(crate) const fn handle_mut(&mut self) -> &mut ContextHandle {
+        self.handle
+    }
+
+    /// `&mut` access to the optional RFC-6962 Merkle event log (Class-C /
+    /// structural). Best-effort rollback acceptable; the durable leaf sequence is
+    /// the event-log adapter's own concern.
+    pub(crate) const fn event_log_mut(&mut self) -> &mut Option<ContextEventLog> {
+        self.event_log
+    }
+
+    /// `&mut` access to the bounded payment-receipt ring buffer (Class-C /
+    /// §19.11). A per-member in-memory sliding window, not the durable ledger —
+    /// best-effort rollback acceptable.
+    pub(crate) const fn payment_receipts_mut(&mut self) -> &mut VecDeque<PaymentReceipt> {
+        self.payment_receipts
+    }
+
+    /// `&mut` access to the optional broadcast-mode metadata (Class-C / §5.14).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn broadcast_context_mut(&mut self) -> &mut Option<ProtocolBroadcastContext> {
+        self.broadcast_context
+    }
+
+    /// `&mut` access to the optional active migration state (Class-C / §5.11A).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn migration_state_mut(&mut self) -> &mut Option<MigrationState> {
+        self.migration_state
+    }
+
+    /// `&mut` access to the MLS epoch + reconnection state (Class-C / §5.9,
+    /// §23.11). Best-effort rollback acceptable.
+    pub(crate) const fn epoch_mut(&mut self) -> &mut EpochState {
+        self.epoch
+    }
+
+    /// `&mut` access to the access-control / CEK-wrapping exclusion state
+    /// (Class-C / ADR-038, §9.17). Best-effort rollback acceptable.
+    pub(crate) const fn access_mut(&mut self) -> &mut AccessControlState {
+        self.access
+    }
+
+    /// `&mut` access to the TTL timer + extension state (Class-C / SCP-021).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn ttl_mut(&mut self) -> &mut TtlState {
+        self.ttl
+    }
+
+    /// `&mut` access to the per-context routing strategy (Class-C / §9.10.4,
+    /// §5.14). Best-effort rollback acceptable.
+    pub(crate) const fn routing_mut(&mut self) -> &mut ContextRouting {
+        self.routing
+    }
+
+    /// `&mut` access to the per-sender anti-replay sequence tracker (Class-C /
+    /// §9.8.2). The Class-S replay witnesses live in `class_s` /
+    /// `governance.class_s`; this structural high-water tracker is best-effort.
+    pub(crate) const fn sequence_tracker_mut(&mut self) -> &mut SequenceTracker {
+        self.sequence_tracker
+    }
+
+    /// `&mut` access to the per-sender reorder buffer (Class-C / §9.8.5).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn reorder_buffer_mut(&mut self) -> &mut ReorderBuffer {
+        self.reorder_buffer
+    }
+
+    /// `&mut` access to the MLS Commit retry queue (Class-C / §9.9.3).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn pending_commits_mut(&mut self) -> &mut VecDeque<PendingCommit> {
+        self.pending_commits
+    }
+
+    /// `&mut` access to the commit-fault fail-close marker (Class-C / structural).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn commit_fault_mut(&mut self) -> &mut Option<CommitFaultMarker> {
+        self.commit_fault
+    }
+
+    /// `&mut` access to the last-checkpoint timestamp (Class-C / §9.9.3).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn checkpoint_last_time_secs_mut(&mut self) -> &mut u64 {
+        self.checkpoint_last_time_secs
+    }
+
+    /// `&mut` access to the locally generated consistency checkpoints (Class-C /
+    /// §9.9.3). Best-effort rollback acceptable.
+    pub(crate) const fn checkpoints_mut(&mut self) -> &mut Vec<ConsistencyCheckpoint> {
+        self.checkpoints
+    }
+
+    /// `&mut` access to the per-sender remote-checkpoint divergence dedup set
+    /// (Class-C / §9.9.3). Receiver-minted equivocation evidence, not a
+    /// sender-authenticated replay witness — best-effort (at most one bounded
+    /// duplicate alert on coalesce-window rollback).
+    pub(crate) const fn last_seen_remote_checkpoint_mut(
+        &mut self,
+    ) -> &mut HashMap<DID, HashSet<(u64, [u8; 32])>> {
+        self.last_seen_remote_checkpoint
+    }
+
+    /// `&mut` access to the send-sequence counter with RAII rollback (Class-C).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn send_tracker_mut(&mut self) -> &mut SendSequenceTracker {
+        self.send_tracker
+    }
+
+    /// `&mut` access to the per-sender receive-sequence high-water marks
+    /// (Class-C). Best-effort rollback acceptable.
+    pub(crate) const fn recv_tracker_mut(&mut self) -> &mut RecvSequenceTracker {
+        self.recv_tracker
+    }
+
+    /// `&mut` access to the reconstructable cross-context UCAN proof store
+    /// (Class-C / §6.2.4). Interface state repopulated when the tool interface is
+    /// re-established — explicitly NOT the Class-S freshness/replay witness
+    /// (`class_s.xctx_nonce_dedup`), so best-effort rollback is acceptable.
+    pub(crate) const fn xctx_ucan_proofs_mut(&mut self) -> &mut InMemoryProofResolver {
+        self.xctx_ucan_proofs
+    }
+
+    /// `&mut` access to the in-flight broadcast-publish reservations (Class-C).
+    /// Best-effort rollback acceptable; an unapplied reservation rolls its
+    /// sequence back by design.
+    pub(crate) const fn pending_broadcast_publishes_mut(
+        &mut self,
+    ) -> &mut HashMap<BroadcastReservationId, PendingBroadcastPublish> {
+        self.pending_broadcast_publishes
+    }
+
+    /// `&mut` access to the multi-step Welcome scratchpad (Class-C / structural).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn welcome_scratchpad_mut(&mut self) -> &mut Option<WelcomeProcessing> {
+        self.welcome_scratchpad
+    }
+
+    /// `&mut` access to the actor-internal lifecycle state (Class-C / structural).
+    /// Best-effort rollback acceptable.
+    pub(crate) const fn lifecycle_state_mut(&mut self) -> &mut ContextLifecycleState {
+        self.lifecycle_state
+    }
+
+    /// `&mut` access to the mode-specific state (Class-C / structural). Best-effort
+    /// rollback acceptable.
+    pub(crate) const fn mode_mut(&mut self) -> &mut ContextModeState {
+        self.mode
     }
 
     /// READ-ONLY access to the Class-S [`ClassSState`] sub-struct. Field-granular
