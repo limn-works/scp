@@ -2710,7 +2710,8 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
 // Bridge functions — governance (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_execute_governance_action`].
+/// Per-bridge-instance implementation of
+/// `Scp::context_execute_governance_action`.
 ///
 /// Executes a previously-approved governance proposal BY ID. The runtime
 /// resolves the authoritative proposal from the context actor's own
@@ -2719,18 +2720,18 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
 /// previous implementation minted a fresh random id and fabricated a fully
 /// `Approved` proposal from a caller-supplied action, executing it with no
 /// engine involvement.
+///
+/// The surface takes only `(handle, proposal_id_hex)`: the executor (the
+/// `GovernanceActionExecuted` leaf `actor_did`) and the consequence subject are
+/// both resolved from the tracked proposal's proposer inside the runtime, never
+/// from a caller-supplied DID.
 pub(crate) async fn context_execute_governance_action_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
-    identity_did: String,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    // `identity_did` is accepted for API symmetry with propose/approve; execute
-    // attribution is resolved from the tracked proposal's proposer inside the
-    // runtime, so it is not threaded into the payload.
-    let _ = &identity_did;
     let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.

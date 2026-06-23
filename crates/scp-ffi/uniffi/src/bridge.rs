@@ -9500,7 +9500,6 @@ impl Scp {
     pub async fn governance_execute(
         &self,
         handle: Arc<ContextHandle>,
-        identity_did: String,
         proposal_id_hex: String,
     ) -> Result<String, ScpError> {
         self.inner
@@ -9508,11 +9507,6 @@ impl Scp {
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
-        // `identity_did` is validated/accepted for API symmetry with
-        // propose/approve; execute attribution is resolved from the tracked
-        // proposal's proposer inside the runtime, so it is not threaded into the
-        // payload.
-        let _ = &identity_did;
         let proposal_id_log = hex::encode(proposal_id);
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();

@@ -2413,22 +2413,19 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `context_execute_governance_action`.
+    /// Executes a previously-approved governance proposal BY ID. Takes only
+    /// `(handle, proposalIdHex)`: the executor and consequence subject are
+    /// resolved from the tracked proposal's proposer inside the runtime, never
+    /// from a caller-supplied DID.
     #[napi(js_name = "contextExecuteGovernanceAction")]
     pub async fn context_execute_governance_action(
         &self,
         handle: &NapiContextHandle,
-        identity_did: String,
         proposal_id_hex: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::context::context_execute_governance_action_on(
-            &self.inner,
-            handle,
-            identity_did,
-            proposal_id_hex,
-        )
-        .await
+        crate::context::context_execute_governance_action_on(&self.inner, handle, proposal_id_hex)
+            .await
     }
 
     /// Per-instance equivalent of the free-function `context_governance_propose`.

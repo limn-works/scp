@@ -3015,8 +3015,6 @@ impl crate::scp::PyScp {
     /// # Arguments
     ///
     /// * `handle` -- The context handle.
-    /// * `identity_did` -- DID of the authenticated caller requesting
-    ///   execution (the executor for the capability check).
     /// * `proposal_id_hex` -- Hex-encoded 32-byte id of the approved proposal.
     ///
     /// # Returns
@@ -3029,16 +3027,14 @@ impl crate::scp::PyScp {
     /// proposal id is malformed or not tracked/approved, or execution fails.
     // FFI orchestration: validate + dispatch + map; grew at the origin/main actor merge
     #[allow(clippy::too_many_lines)]
-    #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
+    #[pyo3(signature = (handle, proposal_id_hex))]
     pub fn governance_execute(
         &self,
         handle: &PyContextHandle,
-        identity_did: &str,
         proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        validate::validate_did(identity_did)?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

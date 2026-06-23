@@ -956,9 +956,12 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
 #[test]
 fn wasm_execute_governance_action_resolves_action_from_tracked_proposal() {
     // The WASM bridge entry (`context_execute_governance`) takes no caller
-    // action: the public `#[wasm_bindgen]` surface carries only
-    // (identity_did, proposal_id_hex). No `action_json` parameter exists for a
-    // caller to populate, so action substitution is structurally impossible.
+    // action and no caller identity/subject: the public `#[wasm_bindgen]`
+    // surface carries ONLY (handle, proposal_id_hex). No `action_json` parameter
+    // exists for a caller to populate (action substitution is structurally
+    // impossible), and no `identity_did` parameter exists for a caller to supply
+    // a consequence subject / executor — both are resolved from the tracked
+    // proposal's proposer inside the manager.
     let wasm_ctx_src: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
     let entry_sig = extract_fn_signature(wasm_ctx_src, "context_execute_governance")
         .expect("WASM context_execute_governance signature must exist");
@@ -966,6 +969,12 @@ fn wasm_execute_governance_action_resolves_action_from_tracked_proposal() {
         !entry_sig.contains("action_json"),
         "WASM context_execute_governance must NOT take an action_json parameter — \
          a caller cannot supply an action to substitute; signature was: {entry_sig}"
+    );
+    assert!(
+        !entry_sig.contains("identity_did"),
+        "WASM context_execute_governance must NOT take an identity_did parameter — \
+         the executor and consequence subject are resolved from the tracked \
+         proposal's proposer, never a caller-supplied DID; signature was: {entry_sig}"
     );
     assert!(
         entry_sig.contains("proposal_id_hex"),

@@ -53,6 +53,41 @@ use scp_protocol::crypto::ucan::validate::{
 use scp_protocol::economy::policy::policy_requires_payment;
 use scp_protocol::economy::types::EconomicPolicy;
 
+/// Strictly parses a hex-encoded governance proposal id into the canonical
+/// 32-byte array.
+///
+/// This is the manager-level equivalent of the native bridges'
+/// `hex::decode(...)` + `try_into::<[u8; 32]>()` parse: it rejects non-hex
+/// input and any length other than exactly 32 bytes. It replaces the former
+/// `hex::decode(...).unwrap_or_default()` + truncate/zero-pad code, which
+/// silently widened a short id (or an empty decode from non-hex input) into a
+/// well-formed-looking all-zero / right-padded id — a divergence from native
+/// that could mint a `GovernanceActionExecuted` leaf whose `proposal_id`
+/// differs across platforms. The WASM bridge boundary
+/// (`validate_proposal_id_hex`) already rejects malformed ids before reaching
+/// the manager; this parse is the defense-in-depth equal of the native parse
+/// for any in-crate caller, and fails loudly rather than fabricating bytes.
+///
+/// # Errors
+///
+/// Returns [`ScpWasmError::Validation`] (via the shared
+/// `validate_proposal_id_hex`) if `proposal_id` is not valid hex or does not
+/// decode to exactly 32 bytes.
+fn parse_proposal_id_bytes(proposal_id: &str) -> Result<[u8; 32], ScpWasmError> {
+    scp_ffi_common::validate::validate_proposal_id_hex(proposal_id)?;
+    // `validate_proposal_id_hex` guarantees clean hex decoding to exactly 32
+    // bytes, so neither `hex::decode` nor `try_into` can fail here; map both to
+    // a Validation error rather than panicking to keep the path total.
+    let bytes = hex::decode(proposal_id).map_err(|e| ScpWasmError::Validation {
+        message: format!("proposal id is not valid hex: {e}"),
+        code: codes::VALID_7000.to_owned(),
+    })?;
+    bytes.try_into().map_err(|_| ScpWasmError::Validation {
+        message: "proposal id must decode to exactly 32 bytes".to_owned(),
+        code: codes::VALID_7000.to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // No-op UCAN validation trait impls for BroadcastContext::subscribe turbofish
 // ---------------------------------------------------------------------------
@@ -3146,13 +3181,11 @@ impl WasmContextManager {
             // proposal-derived value (`finalize_governance_action`); never
             // local `now()` (§7.3.1, §9.9.3).
             let action_summary = action.variant_name().to_owned();
-            let proposal_id_bytes: [u8; 32] = {
-                let bytes = hex::decode(proposal_id).unwrap_or_default();
-                let mut arr = [0u8; 32];
-                let len = bytes.len().min(32);
-                arr[..len].copy_from_slice(&bytes[..len]);
-                arr
-            };
+            // Strict parse: reject non-hex / non-32-byte ids loudly instead of
+            // silently zero-padding (matches the native bridges' parse and the
+            // WASM bridge boundary). A divergent `proposal_id` here would break
+            // cross-platform Merkle equivocation detection.
+            let proposal_id_bytes: [u8; 32] = parse_proposal_id_bytes(proposal_id)?;
             let target_did: Option<DID> = action.target_did().cloned();
 
             // Encode the durable leaf payload FIRST, before any buffer event is
@@ -4219,14 +4252,12 @@ impl WasmContextManager {
         let now_secs = (now / 1000.0) as u64;
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let voting_deadline_secs = ((now + WASM_PROPOSAL_DEADLINE_MS) / 1000.0) as u64;
-        // Compute proposal_id as [u8; 32] from the hex string.
-        let proposal_id_bytes: [u8; 32] = {
-            let bytes = hex::decode(proposal_id).unwrap_or_default();
-            let mut arr = [0u8; 32];
-            let len = bytes.len().min(32);
-            arr[..len].copy_from_slice(&bytes[..len]);
-            arr
-        };
+        // Compute proposal_id as [u8; 32] from the hex string. Strict parse:
+        // reject non-hex / non-32-byte ids loudly instead of silently
+        // zero-padding (matches the native bridges' parse and the WASM bridge
+        // boundary). A divergent `proposal_id` here would break cross-platform
+        // Merkle equivocation detection.
+        let proposal_id_bytes: [u8; 32] = parse_proposal_id_bytes(proposal_id)?;
         let proposal = GovernanceProposal {
             proposal_id: proposal_id_bytes,
             context_id: context_id.to_owned(),
@@ -8904,6 +8935,94 @@ mod tests {
         assert!(
             mgr.contexts[context_id].economic_policy.is_none(),
             "rejected SetEconomicPolicy must not mutate stored policy"
+        );
+    }
+
+    /// `propose_governance_action` REJECTS a caller-supplied `proposal_id` that
+    /// is not strict 32-byte hex, instead of silently truncating / zero-padding
+    /// it into a well-formed-looking `[u8; 32]`. A short / non-hex id reaching
+    /// the `[u8; 32]` parse would have been widened by the former
+    /// `hex::decode(...).unwrap_or_default()` path, producing a `proposal_id`
+    /// that diverges from the native bridges' strict `hex::decode` +
+    /// `try_into::<[u8; 32]>` parse — breaking cross-platform Merkle
+    /// equivocation detection. The proposer is granted `governance:propose`
+    /// (admin role + ceiling) so the rejection happens at the proposal-id parse,
+    /// NOT at the capability gate, and nothing is tracked.
+    #[test]
+    fn test_wasm_propose_rejects_malformed_proposal_id() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let context_id = "ctx-malformed-pid";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        // Admin capabilities are intersected with the ceiling, so grant
+        // `governance:propose` in the ceiling to reach the proposal-id parse.
+        state
+            .ceiling_strings
+            .insert("governance:propose".to_owned());
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        let action = GovernanceAction::ChangeRole {
+            did: DID("did:dht:ztarget".to_owned()),
+            new_role: "moderator".to_owned(),
+        };
+
+        // 4-byte hex — exactly the value the old unwrap_or_default + zero-pad
+        // path would have silently widened to 32 bytes.
+        let err = mgr
+            .propose_governance_action(context_id, creator, "deadbeef", &action)
+            .expect_err("a 4-byte proposal id must be rejected, not zero-padded");
+        match err {
+            ScpWasmError::Validation { ref message, .. } => {
+                assert!(
+                    message.contains("32 bytes"),
+                    "rejection should name the 32-byte requirement, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+
+        // Non-hex input must also be rejected (would decode to 0 bytes and the
+        // old path would have produced an all-zero id).
+        assert!(
+            mgr.propose_governance_action(context_id, creator, "zz", &action)
+                .is_err(),
+            "non-hex proposal id must be rejected"
+        );
+
+        // Defense-in-depth: a rejected proposal id leaves NOTHING tracked.
+        let ctx = &mgr.contexts[context_id];
+        assert!(
+            ctx.pending_proposals.is_empty() && ctx.resolved_proposals.is_empty(),
+            "a rejected proposal id must not insert any tracked proposal"
+        );
+    }
+
+    /// `parse_proposal_id_bytes` is the shared strict parse both
+    /// `propose_governance_action` and `execute_governance_action` use. It
+    /// accepts exactly-32-byte hex and rejects everything else, matching the
+    /// native bridges' `hex::decode` + `try_into::<[u8; 32]>`.
+    #[test]
+    fn test_parse_proposal_id_bytes_strict() {
+        let valid = "a".repeat(64);
+        let parsed = parse_proposal_id_bytes(&valid).expect("64-char hex must parse");
+        assert_eq!(parsed, [0xaa_u8; 32]);
+
+        assert!(
+            parse_proposal_id_bytes("deadbeef").is_err(),
+            "short hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes(&"a".repeat(66)).is_err(),
+            "over-length hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes("zz").is_err(),
+            "non-hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes("").is_err(),
+            "empty input must be rejected"
         );
     }
 

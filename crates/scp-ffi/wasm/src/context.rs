@@ -13,7 +13,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use scp_ffi_common::html_escape_json;
-use scp_ffi_common::validate::validate_did;
+use scp_ffi_common::validate::{validate_did, validate_proposal_id_hex};
 use scp_protocol::context::params::TemplateId;
 use scp_protocol::context::templates::{
     template_params as protocol_template_params,
@@ -715,24 +715,28 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// context ceiling — NOT on the caller's role. This mirrors the native runtime
 /// exactly (§9.9.3 native↔WASM convergence).
 ///
+/// The execute surface takes ONLY `(handle, proposal_id_hex)`. There is no
+/// caller-supplied identity/subject parameter: both the executor (the
+/// `GovernanceActionExecuted` leaf `actor_did`) AND the consequence-evaluation
+/// subject are resolved from the TRACKED proposal's `proposer_did`, never from
+/// a caller param — byte-identical to the native direct-execute path, which
+/// resolves the executor from `proposal.proposer_did` and dispatches
+/// consequences for that same proposer (ADR-031 §8 "executor DID" / spec
+/// §7.3.1). Threading a caller DID here was a divergent shape (validated on
+/// some bridges, load-bearing only here) with no authorization role.
+///
 /// # Arguments
 ///
 /// * `handle` — The context handle.
-/// * `identity_did` — DID of the authenticated caller requesting execution
-///   (the executor stamped on the `GovernanceActionExecuted` leaf, matching the
-///   native direct-execute handler which uses the payload executor DID).
-/// * `proposal_id_hex` — Hex-encoded id of the approved, tracked proposal.
+/// * `proposal_id_hex` — Hex-encoded 32-byte id of the approved, tracked
+///   proposal. Rejected at the boundary if not valid 32-byte hex.
 ///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to a JSON result of the governance action.
 #[wasm_bindgen]
-pub fn context_execute_governance(
-    handle: &WasmContextHandle,
-    identity_did: String,
-    proposal_id_hex: String,
-) -> Promise {
-    if let Err(e) = validate_did(&identity_did) {
+pub fn context_execute_governance(handle: &WasmContextHandle, proposal_id_hex: String) -> Promise {
+    if let Err(e) = validate_proposal_id_hex(&proposal_id_hex) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
@@ -740,18 +744,19 @@ pub fn context_execute_governance(
     future_to_promise(async move {
         let result = with_manager(|mgr| {
             // Direct-execute by id: the manager looks up the tracked proposal
-            // and dispatches ITS action. The executor (and the
-            // `GovernanceActionExecuted` leaf actor_did) is the TRACKED
-            // proposal's PROPOSER — never a caller-supplied DID — byte-identical
-            // to the native direct-execute path, which resolves the executor
-            // from `proposal.proposer_did` inside `execute_governance_action`
-            // (§9.9.3 native↔WASM convergence; ADR-031 §8 "executor DID").
-            // `identity_did` is the authenticated caller / consequence subject.
-            let executor_did = mgr.proposal_proposer_did(&context_id, &proposal_id_hex)?;
+            // and dispatches ITS action. The executor (the
+            // `GovernanceActionExecuted` leaf actor_did) AND the consequence
+            // subject are both the TRACKED proposal's PROPOSER — never a
+            // caller-supplied DID — byte-identical to the native direct-execute
+            // path, which resolves the executor from `proposal.proposer_did`
+            // inside `execute_governance_action` and dispatches consequences for
+            // that same proposer (§9.9.3 native↔WASM convergence; ADR-031 §8
+            // "executor DID").
+            let proposer_did = mgr.proposal_proposer_did(&context_id, &proposal_id_hex)?;
             mgr.execute_governance_action(
                 &context_id,
-                &identity_did,
-                &executor_did,
+                &proposer_did,
+                &proposer_did,
                 &proposal_id_hex,
             )
         })
@@ -798,6 +803,9 @@ pub fn context_governance_propose(
     action_json: String,
 ) -> Promise {
     if let Err(e) = validate_did(&proposer_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_proposal_id_hex(&proposal_id) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
@@ -874,6 +882,9 @@ pub fn context_governance_approve(
     if let Err(e) = validate_did(&voter_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
+    if let Err(e) = validate_proposal_id_hex(&proposal_id) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -914,6 +925,9 @@ pub fn context_governance_reject(
     voter_did: String,
 ) -> Promise {
     if let Err(e) = validate_did(&voter_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_proposal_id_hex(&proposal_id) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
@@ -958,6 +972,9 @@ pub fn context_governance_withdraw(
     if let Err(e) = validate_did(&voter_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
+    if let Err(e) = validate_proposal_id_hex(&proposal_id) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -990,6 +1007,9 @@ pub fn context_governance_withdraw(
 /// `Promise<string>` — JSON with proposal details.
 #[wasm_bindgen]
 pub fn context_governance_get_proposal(handle: &WasmContextHandle, proposal_id: String) -> Promise {
+    if let Err(e) = validate_proposal_id_hex(&proposal_id) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -3056,6 +3076,70 @@ pub fn validate_context_params(params_json: String) -> Result<Option<String>, Js
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
+
+    // -----------------------------------------------------------------------
+    // Strict caller-supplied proposal_id hex validation (governance bridge
+    // boundary). The execute/propose/approve/reject/withdraw/get-proposal
+    // bridge functions call `validate_proposal_id_hex` before touching the
+    // manager, so a malformed/short/non-hex id is rejected at the boundary
+    // instead of being silently truncated or zero-padded into a well-formed
+    // [u8; 32]. This matches the native bridges' `hex::decode` +
+    // `try_into::<[u8; 32]>` parse.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn proposal_id_hex_accepts_exactly_32_bytes() {
+        let valid = "a".repeat(64);
+        assert!(validate_proposal_id_hex(&valid).is_ok());
+    }
+
+    #[test]
+    fn proposal_id_hex_rejects_short_hex() {
+        // 4 bytes — the kind of value the old unwrap_or_default + zero-pad
+        // path would have silently widened to 32 bytes.
+        let msg = match validate_proposal_id_hex("deadbeef") {
+            Ok(()) => String::from("<accepted>"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("32 bytes"),
+            "an 8-char (4-byte) proposal id must be rejected naming the \
+             32-byte requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn proposal_id_hex_rejects_long_hex() {
+        let too_long = "a".repeat(66);
+        assert!(
+            validate_proposal_id_hex(&too_long).is_err(),
+            "a 33-byte proposal id must be rejected"
+        );
+    }
+
+    #[test]
+    fn proposal_id_hex_rejects_non_hex() {
+        // Non-hex characters must be rejected rather than producing an empty
+        // decode that the old path zero-padded into an all-zero id.
+        assert!(
+            validate_proposal_id_hex("zz").is_err(),
+            "non-hex input must be rejected"
+        );
+        assert!(
+            validate_proposal_id_hex("").is_err(),
+            "empty input must be rejected (decodes to 0 bytes, not 32)"
+        );
+    }
+
+    #[test]
+    fn proposal_id_hex_rejects_odd_length() {
+        // Odd-length hex cannot decode to whole bytes.
+        let odd = "a".repeat(63);
+        assert!(
+            validate_proposal_id_hex(&odd).is_err(),
+            "odd-length hex must be rejected"
+        );
+    }
 
     #[test]
     fn validate_min_protocol_version_absent() {

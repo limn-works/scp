@@ -663,14 +663,19 @@ async fn handle_execute_governance_action_actor(
     let context_id = payload.context_id.clone();
 
     let execute_fut = async move {
-        // Direct-execute command. The payload carries ONLY the proposal id and
-        // the authenticated executor DID — never a proposal, action, or status.
+        // Direct-execute command. The payload carries ONLY the proposal id —
+        // never a proposal, action, status, or caller DID.
         // `execute_governance_action` resolves the authoritative proposal from
         // the actor's own quorum-validated engine by id; a caller cannot
-        // fabricate an `Approved` proposal or substitute an action. The
-        // executor is the authenticated caller (capability check); leaf
-        // attribution stays on the tracked proposal's proposer (ADR-031 §8 /
-        // spec §7.3.1).
+        // fabricate an `Approved` proposal or substitute an action.
+        //
+        // There is NO executor capability check here: the proposal is already
+        // engine-`Approved` (quorum-verified at approve time), so execution is
+        // an unprivileged finalization step. Both the executor (the
+        // `GovernanceActionExecuted` leaf actor_did) and the consequence
+        // subject are resolved INSIDE `execute_governance_action` from the
+        // TRACKED proposal's proposer — never a caller-supplied DID (ADR-031 §8
+        // "executor DID" / spec §7.3.1).
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
                 state,
