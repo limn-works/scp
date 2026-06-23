@@ -20,12 +20,38 @@ import { ScpError, UcanPermissionError, ValidationError } from "../src/errors";
 import type { SCP } from "../src/scp";
 import {
   __classifyUcanError,
+  __extractCapabilityUri,
   __extractCoreError,
   __PASSED_BEFORE,
   type CapabilityValidation,
   evaluateTrust,
 } from "../src/trust";
 import { mountMockScp } from "./mock-bridge";
+
+// ---------------------------------------------------------------------------
+// Mock UCAN token construction
+// ---------------------------------------------------------------------------
+
+/**
+ * The capability URI declared by {@link makeMockToken}. `evaluateTrust` extracts
+ * `att[0].with` from the (unverified) JWT payload and passes it to
+ * `scp.ucanValidate`, so a mock token must carry a real `att` entry.
+ */
+const MOCK_CAP_URI = "scp:ctx:test-context/messages:write";
+
+/**
+ * Builds a minimally-valid UCAN JWT string: a `header.payload.signature`
+ * triple whose base64url payload declares one capability in `att[0].with`.
+ * The signature segment is a placeholder — the mock `ucanValidate` never
+ * verifies it; `evaluateTrust` only reads the payload to pick the URI.
+ */
+function makeMockToken(capUri: string = MOCK_CAP_URI): string {
+  const b64url = (obj: unknown): string =>
+    Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+  const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
+  const payload = b64url({ att: [{ with: capUri, can: "messages/write" }] });
+  return `${header}.${payload}.sig`;
+}
 
 // ---------------------------------------------------------------------------
 // __extractCoreError
@@ -52,6 +78,52 @@ describe("__extractCoreError", () => {
 
   it("passes a bare message through unchanged", () => {
     expect(__extractCoreError("token expired")).toBe("token expired");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// __extractCapabilityUri
+// ---------------------------------------------------------------------------
+
+describe("__extractCapabilityUri", () => {
+  const b64url = (obj: unknown): string =>
+    Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+
+  it("returns att[0].with from a valid JWT payload", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [{ with: "scp:ctx:c/messages:write" }],
+    })}.sig`;
+    expect(__extractCapabilityUri(token)).toBe("scp:ctx:c/messages:write");
+  });
+
+  it("returns the first capability when several are declared", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [{ with: "scp:ctx:c/a:read" }, { with: "scp:ctx:c/b:write" }],
+    })}.sig`;
+    expect(__extractCapabilityUri(token)).toBe("scp:ctx:c/a:read");
+  });
+
+  it("returns null for a token that is not a JWT triple", () => {
+    expect(__extractCapabilityUri("not-a-jwt")).toBeNull();
+  });
+
+  it("returns null when the payload is not valid base64url JSON", () => {
+    expect(__extractCapabilityUri("header.@@@notbase64@@@.sig")).toBeNull();
+  });
+
+  it("returns null when att is empty", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [] })}.sig`;
+    expect(__extractCapabilityUri(token)).toBeNull();
+  });
+
+  it("returns null when att is absent", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ iss: "did:dht:z" })}.sig`;
+    expect(__extractCapabilityUri(token)).toBeNull();
+  });
+
+  it("returns null when att[0].with is missing", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [{ can: "x" }] })}.sig`;
+    expect(__extractCapabilityUri(token)).toBeNull();
   });
 });
 
@@ -236,7 +308,7 @@ async function runLayer1(errorMsg: string): Promise<CapabilityValidation> {
   // No event-log history for this subject — Layer 2 is non-fatal.
   native.__stub("eventLogQuery", () => Promise.resolve([]));
 
-  const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+  const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [makeMockToken()]);
   return result.capabilityValidation;
 }
 
@@ -246,7 +318,7 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     native.__stub("ucanValidate", () => Promise.resolve(undefined));
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
-    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, ["good-token"]);
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [makeMockToken()]);
     const cv = result.capabilityValidation;
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
@@ -347,7 +419,10 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     });
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
-    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, ["token1", "token2"]);
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [
+      makeMockToken(),
+      makeMockToken(),
+    ]);
     const cv = result.capabilityValidation;
     // Stages that passed before the revocation failure.
     expect(cv.tokensValid).toBe(true);
@@ -381,6 +456,65 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(native.__calls("ucanValidate")).toHaveLength(0);
   });
 
+  it("malformed JWT token: all false, ucanValidate never called", async () => {
+    // A token that is not a `header.payload.signature` triple cannot have its
+    // capability extracted, so it is treated as invalid and never reaches the
+    // bridge. This is the fail-closed path for `"*"` no longer being passed.
+    const { scp, native, context } = mountWithContext();
+    native.__stub("ucanValidate", () => {
+      throw new Error("ucanValidate should not be called for a malformed token");
+    });
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, ["not-a-jwt"]);
+    const cv = result.capabilityValidation;
+    expect(cv.tokensValid).toBe(false);
+    expect(cv.signaturesValid).toBe(false);
+    expect(cv.withinCeiling).toBe(false);
+    expect(cv.nonceValid).toBe(false);
+    expect(cv.notRevoked).toBe(false);
+    expect(cv.timeBoundsValid).toBe(false);
+    expect(native.__calls("ucanValidate")).toHaveLength(0);
+  });
+
+  it("token with empty att: all false, ucanValidate never called", async () => {
+    // A structurally-valid JWT that declares no capabilities grants nothing,
+    // so there is no capability URI to validate against and the bridge is
+    // never called.
+    const { scp, native, context } = mountWithContext();
+    native.__stub("ucanValidate", () => {
+      throw new Error("ucanValidate should not be called when att is empty");
+    });
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    const emptyAttToken = `${Buffer.from(JSON.stringify({ alg: "EdDSA" }), "utf8").toString(
+      "base64url",
+    )}.${Buffer.from(JSON.stringify({ att: [] }), "utf8").toString("base64url")}.sig`;
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [emptyAttToken]);
+    const cv = result.capabilityValidation;
+    expect(cv.tokensValid).toBe(false);
+    expect(cv.signaturesValid).toBe(false);
+    expect(cv.withinCeiling).toBe(false);
+    expect(cv.nonceValid).toBe(false);
+    expect(cv.notRevoked).toBe(false);
+    expect(cv.timeBoundsValid).toBe(false);
+    expect(native.__calls("ucanValidate")).toHaveLength(0);
+  });
+
+  it("passes the token's declared capability URI to ucanValidate", async () => {
+    // Regression: `evaluateTrust` must validate the token against its own
+    // declared capability (`att[0].with`), never the bogus `"*"` literal that
+    // the bridge rejects with `InvalidCapabilityUri`.
+    const { scp, native, context } = mountWithContext();
+    native.__stub("ucanValidate", () => Promise.resolve(undefined));
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    await evaluateTrust(scp, "did:dht:z6MkBob", context, [makeMockToken()]);
+    const call = native.__lastCall("ucanValidate");
+    // args: (handle, token, capability, ...)
+    expect(call?.args[2]).toBe(MOCK_CAP_URI);
+  });
+
   it("non-UCAN error propagates (not silently classified)", async () => {
     const { scp, native, context } = mountWithContext();
     // Native bridge throws a plain Error whose message carries the
@@ -394,7 +528,7 @@ describe("evaluateTrust — Layer 1 field independence", () => {
 
     let threw = false;
     try {
-      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+      await evaluateTrust(scp, "did:dht:z6MkBob", context, [makeMockToken()]);
     } catch (err) {
       threw = true;
       expect(err).toBeInstanceOf(ValidationError);
@@ -417,7 +551,7 @@ describe("evaluateTrust — Layer 1 field independence", () => {
 
     let threw = false;
     try {
-      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+      await evaluateTrust(scp, "did:dht:z6MkBob", context, [makeMockToken()]);
     } catch (err) {
       threw = true;
       expect(err).toBeInstanceOf(UcanPermissionError);

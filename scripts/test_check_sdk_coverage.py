@@ -767,3 +767,50 @@ def test_aliases_enable_non_standard_symbol_names(tmp_path: Path) -> None:
         f"Expected 'no matching SDK symbol was found' in stdout.\n"
         f"stdout:\n{result_without.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Gate exits 1 on an empty/missing "capabilities" array (floor guard)
+#
+# An empty matrix produces total_ops=0 and errors=0. Without the floor guard
+# the gate would print PASS and exit 0 — silently disabling coverage
+# enforcement against a truncated or empty matrix. The guard must make this
+# fail-closed (exit 1).
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_empty_capabilities(tmp_path: Path) -> None:
+    """An empty 'capabilities' array must fail the gate, not pass it."""
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps({"capabilities": []}), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 on an empty matrix, got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "zero operations" in result.stderr, (
+        f"Expected the empty-matrix floor-guard message in stderr.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_missing_capabilities_key(tmp_path: Path) -> None:
+    """A matrix object lacking the 'capabilities' key must also fail closed."""
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps({}), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 on a matrix missing 'capabilities', "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "zero operations" in result.stderr, (
+        f"Expected the empty-matrix floor-guard message in stderr.\n"
+        f"stderr:\n{result.stderr}"
+    )

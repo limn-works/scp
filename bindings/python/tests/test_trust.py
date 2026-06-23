@@ -14,6 +14,8 @@ four-layer trust model.
 from __future__ import annotations
 
 import asyncio
+import base64 as _base64
+import json as _json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +38,30 @@ from scp_sdk.trust import (
     evaluate_trust,
     verify_participation_requirements,
 )
+
+#: Capability URI declared by :func:`_make_mock_token`. ``evaluate_trust``
+#: extracts ``att[0]["with"]`` from the (unverified) JWT payload and passes it
+#: to ``ucan_validate``, so a mock token must carry a real ``att`` entry.
+_MOCK_CAP_URI = "scp:ctx:test-context/messages:write"
+
+
+def _b64url(obj: dict[str, Any]) -> str:
+    raw = _json.dumps(obj).encode("utf-8")
+    return _base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _make_mock_token(cap_uri: str = _MOCK_CAP_URI) -> str:
+    """Build a minimally-valid UCAN JWT (``header.payload.signature``) whose
+    base64url payload declares one capability in ``att[0]["with"]``.
+
+    The signature segment is a placeholder -- the mocked ``ucan_validate``
+    never verifies it; ``evaluate_trust`` only reads the payload to pick the
+    capability URI to validate against.
+    """
+    header = _b64url({"alg": "EdDSA", "typ": "JWT", "ucv": "0.10.0"})
+    payload = _b64url({"att": [{"with": cap_uri, "can": "messages/write"}]})
+    return f"{header}.{payload}.sig"
+
 
 # -----------------------------------------------------------------------
 # Error extraction helper tests
@@ -320,7 +346,7 @@ class TestCapabilityValidationFieldIndependence:
                     scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
                     context_id="ctx-test",
-                    capability_tokens=["fake-token"],
+                    capability_tokens=[_make_mock_token()],
                 )
             )
         return result.capability_validation
@@ -336,7 +362,7 @@ class TestCapabilityValidationFieldIndependence:
                     scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
                     context_id="ctx-test",
-                    capability_tokens=["good-token"],
+                    capability_tokens=[_make_mock_token()],
                 )
             )
         cv = result.capability_validation
@@ -602,9 +628,84 @@ class TestCapabilityValidationFieldIndependence:
                         scp=MagicMock(),
                         subject_did="did:dht:z6MkBob",
                         context_id="ctx\x00bad",
-                        capability_tokens=["fake-token"],
+                        capability_tokens=[_make_mock_token()],
                     )
                 )
+
+    def test_malformed_jwt_token_all_false_bridge_not_called(self) -> None:
+        """A token that is not a header.payload.signature triple cannot have
+        its capability extracted, so it is treated as invalid and never reaches
+        the bridge. This is the fail-closed path for "*" no longer being passed.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["not-a-jwt"],
+                )
+            )
+        cv = result.capability_validation
+        assert cv.tokens_valid is False
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+        mock_bridge.ucan_validate.assert_not_called()
+
+    def test_empty_att_token_all_false_bridge_not_called(self) -> None:
+        """A structurally-valid JWT that declares no capabilities grants
+        nothing, so there is no capability URI to validate against and the
+        bridge is never called.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+
+        empty_att_token = f"{_b64url({'alg': 'EdDSA'})}.{_b64url({'att': []})}.sig"
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=[empty_att_token],
+                )
+            )
+        cv = result.capability_validation
+        assert cv.tokens_valid is False
+        assert cv.signatures_valid is False
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+        mock_bridge.ucan_validate.assert_not_called()
+
+    def test_declared_capability_uri_passed_to_bridge(self) -> None:
+        """evaluate_trust must validate the token against its own declared
+        capability (att[0]["with"]), never the bogus "*" literal that the
+        bridge rejects with InvalidCapabilityUri.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+        mock_bridge.ucan_validate.return_value = None
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=[_make_mock_token()],
+                )
+            )
+        # Positional args: (context_id, token, capability_uri)
+        call_args = mock_bridge.ucan_validate.call_args[0]
+        assert call_args[2] == _MOCK_CAP_URI
 
 
 # -----------------------------------------------------------------------

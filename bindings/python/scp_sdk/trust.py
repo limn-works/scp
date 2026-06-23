@@ -20,6 +20,7 @@ See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from dataclasses import dataclass, field
@@ -758,8 +759,40 @@ async def evaluate_trust(
         cap_validation.time_bounds_valid = True
 
         for token in capability_tokens:
+            # Extract the first declared capability from the (unverified) JWT
+            # payload so we can validate the token against its own capability.
+            # We use att[0]["with"] (the full scp:ctx:{id}/{resource}:{action}
+            # URI minted by the bridge) to drive the full 11-stage UCAN
+            # validation pipeline. Reading the unverified payload is safe
+            # because ucan_validate performs the cryptographic verification; we
+            # only use att to determine which URI to pass. "*" is NOT a valid
+            # CapabilityUri -- the bridge rejects it with InvalidCapabilityUri,
+            # which would make Layer 1 always all-False.
             try:
-                await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
+                parts = token.split(".")
+                if len(parts) < 2:
+                    raise ValueError("malformed JWT")
+                padding = 4 - len(parts[1]) % 4
+                payload_bytes = base64.urlsafe_b64decode(parts[1] + "=" * (padding % 4))
+                raw_payload = json.loads(payload_bytes)
+                att = raw_payload.get("att", [])
+                cap_uri = att[0].get("with", "") if att else ""
+            except Exception:  # any parse failure -> invalid/no-capability token
+                cap_uri = ""
+
+            if not cap_uri:
+                # Malformed token or no declared capabilities -- treat as
+                # invalid. Structurally the token grants nothing.
+                cap_validation.tokens_valid = False
+                cap_validation.signatures_valid = False
+                cap_validation.within_ceiling = False
+                cap_validation.nonce_valid = False
+                cap_validation.not_revoked = False
+                cap_validation.time_bounds_valid = False
+                break
+
+            try:
+                await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
             except bridge.UcanError as exc:
                 error_msg = str(exc)
                 # PERM-3030 is a caller-misuse error (handle belongs to a

@@ -1637,6 +1637,20 @@ def main() -> int:
                 all_exempted_ops += 1
                 errors += 1
 
+    # Floor guard: a coverage gate must never pass on an empty matrix. If the
+    # "capabilities" array is empty or missing, total_ops stays 0 and the loop
+    # above records no errors — without this guard a truncated/empty matrix
+    # would be reported as PASS, silently disabling the gate. This is a NEW
+    # assertion that expands coverage (it can only ADD a failure), never a
+    # bypass of an existing check.
+    if total_ops == 0:
+        print(
+            "FAIL: matrix produced zero operations — the 'capabilities' array is "
+            "empty or missing. A coverage gate cannot pass on an empty matrix.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Summary
     print()
     print("=" * 60)
