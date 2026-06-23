@@ -712,15 +712,19 @@ fn ingest_pseudonym_announcement(
 /// append. The `Some` branch remains so a future sender-authenticated received
 /// event can opt into a durable append without re-plumbing this helper.
 ///
-/// Returns `true` iff consequence enforcement performed a downward-authorization
-/// mutation (a `suspended_capabilities` GROW or an `AssignRole`
-/// `member_capabilities` replacement). The caller threads this up to the cell
-/// holder, which persists the mutated state fail-closed (ADR-049 §9, RED-CS3) —
-/// evaluation otherwise stays best-effort / coalesced.
+/// Arms `obligation` (the caller's `&mut Option<ClassSCommitToken>` sink) iff
+/// consequence enforcement performed a downward-authorization mutation (a
+/// `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+/// replacement) — the GROW methods do the arming, so it cannot be forgotten
+/// (ADR-049 §9, RED-CS3, GAP-A). The cell holder discharges the populated sink
+/// fail-closed after the borrowing view drops; evaluation otherwise stays
+/// best-effort / coalesced. The returned `bool` mirrors whether the sink was
+/// armed (retained as the RED-CS3b engine signal for callers that observe it).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
     view: &mut ClassCMut,
+    obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
@@ -807,6 +811,7 @@ pub fn run_buffered_post_delivery(
                 event_log,
                 event_tx,
             },
+            obligation,
         )
     };
 
@@ -2133,7 +2138,11 @@ pub fn finalize_send(
     // — a coalesce-window crash must not lose the mutation. Bound from the view
     // block below so the value is set exactly once, then folded into a token
     // obligation (free branch only) at the persist site.
-    let downward_auth_applied;
+    // The GROW methods arm this sink directly when a downward-auth mutation is
+    // applied (GAP-A: arming is coupled to the mutation, not a separate call). It
+    // is owned here at the cell boundary and reconciled with the send's nonce
+    // `token` below.
+    let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> = None;
     // Class-C field mutations run through the non-persisting view (coalesced —
     // the run loop persists on `mutated`); the view borrow ends (NLL) before the
     // cell-taking checkpoint-broadcast + fail-closed persist below.
@@ -2172,25 +2181,25 @@ pub fn finalize_send(
         );
         {
             let mut split = view.consequence_split();
-            // ADR-049 §9 (RED-CS3): the returned flag is `true` iff a downward-auth
-            // mutation was applied (a `suspended_capabilities` GROW or an
-            // `AssignRole` `member_capabilities` replacement). When set, the final
-            // persist below is upgraded to fail-closed so the mutation is durable
-            // before this send acks.
-            downward_auth_applied =
-                crate::context::governance_logic::enforce_triggered_consequences(
-                    &mut split,
-                    &crate::context::governance_logic::EnforceConsequencesCtx {
-                        context_id,
-                        member_did: sender_did,
-                        now,
-                        triggered: &send_triggered,
-                        rules: &consequence_rules,
-                        clock: &*deps.clock,
-                        event_log: &*deps.event_log,
-                        event_tx: deps.event_tx.as_ref(),
-                    },
-                );
+            // ADR-049 §9 (RED-CS3): a downward-auth mutation (a
+            // `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+            // replacement) ARMS `downward_auth_sink` via the GROW method itself.
+            // When armed, the final persist below is upgraded to fail-closed so the
+            // mutation is durable before this send acks.
+            let _ = crate::context::governance_logic::enforce_triggered_consequences(
+                &mut split,
+                &crate::context::governance_logic::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: sender_did,
+                    now,
+                    triggered: &send_triggered,
+                    rules: &consequence_rules,
+                    clock: &*deps.clock,
+                    event_log: &*deps.event_log,
+                    event_tx: deps.event_tx.as_ref(),
+                },
+                &mut downward_auth_sink,
+            );
         }
 
         // Participation record (#1530).
@@ -2209,16 +2218,23 @@ pub fn finalize_send(
     }
     create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now);
 
-    // Fold the downward-auth signal into a fail-closed-persist token obligation —
-    // but ONLY on the FREE branch (`token.is_none()`). On the PAID branch the
-    // nonce `token` already owes a fail-closed `commit` that covers the GROW, so a
-    // second token would force a redundant double-persist (and could not be
-    // discarded without tripping its Drop guard). Minting only when free keeps
-    // EXACTLY ONE owed persist on every branch (ADR-049 §9, RED-CS3).
-    let downward_auth_obligation = if downward_auth_applied && token.is_none() {
-        Some(crate::context::actor::class_s::ClassSCommitToken::for_downward_auth(context_id))
-    } else {
-        None
+    // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
+    // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
+    // RED-CS3):
+    // - FREE branch (`token.is_none()`): the armed sink token IS the obligation —
+    //   pass it straight through.
+    // - PAID branch (`token.is_some()`): the nonce `token` already owes a
+    //   fail-closed `commit` that covers the same GROW (one persist makes the whole
+    //   in-memory state durable). An armed sink token here is genuinely REDUNDANT;
+    //   it is subsumed by the nonce token (consuming it without a second persist).
+    let downward_auth_obligation = match (downward_auth_sink, token.is_some()) {
+        (Some(sink_token), false) => Some(sink_token),
+        (Some(sink_token), true) => {
+            // The nonce token's commit covers this GROW — subsume the redundant one.
+            sink_token.subsume(context_id);
+            None
+        }
+        (None, _) => None,
     };
 
     persist_finalized_send(
@@ -2808,25 +2824,24 @@ pub fn validate_and_drain_timeouts(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+            // The GROW arms `downward_auth_sink` directly (no separate
+            // `note_downward_auth` call to forget — GAP-A closed).
+            let _ = run_buffered_post_delivery(
+                view,
                 downward_auth_sink,
-                run_buffered_post_delivery(
-                    view,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    // Dormant: `event_name` here is always `None`
-                    // (`deliver_plaintext_or_announcement` never appends on
-                    // receive), so this committer-copied timestamp is not yet
-                    // consumed. Live only once cross-member leaf replication lands
-                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                    msg.inner.timestamp / 1000,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                ),
                 context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
             );
         }
     }
@@ -2906,25 +2921,24 @@ pub fn buffer_ahead_message(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+            // The GROW arms `downward_auth_sink` directly (no separate
+            // `note_downward_auth` call to forget — GAP-A closed).
+            let _ = run_buffered_post_delivery(
+                view,
                 downward_auth_sink,
-                run_buffered_post_delivery(
-                    view,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    // Dormant: `event_name` here is always `None`
-                    // (`deliver_plaintext_or_announcement` never appends on
-                    // receive), so this committer-copied timestamp is not yet
-                    // consumed. Live only once cross-member leaf replication lands
-                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                    msg.inner.timestamp / 1000,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                ),
                 context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
             );
         }
     }
@@ -3041,26 +3055,25 @@ pub fn deliver_message_and_drain_buffered(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                // The GROW arms `downward_auth_sink` directly (no separate
+                // `note_downward_auth` call to forget — GAP-A closed).
+                let _ = run_buffered_post_delivery(
+                    view,
                     downward_auth_sink,
-                    run_buffered_post_delivery(
-                        view,
-                        context_id,
-                        context_id_bytes,
-                        &msg.sender_did,
-                        event_name,
-                        // Dormant: `event_name` here is always `None`
-                        // (`deliver_plaintext_or_announcement` never appends on
-                        // receive), so this committer-copied timestamp is not yet
-                        // consumed. Live only once cross-member leaf replication
-                        // lands (ADR-051). See `run_buffered_post_delivery`'s param
-                        // doc.
-                        msg.inner.timestamp / 1000,
-                        &*deps.clock,
-                        &*deps.event_log,
-                        deps.event_tx.as_ref(),
-                    ),
                     context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication
+                    // lands (ADR-051). See `run_buffered_post_delivery`'s param
+                    // doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
                 );
             }
 
@@ -3091,22 +3104,20 @@ pub fn deliver_message_and_drain_buffered(
                 );
                 let recv_member_did = DID(sender_did.to_owned());
                 let mut split = view.consequence_split();
-                crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+                let _ = crate::context::governance_logic::enforce_triggered_consequences(
+                    &mut split,
+                    &crate::context::governance_logic::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: &recv_member_did,
+                        now,
+                        triggered: &recv_triggered,
+                        rules: &consequence_rules,
+                        clock: &*deps.clock,
+                        event_log: &*deps.event_log,
+                        event_tx: deps.event_tx.as_ref(),
+                    },
                     downward_auth_sink,
-                    crate::context::governance_logic::enforce_triggered_consequences(
-                        &mut split,
-                        &crate::context::governance_logic::EnforceConsequencesCtx {
-                            context_id,
-                            member_did: &recv_member_did,
-                            now,
-                            triggered: &recv_triggered,
-                            rules: &consequence_rules,
-                            clock: &*deps.clock,
-                            event_log: &*deps.event_log,
-                            event_tx: deps.event_tx.as_ref(),
-                        },
-                    ),
-                    context_id,
                 );
             }
             *view.checkpoint_events_since_mut() += 1;
@@ -3155,25 +3166,23 @@ pub fn deliver_message_and_drain_buffered(
             context_id,
             deps.event_tx.as_ref(),
         );
-        crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+        let _ = run_buffered_post_delivery(
+            view,
             downward_auth_sink,
-            run_buffered_post_delivery(
-                view,
-                context_id,
-                context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                // Dormant: `event_name` here is always `None`
-                // (`deliver_plaintext_or_announcement` never appends on receive),
-                // so this committer-copied timestamp is not yet consumed. Live only
-                // once cross-member leaf replication lands (ADR-051). See
-                // `run_buffered_post_delivery`'s param doc.
-                msg.inner.timestamp / 1000,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
-            ),
             context_id,
+            context_id_bytes,
+            &msg.sender_did,
+            event_name,
+            // Dormant: `event_name` here is always `None`
+            // (`deliver_plaintext_or_announcement` never appends on receive),
+            // so this committer-copied timestamp is not yet consumed. Live only
+            // once cross-member leaf replication lands (ADR-051). See
+            // `run_buffered_post_delivery`'s param doc.
+            msg.inner.timestamp / 1000,
+            &*deps.clock,
+            &*deps.event_log,
+            deps.event_tx.as_ref(),
         );
     }
 
@@ -3212,22 +3221,20 @@ pub fn deliver_message_and_drain_buffered(
         );
         let recv_member_did = DID(sender_did.to_owned());
         let mut split = view.consequence_split();
-        crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+        let _ = crate::context::governance_logic::enforce_triggered_consequences(
+            &mut split,
+            &crate::context::governance_logic::EnforceConsequencesCtx {
+                context_id,
+                member_did: &recv_member_did,
+                now,
+                triggered: &recv_triggered,
+                rules: &consequence_rules,
+                clock: &*deps.clock,
+                event_log: &*deps.event_log,
+                event_tx: deps.event_tx.as_ref(),
+            },
             downward_auth_sink,
-            crate::context::governance_logic::enforce_triggered_consequences(
-                &mut split,
-                &crate::context::governance_logic::EnforceConsequencesCtx {
-                    context_id,
-                    member_did: &recv_member_did,
-                    now,
-                    triggered: &recv_triggered,
-                    rules: &consequence_rules,
-                    clock: &*deps.clock,
-                    event_log: &*deps.event_log,
-                    event_tx: deps.event_tx.as_ref(),
-                },
-            ),
-            context_id,
         );
     }
 
@@ -3801,8 +3808,10 @@ mod pseudonym_routing_tests {
         // Post-delivery governance MUST run unconditionally, mirroring the
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
+        let mut obligation = None;
         let _suspended = run_buffered_post_delivery(
             &mut ClassCMut::from_state(&mut state),
+            &mut obligation,
             &ctx,
             &ctx_bytes,
             ALICE,
@@ -3811,6 +3820,11 @@ mod pseudonym_routing_tests {
             &clock,
             &event_log,
             None,
+        );
+        // No GROW occurs on this velocity-trigger path, so no obligation is armed.
+        assert!(
+            obligation.is_none(),
+            "a non-GROW post-delivery must not arm a fail-closed obligation"
         );
 
         // (a) Velocity was recorded for the sender.

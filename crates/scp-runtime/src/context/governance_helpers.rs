@@ -4708,17 +4708,19 @@ pub fn finalize_governance_action(
             };
 
             // ADR-049 §9 (RED-CS3): a consequence here may apply a downward-auth
-            // mutation (a capability suspension or an `AssignRole` demotion). On
-            // THIS path the fail-closed persist is already owed by the caller —
+            // mutation (a capability suspension or an `AssignRole` demotion), which
+            // ARMS `downward_auth_sink` via the GROW method. On THIS path the
+            // fail-closed persist is already owed by the caller —
             // `execute_governance_action` runs this whole
             // `finalize_governance_action` body inside the deferred
             // `ClassSCommitToken::discharge_with`, which performs a SINGLE
-            // FAIL-CLOSED persist of the post-finalize state (keep-direction).
-            // So the returned downward-auth flag needs no separate persist here;
-            // it is accumulated only to honour the `#[must_use]` contract and make
-            // the coverage explicit.
+            // FAIL-CLOSED persist of the post-finalize state (keep-direction). So an
+            // armed sink here is REDUNDANT — it is subsumed by the caller's
+            // discharge (no second persist) below.
+            let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
+                None;
             let mut split = ConsequenceStateSplit::from_state(state);
-            let mut downward_auth_applied = enforce_triggered_consequences(
+            let _ = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id,
@@ -4730,10 +4732,11 @@ pub fn finalize_governance_action(
                     event_log: &*deps.event_log,
                     event_tx: deps.event_tx.as_ref(),
                 },
+                &mut downward_auth_sink,
             );
             if let Some((target, triggered)) = triggered_target {
                 let mut split = ConsequenceStateSplit::from_state(state);
-                downward_auth_applied |= enforce_triggered_consequences(
+                let _ = enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {
                         context_id,
@@ -4745,11 +4748,14 @@ pub fn finalize_governance_action(
                         event_log: &*deps.event_log,
                         event_tx: deps.event_tx.as_ref(),
                     },
+                    &mut downward_auth_sink,
                 );
             }
-            // Covered fail-closed by the caller's `discharge_with` commit (above);
-            // the flag is consumed (not separately persisted) on this path.
-            let _ = downward_auth_applied;
+            // Covered fail-closed by the caller's `discharge_with` commit (above):
+            // subsume any armed obligation so EXACTLY ONE persist is owed.
+            if let Some(token) = downward_auth_sink.take() {
+                token.subsume(context_id);
+            }
         }
     }
 

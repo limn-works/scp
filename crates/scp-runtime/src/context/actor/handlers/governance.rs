@@ -832,22 +832,22 @@ fn handle_evaluate_periodic_consequences_actor(
         let mut view = cell.class_c_view();
         let mut split = view.consequence_split();
         for (member_did, triggered) in &results {
-            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+            // The GROW arms `downward_auth_obligation` directly (idempotent across
+            // the sweep — one owed persist; no separate `note_downward_auth` call to
+            // forget — GAP-A closed).
+            let _ = enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &context_id,
+                    member_did,
+                    now,
+                    triggered,
+                    rules: &rules,
+                    clock: deps.clock.as_ref(),
+                    event_log: deps.event_log.as_ref(),
+                    event_tx: deps.event_tx.as_ref(),
+                },
                 &mut downward_auth_obligation,
-                enforce_triggered_consequences(
-                    &mut split,
-                    &EnforceConsequencesCtx {
-                        context_id: &context_id,
-                        member_did,
-                        now,
-                        triggered,
-                        rules: &rules,
-                        clock: deps.clock.as_ref(),
-                        event_log: deps.event_log.as_ref(),
-                        event_tx: deps.event_tx.as_ref(),
-                    },
-                ),
-                &context_id,
             );
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.

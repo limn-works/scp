@@ -204,9 +204,13 @@
 //!   `prune_suspensions_to_role_grants`, structural `&mut`, and a
 //!   `system_assign_role` that mints over its own fields — **NO** downward-auth
 //!   GROW accessor (`suspend_capabilities` / `suspend_all`). So a caller holding a
-//!   `RoleStateClassCMut` (or a [`ClassCSplit`]) structurally CANNOT perform a
-//!   downward-auth GROW — the GROW method does not exist on THAT type (a COMPILE
-//!   error), witnessed by the coupled negative `role_view_grow_resolves_to_trait`.
+//!   `RoleStateClassCMut` (or a [`ClassCSplit`]) cannot perform a downward-auth
+//!   GROW — the GROW method does not exist on THAT type. The load-bearing barrier
+//!   is the PRIVATE Class-S fields + `!DerefMut` (no external `&mut` to the
+//!   downward-auth maps), NOT a compile-witness over method resolution; a
+//!   maintainer adding a new `&mut self` GROW method to this impl in-file is an
+//!   in-file-insider residual, a code-review responsibility (see the honest §9
+//!   structural account in the test submodule).
 //!
 //!   This is a STRUCTURAL property of the field-granular role view, NOT a global
 //!   claim that "a GROW lives nowhere else." There are TWO real GROW paths, each
@@ -1125,24 +1129,31 @@ impl<'a> GovernanceClassCMut<'a> {
 /// SHRINK-only [`Self::prune_suspensions_to_role_grants`] + a shared READ
 /// ([`Self::suspended_capabilities`]) — there is deliberately NO GROW ACCESSOR
 /// (`suspend_capabilities` / `suspend_all`) on this view. So a caller holding THIS
-/// view (a `RoleStateClassCMut`) structurally CANNOT perform a downward-auth GROW —
-/// the GROW method does not exist on this type (a COMPILE error). That confinement
-/// of the FIELD-GRANULAR view is the load-bearing structural guarantee (NOT a
-/// decoupled `compile_fail` mirror); it is witnessed at compile time by the COUPLED
-/// negative `role_view_grow_resolves_to_trait` in this module's test submodule
-/// (which makes the zero-arg `view.suspend_all()` resolve to a trait shim, so
-/// ADDING an inherent GROW to `RoleStateClassCMut` breaks it). Per
+/// view (a `RoleStateClassCMut`) cannot perform a downward-auth GROW — the GROW
+/// method does not exist on this type.
+///
+/// The LOAD-BEARING structural guarantee is the PRIVATE Class-S fields
+/// (`suspended_capabilities` / `member_capabilities`, private to their defining
+/// modules) plus `ClassSCell: !DerefMut` / `SharedClassS: !DerefMut` (asserted in
+/// the test submodule): no code OUTSIDE this crate's view layer can reach a `&mut`
+/// to the downward-auth maps. This is NOT enforced by a coupled compile-witness
+/// over method resolution — the two such witnesses that used to live here were
+/// shape-fragile (they missed the realistic `&mut self` inherent GROW) and were
+/// deleted; see the honest §9 structural account in the test submodule. Per
 /// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`.
 ///
 /// SCOPE: this is NOT a claim that a GROW lives nowhere else. The consequence-only
-/// [`ConsequenceRoleStateMut`] exposes the same GROW (reachable from a best-effort
-/// `ClassCMut` via [`ClassCMut::consequence_split`]) — §9-safe because the
-/// consequence caller persists fail-closed — and the inherent `pub`
+/// [`ConsequenceRoleStateMut`] exposes the GROW (reachable from a best-effort
+/// `ClassCMut` via [`ClassCMut::consequence_split`]) — §9-safe because those GROW
+/// methods STRUCTURALLY REQUIRE an obligation sink and the consequence caller
+/// persists fail-closed (RED-CS3) — and the inherent `pub`
 /// `ContextRoleState::suspend_*` is reachable through any whole
 /// `&mut ContextRoleState` (e.g. [`ClassSMut::rest_mut`]) — §9-safe because that
-/// `&mut` is handed out only inside a fail-closed-persisting combinator. What is
-/// structurally enforced is exactly: THIS field-granular best-effort role view has
-/// no GROW accessor.
+/// `&mut` is handed out only inside a fail-closed-persisting combinator. The
+/// RESIDUAL the type system does NOT prevent — a maintainer editing THIS impl
+/// in-file to add a new `&mut self` GROW over its private maps — is an
+/// in-file-insider action, a code-review responsibility (the deleted witnesses did
+/// not defend it either).
 pub(crate) struct RoleStateClassCMut<'a> {
     /// Shared `&` to the context's identifier (structural identity, stable).
     context_id: &'a str,
@@ -1506,32 +1517,84 @@ impl<'a> ConsequenceRoleStateMut<'a> {
     }
 
     /// DOWNWARD-AUTH GROW: suspend specific capabilities for a member (ADR-049 §9).
-    /// The caller persists the resulting `suspended_capabilities` GROW fail-closed.
+    ///
+    /// The `obligation` sink is a REQUIRED parameter, not a courtesy: arming the
+    /// fail-closed-persist obligation is part of the GROW's signature so it is
+    /// IMPOSSIBLE to apply this GROW without arming the owed persist. Whenever the
+    /// GROW actually mutates `suspended_capabilities` (a non-empty `capabilities`),
+    /// the sink is armed with a [`ClassSCommitToken`] via
+    /// [`ClassSCommitToken::note_downward_auth`] (idempotent — one owed persist per
+    /// cascade); an empty iterator is a no-op that leaves the sink untouched (the
+    /// hot path stays coalesced). The cell-holding caller discharges the populated
+    /// sink fail-closed after the view drops. There is NO separate hand-written
+    /// arming call to forget (GAP-A closed): the mutation and its obligation are one
+    /// operation.
     pub(crate) fn suspend_capabilities(
         &mut self,
         member_did: &str,
         capabilities: impl IntoIterator<Item = Capability>,
+        obligation: &mut Option<ClassSCommitToken>,
+        context_id: &str,
     ) {
-        self.suspended_capabilities
+        let entry = self
+            .suspended_capabilities
             .entry(member_did.to_owned())
-            .or_default()
-            .extend(capabilities);
+            .or_default();
+        let before = entry.len();
+        entry.extend(capabilities);
+        // Arm the fail-closed obligation IFF a capability was actually added — an
+        // empty / fully-redundant suspend is not a downward-auth transition and
+        // owes no fail-closed persist (the coalesced persist suffices). The token
+        // is minted against the AUTHORITATIVE `context_id` the cell-holding caller
+        // will commit against (the dispatch ctx), NOT the role state's own
+        // `context_id` (which may be unset on a test/seed state).
+        let did_grow = entry.len() != before;
+        ClassSCommitToken::note_downward_auth(obligation, did_grow, context_id);
     }
 
     /// DOWNWARD-AUTH GROW: suspend ALL of a member's current capabilities (the H10
-    /// `SuspendAll` escalation / `SuspendAccess`). The caller persists fail-closed.
-    pub(crate) fn suspend_all(&mut self, member_did: &str) {
+    /// `SuspendAll` escalation / `SuspendAccess`).
+    ///
+    /// As with [`Self::suspend_capabilities`], the `obligation` sink is a REQUIRED
+    /// parameter so arming the fail-closed-persist obligation cannot be forgotten
+    /// (GAP-A): the sink is armed via [`ClassSCommitToken::note_downward_auth`]
+    /// whenever the GROW actually inserts a suspension. The cell-holding caller
+    /// discharges the populated sink fail-closed after the view drops.
+    pub(crate) fn suspend_all(
+        &mut self,
+        member_did: &str,
+        obligation: &mut Option<ClassSCommitToken>,
+        context_id: &str,
+    ) {
         if let Some(caps) = self.member_capabilities.get(member_did) {
             let all_caps: HashSet<Capability> = caps.clone();
             self.suspended_capabilities
                 .insert(member_did.to_owned(), all_caps);
         }
+        // `suspend_all` is an explicit downward-auth SUSPEND-ACCESS / H10-escalation
+        // command, so it ALWAYS arms the fail-closed obligation — unconditionally,
+        // matching the dispatch's `downward_auth: true` contract for SuspendAccess.
+        // (Over-persisting when the member currently holds no capabilities is the
+        // safe direction; under-arming would be the §9 violation.) Minted against
+        // the authoritative dispatch `context_id` (see `suspend_capabilities`), not
+        // the role state's own (possibly unset) one.
+        ClassSCommitToken::note_downward_auth(obligation, true, context_id);
     }
 
     /// Demotion / system-level role assignment (a `member_capabilities`
     /// REPLACEMENT — downward-auth on a demotion). Delegates to the protocol seam
-    /// over reborrows of this view's disjoint fields. The caller persists
-    /// fail-closed.
+    /// over reborrows of this view's disjoint fields.
+    ///
+    /// The `obligation` sink is a REQUIRED parameter (GAP-A): a consequence-path
+    /// `system_assign_role` is a demotion — a `member_capabilities` REPLACEMENT that
+    /// shrinks the member's effective authority — so it owes a fail-closed persist,
+    /// and arming that obligation is part of the signature so it cannot be
+    /// forgotten. On a successful assignment the sink is armed via
+    /// [`ClassSCommitToken::note_downward_auth`] (idempotent); a failed assignment
+    /// (member/role not found) mutates nothing and leaves the sink untouched. We do
+    /// NOT diff capability sets to distinguish demotion from promotion: arming
+    /// unconditionally on success is sound and simpler — over-persisting a promotion
+    /// is harmless (a coalesce-loss of a promotion is the safe upward direction).
     ///
     /// # Errors
     ///
@@ -1541,6 +1604,8 @@ impl<'a> ConsequenceRoleStateMut<'a> {
         member_did: &str,
         role_name: &str,
         clock: &dyn scp_primitives::Clock,
+        obligation: &mut Option<ClassSCommitToken>,
+        context_id: &str,
     ) -> Result<Vec<UcanToken>, RoleError> {
         let mut parts = ContextRoleClassCParts {
             context_id: self.context_id,
@@ -1552,7 +1617,12 @@ impl<'a> ConsequenceRoleStateMut<'a> {
             member_capabilities: &mut *self.member_capabilities,
             suspended_capabilities: &mut *self.suspended_capabilities,
         };
-        parts.system_assign_role(member_did, role_name, clock)
+        let result = parts.system_assign_role(member_did, role_name, clock);
+        // Arm the fail-closed obligation IFF the replacement actually landed,
+        // against the authoritative dispatch `context_id` (the cell-holding caller
+        // commits against it), not the role state's own (possibly unset) one.
+        ClassSCommitToken::note_downward_auth(obligation, result.is_ok(), context_id);
+        result
     }
 
     /// `&mut` to the role definitions map (Class-C / structural) — backs the
@@ -1571,12 +1641,12 @@ impl<'a> ConsequenceRoleStateMut<'a> {
         self.members
     }
 
-    /// `&mut` to the per-member derived capability sets (Class-C / structural).
-    pub(crate) const fn member_capabilities_mut(
-        &mut self,
-    ) -> &mut HashMap<String, HashSet<Capability>> {
-        self.member_capabilities
-    }
+    // NO raw `member_capabilities_mut()` accessor (ADR-049 §9, BLACK-1c): handing
+    // out a whole `&mut HashMap` to the per-member derived capability sets would let
+    // a caller SHRINK a member's `member_capabilities` (a downward-auth demotion)
+    // with no obligation sink, re-opening GAP-A on the consequence view. The only
+    // sanctioned `member_capabilities` REPLACEMENT is the obligation-coupled
+    // `system_assign_role` above (which arms the fail-closed persist on success).
 }
 
 /// RESTRICTED mutable view over the Class-C / structural mutation surface of a
@@ -3125,6 +3195,17 @@ impl ClassSCell {
 /// guarantee `EconomyTicket` uses so a forgotten discharge cannot silently
 /// acknowledge an unpersisted Class-S consume. It carries NO snapshot
 /// (keep-direction has nothing to restore).
+///
+/// ACCEPTED RESIDUAL (ADR-049 §9): `std::mem::forget(token)` suppresses the `Drop`
+/// guard, so a deliberately-forgotten token would silently drop its owed
+/// fail-closed persist. This is the UNIVERSAL Rust escape on EVERY linear handle
+/// (it applies identically to [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// and any `#[must_use]` + `Drop` type) and is NOT defendable at the type level —
+/// `mem::forget` is safe, stable, and intrinsic. It is an in-file-insider action in
+/// the same threat class as editing any enforcement, and is a code-review
+/// responsibility, not a structural guarantee. The legitimate "discharge without a
+/// second persist" need (a redundant obligation covered by a sibling token) is
+/// served by the explicit, audited [`Self::subsume`] — NOT by `mem::forget`.
 #[must_use = "ClassSCommitToken must be committed — dropping leaves a Class-S consume (e.g. a burned spending nonce) unpersisted, re-opening a replay/re-spend window on crash"]
 pub(crate) struct ClassSCommitToken {
     /// The context whose state the deferred persist targets. Checked against the
@@ -3316,11 +3397,49 @@ impl ClassSCommitToken {
         }
     }
 
+    /// Discharge this obligation because ANOTHER in-flight [`ClassSCommitToken`]
+    /// already owes the SAME fail-closed persist (ADR-049 §9, keep-direction).
+    ///
+    /// A single [`persist_state_fail_closed`] makes the WHOLE in-memory Class-S
+    /// state durable, so when two obligations are owed for mutations that will both
+    /// be made durable by one other token's `commit` (the canonical case: the send
+    /// path's deferred spending-nonce token AND a consequence GROW armed during the
+    /// same send — see `finalize_send`), only ONE persist must actually run. The
+    /// covering token performs it; this redundant token is SUBSUMED — consumed
+    /// WITHOUT a second persist. This is NOT a silent drop (which would trip the
+    /// `Drop` guard) and NOT a `mem::forget` (which would suppress the guard
+    /// universally): it is an explicit, audited discharge whose precondition is that
+    /// a sibling token covers the identical persist.
+    ///
+    /// The `context_id` is debug-asserted against the token's own, mirroring
+    /// [`Self::commit`], so a token cannot be subsumed against the wrong context.
+    pub(crate) fn subsume(mut self, context_id: &str) {
+        // Mark consumed BEFORE the assert so that, even on the wrong-context
+        // debug-assert path, the `Drop` guard does not ALSO fire (a second panic
+        // during unwinding aborts the process and masks the real assertion).
+        self.consumed = true;
+        debug_assert_eq!(
+            self.context_id, context_id,
+            "ClassSCommitToken subsumed against the wrong context",
+        );
+    }
+
     /// Mint a pre-consumed-context token for tests that drive a deferred-persist
     /// site's commit point directly (e.g. the `finalize_send` unit tests).
     #[cfg(test)]
     pub(crate) fn new_for_test(context_id: &str) -> Self {
         Self::new(context_id)
+    }
+
+    /// Defuse the Drop obligation WITHOUT persisting — for unit tests that
+    /// exercise the obligation-arming logic (a GROW arms the sink) against a
+    /// `PerContextState` with no persistence backend wired, where driving a real
+    /// fail-closed `commit` would require a full `ActorDeps`. This is a test-only
+    /// escape hatch: production code MUST discharge via [`Self::commit`] /
+    /// [`Self::discharge_with`] (the persist is the whole point of the obligation).
+    #[cfg(test)]
+    pub(crate) fn defuse_for_test(mut self) {
+        self.consumed = true;
     }
 }
 
@@ -3374,9 +3493,10 @@ mod tests {
     // no Class-S SUB-STRUCT, and the view exposes that field only through the
     // field-granular `RoleStateClassCMut` / read accessors, NEVER a whole-`&mut`
     // `rest_mut` / `role_state_mut`; the inherent `pub` downward-auth GROW reachable
-    // through such a whole `&mut` is the "path B" the module docs describe, and the
-    // best-effort view's lack of any accessor that returns it is now a COUPLED
-    // compile-time witness — `best_effort_view_has_no_whole_mut_accessor` below.)
+    // through such a whole `&mut` is the "path B" the module docs describe. The
+    // best-effort view's lack of any whole-`&mut` accessor is a code-review property,
+    // NOT a compile-witness — see the honest §9 structural account in this submodule
+    // for why the prior coupled witness was shape-fragile and was deleted.)
     // Only `ClassSCell`'s no-`DerefMut` remains a `DerefMut`-guarded invariant.
     static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
 
@@ -3390,136 +3510,72 @@ mod tests {
     // not a one-token flip — so the wrapper, not a doctest, is the guarantee.)
     static_assertions::assert_not_impl_any!(SharedClassS<'static>: core::ops::DerefMut);
 
-    /// Force a method PATH to resolve as a fn-item value (zero-sized): the method
-    /// must EXIST on the named type or this fails to compile. Used by the positive
-    /// half of the role-view witnesses.
-    fn require<T>(_: T) {}
-
-    /// Zero-sized witness returned by the [`NoInherentGrow`] extension-trait GROW
-    /// shims — its sole purpose is to be the return type the coupled negative test
-    /// names, so the trait method (not an inherent one) MUST resolve.
-    #[derive(Debug, PartialEq, Eq)]
-    struct NoGrowWitness;
-
-    /// COUPLED negative witness (ADR-049 §9 / BLACK-CS-03): an extension trait that
-    /// provides `suspend_capabilities` / `suspend_all` shims on
-    /// [`RoleStateClassCMut`] taking ZERO extra arguments (just `&self`) and
-    /// returning a [`NoGrowWitness`]. The test [`role_view_grow_resolves_to_trait`]
-    /// calls `view.suspend_all()` / `view.suspend_capabilities()` with NO arguments
-    /// and binds the result to a `NoGrowWitness`.
-    ///
-    /// This is genuinely COUPLED to the real type (unlike the prior POSITIVE
-    /// witness, which would still pass if a GROW method were ADDED): Rust prefers an
-    /// INHERENT method over a trait method during method resolution. So IF a real
-    /// downward-auth GROW (`fn suspend_all(&mut self, member_did, …)`) were ever
-    /// added to `RoleStateClassCMut`'s inherent impl, the call `view.suspend_all()`
-    /// would resolve to that inherent method, whose arity/receiver/return type do
-    /// NOT match the zero-arg, `NoGrowWitness`-returning call — a COMPILE ERROR.
-    /// Today, with no inherent GROW, the call resolves to this trait shim and
-    /// compiles. So adding the GROW makes the witness START failing — exactly the
-    /// negative guarantee the positive witness lacked. (Per
-    /// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`: a
-    /// real coupled compile-time witness, not a decoupled mirror.)
-    trait NoInherentGrow {
-        fn suspend_all(&self) -> NoGrowWitness;
-        fn suspend_capabilities(&self) -> NoGrowWitness;
-    }
-    impl NoInherentGrow for RoleStateClassCMut<'_> {
-        fn suspend_all(&self) -> NoGrowWitness {
-            NoGrowWitness
-        }
-        fn suspend_capabilities(&self) -> NoGrowWitness {
-            NoGrowWitness
-        }
-    }
-
-    #[test]
-    fn role_view_grow_resolves_to_trait() {
-        // Build a real `RoleStateClassCMut` (the general best-effort role view).
-        let mut state = fresh_state(0x9a);
-        let mut view = ClassCMut::from_state(&mut state);
-        let role_view = view.role_state_class_c_mut();
-
-        // The ZERO-ARG GROW calls MUST resolve to the `NoInherentGrow` trait shims
-        // (return `NoGrowWitness`). If a real inherent `suspend_all` /
-        // `suspend_capabilities` GROW were added to `RoleStateClassCMut`, the
-        // inherent method would be PREFERRED here and its differing signature would
-        // make these zero-arg, `NoGrowWitness`-typed calls a COMPILE ERROR — so this
-        // test is a coupled negative witness for "no inherent GROW exists". (BLACK-CS-03)
-        let w_all: NoGrowWitness = role_view.suspend_all();
-        let w_caps: NoGrowWitness = role_view.suspend_capabilities();
-        assert_eq!(w_all, NoGrowWitness);
-        assert_eq!(w_caps, NoGrowWitness);
-
-        // POSITIVE confirmation the GROW direction was CONFINED (not lost): it
-        // exists as a real inherent method on the consequence-only view.
-        // (`suspend_capabilities` takes an `impl IntoIterator` generic, which cannot
-        // be named as a bare fn-item value, so `suspend_all` stands for the pair.)
-        require(ConsequenceRoleStateMut::suspend_all);
-        // And the general view's intended downward-auth surface is exactly: a SHARED
-        // read, the SHRINK-only prune, and the ceiling read.
-        require(RoleStateClassCMut::suspended_capabilities);
-        require(RoleStateClassCMut::prune_suspensions_to_role_grants);
-        require(RoleStateClassCMut::ceiling);
-    }
-
-    /// Zero-sized witness returned by the [`NoWholeMutAccessor`] extension-trait
-    /// shims — the return type the coupled negative test binds, so the trait method
-    /// (not an inherent one) MUST resolve.
-    #[derive(Debug, PartialEq, Eq)]
-    struct NoWholeMutWitness;
-
-    /// COUPLED negative witness (ADR-049 §9 — path-B asymmetry): the best-effort
-    /// [`ClassCMut`] exposes NO whole-`&mut` accessor (`rest_mut` /
-    /// `role_state_mut`), MIRRORING the `SharedClassS: !DerefMut` and
-    /// `ClassSCell: !DerefMut` structural guards. `ClassSMut` deliberately HAS
-    /// `rest_mut` (a whole `&mut PerContextState`, including the whole
-    /// `&mut ContextRoleState` that reaches the inherent `pub` GROW — "path B") and
-    /// is sound because its combinator persists fail-closed; the best-effort
-    /// `ClassCMut` MUST NOT, because it runs with no subsequent fail-closed persist.
-    /// That asymmetry was prose; this makes it a compile-time check.
-    ///
-    /// Mechanism (same coupling as [`NoInherentGrow`]): the trait provides zero-arg
-    /// `rest_mut(&self) -> NoWholeMutWitness` / `role_state_mut(&self) -> …` shims on
-    /// `ClassCMut`. The test calls `view.rest_mut()` / `view.role_state_mut()` and
-    /// binds to `NoWholeMutWitness`. Rust prefers an inherent method over a trait
-    /// one, so ADDING an inherent `rest_mut` / `role_state_mut` (returning a whole
-    /// `&mut PerContextState` / `&mut ContextRoleState`, the §9 bypass) makes the
-    /// zero-arg `NoWholeMutWitness`-typed call STOP compiling. (`assert_not_impl_any`
-    /// covers traits, not inherent methods — hence this coupled trick.)
-    trait NoWholeMutAccessor {
-        fn rest_mut(&self) -> NoWholeMutWitness;
-        fn role_state_mut(&self) -> NoWholeMutWitness;
-    }
-    impl NoWholeMutAccessor for ClassCMut<'_> {
-        fn rest_mut(&self) -> NoWholeMutWitness {
-            NoWholeMutWitness
-        }
-        fn role_state_mut(&self) -> NoWholeMutWitness {
-            NoWholeMutWitness
-        }
-    }
-
-    #[test]
-    fn best_effort_view_has_no_whole_mut_accessor() {
-        let mut state = fresh_state(0x9b);
-        let view = ClassCMut::from_state(&mut state);
-
-        // These MUST resolve to the `NoWholeMutAccessor` trait shims. If a real
-        // inherent `rest_mut` / `role_state_mut` (a whole `&mut PerContextState` /
-        // `&mut ContextRoleState`) were ever added to `ClassCMut`, the inherent
-        // method would be PREFERRED and its differing signature would make these
-        // zero-arg, `NoWholeMutWitness`-typed calls a COMPILE ERROR — the coupled
-        // negative witness for "the best-effort view exposes no whole-`&mut`".
-        let w_rest: NoWholeMutWitness = view.rest_mut();
-        let w_role: NoWholeMutWitness = view.role_state_mut();
-        assert_eq!(w_rest, NoWholeMutWitness);
-        assert_eq!(w_role, NoWholeMutWitness);
-
-        // POSITIVE confirmation the whole-`&mut` `rest_mut` EXISTS on the
-        // fail-closed-capable `ClassSMut` (path-B asymmetry: it is sound THERE).
-        require(ClassSMut::rest_mut);
-    }
+    // ------------------------------------------------------------------
+    // ADR-049 §9 — what actually confines the downward-auth GROW (honest
+    // structural account; NOT a coupled compile-witness over method resolution)
+    // ------------------------------------------------------------------
+    //
+    // Two shape-fragile compile-witnesses used to live here
+    // (`role_view_grow_resolves_to_trait` and
+    // `best_effort_view_has_no_whole_mut_accessor`). They coupled a zero-arg,
+    // `&self`, trait-shim call against the real view and relied on "an inherent
+    // method shadows a trait method" to turn an ADDED inherent GROW into a compile
+    // error. They were DELETED because they gave FALSE structural confidence: the
+    // realistic shape a maintainer would add is `fn suspend_all(&mut self, did, …)`
+    // — an `&mut self`, multi-arg inherent method. At the witnesses' NON-`mut`,
+    // zero-arg call site that inherent method is simply non-viable, so resolution
+    // falls through to the `&self` trait shim and the witness stays GREEN. (Proven:
+    // an injected `fn suspend_all(&mut self, did)` on `RoleStateClassCMut` compiled
+    // with all witnesses passing.) A coupled witness over method RESOLUTION is
+    // fragile to receiver mutability, arity, generics, and macros; per
+    // `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md` and
+    // the project's "a gate adds ~zero marginal security vs an insider who can edit
+    // it — prefer real type-system enforcement" philosophy, false confidence is
+    // worse than none.
+    //
+    // What ACTUALLY confines the downward-auth GROW (the real, type-system
+    // guarantees, still witnessed by the `!DerefMut` assertions above):
+    //
+    //   (i)  NO external `&mut` to the downward-auth maps. `ClassSCell` has no
+    //        `DerefMut` (asserted above) and the Class-S fields
+    //        (`suspended_capabilities`, `member_capabilities`) are PRIVATE to their
+    //        defining modules. No code outside this crate's view layer can name or
+    //        reach a `&mut` to them. `SharedClassS` (the best-effort view's Class-S
+    //        reach) is `!DerefMut` (asserted above) and holds only a `&` — no `&mut`
+    //        path exists through the best-effort view at all.
+    //
+    //   (ii) The ONLY whole `&mut ContextRoleState` (which reaches the inherent
+    //        `pub` `ContextRoleState::suspend_*` — "path B") is handed out via
+    //        `ClassSMut::rest_mut()`, and `ClassSMut` is constructed ONLY inside the
+    //        fail-closed-persisting combinators (`commit_class_s_keep` /
+    //        `begin_class_s`). A path-B GROW therefore always rides a fail-closed
+    //        persist. The best-effort `ClassCMut` exposes NO `rest_mut` /
+    //        `role_state_mut` (it has no whole-`&mut` accessor), so it cannot reach
+    //        path B.
+    //
+    //   (iii) The consequence-only `ConsequenceRoleStateMut` GROW methods
+    //        (`suspend_capabilities` / `suspend_all` / the demoting
+    //        `system_assign_role`) STRUCTURALLY REQUIRE an obligation sink: each
+    //        takes `&mut Option<ClassSCommitToken>` as a non-defaultable parameter
+    //        and arms it on a real mutation. A consequence GROW therefore CANNOT be
+    //        applied without arming the fail-closed persist (GAP-A closed) — and a
+    //        populated-but-undischarged sink is a Drop-guard PANIC in debug/CI.
+    //
+    //   (iv) The RESIDUAL the type system does NOT prevent: a maintainer EDITING the
+    //        best-effort `RoleStateClassCMut` impl in THIS file to add a new
+    //        `&mut self` method that inserts into its private `suspended_capabilities`
+    //        / `member_capabilities` `&mut`. That is an in-file-insider action in the
+    //        SAME threat class as editing any enforcement file (the private field is
+    //        the real barrier — only in-module code can name it), and is NOT defended
+    //        by a compile-witness (the deleted witnesses did not defend it either —
+    //        that was the false confidence). It is a CODE-REVIEW responsibility, and
+    //        intentionally so: per the project's enforcement philosophy a CI/AST gate
+    //        adds ~zero marginal security against an insider who can edit the gate.
+    //
+    // The positive confirmation that the GROW direction is CONFINED (exists on the
+    // consequence view, not lost) is the live `consequence_*` fail-closed tests in
+    // the actor handler submodules — they call the consequence GROW with its real
+    // signature (obligation sink included) and assert the fail-closed persist.
 
     // Defense-in-depth (ADR-049 §9): the linear deferred-persist obligation MUST
     // be un-duplicable. `ClassSCommitToken` must NOT implement `Clone` (nor
@@ -3787,6 +3843,18 @@ mod tests {
     /// is the real guarantee; see this test's doc). Matches `type` + ws + an
     /// identifier + ws? + `=` + ws? + `ClassSCell` word-bounded (so `ClassSCellFoo`
     /// is not matched), tolerating any `=`/whitespace spacing.
+    ///
+    /// ACCEPTED RESIDUAL (ADR-049 §9): this catches the `type … = ClassSCell;`
+    /// alias form but NOT a `use …::ClassSCell as Alias;` import rename (nor a
+    /// generic-parameter binding), which would also let `impl Alias { … }` evade the
+    /// literal-`ClassSCell` impl-block scan. That is deliberately UN-chased: the real
+    /// barrier is that `ClassSCell.state` is a PRIVATE field, so ANY aliased `impl`
+    /// — under any spelling — only compiles IN THIS MODULE, i.e. the attacker is
+    /// already editing this file (an in-file-insider, the same threat class as
+    /// editing any enforcement). The tripwire is a cheap, convergent speed-bump for
+    /// HONEST contributors against the accidental `type`-alias shape; the private
+    /// field + module boundary is the guarantee. Out-spelling every alias form would
+    /// be a non-convergent denylist for ~zero marginal security.
     fn class_s_cell_alias(code: &str) -> Option<String> {
         let bytes = code.as_bytes();
         let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -5090,6 +5158,31 @@ impl ClassSCell
         drop(token);
     }
 
+    /// `subsume` discharges the Drop obligation WITHOUT a second persist — the
+    /// audited path for a redundant obligation already covered by a sibling token
+    /// (ADR-049 §9). The token does NOT trip the Drop guard after `subsume`. This is
+    /// the reconciliation the send-finalize PAID branch and the governance-finalize
+    /// `discharge_with` path use when a consequence GROW armed a sink whose persist
+    /// is already owed by another in-flight token.
+    #[test]
+    fn subsume_discharges_without_panicking() {
+        let ctx = ctx_hex(0x66);
+        let token = ClassSCommitToken::new_for_test(&ctx);
+        // Subsuming consumes the token (sets `consumed`), so its `Drop` is silent —
+        // no `dropped without commit` panic. (If `subsume` left the token un-consumed
+        // this test would abort in the destructor.)
+        token.subsume(&ctx);
+    }
+
+    /// `subsume` debug-asserts the token's context against the caller's, mirroring
+    /// `commit` — a token cannot be subsumed against the wrong context.
+    #[test]
+    #[should_panic(expected = "subsumed against the wrong context")]
+    fn subsume_wrong_context_panics_in_debug() {
+        let token = ClassSCommitToken::new_for_test(&ctx_hex(0x67));
+        token.subsume(&ctx_hex(0x68));
+    }
+
     /// `discharge_with` on the ABORT path — `f` returns `Err` — STILL discharges
     /// the Drop obligation (keep-direction: the persist runs regardless of `f`'s
     /// result, so the token is consumed). The test would PANIC in the `Drop`
@@ -5195,7 +5288,9 @@ impl ClassSCell
             evidence: Vec::new(),
         }];
 
-        // Drive the suspension through the handler's exact view path.
+        // Drive the suspension through the handler's exact view path. The GROW
+        // method ARMS the obligation sink (coupled to the mutation — GAP-A closed).
+        let mut obligation = None;
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
             let mut split = view.consequence_split();
@@ -5211,6 +5306,7 @@ impl ClassSCell
                     event_log: deps.event_log.as_ref(),
                     event_tx: None,
                 },
+                &mut obligation,
             )
         };
         assert!(
@@ -5218,6 +5314,9 @@ impl ClassSCell
             "a SuspendCapability against a present member applies a downward-auth \
              suspension and must signal the fail-closed flag (RED-CS3)"
         );
+        let token = obligation
+            .take()
+            .expect("the SuspendCapability GROW arms the fail-closed obligation sink");
         assert!(
             cell.role_state
                 .suspended_for(subject.as_ref())
@@ -5225,10 +5324,9 @@ impl ClassSCell
             "the suspension is applied in memory before the persist"
         );
 
-        // The handler persists fail-closed when `downward_auth_applied` (messaging.rs).
-        // Under FailPersistence it must surface the §9 durability error.
-        let persist =
-            crate::context::messaging_helpers::persist_state_fail_closed(&cell, &deps, &ctx);
+        // Discharging the armed obligation IS the §9 fail-closed persist. Under
+        // FailPersistence it must surface the durability error (not a silent ack).
+        let persist = token.commit(&cell, &deps, &ctx);
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
@@ -5336,7 +5434,10 @@ impl ClassSCell
             evidence: Vec::new(),
         }];
 
-        // Drive the demotion through the handler's exact view path.
+        // Drive the demotion through the handler's exact view path. The GROW
+        // (`system_assign_role` on the consequence view) ARMS the obligation sink
+        // (coupled to the mutation — GAP-A closed).
+        let mut obligation = None;
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
             let mut split = view.consequence_split();
@@ -5352,6 +5453,7 @@ impl ClassSCell
                     event_log: deps.event_log.as_ref(),
                     event_tx: None,
                 },
+                &mut obligation,
             )
         };
         assert!(
@@ -5359,6 +5461,9 @@ impl ClassSCell
             "an AssignRole demotion shrinks `member_capabilities` and must signal \
              the downward-auth fail-closed flag (RED-CS3)"
         );
+        let token = obligation
+            .take()
+            .expect("the AssignRole demotion GROW arms the fail-closed obligation sink");
         assert_eq!(
             cell.role_state.member_capabilities.get(subject.as_ref()),
             Some(&HashSet::from([Capability::MessagesRead])),
@@ -5366,11 +5471,10 @@ impl ClassSCell
              holds only the LOWER role's capabilities (MessagesWrite removed)"
         );
 
-        // The handler persists fail-closed when `downward_auth_applied`
-        // (messaging.rs / governance.rs). Under FailPersistence it must surface
-        // the §9 durability error rather than a silent coalesced ack.
-        let persist =
-            crate::context::messaging_helpers::persist_state_fail_closed(&cell, &deps, &ctx);
+        // Discharging the armed obligation IS the §9 fail-closed persist. Under
+        // FailPersistence it must surface the durability error rather than a silent
+        // coalesced ack.
+        let persist = token.commit(&cell, &deps, &ctx);
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),

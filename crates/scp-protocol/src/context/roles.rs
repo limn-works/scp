@@ -1287,6 +1287,21 @@ impl ContextRoleState {
 /// persist). A full structural seal of this parts struct is deliberately out of
 /// scope (single consumer set; sealing it would fight the disjoint-borrow ergonomics
 /// it exists to provide).
+///
+/// ACCEPTED RESIDUAL (ADR-049 §9): both [`ContextRoleState::class_c_parts`] and
+/// these `pub` raw `&mut` fields are `pub` (NOT `pub(crate)`) because `scp-runtime`
+/// constructs the views CROSS-CRATE and must name them. That `pub` surface is
+/// §9-safe NOT by access modifier but by REACHABILITY: producing a
+/// `ContextRoleClassCParts` requires a `&mut ContextRoleState`, and in the actor
+/// the only `&mut ContextRoleState` is reached through `ClassSCell` — which has NO
+/// `DerefMut` and holds the role state behind PRIVATE fields, so no caller outside
+/// the runtime's fail-closed view layer can obtain the `&mut` needed to call
+/// `class_c_parts` in the first place. Tightening `class_c_parts` to `pub(crate)`
+/// is therefore both impossible (cross-crate consumer) AND unnecessary (the cell's
+/// `!DerefMut` + private fields already block the reach). The residual a maintainer
+/// would have to introduce — a NEW production `&mut ContextRoleState` source outside
+/// a fail-closed combinator — is an in-file-insider action, a code-review
+/// responsibility.
 pub struct ContextRoleClassCParts<'a> {
     /// Shared `&` to the context identifier (structural identity, stable).
     pub context_id: &'a str,

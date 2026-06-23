@@ -920,25 +920,23 @@ pub async fn settle_tool_economy_capture(
     // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
     // which the cell-holding caller performs when `downward_auth_applied` is set.
     let mut split = view.consequence_split();
-    // Populate the caller-owned token sink so the mutation's fail-closed-persist
-    // obligation survives the payment-capture error path below (a returned token
-    // would be stranded/dropped by the early `return Err` — RED-CS3).
-    crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+    // The GROW arms the caller-owned `downward_auth_sink` directly (GAP-A closed),
+    // so the mutation's fail-closed-persist obligation survives the payment-capture
+    // error path below (a returned token would be stranded/dropped by the early
+    // `return Err` — RED-CS3).
+    let _ = crate::context::governance_logic::enforce_triggered_consequences(
+        &mut split,
+        &crate::context::governance_logic::EnforceConsequencesCtx {
+            context_id,
+            member_did: invoker_did,
+            now,
+            triggered: &consequences,
+            rules: &consequence_rules,
+            clock,
+            event_log: event_log.as_ref(),
+            event_tx: event_tx.as_ref(),
+        },
         downward_auth_sink,
-        crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: invoker_did,
-                now,
-                triggered: &consequences,
-                rules: &consequence_rules,
-                clock,
-                event_log: event_log.as_ref(),
-                event_tx: event_tx.as_ref(),
-            },
-        ),
-        context_id,
     );
 
     let payment_receipt = match (
