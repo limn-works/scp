@@ -71,7 +71,14 @@ pub(crate) async fn dispatch(
             let p = *payload;
             // SendMessage reaches the spending-nonce leaf
             // (`enforce_send_economy`) via `send_message`, so it is threaded the
-            // cell; the read-only / non-nonce variants below take `state_mut()`.
+            // cell. The pure Class-C variants below (`ReportDegradedMode`,
+            // `BuildLocalCheckpoint`, `CompareRemoteCheckpoint`) are threaded the
+            // cell too and reach their fields through the non-persisting
+            // `class_c_view`. `DeliverIncoming` still takes `state_mut()`: its
+            // receive cascade is exercised directly with a bare
+            // `&mut PerContextState` by the `deliver_message_and_drain_buffered`
+            // unit tests, which cannot construct a `ClassCMut` view (no cell-free
+            // `ClassCMut::from_state`), so narrowing it is blocked outside this scope.
             handle_send_message(
                 cell,
                 deps,
@@ -127,7 +134,7 @@ pub(crate) async fn dispatch(
             unsupported_features,
             reply,
         } => handle_report_degraded_mode(
-            cell.state_mut(),
+            cell,
             deps,
             &context_id,
             compat,
@@ -139,19 +146,14 @@ pub(crate) async fn dispatch(
             sender_did,
             signing_key,
             reply,
-        } => handle_build_local_checkpoint(
-            cell.state_mut(),
-            deps,
-            &context_id,
-            &sender_did,
-            &signing_key,
-            reply,
-        ),
+        } => {
+            handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signing_key, reply)
+        }
         MessagingCommand::CompareRemoteCheckpoint {
             context_id,
             remote,
             reply,
-        } => handle_compare_remote_checkpoint(cell.state_mut(), deps, &context_id, &remote, reply),
+        } => handle_compare_remote_checkpoint(cell, deps, &context_id, &remote, reply),
         MessagingCommand::SendHeartbeat {
             context_id,
             sender_did,
@@ -454,15 +456,19 @@ async fn handle_send_pseudonym_announcement(
 /// [`Outcome::ok_mutated`] because the receive buffer may have grown by
 /// one event.
 fn handle_report_degraded_mode(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     compat: scp_protocol::envelope::VersionCompatibility,
     unsupported_features: Vec<String>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the
+    // `DegradedMode` event lands in the receive buffer via the non-persisting
+    // `class_c_view`. `report_degraded_mode` is field-narrowed to the single
+    // `&mut ReceiveBuffer` it mutates.
     crate::context::queries_helpers::report_degraded_mode(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         deps,
         context_id,
         compat,
@@ -476,9 +482,10 @@ fn handle_report_degraded_mode(
 ///
 /// Forces a signed consistency checkpoint from the current event-log
 /// state via
-/// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields),
-/// threading disjoint sub-borrows of the actor-owned state exactly as
-/// the periodic broadcast path does, then broadcasts it to peers via
+/// [`force_create_checkpoint_view`](crate::context::queries_helpers::force_create_checkpoint_view),
+/// which reaches the three Class-C checkpoint fields through a
+/// non-persisting [`class_c_view`](crate::context::actor::class_s::ClassSCell::class_c_view)
+/// (the run loop coalesce-persists), then broadcasts it to peers via
 /// [`send_checkpoint`](crate::context::messaging_helpers::send_checkpoint)
 /// (best-effort — a transport failure is logged but does not fail the
 /// command). The send happens inside the actor turn so the FFI-layer
@@ -492,7 +499,7 @@ fn handle_report_degraded_mode(
 /// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
 /// checkpoint ring and counters changed.
 fn handle_build_local_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_identity::DID,
@@ -501,29 +508,34 @@ fn handle_build_local_checkpoint(
 ) -> Outcome<()> {
     let sk = signing_key.to_signing_key();
     let now = deps.clock.now_secs();
-    let broadcast_context_is_none = state.broadcast_context.is_none();
-    let mls_epoch = state.epoch.mls_epoch;
-    let checkpoint = crate::context::queries_helpers::force_create_checkpoint_fields(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        &mut state.checkpoint_events_since,
-        &mut state.checkpoint_last_time_secs,
-        &mut state.checkpoints,
-        sender_did,
-        &sk,
-        now,
-        &*deps.event_log,
-    );
+    // Build + retain the checkpoint through the non-persisting Class-C view
+    // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
+    // ends before the shared-`&` `send_checkpoint` read below (NLL).
+    let checkpoint = {
+        let mut view = cell.class_c_view();
+        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let mls_epoch = view.epoch_mut().mls_epoch;
+        crate::context::queries_helpers::force_create_checkpoint_view(
+            &mut view,
+            context_id,
+            broadcast_context_is_none,
+            mls_epoch,
+            sender_did,
+            &sk,
+            now,
+            &*deps.event_log,
+        )
+    };
 
     // Broadcast the freshly-built checkpoint to peers over the regular
     // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
     // failure is logged but never fails the build (the reconnection driver
     // still receives + records the local checkpoint). Mirrors the
     // periodic `create_and_broadcast_checkpoint_if_due` contract.
+    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
     if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
         deps,
-        state,
+        &*cell,
         context_id,
         sender_did,
         &sk,
@@ -553,14 +565,22 @@ fn handle_build_local_checkpoint(
 /// separately) / `Ahead` / `Consistent` / `Divergent`
 /// classification and any `MemberNotFound` / `CryptoFailed` error.
 fn handle_compare_remote_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
 ) -> Outcome<()> {
-    let result =
-        crate::context::queries_helpers::compare_remote_checkpoint(state, deps, context_id, remote);
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the
+    // equivocation dedup set + receive-buffer emit land through the non-persisting
+    // `class_c_view`. `compare_remote_checkpoint` is narrowed to the Class-C view:
+    // it reads membership and mutates `last_seen_remote_checkpoint` + `receive_buffer`.
+    let result = crate::context::queries_helpers::compare_remote_checkpoint(
+        &mut cell.class_c_view(),
+        deps,
+        context_id,
+        remote,
+    );
     let mutated = result.is_ok();
     let _ = reply.send(result);
     if mutated {

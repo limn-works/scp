@@ -1464,8 +1464,10 @@ fn deliver_checkpoint_message(
 
     // Equivocation detection (§9.9.3): verifies the checkpoint signature,
     // compares Merkle roots, and emits ContextEvent::EquivocationDetected into
-    // the receive buffer when divergent (tier (a) of §23.7).
-    crate::context::queries_helpers::compare_remote_checkpoint(
+    // the receive buffer when divergent (tier (a) of §23.7). The receive path
+    // holds a bare `&mut PerContextState` (threaded from `deliver_incoming`), so
+    // it uses the bare-state sibling rather than the `ClassCMut`-view entry.
+    crate::context::queries_helpers::compare_remote_checkpoint_bare(
         state,
         deps,
         context_id,
