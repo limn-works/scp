@@ -1,4 +1,4 @@
-# ADR-053: Pre-Rotation Key Custody — Substrate Isolation for Callback Custody
+# ADR-054: Pre-Rotation Key Custody — Substrate Isolation for Callback Custody
 
 **Status:** Proposed
 **Date:** 2026-06-14
@@ -41,12 +41,16 @@ Close the gap by introducing a **dedicated pre-rotation custody callback interfa
 
 ### 1. A separate `PreRotationCustodyProvider` FFI callback interface
 
-Define a new callback interface (UniFFI `[Trait, WithForeign]`, with the matching PyO3 `Py<PyAny>` and NAPI threadsafe-function adapters) that the SDK implements **independently** of its operational `KeyCustodyProvider`. Modeling it as a separate provider — not new methods on `KeyCustodyProvider` — is the mechanism that enforces §3's "MUST NOT be accessible through the same custody provider or authentication flow." The interface extends the Rust-core `PreRotationCustody` trait the core already consumes (the existing trait stores externally-generated keys via `store_committed_pre_rotation_key`; `generate()` has no current trait counterpart — it is a new in-substrate generation method added by this ADR):
+Define a new callback interface (UniFFI `[Trait, WithForeign]`, with the matching PyO3 `Py<PyAny>` and NAPI threadsafe-function adapters) that the SDK implements **independently** of its operational `KeyCustodyProvider`. Modeling it as a separate provider — not new methods on `KeyCustodyProvider` — is the mechanism that enforces §3's "MUST NOT be accessible through the same custody provider or authentication flow."
 
-- `generate() -> PreRotationKeyHandle` — generate the keypair **inside the separate substrate** (hardware key, secondary-device enclave, cloud key vault, or an encrypted-offline/Shamir/BIP39 wrapper), never in shared process memory. **`generate()` is required for backends that mint keys in-substrate (HSM, Secure Enclave, cloud vault). Import-only backends (BIP39 mnemonic restore, pre-generated offline backup) MUST return a typed error from `generate()` and the SDK MUST offer an alternative creation path (e.g., `from_mnemonic()` / `from_backup()`). Each SDK backend documents its capability set.**
-- `public_key(handle) -> [u8; 32]` — for the `SHA-256(public_key)` commitment.
-- `import_seed_bytes(seed: Zeroizing<[u8; 32]>) -> PreRotationKeyHandle` — install a known seed into the substrate. This is the method whose absence currently blocks migration; it is the reveal-time inverse of `consume`, used when the new identity adopts the revealed bytes as its operational `#0` (ADR-003 §4b).
-- `consume(handle) -> Zeroizing<[u8; 32]>` — destroy-and-export the private bytes atomically at migration time (the `migrate_identity` step-5 destroy-and-export described in the §9.7.4.1 "Partial-publish recovery" paragraph; §9.7.4.1 item 6 "Post-rotation key cycling" is the subsequent step — generating a fresh pre-rotation keypair after migration completes). **Handle lifecycle invariant:** each `PreRotationKeyHandle` is single-use. The `CallbackPreRotationCustody` adapter MUST invalidate the handle in Rust immediately after `consume` returns — whether the callback succeeded or failed — so subsequent calls to `consume(same_handle)` or `public_key(same_handle)` return `Err(HandleNotFound)` regardless of what the foreign implementation does. This adapter-level enforcement closes the duplicated-handle / leaked-backstop risk that foreign implementations cannot be trusted to self-enforce.
+**Relationship to the existing core trait.** The Rust-core `PreRotationCustody` trait already exists (`crates/scp-platform/src/traits.rs`) and is consumed by `DidDht::create` / `migrate_identity`. This ADR does **not** rename it. The new FFI callback interface is the *foreign-facing* surface; a `CallbackPreRotationCustody` adapter implements the core trait by dispatching to the foreign provider. The interface therefore has four FFI-facing methods, three of which map onto existing core-trait methods and one of which is genuinely new:
+
+- `generate() -> PreRotationKeyHandle` — generate the keypair **inside the separate substrate** (hardware key, secondary-device enclave, cloud key vault, or an encrypted-offline/Shamir/BIP39 wrapper), never in shared process memory. This is the only **new** capability: the core trait has no `generate` counterpart (it only ever *stores* an externally-supplied keypair via `store_committed_pre_rotation_key`). **`generate()` is required for backends that mint keys in-substrate (HSM, Secure Enclave, cloud vault). Import-only backends (BIP39 mnemonic restore, pre-generated offline backup) MUST return a typed error from `generate()` and the SDK MUST offer an alternative creation path (e.g., `from_mnemonic()` / `from_backup()`). Each SDK backend documents its capability set.**
+- `public_key(handle) -> [u8; 32]` — read the 32-byte public key for the `SHA-256(public_key)` commitment. Maps to the core trait's existing **`reveal_public_key`**.
+- `import_seed_bytes(seed: Zeroizing<[u8; 32]>) -> PreRotationKeyHandle` — install a known, externally-generated seed into the substrate and return a handle. This is the FFI-facing analogue of the core trait's existing **`store_committed_pre_rotation_key`** (see "import vs. store" below); it is the method whose absence at the *callback* boundary currently blocks migration, and it is the reveal-time inverse of `consume`, used when the new identity adopts the revealed bytes as its operational `#0` (ADR-003 §4b).
+- `consume(handle) -> Zeroizing<[u8; 32]>` — destroy-and-export the private bytes atomically at migration time. Maps to the core trait's existing **`destroy_after_migration`** (the `migrate_identity` step-5 destroy-and-export described in the §9.7.4.1 "Partial-publish recovery" paragraph; §9.7.4.1 item 6 "Post-rotation key cycling" is the subsequent step — generating a fresh pre-rotation keypair after migration completes). **Handle lifecycle invariant:** each `PreRotationKeyHandle` is single-use. The `CallbackPreRotationCustody` adapter MUST invalidate the handle in Rust immediately after `consume` returns — whether the callback succeeded or failed — so subsequent calls to `consume(same_handle)` or `public_key(same_handle)` return `Err(HandleNotFound)` regardless of what the foreign implementation does. This matches the core trait's documented contract that `destroy_after_migration` makes the handle return `HandleNotFound` thereafter; the adapter enforces it in Rust so foreign implementations cannot leak the backstop.
+
+**`import_seed_bytes` vs. `store_committed_pre_rotation_key` — coexist, do not replace.** The two are the same underlying core-trait operation surfaced under different names: `import_seed_bytes` is simply the FFI-facing spelling that the `CallbackPreRotationCustody` adapter routes into `store_committed_pre_rotation_key`. The core trait's name is **unchanged**; no second "import" method is added to the trait. The reason the FFI method takes only the seed (and not the explicit `public_key` the core trait's signature carries) is that the public key is derivable from the Ed25519 seed inside the adapter before the core call; the adapter derives it and forwards both arguments to `store_committed_pre_rotation_key`. So at the core layer there is exactly one storage method; at the FFI layer it is exposed as `import_seed_bytes`.
 
 **Canonical migration flow (reveal → import, ADR-003 §4b):** at `migrate_identity` step 5, the bridge calls `consume(pre_rotation_handle)` to destroy-and-export the 32-byte seed, wraps the seed in `Zeroizing`, then calls the operational `KeyCustody::import_ed25519_signing_key(seed)` to install the revealed pre-rotation bytes as the new `#0` signing key. The pre-rotation handle is invalidated in Rust before the operational import begins. A fresh pre-rotation handle is then generated via the selection ceremony (§9.7.4.1 §5, §9.7.4.1 item 6 post-rotation cycling) before the migration transaction completes.
 
@@ -72,7 +76,7 @@ This is a **breaking addition to the FFI surface** (a new callback interface), s
 
 | Layer | Change |
 |-------|--------|
-| `scp-protocol` / `scp-platform` | `PreRotationCustody` trait already exists; add shared encrypted-offline / Shamir / BIP39 codecs; add `import_seed_bytes` if not already on the trait. |
+| `scp-protocol` / `scp-platform` | `PreRotationCustody` trait already exists (`store_committed_pre_rotation_key` / `reveal_public_key` / `destroy_after_migration` / `custody_kind`) and is **not** renamed; add the `CallbackPreRotationCustody` adapter that implements it over the foreign provider, plus shared encrypted-offline / Shamir / BIP39 codecs. The FFI `import_seed_bytes` routes into the existing `store_committed_pre_rotation_key` (the adapter derives the public key from the seed) — no new trait method. |
 | PyO3 (`crates/scp-ffi/src/`) | `PyPreRotationCustodyProvider` (`Py<PyAny>` adapter); thread it through `identity_create*` / `identity_migrate`; remove the `InMemoryPreRotationCustody` default on the callback path. |
 | NAPI (`crates/scp-ffi/napi/src/`) | Threadsafe-function adapter for the provider record (`{ generate, publicKey, importSeedBytes, consume }`). |
 | UniFFI (`crates/scp-ffi/uniffi/src/`) | New `[Trait, WithForeign]` interface; replace `generate_ephemeral_ed25519_seed` → in-memory routing; implement `import_ed25519_signing_key` via `import_seed_bytes` (removes the current `Unsupported` block). |
@@ -83,16 +87,18 @@ This is a **breaking addition to the FFI surface** (a new callback interface), s
 
 ### Canonical method names (locked across bindings)
 
-Per-binding casing of the four interface methods — these names are fixed and MUST NOT drift:
+Per-binding casing of the four **FFI callback-interface** methods — these names are fixed and MUST NOT drift. The final column maps each FFI method to the **existing** Rust-core `PreRotationCustody` trait method it routes through (`crates/scp-platform/src/traits.rs`); the core trait keeps its current names and is **not** renamed by this ADR. Only `generate` has no core-trait counterpart — it is the one new capability this ADR adds.
 
-| Concept | Rust trait | UniFFI (`[Trait, WithForeign]`) | NAPI (JS object field) | PyO3 (`Py<PyAny>` attribute) | Swift | Kotlin |
-|---------|-----------|-------------------------------|------------------------|------------------------------|-------|--------|
-| generate in substrate | `generate` | `generate` | `generate` | `generate` | `generate()` | `generate()` |
-| read public key | `public_key` | `public_key` | `publicKey` | `public_key` | `publicKey()` | `publicKey()` |
-| import known seed | `import_seed_bytes` | `import_seed_bytes` | `importSeedBytes` | `import_seed_bytes` | `importSeedBytes()` | `importSeedBytes()` |
-| destroy-and-export | `consume` | `consume` | `consume` | `consume` | `consume()` | `consume()` |
+| Concept | FFI method (canonical) | UniFFI (`[Trait, WithForeign]`) | NAPI (JS object field) | PyO3 (`Py<PyAny>` attribute) | Swift | Kotlin | Core trait method (`PreRotationCustody`) |
+|---------|------------------------|-------------------------------|------------------------|------------------------------|-------|--------|------------------------------------------|
+| generate in substrate | `generate` | `generate` | `generate` | `generate` | `generate()` | `generate()` | *(new — no counterpart)* |
+| read public key | `public_key` | `public_key` | `publicKey` | `public_key` | `publicKey()` | `publicKey()` | `reveal_public_key` |
+| import known seed | `import_seed_bytes` | `import_seed_bytes` | `importSeedBytes` | `import_seed_bytes` | `importSeedBytes()` | `importSeedBytes()` | `store_committed_pre_rotation_key` |
+| destroy-and-export | `consume` | `consume` | `consume` | `consume` | `consume()` | `consume()` | `destroy_after_migration` |
 
-The `CallbackPreRotationCustody` adapter derives its method-call names from this table; bridge aliases (`bridge-aliases.json`) must use the bridge-layer names in the NAPI/UniFFI columns.
+The core trait's diagnostic-only `custody_kind()` method has no FFI-callback counterpart; the adapter reports a fixed `PreRotationCustodyKind` for callback custody.
+
+The `CallbackPreRotationCustody` adapter derives its foreign-call names from the FFI columns of this table and dispatches each into the mapped core-trait method (right column); bridge aliases (`bridge-aliases.json`) must use the bridge-layer names in the NAPI/UniFFI columns.
 
 ## Consequences
 
