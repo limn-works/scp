@@ -792,9 +792,9 @@ pub fn run_buffered_post_delivery(
             convergent_now,
         );
         let member_did = DID(sender_did.to_owned());
-        // The `receive_buffer` read above has ended (NLL) before `split_class_c`
-        // reborrows the disjoint Class-C consequence fields.
-        let mut split = view.split_class_c();
+        // The `receive_buffer` read above has ended (NLL) before `consequence_split`
+        // reborrows the disjoint consequence fields (incl. the GROW role view).
+        let mut split = view.consequence_split();
         crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -1822,8 +1822,7 @@ pub fn send_heartbeat(
     {
         let is_suspended = state
             .role_state
-            .suspended_capabilities
-            .get(sender_did.as_ref())
+            .suspended_for(sender_did.as_ref())
             .is_some_and(|s| s.contains(&Capability::MessagesWrite));
         let msg = if is_suspended {
             format!("member {sender_did} write access has been revoked")
@@ -2167,7 +2166,7 @@ pub fn finalize_send(
             convergent_now,
         );
         {
-            let mut split = view.split_class_c();
+            let mut split = view.consequence_split();
             // ADR-049 §9 (RED-CS3): the returned flag is `true` iff a downward-auth
             // mutation was applied (a `suspended_capabilities` GROW or an
             // `AssignRole` `member_capabilities` replacement). When set, the final
@@ -3050,7 +3049,7 @@ pub fn deliver_message_and_drain_buffered(
                     convergent_now,
                 );
                 let recv_member_did = DID(sender_did.to_owned());
-                let mut split = view.split_class_c();
+                let mut split = view.consequence_split();
                 *downward_auth_sink |=
                     crate::context::governance_logic::enforce_triggered_consequences(
                         &mut split,
@@ -3164,7 +3163,7 @@ pub fn deliver_message_and_drain_buffered(
             convergent_now,
         );
         let recv_member_did = DID(sender_did.to_owned());
-        let mut split = view.split_class_c();
+        let mut split = view.consequence_split();
         *downward_auth_sink |= crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {

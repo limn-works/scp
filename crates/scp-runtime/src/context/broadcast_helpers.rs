@@ -272,8 +272,7 @@ pub fn reserve_broadcast_publish(
     // overlay via Deref (a read cannot violate the §9 invariant).
     if cell
         .role_state
-        .suspended_capabilities
-        .get(author_did.as_ref())
+        .suspended_for(author_did.as_ref())
         .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     {
         return Err(ContextError::PermissionDenied(format!(

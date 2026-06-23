@@ -615,12 +615,11 @@ pub fn compute_ceiling_intersection(parents: &[ParentRef]) -> CapabilityCeiling 
         return CapabilityCeiling::new(std::iter::empty::<Capability>());
     }
 
-    let mut intersection: HashSet<Capability> = parents[0].ceiling.capabilities.clone();
+    let mut intersection: HashSet<Capability> = parents[0].ceiling.iter().cloned().collect();
     for parent in &parents[1..] {
-        intersection = intersection
-            .intersection(&parent.ceiling.capabilities)
-            .cloned()
-            .collect();
+        intersection = parent
+            .ceiling
+            .intersect(&CapabilityCeiling::new(intersection));
     }
 
     CapabilityCeiling::new(intersection)

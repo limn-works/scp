@@ -31,14 +31,13 @@
 //! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth pair and
 //! for `MembershipState::remove_member`; member removal IS now behind the boundary
 //! (the best-effort views withhold `remove_member` and removal routes through a
-//! fail-closed combinator). The `ceiling` / `suspended_capabilities` pair's
-//! BEHAVIORAL §9 hole is now closed too — the consequence-engine auto-suspension
-//! (the live exposed path) is persisted fail-closed by the cell-holding caller
-//! (RED-CS3) — but the pair remains a STRUCTURAL residual: it is not behind the
-//! COMPILE-TIME boundary (the whole `&mut ContextRoleState` can still name it),
-//! so for that structural surface neither the compile boundary nor the tripwire
-//! substitutes for the retired scanner (see "Known residual" below). The
-//! behavioral guarantee is closed; the structural surface is disclosed.
+//! fail-closed combinator). The `ceiling` / `suspended_capabilities` pair is now
+//! CLOSED on both axes: the BEHAVIORAL §9 hole is persisted fail-closed by the
+//! cell-holding caller (RED-CS3), AND the STRUCTURAL residual is gone — the
+//! whole-`&mut` `role_state_mut` accessor is deleted, the fields are privatized to
+//! `pub(crate)` (cross-crate seam: `ContextRoleState::class_c_parts`), and the
+//! downward-auth GROW (`suspend_capabilities` / `suspend_all`) is structurally
+//! confined to the consequence-only view (see the dedicated section below).
 //!
 //! # The mechanism
 //!
@@ -53,8 +52,8 @@
 //!   with no `state_mut` escape hatch, the only way to mutate THOSE THREE FIELDS
 //!   is through the combinators below, each of which performs the fail-closed
 //!   persist by construction. (The dual-use `ContextRoleState.ceiling` /
-//!   `suspended_capabilities` Class-S pair is NOT yet behind this hook — see the
-//!   "Known residual" section below.)
+//!   `suspended_capabilities` Class-S pair is now privatized to `pub(crate)` and
+//!   GROW-confined to the consequence-only view — see the dedicated section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
 //!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
 //!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
@@ -175,67 +174,55 @@
 //! (`scripts/check-class-s-fail-closed.sh`) is retired in favour of this
 //! compile-time guarantee plus the bounded whitelist tripwire described below.
 //!
-//! # Known residual — the dual-use `ContextRoleState` downward-auth fields
+//! # The dual-use `ContextRoleState` downward-auth fields — CLOSED
 //!
 //! ADR-049 §9 also classifies the **downward-authorization** fields
 //! `ContextRoleState.ceiling` and `ContextRoleState.suspended_capabilities` as
 //! Class-S (a coalesce-window rollback of a ceiling tightening or a capability
-//! suspension re-widens authority the caller observed as narrowed). The
-//! BEHAVIORAL hole on the consequence-engine path — the auto-suspension being
-//! lost on a coalesce-window crash, silently re-granting a denied capability
-//! (RED-CS3) — is now **CLOSED**: when consequence enforcement applies a
-//! suspension, [`crate::context::governance_logic::enforce_triggered_consequences`]
-//! returns a downward-auth flag and the cell-holding caller persists the
-//! already-applied suspension **fail-closed** (keep-direction) before acking, in
-//! every production consequence site (send / receive / tool-settle / periodic
-//! sweep; the governance-execution path was already fail-closed via its
-//! `ClassSCommitToken`). Consequence EVALUATION stays best-effort / coalesced —
-//! only the rare suspension OUTCOME is fail-closed.
+//! suspension re-widens authority the caller observed as narrowed). Both the
+//! BEHAVIORAL hole AND the prior STRUCTURAL residual are now **CLOSED**:
 //!
-//! What REMAINS is STRUCTURAL, not behavioral: these two fields are not behind
-//! the COMPILE-TIME boundary (unlike the three privatized Class-S fields). The
-//! best-effort surface still hands out a whole `&mut ContextRoleState` (through
-//! which `ceiling` / `suspended_capabilities` are *nameable* with no fail-closed
-//! persist) via:
+//! - **Behavioral (RED-CS3):** when consequence enforcement applies a downward-auth
+//!   mutation (a `suspended_capabilities` GROW or an `AssignRole`
+//!   `member_capabilities` demotion),
+//!   [`crate::context::governance_logic::enforce_triggered_consequences`] returns a
+//!   downward-auth flag and the cell-holding caller persists the already-applied
+//!   mutation **fail-closed** (keep-direction) before acking, in every production
+//!   consequence site (send / receive / tool-settle / periodic sweep; governance
+//!   execution was already fail-closed via its `ClassSCommitToken`). Consequence
+//!   EVALUATION stays best-effort / coalesced — only the rare downward-auth OUTCOME
+//!   is fail-closed.
+//! - **Structural (BLACK-CS-03):** the whole-`&mut` `ClassCMut::role_state_mut`
+//!   accessor is **DELETED**. The best-effort surface now hands out only the
+//!   field-granular [`RoleStateClassCMut`] (via [`ClassCMut::role_state_class_c_mut`]
+//!   and [`ClassCSplit::role_state`]), which exposes `ceiling` READ-ONLY, the
+//!   suspension map through a SHARED read + the SHRINK-only
+//!   `prune_suspensions_to_role_grants`, structural `&mut`, and a
+//!   `system_assign_role` that mints over its own fields — **NO** downward-auth
+//!   GROW (`suspend_capabilities` / `suspend_all`). The GROW direction lives ONLY
+//!   on the consequence-only [`ConsequenceRoleStateMut`] (carried by
+//!   [`crate::context::governance_logic::ConsequenceStateSplit`], built via
+//!   [`ClassCMut::consequence_split`] / `ConsequenceStateSplit::from_state`), whose
+//!   cell-holding caller persists the GROW fail-closed. So a best-effort caller
+//!   structurally CANNOT perform a downward-auth GROW with no fail-closed persist —
+//!   the method does not exist on the type it holds (a COMPILE error), witnessed by
+//!   `assert_role_view_has_no_grow`.
 //!
-//! 1. [`ClassCMut::role_state_mut`] — the direct whole-`&mut` accessor. Its
-//!    remaining callers pass the whole `&mut` to the
-//!    [`scp_protocol::context::roles`] free functions (`system_assign_role`). Of
-//!    the downward-auth pair, `ceiling` is untouched by them; `suspended_capabilities`
-//!    is touched ONLY by the SHRINK-only `prune_suspensions_to_role_grants`
-//!    `system_assign_role` invokes (it drops a member's suspensions for
-//!    capabilities the reassigned role no longer grants). A best-effort prune is
-//!    §9-safe in the DIRECTIONAL sense that matters: a coalesce-window rollback of
-//!    a prune can only RE-SUSPEND a dropped entry (re-narrow authority) — never
-//!    re-grant a removed capability — and the prune rolls back in lockstep with
-//!    the same-persist `member_capabilities` replacement, so it never leaves a
-//!    member effectively un-denied. (The two best-effort `system_assign_role`
-//!    callers are member ADD/JOIN, where no prior suspension entry exists, so the
-//!    prune is a no-op there anyway.) The dangerous GROW direction
-//!    (`suspend_capabilities` / `suspend_all`, which `extend` / `insert`) is the
-//!    one made fail-closed (RED-CS3). The pure-read / clone callers were migrated
-//!    to [`ClassCMut::role_state`] / [`ClassCMut::role_state_class_c_mut`].
-//! 2. [`ClassCMut::split_class_c`] → [`ClassCSplit::role_state`] — the
-//!    consequence-path split carries the same whole `&mut ContextRoleState`. The
-//!    consequence path DOES mutate `suspended_capabilities` through it (the
-//!    auto-suspension), but that mutation is now persist-covered fail-closed at
-//!    the cell boundary, so it is no longer a §9 bypass.
-//! 3. [`ClassCSplit::from_state`] — the cell-free bridge builds the same split.
+//! The `ContextRoleState.ceiling` / `suspended_capabilities` fields (and
+//! `CapabilityCeiling.capabilities`) are now **privatized** to `pub(crate)` in
+//! `scp-protocol`; the cross-crate seam is [`scp_protocol::context::roles::ContextRoleState::class_c_parts`],
+//! which hands `scp-runtime`'s field-granular views the disjoint refs (ceiling
+//! shared `&`) without naming the private fields. The whole-ceiling WRITE is the
+//! named [`scp_protocol::context::roles::ContextRoleState::set_ceiling`] mutator,
+//! reachable only behind a whole `&mut ContextRoleState` — which, post-deletion of
+//! `role_state_mut`, exists in production only inside a fail-closed-persisting
+//! combinator (the single ceiling-modification site routes through
+//! `commit_class_s_keep`).
 //!
-//! The restricted replacement [`ClassCMut::role_state_class_c_mut`] (a
-//! [`RoleStateClassCMut`] exposing `&mut` only for the Class-C structural fields
-//! and shared `&` reads of the two downward-auth fields) ALREADY EXISTS and is
-//! used by the structural callers. The STRUCTURAL residual closes fully when
-//! `system_assign_role` is reshaped onto the field-granular view and the
-//! consequence path mutates `suspended_capabilities` through a method rather than
-//! the whole `&mut` — a follow-up that does not affect the now-closed behavioral
-//! guarantee. The `ContextRoleState.ceiling` / `suspended_capabilities` fields
-//! remain `pub` (a cross-crate constraint: [`RoleStateClassCMut::new`]
-//! field-destructures `ContextRoleState` in this crate, and there is no
-//! cross-crate `pub(in …)` that admits the destructure while privatizing the
-//! field). The whitelist tripwire scans only `impl ClassSCell` and so does not
-//! cover these `ClassCMut` / `ClassCSplit` accessor paths; the structural residual
-//! is tracked here honestly rather than claimed closed by the compile-time guard.
+//! REMAINING structural-field surface (consciously deferred, NOT claimed closed):
+//! `ContextRoleState.assignments` / `members` / `member_capabilities` /
+//! `role_definitions` stay `pub` (Class-C structural, not the downward-auth
+//! residual); privatizing them too is a larger follow-up.
 //!
 //! # Final enforcement model
 //!
@@ -251,10 +238,9 @@
 //! best-effort views hold no `&mut` to them, so the only `&mut` to those fields
 //! originates inside a persisting `ClassSCell` method. (The dual-use
 //! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth fields are
-//! the documented STRUCTURAL residual still reachable via
-//! `ClassCMut::role_state_mut`; their BEHAVIORAL §9 hole — the lost
-//! consequence-engine suspension — is closed by the caller-side fail-closed
-//! persist, see "Known residual" above.)
+//! now privatized + GROW-confined to the consequence-only view per the section
+//! above; the whole-`&mut` `role_state_mut` accessor is deleted, so the best-effort
+//! surface can no longer name a downward-auth GROW.)
 //!
 //! The ONE remaining `&mut self` method on `ClassSCell` that mutates Class-S
 //! WITHOUT a fail-closed persist is
@@ -295,7 +281,8 @@ use scp_protocol::context::governance::{
 use scp_protocol::context::membership::{MemberInfo, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::ToolRegistration;
 use scp_protocol::context::roles::{
-    Capability, CapabilityCeiling, ContextRoleState, RoleAssignment, RoleDefinition, UcanToken,
+    Capability, CapabilityCeiling, ContextRoleClassCParts, ContextRoleState, RoleAssignment,
+    RoleDefinition, RoleError, UcanToken,
 };
 use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
@@ -405,6 +392,40 @@ impl Deref for ClassSMut<'_> {
     }
 }
 
+/// SHARED, READ-ONLY wrapper around a `&ClassSState` (ADR-049 §9 / BLACK-CS-01).
+///
+/// Holds the actor's Class-S sub-struct as a PRIVATE shared reference. It exposes
+/// ONLY [`Self::get`] (a `&ClassSState` read) — there is NO `&mut` accessor and
+/// NO [`DerefMut`]. [`ClassCMut`] stores its Class-S reach as a `SharedClassS`
+/// rather than a bare `&'a ClassSState` so that re-arming a `&mut` to Class-S on
+/// the best-effort view requires THREE conspicuous central edits — the
+/// `ClassCMut.class_s` field type, this wrapper's private field, AND
+/// [`Self::new`]'s parameter — not a single-token flip of one binding. Each is a
+/// load-bearing central edit a reviewer sees; the structural shape (private field,
+/// no `&mut`/`DerefMut`) is the actual guarantee, backstopped by the crate-root
+/// `#![forbid(unsafe_code)]` (no `*const _ as *mut _` escape).
+///
+/// This is the structural answer to BLACK-CS-01 (the old `compile_fail` doctest
+/// was a decoupled mirror that did NOT track a real-field flip). The companion
+/// `assert_not_impl_any!(SharedClassS<'static>: DerefMut)` (this module's test
+/// submodule) is the compile-time witness.
+pub(crate) struct SharedClassS<'a>(&'a ClassSState);
+
+impl<'a> SharedClassS<'a> {
+    /// Wrap a shared `&ClassSState` (the ONLY constructor; takes a shared `&`, so
+    /// no `&mut` to Class-S can enter the wrapper here).
+    pub(crate) const fn new(class_s: &'a ClassSState) -> Self {
+        Self(class_s)
+    }
+
+    /// The ONLY accessor — a shared `&ClassSState` read. There is deliberately no
+    /// `&mut` counterpart, so a Class-S mutation through this wrapper is a COMPILE
+    /// error by construction.
+    pub(crate) const fn get(&self) -> &ClassSState {
+        self.0
+    }
+}
+
 /// RESTRICTED mutable view over a [`PerContextState`] that exposes ONLY the
 /// Class-C / structural portion — there is **no** `class_s_mut` /
 /// `governance_class_s_mut`, and (deliberately) **no** `rest_mut` /
@@ -443,43 +464,25 @@ impl Deref for ClassSMut<'_> {
 /// (there is no whole-state [`Deref`]); reads don't mutate, so a shared `&` to
 /// Class-S cannot violate the invariant.
 ///
-/// # Compile-fail witness — the `class_s` field is SHARED `&`, never `&mut`
+/// # The Class-S reach is the read-only [`SharedClassS`] wrapper (BLACK-CS-01)
 ///
-/// The airtightness above hinges on ONE token in [`ClassCMut::new`]'s
-/// destructure: `class_s` is bound a shared `&'a ClassSState` (so no `&mut` to
-/// the actor's Class-S sub-struct exists on this best-effort view). A one-token
-/// edit — `class_s: &'a ClassSState` → `class_s: &'a mut ClassSState` — would
-/// re-arm a Class-S `&mut` with NO mechanical check catching it (the whitelist
-/// tripwire scans only `impl ClassSCell`). The `compile_fail` doctest below is
-/// that missing check: the stand-in `View` mirrors this view's shape (a `&mut`
-/// per Class-C field + a SHARED `&` to Class-S), and tries to obtain a `&mut` to
-/// the shared field. It fails to compile FOR THAT REASON ONLY — you cannot get a
-/// `&mut` out of a `&`. If a future edit flips the binding to `&mut`, this
-/// doctest starts COMPILING and the doc-test run FAILS, surfacing the silent
-/// re-arming. It MUST NOT be deleted as "just an example."
+/// `ClassCMut.class_s` is a [`SharedClassS`] — a wrapper holding a PRIVATE
+/// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`]. So the only Class-S
+/// reach on this best-effort view is the shared read [`Self::class_s`]
+/// (`self.class_s.get()`); there is no `&mut` to the actor's `ClassSState`
+/// anywhere, and a Class-S mutation from this view is a COMPILE error by
+/// construction.
 ///
-/// ```compile_fail
-/// struct ClassSState {
-///     spending_nonce: u64,
-/// }
-/// // Mirror of `ClassCMut`: a `&mut` to a Class-C field + a SHARED `&` to the
-/// // Class-S sub-struct. (Flip `class_s: &'a ClassSState` to `&'a mut …` and
-/// // this example compiles — exactly the regression the doctest guards.)
-/// struct View<'a> {
-///     members: &'a mut u64,
-///     class_s: &'a ClassSState,
-/// }
-/// impl<'a> View<'a> {
-///     // A "convenience" `&mut` accessor to the Class-S field. This does NOT
-///     // compile: `self.class_s` is a `&ClassSState`, so a reborrow `&mut *…`
-///     // cannot produce a `&mut` — there is no `&mut` to hand out. (When the
-///     // field is `&'a mut`, this same reborrow DOES compile, which is exactly
-///     // the regression this doctest is here to catch.)
-///     fn class_s_mut(&mut self) -> &mut ClassSState {
-///         &mut *self.class_s
-///     }
-/// }
-/// ```
+/// Re-arming a `&mut` here is NOT a one-token flip: it requires editing the
+/// `class_s` field TYPE here, AND `SharedClassS`'s private field, AND
+/// `SharedClassS::new`'s parameter — three conspicuous central edits a reviewer
+/// sees. The load-bearing guarantee is that structural shape (private field, no
+/// `&mut`/`DerefMut`), witnessed at compile time by
+/// `assert_not_impl_any!(SharedClassS<'static>: DerefMut)` in this module's test
+/// submodule. (Per `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`,
+/// the structural wrapper + assert is the guarantee; an illustrative doctest is a
+/// demoted, accurate signpost — NOT a decoupled mirror that can drift from a real
+/// field flip, which is the BLACK-CS-01 defect this replaces.)
 ///
 /// # Disjoint-borrow support (`ConsequenceStateSplit`)
 ///
@@ -562,10 +565,13 @@ pub(crate) struct ClassCMut<'a> {
     /// `split_class_c` path reborrows it SHARED (`&*`), so its read-only use is
     /// unchanged.
     membership: &'a mut MembershipState,
-    /// Shared `&` to the Class-S [`ClassSState`] sub-struct — READ ONLY through
-    /// this view (no `&mut` to it anywhere here), so reads work without a
-    /// whole-state `Deref` and a Class-S MUTATION is structurally impossible.
-    class_s: &'a ClassSState,
+    /// Shared, read-only Class-S [`ClassSState`] reach — wrapped in
+    /// [`SharedClassS`] (a private-field wrapper with NO `&mut` accessor, NO
+    /// `DerefMut`), so reads work without a whole-state `Deref` and a Class-S
+    /// MUTATION is structurally impossible (BLACK-CS-01). Re-arming a `&mut` here
+    /// requires editing the field type AND `SharedClassS`'s field AND
+    /// `SharedClassS::new` — three conspicuous central edits, not a one-token flip.
+    class_s: SharedClassS<'a>,
     /// Field-granular Class-C governance sub-view (holds no whole
     /// `&mut GovernanceState`, no `class_s` reach).
     governance: GovernanceClassCMut<'a>,
@@ -638,39 +644,21 @@ pub(crate) struct EconomyPreCheckBorrows<'a> {
 /// requires an `unsafe` block, which `forbid` rejects crate-wide and cannot be
 /// locally re-enabled. Weakening that attribute would re-open this vector.
 ///
-/// # Compile-fail witness — `governance.class_s` is unreachable from this view
+/// # `governance.class_s` is unreachable from this view (structural)
 ///
-/// [`GovernanceClassCMut::new`] destructures the `&mut GovernanceState` and
-/// leaves `class_s` (the [`GovernanceClassS`] Class-S sub-struct) in the `..`
-/// rest — so this view holds NO reference (mut or shared) to it. A future
-/// "convenience" accessor cannot return a `&mut GovernanceClassS` because no such
-/// field exists on the view. The regression to guard against is someone BINDING
-/// `class_s` by name (so a `&mut` to it survives into the view). The
-/// `compile_fail` doctest below witnesses the property: the stand-in mirrors the
-/// view — it holds only Class-C field `&mut`s and DOES NOT hold the `class_s`
-/// field — and an accessor that tries to return `&mut` to a `class_s` field does
-/// NOT compile (no such field). If a future edit adds a `class_s: &'a mut …`
-/// field to the view, this doctest starts COMPILING and the doc-test run FAILS.
-/// It MUST NOT be deleted.
-///
-/// ```compile_fail
-/// struct GovernanceClassS {
-///     threshold_value: u64,
-/// }
-/// // Mirror of `GovernanceClassCMut`: holds ONLY Class-C field `&mut`s — NO
-/// // `class_s` field at all (it is left in the source destructure's `..` rest).
-/// // Adding a `class_s: &'a mut GovernanceClassS` field here is exactly the
-/// // regression this doctest guards.
-/// struct View<'a> {
-///     velocity_tracker: &'a mut u64,
-/// }
-/// impl<'a> View<'a> {
-///     // Does NOT compile: there is no `class_s` field on `View` to return.
-///     fn governance_class_s_mut(&mut self) -> &mut GovernanceClassS {
-///         &mut *self.class_s
-///     }
-/// }
-/// ```
+/// [`GovernanceClassCMut::new`] destructures the `&mut GovernanceState` and leaves
+/// `class_s` (the [`GovernanceClassS`] Class-S sub-struct) and
+/// `revoked_spending_ucan_cids` in the `..` rest — so this view holds NO reference
+/// (mut or shared) to either. A "convenience" accessor returning a
+/// `&mut GovernanceClassS` CANNOT be written, because no field of that type exists
+/// on the view (illustrative, NOT a decoupled `compile_fail` mirror that could
+/// drift): the load-bearing guarantee is this struct's field list itself. The
+/// regression to guard against — binding `class_s` by name in `new` so a `&mut`
+/// survives — is caught by the SAFETY-INVARIANT contract on [`Self::new`]'s
+/// destructure (the `..` rest) plus the type having no `class_s` field; it does
+/// NOT rely on an example. (Per
+/// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`, prefer
+/// the structural shape over a source-text/doctest signpost.)
 pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
     velocity_tracker: &'a mut SenderVelocityTracker,
@@ -1069,58 +1057,40 @@ impl<'a> GovernanceClassCMut<'a> {
 ///   re-grants a capability the caller observed as denied. Exposed READ-ONLY
 ///   here.
 ///
-/// The plain `ClassCMut::role_state_mut()` hands out a whole
-/// `&mut ContextRoleState`, through which the best-effort / compensation path
-/// could mutate `ceiling` / `suspended_capabilities` with NO fail-closed
-/// persist — a §9 bypass. This view closes that the same way
-/// [`GovernanceClassCMut`] closes the `governance.class_s` bypass: it holds no
-/// whole `&mut ContextRoleState`, only a `&mut` per Class-C field plus a shared
+/// A whole `&mut ContextRoleState` would let the best-effort / compensation path
+/// mutate `ceiling` / `suspended_capabilities` with NO fail-closed persist — a §9
+/// bypass. This view is the replacement (there is no longer any whole-`&mut`
+/// accessor): it closes that the same way [`GovernanceClassCMut`] closes the
+/// `governance.class_s` bypass — it holds no whole `&mut ContextRoleState`, only a
+/// `&mut` per Class-C field plus a shared
 /// `&` to the two downward-auth fields.
 ///
 /// # Airtight BY CONSTRUCTION — no whole `&mut` to return
 ///
-/// On construction it destructures the `&mut ContextRoleState` ONCE into
-/// disjoint references — a `&mut` to each writable Class-C field, a shared `&`
-/// to `ceiling` and `suspended_capabilities`, and (for completeness, since they
-/// are stable structural identity) shared `&` reads of `context_id` /
-/// `creator_did`. There is therefore NO whole `&mut ContextRoleState`, so a
-/// future "convenience" accessor returning one CANNOT be written. Reads of the
-/// downward-auth fields go through the `&`-returning read accessors; reads
-/// cannot violate the invariant.
+/// On construction it destructures (via [`ContextRoleState::class_c_parts`]) into
+/// disjoint references — a `&mut` to each writable Class-C field, a shared `&` to
+/// `ceiling`, a `&mut` to `suspended_capabilities` exposed ONLY through the
+/// SHRINK-only prune + a shared read, and (stable structural identity) shared `&`
+/// reads of `context_id` / `creator_did`. There is therefore NO whole
+/// `&mut ContextRoleState`, so a future "convenience" accessor returning one
+/// CANNOT be written, and there is no downward-auth GROW path. Reads go through
+/// the `&`-returning read accessors; reads cannot violate the invariant.
 ///
-/// # Compile-fail witness — `ceiling` / `suspended_capabilities` are SHARED `&`
+/// # Downward-auth confinement (structural, BLACK-CS-03)
 ///
-/// The downward-auth pair is intentionally bound a shared `&` in
-/// [`RoleStateClassCMut::new`] and exposed READ-ONLY (there is no `ceiling_mut` /
-/// `suspended_capabilities_mut`). A one-token edit flipping either binding to
-/// `&'a mut` would re-arm a Class-S `&mut` on this best-effort view with NO
-/// mechanical check catching it (the tripwire scans only `impl ClassSCell`). The
-/// `compile_fail` doctest below is that check: the stand-in mirrors this view (a
-/// `&mut` Class-C field + SHARED `&` downward-auth fields) and tries to obtain a
-/// `&mut` to a shared field — which does NOT compile for that reason alone. If a
-/// future edit re-arms the `&mut`, this doctest starts COMPILING and the doc-test
-/// run FAILS. It MUST NOT be deleted.
-///
-/// ```compile_fail
-/// struct CapabilityCeiling {
-///     caps: u64,
-/// }
-/// // Mirror of `RoleStateClassCMut`: a `&mut` to a Class-C field + a SHARED `&`
-/// // to the downward-auth `ceiling`. (Flip `ceiling: &'a CapabilityCeiling` to
-/// // `&'a mut …` and this compiles — the regression the doctest guards.)
-/// struct View<'a> {
-///     assignments: &'a mut u64,
-///     ceiling: &'a CapabilityCeiling,
-/// }
-/// impl<'a> View<'a> {
-///     // A "convenience" `&mut` accessor to the read-only downward-auth field.
-///     // Does NOT compile: `self.ceiling` is a `&CapabilityCeiling`, so the
-///     // reborrow `&mut *…` cannot yield a `&mut`.
-///     fn ceiling_mut(&mut self) -> &mut CapabilityCeiling {
-///         &mut *self.ceiling
-///     }
-/// }
-/// ```
+/// `ceiling` is bound a SHARED `&` (read-only — there is no `ceiling_mut`).
+/// `suspended_capabilities` is held `&mut` BUT exposed ONLY through the
+/// SHRINK-only [`Self::prune_suspensions_to_role_grants`] + a shared READ
+/// ([`Self::suspended_capabilities`]) — there is deliberately NO GROW
+/// (`suspend_capabilities` / `suspend_all`) on this view. The GROW direction lives
+/// ONLY on the consequence-only [`ConsequenceRoleStateMut`], whose cell-holding
+/// caller persists the GROW FAIL-CLOSED. So a best-effort caller holding THIS view
+/// structurally CANNOT perform a downward-auth GROW with no fail-closed persist —
+/// the method does not exist. That confinement is the load-bearing guarantee
+/// (NOT a decoupled `compile_fail` mirror); it is witnessed at compile time by
+/// `assert_role_view_has_no_grow` in this module's test submodule, which confirms
+/// `RoleStateClassCMut` exposes no `suspend_capabilities` / `suspend_all`. (Per
+/// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`.)
 pub(crate) struct RoleStateClassCMut<'a> {
     /// Shared `&` to the context's identifier (structural identity, stable).
     context_id: &'a str,
@@ -1138,33 +1108,33 @@ pub(crate) struct RoleStateClassCMut<'a> {
     /// `&mut` to the per-member derived capability sets (Class-C / structural —
     /// derived from `assignments`, not a downward-auth witness).
     member_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
-    /// Shared `&` to the per-member capability SUSPENSION set — DOWNWARD-AUTH
-    /// Class-S, read-only here (suspend/restore is fail-closed governance).
-    suspended_capabilities: &'a HashMap<String, HashSet<Capability>>,
+    /// `&mut` to the per-member capability SUSPENSION set — DOWNWARD-AUTH
+    /// Class-S. The `&mut` is held ONLY so this view can run the SHRINK-only
+    /// [`Self::prune_suspensions_to_role_grants`] (a coalesce-window rollback of a
+    /// prune can only RE-SUSPEND — re-narrow authority — never re-grant). There is
+    /// deliberately NO GROW accessor on this view (`suspend_capabilities` /
+    /// `suspend_all` live ONLY on the consequence-only [`ConsequenceRoleStateMut`],
+    /// which owns a fail-closed persist), and the READ accessor
+    /// [`Self::suspended_capabilities`] hands out a shared `&` reborrow.
+    suspended_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
 }
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C role-state accessors (`context_id`, `creator_did`, `ceiling`, `role_definitions_mut`, `assignments_mut`, `members_mut`, `member_capabilities_mut`, `suspended_capabilities`) get their first PRODUCTION callers when the structural role-state mutation handlers migrate off the whole-`&mut` `role_state_mut`. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9: the field-granular Class-C role-state accessors (`context_id`, `creator_did`, `ceiling`, `role_definitions_mut`, `assignments_mut`, `members_mut`, `member_capabilities_mut`, `suspended_capabilities`, `prune_suspensions_to_role_grants`, `system_assign_role`, `reborrow`) are partially exercised by this module's unit tests; the remainder gain production callers across the structural / membership role-state mutation sites."
 )]
 impl<'a> RoleStateClassCMut<'a> {
-    /// Wrap a borrowed [`ContextRoleState`] by DESTRUCTURING it into the disjoint
-    /// field references this view holds. Crate-internal: constructed only by
-    /// [`ClassCMut::role_state_class_c_mut`].
+    /// Build from the cross-crate [`ContextRoleClassCParts`] destructure of a
+    /// `&mut ContextRoleState` (ADR-049 §9). Crate-internal: constructed only by
+    /// [`ClassCMut::role_state_class_c_mut`] and the split paths.
     ///
-    /// The single destructuring `let` is what makes the airtightness structural:
-    /// the whole `&mut ContextRoleState` is consumed here and only field-granular
-    /// references survive, so the view never holds a whole-bucket `&mut`.
-    fn new(role_state: &'a mut ContextRoleState) -> Self {
-        // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above).
-        // When adding a field here: any DOWNWARD-AUTHORIZATION field (one whose
-        // governance leaf mutates it through a fail-closed combinator —
-        // `ceiling`, `suspended_capabilities`) MUST be bound a shared `&` (the
-        // `Self` field is `&'a …`, so the `&mut` match-ergonomic binding
-        // reborrows down to `&`), NEVER handed out `&mut`. If a field's status is
-        // unclear, expose it READ-ONLY (the safe default). Every Class-C /
-        // structural field below is a `&mut`.
-        let ContextRoleState {
+    /// The downward-auth `ceiling` arrives a SHARED `&` from `class_c_parts`
+    /// (read-only here, no `&mut`); `suspended_capabilities` arrives `&mut` but is
+    /// exposed ONLY through the SHRINK-only prune + a shared read; the structural
+    /// fields are `&mut`. No whole `&mut ContextRoleState` is held, so no accessor
+    /// can return one, and there is no GROW path to `suspended_capabilities`.
+    const fn from_parts(parts: ContextRoleClassCParts<'a>) -> Self {
+        let ContextRoleClassCParts {
             context_id,
             creator_did,
             ceiling,
@@ -1173,7 +1143,7 @@ impl<'a> RoleStateClassCMut<'a> {
             members,
             member_capabilities,
             suspended_capabilities,
-        } = role_state;
+        } = parts;
         Self {
             context_id,
             creator_did,
@@ -1183,6 +1153,29 @@ impl<'a> RoleStateClassCMut<'a> {
             members,
             member_capabilities,
             suspended_capabilities,
+        }
+    }
+
+    /// Build directly from a `&mut ContextRoleState` by routing through
+    /// [`ContextRoleState::class_c_parts`] (the cross-crate disjoint destructure).
+    fn new(role_state: &'a mut ContextRoleState) -> Self {
+        Self::from_parts(role_state.class_c_parts())
+    }
+
+    /// Reborrow this view into a shorter-lived [`RoleStateClassCMut`] over the
+    /// same fields (mirrors [`GovernanceClassCMut::reborrow`]). Used by the split
+    /// paths to hand an OWNED sub-view into a [`ClassCSplit`] without giving up
+    /// the parent borrow. Each held `&mut` is reborrowed; the shared `&` is copied.
+    const fn reborrow(&mut self) -> RoleStateClassCMut<'_> {
+        RoleStateClassCMut {
+            context_id: self.context_id,
+            creator_did: self.creator_did,
+            ceiling: self.ceiling,
+            role_definitions: &mut *self.role_definitions,
+            assignments: &mut *self.assignments,
+            members: &mut *self.members,
+            member_capabilities: &mut *self.member_capabilities,
+            suspended_capabilities: &mut *self.suspended_capabilities,
         }
     }
 
@@ -1231,10 +1224,75 @@ impl<'a> RoleStateClassCMut<'a> {
     }
 
     /// READ-ONLY access to the per-member capability suspension / blocklist set.
-    /// DOWNWARD-AUTH Class-S: suspend/restore is fail-closed governance, so
-    /// there is deliberately no `&mut` counterpart on this view.
+    /// DOWNWARD-AUTH Class-S: the GROW direction (`suspend_capabilities` /
+    /// `suspend_all`) lives ONLY on the consequence-only [`ConsequenceRoleStateMut`]
+    /// (fail-closed). This view exposes only this read and the SHRINK-only prune.
     pub(crate) const fn suspended_capabilities(&self) -> &HashMap<String, HashSet<Capability>> {
         self.suspended_capabilities
+    }
+
+    /// SHRINK-only prune of a member's suspensions to the capabilities the
+    /// `new_role_capabilities` set still grants (ADR-049 §9). The ONLY mutation of
+    /// `suspended_capabilities` this general-purpose view exposes: it can only
+    /// REMOVE entries, never GROW the denied set. A best-effort prune is §9-safe in
+    /// the directional sense that matters — a coalesce-window rollback can only
+    /// RE-SUSPEND a dropped entry (re-narrow authority), never re-grant a removed
+    /// capability — and it rolls back in lockstep with the same-persist
+    /// `member_capabilities` replacement.
+    pub(crate) fn prune_suspensions_to_role_grants(
+        &mut self,
+        member_did: &str,
+        new_role_capabilities: &HashSet<Capability>,
+    ) {
+        if let Some(suspended) = self.suspended_capabilities.get_mut(member_did) {
+            suspended.retain(|cap| new_role_capabilities.contains(cap));
+            if suspended.is_empty() {
+                self.suspended_capabilities.remove(member_did);
+            }
+        }
+    }
+
+    /// Mint + structurally apply a system-level role assignment over THIS view's
+    /// disjoint fields (ADR-049 §9). Inserts/replaces `assignments` /
+    /// `member_capabilities` and runs the SHRINK-only suspension prune, all over
+    /// the view's own `&mut` fields — reading `context_id` / `creator_did` /
+    /// `role_definitions` shared, writing the structural fields. No whole
+    /// `&mut ContextRoleState` is needed, so the structural / membership callers no
+    /// longer reach for the deleted whole-`&mut` accessor.
+    ///
+    /// Mirrors [`ContextRoleState::system_assign_role`] field-for-field (it cannot
+    /// delegate to it without a whole `&mut`, which the view deliberately does not
+    /// hold). The `member_capabilities` REPLACEMENT is a downward-auth shrink on a
+    /// demotion; at the structural / membership call sites it is best-effort by
+    /// design (member ADD / JOIN is coalesce-window-rollback acceptable, ADR-049
+    /// §9), and the consequence-engine demotion path uses the consequence-only
+    /// view, whose caller persists fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// [`RoleError::MemberNotInContext`] if the member is absent;
+    /// [`RoleError::RoleNotFound`] if the role is undefined.
+    pub(crate) fn system_assign_role(
+        &mut self,
+        member_did: &str,
+        role_name: &str,
+        clock: &dyn scp_primitives::Clock,
+    ) -> Result<Vec<UcanToken>, RoleError> {
+        // Build a transient `ContextRoleClassCParts` from REBORROWS of this view's
+        // own disjoint fields and delegate to the protocol seam (which owns the
+        // private `mint_role_tokens`). `ceiling` is reborrowed shared `&` (unused
+        // by the mint, read-only regardless).
+        let mut parts = ContextRoleClassCParts {
+            context_id: self.context_id,
+            creator_did: self.creator_did,
+            ceiling: self.ceiling,
+            role_definitions: &mut *self.role_definitions,
+            assignments: &mut *self.assignments,
+            members: &mut *self.members,
+            member_capabilities: &mut *self.member_capabilities,
+            suspended_capabilities: &mut *self.suspended_capabilities,
+        };
+        parts.system_assign_role(member_did, role_name, clock)
     }
 
     /// Whether `member_did` currently holds `capability` (read). Mirrors
@@ -1253,6 +1311,187 @@ impl<'a> RoleStateClassCMut<'a> {
         self.member_capabilities
             .get(member_did)
             .is_some_and(|caps| caps.contains(capability))
+    }
+}
+
+/// CONSEQUENCE-ONLY mutable view over a [`ContextRoleState`]'s downward-auth +
+/// structural fields (ADR-049 §9, RED-CS3 / R1).
+///
+/// This is the DISTINCT role-state view the consequence engine holds — the one
+/// type that exposes the downward-authorization GROW mutators
+/// ([`Self::suspend_capabilities`], [`Self::suspend_all`]) and the demotion
+/// ([`Self::system_assign_role`]). It is carried ONLY by [`ConsequenceStateSplit`],
+/// whose cell-holding caller persists the applied downward-auth mutation
+/// FAIL-CLOSED (keep-direction) before acking. The general-purpose
+/// [`RoleStateClassCMut`] (carried by [`ClassCSplit`] and handed to best-effort /
+/// structural callers) deliberately exposes NO GROW path: a best-effort caller
+/// CANNOT call `suspend_capabilities` / `suspend_all` because the method does not
+/// exist on the type it holds. That is the structural confinement that CLOSES
+/// BLACK-CS-03 (a future best-effort GROW-suspend would be a coalesce-loss §9
+/// violation) rather than relocating it.
+///
+/// # Airtight BY CONSTRUCTION — no whole `&mut`, no `ceiling` write
+///
+/// Built from the cross-crate [`ContextRoleClassCParts`] destructure, it holds a
+/// `&mut` per writable field plus a shared `&` to `ceiling` (a ceiling
+/// modification is its OWN fail-closed governance leaf, §5.3.2, never written on
+/// the consequence path). It holds NO whole `&mut ContextRoleState`, so no
+/// accessor can return one, and `ceiling` is unreachable for mutation.
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / RED-CS3: the consequence-only GROW role view. `member_capabilities`/`role_definitions`/`assignments`/`members` mut accessors back the consequence-test setup + future structural needs; the GROW + demotion methods are the live consequence-engine path."
+)]
+pub(crate) struct ConsequenceRoleStateMut<'a> {
+    /// Shared `&` to the context identifier (structural identity, stable).
+    context_id: &'a str,
+    /// Shared `&` to the creator DID (structural identity, stable).
+    creator_did: &'a str,
+    /// Shared `&` to the immutable capability ceiling — DOWNWARD-AUTH Class-S,
+    /// read-only even on the consequence path (ceiling changes are their own
+    /// fail-closed governance leaf, §5.3.2).
+    ceiling: &'a CapabilityCeiling,
+    /// `&mut` to all role definitions (Class-C / structural).
+    role_definitions: &'a mut HashMap<String, RoleDefinition>,
+    /// `&mut` to the current role assignments (Class-C / structural).
+    assignments: &'a mut HashMap<String, RoleAssignment>,
+    /// `&mut` to the member DID set (Class-C / structural).
+    members: &'a mut HashSet<String>,
+    /// `&mut` to the per-member derived capability sets (Class-C / structural —
+    /// REPLACED by a demotion, a downward-auth shrink the caller persists
+    /// fail-closed).
+    member_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
+    /// `&mut` to the per-member capability SUSPENSION set — DOWNWARD-AUTH Class-S.
+    /// The GROW direction (`suspend_capabilities` / `suspend_all`) is exposed HERE
+    /// and ONLY here; the caller persists the GROW fail-closed.
+    suspended_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / RED-CS3: consequence-only GROW role-view accessors; the GROW + demotion methods are the live consequence path, the structural mut accessors + reads back the consequence tests."
+)]
+impl<'a> ConsequenceRoleStateMut<'a> {
+    /// Build from the cross-crate [`ContextRoleClassCParts`] destructure.
+    const fn from_parts(parts: ContextRoleClassCParts<'a>) -> Self {
+        let ContextRoleClassCParts {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        } = parts;
+        Self {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        }
+    }
+
+    /// Reborrow into a shorter-lived consequence view over the same fields (used
+    /// by the split paths to hand an OWNED sub-view into a [`ConsequenceStateSplit`]
+    /// without giving up the parent borrow).
+    const fn reborrow(&mut self) -> ConsequenceRoleStateMut<'_> {
+        ConsequenceRoleStateMut {
+            context_id: self.context_id,
+            creator_did: self.creator_did,
+            ceiling: self.ceiling,
+            role_definitions: &mut *self.role_definitions,
+            assignments: &mut *self.assignments,
+            members: &mut *self.members,
+            member_capabilities: &mut *self.member_capabilities,
+            suspended_capabilities: &mut *self.suspended_capabilities,
+        }
+    }
+
+    /// READ-ONLY access to the immutable capability ceiling.
+    pub(crate) const fn ceiling(&self) -> &CapabilityCeiling {
+        self.ceiling
+    }
+
+    /// Whether `member_did` is currently a member (read).
+    pub(crate) fn contains_member(&self, member_did: &str) -> bool {
+        self.members.contains(member_did)
+    }
+
+    /// DOWNWARD-AUTH GROW: suspend specific capabilities for a member (ADR-049 §9).
+    /// The caller persists the resulting `suspended_capabilities` GROW fail-closed.
+    pub(crate) fn suspend_capabilities(
+        &mut self,
+        member_did: &str,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) {
+        self.suspended_capabilities
+            .entry(member_did.to_owned())
+            .or_default()
+            .extend(capabilities);
+    }
+
+    /// DOWNWARD-AUTH GROW: suspend ALL of a member's current capabilities (the H10
+    /// `SuspendAll` escalation / `SuspendAccess`). The caller persists fail-closed.
+    pub(crate) fn suspend_all(&mut self, member_did: &str) {
+        if let Some(caps) = self.member_capabilities.get(member_did) {
+            let all_caps: HashSet<Capability> = caps.clone();
+            self.suspended_capabilities
+                .insert(member_did.to_owned(), all_caps);
+        }
+    }
+
+    /// Demotion / system-level role assignment (a `member_capabilities`
+    /// REPLACEMENT — downward-auth on a demotion). Delegates to the protocol seam
+    /// over reborrows of this view's disjoint fields. The caller persists
+    /// fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// [`RoleError::MemberNotInContext`] / [`RoleError::RoleNotFound`].
+    pub(crate) fn system_assign_role(
+        &mut self,
+        member_did: &str,
+        role_name: &str,
+        clock: &dyn scp_primitives::Clock,
+    ) -> Result<Vec<UcanToken>, RoleError> {
+        let mut parts = ContextRoleClassCParts {
+            context_id: self.context_id,
+            creator_did: self.creator_did,
+            ceiling: self.ceiling,
+            role_definitions: &mut *self.role_definitions,
+            assignments: &mut *self.assignments,
+            members: &mut *self.members,
+            member_capabilities: &mut *self.member_capabilities,
+            suspended_capabilities: &mut *self.suspended_capabilities,
+        };
+        parts.system_assign_role(member_did, role_name, clock)
+    }
+
+    /// `&mut` to the role definitions map (Class-C / structural) — backs the
+    /// consequence-test role-table setup.
+    pub(crate) const fn role_definitions_mut(&mut self) -> &mut HashMap<String, RoleDefinition> {
+        self.role_definitions
+    }
+
+    /// `&mut` to the current role assignments (Class-C / structural).
+    pub(crate) const fn assignments_mut(&mut self) -> &mut HashMap<String, RoleAssignment> {
+        self.assignments
+    }
+
+    /// `&mut` to the member DID set (Class-C / structural).
+    pub(crate) const fn members_mut(&mut self) -> &mut HashSet<String> {
+        self.members
+    }
+
+    /// `&mut` to the per-member derived capability sets (Class-C / structural).
+    pub(crate) const fn member_capabilities_mut(
+        &mut self,
+    ) -> &mut HashMap<String, HashSet<Capability>> {
+        self.member_capabilities
     }
 }
 
@@ -1403,17 +1642,18 @@ pub(crate) struct ClassCSplit<'a> {
     /// [`GovernanceClassCMut::next_proposal_seq`]); it holds no whole
     /// `&mut GovernanceState` — airtight by that field-granular construction.
     pub(crate) governance: GovernanceClassCMut<'a>,
-    /// `&mut` role / ceiling / assignment state. NOTE: this whole `&mut
-    /// ContextRoleState` can NAME the dual-use downward-auth Class-S fields
-    /// `ceiling` / `suspended_capabilities`. The consequence path mutates
-    /// `suspended_capabilities` through it (the auto-suspension), but that is no
-    /// longer a §9 BYPASS: the suspension is persisted FAIL-CLOSED by the
-    /// cell-holding caller (RED-CS3 — `enforce_triggered_consequences` returns a
-    /// downward-auth flag the caller acts on). What remains is the STRUCTURAL
-    /// residual (the whole `&mut` still names the pair), documented in the module
-    /// "Known residual" section, to be closed alongside
-    /// [`ClassCMut::role_state_mut`].
-    pub(crate) role_state: &'a mut ContextRoleState,
+    /// Field-granular role view (ADR-049 §9). NOT a whole `&mut ContextRoleState`:
+    /// [`RoleStateClassCMut`] exposes `&mut` only for the Class-C structural fields
+    /// (role definitions / assignments / members / derived capabilities), a
+    /// SHRINK-only suspension prune, and SHARED `&` reads of the downward-auth
+    /// `ceiling` / `suspended_capabilities`. It exposes NO GROW
+    /// (`suspend_capabilities` / `suspend_all`) — those live ONLY on the
+    /// consequence-only [`ConsequenceRoleStateMut`] carried by
+    /// [`crate::context::governance_logic::ConsequenceStateSplit`]. So a best-effort
+    /// caller holding a `ClassCSplit` structurally CANNOT perform a downward-auth
+    /// GROW with no fail-closed persist — the BLACK-CS-03 §9 residual is CLOSED by
+    /// construction, not merely documented.
+    pub(crate) role_state: RoleStateClassCMut<'a>,
     /// `&` membership (read-only in the consequence path).
     pub(crate) membership: &'a MembershipState,
     /// `&mut` receive buffer (consequence events are emitted here).
@@ -1458,38 +1698,27 @@ impl<'a> ClassCSplit<'a> {
     ///   in the destructure's `..` rest — NO reference to it is taken AT ALL.
     /// - `membership` is bound a SHARED `&` (read-only on the consequence path),
     ///   matching [`ClassCMut::split_class_c`]'s `&*self.membership` narrowing.
-    /// - `role_state` is bound a whole `&mut ContextRoleState`. This is the
-    ///   STRUCTURAL residual documented in the module-level "Known residual"
-    ///   section: [`ContextRoleState`] is DUAL-USE — it carries Class-C structural
-    ///   fields AND the downward-authorization Class-S fields `ceiling` /
-    ///   `suspended_capabilities`, and this whole `&mut` can NAME those. The
-    ///   consequence path mutates `suspended_capabilities` through it (the
-    ///   auto-suspension); the BEHAVIORAL §9 hole that created (a coalesce-window
-    ///   crash losing the suspension and re-granting a denied capability) is now
-    ///   CLOSED — `enforce_triggered_consequences` returns a downward-auth flag and
-    ///   the cell-holding caller persists the suspension FAIL-CLOSED (RED-CS3). The
-    ///   STRUCTURAL residual (the whole `&mut` still names the pair) closes by the
-    ///   same migration that retires [`ClassCMut::role_state_mut`]: moving the
-    ///   consequence path onto the field-granular [`RoleStateClassCMut`] shape
-    ///   (`&mut` for structural fields + shared `&` for `ceiling` /
-    ///   `suspended_capabilities`). Until then it matches the pre-existing
-    ///   `ConsequenceStateSplit.role_state: &mut ContextRoleState`.
+    /// - `role_state` is wrapped in the field-granular [`RoleStateClassCMut`] (NOT
+    ///   a whole `&mut ContextRoleState`, BLACK-CS-03): it exposes `ceiling`
+    ///   READ-ONLY, the suspension map through a shared read + the SHRINK-only
+    ///   prune, structural `&mut`, and a `system_assign_role` — but NO downward-auth
+    ///   GROW (`suspend_capabilities` / `suspend_all`). So this general split CANNOT
+    ///   perform a downward-auth GROW with no fail-closed persist (that path lives
+    ///   on the consequence-only [`ConsequenceStateSplit`] / [`ConsequenceRoleStateMut`]).
     ///
-    /// Apart from that disclosed `role_state` residual, no whole
-    /// `&mut PerContextState` / `&mut GovernanceState` / `&mut ClassSState` /
-    /// `&mut GovernanceClassS` is held, so a mutation of the THREE PRIVATIZED
-    /// Class-S fields through this view is a compile error by construction.
-    pub(crate) const fn from_state(state: &'a mut PerContextState) -> Self {
+    /// No whole `&mut PerContextState` / `&mut GovernanceState` / `&mut ClassSState`
+    /// / `&mut GovernanceClassS` / `&mut ContextRoleState` is held, so a mutation of
+    /// the privatized Class-S fields (or a downward-auth GROW) through this view is a
+    /// compile error by construction.
+    pub(crate) fn from_state(state: &'a mut PerContextState) -> Self {
         // SAFETY INVARIANT (ADR-049 §9 — rationale in this method's doc above):
-        // mirror the disjoint destructure of `ClassCMut::new` for exactly the
-        // five fields `ConsequenceStateSplit` needs. The Class-S sub-structs
-        // `class_s` (actor) and `governance.class_s` (via `GovernanceClassCMut`'s
-        // own `..`) are NEVER bound `&mut` — they fall into the `..` rest here
-        // and inside `GovernanceClassCMut::new`. `role_state` is the whole-`&mut`
-        // ContextRoleState dual-use residual (downward-auth `ceiling` /
-        // `suspended_capabilities` reachable, no fail-closed persist) tracked in
-        // the module "Known residual" section — to be closed with `role_state_mut`,
-        // NOT an ADR-accepted carve-out; `membership` is narrowed to a shared `&`.
+        // mirror the disjoint destructure of `ClassCMut::new`. The Class-S
+        // sub-structs `class_s` (actor) and `governance.class_s` (via
+        // `GovernanceClassCMut`'s own `..`) are NEVER bound `&mut` — they fall into
+        // the `..` rest here and inside `GovernanceClassCMut::new`. `role_state` is
+        // wrapped in the field-granular `RoleStateClassCMut` (downward-auth
+        // `ceiling` / `suspended_capabilities` exposed read-only / shrink-only, NO
+        // GROW); `membership` is narrowed to a shared `&`.
         let PerContextState {
             governance,
             role_state,
@@ -1500,7 +1729,72 @@ impl<'a> ClassCSplit<'a> {
         } = state;
         Self {
             governance: GovernanceClassCMut::new(governance),
+            role_state: RoleStateClassCMut::new(role_state),
+            membership: &*membership,
+            receive_buffer,
+            checkpoint_events_since,
+        }
+    }
+}
+
+/// The CONSEQUENCE-ENGINE split (ADR-049 §9 / RED-CS3 / R1).
+///
+/// Identical to [`ClassCSplit`] EXCEPT its `role_state` is the consequence-only
+/// [`ConsequenceRoleStateMut`], which exposes the downward-authorization GROW
+/// mutators (`suspend_capabilities` / `suspend_all`) and the demotion
+/// (`system_assign_role`). This is the ONLY split that can apply a downward-auth
+/// GROW — and its cell-holding caller persists that GROW FAIL-CLOSED before
+/// acking (RED-CS3: [`crate::context::governance_logic::enforce_triggered_consequences`]
+/// returns a downward-auth flag the caller acts on).
+///
+/// Un-ALIASED from [`ClassCSplit`] (R1): a type alias would hand the GROW view to
+/// every best-effort caller of [`ClassCMut::split_class_c`], re-opening the §9
+/// hole this PR closes. As a distinct struct, the GROW reach is confined to the
+/// consequence path (built via [`ClassCMut::consequence_split`] or the cell-free
+/// [`Self::from_state`]); best-effort callers get [`ClassCSplit`] with no GROW.
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / RED-CS3: the consequence-engine split; its `role_state` (GROW) is the live consequence path, the other fields drive event emission / cooldown. Some accessors are exercised by tests; the rest are production consequence callers."
+)]
+pub(crate) struct ConsequenceStateSplit<'a> {
+    /// Field-granular Class-C governance view (no whole `&mut GovernanceState`,
+    /// no `class_s` reach) — same as [`ClassCSplit::governance`].
+    pub(crate) governance: GovernanceClassCMut<'a>,
+    /// CONSEQUENCE-ONLY role view exposing the downward-auth GROW mutators. The
+    /// cell-holding caller persists any applied GROW / demotion fail-closed.
+    pub(crate) role_state: ConsequenceRoleStateMut<'a>,
+    /// `&` membership (read-only in the consequence path).
+    pub(crate) membership: &'a MembershipState,
+    /// `&mut` receive buffer (consequence events are emitted here).
+    pub(crate) receive_buffer: &'a mut ReceiveBuffer,
+    /// `&mut` checkpoint counter (bumped by consequence enforcement).
+    pub(crate) checkpoint_events_since: &'a mut u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/tool/sweep path."
+)]
+impl<'a> ConsequenceStateSplit<'a> {
+    /// Build a [`ConsequenceStateSplit`] DIRECTLY from a `&mut PerContextState`,
+    /// with NO owning [`ClassSCell`] / [`ClassCMut`] in scope (the cell-free
+    /// governance-helper consequence sites). Mirrors [`ClassCSplit::from_state`]'s
+    /// disjoint destructure, but wraps `role_state` in the GROW-capable
+    /// [`ConsequenceRoleStateMut`]. The Class-S sub-structs `class_s` (actor) and
+    /// `governance.class_s` are never bound `&mut` (left to the `..` rest / the
+    /// `GovernanceClassCMut` `..`); `membership` is narrowed to shared `&`.
+    pub(crate) fn from_state(state: &'a mut PerContextState) -> Self {
+        let PerContextState {
+            governance,
             role_state,
+            membership,
+            receive_buffer,
+            checkpoint_events_since,
+            ..
+        } = state;
+        Self {
+            governance: GovernanceClassCMut::new(governance),
+            role_state: ConsequenceRoleStateMut::from_parts(role_state.class_c_parts()),
             membership: &*membership,
             receive_buffer,
             checkpoint_events_since,
@@ -1510,7 +1804,7 @@ impl<'a> ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -1601,7 +1895,10 @@ impl<'a> ClassCMut<'a> {
             lifecycle_state,
             mode,
             membership,
-            class_s,
+            // BLACK-CS-01: wrap the shared Class-S reach in `SharedClassS` (no
+            // `&mut` accessor, no `DerefMut`) — re-arming `&mut` now requires three
+            // central edits, not a one-token flip of this binding.
+            class_s: SharedClassS::new(class_s),
             governance: GovernanceClassCMut::new(governance),
         }
     }
@@ -1679,56 +1976,18 @@ impl<'a> ClassCMut<'a> {
         crate::context::state::emit_event_into(self.receive_buffer, event, context_id, tx);
     }
 
-    /// `&mut` access to the whole role / ceiling / assignment state.
-    ///
-    /// [`ContextRoleState`] is DUAL-USE: it carries Class-C structural fields AND
-    /// the downward-authorization Class-S fields `ceiling` /
-    /// `suspended_capabilities`. This whole-`&mut` accessor can in principle
-    /// reach those, so for STRUCTURAL-ONLY mutations the restricted
-    /// [`Self::role_state_class_c_mut`] (structural `&mut`, downward-auth fields
-    /// `&`-read) is preferred and used by the migrated read/structural callers,
-    /// and read-only needs use [`Self::role_state`].
-    ///
-    /// This whole-`&mut` is RETAINED only for the few sites that hand the entire
-    /// `&mut ContextRoleState` to the [`scp_protocol::context::roles`] free
-    /// functions (`system_assign_role`), which take a `&mut ContextRoleState` and
-    /// mutate the structural fields (`assignments` / `member_capabilities` /
-    /// `members`). Of the downward-auth pair they leave `ceiling` untouched and
-    /// touch `suspended_capabilities` ONLY via the SHRINK-only
-    /// `prune_suspensions_to_role_grants` (dropping a member's suspensions for
-    /// capabilities the reassigned role no longer grants). A best-effort prune is
-    /// §9-safe in the DIRECTIONAL sense that matters: a coalesce-window rollback of
-    /// a prune can only RE-SUSPEND a dropped entry (re-narrow authority) — never
-    /// re-grant a removed capability — and it rolls back in lockstep with the
-    /// same-persist `member_capabilities` replacement, so a member is never left
-    /// effectively un-denied. (The two `system_assign_role` callers here are member
-    /// ADD / JOIN, where no prior suspension entry exists, so the prune is a no-op
-    /// there anyway.) The dangerous GROW direction (`suspend_capabilities` /
-    /// `suspend_all`, which `extend` / `insert`) is the one made fail-closed
-    /// (RED-CS3). Those callers ride the ordinary best-effort persist (member ADD /
-    /// role assignment is coalesce-window-rollback acceptable, ADR-049 §9), so the
-    /// whole-`&mut` is not a downward-auth bypass at those sites.
-    ///
-    /// The remaining §9 concern is the dual-use `ceiling` / `suspended_capabilities`
-    /// pair (the "Known residual" in the module docs). The BEHAVIORAL hole there —
-    /// the consequence-engine auto-suspension being lost on a coalesce-window
-    /// crash — is now CLOSED: the consequence path persists an applied suspension
-    /// fail-closed at the cell boundary (RED-CS3). What remains is structural
-    /// (this whole-`&mut` still *can* name those fields); do NOT add new callers
-    /// that mutate `ceiling` / `suspended_capabilities` through it — route a
-    /// downward-auth transition through a fail-closed combinator instead.
-    pub(crate) const fn role_state_mut(&mut self) -> &mut ContextRoleState {
-        self.role_state
-    }
-
     /// RESTRICTED Class-C view over the dual-use [`ContextRoleState`]: a
     /// [`RoleStateClassCMut`] that exposes `&mut` ONLY for the structural /
     /// Class-C fields (role definitions, assignments, the member set, derived
-    /// capabilities) and a shared `&` READ for the downward-authorization
-    /// Class-S fields (`ceiling`, `suspended_capabilities`). Use this — NOT
-    /// [`Self::role_state_mut`] — for best-effort / compensation structural
-    /// mutations of the role state, so a §9 downward-auth bypass is a compile
-    /// error by construction.
+    /// capabilities), the SHRINK-only suspension prune, and a `system_assign_role`
+    /// that mints over those fields — plus shared `&` READS for the
+    /// downward-authorization Class-S fields (`ceiling`, `suspended_capabilities`).
+    /// There is deliberately NO whole-`&mut` `role_state_mut` accessor and NO GROW
+    /// (`suspend_capabilities` / `suspend_all`) on this view (the GROW path lives
+    /// ONLY on the consequence-only [`ConsequenceRoleStateMut`] carried by
+    /// [`Self::consequence_split`]). Use this for best-effort / compensation /
+    /// structural mutations of the role state, so a §9 downward-auth GROW bypass is
+    /// a compile error by construction.
     pub(crate) fn role_state_class_c_mut(&mut self) -> RoleStateClassCMut<'_> {
         RoleStateClassCMut::new(self.role_state)
     }
@@ -1738,7 +1997,8 @@ impl<'a> ClassCMut<'a> {
     /// mutate the dual-use downward-auth Class-S fields (`ceiling` /
     /// `suspended_capabilities`), so it raises no §9 fail-closed obligation. Use
     /// this for read-only needs (capability checks, snapshotting/cloning the role
-    /// state) instead of the whole-`&mut` [`Self::role_state_mut`].
+    /// state); structural mutations use [`Self::role_state_class_c_mut`] (there is
+    /// no whole-`&mut` accessor).
     pub(crate) const fn role_state(&self) -> &ContextRoleState {
         self.role_state
     }
@@ -1953,10 +2213,11 @@ impl<'a> ClassCMut<'a> {
     /// There is NO `&mut` counterpart on this view — a mutation of the actor's
     /// `ClassSState` from the best-effort / compensation path is a compile error by
     /// construction. (This is one of the three privatized Class-S fields; the
-    /// dual-use `ContextRoleState.ceiling` / `suspended_capabilities` Class-S pair
-    /// is NOT covered by this guarantee — see the module "Known residual" section.)
+    /// dual-use `ContextRoleState.ceiling` / `suspended_capabilities` pair is now
+    /// covered by a complementary structural guarantee — privatized + GROW-confined
+    /// to the consequence-only view, see the module section above.)
     pub(crate) const fn class_s(&self) -> &ClassSState {
-        self.class_s
+        self.class_s.get()
     }
 
     // NOTE: This view intentionally holds NO whole `&mut PerContextState` /
@@ -1976,12 +2237,30 @@ impl<'a> ClassCMut<'a> {
     /// Class-S: governance is the field-granular [`GovernanceClassCMut`] (which
     /// cannot reach `governance.class_s`), and `class_s` itself is not handed out
     /// here (the split is for the structural consequence path).
-    pub(crate) const fn split_class_c(&mut self) -> ClassCSplit<'_> {
+    pub(crate) fn split_class_c(&mut self) -> ClassCSplit<'_> {
         ClassCSplit {
             governance: self.governance.reborrow(),
-            role_state: &mut *self.role_state,
+            // Field-granular role view (ADR-049 §9): NO whole `&mut`, NO GROW path.
+            role_state: RoleStateClassCMut::new(&mut *self.role_state),
             // SHARED reborrow: the consequence/split path reads membership only,
             // so the held `&mut` is narrowed to `&` here (unchanged behaviour).
+            membership: &*self.membership,
+            receive_buffer: &mut *self.receive_buffer,
+            checkpoint_events_since: &mut *self.checkpoint_events_since,
+        }
+    }
+
+    /// Produce the CONSEQUENCE-ENGINE split (ADR-049 §9 / RED-CS3 / R1): identical
+    /// disjoint borrows to [`Self::split_class_c`], but `role_state` is the
+    /// GROW-capable [`ConsequenceRoleStateMut`]. Used ONLY by the consequence sites
+    /// (receive / send / tool-settle / periodic sweep), whose cell-holding caller
+    /// persists any applied downward-auth GROW / demotion FAIL-CLOSED. Best-effort
+    /// callers use [`Self::split_class_c`] (no GROW), so the §9 GROW path is
+    /// structurally confined here.
+    pub(crate) fn consequence_split(&mut self) -> ConsequenceStateSplit<'_> {
+        ConsequenceStateSplit {
+            governance: self.governance.reborrow(),
+            role_state: ConsequenceRoleStateMut::from_parts(self.role_state.class_c_parts()),
             membership: &*self.membership,
             receive_buffer: &mut *self.receive_buffer,
             checkpoint_events_since: &mut *self.checkpoint_events_since,
@@ -2960,6 +3239,50 @@ mod tests {
     // guarded invariant.
     static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
 
+    // BLACK-CS-01 (ADR-049 §9): the Class-S reach on the best-effort `ClassCMut`
+    // view is a `SharedClassS` (private `&ClassSState`, no `&mut` accessor). It
+    // MUST NOT implement `DerefMut` — a `DerefMut` would hand out a
+    // `&mut ClassSState` outside any persist combinator. If anyone ever adds
+    // `impl DerefMut for SharedClassS`, this assertion fails to compile. (Re-arming
+    // a `&mut` would also require editing the `ClassCMut.class_s` field type AND
+    // `SharedClassS`'s private field AND `SharedClassS::new` — three central edits,
+    // not a one-token flip — so the wrapper, not a doctest, is the guarantee.)
+    static_assertions::assert_not_impl_any!(SharedClassS<'static>: core::ops::DerefMut);
+
+    /// BLACK-CS-03 (ADR-049 §9) compile-witness: the general-purpose
+    /// `RoleStateClassCMut` exposes NO downward-auth GROW (`suspend_capabilities` /
+    /// `suspend_all`) — only the read accessors and the SHRINK-only prune. The GROW
+    /// direction lives ONLY on `ConsequenceRoleStateMut` (whose caller persists
+    /// fail-closed). This positive compile-witness names the methods that MUST be
+    /// the role view's full downward-auth surface; if a GROW method were ever added
+    /// to `RoleStateClassCMut`, the confinement claim in its doc is violated — the
+    /// witness documents the intended surface as a function reference (no
+    /// `assert_not_impl_any` for a method, so a positive witness is used, per
+    /// `.docs/lessons/rust/compile-time-boundary-over-source-text-denylist.md`).
+    #[test]
+    fn assert_role_view_has_no_grow() {
+        // Reference the downward-auth-relevant methods of the general role view by
+        // PATH: a SHARED read + a SHRINK-only prune + a ceiling read. There is no
+        // GROW counterpart on `RoleStateClassCMut` — `suspend_capabilities` /
+        // `suspend_all` exist ONLY on `ConsequenceRoleStateMut` (referenced last to
+        // confirm the GROW path was CONFINED there, not lost). If a GROW method were
+        // added to `RoleStateClassCMut`, the doc claim is violated; this witness
+        // documents the intended surface (a positive witness — no
+        // `assert_not_impl_any` exists for a method).
+        // Reference each method as a fn-ITEM value (zero-sized). This forces the
+        // path to resolve — the method must exist on the named type — without a
+        // fn-pointer cast (whose lifetime quantification fights the borrow checker).
+        // These are the ONLY downward-auth-relevant methods on the general role
+        // view: a SHARED read, the SHRINK-only prune, and the ceiling read. There is
+        // NO GROW (`suspend_capabilities` / `suspend_all`) counterpart here.
+        fn require<T>(_: T) {}
+        require(RoleStateClassCMut::suspended_capabilities);
+        require(RoleStateClassCMut::prune_suspensions_to_role_grants);
+        require(RoleStateClassCMut::ceiling);
+        // The GROW method exists ONLY on the consequence-only view (CONFINED, not lost).
+        require(ConsequenceRoleStateMut::suspend_all);
+    }
+
     // Defense-in-depth (ADR-049 §9): the linear deferred-persist obligation MUST
     // be un-duplicable. `ClassSCommitToken` must NOT implement `Clone` (nor
     // `Copy`) — cloning the token would let a caller commit one copy and silently
@@ -3137,6 +3460,79 @@ mod tests {
             pos += 1;
         }
         pos
+    }
+
+    /// Find every INHERENT `impl <type_name> { … }` block in `code` (which MUST be
+    /// [`code_only`]-stripped) and return each block's code-only body (header
+    /// through its matching closing `}`), brace-depth bounded (BLACK-CS-02).
+    ///
+    /// Matches `impl` + whitespace + `type_name` (word-bounded — the next char must
+    /// not be an identifier char, so `ClassSCell` does not match `ClassSCellFoo`) +
+    /// optional whitespace/newline + `{`. This handles the inline (`impl T{…}`),
+    /// multi-space, and newline-before-brace spellings a brittle literal
+    /// `"\nimpl T {\n"` scan would miss — closing the BLACK-CS-02 evasion where an
+    /// inline `impl ClassSCell{ … }` block hid a no-persist mutator. A trait impl
+    /// (`impl Trait for T`) is excluded because the token immediately after the
+    /// `impl`-whitespace is the trait name, not `type_name` (and an `impl T for …`
+    /// would have `for` where the `{` is expected, so it is rejected by the
+    /// brace-follows check).
+    fn find_inherent_impl_blocks(code: &str, type_name: &str) -> Vec<String> {
+        let bytes = code.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut blocks = Vec::new();
+        let mut search = 0usize;
+        while let Some(rel) = code[search..].find("impl") {
+            let impl_at = search + rel;
+            search = impl_at + 4;
+            // `impl` must be a standalone keyword (word-bounded both sides).
+            if impl_at > 0 && is_ident(bytes[impl_at - 1]) {
+                continue;
+            }
+            let mut pos = impl_at + 4;
+            if pos >= bytes.len() || !bytes[pos].is_ascii_whitespace() {
+                continue;
+            }
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            // The token here must be exactly `type_name`, word-bounded.
+            if !code[pos..].starts_with(type_name) {
+                continue;
+            }
+            let after_name = pos + type_name.len();
+            if after_name < bytes.len() && is_ident(bytes[after_name]) {
+                continue;
+            }
+            // Optional whitespace/newline, then the opening `{` (inherent impl).
+            let mut brace = after_name;
+            while brace < bytes.len() && bytes[brace].is_ascii_whitespace() {
+                brace += 1;
+            }
+            if brace >= bytes.len() || bytes[brace] != b'{' {
+                // e.g. `impl ClassSCell where …` or `impl Trait for ClassSCell` —
+                // not an inherent `impl T {` header. Skip.
+                continue;
+            }
+            // Brace-depth bound the block (braces in comments/strings already gone).
+            let mut depth = 0i32;
+            let mut end = brace;
+            for (idx, ch) in code[brace..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = brace + idx + ch.len_utf8();
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            blocks.push(code[impl_at..end].to_owned());
+            search = end;
+        }
+        blocks
     }
 
     /// Whether `header_line` (a 4-space-indented line) is a method header —
@@ -3349,8 +3745,10 @@ mod tests {
     /// the only `&mut` to those fields originates inside a `ClassSCell` method (the
     /// combinators + token paths, which persist). (The dual-use
     /// `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth fields
-    /// are NOT yet privatized — `ClassCMut::role_state_mut` still reaches them; see
-    /// the module-level "Known residual" section.) Field privatization to
+    /// are now privatized to `pub(crate)` in `scp-protocol` and the whole-`&mut`
+    /// `role_state_mut` accessor is deleted — the downward-auth GROW is confined to
+    /// the consequence-only view; see the module section above.) Field privatization
+    /// to
     /// `pub(in crate::context)` is the OUTER, defense-in-depth ring: it stops code
     /// *outside* `crate::context` from naming the fields, but does NOT (and cannot)
     /// stop a sibling module under `crate::context` from naming them — so the
@@ -3464,39 +3862,35 @@ mod tests {
             "restore_class_s",
         ];
 
-        // Exactly-ONE-block guard: the isolation below scans only the FIRST
-        // `impl ClassSCell {` block (from its header to the next
-        // `impl ClassSCommitToken {`). A SECOND `impl ClassSCell {` block placed
-        // AFTER `impl ClassSCommitToken {` would escape that window entirely,
-        // letting a no-persist Class-S mutator hide in the un-scanned block. Assert
-        // there is EXACTLY ONE inherent `impl ClassSCell {` block so the
-        // single-window isolation is sound. Counted over the COMMENT/STRING-
-        // stripped source so the literal `"\nimpl ClassSCell {\n"` in this test's
-        // own `.find(...)` arguments (and any doc-comment mentions) do not inflate
-        // the count.
+        // Exactly-ONE-block guard, BRACE-DEPTH-AWARE (BLACK-CS-02): isolate EVERY
+        // inherent `impl ClassSCell { … }` block over the COMMENT/STRING-stripped
+        // source via `find_inherent_impl_blocks`, which matches `impl` + ws +
+        // `ClassSCell` + ws + `{` (handling the inline `impl ClassSCell{…}`,
+        // multi-space, and newline-before-brace spellings a literal
+        // `"\nimpl ClassSCell {\n"` scan missed — the exact spelling that let a
+        // hostile inline no-persist mutator hide) and brace-bounds each body. The
+        // prior whitespace-literal count was the BLACK-CS-02 hole. Assert there is
+        // EXACTLY ONE such block so the single-block scan is exhaustive.
         let src_code = code_only(SRC);
-        let impl_block_count = src_code.matches("\nimpl ClassSCell {\n").count();
+        let cell_blocks = find_inherent_impl_blocks(&src_code, "ClassSCell");
         assert_eq!(
-            impl_block_count, 1,
-            "ADR-049 §9: expected EXACTLY ONE `impl ClassSCell {{` block, found \
-             {impl_block_count}. The whitelist tripwire isolates only the FIRST \
-             such block (up to the next `impl ClassSCommitToken {{`); a 2nd block \
-             after the token impl would escape the scan and could hide a no-persist \
-             Class-S mutator. Merge the blocks into one, or extend this tripwire to \
-             scan ALL `impl ClassSCell` blocks."
+            cell_blocks.len(),
+            1,
+            "ADR-049 §9 (BLACK-CS-02): expected EXACTLY ONE inherent `impl ClassSCell` \
+             block, found {}. The whitelist tripwire scans the block(s) this finds; a \
+             2nd block (in ANY brace/whitespace spelling) could hide a no-persist \
+             Class-S mutator. Merge the blocks into one.",
+            cell_blocks.len()
         );
 
-        // Isolate the `impl ClassSCell { … }` block: from its header to the next
-        // top-level `impl ClassSCommitToken` so the scan is about THIS impl only,
-        // not the token impl or the views above it.
-        let impl_start = SRC
-            .find("\nimpl ClassSCell {\n")
-            .expect("impl ClassSCell block must exist");
-        let after = &SRC[impl_start + 1..];
-        let impl_end_rel = after
-            .find("\nimpl ClassSCommitToken {\n")
-            .expect("impl ClassSCommitToken follows impl ClassSCell");
-        let impl_block = &after[..impl_end_rel];
+        // The isolated `impl ClassSCell { … }` block — code-only, brace-bounded.
+        // The downstream method enumeration / persist-marker scan run over THIS
+        // block only.
+        let impl_block = cell_blocks
+            .into_iter()
+            .next()
+            .expect("one ClassSCell block");
+        let impl_block = impl_block.as_str();
 
         // Enumerate `self`-receiver methods and classify each by whether its body
         // performs ANY persist mechanism. A method with NO persist mechanism that
@@ -3811,6 +4205,59 @@ impl ClassSCell {
         assert_eq!(
             recognized, 5,
             "is_method_header must recognize all five crafted `fn` headers"
+        );
+    }
+
+    /// ADR-049 §9 (BLACK-CS-02) — `find_inherent_impl_blocks` is brace-depth-aware,
+    /// so an INLINE / multi-space / newline-brace second `impl ClassSCell` block is
+    /// detected (the prior literal `"\nimpl ClassSCell {\n"` count missed all three
+    /// spellings, letting a hostile no-persist mutator hide in an un-scanned block).
+    #[test]
+    fn tripwire_counts_inline_and_spaced_impl_blocks() {
+        // One canonical block + an INLINE hostile block (no space before `{`, body
+        // on one line) + a multi-space + a newline-before-brace block. A brittle
+        // `"\nimpl ClassSCell {\n"` scan would count only the canonical one.
+        let src = "\
+impl ClassSCell {
+    fn ok(&mut self) { persist_state_fail_closed(); }
+}
+impl ClassSCell{ fn evil(&mut self){ self.state.class_s.saga_pending.clear(); } }
+impl  ClassSCell   {
+    fn spaced(&self) {}
+}
+impl ClassSCell
+{
+    fn newline_brace(&self) {}
+}
+";
+        let code = code_only(src);
+        let blocks = find_inherent_impl_blocks(&code, "ClassSCell");
+        assert_eq!(
+            blocks.len(),
+            4,
+            "brace-aware scan must find ALL FOUR `impl ClassSCell` blocks \
+             (canonical + inline + multi-space + newline-brace); found {}: {:?}",
+            blocks.len(),
+            blocks
+        );
+        // The inline hostile block's body must be isolated intact (so its
+        // no-persist `evil` mutator would be classified, not hidden).
+        assert!(
+            blocks.iter().any(|b| b.contains("fn evil")),
+            "the inline hostile block must be isolated so its mutator is scannable"
+        );
+        // Word-boundary: `ClassSCellFoo` is NOT `ClassSCell`.
+        let not = code_only("impl ClassSCellFoo { fn x(&self) {} }");
+        assert!(
+            find_inherent_impl_blocks(&not, "ClassSCell").is_empty(),
+            "the type-name match must be word-bounded (no `ClassSCellFoo` match)"
+        );
+        // A trait impl `impl Trait for ClassSCell { … }` is NOT an inherent block.
+        let trait_impl = code_only("impl Deref for ClassSCell { fn deref(&self) {} }");
+        assert!(
+            find_inherent_impl_blocks(&trait_impl, "ClassSCell").is_empty(),
+            "a trait impl (`impl Trait for ClassSCell`) must not be counted as an \
+             inherent `impl ClassSCell` block"
         );
     }
 
@@ -4347,7 +4794,7 @@ impl ClassSCell {
         // Drive the suspension through the handler's exact view path.
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
-            let mut split = view.split_class_c();
+            let mut split = view.consequence_split();
             enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
@@ -4369,8 +4816,7 @@ impl ClassSCell {
         );
         assert!(
             cell.role_state
-                .suspended_capabilities
-                .get(subject.as_ref())
+                .suspended_for(subject.as_ref())
                 .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
             "the suspension is applied in memory before the persist"
         );
@@ -4389,8 +4835,7 @@ impl ClassSCell {
         // persist — it is not silently lost on a coalesce-window crash.
         assert!(
             cell.role_state
-                .suspended_capabilities
-                .get(subject.as_ref())
+                .suspended_for(subject.as_ref())
                 .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
             "keep-direction: the auto-suspension stays in memory through a persist \
              failure, so the denied capability is not silently re-granted (RED-CS3)"
@@ -4442,8 +4887,8 @@ impl ClassSCell {
                 "high".to_owned(),
                 Vec::new(),
             );
-            let role_state = view.role_state_mut();
-            role_state.role_definitions.insert(
+            let mut role_state = view.role_state_class_c_mut();
+            role_state.role_definitions_mut().insert(
                 "high".to_owned(),
                 RoleDefinition {
                     name: "high".to_owned(),
@@ -4453,15 +4898,15 @@ impl ClassSCell {
                     ]),
                 },
             );
-            role_state.role_definitions.insert(
+            role_state.role_definitions_mut().insert(
                 "low".to_owned(),
                 RoleDefinition {
                     name: "low".to_owned(),
                     capabilities: HashSet::from([Capability::MessagesRead]),
                 },
             );
-            role_state.members.insert(subject.as_ref().to_owned());
-            role_state.member_capabilities.insert(
+            role_state.members_mut().insert(subject.as_ref().to_owned());
+            role_state.member_capabilities_mut().insert(
                 subject.as_ref().to_owned(),
                 HashSet::from([Capability::MessagesRead, Capability::MessagesWrite]),
             );
@@ -4487,7 +4932,7 @@ impl ClassSCell {
         // Drive the demotion through the handler's exact view path.
         let downward_auth_applied = {
             let mut view = cell.class_c_view();
-            let mut split = view.split_class_c();
+            let mut split = view.consequence_split();
             enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
@@ -5484,11 +5929,11 @@ impl ClassSCell {
         );
     }
 
-    /// `ClassCMut::role_state_mut` hands out a `&mut ContextRoleState`; a member
-    /// inserted into its `members` set is observable on the underlying
-    /// `cell.role_state`.
+    /// `ClassCMut::role_state_class_c_mut` hands out a `RoleStateClassCMut` (no
+    /// whole `&mut`, no GROW); a member inserted into its `members` set via
+    /// `members_mut()` is observable on the underlying `cell.role_state`.
     #[tokio::test]
-    async fn best_effort_role_state_mut_mutates_through_view() {
+    async fn best_effort_role_state_class_c_mut_mutates_members_through_view() {
         let deps = build_deps(Box::new(OkPersistence)).await;
         let mut cell = ClassSCell::new(fresh_state(0x58));
         let ctx = ctx_hex(0x58);
@@ -5496,12 +5941,14 @@ impl ClassSCell {
         let member_for_assert = member_did.clone();
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
-            view.role_state_mut().members.insert(member_did);
+            view.role_state_class_c_mut()
+                .members_mut()
+                .insert(member_did);
         });
 
         assert!(
             cell.role_state.members.contains(&member_for_assert),
-            "member inserted through role_state_mut"
+            "member inserted through role_state_class_c_mut().members_mut()"
         );
     }
 

@@ -1094,7 +1094,7 @@ fn validate_ucan_rebind(
         CapabilityUri::new(target_hex, "tool_invoke", req.tool_registration_id.clone());
 
     // The ceiling URI set + B's context-creator are taken from B's role state.
-    let ceiling = state.role_state.ceiling.to_ucan_string_set();
+    let ceiling = state.role_state.ceiling().to_ucan_string_set();
     let creator_did = state.role_state.creator_did.clone();
     let revoked = state.governance.revoked_spending_ucan_cids.clone();
 
@@ -3019,10 +3019,11 @@ mod tests {
         st.role_state
             .member_capabilities
             .insert(member.to_owned(), caps);
-        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::ToolInterface,
-            Capability::ToolInvokeAll,
-        ]);
+        st.role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::ToolInterface,
+                Capability::ToolInvokeAll,
+            ]));
         st.governance.registered_tools.push(ToolRegistration {
             tool_id: TOOL.to_owned(),
             name: "Calculator".to_owned(),

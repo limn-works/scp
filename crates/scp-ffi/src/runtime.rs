@@ -1463,7 +1463,6 @@ pub fn register_ffi_state(
             let ceiling = default_ceiling();
             let ceiling_strings = if user_ceiling.is_empty() {
                 ceiling
-                    .capabilities
                     .iter()
                     .map(scp_core::context::roles::Capability::ucan_capability_name)
                     .collect::<HashSet<String>>()

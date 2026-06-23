@@ -13847,8 +13847,11 @@ mod tests {
         state
             .membership
             .add_member(target.clone(), "member".to_owned(), Vec::new());
-        state.role_state.ceiling =
-            scp_protocol::context::roles::CapabilityCeiling::new([Capability::MemberBan]);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MemberBan,
+            ]));
         state
             .role_state
             .member_capabilities
@@ -13898,8 +13901,7 @@ mod tests {
         assert!(
             persisted
                 .role_state
-                .suspended_capabilities
-                .get(target.as_ref())
+                .suspended_for(target.as_ref())
                 .is_some_and(|c| c.contains(&Capability::MessagesWrite)),
             "sync-persisted snapshot must show MessagesWrite suspended"
         );
@@ -13933,8 +13935,7 @@ mod tests {
         assert!(
             after
                 .role_state
-                .suspended_capabilities
-                .get(target.as_ref())
+                .suspended_for(target.as_ref())
                 .is_some_and(|c| {
                     c.contains(&Capability::MessagesWrite) && c.contains(&Capability::MessagesRead)
                 }),
@@ -14929,8 +14930,7 @@ mod tests {
             .expect("snapshot present after respawn");
         let suspended = snap
             .role_state
-            .suspended_capabilities
-            .get(target.as_ref())
+            .suspended_for(target.as_ref())
             .expect("the banned member's suspension must survive the crash");
         assert!(
             suspended.contains(&Capability::MessagesWrite)
@@ -15339,10 +15339,11 @@ mod tests {
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
-        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::ToolInterface,
-            Capability::ToolInvokeAll,
-        ]);
+        st.role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::ToolInterface,
+                Capability::ToolInvokeAll,
+            ]));
         // Established (both-approved) outbound interface caller→target for
         // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
         // passes. Source/target ids are the hex id-form §6.2.4 stores.
@@ -15391,10 +15392,11 @@ mod tests {
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
-        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::ToolInterface,
-            Capability::ToolInvokeAll,
-        ]);
+        st.role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::ToolInterface,
+                Capability::ToolInvokeAll,
+            ]));
         st.governance.registered_tools.push(ToolRegistration {
             tool_id: XCTX_TOOL.to_owned(),
             name: "Calculator".to_owned(),

@@ -814,17 +814,17 @@ fn handle_evaluate_periodic_consequences_actor(
         return Outcome::ok(());
     }
     // Consequence EVALUATION rides the run loop's coalesced persist — the
-    // non-persisting Class-C view supplies the same disjoint `ClassCSplit`
-    // borrows `ConsequenceStateSplit` needs (it is a type alias for
-    // `ClassCSplit`). The downward-auth outcomes it can produce — a capability
-    // suspension (a `suspended_capabilities` GROW) or an `AssignRole` demotion (a
-    // `member_capabilities` replacement) — are OR-accumulated here and persisted
-    // fail-closed below (ADR-049 §9, RED-CS3): a coalesce-window crash must not
-    // silently re-grant a member's removed authority.
+    // non-persisting Class-C view supplies the disjoint `consequence_split()`
+    // borrows `ConsequenceStateSplit` needs (its `role_state` is the
+    // consequence-only GROW view). The downward-auth outcomes it can produce — a
+    // capability suspension (a `suspended_capabilities` GROW) or an `AssignRole`
+    // demotion (a `member_capabilities` replacement) — are OR-accumulated here and
+    // persisted fail-closed below (ADR-049 §9, RED-CS3): a coalesce-window crash
+    // must not silently re-grant a member's removed authority.
     let mut downward_auth_applied = false;
     {
         let mut view = cell.class_c_view();
-        let mut split = view.split_class_c();
+        let mut split = view.consequence_split();
         for (member_did, triggered) in &results {
             downward_auth_applied |= enforce_triggered_consequences(
                 &mut split,
@@ -1457,8 +1457,7 @@ mod consequence_fail_closed_tests {
         // re-grant window on the next coalesced write).
         let suspended = cell
             .role_state
-            .suspended_capabilities
-            .get(SUBJECT)
+            .suspended_for(SUBJECT)
             .expect("SUBJECT must have been suspended by the sweep");
         assert!(
             suspended.contains(&Capability::MessagesWrite),
@@ -1517,8 +1516,7 @@ mod consequence_fail_closed_tests {
         );
         let suspended = cell
             .role_state
-            .suspended_capabilities
-            .get(SUBJECT)
+            .suspended_for(SUBJECT)
             .expect("SUBJECT must have been suspended by the send-path consequence");
         assert!(
             suspended.contains(&Capability::MessagesWrite),
@@ -1593,8 +1591,7 @@ mod consequence_fail_closed_tests {
         // would then persist it fail-closed via the now-set sink).
         let suspended = cell
             .role_state
-            .suspended_capabilities
-            .get(SUBJECT)
+            .suspended_for(SUBJECT)
             .expect("SUBJECT must have been suspended by the receive-path consequence");
         assert!(suspended.contains(&Capability::MessagesWrite));
     }

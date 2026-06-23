@@ -974,7 +974,6 @@ impl UniffiBridgeInstance {
 
         let ceiling_strings = if ceiling.is_empty() {
             scp_core::context::roles::default_ceiling()
-                .capabilities
                 .iter()
                 .map(scp_core::context::roles::Capability::ucan_capability_name)
                 .collect::<HashSet<String>>()

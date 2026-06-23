@@ -475,7 +475,11 @@ pub async fn apply_pending_ceiling_modification(
     // persist via `view.rest_mut()`.
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
-        state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
+        // ADR-049 §9: downward-auth ceiling WRITE via the named `set_ceiling`
+        // mutator, inside this fail-closed-persisting `commit_class_s_keep`.
+        state.role_state.set_ceiling(CapabilityCeiling::new(
+            pending.new_capabilities.iter().cloned(),
+        ));
         state.governance.pending_ceiling_modification = None;
         Ok(())
     })?;
@@ -790,7 +794,7 @@ pub fn execute_suspend_member(
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
-        if !view.role_state.ceiling.contains(&Capability::MemberBan) {
+        if !view.role_state.ceiling().contains(&Capability::MemberBan) {
             return Err(ContextError::PermissionDenied(
                 "member:ban (MemberBan) capability not in ceiling".to_owned(),
             ));
@@ -869,7 +873,7 @@ pub fn execute_revoke(
             let state = view.rest_mut();
             require_active(&state.handle)?;
 
-            if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+            if !state.role_state.ceiling().contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
                     "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
@@ -1034,13 +1038,13 @@ pub fn execute_restore_access(
         let state = view.rest_mut();
         require_active(&state.handle)?;
 
-        if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+        if !state.role_state.ceiling().contains(&Capability::MemberBan) {
             return Err(ContextError::PermissionDenied(
                 "member:ban (MemberBan) capability not in ceiling".to_owned(),
             ));
         }
 
-        let suspended_set = state.role_state.suspended_capabilities.get(did.as_ref());
+        let suspended_set = state.role_state.suspended_for(did.as_ref());
         let nothing_suspended_for_request =
             suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
         let read_excluded = state.access.read_exclusion_list.contains(did);
@@ -1149,19 +1153,21 @@ pub fn execute_add_member(
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    // The fallible role assignment mutates the WHOLE `ContextRoleState` — it
-    // prunes `suspended_capabilities` (a downward-auth field) to the new role's
-    // grants, so the restricted Class-C role view cannot serve it. It runs in a
-    // NON-PERSISTING Class-C view borrow (the run-loop / the best-effort persist
-    // below covers it): this site is best-effort BY DESIGN — member ADD is
-    // coalesce-window-rollback acceptable (ADR-049 §9), so the suspension prune
-    // rides the SAME best-effort persist it always did. It is NOT strengthened
-    // to fail-closed.
+    // The fallible role assignment + structural member insert run through the
+    // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
+    // inserts assignments / member_capabilities and runs the SHRINK-only suspension
+    // prune over the view's own disjoint fields — no whole `&mut ContextRoleState`,
+    // no downward-auth GROW. It runs in a NON-PERSISTING Class-C view borrow (the
+    // run-loop / the best-effort persist below covers it): this site is best-effort
+    // BY DESIGN — member ADD is coalesce-window-rollback acceptable (ADR-049 §9), so
+    // the suspension prune rides the SAME best-effort persist it always did. It is
+    // NOT strengthened to fail-closed.
     let tokens = {
         let mut view = cell.class_c_view();
-        let role_state = view.role_state_mut();
-        role_state.members.insert(did.to_string());
-        roles::system_assign_role(role_state, did, role, &*deps.clock)
+        let mut role_state = view.role_state_class_c_mut();
+        role_state.members_mut().insert(did.to_string());
+        role_state
+            .system_assign_role(did, role, &*deps.clock)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?
     };
     let creator_did = cell.role_state.creator_did.clone();
@@ -1426,7 +1432,11 @@ pub fn execute_register_tool(
     // preserving the prior best-effort persist exactly.
     require_active(&cell.handle)?;
 
-    if !cell.role_state.ceiling.contains(&Capability::ToolRegister) {
+    if !cell
+        .role_state
+        .ceiling()
+        .contains(&Capability::ToolRegister)
+    {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool registration capability".into(),
         ));
@@ -1871,7 +1881,7 @@ pub fn execute_create_child_context(
 
     if !cell
         .role_state
-        .ceiling
+        .ceiling()
         .contains(&Capability::ChildContextCreate)
     {
         return Err(ContextError::PermissionDenied(
@@ -2195,7 +2205,11 @@ pub fn execute_establish_tool_interface(
     // best-effort persist exactly.
     require_active(&cell.handle)?;
 
-    if !cell.role_state.ceiling.contains(&Capability::ToolInterface) {
+    if !cell
+        .role_state
+        .ceiling()
+        .contains(&Capability::ToolInterface)
+    {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool interface capability".into(),
         ));
@@ -3296,8 +3310,7 @@ pub async fn propose_governance_action_inner(
     // GovernancePropose capability.
     if cell
         .role_state
-        .suspended_capabilities
-        .get(proposer_did.as_ref())
+        .suspended_for(proposer_did.as_ref())
         .is_some_and(|s| {
             s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
         })
@@ -3645,10 +3658,7 @@ pub async fn vote_on_proposal_inner(
     // path once these reads/mutations complete.
     require_active(&cell.handle)?;
 
-    let suspended = cell
-        .role_state
-        .suspended_capabilities
-        .get(voter_did.as_ref());
+    let suspended = cell.role_state.suspended_for(voter_did.as_ref());
     if suspended.is_some_and(|s| s.contains(&Capability::GovernanceVote)) {
         return Err(ContextError::PermissionDenied(
             "member does not have governance:vote capability".into(),
@@ -4330,7 +4340,7 @@ pub async fn dispatch_governance_action(
                 let state = view.rest_mut();
                 require_active(&state.handle)?;
 
-                if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+                if !state.role_state.ceiling().contains(&Capability::MemberBan) {
                     return Err(ContextError::PermissionDenied(
                         "member:ban (MemberBan) capability not in ceiling".to_owned(),
                     ));

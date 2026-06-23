@@ -5,11 +5,14 @@
 use scp_identity::DID;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
-use scp_protocol::context::roles;
-use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
 
-use super::actor::class_s::ClassCSplit;
+use super::actor::class_s::ConsequenceRoleStateMut;
+// Re-export the consequence split (defined in `class_s`) for the consequence
+// callers that reach it via this module's path. `pub(in crate::context)` matches
+// the type's `pub(crate)` effective reach within the context module tree without
+// tripping `redundant_pub_crate` (the module itself is private to `context`).
+pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
 use super::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
@@ -81,60 +84,20 @@ fn append_consequence_event(
     }
 }
 
-/// Field-disjoint mutable borrows of the per-context state needed by
-/// the consequence-enforcement chain.
-///
-/// This is an ALIAS for the ADR-049 §9 [`ClassCSplit`] view, so the
-/// consequence path is, by construction, cell-COMPATIBLE: a cell holder
-/// reaches the identical type via `cell.class_c_view().split_class_c()`, and
-/// the non-cell sites build it via [`Self::from_state`] (which bridges through
-/// [`ClassCSplit::from_state`]). It carries the same five disjoint borrows the
-/// enforcement helpers need:
-///
-/// - `governance: GovernanceClassCMut<'a>` — the field-granular Class-C
-///   governance view (NOT a whole `&mut GovernanceState`): it exposes the
-///   Class-C governance fields (e.g. the consequence `cooldown_until` map via
-///   [`cooldown_until_mut`](super::actor::class_s::GovernanceClassCMut::cooldown_until_mut))
-///   and CANNOT reach `governance.class_s`, so a consequence helper cannot
-///   accidentally mutate a Class-S governance field with no fail-closed persist.
-/// - `role_state: &'a mut ContextRoleState` — a whole-substruct `&mut` that can
-///   reach the dual-use downward-auth fields `ceiling` /
-///   `suspended_capabilities` AND the authorization-input field
-///   `member_capabilities`. The consequence path mutates `role_state` IN MEMORY
-///   during evaluation in two downward-auth ways — an anti-spam suspension
-///   (`suspend_all` / `suspend_capabilities`, a `suspended_capabilities` GROW)
-///   and an `AssignRole` demotion (`system_assign_role`, a `member_capabilities`
-///   REPLACEMENT) — but neither is a §9 BYPASS:
-///   [`enforce_triggered_consequences`] now RETURNS a downward-auth flag (`true`
-///   iff a downward-auth mutation was applied — either direction), and the
-///   cell-holding caller persists the mutated state FAIL-CLOSED (keep-direction)
-///   before acking (ADR-049 §9, RED-CS3). So the behavioral hole (a
-///   coalesce-window crash losing the suspension/demotion and re-granting removed
-///   authority) is CLOSED. The whole-`&mut` itself REMAINS for now (a structural
-///   residual, not a behavioral one): the consequence path legitimately needs to
-///   apply the in-memory mutations, and the field-granular [`RoleStateClassCMut`]
-///   exposes `suspended_capabilities` read-only. `ceiling` is never written on
-///   this path. Narrowing `role_state` to a field-granular shape (mutating
-///   through methods while the persist stays fail-closed at the caller) is the
-///   remaining cleanup, tracked alongside
-///   [`super::actor::class_s::ClassCMut::role_state_mut`].
-/// - `membership: &'a MembershipState` (read-only), `receive_buffer`,
-///   `checkpoint_events_since` — unchanged.
-///
-/// Both [`super::state::PerContextState`] (legacy) and
-/// [`crate::context::actor::state::PerContextState`] (actor) expose these same
-/// fields with identical types. Splitting the borrows lets the enforcement
-/// helpers preserve Rust's disjoint subfield borrows (a single method returning
-/// `&mut Self` would block the multiple mutable borrows the body needs).
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can drive the same enforcement pipeline as the legacy
-/// `&Supervisor`-shape `messaging_helpers_legacy` without duplicating
-/// the ~300 lines of consequence dispatch + escalation logic. Reshaped onto
-/// [`ClassCSplit`] (ADR-049 §9) so the type is cell-compatible; the reshape is
-/// NON-BREAKING — [`Self::from_state`] keeps its `&mut PerContextState`
-/// signature.
-pub type ConsequenceStateSplit<'a> = ClassCSplit<'a>;
+// `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
+// `super::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
+// struct — NOT an alias of `ClassCSplit` (ADR-049 §9 / RED-CS3 / R1): its
+// `role_state` is the consequence-only `ConsequenceRoleStateMut`, the one role
+// view that exposes the downward-authorization GROW mutators
+// (`suspend_capabilities` / `suspend_all`) and the demotion (`system_assign_role`).
+// Best-effort callers receive `ClassCSplit` (via `ClassCMut::split_class_c`),
+// whose `RoleStateClassCMut` has NO GROW, so a best-effort downward-auth GROW with
+// no fail-closed persist is a COMPILE error by construction (BLACK-CS-03 closed).
+// The consequence sites build this split via `ClassCMut::consequence_split` (cell
+// path) or `ConsequenceStateSplit::from_state` (cell-free governance-helper path);
+// the cell-holding caller persists any applied GROW / demotion FAIL-CLOSED before
+// acking — `enforce_triggered_consequences` returns the downward-auth flag it acts
+// on (RED-CS3).
 
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
 /// providers, scope identifiers, and pre-evaluated rule data into one
@@ -319,7 +282,7 @@ fn process_one_triggered_consequence(
     }
 
     let enforcement = dispatch_enforcement_action(
-        state.role_state,
+        &mut state.role_state,
         member_did,
         consequence,
         args.clock,
@@ -542,7 +505,7 @@ struct EnforcementOutcome {
 /// an `expression_statement` so the pipeline wiring gates can detect the
 /// `call_expression` per-variant.
 fn dispatch_enforcement_action(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     consequence: &TriggeredConsequence,
     clock: &dyn scp_primitives::Clock,
@@ -632,7 +595,7 @@ fn dispatch_enforcement_action(
 /// downward-auth fail-closed signal (ADR-049 §9): a mutation owes a fail-closed
 /// persist, a no-op does not.
 fn enforce_suspend(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     caps: &[Capability],
 ) -> bool {
@@ -653,12 +616,14 @@ fn enforce_suspend(
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_assign_role(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     to_role: &str,
     clock: &dyn scp_primitives::Clock,
 ) -> bool {
-    roles::system_assign_role(role_state, member_did, to_role, clock).is_ok()
+    role_state
+        .system_assign_role(member_did.as_ref(), to_role, clock)
+        .is_ok()
 }
 
 /// H10 + H4: when enforcement fails, escalate to `SuspendAll` AND emit two

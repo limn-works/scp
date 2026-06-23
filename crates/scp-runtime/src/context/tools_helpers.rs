@@ -907,21 +907,17 @@ pub async fn settle_tool_economy_capture(
         &consequence_rules,
     );
 
-    // Consequence path (ADR-049 §9). `split_class_c()` yields exactly the
-    // `ConsequenceStateSplit` shape — the same five disjoint Class-C / structural
-    // borrows `from_state(&mut PerContextState)` produced — from the field-granular
-    // cell view, with NO whole `&mut PerContextState` and NO `&mut` reach into any
-    // of the three PRIVATIZED Class-S sub-structs. (Its `role_state` borrow is the
-    // dual-use `ContextRoleState` STRUCTURAL residual — see ADR-049 §9 "Known
-    // residual" — through which `ceiling` / `suspended_capabilities` /
-    // `member_capabilities` remain nameable. The BEHAVIORAL §9 hole is closed:
-    // when enforcement applies a downward-auth mutation (a suspension or an
-    // `AssignRole` demotion) the cell-holding caller persists it FAIL-CLOSED,
-    // RED-CS3.) Consequence EVALUATION stays best-effort (the run loop
+    // Consequence path (ADR-049 §9 / RED-CS3). `consequence_split()` yields the
+    // consequence-engine split — disjoint Class-C / structural borrows plus the
+    // consequence-only `ConsequenceRoleStateMut` (the ONE role view exposing the
+    // downward-auth GROW + demotion) — from the field-granular cell view, with NO
+    // whole `&mut PerContextState` and NO `&mut` reach into any PRIVATIZED Class-S
+    // sub-struct. (`ceiling` is read-only even here; the GROW
+    // `suspended_capabilities` / the `member_capabilities` demotion are applied
+    // through methods.) Consequence EVALUATION stays best-effort (the run loop
     // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
-    // which the cell-holding caller performs when `downward_auth_applied` is set
-    // (ADR-049 §9, RED-CS3).
-    let mut split = view.split_class_c();
+    // which the cell-holding caller performs when `downward_auth_applied` is set.
+    let mut split = view.consequence_split();
     // OR-set the caller-owned sink so the mutation's fail-closed-persist
     // obligation survives the payment-capture error path below (a return-value
     // flag would be stranded by the early `return Err` — RED-CS3).
@@ -1297,9 +1293,10 @@ pub async fn settle_tool_economy(
             // state, membership, and the checkpoint counter in ADDITION to the
             // Class-C governance economy fields. `class_c_view()` hands out a
             // `ClassCMut` holding all of those as disjoint field references;
-            // `split_class_c()` (inside `settle_tool_economy_capture`) yields
-            // exactly the `ConsequenceStateSplit` shape with NO whole
-            // `&mut PerContextState` and NO Class-S reach. Evaluation coalesces
+            // `consequence_split()` (inside `settle_tool_economy_capture`) yields
+            // the `ConsequenceStateSplit` shape (consequence-only GROW role view)
+            // with NO whole `&mut PerContextState` and NO Class-S reach. Evaluation
+            // coalesces
             // through the run loop; the downward-auth outcomes — a
             // consequence-engine capability suspension or an `AssignRole` demotion
             // — are signalled via the caller-owned `downward_auth_applied` sink and
@@ -1759,8 +1756,7 @@ mod tests {
             );
             let suspended = cell
                 .role_state
-                .suspended_capabilities
-                .get(INVOKER)
+                .suspended_for(INVOKER)
                 .expect("INVOKER must have been suspended by the tool-rate consequence");
             assert!(
                 suspended.contains(&Capability::MessagesWrite),

@@ -76,7 +76,7 @@ use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::roles::{self, Capability, CapabilityCeiling, ContextRoleState};
+use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 
@@ -1112,23 +1112,27 @@ pub fn join_context_membership(
         );
     }
 
-    // Add member to role state.
-    view.role_state_mut().members.insert(member_did.to_string());
-
-    // Assign default "member" role.
+    // Add member to role state + assign the default "member" role through the
+    // field-granular Class-C role view (ADR-049 §9): structural member insert +
+    // the view's `system_assign_role` (which mints + inserts assignments /
+    // member_capabilities + runs the SHRINK-only suspension prune over its own
+    // disjoint fields). No whole `&mut ContextRoleState`, no downward-auth GROW.
     //
-    // H2: Use system_assign_role to bypass the RoleAssign capability
-    // check. The join handshake is a self-service flow that already
-    // passed economy / sybil / capacity / version gates above —
-    // re-checking `RoleAssign` against the creator would silently fail
-    // every join after the creator has been demoted out of an admin
-    // role. The default "member" role assignment carries no ambient
-    // authority (it's the protocol-defined floor), so there is nothing
-    // to authorize a second time.
-    let creator_did = view.role_state_mut().creator_did.clone();
-    let tokens =
-        roles::system_assign_role(view.role_state_mut(), member_did, "member", &*deps.clock)
+    // H2: `system_assign_role` bypasses the RoleAssign capability check. The join
+    // handshake is a self-service flow that already passed economy / sybil /
+    // capacity / version gates above — re-checking `RoleAssign` against the creator
+    // would silently fail every join after the creator has been demoted out of an
+    // admin role. The default "member" role assignment carries no ambient authority
+    // (it's the protocol-defined floor), so there is nothing to authorize again.
+    let (creator_did, tokens) = {
+        let mut rs = view.role_state_class_c_mut();
+        rs.members_mut().insert(member_did.to_string());
+        let creator_did = rs.creator_did().to_owned();
+        let tokens = rs
+            .system_assign_role(member_did, "member", &*deps.clock)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        (creator_did, tokens)
+    };
 
     // Add to membership tracking.
     view.membership_class_c_mut()
@@ -3659,11 +3663,13 @@ mod restore_reconcile_tests {
             now_secs,
             admin.clone(),
         );
-        state.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::MemberInvite,
-            Capability::MessagesWrite,
-            Capability::MessagesRead,
-        ]);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MemberInvite,
+                Capability::MessagesWrite,
+                Capability::MessagesRead,
+            ]));
         state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
             locked: false,
             cost_schedule: scp_protocol::economy::types::CostSchedule {

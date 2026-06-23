@@ -1331,16 +1331,10 @@ pub struct PerContextState {
 /// skeleton test path does not touch role logic, so a hand-rolled
 /// empty shape is sufficient.
 fn empty_role_state_for_test() -> ContextRoleState {
-    ContextRoleState {
-        context_id: String::new(),
-        creator_did: String::new(),
-        ceiling: scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
-        role_definitions: HashMap::new(),
-        assignments: HashMap::new(),
-        members: HashSet::new(),
-        member_capabilities: HashMap::new(),
-        suspended_capabilities: HashMap::new(),
-    }
+    // ADR-049 §9: `ContextRoleState`'s `ceiling` / `suspended_capabilities` fields
+    // are private, so the skeleton is built via the crate's `empty_for_test`
+    // constructor rather than a cross-crate struct literal.
+    ContextRoleState::empty_for_test()
 }
 
 impl PerContextState {
