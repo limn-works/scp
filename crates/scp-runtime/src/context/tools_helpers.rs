@@ -846,20 +846,22 @@ pub async fn reserve_tool_economy(
 ///
 /// Returns the triggered consequences and the optional payment receipt.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED `&mut bool` that
-/// this function OR-sets to `true` if consequence enforcement performed a
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED
+/// `&mut Option<ClassSCommitToken>` that this function POPULATES with a
+/// fail-closed-persist obligation if consequence enforcement performed a
 /// downward-authorization mutation (a `suspended_capabilities` GROW or an
-/// `AssignRole` `member_capabilities` replacement). The flag is a caller-owned
+/// `AssignRole` `member_capabilities` replacement). The token is a caller-owned
 /// sink rather than part of the return value SO IT SURVIVES THE PAYMENT-CAPTURE
 /// ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
 /// capture, and on capture failure this function returns `Err` early — a
-/// return-value flag would be lost to that `?`, leaving the mutation on
-/// best-effort-only persistence (the RED-CS3 hole). With a `&mut` sink the
-/// cell-holding caller ([`settle_tool_economy`]) persists the mutated state
-/// fail-closed AFTER the call regardless of Ok/Err. On payment-capture failure
-/// the ticket is reversed (budget / velocity / rate-limit) and the error
-/// surfaced; the in-memory downward-auth mutation is NOT reversed
-/// (keep-direction).
+/// returned token would be STRANDED/DROPPED by that `?` (tripping the token's Drop
+/// guard on a path that legitimately must still persist, or losing the obligation
+/// entirely — the RED-CS3 hole). With the token living in the caller's `Option`,
+/// passed by `&mut`, an early `return Err` here does NOT drop it; the cell-holding
+/// caller ([`settle_tool_economy`]) commits it fail-closed AFTER the call
+/// regardless of Ok/Err. On payment-capture failure the ticket is reversed (budget
+/// / velocity / rate-limit) and the error surfaced; the in-memory downward-auth
+/// mutation is NOT reversed (keep-direction).
 ///
 /// # Errors
 ///
@@ -871,7 +873,7 @@ pub async fn settle_tool_economy_capture(
     context_id: &str,
     invoker_did: &DID,
     ticket: ToolEconomyTicket,
-    downward_auth_sink: &mut bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -918,21 +920,25 @@ pub async fn settle_tool_economy_capture(
     // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
     // which the cell-holding caller performs when `downward_auth_applied` is set.
     let mut split = view.consequence_split();
-    // OR-set the caller-owned sink so the mutation's fail-closed-persist
-    // obligation survives the payment-capture error path below (a return-value
-    // flag would be stranded by the early `return Err` — RED-CS3).
-    *downward_auth_sink |= crate::context::governance_logic::enforce_triggered_consequences(
-        &mut split,
-        &crate::context::governance_logic::EnforceConsequencesCtx {
-            context_id,
-            member_did: invoker_did,
-            now,
-            triggered: &consequences,
-            rules: &consequence_rules,
-            clock,
-            event_log: event_log.as_ref(),
-            event_tx: event_tx.as_ref(),
-        },
+    // Populate the caller-owned token sink so the mutation's fail-closed-persist
+    // obligation survives the payment-capture error path below (a returned token
+    // would be stranded/dropped by the early `return Err` — RED-CS3).
+    crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+        downward_auth_sink,
+        crate::context::governance_logic::enforce_triggered_consequences(
+            &mut split,
+            &crate::context::governance_logic::EnforceConsequencesCtx {
+                context_id,
+                member_did: invoker_did,
+                now,
+                triggered: &consequences,
+                rules: &consequence_rules,
+                clock,
+                event_log: event_log.as_ref(),
+                event_tx: event_tx.as_ref(),
+            },
+        ),
+        context_id,
     );
 
     let payment_receipt = match (
@@ -1299,38 +1305,39 @@ pub async fn settle_tool_economy(
             // coalesces
             // through the run loop; the downward-auth outcomes — a
             // consequence-engine capability suspension or an `AssignRole` demotion
-            // — are signalled via the caller-owned `downward_auth_applied` sink and
-            // persisted fail-closed below (ADR-049 §9, RED-CS3). The sink is owned
-            // HERE (not returned by the callee) so the obligation survives the
-            // callee's payment-capture error path — a return-value flag would be
-            // stranded by that early `return Err`, leaving the mutation on
-            // best-effort-only persistence.
-            let mut downward_auth_applied = false;
+            // — populate the caller-owned `downward_auth_obligation` token sink and
+            // are persisted fail-closed below (ADR-049 §9, RED-CS3). The sink is
+            // owned HERE (not returned by the callee) so the obligation survives the
+            // callee's payment-capture error path — a returned token would be
+            // stranded/dropped by that early `return Err`, tripping its Drop guard on
+            // a path that must still persist or losing the obligation. The token
+            // carrier (vs. a `bool`) makes a populated-but-undischarged obligation a
+            // Drop-guard PANIC in debug/CI.
+            let mut downward_auth_obligation: Option<
+                crate::context::actor::class_s::ClassSCommitToken,
+            > = None;
             let capture_result = settle_tool_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
                 ticket,
-                &mut downward_auth_applied,
+                &mut downward_auth_obligation,
             )
             .await;
-            // Fail-closed persist of an applied downward-auth mutation
-            // (keep-direction), run on BOTH the Ok and Err arms: the mutation
-            // is already in memory; make it durable before acking so a
-            // coalesce-window crash cannot silently re-grant the removed
-            // authority. The view above has been consumed, so the `&mut cell`
-            // borrow is released here. ERROR PRECEDENCE: when the capture itself
-            // failed, the persist still runs; if the persist ALSO fails, the
-            // §9 durability failure (`PersistenceFailed`) is surfaced over the
-            // original capture error (durability is the security obligation), and
+            // Fail-closed persist (token `commit`) of an applied downward-auth
+            // mutation (keep-direction), run on BOTH the Ok and Err arms: the
+            // mutation is already in memory; commit it before acking so a
+            // coalesce-window crash cannot silently re-grant the removed authority.
+            // `take()` discharges the Drop guard. The view above has been consumed,
+            // so the `&mut cell` borrow is released here. ERROR PRECEDENCE: when the
+            // capture itself failed, the commit still runs; if the commit ALSO
+            // fails, the §9 durability failure (`PersistenceFailed`) is surfaced over
+            // the original capture error (durability is the security obligation), and
             // the original capture cause is preserved in its message. When the
-            // persist succeeds, the original capture error is surfaced unchanged.
-            if downward_auth_applied
-                && let Err(persist_err) =
-                    crate::context::messaging_helpers::persist_state_fail_closed(
-                        cell, deps, context_id,
-                    )
+            // commit succeeds, the original capture error is surfaced unchanged.
+            if let Some(token) = downward_auth_obligation.take()
+                && let Err(persist_err) = token.commit(cell, deps, context_id)
             {
                 return Err(match capture_result {
                     Ok(_) => persist_err,
@@ -1476,11 +1483,12 @@ mod tests {
     /// A consequence suspends the invoker in memory BEFORE the fallible payment
     /// capture; if capture then fails, `settle_tool_economy_capture` returns
     /// `Err` early — so the suspension obligation is carried on a CALLER-OWNED
-    /// `&mut bool` sink (not a return value the `?` would strand). This test
-    /// drives the capture path with a FAILING adapter and a suspending state and
-    /// asserts the function returns `Err` while the sink is STILL set to `true`
-    /// (the obligation survived the error) and the suspension is retained in
-    /// memory. Without the fix (a return-value flag) the sink would be lost.
+    /// `&mut Option<ClassSCommitToken>` token sink (not a returned token the `?`
+    /// would strand/drop). This test drives the capture path with a FAILING adapter
+    /// and a suspending state and asserts the function returns `Err` while the
+    /// obligation STILL persists fail-closed (the token survived the error) and the
+    /// suspension is retained in memory. Without the fix (a returned token) the
+    /// obligation would be stranded by the `?`.
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
     mod tool_settle_fail_closed {
         use std::sync::Arc;

@@ -313,20 +313,24 @@ async fn handle_deliver_incoming(
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    // ADR-049 §9 (RED-CS3): set when the receive cascade performs a downward-auth
-    // mutation (a `suspended_capabilities` GROW or an `AssignRole`
-    // `member_capabilities` replacement). Owned HERE, at the cell boundary, so the
-    // mutation can persist fail-closed once the borrowing `class_c_view` drops —
-    // it must not ride only the coalesced persist (a ≤50ms crash would silently
-    // re-grant the member's removed authority).
-    let mut downward_auth_applied = false;
+    // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation populated when the
+    // receive cascade performs a downward-auth mutation (a `suspended_capabilities`
+    // GROW or an `AssignRole` `member_capabilities` replacement). Owned HERE as a
+    // `&mut Option<ClassSCommitToken>` sink, at the cell boundary, so the obligation
+    // is `commit`ted (a fail-closed, keep-direction persist) once the borrowing
+    // `class_c_view` drops — it must not ride only the coalesced persist (a ≤50ms
+    // crash would silently re-grant the member's removed authority). The token
+    // carrier (vs. the prior `bool`) makes a populated-but-undischarged obligation a
+    // Drop-guard PANIC in debug/CI, so a missed discharge cannot slip through.
+    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
+        None;
     // Coalesced Class-C mutation (the run loop persists on `mutated`); the receive
     // cascade reaches its Class-C fields through the non-persisting `class_c_view`
     // (sequence/reorder/receive buffers, membership[read], role[read], routing,
     // ConsequenceStateSplit Class-C only). The downward-auth mutations it can make
     // — a consequence-engine capability suspension or an `AssignRole` demotion —
-    // are signalled via `downward_auth_applied` and persisted fail-closed below,
-    // not through the view.
+    // populate `downward_auth_obligation` and are persisted fail-closed below, not
+    // through the view.
     let (outcome, reply_result) = {
         let mut view = cell.class_c_view();
         let deliver_fut = async {
@@ -335,7 +339,7 @@ async fn handle_deliver_incoming(
                 deps,
                 context_id,
                 envelope_bytes,
-                &mut downward_auth_applied,
+                &mut downward_auth_obligation,
             )
         };
 
@@ -358,15 +362,17 @@ async fn handle_deliver_incoming(
 
     // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
     // keep-direction): the mutation (suspension or `AssignRole` demotion) is
-    // already in memory; making it durable before acking closes the
-    // coalesce-window crash hole (RED-CS3). On persist failure the mutation STAYS
-    // in memory and the §9 durability error is surfaced in place of the original
-    // reply (durability is the security obligation). When the deliver itself
-    // already errored (`Ok(Err(_))`), that original cause is preserved in the
-    // surfaced message so it is not lost. Skipped when no downward-auth mutation
-    // occurred (the ordinary coalesced persist via `mutated` is sufficient).
-    let reply_result = if downward_auth_applied {
-        match crate::context::messaging_helpers::persist_state_fail_closed(cell, deps, context_id) {
+    // already in memory; committing the obligation's token makes it durable before
+    // acking, closing the coalesce-window crash hole (RED-CS3). `take()` discharges
+    // the Drop guard. On persist failure the mutation STAYS in memory (the token's
+    // `commit` is keep-direction) and the §9 durability error is surfaced in place
+    // of the original reply (durability is the security obligation). When the
+    // deliver itself already errored (`Ok(Err(_))`), that original cause is
+    // preserved in the surfaced message so it is not lost. Skipped (the obligation
+    // stays `None`) when no downward-auth mutation occurred (the ordinary coalesced
+    // persist via `mutated` is sufficient).
+    let reply_result = if let Some(token) = downward_auth_obligation.take() {
+        match token.commit(cell, deps, context_id) {
             Ok(()) => reply_result,
             Err(persist_err) => Err(match reply_result {
                 Ok(_) => persist_err,

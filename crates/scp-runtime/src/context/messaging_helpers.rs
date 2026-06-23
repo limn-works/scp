@@ -1382,20 +1382,24 @@ pub enum DeliverOutcome {
 /// call in `async {...}` so the per-call transport-timeout budget
 /// still applies.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if the receive
-/// cascade (in-order delivery, force-drained gaps, or timed-out-gap drains) runs
-/// consequence enforcement that performs a downward-authorization mutation (a
-/// capability suspension or an `AssignRole` demotion). The cell-holding handler
-/// ([`crate::context::actor::handlers::messaging`]) owns the `bool` and, when
-/// set, persists the mutated state fail-closed (keep-direction) before acking —
-/// evaluation otherwise stays best-effort / coalesced.
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// the receive cascade (in-order delivery, force-drained gaps, or timed-out-gap
+/// drains) POPULATES with a fail-closed-persist obligation if consequence
+/// enforcement performs a downward-authorization mutation (a capability suspension
+/// or an `AssignRole` demotion). The cell-holding handler
+/// ([`crate::context::actor::handlers::messaging`]) owns the `Option`, mints it
+/// `None`, and — when populated — `commit`s the token (a fail-closed,
+/// keep-direction persist) before acking; evaluation otherwise stays best-effort /
+/// coalesced. The token carrier (vs. the prior `bool`) makes a populated-but-
+/// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
+/// dropped flag.
 #[allow(clippy::too_many_lines)]
 pub fn deliver_incoming(
     view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
-    downward_auth_sink: &mut bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<DeliverOutcome, ContextError> {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
@@ -2127,7 +2131,8 @@ pub fn finalize_send(
     // downward-authorization mutation (a capability suspension or an `AssignRole`
     // demotion), so the final persist is upgraded to fail-closed (keep-direction)
     // — a coalesce-window crash must not lose the mutation. Bound from the view
-    // block below so the value is set exactly once.
+    // block below so the value is set exactly once, then folded into a token
+    // obligation (free branch only) at the persist site.
     let downward_auth_applied;
     // Class-C field mutations run through the non-persisting view (coalesced —
     // the run loop persists on `mutated`); the view borrow ends (NLL) before the
@@ -2204,6 +2209,18 @@ pub fn finalize_send(
     }
     create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now);
 
+    // Fold the downward-auth signal into a fail-closed-persist token obligation —
+    // but ONLY on the FREE branch (`token.is_none()`). On the PAID branch the
+    // nonce `token` already owes a fail-closed `commit` that covers the GROW, so a
+    // second token would force a redundant double-persist (and could not be
+    // discarded without tripping its Drop guard). Minting only when free keeps
+    // EXACTLY ONE owed persist on every branch (ADR-049 §9, RED-CS3).
+    let downward_auth_obligation = if downward_auth_applied && token.is_none() {
+        Some(crate::context::actor::class_s::ClassSCommitToken::for_downward_auth(context_id))
+    } else {
+        None
+    };
+
     persist_finalized_send(
         cell,
         deps,
@@ -2211,7 +2228,7 @@ pub fn finalize_send(
         sender_did,
         token,
         is_broadcast,
-        downward_auth_applied,
+        downward_auth_obligation,
     )
 }
 
@@ -2281,13 +2298,16 @@ fn create_and_broadcast_checkpoint_if_due(
 /// path); it shares the single sequence-rollback ownership invariant documented
 /// on [`finalize_send`] (gated `!is_broadcast`, no caller double-revert).
 ///
-/// `downward_auth_applied` (ADR-049 §9, RED-CS3): when this send's consequence
-/// enforcement performed a downward-authorization mutation (a
-/// `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
-/// replacement), the persist MUST be fail-closed (keep-direction) so a
-/// coalesce-window crash cannot silently re-grant removed authority. The paid
-/// path is already fail-closed (the token's `commit`); the free path is upgraded
-/// from best-effort to fail-closed here when a downward-auth mutation occurred.
+/// `downward_auth_obligation` (ADR-049 §9, RED-CS3): a fail-closed-persist token
+/// minted ONLY on the FREE-send branch when this send's consequence enforcement
+/// performed a downward-authorization mutation (a `suspended_capabilities` GROW or
+/// an `AssignRole` `member_capabilities` replacement). On the PAID branch the
+/// downward-auth mutation rides the nonce `token`'s own fail-closed `commit` (one
+/// persist covers all in-memory state), so `finalize_send` mints no separate
+/// obligation there and this is `None`. The free path commits this token to upgrade
+/// from best-effort to fail-closed so a coalesce-window crash cannot silently
+/// re-grant removed authority. The token carrier (vs. the prior `bool`) makes a
+/// populated-but-undischarged obligation a Drop-guard PANIC in debug/CI.
 fn persist_finalized_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -2295,17 +2315,23 @@ fn persist_finalized_send(
     sender_did: &DID,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
-    downward_auth_applied: bool,
+    downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<(), ContextError> {
     match token {
-        // Paid send: commit the deferred token — its `commit` performs the
-        // fail-closed persist (ADR-049 §9 Class S, keep-direction). The token's
-        // `commit` takes a SHARED `&PerContextState` (via `&*cell`). On failure
-        // roll the reserved sequence back through the Class-C view (this fn owns
-        // that rollback; the caller does not double-revert) and surface the error.
-        // A downward-auth mutation applied on this send is already covered by the
-        // token's fail-closed persist.
+        // Paid send: commit the deferred nonce token — its `commit` performs the
+        // fail-closed persist (ADR-049 §9 Class S, keep-direction) of ALL in-memory
+        // state, so a downward-auth mutation applied on this send is already covered
+        // (no separate obligation is minted on this branch, so
+        // `downward_auth_obligation` is `None` here). The token's `commit` takes a
+        // SHARED `&PerContextState` (via `&*cell`). On failure roll the reserved
+        // sequence back through the Class-C view (this fn owns that rollback; the
+        // caller does not double-revert) and surface the error.
         Some(t) => {
+            debug_assert!(
+                downward_auth_obligation.is_none(),
+                "paid send mints no separate downward-auth obligation — the nonce \
+                 token's commit covers the GROW",
+            );
             if let Err(e) = t.commit(cell, deps, context_id) {
                 if !is_broadcast {
                     cell.class_c_view()
@@ -2318,10 +2344,10 @@ fn persist_finalized_send(
         // Free / non-spending send: best-effort persist (Class C — not regressed)
         // UNLESS this send applied a downward-auth mutation (a capability
         // suspension or an `AssignRole` demotion), in which case the downward-auth
-        // transition must persist fail-closed (ADR-049 §9).
+        // obligation's token commits fail-closed (ADR-049 §9, keep-direction).
         None => {
-            if downward_auth_applied {
-                persist_state_fail_closed(cell, deps, context_id)?;
+            if let Some(obligation) = downward_auth_obligation {
+                obligation.commit(cell, deps, context_id)?;
             } else {
                 persist_state_best_effort(cell, deps, context_id);
             }
@@ -2719,17 +2745,18 @@ pub fn decrypt_and_dispatch(
 
 /// Validates timestamp and sequence, then drains timed-out gaps.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if draining a
-/// timed-out gap runs consequence enforcement that performs a
-/// downward-authorization mutation (a capability suspension or an `AssignRole`
-/// demotion), so the cell-holding caller can persist it fail-closed.
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if draining a timed-out gap
+/// runs consequence enforcement that performs a downward-authorization mutation (a
+/// capability suspension or an `AssignRole` demotion), so the cell-holding caller
+/// commits it fail-closed.
 pub fn validate_and_drain_timeouts(
     view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
-    downward_auth_sink: &mut bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<SequenceCheck, ContextError> {
     // Timestamp validation first.
     let tv = scp_protocol::envelope::validation::TimestampValidator::default();
@@ -2781,21 +2808,25 @@ pub fn validate_and_drain_timeouts(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            *downward_auth_sink |= run_buffered_post_delivery(
-                view,
+            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                downward_auth_sink,
+                run_buffered_post_delivery(
+                    view,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication lands
+                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                ),
                 context_id,
-                &context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                // Dormant: `event_name` here is always `None`
-                // (`deliver_plaintext_or_announcement` never appends on
-                // receive), so this committer-copied timestamp is not yet
-                // consumed. Live only once cross-member leaf replication lands
-                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                msg.inner.timestamp / 1000,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
             );
         }
     }
@@ -2810,10 +2841,11 @@ pub fn validate_and_drain_timeouts(
 /// Buffers an out-of-order message that arrived ahead of expected
 /// sequence. Force-delivers oldest gap on overflow.
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if a force-drained
-/// gap message runs consequence enforcement that performs a downward-authorization
-/// mutation (a capability suspension or an `AssignRole` demotion), so the
-/// cell-holding caller can persist it fail-closed.
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if a force-drained gap message
+/// runs consequence enforcement that performs a downward-authorization mutation (a
+/// capability suspension or an `AssignRole` demotion), so the cell-holding caller
+/// commits it fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub fn buffer_ahead_message(
     view: &mut ClassCMut,
@@ -2823,7 +2855,7 @@ pub fn buffer_ahead_message(
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
-    downward_auth_sink: &mut bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
@@ -2874,21 +2906,25 @@ pub fn buffer_ahead_message(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            *downward_auth_sink |= run_buffered_post_delivery(
-                view,
+            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                downward_auth_sink,
+                run_buffered_post_delivery(
+                    view,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication lands
+                    // (ADR-051). See `run_buffered_post_delivery`'s param doc.
+                    msg.inner.timestamp / 1000,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                ),
                 context_id,
-                &context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                // Dormant: `event_name` here is always `None`
-                // (`deliver_plaintext_or_announcement` never appends on
-                // receive), so this committer-copied timestamp is not yet
-                // consumed. Live only once cross-member leaf replication lands
-                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
-                msg.inner.timestamp / 1000,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
             );
         }
     }
@@ -2903,11 +2939,12 @@ pub fn buffer_ahead_message(
 /// Returns `true` when the message was consumed as a pseudonym
 /// announcement (internal protocol message).
 ///
-/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if this delivery
-/// (or any consecutively-drained buffered message) runs consequence enforcement
-/// that performs a downward-authorization mutation (a capability suspension or an
-/// `AssignRole` demotion), so the cell-holding caller can persist the mutated
-/// state fail-closed (keep-direction).
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if this delivery (or any
+/// consecutively-drained buffered message) runs consequence enforcement that
+/// performs a downward-authorization mutation (a capability suspension or an
+/// `AssignRole` demotion), so the cell-holding caller commits the mutated state
+/// fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_message_and_drain_buffered(
@@ -2919,7 +2956,7 @@ pub fn deliver_message_and_drain_buffered(
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     plaintext: &[u8],
     skip_velocity: bool,
-    downward_auth_sink: &mut bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
 
@@ -3004,22 +3041,26 @@ pub fn deliver_message_and_drain_buffered(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                *downward_auth_sink |= run_buffered_post_delivery(
-                    view,
+                crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                    downward_auth_sink,
+                    run_buffered_post_delivery(
+                        view,
+                        context_id,
+                        context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        // Dormant: `event_name` here is always `None`
+                        // (`deliver_plaintext_or_announcement` never appends on
+                        // receive), so this committer-copied timestamp is not yet
+                        // consumed. Live only once cross-member leaf replication
+                        // lands (ADR-051). See `run_buffered_post_delivery`'s param
+                        // doc.
+                        msg.inner.timestamp / 1000,
+                        &*deps.clock,
+                        &*deps.event_log,
+                        deps.event_tx.as_ref(),
+                    ),
                     context_id,
-                    context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    // Dormant: `event_name` here is always `None`
-                    // (`deliver_plaintext_or_announcement` never appends on
-                    // receive), so this committer-copied timestamp is not yet
-                    // consumed. Live only once cross-member leaf replication
-                    // lands (ADR-051). See `run_buffered_post_delivery`'s param
-                    // doc.
-                    msg.inner.timestamp / 1000,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
                 );
             }
 
@@ -3050,7 +3091,8 @@ pub fn deliver_message_and_drain_buffered(
                 );
                 let recv_member_did = DID(sender_did.to_owned());
                 let mut split = view.consequence_split();
-                *downward_auth_sink |=
+                crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                    downward_auth_sink,
                     crate::context::governance_logic::enforce_triggered_consequences(
                         &mut split,
                         &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -3063,7 +3105,9 @@ pub fn deliver_message_and_drain_buffered(
                             event_log: &*deps.event_log,
                             event_tx: deps.event_tx.as_ref(),
                         },
-                    );
+                    ),
+                    context_id,
+                );
             }
             *view.checkpoint_events_since_mut() += 1;
 
@@ -3111,21 +3155,25 @@ pub fn deliver_message_and_drain_buffered(
             context_id,
             deps.event_tx.as_ref(),
         );
-        *downward_auth_sink |= run_buffered_post_delivery(
-            view,
+        crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+            downward_auth_sink,
+            run_buffered_post_delivery(
+                view,
+                context_id,
+                context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on receive),
+                // so this committer-copied timestamp is not yet consumed. Live only
+                // once cross-member leaf replication lands (ADR-051). See
+                // `run_buffered_post_delivery`'s param doc.
+                msg.inner.timestamp / 1000,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            ),
             context_id,
-            context_id_bytes,
-            &msg.sender_did,
-            event_name,
-            // Dormant: `event_name` here is always `None`
-            // (`deliver_plaintext_or_announcement` never appends on receive),
-            // so this committer-copied timestamp is not yet consumed. Live only
-            // once cross-member leaf replication lands (ADR-051). See
-            // `run_buffered_post_delivery`'s param doc.
-            msg.inner.timestamp / 1000,
-            &*deps.clock,
-            &*deps.event_log,
-            deps.event_tx.as_ref(),
         );
     }
 
@@ -3164,18 +3212,22 @@ pub fn deliver_message_and_drain_buffered(
         );
         let recv_member_did = DID(sender_did.to_owned());
         let mut split = view.consequence_split();
-        *downward_auth_sink |= crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: &recv_member_did,
-                now,
-                triggered: &recv_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_log: &*deps.event_log,
-                event_tx: deps.event_tx.as_ref(),
-            },
+        crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+            downward_auth_sink,
+            crate::context::governance_logic::enforce_triggered_consequences(
+                &mut split,
+                &crate::context::governance_logic::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: &recv_member_did,
+                    now,
+                    triggered: &recv_triggered,
+                    rules: &consequence_rules,
+                    clock: &*deps.clock,
+                    event_log: &*deps.event_log,
+                    event_tx: deps.event_tx.as_ref(),
+                },
+            ),
+            context_id,
         );
     }
 
@@ -4038,7 +4090,8 @@ mod pseudonym_routing_tests {
         // skip governance for the `None`-typed application message.
         let incoming = drain_test_inner(&ctx, 1);
         let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
-        let mut downward_auth_applied = false;
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         validate_and_drain_timeouts(
             &mut ClassCMut::from_state(&mut state),
             &deps,
@@ -4048,6 +4101,12 @@ mod pseudonym_routing_tests {
             &mut downward_auth_applied,
         )
         .expect("validate_and_drain_timeouts");
+        // The `SuspendAccess` action is a downward-auth GROW, so the drain
+        // populated the sink; discharge it (commit performs the fail-closed persist)
+        // so the token's Drop guard is satisfied.
+        if let Some(token) = downward_auth_applied.take() {
+            let _ = token.commit(&state, &deps, &ctx);
+        }
 
         // (a) Velocity recorded for the buffered sender via the drain path.
         let velocity = state.governance.velocity_tracker.snapshot_entries();
@@ -4170,7 +4229,8 @@ mod pseudonym_routing_tests {
         let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
         let inner = drain_test_inner(&ctx, 1);
 
-        let mut downward_auth_applied = false;
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let consumed = deliver_message_and_drain_buffered(
             &mut ClassCMut::from_state(&mut state),
             &deps,
@@ -4183,6 +4243,11 @@ mod pseudonym_routing_tests {
             &mut downward_auth_applied,
         )
         .expect("deliver_message_and_drain_buffered");
+        // No consequence rules are installed here, so the sink stays `None`; the
+        // `take()` is a no-op that satisfies the token's Drop guard either way.
+        if let Some(token) = downward_auth_applied.take() {
+            let _ = token.commit(&state, &deps, &ctx);
+        }
 
         // The announcement WAS recognized + processed (consumed as an internal
         // protocol message) and inserted into the in-memory peer registry.

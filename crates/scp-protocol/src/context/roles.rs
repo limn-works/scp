@@ -894,11 +894,15 @@ pub struct ContextRoleState {
     /// PRIVATE (`pub(crate)`) — ADR-049 §9 downward-authorization Class-S field. A
     /// suspension GROW that a coalesce-window rollback loses silently re-grants a
     /// capability the caller observed as denied. Cross-crate reads go through
-    /// [`Self::suspended_for`]; the GROW mutators ([`Self::suspend_capabilities`],
-    /// [`Self::suspend_all`]) are exposed to the consequence engine only via a
-    /// consequence-only role view that persists fail-closed (ADR-049 §9, RED-CS3).
-    /// The general-purpose Class-C role view exposes only the SHRINK-only
-    /// [`Self::prune_suspensions_to_role_grants`] and a read.
+    /// [`Self::suspended_for`]. The inherent GROW mutators
+    /// ([`Self::suspend_capabilities`], [`Self::suspend_all`]) are `pub`, so they are
+    /// reachable through ANY whole `&mut ContextRoleState` ("path B") AND via the
+    /// runtime's consequence-only role view; EITHER way the §9 obligation is on the
+    /// CALLER — persist the GROW fail-closed before ack (see those methods' docs).
+    /// The runtime's general-purpose FIELD-GRANULAR Class-C role view deliberately
+    /// exposes only the SHRINK-only [`Self::prune_suspensions_to_role_grants`] and a
+    /// read — no GROW accessor — so a GROW through THAT view is a compile error; the
+    /// privatization keeps OUTSIDE-CRATE code from writing the field directly.
     #[serde(default, with = "crate::serde_util::serde_sorted_set_map")]
     pub(crate) suspended_capabilities: HashMap<String, HashSet<Capability>>,
 }
@@ -1028,6 +1032,20 @@ impl ContextRoleState {
     /// The capabilities are added to the member's suspended set. While
     /// suspended, `member_has_capability` returns `false` for these
     /// capabilities even if the member's role grants them.
+    ///
+    /// # §9 caller obligation (ADR-049 §9 — downward-auth GROW)
+    ///
+    /// This is a DOWNWARD-AUTHORIZATION GROW: it narrows a member's effective
+    /// authority, and a coalesce-window crash that rolled it back would silently
+    /// re-grant a capability the caller observed as denied. As an inherent `pub`
+    /// method it is reachable through ANY whole `&mut ContextRoleState` (this is
+    /// "path B" in the runtime's `class_s` module docs). The CALLER MUST persist the
+    /// resulting `suspended_capabilities` GROW **fail-closed before ack**: hold the
+    /// `&mut ContextRoleState` only inside a fail-closed-persisting combinator, or
+    /// use the consequence-only role view
+    /// (`scp_runtime::…::ConsequenceRoleStateMut`). Do NOT call this on a
+    /// best-effort / coalesced path — the runtime's field-granular best-effort role
+    /// view deliberately exposes no GROW accessor for exactly this reason.
     pub fn suspend_capabilities(
         &mut self,
         member_did: &str,
@@ -1058,6 +1076,16 @@ impl ContextRoleState {
     ///
     /// Copies every capability from the member's current capability set into
     /// their suspended set. Equivalent to a full application-level block.
+    ///
+    /// # §9 caller obligation (ADR-049 §9 — downward-auth GROW)
+    ///
+    /// Like [`Self::suspend_capabilities`], this is a DOWNWARD-AUTHORIZATION GROW
+    /// reachable through any whole `&mut ContextRoleState` ("path B"). The CALLER
+    /// MUST persist the resulting `suspended_capabilities` GROW **fail-closed before
+    /// ack** (hold the `&mut` inside a fail-closed-persisting combinator, or use the
+    /// consequence-only role view); do NOT call it on a best-effort / coalesced
+    /// path, where a crash-window rollback would silently re-grant the blocked
+    /// member's authority.
     pub fn suspend_all(&mut self, member_did: &str) {
         if let Some(caps) = self.member_capabilities.get(member_did) {
             let all_caps: HashSet<Capability> = caps.clone();
@@ -1241,6 +1269,24 @@ impl ContextRoleState {
 /// SHRINK-only prune or (on the consequence-only view) a GROW. Because the
 /// individual references are disjoint, the consumer can hold a read of `ceiling`
 /// while writing the structural fields in one borrow.
+///
+/// # Seam contract — confinement is the CONSUMING VIEW's responsibility
+///
+/// This struct is intentionally NOT self-protecting: its fields are RAW `&mut`
+/// (including the downward-auth `suspended_capabilities`, and `member_capabilities`
+/// which is an authorization input). It does NOT itself enforce the §9
+/// shrink/GROW-only narrowing — it is the disjoint-borrow PRIMITIVE, and the
+/// confinement (no GROW accessor, SHRINK-only prune, fail-closed persist) is built
+/// by the CONSUMING `scp-runtime` view that wraps it
+/// (`RoleStateClassCMut` for best-effort, `ConsequenceRoleStateMut` for the
+/// fail-closed consequence path). Today the SOLE consumers are those two runtime
+/// views (plus this struct's own `system_assign_role` / SHRINK-only prune helpers).
+/// A FUTURE second consumer MUST NOT assume the seam narrows anything for it: it has
+/// to apply the same §9 discipline (expose no unpersisted downward-auth GROW; route
+/// any `suspended_capabilities` / `member_capabilities` shrink through a fail-closed
+/// persist). A full structural seal of this parts struct is deliberately out of
+/// scope (single consumer set; sealing it would fight the disjoint-borrow ergonomics
+/// it exists to provide).
 pub struct ContextRoleClassCParts<'a> {
     /// Shared `&` to the context identifier (structural identity, stable).
     pub context_id: &'a str,
@@ -1255,11 +1301,21 @@ pub struct ContextRoleClassCParts<'a> {
     pub assignments: &'a mut HashMap<String, RoleAssignment>,
     /// `&mut` to the member DID set (Class-C / structural).
     pub members: &'a mut HashSet<String>,
-    /// `&mut` to the per-member derived capability sets (Class-C / structural).
+    /// `&mut` to the per-member GRANTED capability sets. An authorization input
+    /// (`member_has_capability` reads it), so a downward SHRINK is itself a §9
+    /// hazard — the consuming view restricts how this is written (the runtime's
+    /// best-effort role view exposes it READ-ONLY + a `system_assign_role` replace;
+    /// a DEMOTION goes through the fail-closed consequence view).
     pub member_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
-    /// `&mut` to the per-member suspension map. DOWNWARD-AUTH Class-S: the
-    /// general-purpose role view exposes only the SHRINK-only prune over it; the
-    /// GROW methods are confined to the consequence-only view (fail-closed).
+    /// `&mut` to the per-member suspension map. DOWNWARD-AUTH Class-S. This RAW
+    /// `&mut` does not itself confine anything: the consuming runtime view decides
+    /// the surface — the general-purpose `RoleStateClassCMut` exposes only the
+    /// SHRINK-only prune + a read (no GROW accessor), while the consequence-only
+    /// `ConsequenceRoleStateMut` exposes the GROW (persisted fail-closed by its
+    /// caller). The inherent `pub` `ContextRoleState::suspend_*` GROW is also
+    /// reachable through a whole `&mut` ("path B"), persisted fail-closed by its
+    /// combinator. Confinement is the consuming view's responsibility (see the type
+    /// doc's seam contract).
     pub suspended_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
 }
 

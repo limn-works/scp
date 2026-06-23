@@ -821,23 +821,33 @@ fn handle_evaluate_periodic_consequences_actor(
     // demotion (a `member_capabilities` replacement) — are OR-accumulated here and
     // persisted fail-closed below (ADR-049 §9, RED-CS3): a coalesce-window crash
     // must not silently re-grant a member's removed authority.
-    let mut downward_auth_applied = false;
+    // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation, owned HERE as a
+    // token sink at the cell boundary and populated when a swept consequence
+    // applies a downward-auth GROW (idempotent across the sweep — one owed
+    // persist). The token carrier (vs. a `bool`) makes a populated-but-undischarged
+    // obligation a Drop-guard PANIC in debug/CI.
+    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
+        None;
     {
         let mut view = cell.class_c_view();
         let mut split = view.consequence_split();
         for (member_did, triggered) in &results {
-            downward_auth_applied |= enforce_triggered_consequences(
-                &mut split,
-                &EnforceConsequencesCtx {
-                    context_id: &context_id,
-                    member_did,
-                    now,
-                    triggered,
-                    rules: &rules,
-                    clock: deps.clock.as_ref(),
-                    event_log: deps.event_log.as_ref(),
-                    event_tx: deps.event_tx.as_ref(),
-                },
+            crate::context::actor::class_s::ClassSCommitToken::note_downward_auth(
+                &mut downward_auth_obligation,
+                enforce_triggered_consequences(
+                    &mut split,
+                    &EnforceConsequencesCtx {
+                        context_id: &context_id,
+                        member_did,
+                        now,
+                        triggered,
+                        rules: &rules,
+                        clock: deps.clock.as_ref(),
+                        event_log: deps.event_log.as_ref(),
+                        event_tx: deps.event_tx.as_ref(),
+                    },
+                ),
+                &context_id,
             );
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
@@ -845,14 +855,13 @@ fn handle_evaluate_periodic_consequences_actor(
 
     // Fail-closed persist of an applied downward-auth mutation (keep-direction):
     // the mutation (suspension or `AssignRole` demotion) is already in memory;
-    // make it durable before acking. On persist failure the mutation STAYS and the
+    // committing the obligation's token makes it durable before acking (`take()`
+    // discharges the Drop guard). On persist failure the mutation STAYS and the
     // error is surfaced to the caller; the handler still reports `mutated` so the
     // run loop also persists.
-    let reply_result = if downward_auth_applied {
-        crate::context::messaging_helpers::persist_state_fail_closed(cell, deps, &context_id)
-    } else {
-        Ok(())
-    };
+    let reply_result = downward_auth_obligation
+        .take()
+        .map_or(Ok(()), |token| token.commit(cell, deps, &context_id));
     let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
@@ -1565,7 +1574,8 @@ mod consequence_fail_closed_tests {
             extensions: std::collections::HashMap::new(),
         };
 
-        let mut downward_auth_sink = false;
+        let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let mut view = cell.class_c_view();
         let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut view,
@@ -1581,10 +1591,24 @@ mod consequence_fail_closed_tests {
         .expect("delivery of an in-order application message succeeds");
 
         assert!(
-            downward_auth_sink,
-            "a received message that trips a suspension consequence must OR-set the \
-             caller-owned sink so the cell holder persists the suspension fail-closed"
+            downward_auth_sink.is_some(),
+            "a received message that trips a suspension consequence must POPULATE the \
+             caller-owned token sink so the cell holder commits the suspension fail-closed"
         );
+        // Discharge the obligation so the token's Drop guard does not trip. This
+        // test runs under a FAILING persistence backend (it proves the SIGNAL
+        // reaches the cell boundary; the actual fail-closed persist is proven by
+        // the send/periodic tests), so `commit` returns the expected §9 durability
+        // error — the keep-direction `commit` consumes the token regardless, which
+        // is all that is needed to satisfy the Drop guard.
+        if let Some(token) = downward_auth_sink.take() {
+            let persist = token.commit(&cell, &deps, &ctx_str);
+            assert!(
+                matches!(persist, Err(ContextError::PersistenceFailed(_))),
+                "the failing backend surfaces the §9 durability error on commit; got \
+                 {persist:?}"
+            );
+        }
         // The `view` borrow of `cell` ends here (NLL) so the assertions below can
         // read the cell directly.
         // The suspension landed in memory through the cascade (the cell holder
