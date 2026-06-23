@@ -1655,7 +1655,12 @@ pub async fn execute_extend_ttl(
     if let Some(secs) = remaining_secs {
         let handle = state.handle.clone();
         crate::context::ttl_close_helpers::start_ttl_timer(
-            state,
+            // ADR-049 §9: `start_ttl_timer` was narrowed from
+            // `&mut PerContextState` to `&mut TtlTimer` so the ttl_close actor
+            // handler can reach it through the non-persisting Class-C view; the
+            // governance path passes the same timer directly. Behaviour
+            // unchanged — the helper only ever touched `state.ttl.timer`.
+            &mut state.ttl.timer,
             deps,
             context_id,
             std::time::Duration::from_secs(secs),

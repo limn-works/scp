@@ -52,6 +52,7 @@ use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
 };
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::state::{context_id_to_bytes, require_active};
@@ -73,7 +74,7 @@ use crate::context::state::{context_id_to_bytes, require_active};
 /// effects worth coalescing into the actor's persist tick.
 #[allow(clippy::too_many_arguments)]
 pub fn create_governance_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     checkpoint_seq: u64,
@@ -84,12 +85,9 @@ pub fn create_governance_checkpoint(
     creator_did: &DID,
     creator_signature: Vec<u8>,
 ) -> Result<ContextCheckpoint, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
-    let (_, min_count) = state
-        .governance
-        .engine
-        .checkpoint_cosignature_requirements();
+    let (_, min_count) = cell.governance.engine.checkpoint_cosignature_requirements();
     let attestation_status = if min_count == 0 {
         CheckpointAttestationStatus::FullyAttested
     } else {
@@ -97,7 +95,7 @@ pub fn create_governance_checkpoint(
     };
 
     // Capture pruning policy snapshot for the optional pruning step.
-    let pruning_policy = state.governance.pruning_policy.clone();
+    let pruning_policy = cell.governance.pruning_policy.clone();
 
     let created_at = deps.clock.now_secs();
 
@@ -149,7 +147,7 @@ pub fn create_governance_checkpoint(
 /// validation succeeds (the candidate-vector pattern preserves
 /// transactional integrity).
 pub fn add_checkpoint_cosignature(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     _deps: &ActorDeps,
     checkpoint: &mut ContextCheckpoint,
     cosignature: CosignedCheckpoint,
@@ -168,7 +166,7 @@ pub fn add_checkpoint_cosignature(
     hasher.update(checkpoint.event_count.to_be_bytes());
     let checkpoint_hash: [u8; 32] = hasher.finalize().into();
 
-    let status = state
+    let status = cell
         .governance
         .engine
         .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
@@ -205,14 +203,14 @@ pub fn add_checkpoint_cosignature(
 /// commands means a `LifecycleControl::Pause` would have already
 /// completed by the time we resume here. Re-checking is defense-in-depth.
 pub fn recovery_advance_epoch(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<u64, ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // 1. Validate the context is active.
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     // 2. Perform the MLS epoch advance (Update + self-Commit). Operates
     //    on the supervisor-scoped `MlsCryptoProvider` contexts map; this
@@ -243,13 +241,20 @@ pub fn recovery_advance_epoch(
     //    delivered between awaits would have flipped the lifecycle —
     //    however the mailbox ordering serializes commands, so this is
     //    defense-in-depth.
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
-    // 4. Increment bookkeeping counter and manage grace store.
-    let old_epoch = state.epoch.mls_epoch;
-    state.epoch.mls_epoch = old_epoch.saturating_add(1);
-    let _expired = state.epoch.grace_store.add_epoch(old_epoch);
-    let new_epoch = state.epoch.mls_epoch;
+    // 4. Increment bookkeeping counter and manage grace store. These are
+    //    Class-C epoch fields with a coalesced (best-effort) persist below;
+    //    route through the non-persisting Class-C view so no whole `&mut`
+    //    is taken (ADR-049 §9). Borrow ends before the event-log step.
+    let (old_epoch, new_epoch) = {
+        let mut view = cell.class_c_view();
+        let epoch = view.epoch_mut();
+        let old_epoch = epoch.mls_epoch;
+        epoch.mls_epoch = old_epoch.saturating_add(1);
+        let _expired = epoch.grace_store.add_epoch(old_epoch);
+        (old_epoch, epoch.mls_epoch)
+    };
 
     // 5. Emit epoch advancement event to event log. Event log failures
     //    are non-fatal — recovery must not be blocked by logging issues.
@@ -281,13 +286,14 @@ pub fn recovery_advance_epoch(
             "failed to append recovery epoch advancement event to event log"
         );
     }
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // 6. Persist if configured (best-effort). The actor's coalesced
     //    persist arm of the `tokio::select!` loop will catch this on
     //    the next 50ms tick anyway, but the legacy path persisted
-    //    inline — preserve that timing for behaviour parity.
-    persist_state_best_effort(state, deps, context_id);
+    //    inline — preserve that timing for behaviour parity. Best-effort
+    //    persist of the just-mutated Class-C state via a shared read.
+    persist_state_best_effort(cell, deps, context_id);
 
     Ok(new_epoch)
 }
@@ -305,7 +311,7 @@ pub fn recovery_advance_epoch(
 /// window); transport delivery via `deps.transport`. Does NOT mutate
 /// `state`.
 pub fn recovery_send_notification(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &str,
@@ -317,7 +323,7 @@ pub fn recovery_send_notification(
 
     // Look up the current MLS epoch from owned state. Receivers validate
     // the message against their local epoch state.
-    let current_epoch = state.epoch.mls_epoch;
+    let current_epoch = cell.epoch.mls_epoch;
 
     // Construct a minimal inner envelope for the recovery notification.
     // Recovery notifications bypass the full send_message pipeline but
@@ -387,7 +393,7 @@ pub fn recovery_send_notification(
 /// uniformity across the `trust_recovery` domain (every actor-shape
 /// helper takes `(&mut PerContextState, &ActorDeps, ...)`).
 pub async fn recovery_notify_contact(
-    _state: &mut PerContextState,
+    _cell: &mut ClassSCell,
     deps: &ActorDeps,
     recovering_did: &str,
     contact_did: &str,

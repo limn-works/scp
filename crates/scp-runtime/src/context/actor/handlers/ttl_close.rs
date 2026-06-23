@@ -42,10 +42,10 @@ use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
 use crate::context::ContextHandle;
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for TTL-close handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -58,18 +58,18 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// (`handlers::ttl_close::dispatch(&mut state, &deps, cmd).await`).
 /// Each variant routes through [`crate::context::ttl_close_helpers`]
 /// (the actor-shape TTL-domain helpers).
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
     match cmd {
         TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
-        TtlCloseCommand::FireTimer { reply } => handle_fire_timer(state, deps, reply).await,
+        TtlCloseCommand::FireTimer { reply } => handle_fire_timer(cell, deps, reply).await,
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
             handle_start_ttl_timer(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -84,28 +84,18 @@ pub async fn dispatch(
             member_did,
             proposed_duration,
             reply,
-        } => {
-            handle_extend_ttl(
-                state,
-                deps,
-                context_id,
-                member_did,
-                proposed_duration,
-                reply,
-            )
-            .await
-        }
+        } => handle_extend_ttl(cell, deps, context_id, member_did, proposed_duration, reply).await,
         TtlCloseCommand::ResetTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_reset_ttl_timer(state, deps, p.context_id, p.params, p.duration, reply).await
+            handle_reset_ttl_timer(cell, deps, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
             let p = *payload;
-            handle_execute_ttl_close(state, deps, p.context_id, p.params, reply).await
+            handle_execute_ttl_close(cell, deps, p.context_id, p.params, reply).await
         }
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
-            handle_finalize_close(state, deps, p.context_id, p.params, reply).await
+            handle_finalize_close(cell, deps, p.context_id, p.params, reply).await
         }
     }
 }
@@ -123,7 +113,7 @@ pub async fn dispatch(
 /// still wrap it so a pathological mailbox / task-set contention storm
 /// cannot block the dispatcher indefinitely.
 async fn handle_start_ttl_timer(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -143,7 +133,7 @@ async fn handle_start_ttl_timer(
     // the local clock (`None`).
     let deadline_override = if anchor_deadline_to_creation {
         crate::context::ttl_close_helpers::convergent_ttl_deadline_secs(
-            state.creation_timestamp_secs,
+            cell.creation_timestamp_secs,
             params.ttl.map(|ttl| ttl.as_secs()),
         )
     } else {
@@ -160,8 +150,13 @@ async fn handle_start_ttl_timer(
         return Outcome::err(sketch);
     }
 
+    // The TTL timer is Class-C; `start_ttl_timer` takes the narrow
+    // `&mut TtlTimer` reached through the non-persisting Class-C view (no
+    // `state_mut`). The view borrow spans the timeout await and ends when
+    // the match arm completes (ADR-049 §9).
+    let mut view = cell.class_c_view();
     let spawn_fut = crate::context::ttl_close_helpers::start_ttl_timer(
-        state,
+        &mut view.ttl_mut().timer,
         deps,
         &context_id,
         duration,
@@ -186,7 +181,7 @@ async fn handle_start_ttl_timer(
 
 /// Handle [`TtlCloseCommand::ExtendTtl`] against actor-owned state.
 async fn handle_extend_ttl(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     member_did: scp_identity::DID,
@@ -198,7 +193,7 @@ async fn handle_extend_ttl(
     // the timeout budget still fires on pathological mutex contention.
     let extend_fut = async {
         crate::context::ttl_close_helpers::propose_ttl_extension(
-            state,
+            cell,
             deps,
             &context_id,
             &member_did,
@@ -227,7 +222,7 @@ async fn handle_extend_ttl(
 
 /// Handle [`TtlCloseCommand::ResetTtlTimer`] against actor-owned state.
 async fn handle_reset_ttl_timer(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -245,7 +240,7 @@ async fn handle_reset_ttl_timer(
     }
 
     let reset_fut = crate::context::ttl_close_helpers::reset_ttl_timer(
-        state,
+        cell,
         deps,
         &context_id,
         new_duration,
@@ -269,7 +264,7 @@ async fn handle_reset_ttl_timer(
 
 /// Handle [`TtlCloseCommand::ExecuteTtlClose`] against actor-owned state.
 async fn handle_execute_ttl_close(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -285,7 +280,7 @@ async fn handle_execute_ttl_close(
         return Outcome::err(sketch);
     }
 
-    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(state, deps, &handle);
+    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -331,12 +326,12 @@ async fn handle_execute_ttl_close(
 /// stops after this tick. (The reply currently always reports "do not
 /// continue"; a future repeating-timer variant would return `Ok(true)`.)
 async fn handle_fire_timer(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let handle = state.handle.clone();
-    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(state, deps, &handle);
+    let handle = cell.handle.clone();
+    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, &handle);
 
     match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
         Ok(Ok(())) => {
@@ -362,7 +357,7 @@ async fn handle_fire_timer(
 
 /// Handle [`TtlCloseCommand::FinalizeClose`] against actor-owned state.
 async fn handle_finalize_close(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -378,7 +373,7 @@ async fn handle_finalize_close(
         return Outcome::err(sketch);
     }
 
-    let finalize_fut = crate::context::ttl_close_helpers::finalize_close(state, deps, &handle);
+    let finalize_fut = crate::context::ttl_close_helpers::finalize_close(cell, deps, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),

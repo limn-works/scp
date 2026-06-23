@@ -47,7 +47,6 @@ use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 /// If no payment adapter is configured, all receipts return
 /// [`ReceiptVerificationError::NoVerifierForAdapter`].
 pub async fn verify_payment_receipts(
-    _state: &mut PerContextState,
     deps: &ActorDeps,
     receipts: &[PaymentReceipt],
 ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {

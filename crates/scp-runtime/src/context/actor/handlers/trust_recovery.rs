@@ -27,13 +27,13 @@ use std::time::Duration;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::{
     CreateGovernanceCheckpointPayload, RecoveryNotifyContactPayload,
     RecoverySendNotificationPayload, TrustRecoveryCommand,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for trust-recovery handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
@@ -52,23 +52,23 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// `Placeholder` exists for mailbox-pipe smoke tests and replies
 /// `NotImplemented` by design.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(state, deps, cmd)).await
+    Box::pin(dispatch_inner(cell, deps, cmd)).await
 }
 
 async fn dispatch_inner(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
     match cmd {
         TrustRecoveryCommand::Placeholder { reply } => reply_not_implemented(reply),
         TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
-            handle_create_governance_checkpoint(state, deps, *payload, reply).await
+            handle_create_governance_checkpoint(cell, deps, *payload, reply).await
         }
         TrustRecoveryCommand::AddCheckpointCosignature {
             context_id,
@@ -77,7 +77,7 @@ async fn dispatch_inner(
             reply,
         } => {
             handle_add_checkpoint_cosignature(
-                state,
+                cell,
                 deps,
                 &context_id,
                 *checkpoint,
@@ -87,13 +87,13 @@ async fn dispatch_inner(
             .await
         }
         TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
-            handle_recovery_advance_epoch(state, deps, &context_id, reply).await
+            handle_recovery_advance_epoch(cell, deps, &context_id, reply).await
         }
         TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-            handle_recovery_send_notification(state, deps, *payload, reply).await
+            handle_recovery_send_notification(cell, deps, *payload, reply).await
         }
         TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
-            handle_recovery_notify_contact(state, deps, *payload, reply).await
+            handle_recovery_notify_contact(cell, deps, *payload, reply).await
         }
     }
 }
@@ -102,7 +102,7 @@ async fn dispatch_inner(
 /// state-owning shape. Wraps the migrated helper in a 30s timeout and
 /// reports the `Outcome` to the actor's run loop.
 async fn handle_create_governance_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: CreateGovernanceCheckpointPayload,
     reply: oneshot::Sender<
@@ -116,7 +116,7 @@ async fn handle_create_governance_checkpoint(
     // could in principle do disk I/O via the provider).
     let create_fut = async {
         crate::context::trust_recovery_helpers::create_governance_checkpoint(
-            state,
+            cell,
             deps,
             &p.context_id,
             p.checkpoint_seq,
@@ -152,7 +152,7 @@ async fn handle_create_governance_checkpoint(
 /// state-owning shape. The validation candidate-vector pattern in the
 /// helper means the checkpoint mutation only persists on success.
 async fn handle_add_checkpoint_cosignature(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     mut checkpoint: scp_protocol::context::governance::ContextCheckpoint,
@@ -169,7 +169,7 @@ async fn handle_add_checkpoint_cosignature(
 ) -> Outcome<()> {
     let add_fut = async {
         crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
-            state,
+            cell,
             deps,
             &mut checkpoint,
             cosignature,
@@ -200,13 +200,13 @@ async fn handle_add_checkpoint_cosignature(
 
 /// Handle [`TrustRecoveryCommand::RecoveryAdvanceEpoch`] — state-owning shape.
 async fn handle_recovery_advance_epoch(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
     let advance_fut = async {
-        crate::context::trust_recovery_helpers::recovery_advance_epoch(state, deps, context_id)
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(cell, deps, context_id)
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
@@ -237,7 +237,7 @@ async fn handle_recovery_advance_epoch(
 /// `deps.crypto.seal` + `deps.transport.send_message`. No persistent
 /// state mutation; reports `Outcome::ok(())` on success.
 async fn handle_recovery_send_notification(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: RecoverySendNotificationPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -247,7 +247,7 @@ async fn handle_recovery_send_notification(
 
     let send_fut = async {
         crate::context::trust_recovery_helpers::recovery_send_notification(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.sender_did,
@@ -286,7 +286,7 @@ async fn handle_recovery_send_notification(
 /// lookup. Reports `Outcome::ok(())` on success (no per-context state
 /// mutation in this actor).
 async fn handle_recovery_notify_contact(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: RecoveryNotifyContactPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -295,7 +295,7 @@ async fn handle_recovery_notify_contact(
     let signing_key = p.signing_key.to_signing_key();
 
     let notify_fut = crate::context::trust_recovery_helpers::recovery_notify_contact(
-        state,
+        cell,
         deps,
         &p.recovering_did,
         &p.contact_did,

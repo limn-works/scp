@@ -23,10 +23,11 @@
 
 use scp_protocol::context::{ContextError, ContextState};
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::LifecycleControlCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::{ContextLifecycleState, PerContextState};
+use crate::context::actor::state::ContextLifecycleState;
 
 /// Dispatch a [`LifecycleControlCommand`] against actor state.
 ///
@@ -34,14 +35,17 @@ use crate::context::actor::state::{ContextLifecycleState, PerContextState};
 /// an `Ok` reply so the bridge's `suspend()` default body can complete.
 /// The state mutations (e.g. flipping `lifecycle_state` to `Closing`)
 /// are minimal and locally-owned — no persistence, no transport.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleControlCommand,
 ) -> Outcome<()> {
     match cmd {
         LifecycleControlCommand::Pause { reply } => {
-            state.lifecycle_state = ContextLifecycleState::Closing;
+            // Class-C lifecycle flag; coalesced persist (no per-site
+            // persist today) — route through the non-persisting Class-C
+            // view (ADR-049 §9).
+            *cell.class_c_view().lifecycle_state_mut() = ContextLifecycleState::Closing;
             let _ = reply.send(Ok(()));
             Outcome::ok_mutated(())
         }
@@ -54,12 +58,12 @@ pub async fn dispatch(
             Outcome::ok(())
         }
         LifecycleControlCommand::Shutdown { reply } => {
-            state.lifecycle_state = ContextLifecycleState::Closed;
+            *cell.class_c_view().lifecycle_state_mut() = ContextLifecycleState::Closed;
             let _ = reply.send(Ok(()));
             Outcome::ok_mutated(())
         }
         LifecycleControlCommand::PrepareForReplace { mls_state, reply } => {
-            handle_prepare_for_replace(state, deps, &mls_state, reply)
+            handle_prepare_for_replace(cell, deps, &mls_state, reply)
         }
         // The test-only fault-injection variant is intercepted by the
         // actor's `dispatch_state` (in `actor/mod.rs`) BEFORE it reaches
@@ -89,16 +93,16 @@ pub async fn dispatch(
 /// move of the former import-gate closure. On success the actor claims
 /// itself terminal and the run loop exits.
 fn handle_prepare_for_replace(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     mls_state: &[u8],
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let ctx_id_bytes = state.context_id;
+    let ctx_id_bytes = cell.context_id;
 
     // Terminal-claim guard: a prior PrepareForReplace already claimed
     // (and is terminating) this actor. Reject the racing second import.
-    if matches!(state.lifecycle_state, ContextLifecycleState::Closed) {
+    if matches!(cell.lifecycle_state, ContextLifecycleState::Closed) {
         let _ = reply.send(Err(ContextError::MembershipFailed(
             "context is already being replaced".to_owned(),
         )));
@@ -110,7 +114,7 @@ fn handle_prepare_for_replace(
     // and is no longer serving the context — so it is replaceable, exactly
     // like the terminal states. Including it here lets an import / replace
     // recover a poisoned id without first requiring an operator `clear_poison`.
-    let replaceable = state.handle.try_read_state().is_some_and(|s| {
+    let replaceable = cell.handle.try_read_state().is_some_and(|s| {
         matches!(
             s,
             ContextState::Closing
@@ -148,7 +152,9 @@ fn handle_prepare_for_replace(
 
     // Claim the slot terminal (rejects a racing second PrepareForReplace)
     // and signal run() to exit so the supervisor can despawn + respawn.
-    state.lifecycle_state = ContextLifecycleState::Closed;
+    // Class-C lifecycle flag, coalesced persist — non-persisting Class-C
+    // view (ADR-049 §9).
+    *cell.class_c_view().lifecycle_state_mut() = ContextLifecycleState::Closed;
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
 }

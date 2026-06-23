@@ -94,6 +94,7 @@ use scp_protocol::context::{ContextError, ContextParams};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
@@ -228,9 +229,17 @@ pub const fn clear_needs_reconnect(state: &mut PerContextState) {
 /// dispatch path already uses.
 #[allow(clippy::needless_pass_by_ref_mut)]
 pub(in crate::context) async fn read_context_state(
-    state: &mut PerContextState,
+    handle: ContextHandle,
 ) -> scp_protocol::context::ContextState {
-    state.handle.state().await
+    // Takes an OWNED (Arc-backed, cheap to clone) handle rather than
+    // borrowing `&PerContextState` across the await: a borrowed
+    // `&PerContextState` future is not `Send` (`PerContextState` is
+    // intentionally `Send` + `!Sync` — its event callback is `dyn FnMut +
+    // Send`, not `Sync`), and the spawned actor run loop requires `Send`.
+    // The prior `&mut PerContextState` signature obtained `Send` via the
+    // `&mut` referent; a Class-C read site must not take a whole `&mut`, so
+    // the caller clones `state.handle` (Deref read) and hands it in by value.
+    handle.state().await
 }
 
 /// Returns `true` if the given DID is a member of the context.

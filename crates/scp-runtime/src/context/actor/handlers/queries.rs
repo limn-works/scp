@@ -27,15 +27,10 @@
 
 use scp_protocol::context::ContextError;
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::QueriesCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A
-// finalization — type unification, single PerContextState): the prior
-// `ActorPerContextState` / legacy alias pair collapsed to a single
-// type. The `ActorPerContextState` alias is preserved here purely as a
-// variable-name affordance for the dispatch surface.
-use crate::context::actor::state::PerContextState as ActorPerContextState;
 use crate::context::queries_helpers;
 
 /// Actor-shape dispatch — routes a [`QueriesCommand`] against the
@@ -54,25 +49,27 @@ use crate::context::queries_helpers;
 /// per-context body — `local_dids` is supervisor-scoped (an `ArcSwap`
 /// shared across all actors) and is not part of `state`.
 ///
-/// `state` is taken as `&mut` even though every read variant only
-/// borrows immutably, so the resulting future is `Send` (an `&PerContextState`
-/// borrow makes the captured future non-`Send` because `PerContextState`
-/// is not `Sync` — the per-context event callback is `dyn FnMut + Send`,
-/// not `Send + Sync`). The actor's run loop owns `state` exclusively so
-/// the upgraded borrow does not race; the body still treats `state` as
-/// read-only — every helper called here takes `&PerContextState`.
+/// Read-only domain: the cell is taken as `&mut ClassSCell` (the actor's
+/// run loop owns it; a `&mut` referent keeps the spawned dispatch future
+/// `Send`, which a shared `&ClassSCell` would not because `ClassSCell` is
+/// not `Sync`). The body only READS the owned state through
+/// [`Deref`](std::ops::Deref) — no [`ClassSCell::state_mut`] escape hatch
+/// (ADR-049 §9). Every helper called here takes `&PerContextState`; the
+/// only async read ([`queries_helpers::read_context_state`]) drives
+/// `handle.state()`, which is itself `&self`, so a shared borrow suffices.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch(
-    state: &mut ActorPerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: QueriesCommand,
 ) -> Outcome<()> {
+    let state = &**cell;
     match cmd {
         QueriesCommand::ReadContextState {
             context_id: _,
             reply,
         } => {
-            let answer = queries_helpers::read_context_state(&mut *state).await;
+            let answer = queries_helpers::read_context_state(state.handle.clone()).await;
             let _ = reply.send(Ok(answer));
             Outcome::ok(())
         }
