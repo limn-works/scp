@@ -8,8 +8,10 @@
 A capability/coverage gate that only **warns** when a matrix says "supported" but no
 implementing symbol can be found is not enforcement — it is a suggestion. Real parity
 gaps survive a warning. A coverage gate MUST exit non-zero unless, for every cell the
-matrix marks `true`, it finds **either** a statically verified implementing symbol **or**
-a reasoned, provenance-citing exemption.
+matrix marks `true`, it finds **either** a statically verified symbol **of the expected
+name** **or** a reasoned, provenance-citing exemption. (Name existence, not implementation:
+the gate confirms a symbol of the expected name exists, not that it implements the
+operation — several aliases map multiple matrix ops to one shared dispatcher symbol.)
 
 A coverage gate MUST NOT match symbols by suffix or substring. Loose matching admits
 fabricated names: a cell can claim an operation that does not exist and still "pass"

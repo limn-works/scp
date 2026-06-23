@@ -2,10 +2,15 @@
 """check-sdk-coverage.py -- CI gate enforcing SDK capability matrix conformance.
 
 Reads `.docs/standards/sdk-capability-matrix.json` and validates:
-  1. Every entry marked `true` has a matching symbol name in the SDK source.
-     (Semantic correctness — that the symbol implements the capability — is a
+  1. Every entry marked `true` has a symbol of the expected name in the SDK
+     source. This is a NAME-EXISTENCE check only: it confirms a symbol with the
+     expected (or aliased) name exists — NOT that the symbol implements the
+     operation. Several aliases deliberately map multiple matrix operations to
+     one shared dispatcher symbol (e.g. governance `execute_*` ->
+     `executeGovernanceAction`), so a single symbol can satisfy many cells.
+     Semantic correctness — that the symbol implements the capability — is a
      human-review invariant enforced by code review of the enforcement-labeled
-     files, not by this gate.)
+     files, not by this gate.
   2. Every entry marked `false` has an `exemptions` entry with a reason.
 
 Detection strategy per SDK (AST-based via tree-sitter):
@@ -87,6 +92,17 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Every entry has been verified against actual SDK source: the named symbol
 # exists (name-existence check). Semantic correctness is a human-review
 # invariant; the gate cannot verify that a symbol implements the capability.
+#
+# Why bare-named ops (no domain prefix in the matrix name) need explicit
+# entries: the matcher intentionally dropped the bare-`op_name` candidate to
+# close the suffix-collision hole (an unrelated `migrate` helper anywhere in
+# the codebase used to satisfy `Identity/migrate`). It now only auto-generates
+# DOMAIN-PREFIXED candidates. So any op whose real SDK symbol equals its bare
+# matrix name — or already carries its own sub-domain prefix in the matrix name
+# (e.g. `scpid_*`, `identity_remove`, `relay_start_in_memory`) — has no
+# auto-generated candidate that matches and MUST have an explicit alias here.
+# Do NOT "simplify" by deleting these entries: removing one re-opens a
+# fail-closed gap for that op.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
@@ -962,8 +978,12 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
 
 
 def _node_text(node: "Node") -> str:
-    """Return the decoded text of a tree-sitter node, or '' if None."""
-    return (node.text or b"").decode("utf-8")
+    """Return the decoded text of a tree-sitter node, or '' if None.
+
+    Decodes with errors="replace" so an identifier node containing invalid
+    UTF-8 cannot raise and abort the whole run.
+    """
+    return (node.text or b"").decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------------------
@@ -1414,8 +1434,14 @@ def _collect_sdk_symbols(sdk: str) -> set[str]:
         except OSError:
             continue
 
-        tree = parser.parse(source)
-        file_symbols = extractor(tree.root_node)
+        # Parsing and extraction are wrapped too: a single unparseable file
+        # (grammar quirk, malformed source) must skip that file, not abort the
+        # whole run and silently weaken the gate to "no symbols extracted".
+        try:
+            tree = parser.parse(source)
+            file_symbols = extractor(tree.root_node)
+        except Exception:  # noqa: BLE001 - per-file robustness; skip and continue
+            continue
         all_symbols.update(file_symbols)
 
     return all_symbols
@@ -1429,8 +1455,8 @@ def _collect_sdk_symbols(sdk: str) -> set[str]:
 def _check_operation_in_sdk(
     sdk_symbols: set[str], sdk: str, domain: str, op_name: str
 ) -> bool:
-    """Check whether the SDK's extracted symbols contain code for this
-    operation.
+    """Check whether the SDK's extracted symbols contain a symbol of the
+    expected name for this operation.
 
     Strategy (in order):
       1. Explicit aliases from the ALIASES table
@@ -1491,8 +1517,21 @@ def main() -> int:
         print(f"FAIL: Matrix file not found: {MATRIX_PATH}", file=sys.stderr)
         return 1
 
-    with open(MATRIX_PATH, encoding="utf-8") as f:
-        matrix = json.load(f)
+    try:
+        with open(MATRIX_PATH, encoding="utf-8") as f:
+            matrix = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"FAIL: could not parse matrix {MATRIX_PATH}: {e}", file=sys.stderr)
+        return 1
+
+    # Validate matrix shape before touching it. A malformed top-level shape
+    # must produce a clean diagnostic and exit 1 — never an uncaught traceback.
+    if not isinstance(matrix, dict) or not isinstance(matrix.get("capabilities"), list):
+        print(
+            "FAIL: matrix must be an object with a 'capabilities' array.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Pre-extract all SDK symbols via tree-sitter
     sdk_symbols: dict[str, set[str]] = {}
@@ -1534,6 +1573,25 @@ def main() -> int:
 
             exemptions = op.get("exemptions", {})
             coverage_exemptions = op.get("coverage_exemptions", {})
+
+            # Guard against malformed exemption blocks: a non-dict value would
+            # make the .items()/membership accesses below raise. Emit a clean
+            # ERROR and treat the block as empty (fail-closed: missing
+            # exemptions then surface as their own errors downstream).
+            if not isinstance(exemptions, dict):
+                print(
+                    f"  ERROR: {domain}/{op_name}: 'exemptions' must be an object, "
+                    f"got {type(exemptions).__name__}."
+                )
+                errors += 1
+                exemptions = {}
+            if not isinstance(coverage_exemptions, dict):
+                print(
+                    f"  ERROR: {domain}/{op_name}: 'coverage_exemptions' must be an "
+                    f"object, got {type(coverage_exemptions).__name__}."
+                )
+                errors += 1
+                coverage_exemptions = {}
 
             # Track per-op coverage state for the all-exempted check below.
             op_true_sdks: list[str] = []

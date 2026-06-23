@@ -20,6 +20,9 @@ Covers:
   10. ALIASES entries enable non-standard SDK symbol names to satisfy coverage.
   11. The absence of an ALIASES entry causes coverage to fail for symbols that
       require explicit mapping.
+  12. Empty / missing 'capabilities' fail closed (floor + shape guards).
+  13. Matrix file not found / malformed JSON / wrong top-level shape / non-dict
+      coverage_exemptions all exit 1 with a clean diagnostic (no traceback).
 """
 
 from __future__ import annotations
@@ -434,9 +437,10 @@ def test_gate_fails_on_all_exempted_with_none_verified(tmp_path: Path) -> None:
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     # Verify the all-exempted guard fired (not a different error).
-    assert "all SDKs claiming coverage" in result.stdout.lower() or "all-exempted" in result.stdout.lower(), (
-        f"Expected all-exempted guard error phrase in stdout.\nstdout:\n{result.stdout}"
-    )
+    assert (
+        "all SDKs claiming coverage" in result.stdout.lower()
+        or "all-exempted" in result.stdout.lower()
+    ), f"Expected all-exempted guard error phrase in stdout.\nstdout:\n{result.stdout}"
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +513,10 @@ def test_gate_fails_on_invalid_false_entry_exemption_reason(tmp_path: Path) -> N
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     # Assert both invalid cases are independently flagged — not just one.
-    assert "exemptions.python" in result.stdout and "must be a non-empty string" in result.stdout, (
+    assert (
+        "exemptions.python" in result.stdout
+        and "must be a non-empty string" in result.stdout
+    ), (
         f"Expected error for dict-valued 'exemptions.python' in stdout.\nstdout:\n{result.stdout}"
     )
     assert "exemptions.kotlin" in result.stdout, (
@@ -706,21 +713,24 @@ def test_aliases_enable_non_standard_symbol_names(tmp_path: Path) -> None:
     # --- Part a: WITH the alias → gate must exit 0 ---
     wrapper_with_alias = tmp_path / "run_with_alias.py"
     wrapper_with_alias.write_text(
-        "\n".join([
-            "import sys",
-            "import importlib.util",
-            "from pathlib import Path",
-            "",
-            f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
-            "_mod = importlib.util.module_from_spec(_spec)",
-            "_spec.loader.exec_module(_mod)",
-            "",
-            f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
-            f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
-            # Inject a custom alias so "myCustomSymbol" satisfies "Fake/custom_op"
-            "_mod.ALIASES[('Fake', 'custom_op')] = {'typescript': ['myCustomSymbol']}",
-            "sys.exit(_mod.main())",
-        ]) + "\n",
+        "\n".join(
+            [
+                "import sys",
+                "import importlib.util",
+                "from pathlib import Path",
+                "",
+                f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
+                "_mod = importlib.util.module_from_spec(_spec)",
+                "_spec.loader.exec_module(_mod)",
+                "",
+                f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
+                f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
+                # Inject a custom alias so "myCustomSymbol" satisfies "Fake/custom_op"
+                "_mod.ALIASES[('Fake', 'custom_op')] = {'typescript': ['myCustomSymbol']}",
+                "sys.exit(_mod.main())",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     result_with = subprocess.run(
@@ -737,20 +747,23 @@ def test_aliases_enable_non_standard_symbol_names(tmp_path: Path) -> None:
     # --- Part b: WITHOUT the alias → gate must exit 1 ---
     wrapper_no_alias = tmp_path / "run_no_alias.py"
     wrapper_no_alias.write_text(
-        "\n".join([
-            "import sys",
-            "import importlib.util",
-            "from pathlib import Path",
-            "",
-            f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
-            "_mod = importlib.util.module_from_spec(_spec)",
-            "_spec.loader.exec_module(_mod)",
-            "",
-            f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
-            f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
-            # No alias added: "myCustomSymbol" is not a valid candidate for "Fake/custom_op"
-            "sys.exit(_mod.main())",
-        ]) + "\n",
+        "\n".join(
+            [
+                "import sys",
+                "import importlib.util",
+                "from pathlib import Path",
+                "",
+                f"_spec = importlib.util.spec_from_file_location('check_sdk_coverage', {_SCRIPT_PATH_STR!r})",
+                "_mod = importlib.util.module_from_spec(_spec)",
+                "_spec.loader.exec_module(_mod)",
+                "",
+                f"_mod.MATRIX_PATH = Path({str(matrix_file)!r})",
+                f"_mod.SDK_PATHS.update({{'typescript': Path({str(ts_src_dir)!r})}})",
+                # No alias added: "myCustomSymbol" is not a valid candidate for "Fake/custom_op"
+                "sys.exit(_mod.main())",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     result_without = subprocess.run(
@@ -798,7 +811,11 @@ def test_gate_fails_on_empty_capabilities(tmp_path: Path) -> None:
 
 
 def test_gate_fails_on_missing_capabilities_key(tmp_path: Path) -> None:
-    """A matrix object lacking the 'capabilities' key must also fail closed."""
+    """A matrix object lacking the 'capabilities' key must also fail closed.
+
+    A missing 'capabilities' key is a shape violation: the top-level shape
+    check fires before the floor guard and emits the shape diagnostic.
+    """
     matrix_file = tmp_path / "matrix.json"
     matrix_file.write_text(json.dumps({}), encoding="utf-8")
 
@@ -810,7 +827,120 @@ def test_gate_fails_on_missing_capabilities_key(tmp_path: Path) -> None:
         f"got {result.returncode}.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert "zero operations" in result.stderr, (
-        f"Expected the empty-matrix floor-guard message in stderr.\n"
+    assert "must be an object with a 'capabilities' array" in result.stderr, (
+        f"Expected the matrix-shape diagnostic in stderr.\nstderr:\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Gate exits 1 (clean diagnostic, not a traceback) when the matrix
+#          file is missing, malformed, or structurally wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_matrix_file_not_found(tmp_path: Path) -> None:
+    """Pointing MATRIX_PATH at a nonexistent file must exit 1 cleanly."""
+    missing = tmp_path / "does_not_exist.json"
+    wrapper = _build_wrapper(tmp_path, missing)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for a missing matrix file, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "not found" in result.stderr.lower(), (
+        f"Expected a 'not found' diagnostic in stderr.\nstderr:\n{result.stderr}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"Missing matrix must not surface a Python traceback.\nstderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_malformed_json_matrix(tmp_path: Path) -> None:
+    """A matrix file containing invalid JSON must exit 1 cleanly (no traceback)."""
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text("{ this is not valid json ]", encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for malformed JSON, got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "could not parse matrix" in result.stderr, (
+        f"Expected the parse-failure diagnostic in stderr.\nstderr:\n{result.stderr}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"Malformed JSON must not surface a Python traceback.\nstderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_matrix_that_is_a_list(tmp_path: Path) -> None:
+    """A matrix whose top-level value is a list (not an object) must fail closed."""
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps([{"domain": "Fake"}]), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for a list-valued matrix, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "must be an object with a 'capabilities' array" in result.stderr, (
+        f"Expected the matrix-shape diagnostic in stderr.\nstderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_non_dict_coverage_exemptions(tmp_path: Path) -> None:
+    """A 'coverage_exemptions' value that is not an object must fail closed.
+
+    A non-dict coverage_exemptions block would make membership/.items()
+    accesses raise; the gate must instead emit a clean ERROR and exit 1.
+    """
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "bad_cov_exempt_op_zzz",
+                        "python": False,
+                        "typescript": False,
+                        "kotlin": False,
+                        "swift": False,
+                        "exemptions": {
+                            "python": "Not yet implemented in Python SDK",
+                            "typescript": "Not yet implemented in TypeScript SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
+                        },
+                        # Invalid: must be an object, not a string.
+                        "coverage_exemptions": "this should be a dict",
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for non-dict coverage_exemptions, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "'coverage_exemptions' must be an" in result.stdout, (
+        f"Expected the non-dict coverage_exemptions diagnostic in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"Non-dict coverage_exemptions must not surface a traceback.\n"
         f"stderr:\n{result.stderr}"
     )
