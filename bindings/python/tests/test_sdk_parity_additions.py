@@ -17,12 +17,19 @@ tests run without the compiled ``_scp_core`` extension.
 
 from __future__ import annotations
 
+import base64
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from scp_sdk import SCP, discovery
 from scp_sdk.errors import ScpError
+
+
+def _b64url(obj: dict) -> str:
+    """Encode a dict as base64url without padding (mirrors _make_mock_token in test_trust.py)."""
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
 
 
 @pytest.mark.asyncio
@@ -124,11 +131,21 @@ async def test_evaluate_trust_reraises_perm_3030_handle_affinity_error() -> None
     scp = SCP.__new__(SCP)
     scp._native = MagicMock()
 
+    # Build a real JWT so _extract_first_capability_uri returns a non-None URI
+    # and the bridge is actually called. "token.a.b" has a 1-char payload that
+    # fails base64 decoding → returns None → the bridge is never reached and
+    # the 3030 side_effect never fires.
+    valid_token = (
+        f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
+        f"{_b64url({'att': [{'with': 'scp:ctx:ctx-1/messages:read', 'can': 'messages/read'}]})}."
+        f"sig"
+    )
+
     with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
         with pytest.raises(Exception, match=r"\[SCP-PERM-3030\]"):
             await evaluate_trust(
                 scp,
                 subject_did="did:dht:z6Mkexample",
                 context_id="ctx-1",
-                capability_tokens=["token.a.b"],
+                capability_tokens=[valid_token],
             )
