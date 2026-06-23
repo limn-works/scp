@@ -592,7 +592,10 @@ pub fn validate_tool_ucan_wasm(
         identity_did,
         None,
     )
-    .map_err(|e| (e.to_string(), None))
+    .map_err(|e| {
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e);
+        (e.to_string(), Some(code))
+    })
 }
 
 /// Revokes a UCAN token with authorization checking.

@@ -36,7 +36,6 @@ from scp_sdk.trust import (
     _classify_ucan_error,
     _extract_all_capability_uris,
     _extract_core_error,
-    _intersect_capability_validation,
     evaluate_trust,
     verify_participation_requirements,
 )
@@ -669,11 +668,12 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
 
-    def test_multi_att_token_evaluates_all_uris(self) -> None:
-        """evaluate_trust validates ALL att[i] URIs and AND-intersects verdicts.
+    def test_multi_att_token_evaluates_att0_only(self) -> None:
+        """evaluate_trust validates only att[0]["with"] per token; att[1] is NOT sent.
 
-        When every URI in a multi-att token passes, all fields are true.
-        Both att[0]["with"] and att[1]["with"] are sent to ucan_validate.
+        Full multi-att validation (checking every att[i]) requires a single
+        bridge call that consumes the nonce only once — that bridge op does not
+        exist yet. Only att[0] is sent to ucan_validate; att[1] is skipped.
         """
         multi_att = [
             {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
@@ -689,7 +689,7 @@ class TestCapabilityValidationFieldIndependence:
 
         def side_effect(context_id: str, token: str, cap_uri: str) -> None:
             uris_seen.append(cap_uri)
-            # all URIs pass — return None
+            # att[0] passes — return None
 
         mock_bridge = MagicMock()
         mock_bridge.UcanError = self._MockUcanError
@@ -705,17 +705,17 @@ class TestCapabilityValidationFieldIndependence:
                 )
             )
         cv = result.capability_validation
-        # Both URIs passed — all fields true.
+        # att[0] passed — all fields true.
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
         assert cv.nonce_valid is True
         assert cv.not_revoked is True
         assert cv.time_bounds_valid is True
-        # Both att URIs were sent to ucan_validate.
+        # Only att[0] URI was sent to ucan_validate; att[1] was NOT.
         assert "scp:ctx:c/messages:read" in uris_seen
-        assert "scp:ctx:c/messages:admin" in uris_seen
-        assert len(uris_seen) == 2
+        assert "scp:ctx:c/messages:admin" not in uris_seen
+        assert len(uris_seen) == 1
 
     def test_non_ucan_exception_propagates(self) -> None:
         """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""
@@ -814,211 +814,6 @@ class TestCapabilityValidationFieldIndependence:
         # Positional args: (context_id, token, capability_uri)
         call_args = mock_bridge.ucan_validate.call_args[0]
         assert call_args[2] == _MOCK_CAP_URI
-
-    def test_multi_att_att0_expiry_att1_also_validated_intersected(self) -> None:
-        """Multi-att token: att[0] expiry + att[1] same expiry → both validated, intersected.
-
-        evaluate_trust validates ALL att URIs. att[0] fails at step 11 (expiry)
-        so time_bounds_valid=False for att[0]. att[1] is also sent to the bridge.
-        When both fail with the same stage, the AND-intersected verdict is returned
-        and fail-fast stops processing further tokens.
-        """
-        multi_att = [
-            {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
-            {"with": "scp:ctx:c/messages:write", "can": "messages/write"},
-        ]
-        multi_att_token = (
-            f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
-            f"{_b64url({'att': multi_att})}."
-            f"sig"
-        )
-
-        uris_seen: list[str] = []
-
-        def side_effect(context_id: str, token: str, cap_uri: str) -> None:
-            uris_seen.append(cap_uri)
-            # Both att entries fail with expiry (step 11).
-            raise TestCapabilityValidationFieldIndependence._MockUcanError("token expired")
-
-        mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-        mock_bridge.ucan_validate.side_effect = side_effect
-
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = asyncio.run(
-                evaluate_trust(
-                    scp=MagicMock(),
-                    subject_did="did:dht:z6MkBob",
-                    context_id="ctx-test",
-                    capability_tokens=[multi_att_token],
-                )
-            )
-        cv = result.capability_validation
-        # Both att entries fail expiry: sigs/ceiling/nonce/revoked=True, time_bounds=False.
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is True
-        assert cv.within_ceiling is True
-        assert cv.nonce_valid is True
-        assert cv.not_revoked is True
-        assert cv.time_bounds_valid is False
-        # Both att URIs were presented to ucan_validate (AND-intersection over all URIs).
-        assert "scp:ctx:c/messages:read" in uris_seen
-        assert "scp:ctx:c/messages:write" in uris_seen
-        assert len(uris_seen) == 2
-
-    def test_cross_att_and_intersection_att0_expiry_att1_ceiling(self) -> None:
-        """Cross-att AND-intersection: att[0] expiry + att[1] ceiling → both fields false.
-
-        att[0] fails at step 11 (expiry): time_bounds_valid=False.
-        att[1] fails at step 8 (ceiling): within_ceiling=False.
-        The AND-intersected verdict must have BOTH time_bounds_valid=False AND
-        within_ceiling=False. Fields that passed in both (tokens_valid,
-        signatures_valid) stay True.
-        """
-        multi_att = [
-            {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
-            {"with": "scp:ctx:c/messages:write", "can": "messages/write"},
-        ]
-        multi_att_token = (
-            f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
-            f"{_b64url({'att': multi_att})}."
-            f"sig"
-        )
-
-        uris_seen: list[str] = []
-
-        def side_effect(context_id: str, token: str, cap_uri: str) -> None:
-            uris_seen.append(cap_uri)
-            if cap_uri.endswith(":read"):
-                # att[0] fails at step 11 (expiry): tokens+sigs+ceiling+nonce+notRevoked=True,
-                # time_bounds=False.
-                raise TestCapabilityValidationFieldIndependence._MockUcanError("token expired")
-            # att[1] fails at step 8 (ceiling): tokens+sigs=True, ceiling=False, rest=False.
-            raise TestCapabilityValidationFieldIndependence._MockUcanError(
-                "capability outside ceiling: write not granted"
-            )
-
-        mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-        mock_bridge.ucan_validate.side_effect = side_effect
-
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = asyncio.run(
-                evaluate_trust(
-                    scp=MagicMock(),
-                    subject_did="did:dht:z6MkBob",
-                    context_id="ctx-test",
-                    capability_tokens=[multi_att_token],
-                )
-            )
-        cv = result.capability_validation
-        # tokens_valid: True (passed in both att[0] expiry verdict AND att[1] ceiling verdict)
-        assert cv.tokens_valid is True
-        # signatures_valid: True (passed in both)
-        assert cv.signatures_valid is True
-        # within_ceiling: False (att[1] failed ceiling; AND → False)
-        assert cv.within_ceiling is False
-        # nonce_valid: False (att[1] ceiling verdict has nonce=False; AND → False)
-        assert cv.nonce_valid is False
-        # not_revoked: False (att[1] ceiling verdict has not_revoked=False; AND → False)
-        assert cv.not_revoked is False
-        # time_bounds_valid: False (att[0] expiry verdict has time_bounds=False; AND → False)
-        assert cv.time_bounds_valid is False
-        # Both att URIs were sent to ucan_validate.
-        assert "scp:ctx:c/messages:read" in uris_seen
-        assert "scp:ctx:c/messages:write" in uris_seen
-        assert len(uris_seen) == 2
-
-
-# -----------------------------------------------------------------------
-# _intersect_capability_validation unit tests
-# -----------------------------------------------------------------------
-
-
-class TestIntersectCapabilityValidation:
-    """Unit tests for the _intersect_capability_validation helper."""
-
-    def _all_true(self) -> CapabilityValidation:
-        return CapabilityValidation(
-            tokens_valid=True,
-            signatures_valid=True,
-            within_ceiling=True,
-            nonce_valid=True,
-            not_revoked=True,
-            time_bounds_valid=True,
-        )
-
-    def test_true_and_true_is_true(self) -> None:
-        result = _intersect_capability_validation(self._all_true(), self._all_true())
-        assert result.tokens_valid is True
-        assert result.signatures_valid is True
-        assert result.within_ceiling is True
-        assert result.nonce_valid is True
-        assert result.not_revoked is True
-        assert result.time_bounds_valid is True
-
-    def test_false_wins_in_first_operand(self) -> None:
-        expiry_fail = CapabilityValidation(
-            tokens_valid=True,
-            signatures_valid=True,
-            within_ceiling=True,
-            nonce_valid=True,
-            not_revoked=True,
-            time_bounds_valid=False,
-        )
-        result = _intersect_capability_validation(expiry_fail, self._all_true())
-        assert result.tokens_valid is True
-        assert result.signatures_valid is True
-        assert result.within_ceiling is True
-        assert result.nonce_valid is True
-        assert result.not_revoked is True
-        assert result.time_bounds_valid is False
-
-    def test_false_wins_in_second_operand(self) -> None:
-        ceiling_fail = CapabilityValidation(
-            tokens_valid=True,
-            signatures_valid=True,
-            within_ceiling=False,
-            nonce_valid=False,
-            not_revoked=False,
-            time_bounds_valid=False,
-        )
-        result = _intersect_capability_validation(self._all_true(), ceiling_fail)
-        assert result.tokens_valid is True
-        assert result.signatures_valid is True
-        assert result.within_ceiling is False
-        assert result.nonce_valid is False
-        assert result.not_revoked is False
-        assert result.time_bounds_valid is False
-
-    def test_cross_field_intersection(self) -> None:
-        """Two operands that fail at different pipeline stages."""
-        expiry_fail = CapabilityValidation(
-            tokens_valid=True,
-            signatures_valid=True,
-            within_ceiling=True,
-            nonce_valid=True,
-            not_revoked=True,
-            time_bounds_valid=False,
-        )
-        ceiling_fail = CapabilityValidation(
-            tokens_valid=True,
-            signatures_valid=True,
-            within_ceiling=False,
-            nonce_valid=False,
-            not_revoked=False,
-            time_bounds_valid=False,
-        )
-        result = _intersect_capability_validation(expiry_fail, ceiling_fail)
-        # tokens + sigs passed in both
-        assert result.tokens_valid is True
-        assert result.signatures_valid is True
-        # ceiling failed in ceiling_fail
-        assert result.within_ceiling is False
-        # nonce/revoked/timebounds all false
-        assert result.nonce_valid is False
-        assert result.not_revoked is False
-        assert result.time_bounds_valid is False
 
 
 # -----------------------------------------------------------------------

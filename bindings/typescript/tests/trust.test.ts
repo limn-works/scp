@@ -25,7 +25,6 @@ import {
   __PASSED_BEFORE,
   type CapabilityValidation,
   evaluateTrust,
-  intersectCapabilityValidation,
 } from "../src/trust";
 import { mountMockScp } from "./mock-bridge";
 
@@ -450,10 +449,11 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(native.__calls("ucanValidate")).toHaveLength(2);
   });
 
-  it("multi-att token — evaluateLayer1 validates ALL att URIs; all pass → all-true", async () => {
-    // evaluateLayer1 AND-intersects verdicts for every att[i].with URI in a
-    // token. When ALL URIs pass, the result is all fields true. Both att[0]
-    // and att[1] are sent to ucanValidate.
+  it("multi-att token — evaluateLayer1 validates att[0] only; att[1] is NOT sent to the bridge", async () => {
+    // evaluateLayer1 validates only att[0].with per token. Full multi-att
+    // validation (checking every att[i]) requires a single bridge call that
+    // consumes the nonce once — that op does not exist yet. Only att[0] is
+    // checked; att[1] is never sent to ucanValidate.
     const b64url = (obj: unknown): string =>
       Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
     const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
@@ -470,30 +470,29 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     native.__stub("ucanValidate", (...args: unknown[]) => {
       const capUri = args[2] as string;
       urisSeen.push(capUri);
-      return Promise.resolve(undefined); // all URIs pass
+      return Promise.resolve(undefined); // att[0] passes
     });
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
     const cv = result.capabilityValidation;
-    // Both URIs passed — all fields true.
+    // att[0] passed — all fields true.
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
     expect(cv.withinCeiling).toBe(true);
     expect(cv.nonceValid).toBe(true);
     expect(cv.notRevoked).toBe(true);
     expect(cv.timeBoundsValid).toBe(true);
-    // Both att URIs were sent to ucanValidate.
+    // Only att[0] URI was sent to ucanValidate; att[1] was NOT.
     expect(urisSeen).toContain("scp:ctx:c/messages:read");
-    expect(urisSeen).toContain("scp:ctx:c/messages:admin");
-    expect(urisSeen).toHaveLength(2);
+    expect(urisSeen).not.toContain("scp:ctx:c/messages:admin");
+    expect(urisSeen).toHaveLength(1);
   });
 
-  it("multi-att token: att[0] expiry failure — att[1] also validated, intersected verdict returned", async () => {
-    // att[0] fails at step 11 (expiry): timeBoundsValid=false. att[1] is
-    // also sent to the bridge. If att[1] also fails (e.g. expiry), the
-    // AND-intersected verdict for the token is returned. The intersected
-    // verdict triggers fail-fast so no further tokens are processed.
+  it("multi-att token: att[0] expiry failure — att[1] is NOT sent to bridge; verdict from att[0] only", async () => {
+    // att[0] fails at step 11 (expiry): timeBoundsValid=false. evaluateLayer1
+    // validates att[0] only and returns the narrowed verdict immediately
+    // (fail-fast). att[1] is never sent to ucanValidate.
     const b64url = (obj: unknown): string =>
       Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
     const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
@@ -510,24 +509,23 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     native.__stub("ucanValidate", (...args: unknown[]) => {
       const capUri = args[2] as string;
       urisSeen.push(capUri);
-      // Both URIs fail with expiry — same pipeline stage.
       return Promise.reject(new Error("[SCP-PERM-3001] permission error: token expired"));
     });
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
     const cv = result.capabilityValidation;
-    // Both att entries fail expiry: tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false.
+    // att[0] fails at expiry: tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false.
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
     expect(cv.withinCeiling).toBe(true);
     expect(cv.nonceValid).toBe(true);
     expect(cv.notRevoked).toBe(true);
     expect(cv.timeBoundsValid).toBe(false);
-    // Both att URIs were sent to ucanValidate (AND-intersection over all URIs).
+    // Only att[0] was sent to ucanValidate; att[1] was NOT.
     expect(urisSeen).toContain("scp:ctx:c/messages:read");
-    expect(urisSeen).toContain("scp:ctx:c/messages:write");
-    expect(urisSeen).toHaveLength(2);
+    expect(urisSeen).not.toContain("scp:ctx:c/messages:write");
+    expect(urisSeen).toHaveLength(1);
   });
 
   it("no tokens: all fields stay default false", async () => {
@@ -627,109 +625,6 @@ describe("evaluateTrust — Layer 1 field independence", () => {
       expect(err).toBeInstanceOf(ValidationError);
     }
     expect(threw).toBe(true);
-  });
-
-  it("cross-att AND-intersection: att[0] expiry + att[1] ceiling → both fields false", async () => {
-    // Verifies AND-intersection: att[0] fails at expiry (timeBoundsValid=false)
-    // and att[1] fails at ceiling (withinCeiling=false). The intersected verdict
-    // must have BOTH timeBoundsValid=false AND withinCeiling=false. Fields that
-    // passed in both operands (tokensValid, signaturesValid) stay true.
-    const b64url = (obj: unknown): string =>
-      Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
-    const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
-    const payload = b64url({
-      att: [
-        { with: "scp:ctx:c/messages:read", can: "messages/read" },
-        { with: "scp:ctx:c/messages:write", can: "messages/write" },
-      ],
-    });
-    const multiAttToken = `${header}.${payload}.sig`;
-
-    const { scp, native, context } = mountWithContext();
-    const urisSeen: string[] = [];
-    native.__stub("ucanValidate", (...args: unknown[]) => {
-      const capUri = args[2] as string;
-      urisSeen.push(capUri);
-      if (capUri.endsWith(":read")) {
-        // att[0] fails at step 11 (expiry): tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false.
-        return Promise.reject(new Error("[SCP-PERM-3001] permission error: token expired"));
-      }
-      // att[1] fails at step 8 (ceiling): tokens+sigs=true, ceiling=false, nonce/notRevoked/timeBounds=false.
-      return Promise.reject(
-        new Error(
-          "[SCP-PERM-3001] permission error: capability outside ceiling: write not granted",
-        ),
-      );
-    });
-    native.__stub("eventLogQuery", () => Promise.resolve([]));
-
-    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
-    const cv = result.capabilityValidation;
-    // tokensValid: true (passed in both att[0] expiry verdict AND att[1] ceiling verdict)
-    expect(cv.tokensValid).toBe(true);
-    // signaturesValid: true (passed in both)
-    expect(cv.signaturesValid).toBe(true);
-    // withinCeiling: false (att[1] failed ceiling; att[0] expiry passed ceiling — AND → false)
-    expect(cv.withinCeiling).toBe(false);
-    // nonceValid: false (att[1] ceiling verdict has nonce=false; AND → false)
-    expect(cv.nonceValid).toBe(false);
-    // notRevoked: false (att[1] ceiling verdict has notRevoked=false; AND → false)
-    expect(cv.notRevoked).toBe(false);
-    // timeBoundsValid: false (att[0] expiry verdict has timeBounds=false; AND → false)
-    expect(cv.timeBoundsValid).toBe(false);
-    // Both att URIs were sent to ucanValidate.
-    expect(urisSeen).toContain("scp:ctx:c/messages:read");
-    expect(urisSeen).toContain("scp:ctx:c/messages:write");
-    expect(urisSeen).toHaveLength(2);
-  });
-
-  it("intersectCapabilityValidation: false wins per field", () => {
-    // Pure unit test for the intersection helper: verify that false wins in
-    // each operand position and that true ∧ true = true.
-    const allTrue: CapabilityValidation = {
-      tokensValid: true,
-      signaturesValid: true,
-      withinCeiling: true,
-      nonceValid: true,
-      notRevoked: true,
-      timeBoundsValid: true,
-    };
-    const expiryFail: CapabilityValidation = {
-      tokensValid: true,
-      signaturesValid: true,
-      withinCeiling: true,
-      nonceValid: true,
-      notRevoked: true,
-      timeBoundsValid: false,
-    };
-    const ceilingFail: CapabilityValidation = {
-      tokensValid: true,
-      signaturesValid: true,
-      withinCeiling: false,
-      nonceValid: false,
-      notRevoked: false,
-      timeBoundsValid: false,
-    };
-    // allTrue ∧ allTrue = allTrue
-    const bothTrue = intersectCapabilityValidation(allTrue, allTrue);
-    expect(bothTrue.tokensValid).toBe(true);
-    expect(bothTrue.timeBoundsValid).toBe(true);
-    // allTrue ∧ expiryFail: only timeBoundsValid=false
-    const r1 = intersectCapabilityValidation(allTrue, expiryFail);
-    expect(r1.tokensValid).toBe(true);
-    expect(r1.signaturesValid).toBe(true);
-    expect(r1.withinCeiling).toBe(true);
-    expect(r1.nonceValid).toBe(true);
-    expect(r1.notRevoked).toBe(true);
-    expect(r1.timeBoundsValid).toBe(false);
-    // expiryFail ∧ ceilingFail: withinCeiling+nonce+notRevoked+timeBounds=false, tokens+sigs=true
-    const r2 = intersectCapabilityValidation(expiryFail, ceilingFail);
-    expect(r2.tokensValid).toBe(true);
-    expect(r2.signaturesValid).toBe(true);
-    expect(r2.withinCeiling).toBe(false);
-    expect(r2.nonceValid).toBe(false);
-    expect(r2.notRevoked).toBe(false);
-    expect(r2.timeBoundsValid).toBe(false);
   });
 
   it("PERM-3030 handle-affinity error re-throws instead of being classified", async () => {
