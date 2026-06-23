@@ -1681,21 +1681,30 @@ impl CoreFields {
     /// - The attached `ContextManager` was built without persistence
     ///   (ephemeral test / in-memory path).
     ///
+    /// Routes through `Supervisor::restore_on_startup` (ADR-049 Phase 2D),
+    /// which runs the durable saga-journal replay BEFORE context restore in
+    /// the §17.16.4-required order — so a process restart resolves any
+    /// crash-orphaned saga journal entries on the same startup sweep that
+    /// rehydrates contexts, with replay observing the not-yet-restored
+    /// (non-resident) caller and leaving outstanding reversals non-terminal
+    /// for a later sweep.
+    ///
     /// Errors from the manager itself are logged but not propagated —
     /// restore is a best-effort rehydration. A caller that needs failure
-    /// visibility calls `ContextManager::restore_all_contexts` directly.
+    /// visibility calls `ContextManager::restore_on_startup` directly.
     pub async fn restore_all_persisted_contexts(&self) {
-        // Supervisor forwards to `ContextManager::restore_all_contexts` when a
-        // manager is attached, and returns `Err(ContextError::NotInitialized)`
-        // otherwise. Both the no-supervisor path (instance has no
-        // supervisor wired yet) and the "no persistence provider
-        // configured" path are expected for ephemeral bridges and share
-        // the same debug-log-and-continue behavior as before the rewire.
+        // Supervisor forwards to `ContextManager::restore_all_contexts` (after
+        // the saga-journal replay) when a manager is attached, and returns
+        // `Err(ContextError::NotInitialized)` otherwise. Both the
+        // no-supervisor path (instance has no supervisor wired yet) and the
+        // "no persistence provider configured" path are expected for ephemeral
+        // bridges and share the same debug-log-and-continue behavior as before
+        // the rewire.
         let Some(supervisor) = self.supervisor.get() else {
             tracing::debug!("restore_all_persisted_contexts: skipped (no Supervisor attached yet)");
             return;
         };
-        match supervisor.restore_all_contexts().await {
+        match supervisor.restore_on_startup().await {
             Ok(restored) => {
                 tracing::debug!(
                     count = restored.len(),

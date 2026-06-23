@@ -4020,9 +4020,11 @@ impl crate::scp::PyScp {
 
     /// Restores all persisted contexts from storage.
     ///
-    /// Delegates to `ContextManager::restore_all_contexts`. Only contexts
-    /// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
-    /// states are skipped.
+    /// Delegates to `ContextManager::restore_on_startup` (ADR-049 Phase 2D),
+    /// which first replays any crash-orphaned saga journal entries and then
+    /// restores contexts in the §17.16.4-required replay-before-restore order.
+    /// Only contexts in `Active` state are restored; contexts in
+    /// `Closing`/`Closed`/`Expired` states are skipped.
     ///
     /// # Returns
     ///
@@ -4041,7 +4043,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
 
         rt.block_on(async move {
-            let restored = sup.restore_all_contexts().await.map_err(|e| {
+            let restored = sup.restore_on_startup().await.map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
             })?;
 

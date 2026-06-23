@@ -7838,6 +7838,44 @@ impl Supervisor {
         crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
+    /// Single process-startup restore entry point (ADR-049 Phase 2D).
+    ///
+    /// Runs the two startup sweeps in the order the §17.16.4 crash-recovery
+    /// proof requires:
+    ///
+    /// 1. [`Self::replay_unresolved_sagas`] — sweep the durable saga journal
+    ///    and resolve every non-terminal entry left by a crash mid-saga.
+    /// 2. [`Self::restore_all_contexts`] — rehydrate every persisted `Active`
+    ///    context's actor from the persistence provider.
+    ///
+    /// **Replay MUST precede restore.** The §17.16.4 recovery treats a
+    /// non-resident saga caller as `ReversalOutstanding`: when the caller
+    /// context is not yet resident, the record-keyed reversal `lookup`-misses
+    /// and the journal is left NON-terminal at `PreparingB` for a later sweep
+    /// (see [`Self::recover_preparing_b_entry`] and the recovery comments near
+    /// the cross-context recovery path). If restore ran first, a now-resident
+    /// caller would be re-driven down the live-reversal path instead, changing
+    /// the crash-recovery semantics the proof relies on. Folding both sweeps
+    /// behind this one method makes it impossible for a bridge to invoke one
+    /// without the other, or in the wrong order.
+    ///
+    /// Returns the list of restored context IDs (the `restore_all_contexts`
+    /// result). Replay's per-entry outcomes are observable on the saga journal,
+    /// not in the return value.
+    ///
+    /// # Errors
+    ///
+    /// - Any [`ContextError`] surfaced by [`Self::replay_unresolved_sagas`]
+    ///   (e.g. a saga-journal load failure). Replay runs first, so a replay
+    ///   failure short-circuits before any context is restored.
+    /// - [`ContextError::PersistenceFailed`] if the persistence provider is
+    ///   unconfigured or `list_persisted_contexts` fails.
+    pub async fn restore_on_startup(self: &Arc<Self>) -> Result<Vec<String>, ContextError> {
+        // §17.16.4: replay BEFORE restore. Do not reorder.
+        self.replay_unresolved_sagas().await?;
+        self.restore_all_contexts().await
+    }
+
     /// Restore a single previously-persisted context from storage via
     /// the actor mailbox.
     ///

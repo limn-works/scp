@@ -3792,12 +3792,14 @@ pub(crate) async fn context_restore_on(
 /// Per-bridge-instance implementation of [`context_restore_all`].
 ///
 /// Returns a JSON array of restored context ID strings. Routes through the
-/// supervisor-scope direct method; `restore_all_contexts` operates on the
-/// supervisor-wide context registry and has no per-context command target.
+/// supervisor-scope direct method `restore_on_startup` (ADR-049 Phase 2D),
+/// which replays any crash-orphaned saga journal entries BEFORE restoring
+/// contexts in the §17.16.4-required order; `restore_on_startup` operates on
+/// the supervisor-wide context registry and has no per-context command target.
 pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Result<String> {
     let sup = crate::runtime::supervisor(bi)?;
 
-    let restored = sup.restore_all_contexts().await.map_err(|e| {
+    let restored = sup.restore_on_startup().await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("restore_all_contexts failed: {e}"),
             code: codes::CTX_2065.to_owned(),

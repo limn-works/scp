@@ -10253,16 +10253,16 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `restore_all_contexts`.
     ///
-    /// Routes through `&*self.inner`.
+    /// Routes through `&*self.inner` and the supervisor-scope
+    /// `restore_on_startup` (ADR-049 Phase 2D), which replays any
+    /// crash-orphaned saga journal entries BEFORE restoring contexts in the
+    /// §17.16.4-required replay-before-restore order.
     pub async fn restore_all_contexts(&self) -> Result<String, ScpError> {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 let manager = bi.context_manager_or_error()?;
-                let restored = manager
-                    .restore_all_contexts()
-                    .await
-                    .map_err(ScpError::from)?;
+                let restored = manager.restore_on_startup().await.map_err(ScpError::from)?;
 
                 serde_json::to_string(&restored).map_err(|e| ScpError::Context {
                     msg: format!("serialization failed: {e}"),

@@ -103,6 +103,15 @@ const HEARTBEAT_SCHEDULER_SRC: &str =
 const COMMON_BROADCAST_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/broadcast.rs");
 
+// Shared bridge-instance core (scp-ffi-common) — owns the production
+// startup/resume path `restore_all_persisted_contexts`, which MUST route
+// through `Supervisor::restore_on_startup` so the §17.16.4 saga-journal
+// replay runs before context restore on every process restart (ADR-049
+// Phase 2D). Pinned by `restore_on_startup_runs_replay_before_restore` and
+// `bridge_resume_path_routes_through_restore_on_startup`.
+const BRIDGE_INSTANCE_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -136,7 +145,7 @@ const UCAN_VALIDATE_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 43;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 45;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -441,6 +450,60 @@ fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
         "governance_helpers::start_governance_timeout_task must dispatch \
          StartTimeoutTask to the actor, not delegate to the legacy \
          start_governance_timeout_task_legacy DashMap spawn dance"
+    );
+}
+
+// Supervisor level (ADR-049 Phase 2D): the single startup entry point
+// `restore_on_startup` MUST run the saga-journal replay BEFORE context
+// restore — the §17.16.4 crash-recovery proof depends on the non-resident
+// caller being observed by replay before restoration makes it resident.
+// This pins both the presence of both calls AND their order, so a future
+// refactor cannot reorder them or drop the replay sweep.
+#[test]
+fn restore_on_startup_runs_replay_before_restore() {
+    let body = extract_fn_body(SUPERVISOR_SRC, "restore_on_startup")
+        .expect("Supervisor::restore_on_startup must exist");
+    let replay_pos = body.find("replay_unresolved_sagas()").expect(
+        "restore_on_startup must call replay_unresolved_sagas() — the §17.16.4 replay sweep",
+    );
+    let restore_pos = body
+        .find("restore_all_contexts()")
+        .expect("restore_on_startup must call restore_all_contexts() — the context-restore sweep");
+    assert!(
+        replay_pos < restore_pos,
+        "restore_on_startup MUST call replay_unresolved_sagas() BEFORE restore_all_contexts() \
+         (§17.16.4 replay-before-restore ordering); found replay at {replay_pos}, restore at \
+         {restore_pos}"
+    );
+}
+
+// Bridge level (ADR-049 Phase 2D): the production startup/resume path
+// `restore_all_persisted_contexts` MUST route through the combined
+// `restore_on_startup` entry point — NOT call the bare `restore_all_contexts`
+// — so the saga-journal replay can never be skipped on a real process restart.
+// Guards against the "exported but never called from the bootstrap path"
+// regression.
+#[test]
+fn bridge_resume_path_routes_through_restore_on_startup() {
+    assert!(
+        fn_body_contains(
+            BRIDGE_INSTANCE_SRC,
+            "restore_all_persisted_contexts",
+            "restore_on_startup()"
+        ),
+        "BridgeInstanceCore::restore_all_persisted_contexts (the production startup/resume path) \
+         must call Supervisor::restore_on_startup() so the §17.16.4 saga-journal replay runs \
+         before context restore on every process restart"
+    );
+    assert!(
+        !fn_body_contains(
+            BRIDGE_INSTANCE_SRC,
+            "restore_all_persisted_contexts",
+            "restore_all_contexts()"
+        ),
+        "BridgeInstanceCore::restore_all_persisted_contexts must NOT call the bare \
+         restore_all_contexts() — that bypasses the saga-journal replay; route through \
+         restore_on_startup() instead"
     );
 }
 

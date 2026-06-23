@@ -197,3 +197,70 @@ async fn replay_on_empty_journal_succeeds() {
     let supervisor = build_supervisor(&storage);
     supervisor.replay_unresolved_sagas().await.unwrap();
 }
+
+/// Process-restart bootstrap wiring (ADR-049 Phase 2D): a fresh supervisor
+/// over storage that durably retains an unresolved saga journal entry
+/// RESOLVES that entry via the single startup entry point
+/// `Supervisor::restore_on_startup` — WITHOUT any manual
+/// `replay_unresolved_sagas()` call. This is the regression guard against the
+/// "exported but never called from the bootstrap path" failure mode: if the
+/// startup method ever stopped folding in the replay sweep, the injected
+/// `Initiated` saga would remain unresolved after `restore_on_startup`.
+#[tokio::test]
+async fn restore_on_startup_replays_unresolved_journal_without_manual_replay() {
+    // First "process": durably journal an unresolved saga, then crash
+    // (drop the supervisor) WITHOUT resolving it.
+    let storage = Arc::new(InMemoryStorage::new());
+    let probe_journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+    let saga_id = SagaId::new();
+    inject(&probe_journal, &saga_id, SagaState::Initiated, 0).await;
+
+    let pre = probe_journal.load_unresolved().await.unwrap();
+    assert_eq!(
+        pre.len(),
+        1,
+        "one synthetic unresolved saga must survive the crash, got {pre:?}"
+    );
+
+    // Second "process": a fresh supervisor over the SAME durable storage. This
+    // lightweight `Supervisor::new` harness wires no helper-side persistence
+    // provider (production builds go through `with_providers`), so the restore
+    // leg of the startup sweep returns `PersistenceFailed`. That is exactly the
+    // ordering probe we want: `restore_on_startup` runs the replay sweep FIRST
+    // (resolving the orphaned journal entry) and ONLY THEN reaches the restore
+    // leg that errors — proving replay ran BEFORE restore, on the bootstrap
+    // path, with no manual `replay_unresolved_sagas()` call.
+    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
+        Arc::new(NoopPersistence);
+    let journal: Arc<dyn SagaJournal> =
+        Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+    let restarted = Arc::new(Supervisor::new(
+        persistence,
+        journal,
+        SupervisorConfig::default(),
+    ));
+
+    // The bootstrap entry point — no manual replay_unresolved_sagas() call.
+    let startup = restarted.restore_on_startup().await;
+
+    // The orphaned `Initiated` saga was discarded by the replay leg of the SAME
+    // startup call — observable on the journal REGARDLESS of the restore leg's
+    // outcome. Without the replay-before-restore wiring this would still be 1.
+    let post = probe_journal.load_unresolved().await.unwrap();
+    assert!(
+        post.is_empty(),
+        "restore_on_startup must replay+resolve the orphaned journal entry on the bootstrap \
+         path before reaching the restore leg, got {post:?}"
+    );
+
+    // The restore leg ran AFTER replay and surfaced the (expected) missing
+    // helper-persistence error for this minimal harness — confirming replay did
+    // not short-circuit on the restore failure (it had already completed).
+    match startup {
+        Err(scp_protocol::context::ContextError::PersistenceFailed(_)) => {}
+        other => panic!(
+            "expected the restore leg to surface PersistenceFailed after replay completed, got \
+             {other:?}"
+        ),
+    }
+}
