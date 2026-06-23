@@ -379,14 +379,13 @@ interface GovernanceBindings {
      *
      * The runtime resolves the authoritative proposal from the context
      * actor's own quorum-validated governance engine using
-     * `proposalIdHex`; the caller supplies no proposal, action, or status.
-     * An untracked / unapproved id is rejected, so a caller cannot
-     * fabricate an approved proposal. Role state is re-synced from the
-     * `ContextManager` after execution.
+     * `proposalIdHex`; the caller supplies no proposal, action, status, or
+     * identity. An untracked / unapproved id is rejected, so a caller
+     * cannot fabricate an approved proposal. The executor and consequence
+     * subject are resolved from the tracked proposal's proposer. Role state
+     * is re-synced from the `ContextManager` after execution.
      *
      * @param contextHandle Opaque handle from context create.
-     * @param identityDid DID of the authenticated caller requesting
-     *   execution.
      * @param proposalIdHex Hex-encoded id of the approved, tracked
      *   proposal.
      * @return JSON string describing the governance action result
@@ -397,7 +396,6 @@ interface GovernanceBindings {
      */
     fun governanceExecute(
         contextHandle: Long,
-        identityDid: String,
         proposalIdHex: String,
     ): String
 
@@ -2077,18 +2075,17 @@ class GovernanceBridgeOps internal constructor(
      *
      * The runtime resolves the authoritative proposal from the context
      * actor's own quorum-validated governance engine; the caller supplies no
-     * proposal, action, or status.
+     * proposal, action, status, or identity. The executor and consequence
+     * subject are resolved from the tracked proposal's proposer.
      *
      * @param contextHandle Handle from context create.
-     * @param identityDid DID of the authenticated caller requesting execution.
      * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
      * @return A string describing the governance action result.
      */
     suspend fun execute(
         contextHandle: Long,
-        identityDid: String,
         proposalIdHex: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, identityDid, proposalIdHex) }
+    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
 
     /**
      * Propose a governance action for voting (#621).

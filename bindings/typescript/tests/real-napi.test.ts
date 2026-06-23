@@ -1593,7 +1593,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // from the context actor's own quorum-validated engine. A fabricated id
       // (a forgery) is rejected — a caller cannot supply an action to run.
       const fabricated = "ab".repeat(32);
-      await expect(napi.contextExecuteGovernanceAction(ctx, admin.did, fabricated)).rejects.toThrow(
+      await expect(napi.contextExecuteGovernanceAction(ctx, fabricated)).rejects.toThrow(
         /not tracked/,
       );
     });
@@ -1608,9 +1608,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         }),
       );
 
-      await expect(
-        napi.contextExecuteGovernanceAction(ctx, admin.did, "not-hex"),
-      ).rejects.toThrow();
+      await expect(napi.contextExecuteGovernanceAction(ctx, "not-hex")).rejects.toThrow();
     });
   });
 

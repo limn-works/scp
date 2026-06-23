@@ -368,7 +368,6 @@ interface WasmModule {
   // Governance
   context_execute_governance: (
     handle: BridgeContextHandle,
-    identityDid: string,
     proposalIdHex: string,
   ) => Promise<string>;
   // Governance proposal lifecycle (#621)
@@ -1093,13 +1092,13 @@ export function createWasmBridge(): Bridge {
     // Governance — delegate to WASM runtime
     async contextExecuteGovernanceAction(
       handle: BridgeContextHandle,
-      identityDid: string,
       proposalIdHex: string,
     ): Promise<string> {
       const wasm = getWasm();
       // Execute BY ID: the WASM runtime resolves the authoritative, tracked
-      // proposal and dispatches its action. No caller-supplied action.
-      return await wasm.context_execute_governance(handle, identityDid, proposalIdHex);
+      // proposal and dispatches its action. No caller-supplied action; the
+      // executor and consequence subject are the tracked proposal's proposer.
+      return await wasm.context_execute_governance(handle, proposalIdHex);
     },
 
     // Governance proposal lifecycle (#621)

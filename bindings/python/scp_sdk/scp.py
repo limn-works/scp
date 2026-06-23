@@ -1285,17 +1285,16 @@ class SCP:
             self._native.governance_approve, handle, identity_did, proposal_id_hex
         )
 
-    async def governance_execute(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
+    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_execute``.
 
         Executes a previously-approved governance proposal *by id*. The runtime
         resolves the authoritative proposal from the context actor's own
         quorum-validated governance engine; the caller supplies no proposal,
-        action, or status.
+        action, status, or identity. The executor and consequence subject are
+        resolved from the tracked proposal's proposer.
         """
-        return await asyncio.to_thread(
-            self._native.governance_execute, handle, identity_did, proposal_id_hex
-        )
+        return await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
 
     async def governance_get_proposal(self, handle: Any, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_get_proposal``."""

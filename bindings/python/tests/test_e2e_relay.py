@@ -410,7 +410,7 @@ class TestGovernanceWithRelay:
         # A 32-byte proposal id the engine never tracked.
         fabricated = "ab" * 32
         with pytest.raises(RuntimeError, match="not tracked"):
-            scp._native.governance_execute(handle, alice_did, fabricated)
+            scp._native.governance_execute(handle, fabricated)
 
         # Bob's role should be unchanged -- the forged execute applied nothing.
         initial_role = scp._native.context_member_role(handle, bob_did)

@@ -187,7 +187,6 @@ class ConformanceStubBindings : NativeBindings {
     // GovernanceBindings
     override fun governanceExecute(
         contextHandle: Long,
-        identityDid: String,
         proposalIdHex: String,
     ): String = """{"status":"executed"}"""
 

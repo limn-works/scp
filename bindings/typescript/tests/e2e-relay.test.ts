@@ -419,9 +419,11 @@ if (bridge === null || scp === null) {
   // -------------------------------------------------------------------------
 
   // NOTE: Direct execute is BY ID across the NAPI bridge:
-  // `contextExecuteGovernanceAction(handle, identityDid, proposalIdHex)`. The
-  // runtime resolves the authoritative proposal from the context actor's own
-  // quorum-validated engine; the caller supplies no proposal, action, or status.
+  // `contextExecuteGovernanceAction(handle, proposalIdHex)`. The runtime
+  // resolves the authoritative proposal from the context actor's own
+  // quorum-validated engine; the caller supplies no proposal, action, status,
+  // or identity. The executor and consequence subject are resolved from the
+  // tracked proposal's proposer.
   // These tests pin the trust boundary (a fabricated id is rejected and applies
   // no state change). Genuine multi-voter execution is covered at the Rust layer
   // in `governance_integration.rs` / the scp-testing cross-bridge fullstack KATs.
@@ -451,7 +453,7 @@ if (bridge === null || scp === null) {
 
       // A fabricated proposal id the engine never tracked.
       const fabricated = "ab".repeat(32);
-      await expect(napi.contextExecuteGovernanceAction(ctx, alice.did, fabricated)).rejects.toThrow(
+      await expect(napi.contextExecuteGovernanceAction(ctx, fabricated)).rejects.toThrow(
         /not tracked/,
       );
 
@@ -484,7 +486,7 @@ if (bridge === null || scp === null) {
 
       // A fabricated proposal id that, if trusted, would have removed Bob.
       const fabricated = "cd".repeat(32);
-      await expect(napi.contextExecuteGovernanceAction(ctx, alice.did, fabricated)).rejects.toThrow(
+      await expect(napi.contextExecuteGovernanceAction(ctx, fabricated)).rejects.toThrow(
         /not tracked/,
       );
 

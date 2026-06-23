@@ -168,7 +168,6 @@ export interface Bridge {
   // Governance
   contextExecuteGovernanceAction(
     handle: BridgeContextHandle,
-    identityDid: string,
     proposalIdHex: string,
   ): Promise<string>;
 

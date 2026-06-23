@@ -932,16 +932,15 @@ class SCP internal constructor(
      * Executes a previously-approved governance proposal BY ID. The runtime
      * resolves the authoritative proposal from the context actor's own
      * quorum-validated governance engine; the caller supplies no proposal,
-     * action, or status.
+     * action, status, or identity. The executor and consequence subject are
+     * resolved from the tracked proposal's proposer.
      */
     suspend fun governanceExecute(
         handle: ContextHandle,
-        identityDid: String,
         proposalIdHex: String,
     ): String =
         inner.governanceExecute(
             handle = handle,
-            identityDid = identityDid,
             proposalIdHex = proposalIdHex,
         )
 

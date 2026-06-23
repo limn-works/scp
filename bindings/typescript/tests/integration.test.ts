@@ -1590,9 +1590,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       await scp.contextJoin(ctx._rawHandle, member.did);
 
       const fabricated = "ab".repeat(32);
-      await expect(
-        scp.contextExecuteGovernanceAction(ctx._rawHandle, admin.did, fabricated),
-      ).rejects.toThrow(/not tracked/);
+      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, fabricated)).rejects.toThrow(
+        /not tracked/,
+      );
 
       // The forged execute applied nothing: the member's role is unchanged.
       const role = await scp.contextMemberRole(ctx._rawHandle, member.did);
@@ -1606,9 +1606,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      await expect(
-        scp.contextExecuteGovernanceAction(ctx._rawHandle, admin.did, "not-hex"),
-      ).rejects.toThrow();
+      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, "not-hex")).rejects.toThrow();
     });
 
     it("scp.contextGovernanceListProposals returns a JSON array (initially empty)", async () => {

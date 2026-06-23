@@ -571,9 +571,10 @@ public extension SCP {
     /// Executes a previously-approved governance proposal BY ID. The runtime
     /// resolves the authoritative proposal from the context actor's own
     /// quorum-validated governance engine; the caller supplies no proposal,
-    /// action, or status.
-    func governanceExecute(handle: ContextHandle, identityDid: String, proposalIdHex: String) async throws -> String {
-        try await inner.governanceExecute(handle: handle, identityDid: identityDid, proposalIdHex: proposalIdHex)
+    /// action, status, or identity. The executor and consequence subject are
+    /// resolved from the tracked proposal's proposer.
+    func governanceExecute(handle: ContextHandle, proposalIdHex: String) async throws -> String {
+        try await inner.governanceExecute(handle: handle, proposalIdHex: proposalIdHex)
     }
 
     /// Forwards to ``Scp/governanceGetProposal`` on ``inner``.
