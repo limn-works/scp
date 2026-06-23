@@ -426,6 +426,40 @@ pub(crate) struct ClassCMut<'a> {
     governance: GovernanceClassCMut<'a>,
 }
 
+/// Simultaneously-held borrows for the §19 economy pre-check.
+///
+/// The §19 message economy pre-check needs a `&mut` to the per-member
+/// `budget_tracker` (to debit) held AT THE SAME TIME as shared reads of the
+/// `velocity_tracker`, `economic_policy`, `consequence_rules`, and
+/// `message_pricing`. Returning these as one struct (rather than a sequence of
+/// accessor calls) lets the caller hold the single `&mut` and the four `&`
+/// reads concurrently without re-borrowing the view between them — every field
+/// here is a DISJOINT borrow of a distinct [`GovernanceClassCMut`] field, so
+/// the aliasing is sound by construction.
+///
+/// All fields are Class-C / structural: the `budget_tracker` debit it enables
+/// is reversed by the economy-compensation hook when a persist does not land,
+/// and the four reads are configuration / liveness state. This struct holds NO
+/// reference into any Class-S sub-struct — it names only the Class-C fields the
+/// [`GovernanceClassCMut`] already exposes individually.
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 foundation: the simultaneous §19 economy pre-check borrows get their first PRODUCTION reader when the message-economy pre-check migrates onto `economy_pre_check_borrows`. Exercised by this module's unit tests now."
+)]
+pub(crate) struct EconomyPreCheckBorrows<'a> {
+    /// `&mut` to the per-member cumulative budget tracker (§19.5) — the debit
+    /// target of the pre-check.
+    pub(crate) budget_tracker: &'a mut MemberBudgetTracker,
+    /// Shared read of the per-sender velocity tracker (§19.7 anti-spam).
+    pub(crate) velocity_tracker: &'a SenderVelocityTracker,
+    /// Shared read of the mutable economic policy (§19.3).
+    pub(crate) economic_policy: &'a Option<EconomicPolicy>,
+    /// Shared read of the consequence rules declared at creation (ADR-017).
+    pub(crate) consequence_rules: &'a [ConsequenceRule],
+    /// Shared read of the per-DID escalating-cost message pricing config (§19.7).
+    pub(crate) message_pricing: &'a Option<ContextMessagePricingConfig>,
+}
+
 /// RESTRICTED mutable view over the Class-C governance fields of a
 /// [`GovernanceState`]. It holds those fields as SEPARATE field-granular
 /// references — it does **not** hold a whole `&mut GovernanceState`, so there is
@@ -744,6 +778,26 @@ impl<'a> GovernanceClassCMut<'a> {
         self.proposal_timestamps
     }
 
+    /// Borrows for the §19 economy pre-check: a `&mut` to the `budget_tracker`
+    /// (the debit target) held simultaneously with shared `&` reads of
+    /// `velocity_tracker`, `economic_policy`, `consequence_rules`, and
+    /// `message_pricing`.
+    ///
+    /// These five borrows are disjoint fields of this view, so the borrow
+    /// checker permits the single `&mut` alongside the four `&` reads. The
+    /// caller can therefore run the whole pre-check (debit + the four reads)
+    /// without re-borrowing the view between steps. Every field is Class-C; no
+    /// reference into any Class-S sub-struct is produced.
+    pub(crate) fn economy_pre_check_borrows(&mut self) -> EconomyPreCheckBorrows<'_> {
+        EconomyPreCheckBorrows {
+            budget_tracker: self.budget_tracker,
+            velocity_tracker: self.velocity_tracker,
+            economic_policy: self.economic_policy,
+            consequence_rules: self.consequence_rules,
+            message_pricing: self.message_pricing,
+        }
+    }
+
     /// Reborrow this view into a shorter-lived [`GovernanceClassCMut`] over the
     /// same fields. Used by [`ClassCMut::split_class_c`] to hand an OWNED
     /// sub-view (not a reference) into a [`ClassCSplit`] without giving up the
@@ -976,7 +1030,7 @@ pub(crate) struct MembershipClassCMut<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the structural membership accessors (`add_member`, `next_sequence_number`, `rollback_sequence_number`, `get_mut`, `count`, `contains`, `get`) get their first PRODUCTION callers when the structural membership-mutation handlers migrate off the whole-`&mut` `members_mut`. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the structural membership accessors (`add_member`, `next_sequence_number`, `rollback_sequence_number`, `get_mut`, `count`, `contains`, `get`, `remove_subscriber`) get their first PRODUCTION callers when the structural membership-mutation handlers migrate off the whole-`&mut` `members_mut`. Exercised by this module's unit tests now."
 )]
 impl<'a> MembershipClassCMut<'a> {
     /// Wrap a borrowed [`MembershipState`]. Crate-internal: constructed only by
@@ -1028,6 +1082,32 @@ impl<'a> MembershipClassCMut<'a> {
     /// [`MembershipState::get`].
     pub(crate) fn get(&self, did: &str) -> Option<&MemberInfo> {
         self.membership.get(did)
+    }
+
+    /// Remove a BROADCAST SUBSCRIBER from the roster (Class-C / best-effort).
+    /// Returns `true` if the subscriber was present. Forwards
+    /// [`MembershipState::remove_member`].
+    ///
+    /// # Why a removal is exposed here when the general one is NOT
+    ///
+    /// This view deliberately withholds a general `remove_member`: removing a
+    /// regular member is a downward-authorization op gated by an MLS Commit, and
+    /// a coalesce-window rollback of such a removal would silently re-admit a
+    /// member the caller already observed as removed — so it MUST be fail-closed
+    /// (ADR-049 §9), not best-effort through this Class-C view.
+    ///
+    /// A broadcast UNSUBSCRIBE is different: a broadcast context's subscriber
+    /// roster carries NO key secrecy — content is public, per-author broadcast
+    /// keys (not MLS group keys) protect publication, and the unsubscribe is not
+    /// an MLS-gated authorization boundary. A coalesce-window rollback of a
+    /// subscriber removal at most re-lists a public-content subscriber for the
+    /// window, with no membership-secrecy consequence — so best-effort removal
+    /// is acceptable HERE and only here. This method is therefore scoped, by
+    /// name and contract, to the broadcast subscription roster; it is NOT a
+    /// general member-removal escape, and a general `remove_member` MUST NOT be
+    /// added to this view.
+    pub(crate) fn remove_subscriber(&mut self, did: &DID) -> bool {
+        self.membership.remove_member(did)
     }
 }
 
@@ -1541,6 +1621,38 @@ impl ClassSCell {
     /// compile error to violate.
     pub(in crate::context) const fn state_mut(&mut self) -> &mut PerContextState {
         &mut self.state
+    }
+
+    /// Idempotent straggler cleanup of a committed cross-context reservation
+    /// (ADR-049 §9). NO fail-closed persist — DELIBERATELY. Safe because: the
+    /// committed terminal is already durably witnessed by `xctx_committed_invocations`
+    /// (the only caller checks `contains(&saga_id)` first); a removal here is the rare
+    /// re-ack straggler, idempotent, and rebuilt-irrelevant on respawn. Adding a persist
+    /// would turn an idempotent `Ok` re-ack into a fallible write. This is a single named
+    /// operation, NOT a general no-persist escape — it can never widen to a closure form.
+    #[allow(
+        dead_code,
+        reason = "ADR-049 §9 foundation: the single no-persist Class-S straggler cleanup gets its production caller when commit_a's replay arm migrates off state_mut(). Exercised by this module's unit tests now."
+    )]
+    pub(crate) fn clear_committed_reservation_idempotent(
+        &mut self,
+        saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    ) -> bool {
+        self.state
+            .class_s
+            .xctx_caller_reservations
+            .remove(saga_id)
+            .is_some()
+    }
+
+    /// Set the monotonic generation counter directly (test fixtures only).
+    ///
+    /// Parity with [`ClassSCommitToken::new_for_test`]: `generation` is a
+    /// Class-C / structural field, so a test may seed it without routing through
+    /// a persist combinator. Test-only — gated behind `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) const fn set_generation_for_test(&mut self, g: u64) {
+        self.state.generation = g;
     }
 
     /// Mutate Class-S state through a [`ClassSMut`] view and persist
@@ -3975,6 +4087,168 @@ mod tests {
         assert!(
             state.saga_pending().contains_key(&saga_a),
             "into_inner preserves the committed mutation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // economy_pre_check_borrows (foundation #1 — simultaneous §19 borrows)
+    // ------------------------------------------------------------------
+
+    /// `GovernanceClassCMut::economy_pre_check_borrows` hands back a `&mut`
+    /// budget_tracker held SIMULTANEOUSLY with shared reads of velocity_tracker,
+    /// economic_policy, consequence_rules, and message_pricing — a debit through
+    /// the `&mut` lands while the four reads are live in the same scope.
+    #[tokio::test]
+    async fn economy_pre_check_borrows_debits_while_reading() {
+        use scp_protocol::economy::types::Amount;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x90));
+        let ctx = ctx_hex(0x90);
+        let member = DID("did:example:precheck-member".to_owned());
+        let member_for_closure = member.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            let gov = view.governance_class_c_mut();
+            let borrows = gov.economy_pre_check_borrows();
+            // The four shared reads are live alongside the single &mut.
+            let policy_is_none = borrows.economic_policy.is_none();
+            let no_rules = borrows.consequence_rules.is_empty();
+            let no_pricing = borrows.message_pricing.is_none();
+            // Read the velocity tracker too (a fresh tracker reports zero).
+            let no_velocity = borrows
+                .velocity_tracker
+                .get_velocity(&member_for_closure, 1_700_000_000)
+                == 0;
+            assert!(policy_is_none && no_rules && no_pricing && no_velocity);
+            // Debit through the &mut while those reads are still in scope.
+            borrows
+                .budget_tracker
+                .grant(&member_for_closure, Amount(700));
+        });
+
+        assert_eq!(
+            cell.governance.budget_tracker.remaining(&member),
+            Amount(700),
+            "budget debit landed through economy_pre_check_borrows.budget_tracker"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // clear_committed_reservation_idempotent (foundation #2 — no-persist Class-S)
+    // ------------------------------------------------------------------
+
+    /// `clear_committed_reservation_idempotent` removes a present
+    /// caller-reservation straggler (returns `true`), is idempotent on a second
+    /// call (returns `false`), and performs NO persist.
+    #[tokio::test]
+    async fn clear_committed_reservation_idempotent_removes_then_noops() {
+        use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let _deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x91));
+        let saga_a = saga("saga-straggler");
+
+        // Seed a straggler reservation directly via the temporary state_mut
+        // escape (test fixture only).
+        let record = CallerReservationRecord {
+            actor_did: DID("did:example:straggler".to_owned()),
+            deducted_cost: None,
+            needs_hard_rate_limit_refund: false,
+            recorded_at_secs: 1_700_000_000,
+            escrow_authorization: None,
+        };
+        cell.state_mut()
+            .class_s
+            .xctx_caller_reservations
+            .insert(saga_a.clone(), record);
+
+        // First clear removes the straggler.
+        assert!(
+            cell.clear_committed_reservation_idempotent(&saga_a),
+            "first clear removes the present reservation"
+        );
+        assert!(
+            !cell.class_s.xctx_caller_reservations.contains_key(&saga_a),
+            "reservation gone after clear"
+        );
+
+        // Second clear is an idempotent no-op.
+        assert!(
+            !cell.clear_committed_reservation_idempotent(&saga_a),
+            "second clear is an idempotent no-op (returns false)"
+        );
+
+        // The method NEVER persists — no combinator was invoked.
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            0,
+            "clear_committed_reservation_idempotent performs NO persist"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // remove_subscriber (foundation #4 — broadcast-roster best-effort removal)
+    // ------------------------------------------------------------------
+
+    /// `MembershipClassCMut::remove_subscriber` removes a broadcast subscriber
+    /// from the roster (returns `true` when present, `false` when absent), via
+    /// the restricted Class-C membership view.
+    #[tokio::test]
+    async fn remove_subscriber_removes_from_roster() {
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x92));
+        let ctx = ctx_hex(0x92);
+        let sub = DID("did:example:broadcast-subscriber".to_owned());
+        let sub_for_f = sub.clone();
+
+        cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
+            let mut m = view.membership_class_c_mut();
+            m.add_member(sub_for_f.clone(), "member".to_owned(), Vec::new());
+            assert!(
+                m.contains(sub_for_f.0.as_str()),
+                "subscriber present after add"
+            );
+            // Remove the broadcast subscriber through the scoped removal.
+            assert!(
+                m.remove_subscriber(&sub_for_f),
+                "remove_subscriber returns true for a present subscriber"
+            );
+            assert!(
+                !m.contains(sub_for_f.0.as_str()),
+                "subscriber gone after remove_subscriber"
+            );
+            // A second removal of the now-absent subscriber returns false.
+            assert!(
+                !m.remove_subscriber(&sub_for_f),
+                "remove_subscriber returns false for an absent subscriber"
+            );
+        });
+
+        assert!(
+            !cell.membership.contains(sub.0.as_str()),
+            "subscriber removed from the underlying roster"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // set_generation_for_test (foundation #5 — test-only Class-C setter)
+    // ------------------------------------------------------------------
+
+    /// `set_generation_for_test` seeds the Class-C generation counter directly,
+    /// observable through the read `Deref`.
+    #[test]
+    fn set_generation_for_test_seeds_generation() {
+        let mut cell = ClassSCell::new(fresh_state(0x93));
+        assert_eq!(cell.generation, 0, "fresh state starts at generation 0");
+        cell.set_generation_for_test(7);
+        assert_eq!(
+            cell.generation, 7,
+            "generation seeded through set_generation_for_test"
         );
     }
 }

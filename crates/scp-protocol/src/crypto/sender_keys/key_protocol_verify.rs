@@ -742,10 +742,42 @@ impl NonceDedup {
     ///
     /// Also evicts entries older than the TTL.
     pub fn is_replayed(&mut self, nonce: &[u8; REQUEST_NONCE_SIZE], now_secs: u64) -> bool {
+        // Additive split: the mutating eviction is now a separate named
+        // operation, and the replay decision is a pure read. This preserves
+        // the exact original behavior (evict-then-decide) for existing
+        // callers while letting newer callers take the replay decision
+        // without a `&mut` borrow (see [`Self::is_replayed_read`] /
+        // [`Self::evict_expired`]).
+        self.evict_expired(now_secs);
+        self.is_replayed_read(nonce, now_secs)
+    }
+
+    /// Pure read: returns `true` iff an **unexpired** entry for `nonce`
+    /// exists, indicating a replay attempt — without mutating the cache.
+    ///
+    /// Applies the SAME TTL freshness filter as [`Self::is_replayed`] inline:
+    /// an entry whose age (`now_secs - seen_at`) has reached the TTL is
+    /// already expired and MUST NOT count as a replay (it is the entry
+    /// [`Self::evict_expired`] would have dropped). This makes the read
+    /// decision identical to `is_replayed`'s without requiring eviction
+    /// first, so a caller holding only `&self` can take the replay decision.
+    #[must_use]
+    pub fn is_replayed_read(&self, nonce: &[u8; REQUEST_NONCE_SIZE], now_secs: u64) -> bool {
+        let ttl = self.ttl_secs;
+        self.seen
+            .get(nonce)
+            .is_some_and(|seen_at| now_secs.saturating_sub(*seen_at) < ttl)
+    }
+
+    /// Evicts every entry older than this cache's TTL relative to `now_secs`.
+    ///
+    /// This is the mutating TTL `retain` extracted from [`Self::is_replayed`]:
+    /// an entry whose age (`now_secs - seen_at`) has reached `ttl_secs` is
+    /// removed. Idempotent for a fixed `now_secs`.
+    pub fn evict_expired(&mut self, now_secs: u64) {
         let ttl = self.ttl_secs;
         self.seen
             .retain(|_, seen_at| now_secs.saturating_sub(*seen_at) < ttl);
-        self.seen.contains_key(nonce)
     }
 
     /// Records `nonce` as seen at `now_secs`.
@@ -1429,6 +1461,120 @@ mod tests {
         // Recording it makes subsequent uses a replay.
         dedup.record(new_nonce, check_time);
         assert!(dedup.is_replayed(&new_nonce, check_time));
+    }
+
+    // -------------------------------------------------------------------
+    // NonceDedup split: is_replayed_read / evict_expired equivalence
+    // -------------------------------------------------------------------
+
+    /// `is_replayed_read` returns the SAME decision as `is_replayed` for a
+    /// fresh (never-seen) nonce: not a replay.
+    #[test]
+    fn nonce_dedup_read_matches_is_replayed_for_fresh_nonce() {
+        let mut a = NonceDedup::new();
+        let read = NonceDedup::new();
+        let nonce = [1u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        let decision_mut = a.is_replayed(&nonce, now);
+        let decision_read = read.is_replayed_read(&nonce, now);
+        assert_eq!(decision_mut, decision_read);
+        assert!(!decision_read, "fresh nonce is not a replay");
+    }
+
+    /// Within the TTL window, `is_replayed_read` (no mutation) agrees with the
+    /// `is_replayed` decision: still a replay.
+    #[test]
+    fn nonce_dedup_read_matches_is_replayed_within_window() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [2u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce, now);
+
+        let check = now + 60;
+        // The read decision (no mutation) must equal the old behavior's
+        // decision. Compute the read first so the cache is unmutated.
+        let decision_read = dedup.is_replayed_read(&nonce, check);
+        let decision_mut = dedup.is_replayed(&nonce, check);
+        assert_eq!(decision_mut, decision_read);
+        assert!(decision_read, "nonce within window is a replay");
+    }
+
+    /// The expired-entry-is-NOT-a-replay case: a still-present-but-expired
+    /// entry must read as not-a-replay (matching what `is_replayed` returns
+    /// after its eviction pass).
+    #[test]
+    fn nonce_dedup_read_treats_expired_entry_as_not_replayed() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [3u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce, now);
+
+        let future = now + NONCE_EXPIRY_SECS + 1;
+        // Read first (entry still physically present but expired): must be
+        // false, exactly as old `is_replayed` returns after eviction.
+        assert!(
+            !dedup.is_replayed_read(&nonce, future),
+            "expired entry must not count as a replay on the read path"
+        );
+        // And the mutating path agrees.
+        assert!(
+            !dedup.is_replayed(&nonce, future),
+            "expired entry must not count as a replay on the mutating path"
+        );
+    }
+
+    /// Exact TTL boundary: an entry whose age equals `ttl_secs` is expired
+    /// (the predicate is strict `<`), so both paths return not-a-replay.
+    #[test]
+    fn nonce_dedup_read_at_exact_ttl_boundary_is_not_replay() {
+        let mut dedup = NonceDedup::new();
+        let nonce = [4u8; REQUEST_NONCE_SIZE];
+        let now = 1_700_000_000u64;
+        dedup.record(nonce, now);
+
+        let boundary = now + NONCE_EXPIRY_SECS; // age == ttl → expired
+        assert!(!dedup.is_replayed_read(&nonce, boundary));
+        assert!(!dedup.is_replayed(&nonce, boundary));
+    }
+
+    /// `evict_expired` drops exactly the expired entries and keeps the fresh
+    /// ones.
+    #[test]
+    fn nonce_dedup_evict_expired_drops_only_expired() {
+        let mut dedup = NonceDedup::new();
+        let now = 1_700_000_000u64;
+
+        let stale = [5u8; REQUEST_NONCE_SIZE];
+        let fresh = [6u8; REQUEST_NONCE_SIZE];
+        // `stale` recorded far enough back to be expired at `later`.
+        dedup.record(stale, now);
+        // `fresh` recorded recently.
+        let later = now + NONCE_EXPIRY_SECS + 1;
+        dedup.record(fresh, later);
+
+        // Before eviction, both are physically present.
+        assert_eq!(dedup.entries().len(), 2);
+
+        dedup.evict_expired(later);
+
+        let remaining = dedup.entries();
+        assert_eq!(remaining.len(), 1, "exactly the expired entry is dropped");
+        assert!(remaining.contains_key(&fresh), "fresh entry survives");
+        assert!(!remaining.contains_key(&stale), "stale entry is evicted");
+    }
+
+    /// `evict_expired` is a no-op when nothing has expired.
+    #[test]
+    fn nonce_dedup_evict_expired_noop_when_all_fresh() {
+        let mut dedup = NonceDedup::new();
+        let now = 1_700_000_000u64;
+        let n1 = [7u8; REQUEST_NONCE_SIZE];
+        let n2 = [8u8; REQUEST_NONCE_SIZE];
+        dedup.record(n1, now);
+        dedup.record(n2, now + 1);
+
+        dedup.evict_expired(now + 2);
+        assert_eq!(dedup.entries().len(), 2, "no fresh entry is dropped");
     }
 
     // -------------------------------------------------------------------
