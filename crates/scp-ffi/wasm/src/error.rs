@@ -149,6 +149,24 @@ impl ScpWasmError {
         };
         JsValue::from_str(&err.to_string())
     }
+
+    /// Maps a malformed caller-supplied governance proposal id to a `Context`
+    /// error with code `SCP-CTX-2040`.
+    ///
+    /// The native PyO3/UniFFI/NAPI bridges all surface a malformed proposal id
+    /// (non-hex, wrong length) as `SCP-CTX-2040`. Routing the WASM
+    /// `validate_proposal_id_hex` failure through this constructor keeps the
+    /// strict-hex rejection error surface identical across every bridge, rather
+    /// than diverging to the generic `SCP-VALID-7000` the blanket
+    /// `From<ValidationError>` impl would produce. The validator's message
+    /// (which names the 32-byte / 64-hex-char requirement) is preserved verbatim.
+    #[must_use]
+    pub fn proposal_id(e: scp_ffi_common::validate::ValidationError) -> Self {
+        Self::Context {
+            message: e.message,
+            code: codes::CTX_2040.to_owned(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

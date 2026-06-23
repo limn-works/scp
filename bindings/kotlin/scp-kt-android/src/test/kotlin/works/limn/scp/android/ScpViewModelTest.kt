@@ -191,7 +191,7 @@ private class TestNativeBindings : NativeBindings {
     override fun contextMemberRole(contextHandle: Long, did: String): String? = null
 
     // GovernanceBindings
-    override fun governanceExecute(contextHandle: Long, proposalJson: String): String = "{}"
+    override fun governanceExecute(contextHandle: Long, proposalIdHex: String): String = "{}"
     override fun governancePropose(contextHandle: Long, proposerDid: String, actionJson: String): String =
         """{"proposal_id":"0000","status":"Pending","execution_result":null}"""
     override fun governanceApprove(contextHandle: Long, voterDid: String, proposalIdHex: String): String =

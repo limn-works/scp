@@ -9289,7 +9289,10 @@ mod tests {
 
         let context_id = "ctx-wasm-genuine";
         let proposer = "did:dht:z6MkWasmGenuineProposer";
-        let proposal_id = "abad1dea";
+        // A valid 64-char (32-byte) hex id: the strict `parse_proposal_id_bytes`
+        // on the execute path requires exactly 32 bytes. The id is only a map
+        // key and the leaf bytes, so any well-formed 64-char hex works.
+        let proposal_id = "abad1dea000000000000000000000000000000000000000000000000000000ff";
         let created_at = 1_700_600_600_u64;
 
         let mut ctx = make_bare_per_context_state(context_id, proposer);

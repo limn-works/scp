@@ -737,7 +737,9 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 #[wasm_bindgen]
 pub fn context_execute_governance(handle: &WasmContextHandle, proposal_id_hex: String) -> Promise {
     if let Err(e) = validate_proposal_id_hex(&proposal_id_hex) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -806,7 +808,9 @@ pub fn context_governance_propose(
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_proposal_id_hex(&proposal_id) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -883,7 +887,9 @@ pub fn context_governance_approve(
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_proposal_id_hex(&proposal_id) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -928,7 +934,9 @@ pub fn context_governance_reject(
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_proposal_id_hex(&proposal_id) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -973,7 +981,9 @@ pub fn context_governance_withdraw(
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_proposal_id_hex(&proposal_id) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -1008,7 +1018,9 @@ pub fn context_governance_withdraw(
 #[wasm_bindgen]
 pub fn context_governance_get_proposal(handle: &WasmContextHandle, proposal_id: String) -> Promise {
     if let Err(e) = validate_proposal_id_hex(&proposal_id) {
-        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+        return future_to_promise(
+            async move { Err(ScpWasmError::proposal_id(e).into_js().into()) },
+        );
     }
     let context_id = handle.context_id();
 
@@ -3138,6 +3150,33 @@ mod tests {
         assert!(
             validate_proposal_id_hex(&odd).is_err(),
             "odd-length hex must be rejected"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn malformed_proposal_id_surfaces_ctx_2040() {
+        // The governance bridge functions route a rejected proposal id through
+        // `ScpWasmError::proposal_id`, which must emit `SCP-CTX-2040` to match
+        // the native PyO3/UniFFI/NAPI bridges' error surface for the identical
+        // malformed-proposal-id condition (not the generic `SCP-VALID-7000`
+        // the blanket `From<ValidationError>` impl would produce).
+        // A 4-byte (8-hex-char) id is rejected by the strict validator.
+        let validation_err = validate_proposal_id_hex("deadbeef").unwrap_err();
+        let mapped = ScpWasmError::proposal_id(validation_err);
+        assert!(
+            matches!(mapped, ScpWasmError::Context { .. }),
+            "a malformed proposal id must map to a Context error, got: {mapped:?}"
+        );
+        let rendered = mapped.to_string();
+        assert!(
+            rendered.contains(codes::CTX_2040),
+            "code must match native bridges (SCP-CTX-2040), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("32 bytes"),
+            "the validator message naming the 32-byte requirement must be \
+             preserved, got: {rendered}"
         );
     }
 

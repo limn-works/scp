@@ -1083,9 +1083,11 @@ mod cross_impl_leaf_parity {
         let mut mgr = WasmContextManager::new();
         mgr.test_insert_context(context_id, ctx);
 
-        // "deadbeef" is valid hex (the handler hex-decodes proposal_id into a
-        // [u8; 32]) and is used verbatim as the pending-proposal map key.
-        let proposal_id = "deadbeef";
+        // A valid 64-char (32-byte) hex id. The execute path hex-decodes
+        // proposal_id into a [u8; 32] via the strict `parse_proposal_id_bytes`,
+        // which requires exactly 32 bytes; the id is also the pending-proposal
+        // map key. Any well-formed 64-char hex works for both roles.
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let action = GovernanceAction::AddSigner {
             did: DID::from("did:dht:z6MkNewSigner".to_owned()),
         };
@@ -1214,7 +1216,9 @@ mod cross_impl_leaf_parity {
         let context_id = "ctx-gov-direct-executor";
         let proposer = "did:dht:z6MkDirectProposer";
         let caller = "did:dht:z6MkDirectCaller"; // distinct from proposer
-        let proposal_id = "feedface";
+        // Valid 64-char (32-byte) hex; the execute path requires exactly 32
+        // bytes via the strict `parse_proposal_id_bytes`.
+        let proposal_id = "feedface000000000000000000000000000000000000000000000000000000ff";
         let created_at = 1_700_500_500_u64;
 
         // SingleAdmin context: the caller (an admin) executes directly. Both
@@ -1545,7 +1549,9 @@ mod cross_impl_leaf_parity {
         let mut mgr = WasmContextManager::new();
         mgr.test_insert_context(context_id, ctx);
 
-        let proposal_id = "deadbeef";
+        // Valid 64-char (32-byte) hex; the execute path requires exactly 32
+        // bytes via the strict `parse_proposal_id_bytes`.
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let action = GovernanceAction::ChangeRole {
             did: DID::from("did:dht:z6MkMemberC".to_owned()),
             new_role: "observer".to_owned(),
@@ -1636,7 +1642,9 @@ mod cross_impl_leaf_parity {
         let mut mgr = WasmContextManager::new();
         mgr.test_insert_context(context_id, ctx);
 
-        let proposal_id = "deadbeef";
+        // Valid 64-char (32-byte) hex; the execute path requires exactly 32
+        // bytes via the strict `parse_proposal_id_bytes`.
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let action = GovernanceAction::ChangeRole {
             did: DID::from("did:dht:z6MkMemberC".to_owned()),
             new_role: "observer".to_owned(),
@@ -1718,7 +1726,12 @@ mod cross_impl_leaf_parity {
             access: AccessScope::Both,
         };
 
-        let result = mgr.propose_governance_action(context_id, admin, "cafebabe", &action);
+        let result = mgr.propose_governance_action(
+            context_id,
+            admin,
+            "cafebabe000000000000000000000000000000000000000000000000000000ff",
+            &action,
+        );
         assert!(
             result.is_err(),
             "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected — \
@@ -1780,7 +1793,12 @@ mod cross_impl_leaf_parity {
         }))
         .expect("CreateChildContext action deserializes");
 
-        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        let result = mgr.propose_governance_action(
+            context_id,
+            admin,
+            "cafef00d000000000000000000000000000000000000000000000000000000ff",
+            &action,
+        );
         assert!(
             result.is_err(),
             "an out-of-ceiling CreateChildContext (context_child:create not in ceiling) MUST be \
@@ -1834,8 +1852,13 @@ mod cross_impl_leaf_parity {
         }))
         .expect("CreateChildContext action deserializes");
 
-        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
-            .expect("in-ceiling CreateChildContext auto-executes on single-admin propose");
+        mgr.propose_governance_action(
+            context_id,
+            admin,
+            "cafef00d000000000000000000000000000000000000000000000000000000ff",
+            &action,
+        )
+        .expect("in-ceiling CreateChildContext auto-executes on single-admin propose");
 
         let logged = mgr.test_context_event_log_events(context_id);
         let executed = logged
@@ -1887,7 +1910,12 @@ mod cross_impl_leaf_parity {
         }))
         .expect("EstablishToolInterface action deserializes");
 
-        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        let result = mgr.propose_governance_action(
+            context_id,
+            admin,
+            "cafef00d000000000000000000000000000000000000000000000000000000ff",
+            &action,
+        );
         assert!(
             result.is_err(),
             "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
@@ -1941,8 +1969,13 @@ mod cross_impl_leaf_parity {
         }))
         .expect("EstablishToolInterface action deserializes");
 
-        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
-            .expect("in-ceiling EstablishToolInterface auto-executes on single-admin propose");
+        mgr.propose_governance_action(
+            context_id,
+            admin,
+            "cafef00d000000000000000000000000000000000000000000000000000000ff",
+            &action,
+        )
+        .expect("in-ceiling EstablishToolInterface auto-executes on single-admin propose");
 
         let logged = mgr.test_context_event_log_events(context_id);
         let executed = logged

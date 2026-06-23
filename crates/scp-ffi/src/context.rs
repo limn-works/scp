@@ -5605,8 +5605,8 @@ mod tests {
     /// through the per-instance supervisor (ADR-049 actor model) and return the
     /// handler's `Result`.
     ///
-    /// The payload now carries ONLY the proposal id and the authenticated
-    /// executor DID — never a caller-supplied proposal/action/status. The
+    /// The payload now carries ONLY the proposal id — never a caller-supplied
+    /// proposal/action/status, and never a caller-supplied executor DID. The
     /// runtime resolves the authoritative proposal from the context actor's own
     /// quorum-validated governance engine; a caller therefore cannot fabricate
     /// an `Approved` proposal or substitute an action. This helper exercises
