@@ -592,10 +592,11 @@ async function evaluateLayer1(
  * which the TS layer obtains from `scp.contextCreate(...)` / `contextJoin(...)`.
  * The context's `contextId` is recorded on the result.
  *
- * Layer 1 validates each token's declared capabilities against the token's own
- * `aud` (i.e., each `att[i].with`). Binding tokens to `subjectDid` (ensuring
- * the token's `aud` is `subjectDid`) is the responsibility of the upstream
- * credential issuance flow, not this function.
+ * Layer 1 validates each token's first declared capability (`att[0].with`)
+ * against the token's own `aud`. Only att[0] is sent to the bridge; see
+ * {@link evaluateLayer1} for the att[0]-only rationale. Binding tokens to
+ * `subjectDid` (ensuring the token's `aud` is `subjectDid`) is the
+ * responsibility of the upstream credential issuance flow, not this function.
  *
  * @param scp The {@link SCP} instance to dispatch bridge calls on.
  * @param subjectDid The DID of the participant to evaluate.
