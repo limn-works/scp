@@ -152,17 +152,38 @@ _EXPIRY_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _intersect_capability_validation(
+    a: CapabilityValidation, b: CapabilityValidation
+) -> CapabilityValidation:
+    """AND-intersect two :class:`CapabilityValidation` verdicts: ``False`` wins per field.
+
+    A failing verdict in either operand means that field fails overall. Used
+    by :func:`evaluate_trust` to combine per-URI verdicts within a single
+    token: each ``att[i]["with"]`` URI is validated independently, and the
+    per-field intersection of all per-URI results is the token's verdict.
+    A token passes a field only if ALL of its declared URIs pass that field.
+    """
+    result = CapabilityValidation()
+    result.tokens_valid = a.tokens_valid and b.tokens_valid
+    result.signatures_valid = a.signatures_valid and b.signatures_valid
+    result.within_ceiling = a.within_ceiling and b.within_ceiling
+    result.nonce_valid = a.nonce_valid and b.nonce_valid
+    result.not_revoked = a.not_revoked and b.not_revoked
+    result.time_bounds_valid = a.time_bounds_valid and b.time_bounds_valid
+    return result
+
+
 def _extract_all_capability_uris(token: str) -> list[str] | None:
     """Extract all declared capability URIs from a UCAN JWT's (unverified) payload.
 
     Reading the unverified payload is safe because ``ucan_validate`` performs
-    the actual cryptographic verification -- this only extracts which URI to
+    the actual cryptographic verification -- this only extracts which URIs to
     validate against.
 
-    ``evaluate_trust`` uses the first element (``att[0]["with"]``) as the
-    representative capability URI for self-consistency validation. Full multi-att
-    ceiling validation (checking every att entry against the context ceiling)
-    requires bridge-level multi-att support.
+    ``evaluate_trust`` validates EVERY element returned by this function:
+    each ``att[i]["with"]`` URI is sent to ``ucan_validate`` independently,
+    and the per-field AND-intersection of all per-URI verdicts (via
+    :func:`_intersect_capability_validation`) is the token's final verdict.
 
     Returns:
         A list of all declared non-empty capability URI strings, or ``None``
@@ -814,13 +835,12 @@ async def evaluate_trust(
         cap_validation.time_bounds_valid = True
 
         for token in capability_tokens:
-            # Extract the first declared capability URI from the (unverified)
-            # JWT payload. Reading the unverified payload is safe because
-            # ucan_validate performs the cryptographic verification; we only
-            # use att[0] to determine which URI to pass. "*" is NOT a valid
-            # CapabilityUri -- the bridge rejects it with InvalidCapabilityUri.
-            # Full multi-att ceiling validation (checking every att[i] entry)
-            # requires bridge-level multi-att support and is not yet implemented.
+            # Extract ALL declared capability URIs from the (unverified) JWT
+            # payload. Reading the unverified payload is safe because
+            # ucan_validate performs the cryptographic verification; we use
+            # every att[i]["with"] to AND-intersect verdicts across all URIs.
+            # "*" is NOT a valid CapabilityUri -- the bridge rejects it with
+            # InvalidCapabilityUri, so the extract helper filters it out.
             cap_uris = _extract_all_capability_uris(token)
             if cap_uris is None:
                 # Malformed token or no declared capabilities — treat as
@@ -833,36 +853,60 @@ async def evaluate_trust(
                 cap_validation.time_bounds_valid = False
                 break
 
-            cap_uri = cap_uris[0]
-            try:
-                await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
-            except bridge.UcanError as exc:
-                error_msg = str(exc)
-                # Python catches bridge.UcanError by exception type (not by
-                # code string prefix). Within that handler, PERM-3030 is a
-                # caller-misuse error (handle belongs to a different SCP
-                # instance) that must re-raise so the programming mistake is
-                # visible rather than being absorbed into a false all-False
-                # trust verdict. The explicit startswith guard is necessary
-                # here because Python exception-type dispatch has already
-                # matched on bridge.UcanError — the only way to distinguish
-                # PERM-3030 (handle-affinity misuse) from PERM-3001 (normal
-                # UcanError pipeline failures) within the same exception
-                # class is by inspecting the error code in the message.
-                # TypeScript avoids this by absorbing ONLY [SCP-PERM-3001]
-                # via a closed regex allowlist outside the catch block.
-                if error_msg.startswith("[SCP-PERM-3030]"):
-                    raise
-                failed_category = _classify_ucan_error(error_msg)
-                passed = _PASSED_BEFORE.get(failed_category, set())
+            # AND-intersect verdicts for all declared URIs in this token.
+            # Start this token's intersected verdict as all-true; false wins.
+            token_verdict = CapabilityValidation()
+            token_verdict.tokens_valid = True
+            token_verdict.signatures_valid = True
+            token_verdict.within_ceiling = True
+            token_verdict.nonce_valid = True
+            token_verdict.not_revoked = True
+            token_verdict.time_bounds_valid = True
 
-                cap_validation.tokens_valid = "tokens_valid" in passed
-                cap_validation.signatures_valid = "signatures_valid" in passed
-                cap_validation.within_ceiling = "within_ceiling" in passed
-                cap_validation.nonce_valid = "nonce_valid" in passed
-                cap_validation.not_revoked = "not_revoked" in passed
-                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
-                break  # Fail-fast: stop processing further tokens on first failure.
+            for cap_uri in cap_uris:
+                try:
+                    await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
+                except bridge.UcanError as exc:
+                    error_msg = str(exc)
+                    # Python catches bridge.UcanError by exception type (not
+                    # by code string prefix). Within that handler, PERM-3030
+                    # is a caller-misuse error (handle belongs to a different
+                    # SCP instance) that must re-raise so the programming
+                    # mistake is visible rather than being absorbed into a
+                    # false all-False trust verdict. The explicit startswith
+                    # guard is necessary here because Python exception-type
+                    # dispatch has already matched on bridge.UcanError — the
+                    # only way to distinguish PERM-3030 (handle-affinity
+                    # misuse) from PERM-3001 (normal UcanError pipeline
+                    # failures) within the same exception class is by
+                    # inspecting the error code in the message. TypeScript
+                    # avoids this by absorbing ONLY [SCP-PERM-3001] via a
+                    # closed regex allowlist outside the catch block.
+                    if error_msg.startswith("[SCP-PERM-3030]"):
+                        raise
+                    failed_category = _classify_ucan_error(error_msg)
+                    passed = _PASSED_BEFORE.get(failed_category, set())
+                    uri_verdict = CapabilityValidation()
+                    uri_verdict.tokens_valid = "tokens_valid" in passed
+                    uri_verdict.signatures_valid = "signatures_valid" in passed
+                    uri_verdict.within_ceiling = "within_ceiling" in passed
+                    uri_verdict.nonce_valid = "nonce_valid" in passed
+                    uri_verdict.not_revoked = "not_revoked" in passed
+                    uri_verdict.time_bounds_valid = "time_bounds_valid" in passed
+                    token_verdict = _intersect_capability_validation(token_verdict, uri_verdict)
+
+            # Apply this token's intersected verdict to the overall result.
+            cap_validation = _intersect_capability_validation(cap_validation, token_verdict)
+            # Fail-fast across tokens: once any field is false, stop.
+            if not (
+                cap_validation.tokens_valid
+                and cap_validation.signatures_valid
+                and cap_validation.within_ceiling
+                and cap_validation.nonce_valid
+                and cap_validation.not_revoked
+                and cap_validation.time_bounds_valid
+            ):
+                break
 
     # Layer 2: query behavioral record from the event log.
     behavioral: BehavioralRecord | None = None
