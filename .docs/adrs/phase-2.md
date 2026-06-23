@@ -405,7 +405,7 @@ pub struct RoleDefinition {
    5. **Audience** — Verify token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., human delegates to their own agent key).
    6. **Capability match** — Verify token's `att` includes the `required_capability`.
    7. **Attenuation** — Verify each delegation narrows or preserves capabilities (never widens).
-   8. **Ceiling** — Verify `required_capability` is within the context's immutable capability ceiling.
+   8. **Ceiling** — Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked `required_capability`. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
    9. **Nonce** — Validate format (`{unix_millis}-{hex16}`), validate freshness (±5 min), verify uniqueness, record in tracker.
    10. **Revocation** — Verify token CID is not in the context's revocation list.
    11. **Expiry** — Verify `exp > now` and `nbf <= now` (if present).
