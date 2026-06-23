@@ -300,11 +300,12 @@ class CapabilityValidation:
     """Layer 1: Protocol enforcement results (mechanical, pass/fail).
 
     All fields must be ``True`` for the subject to be considered
-    protocol-compliant.  Layer 1 validates each token's declared capabilities
-    against the token's own ``aud`` (``att[i].with``). Binding tokens to
-    ``subject_did`` (i.e., ensuring the token's ``aud`` is ``subject_did``)
-    is the responsibility of the upstream credential issuance flow, not
-    :func:`evaluate_trust`.
+    protocol-compliant.  Layer 1 validates each token's first declared
+    capability (``att[0]["with"]``) against the token's own ``aud``.
+    Only ``att[0]`` is sent to the bridge; see :func:`evaluate_trust` for
+    the att[0]-only rationale. Binding tokens to ``subject_did`` (i.e.,
+    ensuring the token's ``aud`` is ``subject_did``) is the responsibility
+    of the upstream credential issuance flow, not :func:`evaluate_trust`.
     """
 
     #: UCAN tokens parse and have valid structure.

@@ -204,9 +204,9 @@ export class WasmCannotValidateSpendingUcan extends EconomyError {
 /**
  * Error code prefix to ScpError subclass mapping.
  *
- * The napi-rs bridge encodes errors as `"[{code}] {category} error: {message}"`.
- * The WASM bridge encodes errors as `"[{code}] {message}"`.
- * Both include a bracketed code prefix that this function parses.
+ * Both the napi-rs and WASM bridges encode errors as
+ * `"[{code}] {category} error: {message}"` — the bracketed code prefix is
+ * always at position 0, which this function uses for routing.
  */
 type ScpErrorConstructor = new (message: string, code: string) => ScpError;
 
