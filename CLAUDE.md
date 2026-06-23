@@ -108,6 +108,7 @@ If any cell is empty, the plan is incomplete — expand scope or file dependent 
 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
+scripts/check-sdk-coverage.py,
 check-cross-layer.sh, check-protocol-deps.sh, check-protocol-sync.py,
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
