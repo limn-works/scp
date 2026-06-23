@@ -697,7 +697,14 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// Executes a governance action on a context.
 ///
 /// Delegates to `WasmContextManager::execute_governance_action`.
-/// All 24 `GovernanceAction` variants are dispatchable.
+///
+/// Executes a previously-approved governance proposal BY ID. The manager
+/// resolves the authoritative proposal from its own tracked
+/// (`resolved_proposals`/`pending_proposals`) governance state; the bridge
+/// never supplies a proposal, action, or status. This closes the direct-execute
+/// quorum bypass — a caller can no longer hand the manager an action to run.
+/// The action-substitution facet is structurally impossible now: there is no
+/// `action_json` parameter to populate.
 ///
 /// Authorization is NOT a per-member execute-time capability check. The
 /// proposal must already be `Approved` (enforced by `require_proposal_approved`)
@@ -705,16 +712,16 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// `governance:propose` and the action must be within the context ceiling).
 /// At dispatch, the per-action context-ceiling gate (`dispatch_ceiling_capability`)
 /// gates the ban/tool-register/child-context/tool-interface class on the
-/// context ceiling — NOT on the caller's role. `initiator_did` is the
-/// consequence subject, NOT capability-checked here. This mirrors the native
-/// runtime exactly (§9.9.3 native↔WASM convergence).
+/// context ceiling — NOT on the caller's role. This mirrors the native runtime
+/// exactly (§9.9.3 native↔WASM convergence).
 ///
 /// # Arguments
 ///
 /// * `handle` — The context handle.
-/// * `initiator_did` — DID of the member requesting the governance action.
-/// * `proposal_id` — Unique proposal ID for replay protection.
-/// * `action_json` — JSON-encoded governance action (see `GovernanceAction`).
+/// * `identity_did` — DID of the authenticated caller requesting execution
+///   (the executor stamped on the `GovernanceActionExecuted` leaf, matching the
+///   native direct-execute handler which uses the payload executor DID).
+/// * `proposal_id_hex` — Hex-encoded id of the approved, tracked proposal.
 ///
 /// # Returns
 ///
@@ -722,68 +729,30 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 #[wasm_bindgen]
 pub fn context_execute_governance(
     handle: &WasmContextHandle,
-    initiator_did: String,
-    proposal_id: String,
-    action_json: String,
+    identity_did: String,
+    proposal_id_hex: String,
 ) -> Promise {
-    if let Err(e) = validate_did(&initiator_did) {
+    if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        // Parse and convert JS-idiomatic camelCase to serde's externally-tagged format.
-        // E.g. {"type": "addMember", "did": "d", "role": "r"} → {"AddMember": {"did": "d", "role": "r"}}
-        let mut action_value: serde_json::Value =
-            serde_json::from_str(&action_json).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("action_json is not valid JSON: {e}"),
-                    code: codes::VALID_7000.to_owned(),
-                }
-                .into_js()
-            })?;
-        js_to_serde_governance_action(&mut action_value).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("action_json is not valid: {e}"),
-                code: codes::VALID_7000.to_owned(),
-            }
-            .into_js()
-        })?;
-        let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("action_json is not valid: {e}"),
-                code: codes::VALID_7000.to_owned(),
-            }
-            .into_js()
-        })?;
-
-        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
-            ScpWasmError::Validation {
-                message: e.message,
-                code: codes::VALID_7000.to_owned(),
-            }
-            .into_js()
-        })?;
-
         let result = with_manager(|mgr| {
-            // Direct-execute: the leaf actor_did (executor) is the proposal's
-            // PROPOSER, NOT the caller `initiator_did` — matching the native
-            // direct-execute handler, which stamps `proposal.proposer_did`
+            // Direct-execute by id: the manager looks up the tracked proposal
+            // and dispatches ITS action. The executor (and the
+            // `GovernanceActionExecuted` leaf actor_did) is the TRACKED
+            // proposal's PROPOSER — never a caller-supplied DID — byte-identical
+            // to the native direct-execute path, which resolves the executor
+            // from `proposal.proposer_did` inside `execute_governance_action`
             // (§9.9.3 native↔WASM convergence; ADR-031 §8 "executor DID").
-            // `initiator_did` is the CONSEQUENCE SUBJECT only — nothing inside
-            // `execute_governance_action` checks its capability. Safety derives
-            // from `require_proposal_approved` (status==Approved), the replay
-            // guard (`executed_proposals`), propose-time authorization, and the
-            // per-action context-ceiling gate (`dispatch_ceiling_capability`).
-            // Only the leaf actor_did converges to the proposer. Resolve the
-            // proposer from the tracked proposal the executed leaf is derived from.
-            let executor_did = mgr.proposal_proposer_did(&context_id, &proposal_id)?;
+            // `identity_did` is the authenticated caller / consequence subject.
+            let executor_did = mgr.proposal_proposer_did(&context_id, &proposal_id_hex)?;
             mgr.execute_governance_action(
                 &context_id,
-                &initiator_did,
+                &identity_did,
                 &executor_did,
-                &proposal_id,
-                &action,
+                &proposal_id_hex,
             )
         })
         .map_err(ScpWasmError::into_js)?;

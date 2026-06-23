@@ -203,6 +203,21 @@ fn fn_body_contains(source: &str, fn_name: &str, callee: &str) -> bool {
     extract_fn_body(source, fn_name).is_some_and(|body| body.contains(callee))
 }
 
+/// Extracts the signature text of `fn_name` — everything from `fn <name>` up to
+/// (but excluding) the opening `{` of the body. Used to assert which parameters
+/// a function does / does not accept (e.g. a by-id execute that must NOT take a
+/// caller-supplied proposal/action).
+fn extract_fn_signature(source: &str, fn_name: &str) -> Option<String> {
+    let needle_paren = format!("fn {fn_name}(");
+    let needle_generic = format!("fn {fn_name}<");
+    let sig_pos = source
+        .find(&needle_paren)
+        .or_else(|| source.find(&needle_generic))?;
+    let after_sig = &source[sig_pos..];
+    let open_brace_offset = after_sig.find('{')?;
+    Some(after_sig[..open_brace_offset].to_string())
+}
+
 // ===========================================================================
 // Baseline assertions — currently wired, must pass today
 // ===========================================================================
@@ -889,6 +904,96 @@ fn wasm_execute_governance_action_dispatches_consequences() {
         "WASM execute_governance_action must call dispatch_consequences_for_subject \
          at least twice (once for the executor DID, once for the action's target \
          DID); found {call_count}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct-execute governance trust boundary (quorum-bypass fix)
+//
+// `execute_governance_action` must dispatch the action the *engine* tracked for
+// a proposal id — never a caller-supplied proposal/action/status. These
+// positive (closed-by-construction) assertions pin the trust boundary at the
+// AST level on BOTH the native runtime and the WASM bridge so a future refactor
+// cannot reintroduce the bypass by re-accepting caller-trusted governance data.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
+    // The native entry point resolves the authoritative proposal from the
+    // context actor's own quorum-validated engine via `engine.get_proposal`,
+    // keyed by a `proposal_id` parameter — and never takes a caller-supplied
+    // `&GovernanceProposal`. The signature carries `proposal_id: &ProposalId`,
+    // not `proposal: &GovernanceProposal`.
+    let sig = extract_fn_signature(MANAGER_SRC, "execute_governance_action")
+        .expect("native execute_governance_action signature must exist");
+    assert!(
+        sig.contains("proposal_id: &ProposalId"),
+        "native execute_governance_action must take the proposal id by reference \
+         (proposal_id: &ProposalId), so the action is resolved from engine state — \
+         not handed in by the caller; signature was: {sig}"
+    );
+    assert!(
+        !sig.contains("proposal: &GovernanceProposal"),
+        "native execute_governance_action must NOT accept a caller-supplied \
+         &GovernanceProposal — that is the quorum-bypass the by-id resolution closes; \
+         signature was: {sig}"
+    );
+
+    let body = extract_fn_body(MANAGER_SRC, "execute_governance_action")
+        .expect("native execute_governance_action body must exist");
+    assert!(
+        body.contains("engine") && body.contains("get_proposal(proposal_id)"),
+        "native execute_governance_action must resolve the authoritative proposal \
+         from the governance engine via engine.get_proposal(proposal_id)"
+    );
+    assert!(
+        body.contains("not tracked"),
+        "native execute_governance_action must reject a proposal id the engine \
+         never tracked (the forgery path)"
+    );
+}
+
+#[test]
+fn wasm_execute_governance_action_resolves_action_from_tracked_proposal() {
+    // The WASM bridge entry (`context_execute_governance`) takes no caller
+    // action: the public `#[wasm_bindgen]` surface carries only
+    // (identity_did, proposal_id_hex). No `action_json` parameter exists for a
+    // caller to populate, so action substitution is structurally impossible.
+    let wasm_ctx_src: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
+    let entry_sig = extract_fn_signature(wasm_ctx_src, "context_execute_governance")
+        .expect("WASM context_execute_governance signature must exist");
+    assert!(
+        !entry_sig.contains("action_json"),
+        "WASM context_execute_governance must NOT take an action_json parameter — \
+         a caller cannot supply an action to substitute; signature was: {entry_sig}"
+    );
+    assert!(
+        entry_sig.contains("proposal_id_hex"),
+        "WASM context_execute_governance must take the tracked proposal id \
+         (proposal_id_hex); signature was: {entry_sig}"
+    );
+
+    // The WASM manager resolves BOTH the convergent timestamp AND the action to
+    // dispatch from the manager's own tracked proposal state
+    // (pending_proposals / resolved_proposals) — never a caller action.
+    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
+        .expect("WASM execute_governance_action body must exist");
+    assert!(
+        body.contains("pending_proposals") && body.contains("resolved_proposals"),
+        "WASM execute_governance_action must resolve the action from its own \
+         tracked proposal state (pending_proposals / resolved_proposals)"
+    );
+    assert!(
+        body.contains("tracked_action") || body.contains("tracked.action"),
+        "WASM execute_governance_action must dispatch the TRACKED proposal's \
+         action, not a caller-supplied one"
+    );
+    let mgr_sig = extract_fn_signature(WASM_MANAGER_SRC, "execute_governance_action")
+        .expect("WASM manager execute_governance_action signature must exist");
+    assert!(
+        !mgr_sig.contains("action: &GovernanceAction"),
+        "WASM manager execute_governance_action must NOT accept a caller-supplied \
+         action: &GovernanceAction; signature was: {mgr_sig}"
     );
 }
 

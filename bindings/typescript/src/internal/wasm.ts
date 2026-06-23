@@ -368,9 +368,8 @@ interface WasmModule {
   // Governance
   context_execute_governance: (
     handle: BridgeContextHandle,
-    initiatorDid: string,
-    proposalId: string,
-    actionJson: string,
+    identityDid: string,
+    proposalIdHex: string,
   ) => Promise<string>;
   // Governance proposal lifecycle (#621)
   context_governance_propose: (
@@ -1094,14 +1093,13 @@ export function createWasmBridge(): Bridge {
     // Governance — delegate to WASM runtime
     async contextExecuteGovernanceAction(
       handle: BridgeContextHandle,
-      actionJson: string,
-      proposerDid: string,
+      identityDid: string,
+      proposalIdHex: string,
     ): Promise<string> {
       const wasm = getWasm();
-      // Generate a 64-char hex proposal ID (256-bit) matching native bridge
-      // format (SHA-256 hex from scp-core's compute_proposal_id).
-      const proposalId = generateProposalIdHex();
-      return await wasm.context_execute_governance(handle, proposerDid, proposalId, actionJson);
+      // Execute BY ID: the WASM runtime resolves the authoritative, tracked
+      // proposal and dispatches its action. No caller-supplied action.
+      return await wasm.context_execute_governance(handle, identityDid, proposalIdHex);
     },
 
     // Governance proposal lifecycle (#621)

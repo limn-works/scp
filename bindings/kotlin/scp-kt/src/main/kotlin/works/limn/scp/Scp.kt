@@ -926,14 +926,23 @@ class SCP internal constructor(
             proposalIdHex = proposalIdHex,
         )
 
-    /** Forwards to [NativeScp.governanceExecute] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governanceExecute] on [inner].
+     *
+     * Executes a previously-approved governance proposal BY ID. The runtime
+     * resolves the authoritative proposal from the context actor's own
+     * quorum-validated governance engine; the caller supplies no proposal,
+     * action, or status.
+     */
     suspend fun governanceExecute(
         handle: ContextHandle,
-        proposalJson: String,
+        identityDid: String,
+        proposalIdHex: String,
     ): String =
         inner.governanceExecute(
             handle = handle,
-            proposalJson = proposalJson,
+            identityDid = identityDid,
+            proposalIdHex = proposalIdHex,
         )
 
     /** Forwards to [NativeScp.governanceGetProposal] on [inner]. */

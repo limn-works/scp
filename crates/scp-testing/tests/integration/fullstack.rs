@@ -1200,3 +1200,152 @@ async fn full_stack_relay_three_party() {
 
     println!("\n  ✓ Three-party relay roundtrip complete!\n");
 }
+
+// ---------------------------------------------------------------------------
+// C-SEC: Direct-execute governance trust boundary (quorum-bypass fix)
+//
+// Cross-bridge KAT against the SHARED runtime substrate every FFI bridge
+// dispatches into. `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a
+// proposal id; the runtime resolves the authoritative proposal from the context
+// actor's own quorum-validated engine. A caller cannot fabricate an approved
+// proposal or substitute an action.
+//   - FORGERY: an untracked id is rejected and applies no membership change.
+//   - GENUINE: a real quorum-approved action takes effect exactly once; a
+//     direct execute-by-id of the same id is then replay-rejected.
+// ---------------------------------------------------------------------------
+
+/// A governance key resolver backed by a shared DID→verifying-key map, so the
+/// real engine can verify propose/approve vote signatures against each
+/// fullstack node's `#active` key. Populate the map after the nodes exist.
+fn shared_key_resolver(
+    keys: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::VerifyingKey>>,
+    >,
+) -> scp_core::context::governance::KeyResolver {
+    std::sync::Arc::new(move |did: &DID, _kid: scp_identity::SigningKeyId| {
+        keys.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(did.as_ref())
+            .copied()
+    })
+}
+
+fn majority_governance_params(voters: &[&str]) -> ContextParams {
+    ContextParams {
+        governance: scp_core::context::params::GovernanceModel::Majority {
+            eligible_voters: voters.iter().map(|d| DID((*d).to_owned())).collect(),
+        },
+        ..encrypted_params()
+    }
+}
+
+#[tokio::test]
+async fn fullstack_direct_execute_rejects_forged_proposal_and_applies_no_change() {
+    let network = FullStackNetwork::new();
+    let keys = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let alice = network.create_node(ALICE_DID, shared_key_resolver(keys.clone()));
+    let bob = network.create_node(BOB_DID, shared_key_resolver(keys.clone()));
+    {
+        let mut k = keys.lock().unwrap();
+        k.insert(ALICE_DID.to_owned(), alice.verifying_key());
+        k.insert(BOB_DID.to_owned(), bob.verifying_key());
+    }
+
+    let ctx_id = "gov-direct-forgery-ctx";
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, majority_governance_params(&[ALICE_DID, BOB_DID]))
+        .await
+        .unwrap();
+    alice.add_member(&handle, BOB_DID).await.unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+
+    let victim = "did:dht:z6MkForgeryVictimNeverAdded";
+    assert!(
+        !alice.manager.is_member(ctx_id, victim).await,
+        "victim must not be a member before the forged execute"
+    );
+
+    // A proposal id the engine never tracked. If the bridge trusted caller
+    // data, this would have carried an AddMember{victim}; the runtime has no
+    // caller action to apply.
+    let fabricated = [0xABu8; 32];
+    let err = alice
+        .execute_governance_by_id(ctx_id, fabricated)
+        .await
+        .expect_err("forged direct-execute must be rejected");
+    assert!(
+        matches!(err, scp_core::context::ContextError::PermissionDenied(_)),
+        "forged proposal must be PermissionDenied, got: {err:?}"
+    );
+    assert!(
+        !alice.manager.is_member(ctx_id, victim).await,
+        "rejected forgery must not have added the victim as a member"
+    );
+}
+
+#[tokio::test]
+async fn fullstack_direct_execute_genuine_runs_once_then_replay_rejected() {
+    use scp_core::context::governance::{GovernanceAction, ProposalStatus};
+
+    let network = FullStackNetwork::new();
+    let keys = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let alice = network.create_node(ALICE_DID, shared_key_resolver(keys.clone()));
+    {
+        let mut k = keys.lock().unwrap();
+        k.insert(ALICE_DID.to_owned(), alice.verifying_key());
+    }
+
+    // Single-voter Majority context (creator only): Alice's own approval is 1/1
+    // = a majority, so the proposal reaches quorum and auto-executes WITHOUT
+    // adding a second member. (The full-MLS `add_member` join path re-homes the
+    // context actor in this single-node harness, so a multi-member governance
+    // round is exercised by the native `governance_integration.rs` KATs; here
+    // we pin the by-id trust boundary against the shared runtime substrate.)
+    let ctx_id = "gov-direct-genuine-ctx";
+    alice
+        .create_context(ctx_id, majority_governance_params(&[ALICE_DID]))
+        .await
+        .unwrap();
+
+    // Genuine propose→approve→quorum. ChangeRole on Alice (the sole member).
+    let action = GovernanceAction::ChangeRole {
+        did: DID(ALICE_DID.to_owned()),
+        new_role: "observer".to_owned(),
+    };
+    let proposal = alice.propose_governance(ctx_id, action).await.unwrap();
+    let status = alice
+        .approve_governance(ctx_id, &proposal.proposal_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        ProposalStatus::Approved,
+        "1/1 crosses majority quorum and the engine marks the proposal Approved"
+    );
+
+    // The engine retains the approved proposal: by-id resolution finds it.
+    let tracked = alice
+        .manager
+        .get_proposal(ctx_id, &proposal.proposal_id)
+        .await
+        .expect("engine must retain the approved proposal");
+    assert_eq!(tracked.status, ProposalStatus::Approved);
+
+    // The action took effect exactly once (auto-executed at quorum). A direct
+    // execute-by-id of the same tracked id is replay-rejected — proving the
+    // by-id path resolves the engine's real proposal and honours the replay
+    // guard rather than re-running a caller-supplied action.
+    let err = alice
+        .execute_governance_by_id(ctx_id, proposal.proposal_id)
+        .await
+        .expect_err("re-executing an already-executed proposal must be rejected");
+    assert!(
+        matches!(err, scp_core::context::ContextError::PermissionDenied(_)),
+        "replay must be PermissionDenied, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("already been executed"),
+        "replay rejection should name the executed proposal: {err}"
+    );
+}

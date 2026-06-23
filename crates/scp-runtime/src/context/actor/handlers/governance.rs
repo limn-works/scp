@@ -661,23 +661,27 @@ async fn handle_execute_governance_action_actor(
     reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
 ) -> Outcome<()> {
     let context_id = payload.context_id.clone();
-    let proposal = payload.proposal;
 
     let execute_fut = async move {
-        // Direct-execute command (no quorum-crossing voter in the payload): the
-        // executor is the proposer, matching the auto-execute convention where
-        // proposer == committer (ADR-031 §8 "executor DID" / spec §7.3.1
-        // "committing member"). The quorum-approval path
-        // that distinguishes voter from proposer lives in
-        // `vote_on_proposal_inner`, not this direct entry point.
-        let executor_did = proposal.proposer_did.clone();
+        // Direct-execute command. The payload carries ONLY the proposal id and
+        // the authenticated executor DID — never a proposal, action, or status.
+        // `execute_governance_action` resolves the authoritative proposal from
+        // the actor's own quorum-validated engine by id; a caller cannot
+        // fabricate an `Approved` proposal or substitute an action. The
+        // executor is the authenticated caller (capability check); leaf
+        // attribution stays on the tracked proposal's proposer (ADR-031 §8 /
+        // spec §7.3.1).
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
                 state,
                 deps,
                 &payload.context_id,
-                &proposal,
-                &executor_did,
+                &payload.proposal_id,
+                // Direct-execute: no quorum-crossing voter. The executor (and
+                // the `GovernanceActionExecuted` leaf actor_did) is resolved
+                // inside `execute_governance_action` from the TRACKED proposal's
+                // proposer — never a caller-supplied DID.
+                None,
             ),
         )
         .await

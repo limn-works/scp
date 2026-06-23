@@ -1269,7 +1269,7 @@ mod cross_impl_leaf_parity {
             .proposal_proposer_did(context_id, proposal_id)
             .expect("proposer resolvable");
         assert_eq!(resolved_proposer, proposer);
-        mgr.execute_governance_action(context_id, caller, &resolved_proposer, proposal_id, &action)
+        mgr.execute_governance_action(context_id, caller, &resolved_proposer, proposal_id)
             .expect("direct execute");
 
         let logged = mgr.test_context_event_log_events(context_id);

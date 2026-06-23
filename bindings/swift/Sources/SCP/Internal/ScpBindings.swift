@@ -2457,7 +2457,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-    func governanceExecute(handle: ContextHandle, proposalJson: String) async throws  -> String
+    func governanceExecute(handle: ContextHandle, identityDid: String, proposalIdHex: String) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `governance_get_proposal`.
@@ -4605,13 +4605,13 @@ open func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdH
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-open func governanceExecute(handle: ContextHandle, proposalJson: String)async throws  -> String  {
+open func governanceExecute(handle: ContextHandle, identityDid: String, proposalIdHex: String)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_governance_execute(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalJson)
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(identityDid),FfiConverterString.lower(proposalIdHex)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -15532,7 +15532,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_approve() != 14937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_execute() != 38425) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_execute() != 14006) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_get_proposal() != 65469) {

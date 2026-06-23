@@ -348,6 +348,32 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Insert a member directly into the context's role state (`members` +
+    /// role `assignments`), bypassing the MLS Welcome / governance round-trip.
+    ///
+    /// Single-node tests that need a multi-member context — e.g. to exercise
+    /// exporter selection over a context whose membership map holds 2+ DIDs —
+    /// cannot drive a genuine join: the bridge governance/key resolver only
+    /// resolves DID-document-published identities, and in-memory test
+    /// identities are never published. This seam records membership the same
+    /// way an executed `AddMember` would for the two role-state fields export
+    /// reads, without requiring a resolvable key or an MLS group operation.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    TestInsertMember {
+        /// Context identifier.
+        context_id: String,
+        /// The member DID to insert.
+        member_did: scp_identity::DID,
+        /// The role name to assign (e.g. `"member"`).
+        role: String,
+        /// Oneshot reply channel. Replies `Ok(())` once role state is updated,
+        /// or `Err` if the context is unknown / inactive.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event
@@ -1042,18 +1068,25 @@ pub struct VoteOnProposalPayload {
     pub signing_key: SigningKeyBytes,
 }
 
-/// Payload for [`GovernanceCommand::ExecuteGovernanceAction`]. Boxed
-/// because [`scp_protocol::context::governance::GovernanceProposal`]
-/// carries a complete
-/// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
-/// plus signatures; together the struct is well over the
-/// `large_enum_variant` threshold.
+/// Payload for [`GovernanceCommand::ExecuteGovernanceAction`].
+///
+/// Carries only the *identifier* of an already-tracked proposal plus the
+/// authenticated executor DID — never a caller-supplied proposal, action, or
+/// status. The handler resolves the authoritative proposal from the context
+/// actor's own governance engine via `engine.get_proposal(proposal_id)` and
+/// rejects anything that is not present and `Approved`. This closes the
+/// direct-execute quorum-bypass: a caller cannot fabricate an `Approved`
+/// proposal or substitute an action, because the runtime trusts only what its
+/// own quorum-validated engine retained.
 pub struct ExecuteGovernanceActionPayload {
     /// Context identifier string.
     pub context_id: String,
-    /// Fully-validated governance proposal (status ==
-    /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus)).
-    pub proposal: scp_protocol::context::governance::GovernanceProposal,
+    /// Identifier of the proposal to execute. Looked up in the context
+    /// actor's governance engine; must be tracked and `Approved`. The executor
+    /// attribution for the `GovernanceActionExecuted` leaf is resolved from the
+    /// tracked proposal's `proposer_did` (the direct-execute committing member),
+    /// never from a caller-supplied DID — ADR-031 §8 / spec §7.3.1.
+    pub proposal_id: scp_protocol::context::governance::ProposalId,
 }
 
 /// See [`ContextCommand::Governance`]. Real variants land in commit 10

@@ -168,8 +168,8 @@ export interface Bridge {
   // Governance
   contextExecuteGovernanceAction(
     handle: BridgeContextHandle,
-    actionJson: string,
-    proposerDid: string,
+    identityDid: string,
+    proposalIdHex: string,
   ): Promise<string>;
 
   // Governance lifecycle (#559)

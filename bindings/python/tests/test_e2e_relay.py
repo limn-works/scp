@@ -299,41 +299,15 @@ class TestMultipleMessages:
 # ---------------------------------------------------------------------------
 
 
-def _make_proposal_json(
-    context_id: str,
-    proposer_did: str,
-    action: dict,
-) -> str:
-    """Construct a GovernanceProposal JSON for governance_execute."""
-    import os
-    import time
-
-    proposal_id = list(os.urandom(32))
-    now = int(time.time())
-    return json.dumps(
-        {
-            "proposal_id": proposal_id,
-            "context_id": context_id,
-            "proposer_did": proposer_did,
-            "action": action,
-            "status": "Approved",
-            "created_at": now,
-            "voting_deadline": now + 3600,
-            "approvals": [],
-            "rejections": [],
-            "created_at_epoch": None,
-        }
-    )
-
-
 class TestGovernanceWithRelay:
     """Governance actions on relay-connected contexts.
 
-    NOTE: These tests exercise the governance execution path with pre-approved
-    proposals (``"status": "Approved"``). The ``single_admin`` governance engine
-    auto-approves proposals from the admin, so these tests verify the happy-path
-    execution dispatch -- not the vote validation or quorum logic. The negative
-    test ``test_pending_proposal_is_rejected`` below verifies the status gate.
+    Governance is enacted through the genuine ``governance_propose`` flow: under
+    ``single_admin`` the runtime tracks, approves, and executes the proposer's
+    action in one step. ``governance_execute`` is a separate by-id entry that
+    runs an already-approved, engine-tracked proposal — a caller cannot hand it
+    a fabricated proposal or action. The negative test
+    ``test_untracked_proposal_is_rejected`` pins that boundary.
     """
 
     def test_change_role_after_join(self, scp: SCP) -> None:
@@ -361,13 +335,13 @@ class TestGovernanceWithRelay:
         initial_role = scp._native.context_member_role(handle, bob_did)
         assert initial_role is not None
 
-        # Change Bob's role via governance proposal
-        proposal_json = _make_proposal_json(
-            handle.context_id,
+        # Change Bob's role via the genuine governance flow. Under single_admin
+        # the proposer's proposal is tracked, approved, and executed in one step.
+        result = scp._native.governance_propose(
+            handle,
             alice_did,
-            {"ChangeRole": {"did": bob_did, "new_role": "moderator"}},
+            json.dumps({"ChangeRole": {"did": bob_did, "new_role": "moderator"}}),
         )
-        result = scp._native.governance_execute(handle, proposal_json)
         assert result is not None
 
         # Verify role changed to moderator
@@ -397,22 +371,22 @@ class TestGovernanceWithRelay:
         scp._native.context_join(handle, bob_did)
         assert scp._native.context_is_member(handle, bob_did)
 
-        proposal_json = _make_proposal_json(
-            handle.context_id,
+        scp._native.governance_propose(
+            handle,
             alice_did,
-            {"RemoveMember": {"did": bob_did, "reason": None}},
+            json.dumps({"RemoveMember": {"did": bob_did, "reason": None}}),
         )
-        scp._native.governance_execute(handle, proposal_json)
 
         assert not scp._native.context_is_member(handle, bob_did)
 
-    def test_pending_proposal_is_rejected(self, scp: SCP) -> None:
-        """Governance engine must reject proposals that are not Approved.
+    def test_untracked_proposal_is_rejected(self, scp: SCP) -> None:
+        """Direct execute-by-id must reject a proposal the engine never tracked.
 
-        This is the negative counterpart to the happy-path tests above: a
-        proposal with ``"status": "Pending"`` must be refused, proving that
-        the governance engine checks proposal status and does not blindly
-        execute any submitted action.
+        This is the trust-boundary test: ``governance_execute`` resolves the
+        authoritative proposal from the context actor's own quorum-validated
+        engine. A fabricated proposal id (a forgery) must be refused, proving a
+        caller cannot smuggle in an action via a hand-crafted "approved"
+        proposal. Bob's role must be unchanged as a result.
         """
         alice_did = _create_identity(scp)
         bob_did = _create_identity(scp)
@@ -433,31 +407,12 @@ class TestGovernanceWithRelay:
 
         scp._native.context_join(handle, bob_did)
 
-        # Construct a proposal with Pending status -- must be rejected.
-        import os
-        import time
+        # A 32-byte proposal id the engine never tracked.
+        fabricated = "ab" * 32
+        with pytest.raises(RuntimeError, match="not tracked"):
+            scp._native.governance_execute(handle, alice_did, fabricated)
 
-        proposal_id = list(os.urandom(32))
-        now = int(time.time())
-        pending_proposal = json.dumps(
-            {
-                "proposal_id": proposal_id,
-                "context_id": handle.context_id,
-                "proposer_did": alice_did,
-                "action": {"ChangeRole": {"did": bob_did, "new_role": "moderator"}},
-                "status": "Pending",
-                "created_at": now,
-                "voting_deadline": now + 3600,
-                "approvals": [],
-                "rejections": [],
-                "created_at_epoch": None,
-            }
-        )
-
-        with pytest.raises(RuntimeError, match="not approved"):
-            scp._native.governance_execute(handle, pending_proposal)
-
-        # Bob's role should be unchanged -- the action was not executed.
+        # Bob's role should be unchanged -- the forged execute applied nothing.
         initial_role = scp._native.context_member_role(handle, bob_did)
         assert initial_role is not None
 

@@ -2418,15 +2418,15 @@ impl Scp {
     pub async fn context_execute_governance_action(
         &self,
         handle: &NapiContextHandle,
-        action_json: String,
-        proposer_did: String,
+        identity_did: String,
+        proposal_id_hex: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_execute_governance_action_on(
             &self.inner,
             handle,
-            action_json,
-            proposer_did,
+            identity_did,
+            proposal_id_hex,
         )
         .await
     }

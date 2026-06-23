@@ -1349,18 +1349,25 @@ export class SCP {
   // Domain: Governance
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Execute a previously-approved governance proposal BY ID.
+   *
+   * The runtime resolves the authoritative proposal from the context actor's
+   * own quorum-validated governance engine; the caller supplies no proposal,
+   * action, or status. An untracked / unapproved id is rejected.
+   */
   async contextExecuteGovernanceAction(
     handle: unknown,
-    actionJson: string,
-    proposerDid: string,
+    identityDid: string,
+    proposalIdHex: string,
   ): Promise<string> {
     return await (
       this.#native.contextExecuteGovernanceAction as (
         h: unknown,
-        a: string,
+        i: string,
         p: string,
       ) => Promise<string>
-    )(handle, actionJson, proposerDid);
+    )(handle, identityDid, proposalIdHex);
   }
 
   async contextGovernancePropose(

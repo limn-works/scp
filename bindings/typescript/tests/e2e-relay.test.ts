@@ -418,15 +418,15 @@ if (bridge === null || scp === null) {
   // 6. Governance after join
   // -------------------------------------------------------------------------
 
-  // NOTE: These governance tests exercise the execution path with auto-approved
-  // proposals. The NAPI bridge constructs proposals with `ProposalStatus::Approved`
-  // internally (see crates/scp-ffi/napi/src/context.rs), so callers cannot submit
-  // a pending/unapproved proposal through this API. The status gate (rejecting
-  // non-Approved proposals) is tested at the Rust layer in ContextManager and in
-  // the Python E2E test `test_pending_proposal_is_rejected` where the bridge
-  // accepts raw proposal JSON with caller-specified status.
+  // NOTE: Direct execute is BY ID across the NAPI bridge:
+  // `contextExecuteGovernanceAction(handle, identityDid, proposalIdHex)`. The
+  // runtime resolves the authoritative proposal from the context actor's own
+  // quorum-validated engine; the caller supplies no proposal, action, or status.
+  // These tests pin the trust boundary (a fabricated id is rejected and applies
+  // no state change). Genuine multi-voter execution is covered at the Rust layer
+  // in `governance_integration.rs` / the scp-testing cross-bridge fullstack KATs.
   describe("Governance operations with real relay", () => {
-    test("Alice changes Bob's role after join", async () => {
+    test("Alice cannot change Bob's role via a forged proposal id", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -446,32 +446,21 @@ if (bridge === null || scp === null) {
       );
 
       await napi.contextJoin(ctx, bob.did);
-
-      // Verify Bob's initial role
       const initialRole = await napi.contextMemberRole(ctx, bob.did);
       expect(initialRole).toBeTruthy();
 
-      // Execute governance action: change Bob's role to moderator.
-      // GovernanceAction is a Rust tagged enum -- serialized as {"VariantName":{fields}}.
-      const result = await napi.contextExecuteGovernanceAction(
-        ctx,
-        JSON.stringify({
-          ChangeRole: {
-            did: bob.did,
-            new_role: "moderator",
-          },
-        }),
-        alice.did,
+      // A fabricated proposal id the engine never tracked.
+      const fabricated = "ab".repeat(32);
+      await expect(napi.contextExecuteGovernanceAction(ctx, alice.did, fabricated)).rejects.toThrow(
+        /not tracked/,
       );
-      expect(result).toBeDefined();
 
-      // Verify role changed to moderator
-      const newRole = await napi.contextMemberRole(ctx, bob.did);
-      expect(newRole).toBeTruthy();
-      expect(String(newRole).toLowerCase()).toContain("moderator");
+      // The forged execute applied nothing: Bob's role is unchanged.
+      const role = await napi.contextMemberRole(ctx, bob.did);
+      expect(String(role).toLowerCase()).not.toContain("moderator");
     });
 
-    test("Alice removes Bob from context", async () => {
+    test("Alice cannot remove Bob via a forged proposal id", async () => {
       const alice = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
 
@@ -493,19 +482,14 @@ if (bridge === null || scp === null) {
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
 
-      // Remove Bob via governance
-      await napi.contextExecuteGovernanceAction(
-        ctx,
-        JSON.stringify({
-          RemoveMember: {
-            did: bob.did,
-            reason: null,
-          },
-        }),
-        alice.did,
+      // A fabricated proposal id that, if trusted, would have removed Bob.
+      const fabricated = "cd".repeat(32);
+      await expect(napi.contextExecuteGovernanceAction(ctx, alice.did, fabricated)).rejects.toThrow(
+        /not tracked/,
       );
 
-      expect(await napi.contextIsMember(ctx, bob.did)).toBe(false);
+      // The forged execute applied nothing: Bob is still a member.
+      expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
     });
   });
 
