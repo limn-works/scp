@@ -87,9 +87,14 @@ use crate::economy::integration::PreparedAction;
 /// shim fallback; once a command reaches this helper, the context actor
 /// already owns the target [`PerContextState`].
 #[must_use]
-#[allow(clippy::needless_pass_by_ref_mut)] // PerContextState is Send + !Sync; &mut keeps actor futures Send.
-pub fn try_consume_hard_rate_limit(state: &mut PerContextState, did: &DID, now_secs: u64) -> bool {
-    state.governance.hard_rate_limit.try_consume(did, now_secs)
+pub fn try_consume_hard_rate_limit(
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    did: &DID,
+    now_secs: u64,
+) -> bool {
+    view.governance_class_c_mut()
+        .hard_rate_limit_mut()
+        .try_consume(did, now_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -100,9 +105,10 @@ pub fn try_consume_hard_rate_limit(state: &mut PerContextState, did: &DID, now_s
 ///
 /// Unknown-context no-op behavior remains in the supervisor shim
 /// fallback; the actor path only runs after mailbox lookup succeeds.
-#[allow(clippy::needless_pass_by_ref_mut)] // PerContextState is Send + !Sync; &mut keeps actor futures Send.
-pub fn refund_hard_rate_limit(state: &mut PerContextState, did: &DID) {
-    state.governance.hard_rate_limit.refund(did);
+pub fn refund_hard_rate_limit(mut view: crate::context::actor::class_s::ClassCMut<'_>, did: &DID) {
+    view.governance_class_c_mut()
+        .hard_rate_limit_mut()
+        .refund(did);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +364,7 @@ impl ToolEconomyTicket {
 /// reversal); the caller folds that into its Class-S fail-closed persist
 /// decision exactly as it does for a carrier rollback.
 pub async fn reverse_caller_reservation_record(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
 ) -> bool {
@@ -379,24 +385,23 @@ pub async fn reverse_caller_reservation_record(
         );
     }
 
-    // Reverse this restored actor's OWNED economy bookkeeping. Keyed by
-    // `record.actor_did`; routing already guarantees this is the right context's
-    // restored state, so there is no instance to confuse. No spawn-generation
-    // gate (see the doc-comment): a fresh respawn-stamped generation never
-    // matches the pre-crash record, so gating would wrongly skip every real
-    // crash-recovery refund and durably over-charge the caller.
-    state
-        .governance
-        .velocity_tracker
+    // Reverse this restored actor's OWNED economy bookkeeping (Class-C governance
+    // economy fields, reached through the field-granular `GovernanceClassCMut`
+    // view — this helper cannot touch Class-S). Keyed by `record.actor_did`;
+    // routing already guarantees this is the right context's restored state, so
+    // there is no instance to confuse. No spawn-generation gate (see the
+    // doc-comment): a fresh respawn-stamped generation never matches the
+    // pre-crash record, so gating would wrongly skip every real crash-recovery
+    // refund and durably over-charge the caller.
+    let gov = view.governance_class_c_mut();
+    gov.velocity_tracker_mut()
         .rollback_one_at(&record.actor_did, record.recorded_at_secs);
     if let Some(cost) = record.deducted_cost {
-        state
-            .governance
-            .budget_tracker
+        gov.budget_tracker_mut()
             .reverse_spend(&record.actor_did, cost);
     }
     if record.needs_hard_rate_limit_refund {
-        state.governance.hard_rate_limit.refund(&record.actor_did);
+        gov.hard_rate_limit_mut().refund(&record.actor_did);
     }
     true
 }
@@ -474,6 +479,24 @@ pub async fn reserve_tool_economy(
     // runs regardless (hard rate limit, velocity, pre-check) still mutates the
     // bare `&mut PerContextState` through the temporary `state_mut()` escape
     // hatch, with the borrow released before the combinator call.
+    //
+    // ── FLAG-RESERVE-PRECHECK (whole-state `state_mut`, blocked) ─────────────
+    // This pre-check block is the ONE reserve `state_mut()` that cannot route
+    // through `class_c_view()`: `economy_pre_check` takes a `ToolEconomyContext`
+    // that borrows `&mut state.governance.budget_tracker` AND
+    // `&state.governance.velocity_tracker` SIMULTANEOUSLY (two disjoint fields of
+    // the SAME governance bucket). `GovernanceClassCMut` holds both as disjoint
+    // field references, but its public surface exposes them only through
+    // accessor methods (`budget_tracker_mut()`, `velocity_tracker_mut()`), each
+    // of which reborrows `&mut self` — so two of them cannot be held live at
+    // once. Expressing this needs a `GovernanceClassCMut::split`-style accessor
+    // that returns multiple disjoint field `&mut`/`&` at once (a foundation
+    // addition in `class_s.rs`, out of scope for this saga+tools migration). All
+    // mutations here ARE Class-C and the borrow is released before the
+    // combinator call, so the §9 invariant is upheld; this `state_mut()` is a
+    // blocked production residual pending that foundation accessor. (The error
+    // arm's velocity rollback + hard-rate refund stay inside this same block, so
+    // they share its already-acquired borrow — no extra persist either way.)
     let event_log = &deps.event_log;
     let key_resolver = &deps.key_resolver;
     let clock = deps.clock.as_ref();
@@ -724,10 +747,13 @@ pub async fn reserve_tool_economy(
                 // can reach; the hard rate limit is NOT reachable through the
                 // `ClassCMut` compensation view, so its refund runs here — exactly
                 // once, matching the original inline single refund (a second refund
-                // would over-credit the token bucket).
-                cell.state_mut()
-                    .governance
-                    .hard_rate_limit
+                // would over-credit the token bucket). The refund is a Class-C
+                // governance mutation routed through the non-persisting
+                // `class_c_view()` (the reserve path's persist already happened in
+                // the combinator above; this error arm injects no extra persist).
+                cell.class_c_view()
+                    .governance_class_c_mut()
+                    .hard_rate_limit_mut()
                     .refund(invoker_did);
                 return Err(err);
             }
@@ -736,8 +762,11 @@ pub async fn reserve_tool_economy(
         None
     };
 
-    let state = cell.state_mut();
-
+    // The escrow authorization is an EXTERNAL `.await` that touches no actor
+    // state; do it without holding a state borrow. Only the failure arm mutates
+    // Class-C governance economy, routed through the non-persisting
+    // `class_c_view()` (the paid-path persist already ran in the combinator
+    // above; this reserve error arm injects no extra persist).
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
         (Some(policy), Some(adapter)) => {
             match invoke::authorize_tool_payment(
@@ -751,17 +780,14 @@ pub async fn reserve_tool_economy(
             {
                 Ok(prepared) => prepared,
                 Err(auth_err) => {
+                    let mut view = cell.class_c_view();
+                    let gov = view.governance_class_c_mut();
                     if let Some(cost) = deducted_cost {
-                        state
-                            .governance
-                            .budget_tracker
-                            .reverse_spend(invoker_did, cost);
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
                     }
-                    state
-                        .governance
-                        .velocity_tracker
+                    gov.velocity_tracker_mut()
                         .rollback(invoker_did, velocity_token);
-                    state.governance.hard_rate_limit.refund(invoker_did);
+                    gov.hard_rate_limit_mut().refund(invoker_did);
                     return Err(invocation_error_to_context(auth_err));
                 }
             }
@@ -780,10 +806,11 @@ pub async fn reserve_tool_economy(
         consumed: false,
     };
 
+    // `generation` is a Class-C structural field read through the cell `Deref`.
     Ok(ToolEconomyReservation {
         handle,
         role_state,
-        generation: state.generation,
+        generation: cell.generation,
         ticket,
     })
 }
@@ -927,12 +954,14 @@ pub async fn settle_tool_economy_capture(
 /// state. Returns `true` when the local rollback ran (generations matched),
 /// `false` when only the external escrow was voided (mismatch).
 pub async fn rollback_tool_economy_generation_checked(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     reservation_generation: u64,
     ticket: ToolEconomyTicket,
 ) -> bool {
-    if reservation_generation != state.generation {
+    // `generation` is a Class-C structural field reached through the view; read
+    // it via the field-granular accessor (the view holds no whole `&mut`).
+    if reservation_generation != *view.generation_mut() {
         // Confused-deputy guard (mirrors `settle_tool_economy`): the reservation
         // belongs to a now-replaced actor instance. Void only the external
         // escrow and consume; the context-local bookkeeping lived in the gone
@@ -942,12 +971,12 @@ pub async fn rollback_tool_economy_generation_checked(
             .await;
         return false;
     }
-    rollback_tool_economy(state, deps, ticket).await;
+    rollback_tool_economy(view, deps, ticket).await;
     true
 }
 
 pub async fn rollback_tool_economy(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     mut ticket: ToolEconomyTicket,
 ) {
@@ -958,18 +987,18 @@ pub async fn rollback_tool_economy(
         invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
     }
 
-    state
-        .governance
-        .velocity_tracker
+    // Reverse the Class-C governance economy bookkeeping through the
+    // field-granular `GovernanceClassCMut` view (this helper cannot touch
+    // Class-S — it holds no `&mut` path to it).
+    let gov = view.governance_class_c_mut();
+    gov.velocity_tracker_mut()
         .rollback(&ticket.actor_did, ticket.velocity_token);
     if let Some(cost) = ticket.deducted_cost {
-        state
-            .governance
-            .budget_tracker
+        gov.budget_tracker_mut()
             .reverse_spend(&ticket.actor_did, cost);
     }
     if ticket.needs_hard_rate_limit_refund {
-        state.governance.hard_rate_limit.refund(&ticket.actor_did);
+        gov.hard_rate_limit_mut().refund(&ticket.actor_did);
         ticket.needs_hard_rate_limit_refund = false;
     }
 }
@@ -1174,7 +1203,7 @@ pub struct ToolSettleOutcome {
 /// Propagates the capture path's [`ContextError`] on payment-capture
 /// failure. The rollback path is infallible.
 pub async fn settle_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -1189,10 +1218,11 @@ pub async fn settle_tool_economy(
     // economy state. Reject without touching this state — void only the
     // EXTERNAL escrow (a real payment hold from the prior instance's
     // reserve) and consume the ticket so it does not leak or trip the
-    // unbalanced-Drop guard.
-    if request.generation() != state.generation {
+    // unbalanced-Drop guard. `generation` is a Class-C structural field read
+    // through the `Deref` to `&PerContextState`.
+    if request.generation() != cell.generation {
         let expected = request.generation();
-        let actual = state.generation;
+        let actual = cell.generation;
         let ticket = request.into_ticket();
         ticket
             .void_external_and_consume(deps.payment_adapter.as_ref())
@@ -1209,8 +1239,33 @@ pub async fn settle_tool_economy(
             // Read the committed cost before the ticket is consumed by
             // the capture path so it can be threaded into the event.
             let cost = ticket.deducted_cost;
-            let (consequences, payment_receipt) =
-                settle_tool_economy_capture(state, deps, context_id, invoker_did, ticket).await?;
+            // ── FLAG-SETTLE-CAPTURE (whole-state `state_mut`, blocked) ────────
+            // The capture path runs consequence enforcement via
+            // `ConsequenceStateSplit::from_state(&mut PerContextState)` plus
+            // post-invocation participation bookkeeping — it reaches the
+            // receive buffer, role state, membership, and the checkpoint counter
+            // in ADDITION to the Class-C governance economy fields. `ClassCMut`
+            // already holds all of those as disjoint field references
+            // (`split_class_c()` yields exactly the `ConsequenceStateSplit`
+            // shape), but `ConsequenceStateSplit` / `enforce_triggered_consequences`
+            // still take a whole `&mut GovernanceState`, not a
+            // `GovernanceClassCMut`. Migrating them onto `ClassCSplit` is the
+            // explicitly-deferred `ConsequenceStateSplit` migration (see the
+            // `ClassCSplit` doc in `class_s.rs`), which lives in
+            // `governance_logic.rs` — out of scope for this saga+tools migration.
+            // Until it lands, the capture path needs the whole `&mut`, so this
+            // ONE `state_mut()` is a blocked production residual. The settle
+            // entry takes the cell (not a bare `&mut`) so the ROLLBACK arm below
+            // can use the migrated `ClassCMut`-shaped `rollback_tool_economy`;
+            // capture coalesces through the run loop (no per-site persist).
+            let (consequences, payment_receipt) = settle_tool_economy_capture(
+                cell.state_mut(),
+                deps,
+                context_id,
+                invoker_did,
+                ticket,
+            )
+            .await?;
             Ok(ToolSettleOutcome {
                 consequences,
                 payment_receipt,
@@ -1218,7 +1273,7 @@ pub async fn settle_tool_economy(
             })
         }
         ToolSettleRequest::Rollback { ticket, .. } => {
-            rollback_tool_economy(state, deps, ticket).await;
+            rollback_tool_economy(cell.class_c_view(), deps, ticket).await;
             Ok(ToolSettleOutcome::default())
         }
     }
@@ -1275,22 +1330,26 @@ mod tests {
     #[test]
     fn consume_hard_rate_limit_uses_actor_owned_state() {
         let did = test_did();
-        let mut state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
+        let state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
+        // The helpers take the field-granular `ClassCMut`; wrap the test state in
+        // a `ClassSCell` to construct the view.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
-        assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+        assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
     #[test]
     fn refund_hard_rate_limit_restores_actor_owned_bucket() {
         let did = test_did();
-        let mut state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
+        let state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         for _ in 0..10 {
-            assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+            assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
         }
-        assert!(!try_consume_hard_rate_limit(&mut state, &did, 10));
-        refund_hard_rate_limit(&mut state, &did);
-        assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+        assert!(!try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
+        refund_hard_rate_limit(cell.class_c_view(), &did);
+        assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
     fn ticket_with_budget(did: &DID) -> ToolEconomyTicket {

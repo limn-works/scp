@@ -409,31 +409,27 @@ async fn prepare_a(
 ) -> Outcome<()> {
     let context_id_hex = hex_context_id(caller_context_id);
 
-    // ── FLAG-PREPARE-A-SEAM (read gate + step-2 Class-C consume) ─────────────
+    // ── PREPARE-A-SEAM (read gate via Deref + step-2 Class-C consume via view) ─
     // The cell is held so the spending-nonce-bearing `reserve_tool_economy` leaf
-    // receives it (it routes its OWN Class-S consume through a combinator); this
-    // `state` re-derives the bare `&mut PerContextState` for (1) the read-only
-    // outbound-caller gate and (2) the §6.2.0.2 outbound-rate window consume on
-    // `governance.tool_interfaces` (Class-C). Like FLAG-PREPARE-B-CHECKS, the
-    // consume is BLOCKED from a combinator under the saga.rs-only, behaviour-
-    // preserving constraint: on the SUCCESS path it carries NO own persist (it
-    // falls through to the `reserve_tool_economy` / staging combinators, which
-    // persist it), so any combinator wrapper would add an extra durable write; on
-    // the over-budget REJECT path it persists fail-closed + replies `err_mutated`
-    // (the partial-increment-durably-lands arm), a CONDITIONAL persist that no
-    // combinator's fixed persist-on-`Ok` / persist-never shape expresses. So the
-    // gate + consume stay on the bare `&mut PerContextState`; the NLL borrow ends
-    // before the next `cell`-taking call. Terminal-PR fix mirrors
-    // FLAG-PREPARE-B-CHECKS: a view-only `ClassCMut` accessor that mutates
-    // Class-C WITHOUT a persist (deferring it) lets the consume reach
-    // `governance.tool_interfaces` without `state_mut()`. Behaviour is unchanged.
-    let state = cell.state_mut();
+    // receives it (it routes its OWN Class-S consume through a combinator). The
+    // read-only outbound-caller gate reads through the cell `Deref` (`&*cell`),
+    // and the §6.2.0.2 outbound-rate window consume mutates ONLY
+    // `governance.tool_interfaces` (Class-C) through the non-persisting
+    // `class_c_view()`. The consume carries NO own persist on the SUCCESS path
+    // (it falls through to the `reserve_tool_economy` / staging combinators,
+    // which persist it). On the over-budget REJECT path the window may have
+    // partially incremented, so an EXPLICIT `persist_state_fail_closed(&*cell)`
+    // (a shared `&PerContextState` Deref read) lands the partial increment
+    // fail-closed before replying `err_mutated` — the conditional persist is
+    // expressed explicitly here, NOT folded into a combinator's fixed
+    // persist-on-`Ok` / persist-never shape. Each borrow ends before the next.
 
     // 1. Caller must hold `tool:interface` AND be in the interface's outbound
     //    allowed_callers (empty = any member). REUSES the role-state capability
     //    surface (`member_has_capability`) and the `OutboundPolicy.allowed_callers`
     //    enforcement shape `invoke_cross_context` uses for the single-context path.
-    if let Err(err) = validate_outbound_caller(state, caller_did, tool_registration_id) {
+    // `&*cell` deref-coerces &mut ClassSCell → &PerContextState (read-only gate).
+    if let Err(err) = validate_outbound_caller(&*cell, caller_did, tool_registration_id) {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
@@ -451,15 +447,20 @@ async fn prepare_a(
     //    sagas burns its own quota. REUSES the same `RateLimit` /
     //    `PerCallerRateLimit::check_and_increment` sliding-window mechanism the
     //    single-context `invoke_cross_context` path consumes (spec §6.2.0.2).
-    if let Err(err) =
-        consume_outbound_interface_rate_limit(state, deps, caller_did, tool_registration_id)
-    {
+    if let Err(err) = consume_outbound_interface_rate_limit(
+        cell.class_c_view(),
+        deps,
+        caller_did,
+        tool_registration_id,
+    ) {
         // The §6.2.0.2 consume is non-refundable: if it incremented the window
         // and THEN this branch is reached, the increment stays. (In practice a
         // rejection here means the window was NOT incremented — `RateLimited`
         // is the over-budget case where the call is denied.) Persist so any
         // partial increment durably lands (fail-closed direction), then reply.
-        let _ = persist_state_fail_closed(state, deps, &context_id_hex);
+        // `persist_state_fail_closed` reads a shared `&PerContextState` via the
+        // cell `Deref` (`&*cell`) — no `state_mut()`.
+        let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex);
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err_mutated(sketch);
@@ -543,23 +544,14 @@ async fn prepare_a(
         // Combinator already un-inserted the record (Class-S restore). Complete
         // the RAII release: reverse the Class-C economy + void the external
         // escrow from the still-owned reservation, exactly as the prior inline
-        // path did.
-        // ── FLAG-PREPARE-A-ROLLBACK (out-of-scope async helper) ──────────────
-        // `rollback_tool_economy` takes a bare `&mut PerContextState`, mutates
-        // Class-C governance fields (`velocity_tracker` / `budget_tracker` /
-        // `hard_rate_limit`), and `.await`s an EXTERNAL escrow void. A combinator
-        // closure is SYNC, so this cannot run inside one; the combinator async
-        // hooks (`compensate` / `on_persist_failure`) hand a `ClassCMut`, but
-        // `rollback_tool_economy` is defined in `tools_helpers.rs` and takes a
-        // whole `&mut PerContextState` — re-deriving that from a `ClassCMut` is
-        // impossible. BLOCKED until the terminal PR re-signatures the economy
-        // helpers (`rollback_tool_economy` / `settle_tool_economy` /
-        // `rollback_tool_economy_generation_checked` /
-        // `reverse_caller_reservation_record`) to take the field-granular
-        // `ClassCMut` governance accessors instead of `&mut PerContextState`
-        // (out of scope: lives in `tools_helpers.rs`, not saga.rs).
+        // path did. `rollback_tool_economy` reverses ONLY Class-C governance
+        // economy (`velocity_tracker` / `budget_tracker` / `hard_rate_limit`) +
+        // an external escrow void, so it takes the field-granular `ClassCMut`
+        // (non-persisting — the combinator above already persisted the Class-S
+        // restore; this reversal rides the run-loop coalesce, matching the prior
+        // inline no-extra-persist behaviour).
         crate::context::tools_helpers::rollback_tool_economy(
-            cell.state_mut(),
+            cell.class_c_view(),
             deps,
             reservation.ticket,
         )
@@ -674,16 +666,18 @@ fn validate_outbound_caller(
 /// per-caller limit, so an exhausted per-interface window short-circuits before
 /// the per-caller window is touched (matching `invoke_cross_context` order).
 fn consume_outbound_interface_rate_limit(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     caller_did: &DID,
     tool_registration_id: &str,
 ) -> Result<(), ContextError> {
     let clock = deps.clock.as_ref();
 
-    let Some(interface) = state
-        .governance
-        .tool_interfaces
+    // The §6.2.0.2 outbound window lives on `governance.tool_interfaces` — a
+    // Class-C field reached through the field-granular governance view.
+    let Some(interface) = view
+        .governance_class_c_mut()
+        .tool_interfaces_mut()
         .iter_mut()
         .find(|i| i.tool_id == tool_registration_id)
     else {
@@ -756,7 +750,7 @@ fn consume_outbound_interface_rate_limit(
 /// eviction bound a mechanical function of the configured ceiling at runtime,
 /// not merely a `cfg(test)` invariant.
 fn consume_inbound_interface_rate_limit(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     tool_registration_id: &str,
 ) -> Result<(), ContextError> {
@@ -764,9 +758,11 @@ fn consume_inbound_interface_rate_limit(
 
     let clock = deps.clock.as_ref();
 
-    let Some(interface) = state
-        .governance
-        .tool_interfaces
+    // The §6.2.0.2 inbound window lives on `governance.tool_interfaces` — a
+    // Class-C field reached through the field-granular governance view.
+    let Some(interface) = view
+        .governance_class_c_mut()
+        .tool_interfaces_mut()
         .iter_mut()
         .find(|i| i.tool_id == tool_registration_id)
     else {
@@ -858,38 +854,45 @@ async fn prepare_b(
     req: PrepareBRequest,
     reply: tokio::sync::oneshot::Sender<Result<PreparedBFields, ContextError>>,
 ) -> Outcome<()> {
-    // ── FLAG-PREPARE-B-CHECKS (read gate + step-7 Class-C consume) ───────────
-    // This `state_mut()` backs the read-only validation gate (checks 1–6) AND
-    // the ONE Class-C mutation `run_prepare_b_checks` performs: step 7, the
-    // §6.2.0.2 inbound-rate sliding-window consume on `governance.tool_interfaces`.
-    // It is BLOCKED from migrating onto a combinator under this saga.rs-only,
-    // behaviour-preserving constraint, because the consume's two requirements
-    // are jointly unsatisfiable by any existing combinator:
-    //   (i)  it must NOT carry its own persist — on the success path its window
-    //        increment is persisted by the SUBSEQUENT `commit_class_s_keep`
-    //        staging combinator (one persist covers window + nonce + slot).
-    //        Routing it through `commit_class_c_best_effort` would add a SECOND
-    //        (best-effort) persist; through `commit_class_s_keep` a SECOND
-    //        (fail-closed) persist — either an extra durable write, a behaviour
-    //        change.
-    //   (ii) a check REJECT must surface as `Outcome::err` (no mutation, no slot
-    //        staged), DISTINCT from a later persist failure's `Outcome::err_mutated`
-    //        (slot staged, then rolled back). A combinator returns a single
-    //        `Result<T, ContextError>` that does NOT distinguish an `f`-reject
-    //        from a persist failure, so folding the gate into the staging
-    //        combinator's closure would CONFLATE the two arms and mis-map a
-    //        clean reject to `err_mutated` + a spurious `saga_pending.remove`.
-    // So the gate + consume stay on the bare `&mut PerContextState` here, OUTSIDE
-    // the staging combinator that follows. Terminal-PR fix (in `class_s.rs`):
-    // either a `commit_class_c_no_persist(|ClassCMut|) -> R` view-only accessor
-    // (mutate Class-C, defer the persist to a later combinator) so the consume
-    // can reach `governance.tool_interfaces` through `ClassCMut` without its own
-    // persist, OR a typed combinator error that distinguishes f-reject from
-    // persist-failure so the whole handler can fold into one combinator.
+    // ── FLAG-PREPARE-B-CHECKS (Class-S cache-eviction read gate; blocked) ─────
+    // The validation gate (checks 1–6) is read-mostly, but check 5 (freshness /
+    // anti-replay) calls `NonceDedup::is_replayed`, which takes `&mut self` and
+    // EVICTS TTL-expired entries from `class_s.xctx_nonce_dedup` as a side effect
+    // — a Class-S `&mut` mutation with NO accompanying persist (the eviction is
+    // best-effort cache maintenance, not a fail-closed transition). The
+    // non-persisting Class-C escape (`class_c_view()`) exposes only a shared `&`
+    // READ of `class_s`, so it cannot host `is_replayed`'s `&mut` eviction; the
+    // persisting Class-S combinators would inject a persist this read gate does
+    // not have. Expressing "mutate Class-S, inject NO persist" for the dedup
+    // cache-eviction needs a foundation addition in `class_s.rs` (a `class_c`-
+    // style no-persist Class-S escape), out of scope here. So the read gate stays
+    // on `state_mut()`; the NLL borrow ends before the next `cell`-taking call.
+    // The step-7 inbound-rate consume (the ONLY Class-C mutation) has been
+    // HOISTED OUT of the gate to run through `class_c_view()` below.
     let state = cell.state_mut();
-    // Run every read-only check first (no state mutation, no `.await` holding a
-    // `&PerContextState` borrow), then the step-7 inbound-rate consume.
+    // Run every read-only check (plus the dedup cache-eviction side effect) first;
+    // the step-7 inbound-rate Class-C consume runs after, through the view.
     if let Err(err) = run_prepare_b_checks(state, deps, &req) {
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    }
+
+    // (7) Inbound RATE (the ONLY Class-C mutation in the Prepare-B gate): consume
+    //     B's INBOUND §6.2.0.2 sliding window (spec §6.2.4 "Prepare-B validates
+    //     InboundPolicy (… inbound rate …)"; §6.2.0 effective min(outbound,
+    //     inbound)) through the non-persisting `class_c_view()` — it mutates ONLY
+    //     `governance.tool_interfaces`. It carries NO own persist: on success its
+    //     window increment is persisted by the SUBSEQUENT staging combinator (one
+    //     persist covers window + nonce + slot). It runs AFTER the read-only
+    //     rejects (a rejected call never consumes the budget) but BEFORE the
+    //     staging combinator, so a clean over-budget reject here surfaces as
+    //     `Outcome::err` (no slot staged), DISTINCT from a later persist failure's
+    //     `Outcome::err_mutated`. The over-budget / over-ceiling reject paths do
+    //     NOT mutate (no increment), so an un-persisted `Outcome::err` is correct.
+    if let Err(err) =
+        consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.tool_registration_id)
+    {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
@@ -919,7 +922,7 @@ async fn prepare_b(
         recorded_chain_depth,
     };
 
-    // ── FLAG-PREPARE-B (keep+restore SPLIT — reviewer sign-off) ──────────────
+    // ── PREPARE-B (keep+restore SPLIT) ───────────────────────────────────────
     // Prepare-B stages TWO Class-S fields under ONE fail-closed persist with
     // OPPOSITE rollback directions:
     //   (a) `xctx_nonce_dedup.record` — KEEP on persist failure. Un-recording an
@@ -928,52 +931,50 @@ async fn prepare_b(
     //   (b) `saga_pending.insert` — RESTORE on persist failure. A staged slot
     //       that did not durably land must be removed so a retry re-stages
     //       cleanly and no orphaned reservation linkage survives.
-    // No single EXISTING combinator expresses keep-one-field / restore-another:
+    // No all-or-nothing combinator expresses keep-one-field / restore-another:
     // the `*_restore` snapshot/restore is all-or-nothing over the Class-S
     // sub-structs, and `*_keep_compensating`'s `on_persist_failure` hook is
     // handed a `ClassCMut` that STRUCTURALLY cannot reach `saga_pending`
-    // (Class-S) to remove it (see `class_s.rs` module docs "Intra-Class-S
-    // keep-one-field / restore-another split"). The faithful options are: (1)
-    // DECOMPOSE into a sequential `commit_class_s_keep` (nonce) then
-    // `commit_class_s_restore` (slot) — TWO fail-closed persists where there is
-    // ONE today, a behaviour change whose intermediate-crash state (nonce
-    // durable, slot not) would need its own recovery proof; (2) ADD a new
-    // field-granular keep-one/restore-another combinator to `class_s.rs` —
-    // OUT OF SCOPE for this saga.rs-only migration (and the cleanest terminal
-    // fix); or (3) preserve the CURRENT single-persist behaviour. The directive
-    // is to preserve current behaviour with no extra persist, so this keeps (3):
-    // `commit_class_s_keep` performs the SINGLE fail-closed persist and KEEPS
-    // both fields on failure (correct for the nonce); the slot's RESTORE
-    // direction is then completed by removing it from `saga_pending` AFTER the
-    // combinator on the Err arm. That post-combinator remove is a rollback of an
-    // UNPERSISTED forward mutation toward the durable state (which holds neither
-    // field, the persist having failed), not a new forward Class-S transition,
-    // so it needs no persist of its own. It is the LONE residual `state_mut()`
-    // in this handler and is BLOCKED from migration until option (2) lands in
-    // `class_s.rs` (the terminal `state_mut()`-deletion PR): minimal new shape =
-    // `commit_class_s_keep_restore_split(keep: |&mut ClassSState|, restore_on_fail:
-    // |&mut ClassSState|)` that snapshots ONLY the restore-targeted field.
+    // (Class-S) to remove it. `commit_class_s_keep_restore_split` is the
+    // field-granular combinator for exactly this shape: it snapshots ONLY the
+    // restore-targeted field (`saga_pending`) BEFORE `f`, runs `f` (recording the
+    // nonce — KEEP — and staging the slot — RESTORE) under ONE fail-closed
+    // persist, and on persist FAILURE runs `restore_on_failure` (which rolls the
+    // slot back while LEAVING the recorded nonce). A check REJECT inside `f`
+    // returns immediately and runs NEITHER the persist NOR `restore_on_failure`
+    // (clean `Outcome::err`), distinct from a persist failure (slot staged then
+    // rolled back, `Outcome::err_mutated`) — preserving EXACT prior behaviour:
+    // one persist, nonce kept, slot rolled back only on persist failure.
     let target_hex = hex_context_id(&req.target_context_id);
     let saga_id = req.saga_id.clone();
-    if let Err(persist_err) = cell.commit_class_s_keep(deps, &target_hex, |mut view| {
-        let class_s = view.class_s_mut();
-        // (a) Record the accepted nonce in B's dedup cache (freshness state
-        //     lives on B) — KEEP direction.
-        class_s
-            .xctx_nonce_dedup
-            .record(req.asserted_nonce, now_secs);
-        // (b) Stage the prepared projection — RESTORE direction (completed on
-        //     the Err arm below).
-        class_s.saga_pending.insert(
-            saga_id.clone(),
-            SagaPreparedState::CrossContextToolInvocation(prepared),
-        );
-        Ok(())
-    }) {
-        // Complete the slot's RESTORE direction: roll the just-staged slot back
-        // so a retry re-stages cleanly (matching the prior inline remove). The
-        // nonce stays recorded (KEEP — the combinator did not restore it).
-        cell.state_mut().class_s.saga_pending.remove(&req.saga_id);
+    if let Err(persist_err) = cell.commit_class_s_keep_restore_split(
+        deps,
+        &target_hex,
+        // Snapshot ONLY the restore-targeted field (`saga_pending`) — the
+        // pre-`f` key set, so the failure restore removes exactly the slot `f`
+        // stages and nothing else (the kept nonce is NOT snapshotted).
+        |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+        |mut view| {
+            let class_s = view.class_s_mut();
+            // (a) Record the accepted nonce in B's dedup cache (freshness state
+            //     lives on B) — KEEP direction.
+            class_s
+                .xctx_nonce_dedup
+                .record(req.asserted_nonce, now_secs);
+            // (b) Stage the prepared projection — RESTORE direction.
+            class_s.saga_pending.insert(
+                saga_id.clone(),
+                SagaPreparedState::CrossContextToolInvocation(prepared),
+            );
+            Ok(())
+        },
+        // RESTORE on persist failure: drop any `saga_pending` key not present
+        // before `f` (i.e. the just-staged slot), so a retry re-stages cleanly.
+        // The recorded nonce is NOT restored here (KEEP direction — fail-closed).
+        |class_s, keys_before| {
+            class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+        },
+    ) {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         // The persist just FAILED, so the recorded nonce did NOT durably land;
@@ -1039,21 +1040,12 @@ fn run_prepare_b_checks(
     //     context-configured max (spec §6.2.4 "Chain-depth enforcement").
     validate_chain_depth(state, req)?;
 
-    // (7) Inbound RATE (the ONLY mutating check — runs LAST): consume B's INBOUND
-    //     §6.2.0.2 sliding window (spec §6.2.4 "Prepare-B validates InboundPolicy
-    //     (… inbound rate …)"; §6.2.0 effective min(outbound,inbound)). The
-    //     TARGET-side counterpart to Prepare-A's outbound consume; non-refundable.
-    //     ALSO enforces the cache-eviction config guard (rejects a configured
-    //     inbound ceiling above MAX_SAFE_INBOUND_CALLS_PER_MINUTE before
-    //     materializing the window) so a high inbound rate cannot erode the
-    //     §6.2.4 replay bound. Placed last so every read-only reject above fires
-    //     before any window mutation — a rejected call never consumes the budget,
-    //     and the only successful-consume mutation is followed by the staging +
-    //     Class-S persist in `prepare_b` (the window durably lands). The
-    //     over-budget / over-ceiling reject paths do NOT mutate (no increment),
-    //     so an `Outcome::err` (un-persisted) on those is correct.
-    consume_inbound_interface_rate_limit(state, deps, &req.tool_registration_id)?;
-
+    // (7) Inbound RATE — the ONLY Class-C-mutating check — is consumed by the
+    //     `prepare_b` CALLER after these checks (it needs the `ClassCMut` view,
+    //     and the caller owns the cell). Placed AFTER every read-only reject
+    //     above so a rejected call never consumes the inbound window. The
+    //     §6.2.0 effective `min(outbound, inbound)` rate and the cache-eviction
+    //     config guard are enforced there.
     Ok(())
 }
 
@@ -1922,25 +1914,32 @@ async fn commit_a(
         // corrupt the WRONG context. On a mismatch the helper voids only the
         // external escrow and consumes the ticket (mirrors `settle_tool_economy`).
         crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-            cell.state_mut(),
+            cell.class_c_view(),
             deps,
             req.reservation.reservation.generation,
             req.reservation.reservation.ticket,
         )
         .await;
-        // ── FLAG-COMMIT-A-REPLAY (Class-S remove deliberately NOT persisted) ──
+        // ── FLAG-COMMIT-A-REPLAY (idempotent Class-S remove, no-persist; blocked) ─
         // The durable reversal record (if still present) was consumed at the
         // FIRST Commit-A; remove any straggler so it cannot reverse settled
         // state. A removal here is rare (the first Commit-A already removed it),
         // so it is NOT folded into a persist decision — `xctx_committed_invocations`
         // already witnesses the committed terminal durably, and this arm replies
-        // `Ok(())` with NO persist today. Wrapping this `remove` in any combinator
-        // would introduce a fail-closed persist that does not exist here — a
-        // behaviour change (an extra persist that could itself FAIL, turning this
-        // idempotent `Ok` re-ack into an error). So this lone Class-S mutation is
-        // deliberately kept on `state_mut()` to preserve the no-persist re-ack
-        // exactly. This is the documented "rare straggler" outlier, NOT the main
-        // Commit-A transaction (which IS migrated onto combinators below).
+        // `Ok(())` with NO persist today. Every persisting combinator
+        // (`commit_class_s_*` / `begin_class_s` + token `commit`) injects a
+        // fail-closed persist that DOES NOT exist here — a behaviour change (an
+        // extra durable write that could itself FAIL, turning this idempotent
+        // `Ok` re-ack into an error). The non-persisting Class-C escape
+        // (`class_c_view()`) STRUCTURALLY cannot reach `xctx_caller_reservations`
+        // (a Class-S field — the view exposes only a shared `&` read of
+        // `class_s`). Expressing "mutate Class-S, inject NO persist" for an
+        // idempotent cleanup needs a foundation addition in `class_s.rs` (a
+        // `class_c`-style no-persist Class-S escape), out of scope for this
+        // saga+tools migration. So this lone idempotent Class-S remove is the
+        // documented "rare straggler" outlier and stays on `state_mut()`; adding
+        // a persist to migrate it would be a forbidden idempotency-breaking
+        // behaviour change.
         let _ = cell
             .state_mut()
             .class_s
@@ -1957,14 +1956,8 @@ async fn commit_a(
         generation: req.reservation.reservation.generation,
         ticket: req.reservation.reservation.ticket,
     };
-    if let Err(err) = settle_tool_economy(
-        cell.state_mut(),
-        deps,
-        &caller_hex,
-        &req.caller_did,
-        settle_request,
-    )
-    .await
+    if let Err(err) =
+        settle_tool_economy(cell, deps, &caller_hex, &req.caller_did, settle_request).await
     {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -2154,19 +2147,22 @@ async fn abort(
     reservation: Option<PreparedAFields>,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // ── FLAG-ABORT (keep direction + inline Class-S removes — reviewer sign-off) ─
-    // Abort does NOT cleanly fit one combinator. Its caller-side
-    // `xctx_caller_reservations` removes are INTERLEAVED with order-critical async
+    // ── ABORT (keep direction; deferred Class-S removes hoisted into the combinator) ─
+    // Abort's caller-side reversal is INTERLEAVED with order-critical async
     // EXTERNAL effects (escrow void via `rollback_tool_economy_generation_checked`
-    // / `reverse_caller_reservation_record`): the `None` (crash-recovery) arm must
-    // REMOVE the record to obtain it, THEN async-reverse FROM it; and the whole
-    // reversal must run BEFORE the fail-closed persist so the crash-window
-    // void→persist ordering is preserved (persist-then-void would change the
-    // crash-window semantics). A sync combinator `f` cannot host the async
-    // reversal, so those Class-S removes stay inline on `state_mut()` here — they
-    // are nonetheless fail-closed-persisted by the `commit_class_s_keep` that
-    // follows (the persist they always shared). Only the deferrable, async-free
-    // `saga_pending` clear is hoisted into the combinator `f`.
+    // / `reverse_caller_reservation_record`) that a sync combinator `f` cannot
+    // host, and the whole reversal must run BEFORE the fail-closed persist so the
+    // crash-window void→persist ordering is preserved (persist-then-void would
+    // change the crash-window semantics). The economy reversals reverse ONLY
+    // Class-C governance economy + an external escrow void, so they take the
+    // field-granular `ClassCMut` (`cell.class_c_view()`) — they cannot touch
+    // Class-S. The Class-S `xctx_caller_reservations` removal is the only Class-S
+    // mutation, and it is DEFERRED into the trailing `commit_class_s_keep` `f`
+    // alongside the `saga_pending` clear (both Class-S removals land in the SINGLE
+    // fail-closed persist that always covered them). The async reversal reads the
+    // record via `get().cloned()` (a shared Deref read — NOT a remove), so the
+    // remove no longer needs to precede the reversal to obtain the record; the
+    // observable order is unchanged (reverse → single remove+persist).
     //
     // KEEP direction: on a persist FAILURE today's abort does NOT roll anything
     // back — the reversal + removes + slot clear stay applied and it returns
@@ -2226,7 +2222,7 @@ async fn abort(
         Some(prepared) => {
             let carrier_ran =
                 crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-                    cell.state_mut(),
+                    cell.class_c_view(),
                     deps,
                     prepared.reservation.generation,
                     prepared.reservation.ticket,
@@ -2237,19 +2233,20 @@ async fn abort(
             // false`), so the rehydrated instance's LOCAL budget / velocity /
             // hard-rate-limit are STILL deducted. The durable record is the
             // source of truth for the caller reversal: fall through and reverse
-            // the LOCAL economy from it via the gen-agnostic record path (which
-            // idempotently re-voids the same escrow) BEFORE removing the record.
-            // On a MATCH the carrier already reversed LOCAL — we only consume the
+            // the LOCAL economy from a CLONED copy of it via the gen-agnostic
+            // record path (which idempotently re-voids the same escrow). On a
+            // MATCH the carrier already reversed LOCAL — we only consume the
             // record, never re-reversing. Either way LOCAL is reversed exactly
-            // once and the record is removed exactly once.
+            // once and the record is removed exactly once (the removal is the
+            // combinator `f`'s Class-S mutation below).
+            let record = cell.class_s.xctx_caller_reservations.get(saga_id).cloned();
             let local_ran = if carrier_ran {
                 true
-            } else if let Some(record) = cell.class_s.xctx_caller_reservations.get(saga_id).cloned()
-            {
+            } else if let Some(ref record) = record {
                 crate::context::tools_helpers::reverse_caller_reservation_record(
-                    cell.state_mut(),
+                    cell.class_c_view(),
                     deps,
-                    &record,
+                    record,
                 )
                 .await
             } else {
@@ -2257,17 +2254,11 @@ async fn abort(
                 // for a saga whose record was already drained). Nothing local ran.
                 false
             };
-            // Consume the durable record. Its removal is an owned mutation that
-            // MUST be persisted so a later spurious crash-abort cannot reverse an
-            // already-released reservation from a stale record. Inline (see
-            // FLAG-ABORT) — it is fail-closed-persisted by the combinator below.
-            let consumed = cell
-                .state_mut()
-                .class_s
-                .xctx_caller_reservations
-                .remove(saga_id)
-                .is_some();
-            (local_ran, consumed)
+            // A record present here WILL be consumed (removed) by the combinator
+            // `f` below — its removal is an owned mutation that MUST be persisted
+            // so a later spurious crash-abort cannot reverse an already-released
+            // reservation from a stale record.
+            (local_ran, record.is_some())
         }
         None => {
             // Crash-recovery abort: reverse from the durable record if present.
@@ -2281,17 +2272,13 @@ async fn abort(
             // `context_id`-routed actor, keyed by `record.actor_did` + the
             // `SagaId` — not on a generation check. Returns whether the local
             // reversal ran (always `true` for a present record on this path). The
-            // remove must precede the async reverse (it yields the record), so it
-            // stays inline (see FLAG-ABORT) — persisted by the combinator below.
-            match cell
-                .state_mut()
-                .class_s
-                .xctx_caller_reservations
-                .remove(saga_id)
-            {
+            // record is read via a Deref `get().cloned()` (NOT a remove) so the
+            // async reverse can run BEFORE the single persist; the actual
+            // Class-S removal is hoisted into the combinator `f` below.
+            match cell.class_s.xctx_caller_reservations.get(saga_id).cloned() {
                 Some(record) => {
                     let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
-                        cell.state_mut(),
+                        cell.class_c_view(),
                         deps,
                         &record,
                     )
@@ -2330,13 +2317,19 @@ async fn abort(
     // reversal/removals on a persist failure (the refunded economy + consumed
     // record + cleared slot stay applied — un-applying would re-open the
     // over-charge a respawn-from-durable already corrects). `commit_class_s_keep`
-    // clears the staged slot in `f` (the deferrable, async-free Class-S mutation)
-    // and performs the single fail-closed persist that also covers the inline
-    // caller-reservation removes above. On failure it returns the persist error
-    // without restoring — byte-identical to the prior inline persist-failure
-    // arm's `err_mutated`.
+    // performs the BOTH Class-S removals (the caller-reservation record consumed
+    // above is removed here, and the target-side staged slot is cleared) under
+    // the SINGLE fail-closed persist that always covered them. On failure it
+    // returns the persist error without restoring — byte-identical to the prior
+    // inline persist-failure arm's `err_mutated`. Removing an absent key is a
+    // no-op, so the unconditional removes are safe on every arm.
     if let Err(persist_err) = cell.commit_class_s_keep(deps, &context_hex, |mut view| {
-        view.class_s_mut().saga_pending.remove(saga_id);
+        let class_s = view.class_s_mut();
+        // Consume the durable caller-reservation record (no-op if absent — e.g. a
+        // target-side abort or a gen-mismatch with no record).
+        class_s.xctx_caller_reservations.remove(saga_id);
+        // Clear the target-side staged tool-session slot.
+        class_s.saga_pending.remove(saga_id);
         Ok(())
     }) {
         let sketch = outcome_error_sketch(&persist_err);
@@ -3154,7 +3147,7 @@ mod tests {
         // reservation back — dropping a live ToolEconomyTicket is a balance-
         // invariant violation by design.
         crate::context::tools_helpers::rollback_tool_economy(
-            st_cell.state_mut(),
+            st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
         )
@@ -3322,7 +3315,7 @@ mod tests {
         );
 
         crate::context::tools_helpers::rollback_tool_economy(
-            st_cell.state_mut(),
+            st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
         )
@@ -3638,13 +3631,16 @@ mod tests {
         )
         .await;
 
+        // The consume takes the field-granular `ClassCMut`; wrap the test state
+        // in a `ClassSCell` to construct the view per call.
+        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         // Drain the base + burst budget (1 base + 5 burst = 6 admitted).
         for i in 0..6 {
-            consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+            consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
                 .unwrap_or_else(|e| panic!("call {i} within budget must be admitted: {e:?}"));
         }
         // The next consume exhausts the window ⇒ typed SCP-SAGA-13026.
-        let err = consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+        let err = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
             .expect_err("inbound window exhausted must reject");
         assert!(
             matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13026")),
@@ -3675,14 +3671,15 @@ mod tests {
         )
         .await;
 
-        let err = consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        let err = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
             .expect_err("an inbound ceiling above the eviction-safe limit must reject");
         assert!(
             matches!(err, ContextError::PermissionDenied(ref m) if m.contains("SCP-SAGA-13027")),
             "expected cache-eviction config-guard rejection (SCP-SAGA-13027), got {err:?}"
         );
         // The guard fires BEFORE materializing the window — nothing was created.
-        let iface = st
+        let iface = st_cell
             .governance
             .tool_interfaces
             .iter()
@@ -3710,7 +3707,8 @@ mod tests {
         )
         .await;
 
-        consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
+        consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
             .expect("the maximum safe inbound ceiling must be admitted");
     }
 
@@ -4697,7 +4695,7 @@ mod tests {
 
         // Generations MATCH ⇒ local rollback runs.
         let ran_local = rollback_tool_economy_generation_checked(
-            st_cell.state_mut(),
+            st_cell.class_c_view(),
             &deps,
             prepared_match.reservation.generation,
             prepared_match.reservation.ticket,
@@ -4730,7 +4728,7 @@ mod tests {
         // (no unbalanced-drop panic). Routing through the saga `abort` handler
         // would call `rollback_tool_economy` directly without this guard.
         let ran_local = rollback_tool_economy_generation_checked(
-            st_cell.state_mut(),
+            st_cell.class_c_view(),
             &deps,
             stale_gen,
             prepared_stale.reservation.ticket,
@@ -5505,8 +5503,13 @@ mod tests {
         // The reversal must still run — it is NOT generation-gated.
         st.generation = st.generation.wrapping_add(11);
 
+        // The helper takes the field-granular `ClassCMut`; wrap the test state in
+        // a `ClassSCell` to construct the view, then read results back via Deref.
+        let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
-            &mut st, &deps, &record,
+            st_cell.class_c_view(),
+            &deps,
+            &record,
         )
         .await;
         assert!(
@@ -5521,7 +5524,8 @@ mod tests {
         );
         // The local velocity entry was reversed by timestamp.
         assert_eq!(
-            st.governance
+            st_cell
+                .governance
                 .velocity_tracker
                 .get_velocity(&caller, now_secs),
             0,
