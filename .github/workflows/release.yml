@@ -567,19 +567,19 @@ jobs:
             cp "$artifact/index.node" "$pkg_dir/index.node"
 
             cat > "$pkg_dir/package.json" <<JSON
-{
-  "name": "${pkg_name}",
-  "version": "${{ env.VERSION }}",
-  "description": "${os} ${cpu} native addon for @limn-works/scp-ts",
-  "os": ["${os}"],
-  "cpu": ["${cpu}"],
-  "main": "index.node",
-  "files": ["index.node"],
-  "license": "MIT OR Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/limn/scp" },
-  "publishConfig": { "access": "public" }
-}
-JSON
+          {
+            "name": "${pkg_name}",
+            "version": "${{ env.VERSION }}",
+            "description": "${os} ${cpu} native addon for @limn-works/scp-ts",
+            "os": ["${os}"],
+            "cpu": ["${cpu}"],
+            "main": "index.node",
+            "files": ["index.node"],
+            "license": "MIT OR Apache-2.0",
+            "repository": { "type": "git", "url": "https://github.com/limn/scp" },
+            "publishConfig": { "access": "public" }
+          }
+          JSON
 
             echo "Publishing ${pkg_name}@${{ env.VERSION }}…"
             npm publish "$pkg_dir" --access public
