@@ -21,7 +21,6 @@ import type { SCP } from "../src/scp";
 import {
   __classifyUcanError,
   __extractAllCapabilityUris,
-  __extractCapabilityUri,
   __extractCoreError,
   __PASSED_BEFORE,
   type CapabilityValidation,
@@ -79,52 +78,6 @@ describe("__extractCoreError", () => {
 
   it("passes a bare message through unchanged", () => {
     expect(__extractCoreError("token expired")).toBe("token expired");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// __extractCapabilityUri
-// ---------------------------------------------------------------------------
-
-describe("__extractCapabilityUri", () => {
-  const b64url = (obj: unknown): string =>
-    Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
-
-  it("returns att[0].with from a valid JWT payload", () => {
-    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
-      att: [{ with: "scp:ctx:c/messages:write" }],
-    })}.sig`;
-    expect(__extractCapabilityUri(token)).toBe("scp:ctx:c/messages:write");
-  });
-
-  it("returns the first capability when several are declared", () => {
-    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
-      att: [{ with: "scp:ctx:c/a:read" }, { with: "scp:ctx:c/b:write" }],
-    })}.sig`;
-    expect(__extractCapabilityUri(token)).toBe("scp:ctx:c/a:read");
-  });
-
-  it("returns null for a token that is not a JWT triple", () => {
-    expect(__extractCapabilityUri("not-a-jwt")).toBeNull();
-  });
-
-  it("returns null when the payload is not valid base64url JSON", () => {
-    expect(__extractCapabilityUri("header.@@@notbase64@@@.sig")).toBeNull();
-  });
-
-  it("returns null when att is empty", () => {
-    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [] })}.sig`;
-    expect(__extractCapabilityUri(token)).toBeNull();
-  });
-
-  it("returns null when att is absent", () => {
-    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ iss: "did:dht:z" })}.sig`;
-    expect(__extractCapabilityUri(token)).toBeNull();
-  });
-
-  it("returns null when att[0].with is missing", () => {
-    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [{ can: "x" }] })}.sig`;
-    expect(__extractCapabilityUri(token)).toBeNull();
   });
 });
 
@@ -496,10 +449,10 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(native.__calls("ucanValidate")).toHaveLength(2);
   });
 
-  it("multi-att token — att[1] ceiling violation narrows withinCeiling to false", async () => {
-    // Builds a token declaring two att entries. The mock validates att[0] but
-    // rejects att[1] with a ceiling failure. evaluateLayer1 must check ALL
-    // att entries and narrow withinCeiling to false.
+  it("multi-att token — evaluateLayer1 validates ALL att entries (AND-intersects)", async () => {
+    // evaluateLayer1 iterates every att[i].with URI and AND-intersects per-URI
+    // verdicts. A token with two att entries that both pass yields all fields true,
+    // and both URIs are sent to ucanValidate.
     const b64url = (obj: unknown): string =>
       Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
     const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
@@ -516,28 +469,63 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     native.__stub("ucanValidate", (...args: unknown[]) => {
       const capUri = args[2] as string;
       urisSeen.push(capUri);
-      if (capUri.endsWith(":admin")) {
-        // att[1] fails ceiling.
-        return Promise.reject(
-          new Error("[SCP-PERM-3001] permission error: capability outside ceiling: messages:admin"),
-        );
-      }
-      return Promise.resolve(undefined);
+      return Promise.resolve(undefined); // both att entries pass
     });
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
     const cv = result.capabilityValidation;
-    // att[0] passed (tokens + sigs valid), att[1] ceiling failed.
+    // Both att entries passed — all fields true.
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
-    expect(cv.withinCeiling).toBe(false);
-    expect(cv.nonceValid).toBe(false);
-    expect(cv.notRevoked).toBe(false);
-    expect(cv.timeBoundsValid).toBe(false);
-    // Both URIs were sent to ucanValidate.
+    expect(cv.withinCeiling).toBe(true);
+    expect(cv.nonceValid).toBe(true);
+    expect(cv.notRevoked).toBe(true);
+    expect(cv.timeBoundsValid).toBe(true);
+    // Both att URIs were sent to ucanValidate.
     expect(urisSeen).toContain("scp:ctx:c/messages:read");
     expect(urisSeen).toContain("scp:ctx:c/messages:admin");
+    expect(urisSeen).toHaveLength(2);
+  });
+
+  it("multi-att token: expiry failure on every URI — AND of identical expiry verdicts", async () => {
+    // Both att entries fail at step 11 (expiry). The AND-intersection of two
+    // identical expiry verdicts is the expiry verdict itself:
+    // tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false.
+    // Both URIs are sent to ucanValidate (no early exit on first URI failure).
+    const b64url = (obj: unknown): string =>
+      Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+    const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
+    const payload = b64url({
+      att: [
+        { with: "scp:ctx:c/messages:read", can: "messages/read" },
+        { with: "scp:ctx:c/messages:write", can: "messages/write" },
+      ],
+    });
+    const multiAttToken = `${header}.${payload}.sig`;
+
+    const { scp, native, context } = mountWithContext();
+    const urisSeen: string[] = [];
+    native.__stub("ucanValidate", (...args: unknown[]) => {
+      const capUri = args[2] as string;
+      urisSeen.push(capUri);
+      return Promise.reject(new Error("[SCP-PERM-3001] permission error: token expired"));
+    });
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
+    const cv = result.capabilityValidation;
+    // Expiry verdict AND-intersected: tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false
+    expect(cv.tokensValid).toBe(true);
+    expect(cv.signaturesValid).toBe(true);
+    expect(cv.withinCeiling).toBe(true);
+    expect(cv.nonceValid).toBe(true);
+    expect(cv.notRevoked).toBe(true);
+    expect(cv.timeBoundsValid).toBe(false);
+    // Both att URIs were validated.
+    expect(urisSeen).toContain("scp:ctx:c/messages:read");
+    expect(urisSeen).toContain("scp:ctx:c/messages:write");
+    expect(urisSeen).toHaveLength(2);
   });
 
   it("no tokens: all fields stay default false", async () => {

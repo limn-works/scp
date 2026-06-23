@@ -276,7 +276,11 @@ const NONCE_PREFIXES: readonly string[] = [
 ];
 
 /** Error-message prefixes that indicate a revocation failure (step 10). */
-const REVOCATION_PREFIXES: readonly string[] = ["token revoked:"];
+const REVOCATION_PREFIXES: readonly string[] = [
+  "token revoked:",
+  "revocation unauthorized:",
+  "revocation failed:",
+];
 
 /** Error-message prefixes for expiry/time-bounds failures (step 11). */
 const EXPIRY_PREFIXES: readonly string[] = [
@@ -297,56 +301,20 @@ export type UcanFailureCategory =
   | "unknown";
 
 /**
- * Extracts the first declared capability URI from a UCAN JWT's (unverified)
- * payload, for use as the `capability` argument to `scp.ucanValidate`.
+ * Extracts all declared capability URIs from a UCAN JWT's (unverified) payload.
  *
- * UCAN tokens are `header.payload.signature` triples; the base64url payload
- * declares granted capabilities in `att[0].with` (the full
- * `scp:ctx:{id}/{resource}:{action}` URI minted by the bridge). Reading the
- * unverified payload here is safe: `scp.ucanValidate` performs the actual
- * cryptographic verification — this only selects which URI to validate
- * against. (`"*"` is NOT a valid `CapabilityUri`; the bridge rejects it with
- * `InvalidCapabilityUri`, which would make Layer 1 unconditionally all-false.)
+ * Reading the unverified payload is safe: `scp.ucanValidate` performs the
+ * actual cryptographic verification — this only extracts which URI to validate.
  *
- * @returns the capability URI, or `null` if the token is malformed or declares
- *   no capabilities (both are treated as a fail-closed all-false verdict).
- * @internal Exported for unit tests.
- * @deprecated Use {@link __extractAllCapabilityUris} instead.
- */
-export function __extractCapabilityUri(token: string): string | null {
-  let capUri: string;
-  try {
-    const payloadSegment = token.split(".")[1];
-    if (payloadSegment === undefined) return null;
-    const rawPayload = JSON.parse(Buffer.from(payloadSegment, "base64url").toString("utf8")) as {
-      att?: readonly { with?: string }[];
-    };
-    const att = Array.isArray(rawPayload?.att) ? rawPayload.att : [];
-    capUri = typeof att[0]?.with === "string" ? att[0].with : "";
-  } catch {
-    return null;
-  }
-  return capUri === "" ? null : capUri;
-}
-
-/**
- * Extracts ALL declared capability URIs from a UCAN JWT's (unverified)
- * payload, for use in {@link evaluateLayer1} to validate every declared
- * capability against the context ceiling.
- *
- * A UCAN with multiple `att` entries could have `att[1]` violating the ceiling
- * while `att[0]` passes, producing a false `withinCeiling: true` verdict if
- * only `att[0]` is checked. This function returns every non-empty `att[i].with`
- * value so {@link evaluateLayer1} can validate ALL declared capabilities.
- *
- * Reading the unverified payload is safe for the same reason as
- * {@link __extractCapabilityUri}: `scp.ucanValidate` performs the actual
- * cryptographic verification — this only extracts which URIs to validate.
+ * {@link evaluateLayer1} uses the first element (`att[0].with`) as the
+ * representative capability URI for self-consistency validation. Full multi-att
+ * ceiling validation (checking every att entry against the context ceiling)
+ * requires bridge-level multi-att support.
  *
  * @returns An array of all declared capability URIs (non-empty strings from
- *   `att[i].with`), or `null` if the token is malformed OR if the resulting
- *   array is empty. Both `null` and `[]` are treated as fail-closed: a token
- *   that declares no valid capabilities is structurally invalid.
+ *   `att[i].with`), or `null` if the token is malformed or declares no valid
+ *   capabilities. Both cases are fail-closed: the caller must treat `null` as
+ *   structurally invalid.
  * @internal Exported for unit tests.
  */
 export function __extractAllCapabilityUris(token: string): string[] | null {
@@ -490,10 +458,15 @@ async function validateOneCapUri(
     await scp.ucanValidate(handle, token, capUri);
     return null; // success
   } catch (error) {
-    // `scp.ucanValidate` routes through `mapBridgeError`, so this is a typed
-    // `ScpError` whose message preserves the original `[SCP-PERM-NNNN]` code
-    // prefix verbatim. We absorb ONLY `[SCP-PERM-3001]` — the one code all
-    // UcanError variants use — and re-throw everything else. This is a closed
+    // The NAPI bridge emits UCAN errors in the form
+    // `[SCP-CAT-NNNN] <category> error: <message>` via thiserror Display
+    // (`error.rs`). `scp.ucanValidate` in `scp.ts` calls the NAPI bridge
+    // directly; `mapBridgeError` re-types the error by its prefix, preserving
+    // the original message verbatim. The `[SCP-PERM-3001]` prefix is at
+    // message position 0 by the bridge's wire format contract — it is NOT
+    // injected by `mapBridgeError`. We absorb ONLY `[SCP-PERM-3001]` — the
+    // one code every `UcanError` variant maps to (exhaustive Rust match in
+    // `ucan_errors.rs`) — and re-throw everything else. This is a closed
     // allowlist: PERM-3000 (WASM manager permission failures), PERM-3030
     // (handle-affinity misuse), and any future codes are genuine faults and
     // must propagate rather than being silently folded into a false verdict.
@@ -513,39 +486,40 @@ async function validateOneCapUri(
   }
 }
 
-/** Returns `true` when every field in a {@link CapabilityValidation} is `false`. */
-function isAllFalse(cv: CapabilityValidation): boolean {
-  return (
-    !cv.tokensValid &&
-    !cv.signaturesValid &&
-    !cv.withinCeiling &&
-    !cv.nonceValid &&
-    !cv.notRevoked &&
-    !cv.timeBoundsValid
-  );
-}
-
-/** Returns `true` when any field in a {@link CapabilityValidation} is `false`. */
-function hasAnyFalse(cv: CapabilityValidation): boolean {
-  return (
-    !cv.tokensValid ||
-    !cv.signaturesValid ||
-    !cv.withinCeiling ||
-    !cv.nonceValid ||
-    !cv.notRevoked ||
-    !cv.timeBoundsValid
-  );
+/**
+ * AND-intersects two {@link CapabilityValidation} objects: `false` wins on
+ * every field. Used to merge per-att-entry verdicts within a single token
+ * and per-token verdicts across all tokens in the capability set.
+ */
+function intersectCapabilityValidation(
+  a: CapabilityValidation,
+  b: CapabilityValidation,
+): CapabilityValidation {
+  return {
+    tokensValid: a.tokensValid && b.tokensValid,
+    signaturesValid: a.signaturesValid && b.signaturesValid,
+    withinCeiling: a.withinCeiling && b.withinCeiling,
+    nonceValid: a.nonceValid && b.nonceValid,
+    notRevoked: a.notRevoked && b.notRevoked,
+    timeBoundsValid: a.timeBoundsValid && b.timeBoundsValid,
+  };
 }
 
 /**
  * Runs Layer 1 (protocol enforcement) over the supplied capability tokens.
  *
- * Each token is validated against ALL of its declared capability URIs (see
- * `__extractAllCapabilityUris`). The result starts optimistic (all fields
- * `true`) and is narrowed by the first failure: the failing UCAN pipeline stage
- * is classified (`__classifyUcanError`) and only the stages known to have
- * passed before it (`__PASSED_BEFORE`) stay `true`. A malformed / no-capability
- * token is fail-closed (all-false) and never reaches the bridge.
+ * Each token is validated against ALL of its declared capability URIs
+ * (`att[i].with`, extracted via `__extractAllCapabilityUris`). Per-URI
+ * verdicts are AND-intersected: a `false` from any URI propagates to the
+ * token verdict, and per-token verdicts are AND-intersected across all tokens
+ * in the capability set. This ensures that if `att[0]` passes ceiling but
+ * `att[1]` does not, `withinCeiling` is correctly `false`.
+ *
+ * Each per-URI verdict is derived from the failing pipeline stage: the
+ * failing stage is classified (`__classifyUcanError`) and only the stages
+ * known to have passed before it (`__PASSED_BEFORE`) stay `true` for that
+ * URI. A malformed / no-capability token is fail-closed (all-false) and
+ * never reaches the bridge.
  *
  * Only errors with the `[SCP-PERM-3001]` code (the one code used by all
  * `UcanError` variants) are classified and absorbed into the verdict. All
@@ -556,11 +530,12 @@ function hasAnyFalse(cv: CapabilityValidation): boolean {
  *
  * **What Layer 1 measures**: token self-consistency — is this token
  * structurally valid, cryptographically signed, within the context ceiling,
- * and unexpired/unrevoked? The capability URI validated against is the token's
- * OWN declared capability (from `att[i].with`). Layer 1 does NOT answer
- * "does this token authorize action X?" Callers that need to verify authority
- * for a specific operation must call `scp.ucanValidate(handle, token, uri)`
- * directly with a caller-supplied `uri`.
+ * and unexpired/unrevoked? The capability URIs validated against are the
+ * token's OWN declared capabilities (from `att[i].with`). Layer 1 does NOT
+ * answer "does this token authorize action X?" Callers that need to verify
+ * authority for a specific operation must call
+ * `scp.ucanValidate(handle, token, uri)` directly with a caller-supplied
+ * `uri`.
  */
 async function evaluateLayer1(
   scp: SCP,
@@ -583,22 +558,41 @@ async function evaluateLayer1(
 
   for (const token of capabilityTokens) {
     const capUris = __extractAllCapabilityUris(token);
-    if (capUris === null) {
+    if (capUris === null || capUris.length === 0) {
       // Malformed token or one that declares no capabilities: structurally
       // invalid / grants nothing. Fail-closed; the bridge is not called.
       return { ...ALL_LAYER1_FIELDS_FALSE };
     }
+
+    // Validate every att entry and AND-intersect the per-URI verdicts.
+    // false wins on each field — a violation in any att entry propagates.
+    let tokenVerdict: CapabilityValidation = {
+      tokensValid: true,
+      signaturesValid: true,
+      withinCeiling: true,
+      nonceValid: true,
+      notRevoked: true,
+      timeBoundsValid: true,
+    };
     for (const capUri of capUris) {
       const narrowed = await validateOneCapUri(scp, handle, token, capUri);
       if (narrowed !== null) {
-        result = narrowed;
-        // Fail-fast: stop checking more URIs on this token once one fails.
-        break;
+        tokenVerdict = intersectCapabilityValidation(tokenVerdict, narrowed);
       }
     }
-    // If any field was narrowed to false, stop processing further tokens.
-    if (hasAnyFalse(result)) {
-      return isAllFalse(result) ? { ...ALL_LAYER1_FIELDS_FALSE } : result;
+    result = intersectCapabilityValidation(result, tokenVerdict);
+
+    // Short-circuit: if every field is already false, no further narrowing
+    // is possible. Return the early-exit sentinel.
+    if (
+      !result.tokensValid &&
+      !result.signaturesValid &&
+      !result.withinCeiling &&
+      !result.nonceValid &&
+      !result.notRevoked &&
+      !result.timeBoundsValid
+    ) {
+      return { ...ALL_LAYER1_FIELDS_FALSE };
     }
   }
 
@@ -680,11 +674,14 @@ export async function evaluateTrust(
     // no event-log history yet. Mirrors the Python port, which catches only
     // `ContextError` here — any other error is a genuine fault that propagates.
     //
-    // `scp.eventLogQuery` routes through `mapBridgeError`, so this is a typed
-    // `ScpError` whose message preserves the original `[SCP-CTX-NNNN]` code
-    // prefix verbatim. We classify on that prefix (rather than `instanceof`) to
-    // mirror the Python port's code-based dispatch and stay robust to the exact
-    // subclass.
+    // The NAPI bridge emits context errors with the `[SCP-CTX-NNNN]` prefix
+    // via thiserror Display (`error.rs`). `scp.eventLogQuery` calls the NAPI
+    // bridge directly; `mapBridgeError` re-types the error by its prefix,
+    // preserving the original message verbatim. The prefix is at message
+    // position 0 by the bridge's wire format contract — not injected by
+    // `mapBridgeError`. We classify on the prefix (rather than `instanceof`)
+    // to mirror the Python port's exception-type dispatch and stay robust to
+    // the exact subclass.
     const msg = error instanceof Error ? error.message : String(error);
     if (!/^\[SCP-CTX-\d+\]/.test(msg)) {
       throw error;

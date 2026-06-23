@@ -805,7 +805,9 @@ SCP.Trust.evaluate(
     tokensValid: Bool,
     signaturesValid: Bool,
     withinCeiling: Bool,
-    notRevoked: Bool
+    nonceValid: Bool,
+    notRevoked: Bool,
+    timeBoundsValid: Bool
   },
 
   // Layer 2: Behavioral Validation (verified facts)

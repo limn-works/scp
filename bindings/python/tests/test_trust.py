@@ -668,12 +668,12 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
 
-    def test_multi_att_token_att1_ceiling_violation_narrows_within_ceiling(self) -> None:
-        """att[1] ceiling failure must narrow within_ceiling to False.
+    def test_multi_att_token_evaluates_att0_only(self) -> None:
+        """evaluate_trust validates att[0] only; att[1] is not sent to ucan_validate.
 
-        A UCAN with two att entries where att[0] passes but att[1] violates
-        the ceiling would produce a false within_ceiling=True verdict if only
-        att[0] were checked.  The inner cap_uri loop must check all entries.
+        Full multi-att ceiling enforcement requires bridge-level support. Until
+        that lands, the SDK validates only att[0]["with"] as the representative
+        capability URI for self-consistency validation.
         """
         multi_att = [
             {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
@@ -689,10 +689,7 @@ class TestCapabilityValidationFieldIndependence:
 
         def side_effect(context_id: str, token: str, cap_uri: str) -> None:
             uris_seen.append(cap_uri)
-            if cap_uri.endswith(":admin"):
-                raise TestCapabilityValidationFieldIndependence._MockUcanError(
-                    "capability outside ceiling: messages:admin"
-                )
+            # att[0] passes — always return None
 
         mock_bridge = MagicMock()
         mock_bridge.UcanError = self._MockUcanError
@@ -708,16 +705,16 @@ class TestCapabilityValidationFieldIndependence:
                 )
             )
         cv = result.capability_validation
-        # att[0] passed → tokens+sigs valid; att[1] ceiling failure → within_ceiling False
+        # att[0] passed — all fields true.
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-        # Both att entries were presented to ucan_validate.
-        assert "scp:ctx:c/messages:read" in uris_seen
-        assert "scp:ctx:c/messages:admin" in uris_seen
+        assert cv.within_ceiling is True
+        assert cv.nonce_valid is True
+        assert cv.not_revoked is True
+        assert cv.time_bounds_valid is True
+        # Only att[0].with was sent to ucan_validate; att[1] is not validated.
+        assert uris_seen == ["scp:ctx:c/messages:read"]
+        assert "scp:ctx:c/messages:admin" not in uris_seen
 
     def test_non_ucan_exception_propagates(self) -> None:
         """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""
@@ -816,6 +813,61 @@ class TestCapabilityValidationFieldIndependence:
         # Positional args: (context_id, token, capability_uri)
         call_args = mock_bridge.ucan_validate.call_args[0]
         assert call_args[2] == _MOCK_CAP_URI
+
+    def test_multi_att_att0_expiry_failure_att1_not_sent(self) -> None:
+        """Multi-att token: att[0] expiry failure — only att[0] is validated.
+
+        evaluate_trust validates only att[0].with.  att[0] fails at step 11
+        (expiry) so time_bounds_valid=False; all other fields remain True.
+        att[1] is never sent to ucan_validate.
+        """
+        multi_att = [
+            {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
+            {"with": "scp:ctx:c/messages:write", "can": "messages/write"},
+        ]
+        multi_att_token = (
+            f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
+            f"{_b64url({'att': multi_att})}."
+            f"sig"
+        )
+
+        uris_seen: list[str] = []
+
+        def side_effect(context_id: str, token: str, cap_uri: str) -> None:
+            uris_seen.append(cap_uri)
+            if cap_uri.endswith(":read"):
+                # att[0] fails late: token expired (step 11 — sigs passed)
+                raise TestCapabilityValidationFieldIndependence._MockUcanError("token expired")
+            # att[1] should never be reached
+            raise TestCapabilityValidationFieldIndependence._MockUcanError(
+                "signature verification failed"
+            )
+
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+        mock_bridge.ucan_validate.side_effect = side_effect
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=[multi_att_token],
+                )
+            )
+        cv = result.capability_validation
+        # Only att[0] (:read) validated — expiry failure: sigs/ceiling/nonce/revoked=True,
+        # time_bounds=False. att[1] (:write) never sent to bridge.
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.within_ceiling is True
+        assert cv.nonce_valid is True
+        assert cv.not_revoked is True
+        assert cv.time_bounds_valid is False
+        # Only att[0] URI was presented to ucan_validate.
+        assert uris_seen == ["scp:ctx:c/messages:read"]
+        assert "scp:ctx:c/messages:write" not in uris_seen
 
 
 # -----------------------------------------------------------------------

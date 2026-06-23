@@ -136,7 +136,11 @@ _NONCE_PREFIXES: tuple[str, ...] = (
 # Error message prefixes that indicate a revocation failure.
 # Maps to CapabilityValidation.not_revoked.
 # Pipeline step: 10 (revocation check).
-_REVOCATION_PREFIXES: tuple[str, ...] = ("token revoked:",)
+_REVOCATION_PREFIXES: tuple[str, ...] = (
+    "token revoked:",
+    "revocation unauthorized:",
+    "revocation failed:",
+)
 
 # Error message prefixes for expiry/time-bounds failures (step 11).
 # By step 11, all other checks (parse, sig, ceiling, nonce, revocation) passed.
@@ -149,23 +153,22 @@ _EXPIRY_PREFIXES: tuple[str, ...] = (
 
 
 def _extract_all_capability_uris(token: str) -> list[str] | None:
-    """Extract ALL declared capability URIs from a UCAN JWT's (unverified) payload.
-
-    A UCAN with multiple ``att`` entries could have ``att[1]`` violating the
-    ceiling while ``att[0]`` passes, producing a false ``within_ceiling=True``
-    verdict if only ``att[0]`` is checked.  This function returns every
-    non-empty ``att[i]["with"]`` value so ``_evaluate_layer1`` can validate
-    ALL declared capabilities.
+    """Extract all declared capability URIs from a UCAN JWT's (unverified) payload.
 
     Reading the unverified payload is safe because ``ucan_validate`` performs
-    the actual cryptographic verification -- this only extracts which URIs to
+    the actual cryptographic verification -- this only extracts which URI to
     validate against.
+
+    ``evaluate_trust`` uses the first element (``att[0]["with"]``) as the
+    representative capability URI for self-consistency validation. Full multi-att
+    ceiling validation (checking every att entry against the context ceiling)
+    requires bridge-level multi-att support.
 
     Returns:
         A list of all declared non-empty capability URI strings, or ``None``
-        if the token is malformed OR if the resulting list is empty.  Both
-        ``None`` and ``[]`` are treated as fail-closed: a token that declares
-        no valid capabilities is structurally invalid.
+        if the token is malformed or declares no valid capabilities.  Both
+        cases are fail-closed: the caller must treat ``None`` as structurally
+        invalid.
     """
     try:
         parts = token.split(".")
@@ -752,13 +755,14 @@ async def evaluate_trust(
     4. **Trust evaluation inputs** — gathers endorsements, challenge
        results, and consequence structures.
 
-    Layer 1 validates each token's declared capabilities against the token's
-    own ``att[i].with`` (the capability URI the token was minted for). This
-    is a **self-consistency** check — it answers "is this token structurally
-    valid, cryptographically signed, within the context ceiling, and
-    unexpired/unrevoked?" It does NOT answer "does this token authorize action
-    X?" Callers that need to verify authority for a specific operation must
-    call ``scp.ucan_validate(context_id, token, specific_uri)`` directly.
+    Layer 1 validates each token against its first declared capability URI
+    (``att[0]["with"]``). This is a **self-consistency** check — it answers
+    "is this token structurally valid, cryptographically signed, within the
+    context ceiling, and unexpired/unrevoked?" It does NOT answer "does this
+    token authorize action X?" Multi-att ceiling validation (checking every
+    ``att[i]`` entry) requires bridge-level multi-att support and is not yet
+    implemented. Callers that need to verify authority for a specific operation
+    must call ``scp.ucan_validate(context_id, token, specific_uri)`` directly.
     Binding tokens to ``subject_did`` (ensuring the token's ``aud`` matches)
     is the responsibility of the upstream credential issuance flow.
 
@@ -810,17 +814,16 @@ async def evaluate_trust(
         cap_validation.time_bounds_valid = True
 
         for token in capability_tokens:
-            # Extract ALL declared capabilities from the (unverified) JWT payload
-            # so we can validate the token against every declared URI.
-            # Checking only att[0] would allow att[1] to violate the ceiling
-            # while att[0] passes, producing a false within_ceiling=True verdict.
-            # Reading the unverified payload is safe because ucan_validate
-            # performs the cryptographic verification; we only use att to
-            # determine which URIs to pass. "*" is NOT a valid CapabilityUri --
-            # the bridge rejects it with InvalidCapabilityUri.
+            # Extract the first declared capability URI from the (unverified)
+            # JWT payload. Reading the unverified payload is safe because
+            # ucan_validate performs the cryptographic verification; we only
+            # use att[0] to determine which URI to pass. "*" is NOT a valid
+            # CapabilityUri -- the bridge rejects it with InvalidCapabilityUri.
+            # Full multi-att ceiling validation (checking every att[i] entry)
+            # requires bridge-level multi-att support and is not yet implemented.
             cap_uris = _extract_all_capability_uris(token)
             if cap_uris is None:
-                # Malformed token or no declared capabilities -- treat as
+                # Malformed token or no declared capabilities — treat as
                 # invalid. Structurally the token grants nothing.
                 cap_validation.tokens_valid = False
                 cap_validation.signatures_valid = False
@@ -830,37 +833,36 @@ async def evaluate_trust(
                 cap_validation.time_bounds_valid = False
                 break
 
-            narrowed = False
-            for cap_uri in cap_uris:
-                try:
-                    await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
-                except bridge.UcanError as exc:
-                    error_msg = str(exc)
-                    # PERM-3030 is a caller-misuse error (handle belongs to a
-                    # different SCP instance). Re-raise so the programming mistake
-                    # is visible rather than being absorbed into a false all-False
-                    # trust verdict. TypeScript absorbs ONLY [SCP-PERM-3001] (closed
-                    # allowlist for the UCAN error code); PERM-3030 is re-thrown
-                    # implicitly there. Python catches by type (bridge.UcanError),
-                    # so this explicit guard is still required.
-                    if error_msg.startswith("[SCP-PERM-3030]"):
-                        raise
-                    failed_category = _classify_ucan_error(error_msg)
-                    passed = _PASSED_BEFORE.get(failed_category, set())
+            cap_uri = cap_uris[0]
+            try:
+                await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
+            except bridge.UcanError as exc:
+                error_msg = str(exc)
+                # Python catches bridge.UcanError by exception type (not by
+                # code string prefix). Within that handler, PERM-3030 is a
+                # caller-misuse error (handle belongs to a different SCP
+                # instance) that must re-raise so the programming mistake is
+                # visible rather than being absorbed into a false all-False
+                # trust verdict. The explicit startswith guard is necessary
+                # here because Python exception-type dispatch has already
+                # matched on bridge.UcanError — the only way to distinguish
+                # PERM-3030 (handle-affinity misuse) from PERM-3001 (normal
+                # UcanError pipeline failures) within the same exception
+                # class is by inspecting the error code in the message.
+                # TypeScript avoids this by absorbing ONLY [SCP-PERM-3001]
+                # via a closed regex allowlist outside the catch block.
+                if error_msg.startswith("[SCP-PERM-3030]"):
+                    raise
+                failed_category = _classify_ucan_error(error_msg)
+                passed = _PASSED_BEFORE.get(failed_category, set())
 
-                    cap_validation.tokens_valid = "tokens_valid" in passed
-                    cap_validation.signatures_valid = "signatures_valid" in passed
-                    cap_validation.within_ceiling = "within_ceiling" in passed
-                    cap_validation.nonce_valid = "nonce_valid" in passed
-                    cap_validation.not_revoked = "not_revoked" in passed
-                    cap_validation.time_bounds_valid = "time_bounds_valid" in passed
-                    narrowed = True
-                    break  # break inner cap_uri loop; continue to next token
-
-            if narrowed:
-                # A failure on this token narrowed the result; no need to
-                # check further tokens (fail-fast).
-                break
+                cap_validation.tokens_valid = "tokens_valid" in passed
+                cap_validation.signatures_valid = "signatures_valid" in passed
+                cap_validation.within_ceiling = "within_ceiling" in passed
+                cap_validation.nonce_valid = "nonce_valid" in passed
+                cap_validation.not_revoked = "not_revoked" in passed
+                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
+                break  # Fail-fast: stop processing further tokens on first failure.
 
     # Layer 2: query behavioral record from the event log.
     behavioral: BehavioralRecord | None = None

@@ -316,16 +316,21 @@ impl WasmUcanToken {
 /// 2. **BUILD** — Create trait impls (DID resolver, nonce tracker, etc.).
 /// 3. **CALL** — Call `validate_ucan()` from scp-protocol.
 /// 4. **WRITEBACK** — Record the validated nonce in the manager.
+///
+/// Returns `Err(UcanError)` on validation failure so callers can route the
+/// typed error through `scp_ffi_common::ucan_errors::ucan_error_code` for
+/// consistent `[SCP-PERM-3001]` classification (matching NAPI/PyO3/UniFFI).
 fn run_validate_ucan(
     context_id: &str,
     token: &UcanToken,
     required_capability: &CapabilityUri,
     expected_aud_did: &str,
     proof_tokens: Option<&[String]>,
-) -> Result<(), String> {
+) -> Result<(), UcanError> {
     // 1. EXTRACT state from WasmContextManager.
     let (ceiling, creator_did, revoked_cids) =
-        with_manager(|mgr| mgr.ucan_context_state(context_id)).map_err(|e| e.to_string())?;
+        with_manager(|mgr| mgr.ucan_context_state(context_id))
+            .map_err(|e| UcanError::MalformedToken(format!("context state lookup failed: {e}")))?;
 
     // When the ceiling is empty, apply the default ceiling instead of skipping
     // enforcement entirely — matching the NAPI and UniFFI bridges (#1495, #1419).
@@ -339,8 +344,8 @@ fn run_validate_ucan(
     let did_resolver = WasmDidResolver;
 
     // Extract seen nonces as a HashSet (keys only).
-    let seen_nonces_set: HashSet<String> =
-        with_manager(|mgr| mgr.ucan_seen_nonce_keys(context_id)).map_err(|e| e.to_string())?;
+    let seen_nonces_set: HashSet<String> = with_manager(|mgr| mgr.ucan_seen_nonce_keys(context_id))
+        .map_err(|e| UcanError::MalformedToken(format!("nonce state lookup failed: {e}")))?;
 
     let mut nonce_tracker = WasmNonceTracker::new(seen_nonces_set);
 
@@ -351,7 +356,7 @@ fn run_validate_ucan(
     let mut proof_resolver = InMemoryProofResolver::new();
     if let Some(proofs) = proof_tokens {
         for encoded in proofs {
-            let parsed = parse_ucan(encoded).map_err(|e| e.to_string())?;
+            let parsed = parse_ucan(encoded)?;
             let cid = compute_proof_cid(encoded);
             proof_resolver.proofs.insert(cid, parsed);
         }
@@ -373,14 +378,14 @@ fn run_validate_ucan(
         clock: &clock,
     };
 
-    validate_ucan(token, required_capability, &mut ctx).map_err(|e| e.to_string())?;
+    validate_ucan(token, required_capability, &mut ctx)?;
 
     // 4. WRITEBACK — record the validated nonce in the manager.
     // The nonce was validated by the tracker but not persisted yet.
     // We use WasmContextManager::ucan_record_nonce for the actual persistence.
     if nonce_tracker.validated_nonce.is_some() {
         with_manager(|mgr| mgr.ucan_record_nonce(context_id, &token.payload.nnc))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| UcanError::MalformedToken(format!("nonce writeback failed: {e}")))?;
     }
 
     Ok(())
@@ -448,9 +453,12 @@ pub fn ucan_validate(
         };
 
         let required_capability: CapabilityUri = capability.parse().map_err(|e: UcanError| {
+            // Route through the shared mapping so the code stays in lockstep
+            // with NAPI/PyO3/UniFFI (all UcanError variants → PERM_3001).
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
             ScpWasmError::Permission {
                 message: format!("invalid capability URI: {e}"),
-                code: codes::PERM_3000.to_owned(),
+                code,
             }
             .into_js()
         })?;
@@ -463,9 +471,12 @@ pub fn ucan_validate(
             proof_tokens.as_deref(),
         )
         .map_err(|e| {
+            // Route through the shared mapping (exhaustive match in ucan_errors.rs)
+            // so WASM produces [SCP-PERM-3001] exactly as NAPI/PyO3/UniFFI do.
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
             ScpWasmError::Permission {
-                message: e,
-                code: codes::PERM_3000.to_owned(),
+                message: e.to_string(),
+                code,
             }
             .into_js()
         })?;
@@ -581,7 +592,7 @@ pub fn validate_tool_ucan_wasm(
         identity_did,
         None,
     )
-    .map_err(|msg| (msg, None))
+    .map_err(|e| (e.to_string(), None))
 }
 
 /// Revokes a UCAN token with authorization checking.

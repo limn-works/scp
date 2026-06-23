@@ -376,7 +376,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    class ContextError(ScpError):
        """Context lifecycle errors (create, join, leave, close)."""
 
-   class PermissionError(ScpError):
+   class UcanPermissionError(ScpError):
        """UCAN capability validation failure."""
 
    class CryptoError(ScpError):
@@ -679,7 +679,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 - **Attenuation chain verification:** UCAN tokens support delegation — Alice delegates to Bob, who delegates to Carol. Each delegation can attenuate (narrow) capabilities. The validation module must verify the complete chain: every signature valid (using the `kid` at each link to resolve the correct verification method, ADR-039), every delegation narrower than or equal to its parent, root issuer is the context creator. Attenuation violations (a delegatee claiming broader capabilities than delegated) must be rejected.
 - **Nonce uniqueness for replay prevention (spec section 9.5):** Every UCAN token includes a mandatory `nnc` (nonce) field. The SDK tracks seen nonces per context and rejects duplicates. Without nonce tracking, a captured UCAN could be replayed to authorize actions the human never intended. Nonces are pruned after 24 hours to bound storage.
 - **Ceiling integration:** UCAN capabilities are bounded by the context's immutable capability ceiling (spec section 5.3). A valid UCAN chain that grants a capability outside the ceiling is rejected. Ceiling checking is a constant-time set membership test, performed as part of every validation.
-- **Rust implementation, Python exposure:** Validation logic is implemented in Rust for performance (hot path) and correctness (crypto operations). Python sees a clean API surface via the bridge. Validation failures surface as `scp_sdk.PermissionError` with descriptive messages.
+- **Rust implementation, Python exposure:** Validation logic is implemented in Rust for performance (hot path) and correctness (crypto operations). Python sees a clean API surface via the bridge. Validation failures surface as `scp_sdk.UcanPermissionError` with descriptive messages.
 
 ### Implementation
 
@@ -943,7 +943,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 8. Bob attempts an admin action — UCAN rejects:
    try:
        await ctx.close(identity=bob)
-   except scp.PermissionError:
+   except scp.UcanPermissionError:
        pass  # Bob lacks context:close capability. UCAN validation failed (ADR-016).
 
 9. Start an MCP server exposing Alice's SCP contexts (ADR-015):
@@ -974,7 +974,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 12. Alice revokes Bob's tool invocation capability:
     await scp.ucan.revoke(context=ctx, token=membership.tokens["tool_invoke_all"])
     Revocation distributed via MLS to all members (ADR-016).
-    Bob's next tool invocation attempt fails with PermissionError.
+    Bob's next tool invocation attempt fails with UcanPermissionError.
 
 13. Throughout: Every Python async call crosses the PyO3 bridge (ADR-013),
     runs on the shared tokio runtime, and returns results as native Python
