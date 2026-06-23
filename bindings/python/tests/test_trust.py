@@ -34,6 +34,7 @@ from scp_sdk.trust import (
     RequireParticipation,
     TrustEvaluation,
     _classify_ucan_error,
+    _extract_all_capability_uris,
     _extract_core_error,
     evaluate_trust,
     verify_participation_requirements,
@@ -89,6 +90,64 @@ class TestExtractCoreError:
     def test_bare_message(self) -> None:
         msg = "token expired"
         assert _extract_core_error(msg) == "token expired"
+
+
+# -----------------------------------------------------------------------
+# _extract_all_capability_uris tests
+# -----------------------------------------------------------------------
+
+
+class TestExtractAllCapabilityUris:
+    """Tests for _extract_all_capability_uris which returns all att[i].with values."""
+
+    def test_multi_att_returns_all_uris(self) -> None:
+        """Multi-att token returns all non-empty with values."""
+        att = [
+            {"with": "scp:ctx:c/a:read"},
+            {"with": "scp:ctx:c/b:write"},
+            {"with": "scp:ctx:c/c:admin"},
+        ]
+        token = f"{_b64url({'alg': 'EdDSA'})}.{_b64url({'att': att})}.sig"
+        result = _extract_all_capability_uris(token)
+        assert result == ["scp:ctx:c/a:read", "scp:ctx:c/b:write", "scp:ctx:c/c:admin"]
+
+    def test_single_att_returns_list_with_one_uri(self) -> None:
+        """Single-att token returns a one-element list."""
+        token = (
+            f"{_b64url({'alg': 'EdDSA'})}."
+            f"{_b64url({'att': [{'with': 'scp:ctx:c/messages:write'}]})}."
+            f"sig"
+        )
+        result = _extract_all_capability_uris(token)
+        assert result == ["scp:ctx:c/messages:write"]
+
+    def test_skips_entries_with_missing_or_empty_with(self) -> None:
+        """Entries without a valid 'with' key are skipped."""
+        token = (
+            f"{_b64url({'alg': 'EdDSA'})}."
+            f"{_b64url({'att': [{'can': 'x'}, {'with': 'scp:ctx:c/a:read'}, {'with': ''}]})}."
+            f"sig"
+        )
+        result = _extract_all_capability_uris(token)
+        assert result == ["scp:ctx:c/a:read"]
+
+    def test_not_a_jwt_triple_returns_none(self) -> None:
+        """A non-JWT string returns None."""
+        assert _extract_all_capability_uris("not-a-jwt") is None
+
+    def test_invalid_base64url_returns_none(self) -> None:
+        """Non-base64url payload returns None."""
+        assert _extract_all_capability_uris("header.@@@notbase64@@@.sig") is None
+
+    def test_empty_att_returns_none(self) -> None:
+        """A token with empty att returns None (not [])."""
+        token = f"{_b64url({'alg': 'EdDSA'})}.{_b64url({'att': []})}.sig"
+        assert _extract_all_capability_uris(token) is None
+
+    def test_all_entries_missing_with_returns_none(self) -> None:
+        """All entries without 'with' → None (no valid capabilities)."""
+        token = f"{_b64url({'alg': 'EdDSA'})}.{_b64url({'att': [{'can': 'x'}, {'with': ''}]})}.sig"
+        assert _extract_all_capability_uris(token) is None
 
 
 # -----------------------------------------------------------------------
@@ -608,6 +667,57 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
+
+    def test_multi_att_token_att1_ceiling_violation_narrows_within_ceiling(self) -> None:
+        """att[1] ceiling failure must narrow within_ceiling to False.
+
+        A UCAN with two att entries where att[0] passes but att[1] violates
+        the ceiling would produce a false within_ceiling=True verdict if only
+        att[0] were checked.  The inner cap_uri loop must check all entries.
+        """
+        multi_att = [
+            {"with": "scp:ctx:c/messages:read", "can": "messages/read"},
+            {"with": "scp:ctx:c/messages:admin", "can": "messages/admin"},
+        ]
+        multi_att_token = (
+            f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
+            f"{_b64url({'att': multi_att})}."
+            f"sig"
+        )
+
+        uris_seen: list[str] = []
+
+        def side_effect(context_id: str, token: str, cap_uri: str) -> None:
+            uris_seen.append(cap_uri)
+            if cap_uri.endswith(":admin"):
+                raise TestCapabilityValidationFieldIndependence._MockUcanError(
+                    "capability outside ceiling: messages:admin"
+                )
+
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._MockUcanError
+        mock_bridge.ucan_validate.side_effect = side_effect
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=[multi_att_token],
+                )
+            )
+        cv = result.capability_validation
+        # att[0] passed → tokens+sigs valid; att[1] ceiling failure → within_ceiling False
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.within_ceiling is False
+        assert cv.nonce_valid is False
+        assert cv.not_revoked is False
+        assert cv.time_bounds_valid is False
+        # Both att entries were presented to ucan_validate.
+        assert "scp:ctx:c/messages:read" in uris_seen
+        assert "scp:ctx:c/messages:admin" in uris_seen
 
     def test_non_ucan_exception_propagates(self) -> None:
         """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""

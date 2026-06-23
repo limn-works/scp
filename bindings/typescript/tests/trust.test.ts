@@ -20,6 +20,7 @@ import { ScpError, UcanPermissionError, ValidationError } from "../src/errors";
 import type { SCP } from "../src/scp";
 import {
   __classifyUcanError,
+  __extractAllCapabilityUris,
   __extractCapabilityUri,
   __extractCoreError,
   __PASSED_BEFORE,
@@ -124,6 +125,64 @@ describe("__extractCapabilityUri", () => {
   it("returns null when att[0].with is missing", () => {
     const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [{ can: "x" }] })}.sig`;
     expect(__extractCapabilityUri(token)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// __extractAllCapabilityUris
+// ---------------------------------------------------------------------------
+
+describe("__extractAllCapabilityUris", () => {
+  const b64url = (obj: unknown): string =>
+    Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+
+  it("returns all att[i].with values from a multi-att JWT payload", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [
+        { with: "scp:ctx:c/a:read" },
+        { with: "scp:ctx:c/b:write" },
+        { with: "scp:ctx:c/c:admin" },
+      ],
+    })}.sig`;
+    expect(__extractAllCapabilityUris(token)).toEqual([
+      "scp:ctx:c/a:read",
+      "scp:ctx:c/b:write",
+      "scp:ctx:c/c:admin",
+    ]);
+  });
+
+  it("returns [uri] for a single-att JWT payload", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [{ with: "scp:ctx:c/messages:write" }],
+    })}.sig`;
+    expect(__extractAllCapabilityUris(token)).toEqual(["scp:ctx:c/messages:write"]);
+  });
+
+  it("skips att entries where with is missing or empty", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [{ can: "x" }, { with: "scp:ctx:c/a:read" }, { with: "" }],
+    })}.sig`;
+    expect(__extractAllCapabilityUris(token)).toEqual(["scp:ctx:c/a:read"]);
+  });
+
+  it("returns null for a token that is not a JWT triple", () => {
+    expect(__extractAllCapabilityUris("not-a-jwt")).toBeNull();
+  });
+
+  it("returns null when the payload is not valid base64url JSON", () => {
+    expect(__extractAllCapabilityUris("header.@@@notbase64@@@.sig")).toBeNull();
+  });
+
+  it("returns null when att is empty", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({ att: [] })}.sig`;
+    expect(__extractAllCapabilityUris(token)).toBeNull();
+  });
+
+  it("returns null when all att entries have missing/empty with", () => {
+    const token = `${b64url({ alg: "EdDSA" })}.${b64url({
+      att: [{ can: "x" }, { with: "" }],
+    })}.sig`;
+    expect(__extractAllCapabilityUris(token)).toBeNull();
   });
 });
 
@@ -435,6 +494,50 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(cv.timeBoundsValid).toBe(false);
     // Both tokens were presented to ucanValidate.
     expect(native.__calls("ucanValidate")).toHaveLength(2);
+  });
+
+  it("multi-att token — att[1] ceiling violation narrows withinCeiling to false", async () => {
+    // Builds a token declaring two att entries. The mock validates att[0] but
+    // rejects att[1] with a ceiling failure. evaluateLayer1 must check ALL
+    // att entries and narrow withinCeiling to false.
+    const b64url = (obj: unknown): string =>
+      Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+    const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
+    const payload = b64url({
+      att: [
+        { with: "scp:ctx:c/messages:read", can: "messages/read" },
+        { with: "scp:ctx:c/messages:admin", can: "messages/admin" },
+      ],
+    });
+    const multiAttToken = `${header}.${payload}.sig`;
+
+    const { scp, native, context } = mountWithContext();
+    const urisSeen: string[] = [];
+    native.__stub("ucanValidate", (...args: unknown[]) => {
+      const capUri = args[2] as string;
+      urisSeen.push(capUri);
+      if (capUri.endsWith(":admin")) {
+        // att[1] fails ceiling.
+        return Promise.reject(
+          new Error("[SCP-PERM-3001] permission error: capability outside ceiling: messages:admin"),
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+    native.__stub("eventLogQuery", () => Promise.resolve([]));
+
+    const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
+    const cv = result.capabilityValidation;
+    // att[0] passed (tokens + sigs valid), att[1] ceiling failed.
+    expect(cv.tokensValid).toBe(true);
+    expect(cv.signaturesValid).toBe(true);
+    expect(cv.withinCeiling).toBe(false);
+    expect(cv.nonceValid).toBe(false);
+    expect(cv.notRevoked).toBe(false);
+    expect(cv.timeBoundsValid).toBe(false);
+    // Both URIs were sent to ucanValidate.
+    expect(urisSeen).toContain("scp:ctx:c/messages:read");
+    expect(urisSeen).toContain("scp:ctx:c/messages:admin");
   });
 
   it("no tokens: all fields stay default false", async () => {
