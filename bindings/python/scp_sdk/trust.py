@@ -175,8 +175,11 @@ def _extract_all_capability_uris(token: str) -> list[str] | None:
         payload_bytes = base64.urlsafe_b64decode(parts[1] + "=" * (padding % 4))
         raw_payload = json.loads(payload_bytes)
         att = raw_payload.get("att", [])
-        uris = [entry.get("with", "") for entry in att if isinstance(entry, dict)]
-        uris = [uri for uri in uris if uri]
+        uris = [
+            entry["with"]
+            for entry in att
+            if isinstance(entry, dict) and isinstance(entry.get("with"), str) and entry["with"]
+        ]
         return uris if uris else None
     except Exception:
         return None
@@ -293,7 +296,11 @@ class CapabilityValidation:
     """Layer 1: Protocol enforcement results (mechanical, pass/fail).
 
     All fields must be ``True`` for the subject to be considered
-    protocol-compliant.
+    protocol-compliant.  Layer 1 validates each token's declared capabilities
+    against the token's own ``aud`` (``att[i].with``). Binding tokens to
+    ``subject_did`` (i.e., ensuring the token's ``aud`` is ``subject_did``)
+    is the responsibility of the upstream credential issuance flow, not
+    :func:`evaluate_trust`.
     """
 
     #: UCAN tokens parse and have valid structure.
@@ -745,6 +752,16 @@ async def evaluate_trust(
     4. **Trust evaluation inputs** — gathers endorsements, challenge
        results, and consequence structures.
 
+    Layer 1 validates each token's declared capabilities against the token's
+    own ``att[i].with`` (the capability URI the token was minted for). This
+    is a **self-consistency** check — it answers "is this token structurally
+    valid, cryptographically signed, within the context ceiling, and
+    unexpired/unrevoked?" It does NOT answer "does this token authorize action
+    X?" Callers that need to verify authority for a specific operation must
+    call ``scp.ucan_validate(context_id, token, specific_uri)`` directly.
+    Binding tokens to ``subject_did`` (ensuring the token's ``aud`` matches)
+    is the responsibility of the upstream credential issuance flow.
+
     Phase 4 PR 5 Agent B+C (#1549) retained this module-level function:
     it consumes the :class:`SCP` instance to dispatch ``ucan_validate``
     and ``event_log_query`` bridge calls, then classifies the resulting
@@ -822,7 +839,7 @@ async def evaluate_trust(
                     # PERM-3030 is a caller-misuse error (handle belongs to a
                     # different SCP instance). Re-raise so the programming mistake
                     # is visible rather than being absorbed into a false all-False
-                    # trust verdict. Mirrors TypeScript trust.ts line ~461:
+                    # trust verdict. Mirrors the TypeScript `evaluateLayer1` function in trust.ts:
                     #   if (/^\[SCP-PERM-3030\]/.test(msg)) throw error;
                     if error_msg.startswith("[SCP-PERM-3030]"):
                         raise

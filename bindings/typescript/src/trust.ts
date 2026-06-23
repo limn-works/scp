@@ -181,7 +181,14 @@ export interface TrustEvaluation {
   subjectDid: string;
   /** ID of the context the evaluation applies to. */
   contextId: string;
-  /** Layer 1: Protocol enforcement (mechanical pass/fail). */
+  /**
+   * Layer 1: Protocol enforcement (mechanical pass/fail).
+   *
+   * Layer 1 validates each token's declared capabilities against the token's
+   * own `aud`. Binding tokens to `subjectDid` (i.e., ensuring the token's
+   * `aud` is `subjectDid`) is the responsibility of the upstream credential
+   * issuance flow, not this function.
+   */
   capabilityValidation: CapabilityValidation;
   /** Layer 2: Behavioral validation (verified facts), or `null` if unavailable. */
   behavioralRecord: BehavioralRecord | null;
@@ -304,6 +311,7 @@ export type UcanFailureCategory =
  * @returns the capability URI, or `null` if the token is malformed or declares
  *   no capabilities (both are treated as a fail-closed all-false verdict).
  * @internal Exported for unit tests.
+ * @deprecated Use {@link __extractAllCapabilityUris} instead.
  */
 export function __extractCapabilityUri(token: string): string | null {
   let capUri: string;
@@ -545,6 +553,14 @@ function hasAnyFalse(cv: CapabilityValidation): boolean {
  * Non-UCAN errors (anything without an `[SCP-PERM-NNNN]` prefix) and
  * handle-affinity misuse (`[SCP-PERM-3030]`) propagate to the caller rather
  * than being absorbed into a false verdict.
+ *
+ * **What Layer 1 measures**: token self-consistency — is this token
+ * structurally valid, cryptographically signed, within the context ceiling,
+ * and unexpired/unrevoked? The capability URI validated against is the token's
+ * OWN declared capability (from `att[i].with`). Layer 1 does NOT answer
+ * "does this token authorize action X?" Callers that need to verify authority
+ * for a specific operation must call `scp.ucanValidate(handle, token, uri)`
+ * directly with a caller-supplied `uri`.
  */
 async function evaluateLayer1(
   scp: SCP,
@@ -609,6 +625,11 @@ async function evaluateLayer1(
  * bridge's `ucanValidate`/`eventLogQuery` operations require a context handle,
  * which the TS layer obtains from `scp.contextCreate(...)` / `contextJoin(...)`.
  * The context's `contextId` is recorded on the result.
+ *
+ * Layer 1 validates each token's declared capabilities against the token's own
+ * `aud` (i.e., each `att[i].with`). Binding tokens to `subjectDid` (ensuring
+ * the token's `aud` is `subjectDid`) is the responsibility of the upstream
+ * credential issuance flow, not this function.
  *
  * @param scp The {@link SCP} instance to dispatch bridge calls on.
  * @param subjectDid The DID of the participant to evaluate.
