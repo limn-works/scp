@@ -226,11 +226,17 @@ pub fn evaluate_sybil_resistance(
 }
 
 /// Initializes participation record and records budget spend for a new
-/// member (#1530, #1537). Takes a `&mut GovernanceState` and a
-/// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of
-/// the unified [`PerContextState`] (ADR-049 §Decision 1).
+/// member (#1530, #1537). Takes the `&mut participation_cache` field and a
+/// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
+/// unified [`PerContextState`] (ADR-049 §Decision 1) — a cell-holder supplies
+/// the cache via `governance_class_c_mut().participation_cache_mut()` and the
+/// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
+/// `state_mut()`) is needed.
 pub fn post_join_bookkeeping(
-    governance: &mut super::state::GovernanceState,
+    participation_cache: &mut std::collections::HashMap<
+        String,
+        scp_protocol::trust::participation::ParticipationRecord,
+    >,
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
     context_id: &str,
     member_did: &DID,
@@ -259,9 +265,7 @@ pub fn post_join_bookkeeping(
             now,
         )
     {
-        governance
-            .participation_cache
-            .insert(member_did.to_string(), record);
+        participation_cache.insert(member_did.to_string(), record);
     }
 }
 

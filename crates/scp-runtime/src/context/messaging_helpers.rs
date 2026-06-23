@@ -1154,7 +1154,7 @@ pub async fn send_message(
         );
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
         crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
@@ -1221,7 +1221,7 @@ pub async fn send_message(
         // counter one below correct. The consumed nonce is intentionally left
         // consumed (the fail-closed direction).
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
         crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
