@@ -56,7 +56,7 @@ class TrustLevelDict(TypedDict):
 
 
 class DiscoveryResult(TypedDict):
-    """A context discovery result (§22.2.1 ``AddressResolution``).
+    """A context discovery result (§22.11.3 ``AddressResolution``).
 
     Matches the shape of ``DiscoveryResult`` in the TypeScript SDK but uses
     snake_case per Python conventions.

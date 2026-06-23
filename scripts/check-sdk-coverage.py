@@ -14,7 +14,13 @@ Detection strategy per SDK (AST-based via tree-sitter):
   - Kotlin:      public class/function declarations in bindings/kotlin/scp-kt/src/main/kotlin/**/*.kt
   - Swift:       public func/class/struct/actor/extension in bindings/swift/Sources/SCP/**/*.swift
 
-Exit 0 if all checks pass, 1 if any `false` entry lacks an exemption.
+Exit 0 if all checks pass. Exit 1 if any of: matrix file not found,
+`true` entry has no matching symbol and no coverage exemption, `false`
+entry lacks an exemption or has an empty exemption reason, a
+coverage_exemptions entry has a blank reason, a cell value is not
+true/false/null, an expected SDK key is absent from an operation entry,
+or every SDK claiming coverage for an operation is coverage-exempted
+with no statically-verified implementation.
 
 Usage: python3.12 scripts/check-sdk-coverage.py
 
