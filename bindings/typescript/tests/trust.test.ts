@@ -449,10 +449,10 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     expect(native.__calls("ucanValidate")).toHaveLength(2);
   });
 
-  it("multi-att token — evaluateLayer1 validates ALL att entries (AND-intersects)", async () => {
-    // evaluateLayer1 iterates every att[i].with URI and AND-intersects per-URI
-    // verdicts. A token with two att entries that both pass yields all fields true,
-    // and both URIs are sent to ucanValidate.
+  it("multi-att token — evaluateLayer1 validates att[0] only, returns all-true on pass", async () => {
+    // evaluateLayer1 validates only att[0].with. A token with two att entries
+    // that both pass yields all fields true, and only att[0].with is sent to
+    // ucanValidate (att[1] is not checked).
     const b64url = (obj: unknown): string =>
       Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
     const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
@@ -469,30 +469,28 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     native.__stub("ucanValidate", (...args: unknown[]) => {
       const capUri = args[2] as string;
       urisSeen.push(capUri);
-      return Promise.resolve(undefined); // both att entries pass
+      return Promise.resolve(undefined); // att[0] passes
     });
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
     const cv = result.capabilityValidation;
-    // Both att entries passed — all fields true.
+    // att[0] passed — all fields true.
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
     expect(cv.withinCeiling).toBe(true);
     expect(cv.nonceValid).toBe(true);
     expect(cv.notRevoked).toBe(true);
     expect(cv.timeBoundsValid).toBe(true);
-    // Both att URIs were sent to ucanValidate.
-    expect(urisSeen).toContain("scp:ctx:c/messages:read");
-    expect(urisSeen).toContain("scp:ctx:c/messages:admin");
-    expect(urisSeen).toHaveLength(2);
+    // Only att[0] URI was sent to ucanValidate; att[1] was not.
+    expect(urisSeen).toEqual(["scp:ctx:c/messages:read"]);
+    expect(urisSeen).not.toContain("scp:ctx:c/messages:admin");
   });
 
-  it("multi-att token: expiry failure on every URI — AND of identical expiry verdicts", async () => {
-    // Both att entries fail at step 11 (expiry). The AND-intersection of two
-    // identical expiry verdicts is the expiry verdict itself:
-    // tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false.
-    // Both URIs are sent to ucanValidate (no early exit on first URI failure).
+  it("multi-att token: att[0] expiry failure — att[1] not sent to bridge", async () => {
+    // att[0] fails at step 11 (expiry). evaluateLayer1 stops after att[0]
+    // and returns the expiry verdict: tokens+sigs+ceiling+nonce+notRevoked=true,
+    // timeBounds=false. att[1] is never sent to ucanValidate.
     const b64url = (obj: unknown): string =>
       Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
     const header = b64url({ alg: "EdDSA", typ: "JWT", ucv: "0.10.0" });
@@ -515,17 +513,16 @@ describe("evaluateTrust — Layer 1 field independence", () => {
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context, [multiAttToken]);
     const cv = result.capabilityValidation;
-    // Expiry verdict AND-intersected: tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false
+    // att[0] expiry verdict: tokens+sigs+ceiling+nonce+notRevoked=true, timeBounds=false
     expect(cv.tokensValid).toBe(true);
     expect(cv.signaturesValid).toBe(true);
     expect(cv.withinCeiling).toBe(true);
     expect(cv.nonceValid).toBe(true);
     expect(cv.notRevoked).toBe(true);
     expect(cv.timeBoundsValid).toBe(false);
-    // Both att URIs were validated.
-    expect(urisSeen).toContain("scp:ctx:c/messages:read");
-    expect(urisSeen).toContain("scp:ctx:c/messages:write");
-    expect(urisSeen).toHaveLength(2);
+    // Only att[0] was validated; att[1] never reached the bridge.
+    expect(urisSeen).toEqual(["scp:ctx:c/messages:read"]);
+    expect(urisSeen).not.toContain("scp:ctx:c/messages:write");
   });
 
   it("no tokens: all fields stay default false", async () => {

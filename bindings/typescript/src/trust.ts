@@ -487,33 +487,15 @@ async function validateOneCapUri(
 }
 
 /**
- * AND-intersects two {@link CapabilityValidation} objects: `false` wins on
- * every field. Used to merge per-att-entry verdicts within a single token
- * and per-token verdicts across all tokens in the capability set.
- */
-function intersectCapabilityValidation(
-  a: CapabilityValidation,
-  b: CapabilityValidation,
-): CapabilityValidation {
-  return {
-    tokensValid: a.tokensValid && b.tokensValid,
-    signaturesValid: a.signaturesValid && b.signaturesValid,
-    withinCeiling: a.withinCeiling && b.withinCeiling,
-    nonceValid: a.nonceValid && b.nonceValid,
-    notRevoked: a.notRevoked && b.notRevoked,
-    timeBoundsValid: a.timeBoundsValid && b.timeBoundsValid,
-  };
-}
-
-/**
  * Runs Layer 1 (protocol enforcement) over the supplied capability tokens.
  *
- * Each token is validated against ALL of its declared capability URIs
- * (`att[i].with`, extracted via `__extractAllCapabilityUris`). Per-URI
- * verdicts are AND-intersected: a `false` from any URI propagates to the
- * token verdict, and per-token verdicts are AND-intersected across all tokens
- * in the capability set. This ensures that if `att[0]` passes ceiling but
- * `att[1]` does not, `withinCeiling` is correctly `false`.
+ * Each token is validated against its first declared capability URI
+ * (`att[0].with`, extracted via `__extractAllCapabilityUris`). Only att[0]
+ * is sent to the bridge — full multi-att ceiling validation requires
+ * bridge-level support (a single `ucanValidate` call that verifies ALL att
+ * entries, consuming the nonce only once). Until that support lands, the SDK
+ * validates att[0] only. The bridge (SCP production) always mints single-att
+ * tokens, so this limitation does not affect normal operation.
  *
  * Each per-URI verdict is derived from the failing pipeline stage: the
  * failing stage is classified (`__classifyUcanError`) and only the stages
@@ -531,7 +513,7 @@ function intersectCapabilityValidation(
  * **What Layer 1 measures**: token self-consistency — is this token
  * structurally valid, cryptographically signed, within the context ceiling,
  * and unexpired/unrevoked? The capability URIs validated against are the
- * token's OWN declared capabilities (from `att[i].with`). Layer 1 does NOT
+ * token's OWN declared capabilities (from `att[0].with`). Layer 1 does NOT
  * answer "does this token authorize action X?" Callers that need to verify
  * authority for a specific operation must call
  * `scp.ucanValidate(handle, token, uri)` directly with a caller-supplied
@@ -557,42 +539,18 @@ async function evaluateLayer1(
   };
 
   for (const token of capabilityTokens) {
-    const capUris = __extractAllCapabilityUris(token);
-    if (capUris === null || capUris.length === 0) {
+    const capUri = __extractAllCapabilityUris(token)?.[0] ?? null;
+    if (capUri === null) {
       // Malformed token or one that declares no capabilities: structurally
       // invalid / grants nothing. Fail-closed; the bridge is not called.
       return { ...ALL_LAYER1_FIELDS_FALSE };
     }
 
-    // Validate every att entry and AND-intersect the per-URI verdicts.
-    // false wins on each field — a violation in any att entry propagates.
-    let tokenVerdict: CapabilityValidation = {
-      tokensValid: true,
-      signaturesValid: true,
-      withinCeiling: true,
-      nonceValid: true,
-      notRevoked: true,
-      timeBoundsValid: true,
-    };
-    for (const capUri of capUris) {
-      const narrowed = await validateOneCapUri(scp, handle, token, capUri);
-      if (narrowed !== null) {
-        tokenVerdict = intersectCapabilityValidation(tokenVerdict, narrowed);
-      }
-    }
-    result = intersectCapabilityValidation(result, tokenVerdict);
-
-    // Short-circuit: if every field is already false, no further narrowing
-    // is possible. Return the early-exit sentinel.
-    if (
-      !result.tokensValid &&
-      !result.signaturesValid &&
-      !result.withinCeiling &&
-      !result.nonceValid &&
-      !result.notRevoked &&
-      !result.timeBoundsValid
-    ) {
-      return { ...ALL_LAYER1_FIELDS_FALSE };
+    const narrowed = await validateOneCapUri(scp, handle, token, capUri);
+    if (narrowed !== null) {
+      result = narrowed;
+      // Fail-fast: stop processing further tokens on first failure.
+      return narrowed;
     }
   }
 
