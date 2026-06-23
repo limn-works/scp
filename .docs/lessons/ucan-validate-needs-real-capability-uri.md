@@ -23,28 +23,35 @@ await scp.ucanValidate(handle, token, capUri);
 
 ```python
 # trust.py — correct
-cap_uris = _extract_all_capability_uris(token)
-if cap_uris is None:
+cap_uri = _extract_first_capability_uri(token)  # reads att[0]["with"]; returns str | None
+if cap_uri is None:
     # fail-closed: no valid capabilities declared
     break
-cap_uri = cap_uris[0]
 await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
 ```
 
-## PERM-3001 closed allowlist
+## PERM-3001 and VALID-* closed allowlists
 
-`validateOneCapUri` absorbs **only** `[SCP-PERM-3001]` errors. This is the one code that every `UcanError` variant maps to, enforced by an exhaustive Rust match in `ucan_errors.rs` (single point of change across all four bridges). The pattern:
+`validateOneCapUri` (TypeScript) / the `except` handlers in `evaluate_trust` (Python) absorb two categories of errors, both treated as "malformed token — all-false fail-closed":
+
+**`[SCP-PERM-3001]`** — the one code every `UcanError` variant maps to, enforced by an exhaustive Rust match in `ucan_errors.rs`. This covers pipeline failures: bad signature, ceiling violation, nonce reuse, revocation, expiry, etc. Each failure is classified into the failing pipeline stage, and the `__PASSED_BEFORE` / `_PASSED_BEFORE` map yields a narrowed (partially-true) `CapabilityValidation`.
+
+**`[SCP-VALID-*]`** — boundary validation failures emitted by the bridge's `validate_capability_uri` pre-flight **before** the UCAN pipeline runs. Examples: the URI extracted from `att[0].with` contains control characters or HTML-special characters. Because the URI itself is invalid, no pipeline stage runs and the result is all-false (identical to the null-URI path). TypeScript pattern:
 
 ```ts
-if (!/^\[SCP-PERM-3001\]/.test(msg)) {
-  throw error;
+if (/^\[SCP-PERM-3001\]/.test(msg)) {
+  // narrowed verdict from pipeline stage classification
+} else if (/^\[SCP-VALID-/.test(msg)) {
+  return { ...ALL_LAYER1_FIELDS_FALSE }; // URI invalid → all-false
+} else {
+  throw error; // propagate genuine faults
 }
 ```
 
-Re-throws:
+Re-throws (both TS and Python):
 - `[SCP-PERM-3030]` — handle-affinity misuse (the token's context handle belongs to a different SCP instance). This is a programming error and must propagate visibly.
 - `[SCP-PERM-3000]` — WASM manager permission failures.
-- Any future codes — future unknown codes are genuine faults, not UCAN pipeline outcomes.
+- Any other code — unknown codes are genuine faults, not UCAN pipeline or URI-parse outcomes.
 
 ## Rules
 

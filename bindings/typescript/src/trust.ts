@@ -450,9 +450,19 @@ const ALL_LAYER1_FIELDS_FALSE: CapabilityValidation = {
 /**
  * Validates a single capability token against one of its declared URIs.
  *
- * Throws if the error is not a UCAN permission error (non-UCAN errors and
- * handle-affinity misuse propagate to the caller). Returns a narrowed
- * {@link CapabilityValidation} on UCAN failure, or `null` on success.
+ * Returns one of three outcomes:
+ * - `null` — bridge accepted the token (all checks passed).
+ * - A narrowed {@link CapabilityValidation} — bridge returned a `[SCP-PERM-3001]`
+ *   UCAN pipeline failure; fields are set from the failing pipeline stage via
+ *   `__classifyUcanError` / `__PASSED_BEFORE`.
+ * - `ALL_LAYER1_FIELDS_FALSE` — bridge returned a `[SCP-VALID-*]` boundary
+ *   validation failure (the URI itself was malformed — e.g. control chars or
+ *   HTML-special chars). Treated identically to a null capUri: the token is
+ *   structurally invalid and grants nothing.
+ *
+ * Throws if the error is neither `[SCP-PERM-3001]` nor `[SCP-VALID-*]`:
+ * `[SCP-PERM-3000]` (WASM manager), `[SCP-PERM-3030]` (handle-affinity misuse),
+ * and any future codes are genuine faults and must propagate.
  *
  * Extracted to reduce cognitive complexity of {@link evaluateLayer1}.
  */
@@ -604,6 +614,13 @@ async function evaluateLayer1(
  * {@link evaluateLayer1} for the att[0]-only rationale. Binding tokens to
  * `subjectDid` (ensuring the token's `aud` is `subjectDid`) is the
  * responsibility of the upstream credential issuance flow, not this function.
+ *
+ * Tokens with an absent or non-string `att[0].with` produce all-false
+ * fail-closed without reaching the bridge. Tokens whose `att[0].with` URI is
+ * present but rejected by the bridge's pre-flight boundary check (`[SCP-VALID-*]`
+ * — e.g. control chars, HTML-special chars) also produce all-false, identical
+ * to the absent-URI path. Only `[SCP-PERM-3001]` UCAN pipeline errors produce a
+ * narrowed verdict; `[SCP-PERM-3030]` and other codes propagate.
  *
  * @param scp The {@link SCP} instance to dispatch bridge calls on.
  * @param subjectDid The DID of the participant to evaluate.
