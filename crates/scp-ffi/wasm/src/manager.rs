@@ -3072,8 +3072,9 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not active, the proposal is not
-    /// `Approved`, the initiator lacks the required capability, the proposal
-    /// was already executed, the proposal is not tracked, or the action fails.
+    /// tracked, the proposal is not `Approved`, the proposal was already
+    /// executed, or the action fails. There is no per-member capability check
+    /// at execute time (see above).
     pub fn execute_governance_action(
         &mut self,
         context_id: &str,
