@@ -284,12 +284,17 @@ const NONCE_PREFIXES: readonly string[] = [
   "nonce tracker full:",
 ];
 
-/** Error-message prefixes that indicate a revocation failure (step 10). */
-const REVOCATION_PREFIXES: readonly string[] = [
-  "token revoked:",
-  "revocation unauthorized:",
-  "revocation failed:",
-];
+/**
+ * Error-message prefixes that indicate a revocation failure (step 10).
+ *
+ * `"revocation unauthorized:"` and `"revocation failed:"` are intentionally
+ * excluded: those are operational errors (revocation management — admin-side
+ * actions on the revocation list) that never appear as step-10 validation
+ * failures. They classify as `"unknown"` → fail-closed. Only `"token revoked:"`
+ * is the actual step-10 result emitted by `validate.rs`. Mirrors
+ * `_REVOCATION_PREFIXES` in the Python SDK (`trust.py`).
+ */
+const REVOCATION_PREFIXES: readonly string[] = ["token revoked:"];
 
 /** Error-message prefixes for expiry/time-bounds failures (step 11). */
 const EXPIRY_PREFIXES: readonly string[] = [
