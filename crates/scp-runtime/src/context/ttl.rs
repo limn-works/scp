@@ -676,7 +676,7 @@ pub async fn finalize_close(
     event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextClosed,
-        "system:close",
+        scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
         timestamp_secs,
     )?;
 
@@ -873,7 +873,7 @@ pub async fn try_ttl_expiry_cleanup(
         match event_log.append_context_event(
             &context_id_bytes,
             scp_event_log::EventType::ContextExpired,
-            "system:timer",
+            scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
             expiry_deadline_secs,
         ) {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
@@ -1365,6 +1365,101 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
+    }
+
+    /// Records the `(EventType, actor_did)` of every append so a test can
+    /// assert the real producer stamps the convergent system-leaf sentinel.
+    #[derive(Default)]
+    struct CapturingEventLog {
+        // Test-only capture buffer; the guard is never held across an `.await`
+        // (locked, pushed, and dropped synchronously inside `append_event`).
+        // Per `crates/scp-runtime/clippy.toml`, test-only `std::sync::Mutex`
+        // sites carry this allow.
+        #[allow(clippy::disallowed_types)]
+        appends: std::sync::Mutex<Vec<(scp_event_log::EventType, String)>>,
+    }
+
+    impl ContextEventLogProvider for CapturingEventLog {
+        fn init_event_log(
+            &self,
+            _cid: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _cid: &[u8; 32],
+            event: scp_event_log::EventType,
+            actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.appends
+                .lock()
+                .unwrap()
+                .push((event, actor_did.to_owned()));
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _cid: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// §9.9.3 native↔WASM convergence: the native `finalize_close` producer MUST
+    /// stamp the descriptive sentinel `"system:close"` on the `ContextClosed`
+    /// leaf so it is byte-identical to the WASM bridge's `finalize_close` leaf.
+    #[tokio::test]
+    async fn finalize_close_stamps_system_close_actor_did() {
+        let crypto = mk_crypto();
+        let transport = NullTransport;
+        let event_log = CapturingEventLog::default();
+        let handle = active_handle("ctx-close-actor", MemoryScope::Full).await;
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+        finalize_close(
+            &handle,
+            crypto.as_ref(),
+            &transport,
+            &event_log,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
+
+        let appends = event_log.appends.lock().unwrap();
+        let closed = appends
+            .iter()
+            .find(|(e, _)| *e == scp_event_log::EventType::ContextClosed)
+            .expect("ContextClosed leaf must be appended by finalize_close");
+        assert_eq!(
+            closed.1, "system:close",
+            "native ContextClosed leaf MUST stamp \"system:close\" (§9.9.3 native↔WASM parity)"
+        );
+    }
+
+    /// §9.9.3 native↔WASM convergence: the native `handle_ttl_expiry` producer
+    /// MUST stamp the descriptive sentinel `"system:timer"` on the
+    /// `ContextExpired` leaf so it is byte-identical to the WASM bridge's leaf.
+    #[tokio::test]
+    async fn handle_ttl_expiry_stamps_system_timer_actor_did() {
+        let crypto = mk_crypto();
+        let event_log = CapturingEventLog::default();
+        let handle = active_handle("ctx-ttl-actor", MemoryScope::Full).await;
+        handle_ttl_expiry(&handle, crypto.as_ref(), &event_log, 1_700_000_000)
+            .await
+            .unwrap();
+
+        let appends = event_log.appends.lock().unwrap();
+        let expired = appends
+            .iter()
+            .find(|(e, _)| *e == scp_event_log::EventType::ContextExpired)
+            .expect("ContextExpired leaf must be appended by handle_ttl_expiry");
+        assert_eq!(
+            expired.1, "system:timer",
+            "native ContextExpired leaf MUST stamp \"system:timer\" (§9.9.3 native↔WASM parity)"
+        );
     }
 
     async fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {

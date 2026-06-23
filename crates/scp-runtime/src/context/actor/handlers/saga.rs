@@ -2420,7 +2420,7 @@ fn emit_divergence_marker(
     if let Err(err) = deps.event_log.append_context_event_with_payload(
         &state.context_id,
         scp_event_log::EventType::CrossContextDivergenceMarker,
-        "",
+        scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
         scp_event_log::EventPayload {
             data: marker_payload_bytes,
         },

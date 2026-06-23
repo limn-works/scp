@@ -37,6 +37,7 @@ pub mod metrics;
 pub mod payload;
 pub mod proof;
 pub mod pruning;
+pub mod system_actors;
 pub mod tiered_storage;
 pub mod time;
 pub mod tree;

@@ -878,7 +878,7 @@ mod tests {
 // answer; together they prove the two impls emit byte-identical leaves.
 // ===========================================================================
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod cross_impl_leaf_parity {
     /// `GovernanceActionExecuted`: WASM's real value extraction + shared
     /// `GovernanceActionExecutedPayload` + `encode_payload` (the exact code at
@@ -1135,5 +1135,824 @@ mod cross_impl_leaf_parity {
                  with an EMPTY payload (§9.9.3 native↔WASM parity)"
             );
         }
+    }
+
+    /// Reconstructs the native-reference leaf bytes for a single system event
+    /// from the SHARED `scp_event_log` primitives — the exact preimage native's
+    /// real producer (`ttl.rs`'s `handle_ttl_expiry` / `finalize_close`) feeds
+    /// `tree::append_unsigned_event`: `Event { event_type, actor_did,
+    /// timestamp, sequence: 0, payload: empty, prev_hash: GENESIS, signature:
+    /// [] }`. The leaf hash is `SHA-256(0x00 ‖ rmp_serde(Event))`, so a single
+    /// such append's `tree::root` is exactly that leaf hash. The WASM real
+    /// producer must reproduce this byte-for-byte.
+    #[cfg(test)]
+    fn native_reference_single_system_leaf_root(
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        timestamp: u64,
+    ) -> [u8; 32] {
+        // A system leaf is exactly a payload leaf with an EMPTY payload — the
+        // `EventPayload { data: Vec::new() }` an empty `&[]` produces is
+        // byte-identical, so forward to the payload reference to keep a single
+        // source of preimage truth.
+        native_reference_single_payload_leaf_root(context_id, event_type, actor_did, timestamp, &[])
+    }
+
+    /// Reconstructs the native-reference leaf bytes for a single
+    /// payload-bearing event (e.g. `GovernanceActionExecuted`) from the SHARED
+    /// `scp_event_log` primitives — the exact preimage native's real producer
+    /// (`finalize_governance_action`) feeds `tree::append_unsigned_event`. Same
+    /// shape as [`native_reference_single_system_leaf_root`] but with a non-empty
+    /// payload, so the full leaf bytes (`actor_did` + payload + timestamp) are
+    /// pinned, not just the `actor_did` field.
+    #[cfg(test)]
+    fn native_reference_single_payload_leaf_root(
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) -> [u8; 32] {
+        use scp_event_log::tree::{append_unsigned_event, root};
+        use scp_event_log::{DID, Event, EventLog, EventPayload};
+
+        let mut log = EventLog::new(context_id.to_owned());
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence: 0,
+            payload: EventPayload {
+                data: payload.to_vec(),
+            },
+            prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+            signature: Vec::new(),
+        };
+        append_unsigned_event(&mut log, &event).expect("reference payload leaf append");
+        root(&log)
+    }
+
+    /// §9.9.3 native↔WASM DIRECT-EXECUTE `GovernanceActionExecuted` parity.
+    /// The direct-FFI execute entry (`context_execute_governance`) stamps the
+    /// proposal's PROPOSER as the leaf `actor_did` (the executor) — NOT the
+    /// caller (`initiator_did`) — matching the native direct-execute handler
+    /// (`handle_execute_governance_action_actor`), which sets
+    /// `executor_did = proposal.proposer_did`. This drives the exact manager
+    /// call the fixed direct entry performs (auth subject = caller, executor =
+    /// `proposal_proposer_did(...)`) and pins the FULL single-leaf root against
+    /// the native-reference leaf bytes, with a non-vacuity control proving the
+    /// PRE-FIX caller-stamp diverged.
+    #[test]
+    fn cross_impl_governance_action_executed_direct_stamps_proposer_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        };
+
+        let context_id = "ctx-gov-direct-executor";
+        let proposer = "did:dht:z6MkDirectProposer";
+        let caller = "did:dht:z6MkDirectCaller"; // distinct from proposer
+        let proposal_id = "feedface";
+        let created_at = 1_700_500_500_u64;
+
+        // SingleAdmin context: the caller (an admin) executes directly. Both
+        // proposer and caller are admins so the caller's capability check
+        // passes while the executor (leaf actor_did) must still be the proposer.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(caller, "admin");
+        ctx.test_insert_member("did:dht:z6MkDirectTarget", "member");
+        ctx.test_insert_ceiling("role:assign");
+
+        // A target distinct from both proposer and caller keeps the leaf actor
+        // unambiguously the proposer.
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkDirectTarget".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        let proposal_id_bytes: [u8; 32] = {
+            let bytes = hex::decode(proposal_id).unwrap();
+            let mut arr = [0u8; 32];
+            let len = bytes.len().min(32);
+            arr[..len].copy_from_slice(&bytes[..len]);
+            arr
+        };
+        // Track the proposal as Approved (the direct-execute precondition).
+        let proposal = GovernanceProposal {
+            proposal_id: proposal_id_bytes,
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(proposer.to_owned()),
+            action: action.clone(),
+            status: ProposalStatus::Approved,
+            created_at,
+            voting_deadline: created_at + 3600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(proposer.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: created_at,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        ctx.test_insert_resolved_proposal(proposal_id.to_owned(), proposal);
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // EXACTLY what the fixed `context_execute_governance` direct entry does:
+        // resolve the proposer, then execute with auth-subject = caller,
+        // executor = proposer.
+        let resolved_proposer = mgr
+            .proposal_proposer_did(context_id, proposal_id)
+            .expect("proposer resolvable");
+        assert_eq!(resolved_proposer, proposer);
+        mgr.execute_governance_action(context_id, caller, &resolved_proposer, proposal_id, &action)
+            .expect("direct execute");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed_leaf = logged
+            .iter()
+            .find(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted leaf present after direct execute");
+        assert_eq!(
+            executed_leaf.actor_did.as_ref(),
+            proposer,
+            "direct-execute GovernanceActionExecuted leaf actor_did MUST be the proposal's \
+             proposer (the executor), NOT the caller (§9.9.3; native direct handler stamps \
+             proposal.proposer_did)"
+        );
+        assert_eq!(executed_leaf.timestamp, created_at);
+
+        // Full-leaf-bytes parity: the WASM real-producer root equals the
+        // native-reference leaf reconstructed from the shared primitives with
+        // the proposer actor, the convergent created_at, and the shared
+        // GovernanceActionExecutedPayload bytes.
+        let payload = WasmContextManager::encode_governance_action_executed_payload(
+            &action,
+            action.target_did(),
+        )
+        .expect("payload encodes");
+        assert_eq!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_payload_leaf_root(
+                context_id,
+                EventType::GovernanceActionExecuted,
+                proposer,
+                created_at,
+                &payload,
+            ),
+            "WASM direct-execute leaf MUST be byte-identical to native's proposer-stamped \
+             reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX caller (initiator) stamp would diverge.
+        assert_ne!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_payload_leaf_root(
+                context_id,
+                EventType::GovernanceActionExecuted,
+                caller,
+                created_at,
+                &payload,
+            ),
+            "the pre-fix caller-stamped actor_did MUST diverge from the aligned proposer-stamped \
+             leaf"
+        );
+    }
+
+    /// §9.9.3 native↔WASM `ContextClosed` TTL-DEADLINE parity. A TTL-driven
+    /// close MUST stamp the CONVERGENT TTL deadline (`creation + ttl`) on the
+    /// `ContextClosed` leaf — NOT each member's local `now()` — matching native
+    /// `finalize_close`, which stamps `deadline_unix_secs` (= `creation + ttl`)
+    /// for a timer-armed context. Pins the full single-leaf root against the
+    /// native-reference leaf, with a non-vacuity control proving the PRE-FIX
+    /// `now_secs()` behavior diverged.
+    #[test]
+    fn cross_impl_context_closed_stamps_convergent_ttl_deadline_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-close-ttl-deadline";
+        let creation = 1_700_000_000_u64;
+        let ttl = 86_400_u64;
+        let convergent_deadline = creation + ttl;
+
+        let mut state = make_bare_per_context_state(context_id, "did:dht:zcreator");
+        state.test_set_creation_timestamp_secs(creation);
+        state.test_set_ttl_seconds(Some(ttl));
+        // `finalize_close` requires the `closing` state.
+        state.test_set_state("closing");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, state);
+        mgr.finalize_close(context_id)
+            .expect("real WASM finalize_close producer");
+
+        let leaves = mgr.test_context_event_log_events(context_id);
+        let close_leaf = leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextClosed)
+            .expect("ContextClosed leaf present after finalize_close");
+        assert_eq!(
+            close_leaf.timestamp, convergent_deadline,
+            "TTL-driven ContextClosed leaf MUST stamp the convergent creation+ttl deadline, \
+             NOT local now() (§9.9.3)"
+        );
+
+        // Full-leaf-bytes parity at the convergent deadline.
+        assert_eq!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_system_leaf_root(
+                context_id,
+                EventType::ContextClosed,
+                "system:close",
+                convergent_deadline,
+            ),
+            "WASM ContextClosed real-producer leaf MUST be byte-identical to native's reference \
+             leaf at the convergent TTL deadline (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX `now_secs()` timestamp would diverge from the
+        // convergent deadline (the test clock's `now` is not `creation + ttl`).
+        let local_now = crate::time::now_secs();
+        assert_ne!(
+            local_now, convergent_deadline,
+            "test precondition: local now must differ from the convergent deadline"
+        );
+        assert_ne!(
+            mgr.test_context_event_log_root(context_id),
+            native_reference_single_system_leaf_root(
+                context_id,
+                EventType::ContextClosed,
+                "system:close",
+                local_now,
+            ),
+            "the pre-fix now()-stamped close leaf MUST diverge from the convergent-deadline leaf"
+        );
+    }
+
+    /// §9.9.3 native↔WASM SYSTEM-LEAF parity. The WASM bridge's REAL producers
+    /// (`handle_ttl_expiry` → `ContextExpired`, `finalize_close` →
+    /// `ContextClosed`) MUST stamp the SAME descriptive `actor_did` sentinels
+    /// native's `ttl.rs` stamps (`"system:timer"` / `"system:close"`), at the
+    /// same convergent timestamp — so the same event produces a byte-identical
+    /// leaf hash and therefore an identical single-leaf Merkle root.
+    ///
+    /// A non-vacuity control proves the assertion bites: a leaf reconstructed
+    /// with the PRE-FIX sentinels (`""` for expiry, `"system"` for close) yields
+    /// a DIFFERENT root, i.e. the old WASM bytes diverged from native.
+    #[test]
+    fn cross_impl_system_leaf_actor_did_parity_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+
+        // ---- ContextExpired (TTL fire) ----
+        let creation = 1_700_000_000_u64;
+        let ttl = 86_400_u64;
+        let expiry_ts = creation + ttl; // the convergent deadline WASM stamps.
+
+        let expiry_ctx = "ctx-sysleaf-expiry";
+        let mut expiry_state = make_bare_per_context_state(expiry_ctx, "did:dht:zcreator");
+        expiry_state.test_set_creation_timestamp_secs(creation);
+        expiry_state.test_set_ttl_seconds(Some(ttl));
+        let mut expiry_mgr = WasmContextManager::new();
+        expiry_mgr.test_insert_context(expiry_ctx, expiry_state);
+        expiry_mgr
+            .handle_ttl_expiry(expiry_ctx)
+            .expect("real WASM ttl-expiry producer");
+
+        let expiry_leaves = expiry_mgr.test_context_event_log_events(expiry_ctx);
+        let expiry_leaf = expiry_leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextExpired)
+            .expect("ContextExpired leaf present after handle_ttl_expiry");
+        assert_eq!(
+            expiry_leaf.actor_did.as_ref(),
+            "system:timer",
+            "WASM ContextExpired leaf MUST stamp the native sentinel \"system:timer\" (§9.9.3)"
+        );
+        assert_eq!(expiry_leaf.timestamp, expiry_ts);
+
+        // The WASM real-producer root equals the native-reference single-leaf
+        // root reconstructed from the shared primitives.
+        assert_eq!(
+            expiry_mgr.test_context_event_log_root(expiry_ctx),
+            native_reference_single_system_leaf_root(
+                expiry_ctx,
+                EventType::ContextExpired,
+                "system:timer",
+                expiry_ts,
+            ),
+            "WASM ContextExpired real-producer leaf MUST be byte-identical to native's \
+             \"system:timer\" reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX empty sentinel would diverge.
+        assert_ne!(
+            expiry_mgr.test_context_event_log_root(expiry_ctx),
+            native_reference_single_system_leaf_root(
+                expiry_ctx,
+                EventType::ContextExpired,
+                "",
+                expiry_ts,
+            ),
+            "the pre-fix empty actor_did MUST diverge from the aligned \"system:timer\" leaf"
+        );
+
+        // ---- ContextClosed (finalize close) ----
+        let close_ctx = "ctx-sysleaf-close";
+        let mut close_state = make_bare_per_context_state(close_ctx, "did:dht:zcreator");
+        // `finalize_close` requires the context to be in the `closing` state.
+        close_state.test_set_state("closing");
+        let mut close_mgr = WasmContextManager::new();
+        close_mgr.test_insert_context(close_ctx, close_state);
+        close_mgr
+            .finalize_close(close_ctx)
+            .expect("real WASM finalize_close producer");
+
+        let close_leaves = close_mgr.test_context_event_log_events(close_ctx);
+        let close_leaf = close_leaves
+            .iter()
+            .find(|e| e.event_type == EventType::ContextClosed)
+            .expect("ContextClosed leaf present after finalize_close");
+        assert_eq!(
+            close_leaf.actor_did.as_ref(),
+            "system:close",
+            "WASM ContextClosed leaf MUST stamp the native sentinel \"system:close\" (§9.9.3)"
+        );
+
+        // `finalize_close` stamps `now_secs()`; pin the parity + non-vacuity at
+        // that landed timestamp (read back from the real leaf) so the leaf-byte
+        // comparison is independent of the test clock.
+        let close_ts = close_leaf.timestamp;
+        assert_eq!(
+            close_mgr.test_context_event_log_root(close_ctx),
+            native_reference_single_system_leaf_root(
+                close_ctx,
+                EventType::ContextClosed,
+                "system:close",
+                close_ts,
+            ),
+            "WASM ContextClosed real-producer leaf MUST be byte-identical to native's \
+             \"system:close\" reference leaf (§9.9.3 cross-bridge convergence)"
+        );
+        // Non-vacuity: the PRE-FIX `"system"` sentinel would diverge.
+        assert_ne!(
+            close_mgr.test_context_event_log_root(close_ctx),
+            native_reference_single_system_leaf_root(
+                close_ctx,
+                EventType::ContextClosed,
+                "system",
+                close_ts,
+            ),
+            "the pre-fix \"system\" actor_did MUST diverge from the aligned \"system:close\" leaf"
+        );
+    }
+
+    /// §9.9.3 native↔WASM `GovernanceActionExecuted` EXECUTOR-stamp parity.
+    /// Drives the REAL WASM quorum-approval handlers: a 3-member `majority`
+    /// context (quorum = 2) where the proposer's self-vote is approval #1
+    /// (Pending) and a SECOND admin's approval is #2 — crossing quorum and
+    /// committing the action. The committing member (the quorum-crossing VOTER)
+    /// — NOT the proposer — MUST be stamped as the `GovernanceActionExecuted`
+    /// leaf `actor_did` (ADR-031 §8 "executor DID" / §7.3.1 "committing member"
+    /// / ADR-051 §6). Native's `vote_on_proposal_inner` stamps the same voter;
+    /// stamping the proposer (the pre-fix behavior) would diverge the leaf.
+    #[test]
+    fn cross_impl_governance_action_executed_stamps_executor_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-executor";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // 3-member majority: quorum = 3/2 + 1 = 2. Proposer self-vote = #1
+        // (Pending); the voter's approval = #2 → crosses quorum → executes,
+        // with the VOTER as the committing member.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(proposer, "admin");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // A target action distinct from both proposer and voter keeps the
+        // leaf actor (executor) unambiguously the voter, not the target.
+        ctx.test_insert_ceiling("role:assign");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkMemberC".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        let propose_result = mgr
+            .propose_governance_action(context_id, proposer, proposal_id, &action)
+            .unwrap();
+        assert_eq!(
+            propose_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "proposer self-vote (1 of quorum 2) must leave the proposal Pending"
+        );
+
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .unwrap();
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "voter approval crosses majority quorum (2 of 2) and commits the action"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed_leaf = logged
+            .iter()
+            .find(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted leaf present after quorum-crossing approval");
+        assert_eq!(
+            executed_leaf.actor_did.as_ref(),
+            voter,
+            "the GovernanceActionExecuted leaf actor_did MUST be the quorum-crossing executor \
+             (voter), NOT the proposer (§9.9.3 native↔WASM convergence; ADR-031 §8 executor DID)"
+        );
+        assert_ne!(
+            executed_leaf.actor_did.as_ref(),
+            proposer,
+            "non-vacuity: proposer != voter, so stamping the proposer would be a distinct \
+             (divergent) leaf actor_did"
+        );
+    }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity: an eligible voter who holds
+    /// `governance:vote` but LACKS the action capability (`role:assign`, here
+    /// suspended) crosses quorum and the action executes, minting EXACTLY ONE
+    /// `GovernanceActionExecuted` leaf with the voter as actor.
+    ///
+    /// This is the exact regression the per-member execute-time capability check
+    /// caused: native `execute_governance_action` performs NO per-member action
+    /// check (only status / context-id / replay / commit-fault), so native mints
+    /// one leaf. WASM previously gated on
+    /// `member_has_capability(voter, role:assign)` at execute, which a
+    /// vote-eligible-but-action-suspended voter fails — minting zero where native
+    /// mints one. `ChangeRole` has NO native per-action ceiling gate, so removing
+    /// the per-member check converges the decision: both mint exactly one leaf.
+    #[test]
+    fn cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::{DID, EventType};
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-vote-only-voter";
+        let proposer = "did:dht:z6MkProposer";
+        let voter = "did:dht:z6MkVoter";
+
+        // 3-member majority: quorum = 3/2 + 1 = 2. Proposer self-vote = #1
+        // (Pending); the voter's approval = #2 → crosses quorum → executes.
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_set_governance("majority");
+        ctx.test_insert_member(proposer, "admin");
+        ctx.test_insert_member(voter, "admin");
+        ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        ctx.test_insert_ceiling("role:assign");
+        // The voter is an ELIGIBLE VOTER (governance:vote intact) but LACKS the
+        // action capability: `role:assign` is suspended for them. The pre-fix
+        // per-member execute check tested exactly `member_has_capability(voter,
+        // role:assign)`, which now returns false (suspension is checked first),
+        // so it would have rejected and minted 0 leaves. `governance:vote` is
+        // NOT suspended, so voting still succeeds.
+        ctx.test_insert_suspended_capability(voter, "role:assign");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let proposal_id = "deadbeef";
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkMemberC".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+
+        mgr.propose_governance_action(context_id, proposer, proposal_id, &action)
+            .expect("propose by an admin proposer with governance:propose succeeds");
+
+        let approve_result = mgr
+            .approve_governance_proposal(context_id, proposal_id, voter)
+            .expect("vote-eligible voter (governance:vote intact) crosses quorum and commits");
+        assert_eq!(
+            approve_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "voter approval crosses majority quorum (2 of 2) and commits the action"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed: Vec<_> = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .collect();
+        assert_eq!(
+            executed.len(),
+            1,
+            "a vote-eligible voter lacking the action capability MUST still mint EXACTLY ONE \
+             GovernanceActionExecuted leaf — identical to native, which has no per-member \
+             execute-time check (§9.9.3; ADR-031 §8)"
+        );
+        assert_eq!(
+            executed[0].actor_did.as_ref(),
+            voter,
+            "the single GovernanceActionExecuted leaf actor_did is the quorum-crossing voter \
+             (executor), matching native"
+        );
+    }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity: a governance action whose
+    /// required capability is NOT in the context ceiling is rejected IDENTICALLY
+    /// on both bridges — no `GovernanceActionExecuted` leaf is minted.
+    ///
+    /// `RevokeAccess` is gated on `member:ban` in native's `execute_revoke`
+    /// (`governance_helpers.rs`) via `ceiling.contains(&Capability::MemberBan)`.
+    /// `member:ban` is absent from the default ceiling, so native rejects when it
+    /// is not explicitly added. WASM now mirrors this with a per-action
+    /// CONTEXT-CEILING gate in `dispatch_governance_action`, so both reject and
+    /// neither mints a leaf.
+    #[test]
+    fn cross_impl_out_of_ceiling_action_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::DID;
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+        let context_id = "ctx-gov-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+        let target = "did:dht:z6MkTarget";
+
+        // SingleAdmin governance (quorum 0): the admin proposer auto-executes on
+        // propose, so the dispatch ceiling gate fires synchronously and the
+        // propose call surfaces the rejection.
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_member(target, "member");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "member:ban" into the ceiling — this is the
+        // out-of-ceiling condition. Native's `execute_revoke` rejects the same
+        // way (`ceiling.contains(&Capability::MemberBan)` is false).
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action = GovernanceAction::RevokeAccess {
+            did: DID::from(target.to_owned()),
+            access: AccessScope::Both,
+        };
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafebabe", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected — \
+             identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling action MUST mint ZERO GovernanceActionExecuted leaves on \
+             both bridges"
+        );
+    }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
+    ///
+    /// Native gates `CreateChildContext` on `Capability::ChildContextCreate` in
+    /// `execute_create_child_context` (`governance_helpers.rs`) via
+    /// `ceiling.contains(&Capability::ChildContextCreate)`. The capability is
+    /// absent from the default ceiling, so an out-of-ceiling proposal is
+    /// rejected and mints ZERO leaves. WASM previously returned `None` (ungated)
+    /// for this action — executing it where native rejected — a §9.9.3
+    /// divergence AND a security gap (running an action outside the ceiling).
+    /// WASM now mirrors native: `dispatch_ceiling_capability` returns
+    /// `Some("context_child:create")` (the `ucan_capability_name()` form that
+    /// `ceiling_strings` stores).
+    #[test]
+    fn cross_impl_out_of_ceiling_create_child_context_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-child-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "context_child:create" — the out-of-ceiling
+        // condition. Native's `execute_create_child_context` rejects the same way.
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // Shape mirrors the dispatch-roundtrip fixture in manager.rs tests.
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "CreateChildContext": {"params": {
+                "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+                "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+                "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+                "template_id": null
+            }}
+        }))
+        .expect("CreateChildContext action deserializes");
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling CreateChildContext (context_child:create not in ceiling) MUST be \
+             rejected — identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling CreateChildContext MUST mint ZERO GovernanceActionExecuted \
+             leaves on both bridges"
+        );
+    }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity for `CreateChildContext`: with
+    /// `context_child:create` IN the ceiling, the single-admin propose auto-
+    /// executes and mints EXACTLY ONE `GovernanceActionExecuted` leaf — matching
+    /// native, whose `execute_create_child_context` ceiling check passes.
+    #[test]
+    fn cross_impl_in_ceiling_create_child_context_executes_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-child-in-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // In-ceiling: the UCAN-format string `ceiling_strings` stores for
+        // `ChildContextCreate` (`Capability::ucan_capability_name()`).
+        ctx.test_insert_ceiling("context_child:create");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "CreateChildContext": {"params": {
+                "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
+                "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+                "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
+                "template_id": null
+            }}
+        }))
+        .expect("CreateChildContext action deserializes");
+
+        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
+            .expect("in-ceiling CreateChildContext auto-executes on single-admin propose");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 1,
+            "an in-ceiling CreateChildContext MUST mint EXACTLY ONE GovernanceActionExecuted leaf \
+             — identical to native (§9.9.3; ADR-031 §8)"
+        );
+    }
+
+    /// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
+    ///
+    /// Native gates this on `Capability::ToolInterface` in
+    /// `execute_establish_tool_interface` (`governance_helpers.rs`) via
+    /// `ceiling.contains(&Capability::ToolInterface)`. Absent from the default
+    /// ceiling, so an out-of-ceiling proposal is rejected and mints ZERO leaves.
+    /// WASM previously returned `None` (ungated) — the same divergence/security
+    /// gap as `CreateChildContext`. WASM now returns `Some("tool:interface")`.
+    #[test]
+    fn cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-iface-out-of-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // Deliberately DO NOT insert "tool:interface" — the out-of-ceiling
+        // condition. Native's `execute_establish_tool_interface` rejects likewise.
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "EstablishToolInterface": {"interface": {
+                "source_context": "ctx-src", "target_context": "ctx-tgt",
+                "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+                "approved_by_source": false, "approved_by_target": false,
+                "outbound_policy": null, "inbound_policy": null
+            }}
+        }))
+        .expect("EstablishToolInterface action deserializes");
+
+        let result = mgr.propose_governance_action(context_id, admin, "cafef00d", &action);
+        assert!(
+            result.is_err(),
+            "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
+             rejected — identical to native's per-action ceiling gate (§9.9.3; ADR-031 §8)"
+        );
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 0,
+            "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO \
+             GovernanceActionExecuted leaves on both bridges"
+        );
+    }
+
+    /// §9.9.3 native↔WASM ACCEPT-decision parity for `EstablishToolInterface`:
+    /// with `tool:interface` IN the ceiling, the single-admin propose auto-
+    /// executes and mints EXACTLY ONE `GovernanceActionExecuted` leaf — matching
+    /// native, whose `execute_establish_tool_interface` ceiling check passes.
+    #[test]
+    fn cross_impl_in_ceiling_establish_tool_interface_executes_wasm() {
+        use crate::manager::{WasmContextManager, make_bare_per_context_state};
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let context_id = "ctx-gov-iface-in-ceiling";
+        let admin = "did:dht:z6MkAdmin";
+
+        let mut ctx = make_bare_per_context_state(context_id, admin);
+        ctx.test_set_governance("single_admin");
+        ctx.test_insert_member(admin, "admin");
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        // In-ceiling: `Capability::ToolInterface` is 2-segment, so its
+        // `ucan_capability_name()` form equals its `name()` form: "tool:interface".
+        ctx.test_insert_ceiling("tool:interface");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let action: GovernanceAction = serde_json::from_value(serde_json::json!({
+            "EstablishToolInterface": {"interface": {
+                "source_context": "ctx-src", "target_context": "ctx-tgt",
+                "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+                "approved_by_source": false, "approved_by_target": false,
+                "outbound_policy": null, "inbound_policy": null
+            }}
+        }))
+        .expect("EstablishToolInterface action deserializes");
+
+        mgr.propose_governance_action(context_id, admin, "cafef00d", &action)
+            .expect("in-ceiling EstablishToolInterface auto-executes on single-admin propose");
+
+        let logged = mgr.test_context_event_log_events(context_id);
+        let executed = logged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed, 1,
+            "an in-ceiling EstablishToolInterface MUST mint EXACTLY ONE GovernanceActionExecuted \
+             leaf — identical to native (§9.9.3; ADR-031 §8)"
+        );
     }
 }
