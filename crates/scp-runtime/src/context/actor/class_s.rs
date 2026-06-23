@@ -3841,13 +3841,19 @@ mod tests {
     /// chasing every alias-impl spelling) keeps the guard CHEAP and CONVERGENT — it
     /// is NOT an attempt to out-spell a determined adversary (the compile boundary
     /// is the real guarantee; see this test's doc). Matches `type` + ws + an
-    /// identifier + ws? + `=` + ws? + `ClassSCell` word-bounded (so `ClassSCellFoo`
-    /// is not matched), tolerating any `=`/whitespace spacing.
+    /// identifier + ws? + `=` + ws? + a type-path whose FINAL `::`-separated segment
+    /// is `ClassSCell` word-bounded (so the bare `type X = ClassSCell;` AND the
+    /// path-qualified `type X = crate::context::actor::class_s::ClassSCell;` both
+    /// trip, while `ClassSCellFoo` does not), tolerating any `=`/whitespace spacing
+    /// and an optional leading `::` (absolute path).
     ///
-    /// ACCEPTED RESIDUAL (ADR-049 §9): this catches the `type … = ClassSCell;`
-    /// alias form but NOT a `use …::ClassSCell as Alias;` import rename (nor a
-    /// generic-parameter binding), which would also let `impl Alias { … }` evade the
-    /// literal-`ClassSCell` impl-block scan. That is deliberately UN-chased: the real
+    /// ACCEPTED RESIDUAL (ADR-049 §9): this catches the `type … = ClassSCell;` alias
+    /// form (bare OR path-qualified) but NOT a `use …::ClassSCell as Alias;` import
+    /// rename (nor a generic-parameter binding), which would also let `impl Alias { … }`
+    /// evade the literal-`ClassSCell` impl-block scan. That is deliberately UN-chased:
+    /// the path-qualified RHS is the one convergent extra spelling an HONEST
+    /// contributor would reach for; out-spelling import renames or generic bindings
+    /// would be a non-convergent denylist. The real
     /// barrier is that `ClassSCell.state` is a PRIVATE field, so ANY aliased `impl`
     /// — under any spelling — only compiles IN THIS MODULE, i.e. the attacker is
     /// already editing this file (an in-file-insider, the same threat class as
@@ -3914,14 +3920,59 @@ mod tests {
             while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
                 pos += 1;
             }
-            // The aliased type must be exactly `ClassSCell`, word-bounded.
-            if !code[pos..].starts_with("ClassSCell") {
+            // The aliased type's FINAL path segment must be exactly `ClassSCell`,
+            // word-bounded. Walk a `seg (:: seg)*` path so a PATH-QUALIFIED RHS
+            // (`type Evil = crate::context::actor::class_s::ClassSCell;`) is caught
+            // as well as the bare `type Evil = ClassSCell;` — both let an
+            // `impl <Alias>` block reach the privatized Class-S fields through a
+            // header the literal-`ClassSCell` impl-block scan can't see. An optional
+            // leading `::` (absolute path) is tolerated. This stays a CHEAP,
+            // CONVERGENT honest-contributor speed-bump for the path-qualified case
+            // ONLY — it does NOT chase `use … as Alias;` import renames or generic
+            // bindings (the private `ClassSCell.state` field + the module boundary is
+            // the real barrier; see this fn's doc).
+            if code[pos..].starts_with("::") {
+                pos += 2;
+                while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+            }
+            // Walk path segments, tracking the byte span of the LAST one.
+            let mut last_seg_start = pos;
+            let mut last_seg_end = pos;
+            loop {
+                let seg_start = pos;
+                while pos < bytes.len() && is_ident(bytes[pos]) {
+                    pos += 1;
+                }
+                if pos == seg_start {
+                    // No identifier where a path segment was required — not a
+                    // type-path RHS (e.g. `type Bytes = [u8; 32];`).
+                    break;
+                }
+                last_seg_start = seg_start;
+                last_seg_end = pos;
+                // Look past whitespace for a `::` path separator.
+                let mut peek = pos;
+                while peek < bytes.len() && bytes[peek].is_ascii_whitespace() {
+                    peek += 1;
+                }
+                if code[peek..].starts_with("::") {
+                    pos = peek + 2;
+                    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            // The final segment must be exactly `ClassSCell` (word-bounded by the
+            // ident-run scan above — `ClassSCellFoo` is a single longer segment that
+            // will not equal `ClassSCell`).
+            if &code[last_seg_start..last_seg_end] != "ClassSCell" {
                 continue;
             }
-            let after = pos + "ClassSCell".len();
-            if after < bytes.len() && is_ident(bytes[after]) {
-                continue; // `ClassSCellFoo` — not an alias of `ClassSCell`.
-            }
+            let after = last_seg_end;
             // Report the whole logical line for the failure message.
             let line_start = code[..kw_at].rfind('\n').map_or(0, |i| i + 1);
             let line_end = code[after..].find('\n').map_or(code.len(), |i| after + i);
@@ -4714,9 +4765,41 @@ impl ClassSCell
         // A generic alias `type C<T> = ClassSCell;` (degenerate but parse-safe).
         assert!(class_s_cell_alias(&code_only("type C<T> = ClassSCell;")).is_some());
 
+        // A PATH-QUALIFIED RHS whose final segment is `ClassSCell` also trips — the
+        // canonical honest-contributor spelling the bare-name match alone would miss
+        // (the `impl <Alias>` it enables would equally evade the literal-`ClassSCell`
+        // impl-block scan).
+        assert!(
+            class_s_cell_alias(&code_only(
+                "type Evil = crate::context::actor::class_s::ClassSCell;"
+            ))
+            .is_some(),
+            "a path-qualified alias of `ClassSCell` must be detected (F3)"
+        );
+        // An absolute-path (`::`-prefixed) qualification trips too.
+        assert!(
+            class_s_cell_alias(&code_only(
+                "type Evil = ::crate::actor::class_s::ClassSCell;"
+            ))
+            .is_some(),
+            "a leading-`::` path-qualified alias must be detected"
+        );
+
         // NOT an alias of ClassSCell: a different aliased type, a prefix collision,
         // and an unrelated `type` item must all be ignored (no false positive).
         assert!(class_s_cell_alias(&code_only("type Other = PerContextState;")).is_none());
+        // A path-qualified RHS whose final segment is an UNRELATED type must NOT trip
+        // — the match keys on the final segment, not on any `ClassSCell` in the path.
+        assert!(
+            class_s_cell_alias(&code_only("type Ok = crate::foo::PerContextState;")).is_none(),
+            "a path-qualified alias of an unrelated type must not false-positive"
+        );
+        // A path-qualified RHS whose final segment is a `ClassSCell` PREFIX collision
+        // stays word-bounded (the final segment is `ClassSCellFoo`, not `ClassSCell`).
+        assert!(
+            class_s_cell_alias(&code_only("type Foo = crate::class_s::ClassSCellFoo;")).is_none(),
+            "the final-segment match must be word-bounded even when path-qualified"
+        );
         assert!(
             class_s_cell_alias(&code_only("type Foo = ClassSCellFoo;")).is_none(),
             "the aliased-type match must be word-bounded (no `ClassSCellFoo` match)"
@@ -4923,8 +5006,22 @@ impl ClassSCell
         }
     }
 
-    /// Assemble an `ActorDeps` with the supplied persistence backend.
+    /// Assemble an `ActorDeps` with the supplied persistence backend (and the
+    /// minimal `TestEventLog`, whose entry reads are empty).
     async fn build_deps(persistence: Box<dyn ContextPersistence>) -> ActorDeps {
+        build_deps_with_event_log(persistence, Box::new(TestEventLog)).await
+    }
+
+    /// Assemble an `ActorDeps` with the supplied persistence backend AND a custom
+    /// event-log provider — used by the paid-send-with-suspension test, which seeds
+    /// a `GovernanceAction` into a real [`MerkleEventLogProvider`] so the
+    /// consequence engine reads convergent `WarningCount` evidence (Source 1 of
+    /// `event_log_entries_for_consequences`; the receive buffer never sources
+    /// governance events).
+    async fn build_deps_with_event_log(
+        persistence: Box<dyn ContextPersistence>,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
@@ -4932,8 +5029,6 @@ impl ClassSCell
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(TestEventLog);
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -5183,6 +5278,84 @@ impl ClassSCell
         token.subsume(&ctx_hex(0x68));
     }
 
+    /// ADR-049 §9 (RED-CS3) — `note_downward_auth` is IDEMPOTENT and a NO-OP when
+    /// no GROW occurred: a consequence cascade owes EXACTLY ONE fail-closed persist
+    /// regardless of how many downward-auth GROWs it applies (the single
+    /// cell-boundary `commit` makes the whole in-memory state durable), and a
+    /// cascade that applied no GROW arms no obligation at all (the hot path stays
+    /// coalesced).
+    ///
+    /// This drives the central sink invariant directly on the constructor the GROW
+    /// methods funnel through, so it is covered independently of any one GROW
+    /// caller:
+    /// - Two successive `note_downward_auth(&mut sink, true, ctx)` calls leave
+    ///   EXACTLY ONE token. The first arms the sink (`is_none() → is_some()`); the
+    ///   second is a no-op because `sink.is_some()` — it does NOT replace or stack a
+    ///   second obligation. We confirm exactly-one by discharging the single armed
+    ///   token through the real fail-closed `commit` under a `SpyPersistence` and
+    ///   asserting the spy saw EXACTLY ONE persist (a duplicated/stacked obligation
+    ///   would surface as a leaked second token tripping the `Drop` guard, or, were
+    ///   it committed too, a second persist).
+    /// - `note_downward_auth(&mut sink, false, ctx)` against a `None` sink is a
+    ///   no-op: `sink.is_none()` stays true, no token is armed, nothing to discharge.
+    #[tokio::test]
+    async fn note_downward_auth_is_idempotent_and_noops_without_grow() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let cell = ClassSCell::new(fresh_state(0x69));
+        let ctx = ctx_hex(0x69);
+
+        // No GROW (did_grow == false) against an empty sink: stays empty, arms
+        // nothing — the coalesced persist suffices, no fail-closed obligation owed.
+        let mut sink: Option<ClassSCommitToken> = None;
+        ClassSCommitToken::note_downward_auth(&mut sink, false, &ctx);
+        assert!(
+            sink.is_none(),
+            "no GROW must arm no obligation (hot path stays coalesced)"
+        );
+
+        // First GROW arms the single obligation.
+        ClassSCommitToken::note_downward_auth(&mut sink, true, &ctx);
+        assert!(
+            sink.is_some(),
+            "the first downward-auth GROW arms the fail-closed obligation sink"
+        );
+
+        // Second GROW in the SAME cascade is a no-op (`sink.is_some()`): one cascade
+        // owes one persist, so the existing token is reused, not duplicated.
+        ClassSCommitToken::note_downward_auth(&mut sink, true, &ctx);
+        assert!(
+            sink.is_some(),
+            "a second GROW in the same cascade reuses the armed token (idempotent)"
+        );
+
+        // A later `false` call must not clear or replace the armed obligation either.
+        ClassSCommitToken::note_downward_auth(&mut sink, false, &ctx);
+
+        // EXACTLY ONE owed persist: discharge the single token and confirm the spy
+        // saw exactly one fail-closed persist. (A stacked second obligation would
+        // either leak a token — tripping the `Drop` guard at end of scope — or, if
+        // also committed, bump this count past one.)
+        let token = sink
+            .take()
+            .expect("the cascade armed exactly one obligation");
+        token
+            .commit(&cell, &deps, &ctx)
+            .expect("the single armed obligation commits fail-closed (SpyPersistence Ok)");
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "a coalesced cascade owes EXACTLY ONE fail-closed persist, no double-arm"
+        );
+        assert!(
+            sink.is_none(),
+            "the sink is emptied by `take` — no residual obligation to drop"
+        );
+    }
+
     /// `discharge_with` on the ABORT path — `f` returns `Err` — STILL discharges
     /// the Drop obligation (keep-direction: the persist runs regardless of `f`'s
     /// result, so the token is consumed). The test would PANIC in the `Drop`
@@ -5341,6 +5514,156 @@ impl ClassSCell
                 .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
             "keep-direction: the auto-suspension stays in memory through a persist \
              failure, so the denied capability is not silently re-granted (RED-CS3)"
+        );
+    }
+
+    /// ADR-049 §9 (RED-CS3) — a PAID send (one that burns a spending nonce, minting
+    /// the deferred nonce [`ClassSCommitToken`]) that ALSO trips a downward-auth
+    /// consequence suspension persists the WHOLE Class-S state — the burned nonce
+    /// AND the new suspension — under EXACTLY ONE fail-closed persist, and that
+    /// persist is fail-closed (not a silent coalesced ack).
+    ///
+    /// This drives the PRODUCTION `finalize_send` end-to-end on the paid branch,
+    /// exercising the seam Item 2 targets:
+    /// - `finalize_send` evaluates this send's consequence rules. A
+    ///   `SuspendCapability` `WarningCount` rule against the sender (seeded as a
+    ///   `GovernanceAction` leaf in a real [`MerkleEventLogProvider`] — the
+    ///   convergent Source-1 evidence the receive buffer never supplies) fires and
+    ///   ARMS the `downward_auth_sink` from inside the GROW (GAP-A coupled).
+    /// - The reconcile match (`(downward_auth_sink, token.is_some())`) sees the PAID
+    ///   token, so it `subsume`s the redundant sink token (consuming it WITHOUT a
+    ///   second persist — NOT a drop, NOT a `mem::forget`) and threads `None` as the
+    ///   separate obligation into `persist_finalized_send`.
+    /// - `persist_finalized_send`'s paid arm then commits the SINGLE nonce token
+    ///   fail-closed: under `FailPersistence` it surfaces `PersistenceFailed` rather
+    ///   than acking silently, and the suspension stays applied in memory
+    ///   (keep-direction).
+    ///
+    /// The single nonce `commit` is the ONLY persist owed: the paid branch mints no
+    /// second obligation, and the `subsume` discharges the redundant armed sink — so
+    /// no double-commit and no lost obligation. (A leaked sink token would trip the
+    /// `Drop` guard inside `finalize_send`; reaching the `PersistenceFailed`
+    /// assertion proves the reconcile consumed it cleanly.)
+    ///
+    /// END-TO-END SCOPE: this drives the real `finalize_send` → consequence
+    /// enforcement → GROW-arming → reconcile/`subsume` → paid-branch fail-closed
+    /// `commit`. The ONE element it does not drive through production wiring is the
+    /// nonce BURN itself: minting the deferred nonce token directly
+    /// (`ClassSCommitToken::new_for_test`) is exactly how the existing production
+    /// `finalize_send` send-path tests model a paid send (the burn lives upstream in
+    /// `enforce_send_economy`, a separate seam with its own coverage), so the paid
+    /// branch is exercised with a faithful stand-in for the burned-nonce obligation.
+    #[tokio::test]
+    async fn paid_send_with_suspension_owes_single_fail_closed_persist() {
+        use crate::context::builder::ContextEventLogProvider;
+        use scp_protocol::context::roles::Capability;
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+
+        let event_log = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        let ctx_byte = 0x73u8;
+        let ctx = ctx_hex(ctx_byte);
+        // The event-log key the consequence reader derives from the context-id
+        // STRING is `SHA-256(context_id)` (NOT the raw bytes), so the seeded
+        // governance leaf must be stored under that same hashed key to be visible to
+        // `event_log_entries_for_consequences`.
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let sender = DID("did:example:paid-suspend-sender".to_owned());
+
+        // Seed a convergent `WarningCount` evidence leaf: a `GovernanceAction`
+        // whose actor is SOMEONE ELSE and whose payload `target_did` is the sender
+        // (the `matches_trigger(WarningCount, …)` shape). This MUST come from the
+        // durable log (Source 1) — `merge_consequence_events` deliberately omits
+        // governance events from the receive buffer to preserve durable-leaf
+        // convergence.
+        event_log
+            .init_event_log(&ctx_id_bytes)
+            .expect("init event log");
+        let warning_payload = scp_event_log::EventPayload {
+            data: serde_json::to_vec(&serde_json::json!({ "target_did": sender.as_ref() }))
+                .expect("serialize warning payload"),
+        };
+        event_log
+            .append_event(
+                &ctx_id_bytes,
+                scp_event_log::EventType::GovernanceAction,
+                "did:example:warning-issuer",
+                warning_payload,
+                1_700_000_050,
+            )
+            .expect("seed governance warning leaf");
+
+        // FailPersistence ⇒ the single nonce-token commit must surface the §9
+        // durability error (not a silent coalesced ack).
+        let deps = build_deps_with_event_log(Box::new(FailPersistence), Box::new(event_log)).await;
+        let mut cell = ClassSCell::new(fresh_state(ctx_byte));
+
+        // The send path requires an ACTIVE context (else `finalize_send` takes the
+        // TTL-inactive early return and never runs consequence enforcement).
+        cell.class_c_view()
+            .handle_mut()
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+
+        // The sender must be a present member for the suspension GROW to apply.
+        cell.class_c_view().membership_class_c_mut().add_member(
+            sender.clone(),
+            "member".to_owned(),
+            Vec::new(),
+        );
+
+        // Configure the consequence rule this send will evaluate: a
+        // `SuspendCapability` (threshold 1) keyed on `WarningCount`.
+        {
+            let mut view = cell.class_c_view();
+            *view.governance_class_c_mut().consequence_rules_mut() = vec![ConsequenceRule {
+                trigger: ConsequenceTrigger::WarningCount,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                    capabilities: vec![Capability::MessagesWrite],
+                }),
+                threshold: 1,
+                window: std::time::Duration::from_hours(1),
+            }];
+        }
+
+        // Drive the PRODUCTION paid send. `Some(nonce_token)` models the burned
+        // spending-nonce obligation (the exact stand-in the production send-path
+        // fail-closed tests use). `signing_key = None` skips checkpoint creation;
+        // the consequence path runs regardless.
+        let paid = crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"paid-with-suspension",
+            None,
+            Some(ClassSCommitToken::new_for_test(&ctx)),
+            /* is_broadcast = */ false,
+        );
+
+        // The single nonce-token commit covers BOTH the burned nonce and the armed
+        // suspension; under FailPersistence it surfaces the §9 durability error
+        // (the redundant sink token was `subsume`d, leaving exactly one obligation —
+        // a leaked sink would have tripped the Drop guard before we got here).
+        assert!(
+            matches!(paid, Err(ContextError::PersistenceFailed(_))),
+            "a paid send that also armed a downward-auth suspension must persist \
+             fail-closed through the single nonce token (not a silent ack): {paid:?}"
+        );
+
+        // KEEP-direction: the suspension applied during the send stays in memory
+        // through the failed persist — the denied capability is not silently
+        // re-granted on a coalesce-window crash.
+        assert!(
+            cell.role_state
+                .suspended_for(sender.as_ref())
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+            "keep-direction: the consequence suspension armed during the paid send \
+             is retained in memory even when the fail-closed persist fails (RED-CS3)"
         );
     }
 
