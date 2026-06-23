@@ -299,6 +299,38 @@ export type UcanFailureCategory =
   | "unknown";
 
 /**
+ * Extracts the first declared capability URI from a UCAN JWT's (unverified)
+ * payload, for use as the `capability` argument to `scp.ucanValidate`.
+ *
+ * UCAN tokens are `header.payload.signature` triples; the base64url payload
+ * declares granted capabilities in `att[0].with` (the full
+ * `scp:ctx:{id}/{resource}:{action}` URI minted by the bridge). Reading the
+ * unverified payload here is safe: `scp.ucanValidate` performs the actual
+ * cryptographic verification — this only selects which URI to validate
+ * against. (`"*"` is NOT a valid `CapabilityUri`; the bridge rejects it with
+ * `InvalidCapabilityUri`, which would make Layer 1 unconditionally all-false.)
+ *
+ * @returns the capability URI, or `null` if the token is malformed or declares
+ *   no capabilities (both are treated as a fail-closed all-false verdict).
+ * @internal Exported for unit tests.
+ */
+export function __extractCapabilityUri(token: string): string | null {
+  let capUri: string;
+  try {
+    const payloadSegment = token.split(".")[1];
+    if (payloadSegment === undefined) return null;
+    const rawPayload = JSON.parse(Buffer.from(payloadSegment, "base64url").toString("utf8")) as {
+      att?: readonly { with?: string }[];
+    };
+    const att = Array.isArray(rawPayload?.att) ? rawPayload.att : [];
+    capUri = typeof att[0]?.with === "string" ? att[0].with : "";
+  } catch {
+    return null;
+  }
+  return capUri === "" ? null : capUri;
+}
+
+/**
  * Extracts the core `UcanError` Display text from a bridge error message.
  *
  * The Rust bridge formats UCAN errors as:
@@ -394,6 +426,86 @@ export const __PASSED_BEFORE: Readonly<Record<UcanFailureCategory, ReadonlySet<s
 // Public API
 // ---------------------------------------------------------------------------
 
+const ALL_LAYER1_FIELDS_FALSE: CapabilityValidation = {
+  tokensValid: false,
+  signaturesValid: false,
+  withinCeiling: false,
+  nonceValid: false,
+  notRevoked: false,
+  timeBoundsValid: false,
+};
+
+/**
+ * Runs Layer 1 (protocol enforcement) over the supplied capability tokens.
+ *
+ * Each token is validated against its OWN declared capability URI (see
+ * `__extractCapabilityUri`). The result starts optimistic (all fields `true`)
+ * and is narrowed by the first failure: the failing UCAN pipeline stage is
+ * classified (`__classifyUcanError`) and only the stages known to have passed
+ * before it (`__PASSED_BEFORE`) stay `true`. A malformed / no-capability token
+ * is fail-closed (all-false) and never reaches the bridge.
+ *
+ * Non-UCAN errors (anything without an `[SCP-PERM-NNNN]` prefix) and
+ * handle-affinity misuse (`[SCP-PERM-3030]`) propagate to the caller rather
+ * than being absorbed into a false verdict.
+ */
+async function evaluateLayer1(
+  scp: SCP,
+  handle: unknown,
+  capabilityTokens: readonly string[] | undefined,
+): Promise<CapabilityValidation> {
+  if (capabilityTokens === undefined || capabilityTokens.length === 0) {
+    return { ...ALL_LAYER1_FIELDS_FALSE };
+  }
+
+  // Start optimistic: assume all pass until a failure proves otherwise.
+  const result: CapabilityValidation = {
+    tokensValid: true,
+    signaturesValid: true,
+    withinCeiling: true,
+    nonceValid: true,
+    notRevoked: true,
+    timeBoundsValid: true,
+  };
+
+  for (const token of capabilityTokens) {
+    const capUri = __extractCapabilityUri(token);
+    if (capUri === null) {
+      // Malformed token or one that declares no capabilities: structurally
+      // invalid / grants nothing. Fail-closed; the bridge is not called.
+      return { ...ALL_LAYER1_FIELDS_FALSE };
+    }
+    try {
+      await scp.ucanValidate(handle, token, capUri);
+    } catch (error) {
+      // `scp.ucanValidate` routes through `mapBridgeError`, so this is a typed
+      // `ScpError` whose message preserves the original `[SCP-PERM-NNNN]` code
+      // prefix verbatim. We classify on that prefix (rather than `instanceof`)
+      // to mirror the Python port's code-based dispatch and stay robust to the
+      // exact subclass. Any non-UCAN error is a genuine fault and propagates.
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!/^\[SCP-PERM-\d+\]/.test(msg)) {
+        throw error;
+      }
+      // Re-raise handle-affinity errors — these are caller misuse, not UCAN
+      // failures.
+      if (/^\[SCP-PERM-3030\]/.test(msg)) {
+        throw error;
+      }
+      const passed = __PASSED_BEFORE[__classifyUcanError(msg)];
+      result.tokensValid = passed.has("tokensValid");
+      result.signaturesValid = passed.has("signaturesValid");
+      result.withinCeiling = passed.has("withinCeiling");
+      result.nonceValid = passed.has("nonceValid");
+      result.notRevoked = passed.has("notRevoked");
+      result.timeBoundsValid = passed.has("timeBoundsValid");
+      return result;
+    }
+  }
+
+  return result;
+}
+
 /**
  * Evaluates the trustworthiness of a participant in a context.
  *
@@ -430,57 +542,8 @@ export async function evaluateTrust(
   const handle = context._rawHandle;
   const contextId = context.contextId;
 
-  // Layer 1: validate capability tokens if provided.
-  const capabilityValidation: CapabilityValidation = {
-    tokensValid: false,
-    signaturesValid: false,
-    withinCeiling: false,
-    nonceValid: false,
-    notRevoked: false,
-    timeBoundsValid: false,
-  };
-
-  if (capabilityTokens !== undefined && capabilityTokens.length > 0) {
-    // Start optimistic: assume all pass until a failure proves otherwise.
-    capabilityValidation.tokensValid = true;
-    capabilityValidation.signaturesValid = true;
-    capabilityValidation.withinCeiling = true;
-    capabilityValidation.nonceValid = true;
-    capabilityValidation.notRevoked = true;
-    capabilityValidation.timeBoundsValid = true;
-
-    for (const token of capabilityTokens) {
-      try {
-        await scp.ucanValidate(handle, token, "*");
-      } catch (error) {
-        // Only UCAN-permission failures are classified into the Layer 1
-        // fields. Any other error (e.g. validation/transport) is a genuine
-        // fault and must propagate to the caller — matching the Python port,
-        // which catches only `bridge.UcanError`.
-        //
-        // `scp.ucanValidate` routes through `mapBridgeError`, so this is a
-        // typed `ScpError` whose message preserves the original
-        // `[SCP-PERM-NNNN]` code prefix verbatim. We classify on that prefix
-        // (rather than `instanceof`) to mirror the Python port's code-based
-        // dispatch and stay robust to the exact subclass.
-        const msg = error instanceof Error ? error.message : String(error);
-        if (!/^\[SCP-PERM-\d+\]/.test(msg)) {
-          throw error;
-        }
-        // Re-raise handle-affinity errors — these are caller misuse, not UCAN failures.
-        if (/^\[SCP-PERM-3030\]/.test(msg)) throw error;
-        const failed = __classifyUcanError(msg);
-        const passed = __PASSED_BEFORE[failed];
-        capabilityValidation.tokensValid = passed.has("tokensValid");
-        capabilityValidation.signaturesValid = passed.has("signaturesValid");
-        capabilityValidation.withinCeiling = passed.has("withinCeiling");
-        capabilityValidation.nonceValid = passed.has("nonceValid");
-        capabilityValidation.notRevoked = passed.has("notRevoked");
-        capabilityValidation.timeBoundsValid = passed.has("timeBoundsValid");
-        break;
-      }
-    }
-  }
+  // Layer 1: validate capability tokens (if any) against the context handle.
+  const capabilityValidation = await evaluateLayer1(scp, handle, capabilityTokens);
 
   // Layer 2: query behavioral record from the event log.
   let behavioralRecord: BehavioralRecord | null = null;
