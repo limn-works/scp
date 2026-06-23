@@ -21,7 +21,7 @@ from scp_sdk.errors import ScpError
 
 
 class ResolutionPathDict(TypedDict):
-    """Structured metadata recording which layer resolved an address (§22.7)."""
+    """Structured metadata recording which layer resolved an address (§22.11.3)."""
 
     layer: Literal["Petname", "HandleRegistry", "Attestation", "Domain", "MultiLayerCorroborated"]
     """The resolution layer (§22.11.3 ``ResolutionLayer``).
@@ -37,10 +37,10 @@ class ResolutionPathDict(TypedDict):
 
 
 class TrustLevelDict(TypedDict):
-    """Trust level of a discovery result (§22.7).
+    """Trust level of a discovery result (§22.11.3).
 
     The ``kind`` field discriminates among the six trust-level variants
-    defined by §22.7, matching the TypeScript ``TrustLevel`` discriminated union.
+    defined by §22.11.3, matching the TypeScript ``TrustLevel`` discriminated union.
     """
 
     kind: Literal[
@@ -76,9 +76,9 @@ class DiscoveryResult(TypedDict):
     metadata_summary:
         Human-readable summary, or ``None`` if unavailable.
     trust_level:
-        Trust level of this result (§22.7).
+        Trust level of this result (§22.11.3).
     resolution_path:
-        Which resolution layer produced this result (§22.7).
+        Which resolution layer produced this result (§22.11.3).
     """
 
     context_id: str
