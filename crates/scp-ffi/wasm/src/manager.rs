@@ -3063,9 +3063,11 @@ impl WasmContextManager {
     /// - Propose auto-execute (`SingleAdmin`) path: `initiator_did ==
     ///   executor_did ==` the proposer (proposer == committer there).
     /// - Direct-FFI execute path (`context_execute_governance`):
-    ///   `initiator_did ==` the caller (auth subject), `executor_did ==` the
-    ///   proposal's `proposer_did` — matching the native direct-execute handler
-    ///   which stamps `proposal.proposer_did` as the executor.
+    ///   `initiator_did == executor_did ==` the proposal's `proposer_did`,
+    ///   resolved from tracked state by the bridge — the caller's identity is
+    ///   NOT used as the subject. Matches the native direct-execute handler,
+    ///   which stamps `proposal.proposer_did` as both the executor and the
+    ///   consequence subject.
     ///
     /// # Errors
     ///
