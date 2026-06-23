@@ -225,8 +225,10 @@ pub fn evaluate_sybil_resistance(
         .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
 }
 
-/// Initializes participation record and records budget spend for a new
-/// member (#1530, #1537). Takes the `&mut participation_cache` field and a
+/// Initializes the per-member participation record for a new member (#1530):
+/// computes a `ParticipationRecord` from the merged join event set and inserts it
+/// into `participation_cache`. Budget spend is NOT recorded here — that is
+/// `enforce_join_economy`'s responsibility (#1537). Takes the `&mut participation_cache` field and a
 /// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
 /// unified [`PerContextState`] (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the

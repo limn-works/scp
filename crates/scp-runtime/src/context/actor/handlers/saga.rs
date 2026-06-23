@@ -996,12 +996,15 @@ async fn prepare_b(
 /// Run the Prepare-B checks in spec order. Returns `Ok(())` if every check
 /// passes; a typed `SCP-SAGA-13xxx` rejection otherwise.
 ///
-/// All checks except the inbound-rate consume are read-only. Step (2b) consumes
-/// B's INBOUND §6.2.0.2 sliding window — a NON-REFUNDABLE mutation that, by the
-/// "initiation-consumes" discipline, stays consumed even if a LATER check
-/// rejects (an arrival reaching the inbound-rate gate is inbound load whether or
-/// not it ultimately validates). It runs as part of the InboundPolicy gate, so
-/// it precedes the freshness/chain-depth checks deliberately.
+/// All six checks this function runs are read-only; the only state-MUTATING gate
+/// — the inbound-rate consume (step 7) — is performed by the `prepare_b` CALLER
+/// AFTER this function returns `Ok(())`, because it needs the `ClassCMut` view the
+/// cell-holding caller owns. The consume is therefore ordered LAST, AFTER the
+/// freshness (5) and chain-depth (6) read-only rejects, deliberately: a call that
+/// any read-only check rejects never reaches — and so never consumes (or durably
+/// persists) — B's INBOUND §6.2.0.2 sliding window. By the "initiation-consumes"
+/// discipline, an arrival that DOES reach the inbound-rate gate is counted as
+/// inbound load and stays consumed even if some later step aborts.
 fn run_prepare_b_checks(
     state: &PerContextState,
     deps: &ActorDeps,

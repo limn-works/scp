@@ -4196,4 +4196,147 @@ mod restore_reconcile_tests {
             "the newest receipt is pushed onto the back of the ring"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 §9 — leave_context / close_context route their downward-auth
+    // transition through `commit_class_s_keep` (FAIL-CLOSED, keep-direction).
+    // These drive a FAILING persistence backend end-to-end and assert the
+    // helper returns the §9 durability error AND the removal/close mutation is
+    // RETAINED in memory (keep-direction: never rolled back on persist failure —
+    // re-admitting a removed member / re-opening a closed context is unsafe).
+    // -----------------------------------------------------------------------
+
+    /// `leave_context` (broadcast self-removal) persists fail-closed: under a
+    /// failing persistence backend it returns `PersistenceFailed`, and the
+    /// member removal STAYS applied in memory (keep-direction).
+    #[tokio::test]
+    async fn leave_context_persist_failure_keeps_removal_fail_closed() {
+        use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+
+        let sup = build_supervisor(Box::new(FailingJoinPersistence));
+        let admin = DID("did:dht:z6MkLeaveFailClosed".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-leave-fail-closed".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+        // Broadcast-mode state: leave skips MLS (no crypto group needed), so the
+        // whole removal body runs synchronously inside `commit_class_s_keep`.
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
+            context_id_bytes,
+            now,
+            admin.clone(),
+        );
+        // The departing member must be on the authoritative roster for
+        // `remove_member` to succeed and reach the persist.
+        let leaver = DID("did:dht:z6MkLeaver".to_owned());
+        state
+            .membership
+            .add_member(leaver.clone(), "member".to_owned(), Vec::new());
+        state.broadcast_context = Some(
+            BroadcastContext::new(
+                context_id.clone(),
+                &ContextMode::Broadcast,
+                BroadcastAdmission::Open,
+            )
+            .expect("broadcast context"),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        // Self-removal (caller == member): always permitted, no MemberRemove cap.
+        let result =
+            lifecycle_helpers::leave_context(&mut cell, &deps, &handle, &leaver, &leaver).await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "a leave whose fail-closed persist fails must surface the §9 durability \
+             error (not a silent ack): got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(leaver.as_ref()),
+            "keep-direction: the member removal STAYS in memory through a persist \
+             failure — re-admitting a departed member is the unsafe direction"
+        );
+    }
+
+    /// `close_context` persists fail-closed: under a failing persistence backend
+    /// it returns `PersistenceFailed`, and the close teardown STAYS applied in
+    /// memory (keep-direction — a closed context must not silently re-open).
+    #[tokio::test]
+    async fn close_context_persist_failure_keeps_close_fail_closed() {
+        use scp_protocol::context::roles::Capability;
+
+        let sup = build_supervisor(Box::new(FailingJoinPersistence));
+        let admin = DID("did:dht:z6MkCloseFailClosed".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-close-fail-closed".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+        // Default test governance is SingleAdmin (the close-path model gate).
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now,
+            admin.clone(),
+        );
+        // The initiator needs `ContextClose` (the `ttl::close_context` role gate).
+        state.role_state.members.insert(admin.as_ref().to_owned());
+        state.role_state.member_capabilities.insert(
+            admin.as_ref().to_owned(),
+            std::iter::once(Capability::ContextClose).collect(),
+        );
+        // A non-default routing axis so the close teardown's collapse to
+        // `Broadcast` is observable as a retained mutation.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let result = lifecycle_helpers::close_context(&mut cell, &deps, &handle, &admin).await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "a close whose fail-closed persist fails must surface the §9 durability \
+             error (not a silent ack): got {result:?}"
+        );
+        // Keep-direction: the close teardown (routing collapsed to `Broadcast`,
+        // broadcast_context cleared) STAYS in memory through the persist failure —
+        // silently re-opening a closed context is the unsafe direction.
+        assert!(
+            matches!(cell.routing, ContextRouting::Broadcast),
+            "keep-direction: the close teardown's routing collapse is retained on \
+             persist failure (a closed context must not re-open)"
+        );
+        assert!(
+            cell.broadcast_context.is_none(),
+            "keep-direction: the close teardown stays applied through persist failure"
+        );
+    }
 }

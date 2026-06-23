@@ -443,6 +443,44 @@ impl Deref for ClassSMut<'_> {
 /// (there is no whole-state [`Deref`]); reads don't mutate, so a shared `&` to
 /// Class-S cannot violate the invariant.
 ///
+/// # Compile-fail witness — the `class_s` field is SHARED `&`, never `&mut`
+///
+/// The airtightness above hinges on ONE token in [`ClassCMut::new`]'s
+/// destructure: `class_s` is bound a shared `&'a ClassSState` (so no `&mut` to
+/// the actor's Class-S sub-struct exists on this best-effort view). A one-token
+/// edit — `class_s: &'a ClassSState` → `class_s: &'a mut ClassSState` — would
+/// re-arm a Class-S `&mut` with NO mechanical check catching it (the whitelist
+/// tripwire scans only `impl ClassSCell`). The `compile_fail` doctest below is
+/// that missing check: the stand-in `View` mirrors this view's shape (a `&mut`
+/// per Class-C field + a SHARED `&` to Class-S), and tries to obtain a `&mut` to
+/// the shared field. It fails to compile FOR THAT REASON ONLY — you cannot get a
+/// `&mut` out of a `&`. If a future edit flips the binding to `&mut`, this
+/// doctest starts COMPILING and the doc-test run FAILS, surfacing the silent
+/// re-arming. It MUST NOT be deleted as "just an example."
+///
+/// ```compile_fail
+/// struct ClassSState {
+///     spending_nonce: u64,
+/// }
+/// // Mirror of `ClassCMut`: a `&mut` to a Class-C field + a SHARED `&` to the
+/// // Class-S sub-struct. (Flip `class_s: &'a ClassSState` to `&'a mut …` and
+/// // this example compiles — exactly the regression the doctest guards.)
+/// struct View<'a> {
+///     members: &'a mut u64,
+///     class_s: &'a ClassSState,
+/// }
+/// impl<'a> View<'a> {
+///     // A "convenience" `&mut` accessor to the Class-S field. This does NOT
+///     // compile: `self.class_s` is a `&ClassSState`, so a reborrow `&mut *…`
+///     // cannot produce a `&mut` — there is no `&mut` to hand out. (When the
+///     // field is `&'a mut`, this same reborrow DOES compile, which is exactly
+///     // the regression this doctest is here to catch.)
+///     fn class_s_mut(&mut self) -> &mut ClassSState {
+///         &mut *self.class_s
+///     }
+/// }
+/// ```
+///
 /// # Disjoint-borrow support (`ConsequenceStateSplit`)
 ///
 /// [`crate::context::governance_logic::ConsequenceStateSplit`] needs FIVE
@@ -599,6 +637,40 @@ pub(crate) struct EconomyPreCheckBorrows<'a> {
 /// escape — a `*const _ as *mut _` cast on the shared `class_s` read reference —
 /// requires an `unsafe` block, which `forbid` rejects crate-wide and cannot be
 /// locally re-enabled. Weakening that attribute would re-open this vector.
+///
+/// # Compile-fail witness — `governance.class_s` is unreachable from this view
+///
+/// [`GovernanceClassCMut::new`] destructures the `&mut GovernanceState` and
+/// leaves `class_s` (the [`GovernanceClassS`] Class-S sub-struct) in the `..`
+/// rest — so this view holds NO reference (mut or shared) to it. A future
+/// "convenience" accessor cannot return a `&mut GovernanceClassS` because no such
+/// field exists on the view. The regression to guard against is someone BINDING
+/// `class_s` by name (so a `&mut` to it survives into the view). The
+/// `compile_fail` doctest below witnesses the property: the stand-in mirrors the
+/// view — it holds only Class-C field `&mut`s and DOES NOT hold the `class_s`
+/// field — and an accessor that tries to return `&mut` to a `class_s` field does
+/// NOT compile (no such field). If a future edit adds a `class_s: &'a mut …`
+/// field to the view, this doctest starts COMPILING and the doc-test run FAILS.
+/// It MUST NOT be deleted.
+///
+/// ```compile_fail
+/// struct GovernanceClassS {
+///     threshold_value: u64,
+/// }
+/// // Mirror of `GovernanceClassCMut`: holds ONLY Class-C field `&mut`s — NO
+/// // `class_s` field at all (it is left in the source destructure's `..` rest).
+/// // Adding a `class_s: &'a mut GovernanceClassS` field here is exactly the
+/// // regression this doctest guards.
+/// struct View<'a> {
+///     velocity_tracker: &'a mut u64,
+/// }
+/// impl<'a> View<'a> {
+///     // Does NOT compile: there is no `class_s` field on `View` to return.
+///     fn governance_class_s_mut(&mut self) -> &mut GovernanceClassS {
+///         &mut *self.class_s
+///     }
+/// }
+/// ```
 pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the per-sender velocity tracker (§19.7).
     velocity_tracker: &'a mut SenderVelocityTracker,
@@ -1015,6 +1087,40 @@ impl<'a> GovernanceClassCMut<'a> {
 /// future "convenience" accessor returning one CANNOT be written. Reads of the
 /// downward-auth fields go through the `&`-returning read accessors; reads
 /// cannot violate the invariant.
+///
+/// # Compile-fail witness — `ceiling` / `suspended_capabilities` are SHARED `&`
+///
+/// The downward-auth pair is intentionally bound a shared `&` in
+/// [`RoleStateClassCMut::new`] and exposed READ-ONLY (there is no `ceiling_mut` /
+/// `suspended_capabilities_mut`). A one-token edit flipping either binding to
+/// `&'a mut` would re-arm a Class-S `&mut` on this best-effort view with NO
+/// mechanical check catching it (the tripwire scans only `impl ClassSCell`). The
+/// `compile_fail` doctest below is that check: the stand-in mirrors this view (a
+/// `&mut` Class-C field + SHARED `&` downward-auth fields) and tries to obtain a
+/// `&mut` to a shared field — which does NOT compile for that reason alone. If a
+/// future edit re-arms the `&mut`, this doctest starts COMPILING and the doc-test
+/// run FAILS. It MUST NOT be deleted.
+///
+/// ```compile_fail
+/// struct CapabilityCeiling {
+///     caps: u64,
+/// }
+/// // Mirror of `RoleStateClassCMut`: a `&mut` to a Class-C field + a SHARED `&`
+/// // to the downward-auth `ceiling`. (Flip `ceiling: &'a CapabilityCeiling` to
+/// // `&'a mut …` and this compiles — the regression the doctest guards.)
+/// struct View<'a> {
+///     assignments: &'a mut u64,
+///     ceiling: &'a CapabilityCeiling,
+/// }
+/// impl<'a> View<'a> {
+///     // A "convenience" `&mut` accessor to the read-only downward-auth field.
+///     // Does NOT compile: `self.ceiling` is a `&CapabilityCeiling`, so the
+///     // reborrow `&mut *…` cannot yield a `&mut`.
+///     fn ceiling_mut(&mut self) -> &mut CapabilityCeiling {
+///         &mut *self.ceiling
+///     }
+/// }
+/// ```
 pub(crate) struct RoleStateClassCMut<'a> {
     /// Shared `&` to the context's identifier (structural identity, stable).
     context_id: &'a str,
@@ -2685,6 +2791,16 @@ impl ClassSCommitToken {
     ///    rolled back (keep-direction); the error propagates so the caller runs
     ///    its existing Class-C reversal.
     ///
+    /// # When to use this vs [`Self::discharge_with`]
+    ///
+    /// Use `commit` when the deferred persist has NO further state mutation to
+    /// run at the terminal — it takes a `&PerContextState` (read-only) and simply
+    /// persists the state the cell already holds. Use [`Self::discharge_with`]
+    /// when ONE final Class-S mutation must land under this SAME (still-owed)
+    /// persist: it takes a `&mut ClassSCell` + a closure, runs the closure through
+    /// a [`ClassSMut`] view, then performs the single deferred persist. Both are
+    /// keep-direction and perform EXACTLY ONE [`persist_state_fail_closed`].
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::PersistenceFailed`] when the durable write fails
@@ -2740,6 +2856,15 @@ impl ClassSCommitToken {
     /// takes) because building the [`ClassSMut`] view needs `&mut` to the owned
     /// state; the cell is the owner.
     ///
+    /// # When to use this vs [`Self::commit`]
+    ///
+    /// Use `discharge_with` when ONE final Class-S mutation must land under the
+    /// token's still-owed persist (it needs the `&mut ClassSCell` to build the
+    /// [`ClassSMut`] view for that mutation). Use the read-only [`Self::commit`]
+    /// when the terminal has nothing left to mutate and only owes the persist of
+    /// the state the cell already holds. Both perform EXACTLY ONE
+    /// [`persist_state_fail_closed`], keep-direction.
+    ///
     /// # Errors
     ///
     /// Returns `f`'s error (after the keep-direction persist still ran), or
@@ -2786,12 +2911,16 @@ impl Drop for ClassSCommitToken {
     fn drop(&mut self) {
         if !self.consumed {
             // Error-level log so a leaked obligation is visible in production,
-            // and a debug-assert so CI fails loudly — parity with EconomyTicket.
+            // a metered counter so it is OBSERVABLE in release builds (where the
+            // `debug_assert!` below is a no-op and `#[must_use]` is silenced by an
+            // `_`-binding), and a debug-assert so CI fails loudly — parity with
+            // EconomyTicket plus the release-build metric backstop (ADR-049 §9).
             tracing::error!(
                 context_id = %self.context_id,
                 "ClassSCommitToken dropped without commit — a Class-S consume \
                  (e.g. a burned spending nonce) may be unpersisted (ADR-049 §9)"
             );
+            crate::metrics::record_class_s_token_dropped_uncommitted();
             debug_assert!(
                 false,
                 "ClassSCommitToken dropped without commit for context {}",
@@ -2830,6 +2959,16 @@ mod tests {
     // `DerefMut` the same way). Only `ClassSCell`'s no-`DerefMut` remains a
     // guarded invariant.
     static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
+
+    // Defense-in-depth (ADR-049 §9): the linear deferred-persist obligation MUST
+    // be un-duplicable. `ClassSCommitToken` must NOT implement `Clone` (nor
+    // `Copy`) — cloning the token would let a caller commit one copy and silently
+    // drop the other, OR (worse) hold two tokens for ONE deferred persist and
+    // double-discharge / mis-attribute it. The keep-direction obligation is
+    // exactly-once: one mutation, one owed persist, one consuming `commit` /
+    // `discharge_with`. If anyone ever derives/implements `Clone` (or `Copy`) on
+    // the token, this assertion fails to compile.
+    static_assertions::assert_not_impl_any!(ClassSCommitToken: Clone, Copy);
 
     /// Return `src` with the CONTENT of comments and string / char literals
     /// blanked out (delimiters, braces, code tokens, and newlines preserved), so
@@ -3325,6 +3464,28 @@ mod tests {
             "restore_class_s",
         ];
 
+        // Exactly-ONE-block guard: the isolation below scans only the FIRST
+        // `impl ClassSCell {` block (from its header to the next
+        // `impl ClassSCommitToken {`). A SECOND `impl ClassSCell {` block placed
+        // AFTER `impl ClassSCommitToken {` would escape that window entirely,
+        // letting a no-persist Class-S mutator hide in the un-scanned block. Assert
+        // there is EXACTLY ONE inherent `impl ClassSCell {` block so the
+        // single-window isolation is sound. Counted over the COMMENT/STRING-
+        // stripped source so the literal `"\nimpl ClassSCell {\n"` in this test's
+        // own `.find(...)` arguments (and any doc-comment mentions) do not inflate
+        // the count.
+        let src_code = code_only(SRC);
+        let impl_block_count = src_code.matches("\nimpl ClassSCell {\n").count();
+        assert_eq!(
+            impl_block_count, 1,
+            "ADR-049 §9: expected EXACTLY ONE `impl ClassSCell {{` block, found \
+             {impl_block_count}. The whitelist tripwire isolates only the FIRST \
+             such block (up to the next `impl ClassSCommitToken {{`); a 2nd block \
+             after the token impl would escape the scan and could hide a no-persist \
+             Class-S mutator. Merge the blocks into one, or extend this tripwire to \
+             scan ALL `impl ClassSCell` blocks."
+        );
+
         // Isolate the `impl ClassSCell { … }` block: from its header to the next
         // top-level `impl ClassSCommitToken` so the scan is about THIS impl only,
         // not the token impl or the views above it.
@@ -3437,6 +3598,219 @@ mod tests {
              combinator / `ClassSCommitToken`, or — if it is genuinely safe — add \
              it to KNOWN_SAFE with a §9 safety argument on the method. \
              Found: {no_persist_methods:?}, expected: {expected:?}"
+        );
+    }
+
+    /// ADR-049 §9 — table-driven UNIT tests for the tripwire's hand-rolled lexer
+    /// (`code_only` / `skip_block_comment` / `skip_raw_string`). These helpers are
+    /// the tripwire's trust root; the whitelist test above feeds them only the REAL
+    /// file, so a silent lexer bug (a marker leaking out of a comment/string, a
+    /// multi-byte-UTF-8 desync) would go unnoticed until it let a real evasion
+    /// through. This test feeds CRAFTED synthetic inputs so such a bug is a LOUD
+    /// test failure, not a silent gap. (The header / receiver / brace-bounding /
+    /// no-persist-method helpers are exercised by
+    /// `tripwire_lexer_classifies_headers_and_no_persist_methods`.)
+    #[test]
+    fn tripwire_lexer_blanks_comments_and_strings() {
+        // --- code_only: comment / string content is blanked, code survives ---
+        // A persist marker that appears ONLY inside a `//` line comment, a
+        // `/* … */` block comment, and a raw string must NOT survive into the
+        // code-only output (so a marker-in-comment cannot spoof "persisted").
+        let line_comment = "let x = 1; // persist_state_fail_closed here\n let y = 2;";
+        assert!(
+            !code_only(line_comment).contains("persist_state_fail_closed"),
+            "a marker inside a `//` comment must be blanked by code_only"
+        );
+        let block_comment = "a(); /* persist_state_fail_closed */ b();";
+        let bc_out = code_only(block_comment);
+        assert!(
+            !bc_out.contains("persist_state_fail_closed"),
+            "a marker inside a `/* … */` block comment must be blanked"
+        );
+        assert!(
+            bc_out.contains("a()") && bc_out.contains("b()"),
+            "code outside the block comment must survive: {bc_out:?}"
+        );
+        // Nested block comments: the inner `*/` must not close the outer comment.
+        let nested = "p(); /* outer /* inner persist_state_fail_closed */ still */ q();";
+        let nested_out = code_only(nested);
+        assert!(
+            !nested_out.contains("persist_state_fail_closed") && !nested_out.contains("still"),
+            "nested block comment must be fully blanked: {nested_out:?}"
+        );
+        assert!(
+            nested_out.contains("p()") && nested_out.contains("q()"),
+            "code around a nested block comment must survive: {nested_out:?}"
+        );
+
+        // --- skip_raw_string: a raw-string-spoofed marker is dropped ---
+        // `r#"…"#` content (with any `#` count) is blanked; an embedded `"#` that
+        // does not match the opener's hash count does NOT close the raw string.
+        let raw_spoof = r##"let s = r#"persist_state_fail_closed and a "quote" inside"#; tail()"##;
+        let raw_out = code_only(raw_spoof);
+        assert!(
+            !raw_out.contains("persist_state_fail_closed"),
+            "a marker inside a raw string must be blanked: {raw_out:?}"
+        );
+        assert!(
+            raw_out.contains("tail()"),
+            "code after a raw string must survive: {raw_out:?}"
+        );
+        // Byte raw string `br#"…"#` is handled the same way.
+        let byte_raw = r##"x(); let b = br#"persist_state_fail_closed"#; y();"##;
+        let byte_raw_out = code_only(byte_raw);
+        assert!(
+            !byte_raw_out.contains("persist_state_fail_closed")
+                && byte_raw_out.contains("x()")
+                && byte_raw_out.contains("y()"),
+            "byte raw string must be blanked, surrounding code kept: {byte_raw_out:?}"
+        );
+
+        // --- code_only: multi-byte UTF-8 (`§ × →`) must not corrupt offsets ---
+        // The lexer is char-based; a multi-byte body must round-trip its CODE
+        // tokens intact and still blank a comment that follows.
+        let utf8 = "fn f() { let _ = \"§ × →\"; do_it(); } // §persist_state_fail_closed";
+        let utf8_out = code_only(utf8);
+        assert!(
+            utf8_out.contains("do_it()") && utf8_out.contains("fn f()"),
+            "multi-byte UTF-8 body code must survive intact: {utf8_out:?}"
+        );
+        assert!(
+            !utf8_out.contains("persist_state_fail_closed"),
+            "the trailing comment (after a multi-byte body) must still be blanked"
+        );
+
+        // --- skip_block_comment / skip_raw_string newline preservation ---
+        // (so the count cross-check's line indexing stays aligned).
+        let multiline_block = "a();\n/* line1\nline2 persist_state_fail_closed\nline3 */\nb();";
+        let ml_out = code_only(multiline_block);
+        assert_eq!(
+            ml_out.matches('\n').count(),
+            multiline_block.matches('\n').count(),
+            "code_only must preserve every newline (block-comment newlines kept) so \
+             line-indexed cross-checks stay aligned: {ml_out:?}"
+        );
+        assert!(!ml_out.contains("persist_state_fail_closed"));
+    }
+
+    /// ADR-049 §9 — table-driven UNIT tests for the tripwire's header / receiver /
+    /// brace-bounding / no-persist-method helpers (`is_method_header` /
+    /// `body_has_self_receiver` / `brace_bounded_body` /
+    /// `class_s_no_persist_methods`). Companion to
+    /// `tripwire_lexer_blanks_comments_and_strings`.
+    #[test]
+    fn tripwire_lexer_classifies_headers_and_no_persist_methods() {
+        // --- is_method_header: structural qualifier-soup recognition ---
+        for ok in [
+            "    fn plain(&mut self) {",
+            "    pub fn p(&self) {",
+            "    pub(crate) fn pc(&mut self) {",
+            "    pub(in crate::context) fn restricted(&self) {",
+            "    pub(super) const fn cs(&self) {",
+            "    async fn af(&mut self) {",
+            "    pub(crate) const async unsafe fn soup(&mut self) {",
+            "    extern \"C\" fn ext() {",
+        ] {
+            assert!(is_method_header(ok), "must recognize method header: {ok:?}");
+        }
+        for not in [
+            "    let x = 1;",
+            "    // fn commented(&self) {",
+            "    self.field = 2;",
+            "    struct NotAFn;",
+        ] {
+            assert!(
+                !is_method_header(not),
+                "must NOT treat as a method header: {not:?}"
+            );
+        }
+
+        // --- body_has_self_receiver: token match, not substring ---
+        assert!(body_has_self_receiver("fn m(&mut self) { }"));
+        assert!(body_has_self_receiver("fn m(&self) { }"));
+        assert!(body_has_self_receiver("fn m(self) { }"));
+        assert!(body_has_self_receiver("fn m(&'a self) { }"));
+        assert!(body_has_self_receiver("fn m(self: Box<Self>) { }"));
+        // A generic `<…>` list with a `Fn(…)` bound before the param list must not
+        // confuse the param-list finder.
+        assert!(body_has_self_receiver(
+            "fn m<T: Fn(u8) -> u8>(&mut self, t: T) { }"
+        ));
+        // A param merely NAMED `self_id` is NOT a self receiver (false-positive
+        // guard) — nor is a free function whose first param is some other type.
+        assert!(
+            !body_has_self_receiver("fn m(self_id: u8) { }"),
+            "`self_id` must not be mistaken for a `self` receiver"
+        );
+        assert!(
+            !body_has_self_receiver("fn m(myself: u8) { }"),
+            "`myself` must not be mistaken for a `self` receiver"
+        );
+        assert!(
+            !body_has_self_receiver("fn new(state: PerContextState) { }"),
+            "a constructor with no self receiver must be skipped"
+        );
+
+        // --- brace_bounded_body: a `format!`-style `\"{…}\"` brace cannot desync ---
+        // Braces inside a string literal must not be counted (code_only blanks the
+        // string content first), so the body bounds at its REAL closing brace.
+        let with_str_brace = "fn m(&self) { let s = \"{ not a brace }\"; inner(); } fn next() {";
+        let bounded = brace_bounded_body(with_str_brace);
+        assert!(
+            bounded.contains("inner()") && !bounded.contains("fn next"),
+            "brace_bounded_body must stop at the real closing brace, not a \
+             string-literal brace, and not bleed into the next method: {bounded:?}"
+        );
+
+        // --- class_s_no_persist_methods: end-to-end over a crafted impl block ---
+        // A rogue `&mut self` no-persist mutator must be FOUND; a method that names
+        // the marker only inside a comment must ALSO be found (the comment marker
+        // does not count as a persist); a method that genuinely names the marker in
+        // CODE must NOT be found; a `self_id`-param free-ish method and a no-self
+        // constructor must be skipped.
+        let crafted_impl = "\
+impl ClassSCell {
+    fn rogue_no_persist(&mut self) {
+        self.state.class_s.x = 1;
+    }
+
+    fn marker_only_in_comment(&mut self) {
+        // persist_state_fail_closed (this is a comment, must NOT count)
+        self.state.class_s.y = 2;
+    }
+
+    fn genuinely_persists(&mut self) {
+        self.state.class_s.z = 3;
+        persist_state_fail_closed(&self.state, deps, ctx);
+    }
+
+    fn not_a_receiver(self_id: u8) {
+        let _ = self_id;
+    }
+
+    fn ctor(state: PerContextState) -> Self {
+        Self { state }
+    }
+}
+";
+        let (mut found, recognized) =
+            class_s_no_persist_methods(crafted_impl, &["persist_state_fail_closed"]);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "marker_only_in_comment".to_owned(),
+                "rogue_no_persist".to_owned(),
+            ],
+            "the no-persist SELF-receiver methods must be exactly the rogue mutator \
+             and the comment-only-marker method; the genuinely-persisting method, \
+             the `self_id` non-receiver, and the no-self constructor are excluded"
+        );
+        // Five `fn` headers, all recognized (the count cross-check the tripwire
+        // relies on).
+        assert_eq!(
+            recognized, 5,
+            "is_method_header must recognize all five crafted `fn` headers"
         );
     }
 
@@ -3863,6 +4237,164 @@ mod tests {
     fn token_dropped_without_commit_panics_in_debug() {
         let token = ClassSCommitToken::new_for_test(&ctx_hex(0x65));
         drop(token);
+    }
+
+    /// `discharge_with` on the ABORT path — `f` returns `Err` — STILL discharges
+    /// the Drop obligation (keep-direction: the persist runs regardless of `f`'s
+    /// result, so the token is consumed). The test would PANIC in the `Drop`
+    /// `debug_assert!` if `discharge_with` failed to mark the obligation
+    /// discharged on the error path; reaching the assertions proves the abort path
+    /// does not leave a leaked token, and that the keep-direction persist still
+    /// ran (SpyPersistence counts exactly one call) while `f`'s error is surfaced.
+    #[tokio::test]
+    async fn discharge_with_consumes_token_on_f_error_keep_direction() {
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(Box::new(SpyPersistence {
+            persist_calls: Arc::clone(&persist_calls),
+        }))
+        .await;
+        let mut cell = ClassSCell::new(fresh_state(0x66));
+        let ctx = ctx_hex(0x66);
+
+        let (_v, token) = cell
+            .begin_class_s(&ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x6Eu8; 16], 0);
+                Ok(())
+            })
+            .expect("f Ok ⇒ token");
+
+        // `f` aborts (Err). Keep-direction: the persist still runs and the token
+        // is consumed — so no Drop panic, `f`'s error is surfaced.
+        let err = token
+            .discharge_with(&mut cell, &deps, &ctx, |_view| {
+                Err::<(), _>(ContextError::PermissionDenied("abort".into()))
+            })
+            .expect_err("f Err ⇒ discharge_with surfaces it");
+        assert!(matches!(err, ContextError::PermissionDenied(_)));
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "keep-direction: the deferred persist runs even on the f-abort path"
+        );
+        assert!(
+            cell.class_s
+                .xctx_nonce_dedup
+                .entries()
+                .contains_key(&[0x6Eu8; 16]),
+            "keep-direction: the early consume stays in memory through the abort"
+        );
+        // `token` was moved into `discharge_with` and consumed — no leaked Drop
+        // obligation. (A failure to set `consumed` would have panicked above.)
+    }
+
+    // ------------------------------------------------------------------
+    // RED-CS3 — consequence-engine auto-suspension is fail-closed
+    // ------------------------------------------------------------------
+
+    /// ADR-049 §9 (RED-CS3) — the consequence-engine capability suspension is
+    /// persisted FAIL-CLOSED, not silently coalesced. This drives a triggered
+    /// `SuspendCapability` consequence through the SAME path the receive handler
+    /// uses — `enforce_triggered_consequences` against the cell's
+    /// `class_c_view().split_class_c()` — to set the in-memory suspension and the
+    /// `suspension_applied` flag, then performs the handler's fail-closed persist
+    /// (`persist_state_fail_closed`) under a FAILING persistence backend. It
+    /// asserts (a) the handler surfaces the §9 durability error
+    /// (`PersistenceFailed`) rather than a silent coalesced ack, AND (b) the
+    /// suspension is RETAINED in memory (keep-direction) — so it is NOT lost on a
+    /// coalesce-window crash and the denied capability is not silently re-granted.
+    #[tokio::test]
+    async fn consequence_suspension_persists_fail_closed_and_keeps_suspension() {
+        use crate::context::governance_logic::{
+            EnforceConsequencesCtx, enforce_triggered_consequences,
+        };
+        use scp_protocol::context::roles::Capability;
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, EnforcementSeverity, TriggeredConsequence,
+        };
+
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x71));
+        let ctx = ctx_hex(0x71);
+        let subject = DID("did:example:suspend-subject".to_owned());
+
+        // The subject must be a member for enforcement to apply a suspension.
+        {
+            let mut view = cell.class_c_view();
+            view.membership_class_c_mut().add_member(
+                subject.clone(),
+                "member".to_owned(),
+                Vec::new(),
+            );
+        }
+
+        // A `SuspendCapability` consequence (explicit caps) unconditionally
+        // mutates `suspended_capabilities` for the present member, so the
+        // downward-auth fail-closed flag must be `true`.
+        let rules = vec![ConsequenceRule {
+            trigger: scp_protocol::trust::consequence::ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        }];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: rules[0].action.clone(),
+            evidence: Vec::new(),
+        }];
+
+        // Drive the suspension through the handler's exact view path.
+        let suspension_applied = {
+            let mut view = cell.class_c_view();
+            let mut split = view.split_class_c();
+            enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &ctx,
+                    member_did: &subject,
+                    now: 1_700_000_100,
+                    triggered: &triggered,
+                    rules: &rules,
+                    clock: deps.clock.as_ref(),
+                    event_log: deps.event_log.as_ref(),
+                    event_tx: None,
+                },
+            )
+        };
+        assert!(
+            suspension_applied,
+            "a SuspendCapability against a present member applies a downward-auth \
+             suspension and must signal the fail-closed flag (RED-CS3)"
+        );
+        assert!(
+            cell.role_state
+                .suspended_capabilities
+                .get(subject.as_ref())
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+            "the suspension is applied in memory before the persist"
+        );
+
+        // The handler persists fail-closed when `suspension_applied` (messaging.rs).
+        // Under FailPersistence it must surface the §9 durability error.
+        let persist =
+            crate::context::messaging_helpers::persist_state_fail_closed(&cell, &deps, &ctx);
+        let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "the §9 durability error must surface (not a silent coalesced ack): {err:?}"
+        );
+
+        // KEEP-direction: the suspension is RETAINED in memory after the failed
+        // persist — it is not silently lost on a coalesce-window crash.
+        assert!(
+            cell.role_state
+                .suspended_capabilities
+                .get(subject.as_ref())
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
+            "keep-direction: the auto-suspension stays in memory through a persist \
+             failure, so the denied capability is not silently re-granted (RED-CS3)"
+        );
     }
 
     // ------------------------------------------------------------------
