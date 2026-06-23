@@ -315,10 +315,11 @@ export type UcanFailureCategory =
  * Reading the unverified payload is safe: `scp.ucanValidate` performs the
  * actual cryptographic verification — this only extracts which URIs to validate.
  *
- * {@link evaluateLayer1} validates EVERY element returned by this function:
- * each `att[i].with` URI is sent to `scp.ucanValidate` independently, and
- * the per-field AND-intersection of all per-URI verdicts (via
- * {@link intersectCapabilityValidation}) is the token's final verdict.
+ * {@link evaluateLayer1} validates only the **first** element (`att[0].with`)
+ * returned by this function. Full multi-att validation (checking every
+ * `att[i]` entry) requires a single `ucanValidate` call that verifies all
+ * URIs while consuming the nonce only once; until that bridge op exists,
+ * only att[0] is checked.
  *
  * @returns An array of all declared capability URIs (non-empty strings from
  *   `att[i].with`), or `null` if the token is malformed or declares no valid
@@ -449,31 +450,6 @@ const ALL_LAYER1_FIELDS_FALSE: CapabilityValidation = {
 };
 
 /**
- * AND-intersects two {@link CapabilityValidation} verdicts: `false` wins per
- * field (a failing verdict in either operand means the field fails overall).
- *
- * Used by {@link evaluateLayer1} to combine per-URI verdicts within a single
- * token: each `att[i].with` URI is validated independently, and the
- * per-field intersection of all per-URI results is the token's verdict. A
- * token passes a field only if ALL of its declared URIs pass that field.
- *
- * @internal Exported for unit tests.
- */
-export function intersectCapabilityValidation(
-  a: CapabilityValidation,
-  b: CapabilityValidation,
-): CapabilityValidation {
-  return {
-    tokensValid: a.tokensValid && b.tokensValid,
-    signaturesValid: a.signaturesValid && b.signaturesValid,
-    withinCeiling: a.withinCeiling && b.withinCeiling,
-    nonceValid: a.nonceValid && b.nonceValid,
-    notRevoked: a.notRevoked && b.notRevoked,
-    timeBoundsValid: a.timeBoundsValid && b.timeBoundsValid,
-  };
-}
-
-/**
  * Validates a single capability token against one of its declared URIs.
  *
  * Throws if the error is not a UCAN permission error (non-UCAN errors and
@@ -523,23 +499,22 @@ async function validateOneCapUri(
 /**
  * Runs Layer 1 (protocol enforcement) over the supplied capability tokens.
  *
- * Each token is validated against ALL of its declared capability URIs
- * (`att[i].with`, extracted via `__extractAllCapabilityUris`). For each URI,
- * `validateOneCapUri` is called independently. The per-field AND-intersection
- * of all per-URI verdicts (via {@link intersectCapabilityValidation}) is the
- * token's final verdict: a token passes a field only if ALL of its declared
- * URIs pass that field. A malformed / no-capability token is fail-closed
- * (all-false) and never reaches the bridge.
+ * Each token is validated against its **first** declared capability URI
+ * (`att[0].with`, extracted via `__extractAllCapabilityUris`). Only att[0]
+ * is sent to `scp.ucanValidate`. Full multi-att validation (checking every
+ * `att[i]` entry) requires a single bridge call that validates all URIs
+ * while consuming the nonce only once; until that bridge op exists, only
+ * att[0] is checked here.
  *
- * Across tokens, fail-fast applies: once a token's AND-intersected verdict
- * has any field `false`, processing stops and that verdict is returned
- * immediately without evaluating further tokens.
+ * A malformed token or one that declares no capabilities is fail-closed
+ * (all-false) and never reaches the bridge. Fail-fast across tokens applies:
+ * once any token produces a non-null (narrowed) verdict, processing stops
+ * and that verdict is returned.
  *
- * Each per-URI verdict is derived from the failing pipeline stage: the
- * failing stage is classified (`__classifyUcanError`) and only the stages
- * known to have passed before it (`__PASSED_BEFORE`) stay `true` for that
- * URI. If a URI passes validation, `validateOneCapUri` returns `null` (no
- * narrowing needed).
+ * Each verdict is derived from the failing pipeline stage: the stage is
+ * classified (`__classifyUcanError`) and only the stages known to have
+ * passed before it (`__PASSED_BEFORE`) stay `true`. If the token passes
+ * validation, `validateOneCapUri` returns `null` (no narrowing needed).
  *
  * Only errors with the `[SCP-PERM-3001]` code (the one code used by all
  * `UcanError` variants) are classified and absorbed into the verdict. All
@@ -550,8 +525,8 @@ async function validateOneCapUri(
  *
  * **What Layer 1 measures**: token self-consistency — is this token
  * structurally valid, cryptographically signed, within the context ceiling,
- * and unexpired/unrevoked? The capability URIs validated against are the
- * token's OWN declared capabilities (from `att[i].with`). Layer 1 does NOT
+ * and unexpired/unrevoked? The capability URI validated against is the
+ * token's OWN first declared capability (`att[0].with`). Layer 1 does NOT
  * answer "does this token authorize action X?" Callers that need to verify
  * authority for a specific operation must call
  * `scp.ucanValidate(handle, token, uri)` directly with a caller-supplied
@@ -567,7 +542,7 @@ async function evaluateLayer1(
   }
 
   // Start optimistic: assume all pass until a failure proves otherwise.
-  let result: CapabilityValidation = {
+  const result: CapabilityValidation = {
     tokensValid: true,
     signaturesValid: true,
     withinCeiling: true,
@@ -577,42 +552,19 @@ async function evaluateLayer1(
   };
 
   for (const token of capabilityTokens) {
-    const capUris = __extractAllCapabilityUris(token);
-    if (capUris === null) {
+    // Only validate att[0].with per token. Full multi-att validation requires
+    // a single bridge call consuming the nonce once — that op does not exist yet.
+    const capUri = __extractAllCapabilityUris(token)?.[0] ?? null;
+    if (capUri === null) {
       // Malformed token or one that declares no capabilities: structurally
       // invalid / grants nothing. Fail-closed; the bridge is not called.
       return { ...ALL_LAYER1_FIELDS_FALSE };
     }
 
-    // AND-intersect verdicts for all declared URIs in this token.
-    // Start this token's intersected verdict as all-true; false wins per field.
-    let tokenVerdict: CapabilityValidation = {
-      tokensValid: true,
-      signaturesValid: true,
-      withinCeiling: true,
-      nonceValid: true,
-      notRevoked: true,
-      timeBoundsValid: true,
-    };
-    for (const capUri of capUris) {
-      const narrowed = await validateOneCapUri(scp, handle, token, capUri);
-      if (narrowed !== null) {
-        tokenVerdict = intersectCapabilityValidation(tokenVerdict, narrowed);
-      }
-    }
-
-    // Apply this token's verdict to the overall result.
-    result = intersectCapabilityValidation(result, tokenVerdict);
-    // Fail-fast across tokens: once any field is false, stop and return.
-    if (
-      !result.tokensValid ||
-      !result.signaturesValid ||
-      !result.withinCeiling ||
-      !result.nonceValid ||
-      !result.notRevoked ||
-      !result.timeBoundsValid
-    ) {
-      return result;
+    const narrowed = await validateOneCapUri(scp, handle, token, capUri);
+    if (narrowed !== null) {
+      // Fail-fast: return the narrowed verdict immediately.
+      return narrowed;
     }
   }
 
