@@ -3102,7 +3102,17 @@ mod tests {
     #[test]
     fn proposal_id_hex_accepts_exactly_32_bytes() {
         let valid = "a".repeat(64);
-        assert!(validate_proposal_id_hex(&valid).is_ok());
+        // The validator decodes once and returns the canonical 32-byte array.
+        // Compare a comparable value in both arms to avoid panic! / expect (both
+        // clippy-denied in this crate): Ok yields the decoded bytes, Err yields
+        // the error text, and only the Ok-bytes case matches the expectation.
+        let outcome: Result<[u8; 32], String> =
+            validate_proposal_id_hex(&valid).map_err(|e| e.to_string());
+        assert_eq!(
+            outcome,
+            Ok([0xaa_u8; 32]),
+            "64-char hex must validate to the decoded 32-byte array"
+        );
     }
 
     #[test]
@@ -3110,7 +3120,7 @@ mod tests {
         // 4 bytes — the kind of value the old unwrap_or_default + zero-pad
         // path would have silently widened to 32 bytes.
         let msg = match validate_proposal_id_hex("deadbeef") {
-            Ok(()) => String::from("<accepted>"),
+            Ok(_) => String::from("<accepted>"),
             Err(e) => e.to_string(),
         };
         assert!(

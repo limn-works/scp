@@ -1221,9 +1221,11 @@ mod cross_impl_leaf_parity {
         let proposal_id = "feedface000000000000000000000000000000000000000000000000000000ff";
         let created_at = 1_700_500_500_u64;
 
-        // SingleAdmin context: the caller (an admin) executes directly. Both
-        // proposer and caller are admins so the caller's capability check
-        // passes while the executor (leaf actor_did) must still be the proposer.
+        // SingleAdmin context: a non-proposer admin triggers the direct-execute
+        // entry. The bridge resolves the proposal's proposer and uses it for the
+        // executor (leaf actor_did) AND the consequence subject; the caller DID
+        // is present as a context member only to prove it is NOT what ends up on
+        // the leaf. The leaf actor_did must still be the proposer.
         let mut ctx = make_bare_per_context_state(context_id, proposer);
         ctx.test_insert_member(caller, "admin");
         ctx.test_insert_member("did:dht:z6MkDirectTarget", "member");
@@ -1266,15 +1268,21 @@ mod cross_impl_leaf_parity {
         let mut mgr = WasmContextManager::new();
         mgr.test_insert_context(context_id, ctx);
 
-        // EXACTLY what the fixed `context_execute_governance` direct entry does:
-        // resolve the proposer, then execute with auth-subject = caller,
-        // executor = proposer.
+        // EXACTLY what the shipped `context_execute_governance` direct entry
+        // does: it resolves the tracked proposal's proposer and passes that
+        // proposer for BOTH the auth-subject (initiator) and the executor — the
+        // caller-supplied DID is never forwarded to `execute_governance_action`.
         let resolved_proposer = mgr
             .proposal_proposer_did(context_id, proposal_id)
             .expect("proposer resolvable");
         assert_eq!(resolved_proposer, proposer);
-        mgr.execute_governance_action(context_id, caller, &resolved_proposer, proposal_id)
-            .expect("direct execute");
+        mgr.execute_governance_action(
+            context_id,
+            &resolved_proposer,
+            &resolved_proposer,
+            proposal_id,
+        )
+        .expect("direct execute");
 
         let logged = mgr.test_context_event_log_events(context_id);
         let executed_leaf = logged

@@ -70,22 +70,16 @@ use scp_protocol::economy::types::EconomicPolicy;
 ///
 /// # Errors
 ///
-/// Returns [`ScpWasmError::Validation`] (via the shared
-/// `validate_proposal_id_hex`) if `proposal_id` is not valid hex or does not
-/// decode to exactly 32 bytes.
+/// Returns [`ScpWasmError::Context`] with code `SCP-CTX-2040` (via
+/// [`ScpWasmError::proposal_id`]) if `proposal_id` is not valid hex or does not
+/// decode to exactly 32 bytes — the same error surface the bridge boundary
+/// emits, so the in-crate defense-in-depth path is byte-for-byte consistent.
 fn parse_proposal_id_bytes(proposal_id: &str) -> Result<[u8; 32], ScpWasmError> {
-    scp_ffi_common::validate::validate_proposal_id_hex(proposal_id)?;
-    // `validate_proposal_id_hex` guarantees clean hex decoding to exactly 32
-    // bytes, so neither `hex::decode` nor `try_into` can fail here; map both to
-    // a Validation error rather than panicking to keep the path total.
-    let bytes = hex::decode(proposal_id).map_err(|e| ScpWasmError::Validation {
-        message: format!("proposal id is not valid hex: {e}"),
-        code: codes::VALID_7000.to_owned(),
-    })?;
-    bytes.try_into().map_err(|_| ScpWasmError::Validation {
-        message: "proposal id must decode to exactly 32 bytes".to_owned(),
-        code: codes::VALID_7000.to_owned(),
-    })
+    // Single decode + length-check: `validate_proposal_id_hex` returns the
+    // canonical 32-byte array, so there is no second `hex::decode` and no
+    // unreachable error arm to map.
+    scp_ffi_common::validate::validate_proposal_id_hex(proposal_id)
+        .map_err(ScpWasmError::proposal_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -8968,18 +8962,30 @@ mod tests {
         };
 
         // 4-byte hex — exactly the value the old unwrap_or_default + zero-pad
-        // path would have silently widened to 32 bytes.
+        // path would have silently widened to 32 bytes. The strict parse
+        // (`parse_proposal_id_bytes`) routes the rejection through
+        // `ScpWasmError::proposal_id`, so a malformed id surfaces as the same
+        // `Context` / `SCP-CTX-2040` error the bridge boundary emits — identical
+        // to the native PyO3/UniFFI/NAPI bridges' malformed-proposal-id surface.
         let err = mgr
             .propose_governance_action(context_id, creator, "deadbeef", &action)
             .expect_err("a 4-byte proposal id must be rejected, not zero-padded");
         match err {
-            ScpWasmError::Validation { ref message, .. } => {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(
+                    code,
+                    codes::CTX_2040,
+                    "a malformed proposal id must surface SCP-CTX-2040, got: {code}"
+                );
                 assert!(
                     message.contains("32 bytes"),
                     "rejection should name the 32-byte requirement, got: {message}"
                 );
             }
-            other => panic!("expected Validation error, got: {other:?}"),
+            other => panic!("expected Context (SCP-CTX-2040) error, got: {other:?}"),
         }
 
         // Non-hex input must also be rejected (would decode to 0 bytes and the
@@ -9239,9 +9245,11 @@ mod tests {
         // An id the manager never tracked. WASM checks the status precondition
         // first, so an untracked id surfaces as "not approved (status: None)"
         // — the engine has no `Approved` proposal to dispatch. Either way the
-        // forgery is rejected before any action can run.
+        // forgery is rejected before any action can run. The shipped bridge
+        // resolves the proposer and passes it for both the initiator and the
+        // executor, so this call uses the production (proposer, proposer) shape.
         let err = mgr
-            .execute_governance_action(context_id, caller, proposer, "deadbeef")
+            .execute_governance_action(context_id, proposer, proposer, "deadbeef")
             .expect_err("executing an untracked proposal id must be rejected");
         let msg = format!("{err:?}");
         assert!(
