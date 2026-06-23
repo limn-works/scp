@@ -406,7 +406,13 @@ async fn builtin_roles_capabilities() {
     // Admin gets all ceiling capabilities
     let admin = builtin_admin(&ceiling);
     assert_eq!(admin.name, "admin");
-    assert_eq!(admin.capabilities, ceiling.capabilities);
+    assert_eq!(
+        admin.capabilities,
+        ceiling
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+    );
 
     // Observer gets only MessagesRead
     let observer = builtin_observer(&ceiling);

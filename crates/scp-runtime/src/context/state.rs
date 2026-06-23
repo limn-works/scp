@@ -1239,7 +1239,15 @@ pub(crate) struct GovernanceState {
     /// required when revocation lands is populating it (no enforcement
     /// rewrite needed). The set is part of the governance bucket because
     /// revocation actions are governance-driven (§19.5).
-    pub(crate) revoked_spending_ucan_cids: HashSet<String>,
+    ///
+    /// ADR-049 §9 classifies this revocation set as **Class S**: a coalesce-window
+    /// rollback of a revocation would re-admit a spending UCAN the caller observed
+    /// as revoked. Privatized to `pub(in crate::context)` (defense-in-depth, so it
+    /// is unnameable outside `crate::context`) and left to the `..` rest of the
+    /// best-effort [`GovernanceClassCMut`](crate::context::actor::class_s) view's
+    /// destructure, so that best-effort path holds no `&mut` to it — when
+    /// revocation wiring lands it must route through a fail-closed combinator.
+    pub(in crate::context) revoked_spending_ucan_cids: HashSet<String>,
     /// Per-member governance proposal timestamps for earned capacity rate limiting
     /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
     /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
@@ -1251,9 +1259,12 @@ pub(crate) struct GovernanceState {
     /// a security window the caller already observed as closed. Grouped into
     /// [`GovernanceClassS`] so the fail-closed-persist boundary is one named
     /// sub-struct rather than four loose fields scattered through the
-    /// governance bucket. Fields remain `pub(crate)` — privatization behind a
-    /// mutator-combinator boundary is a LATER PR.
-    pub(crate) class_s: GovernanceClassS,
+    /// governance bucket. Privatized to `pub(in crate::context)`: the field is
+    /// unnameable outside `crate::context`, and within it the ONLY mutable reach
+    /// is through the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+    /// persist-on-commit combinators (no `state_mut`, no `DerefMut`). The
+    /// snapshot/serialization paths read it shared. ADR-049 §9.
+    pub(in crate::context) class_s: GovernanceClassS,
 }
 
 /// The Class-S subset of [`GovernanceState`] (ADR-049 §9).
@@ -1384,32 +1395,6 @@ impl GovernanceState {
         // Clear velocity tracker on participation decay. Stale velocity
         // data from a closed/expired context must not carry over.
         self.velocity_tracker.clear();
-    }
-
-    /// Evicts stale entries from caches to prevent unbounded growth.
-    ///
-    /// Unlike [`decay_participation`](Self::decay_participation) (which
-    /// clears everything), this performs targeted eviction based on current
-    /// state:
-    /// - `participation_cache`: removes DIDs not in `last_known_members`.
-    /// - `cooldown_until`: removes entries where `now >= expiry`.
-    ///
-    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
-    /// the hoisted
-    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
-    /// free function can call it from outside the `manager/` submodule
-    /// tree.
-    pub(crate) fn evict_stale_entries(&mut self, now: u64) {
-        // M25: O(1) membership check per entry via HashSet::contains.
-        // last_known_members is HashSet<DID> which implements Borrow<str>,
-        // so we can look up &str keys directly.
-        self.participation_cache
-            .retain(|did, _| self.last_known_members.contains(did.as_str()));
-        // Evict expired cooldown entries.
-        self.cooldown_until.retain(|_, expiry| now < *expiry);
-        // Evict departed members from proposal timestamps.
-        self.proposal_timestamps
-            .retain(|did, _| self.last_known_members.contains(did.as_str()));
     }
 }
 

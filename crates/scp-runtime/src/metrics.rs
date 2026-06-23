@@ -17,6 +17,7 @@
 //! | `scp_saga_repair_needed_total`    | Counter   | Cross-context sagas landed in `NeedsRepair` requiring operator repair (§17.16.4) |
 //! | `scp_saga_caller_reversal_outstanding_total` | Counter | Cross-context saga aborts that could not confirm the caller-side reversal; the journal stays non-terminal for the §17.16.4 sweep (§6.2.4) |
 //! | `scp_pseudonym_announcements_rejected_total` | Counter | Rejected pseudonym announcements (forged DID, reserved value, or cross-DID RID collision, §9.10.4) |
+//! | `scp_class_s_token_dropped_uncommitted_total` | Counter | `ClassSCommitToken`s dropped without `commit` — a deferred Class-S persist obligation may be undurable (ADR-049 §9) |
 //! | `scp_active_contexts`             | Gauge     | Number of registered (active) contexts         |
 //! | `scp_buffer_occupancy`            | Gauge     | Total events buffered across all contexts      |
 //!
@@ -87,6 +88,21 @@ pub(crate) fn record_saga_caller_reversal_outstanding() {
 /// signals either a misbehaving/forging peer or a routing-ID derivation bug.
 pub(crate) fn record_pseudonym_announcement_rejected() {
     metrics::counter!("scp_pseudonym_announcements_rejected_total").increment(1);
+}
+
+/// Records a `ClassSCommitToken` dropped WITHOUT `commit` (ADR-049 §9).
+///
+/// A deferred-persist Class-S obligation (e.g. a burned spending nonce, an
+/// inserted `executed_proposals` marker) was applied in memory but the token that
+/// owed its fail-closed persist was dropped un-committed — so the consume may be
+/// undurable, re-opening a replay / re-spend / re-execute window on crash. The
+/// token's `Drop` `debug_assert!`s in debug builds (CI catches it loudly); this
+/// counter is the RELEASE-build observability backstop, since `debug_assert!` is a
+/// no-op and `#[must_use]` is silenced by an `_`-binding. A nonzero rate is a hard
+/// fault: an unconsumed token reached a production drop. Paired with the existing
+/// `tracing::error!` at the drop site for log-based alerting.
+pub(crate) fn record_class_s_token_dropped_uncommitted() {
+    metrics::counter!("scp_class_s_token_dropped_uncommitted_total").increment(1);
 }
 
 /// Sets the active context gauge to the given count.

@@ -822,10 +822,14 @@ fn invoke_tool_with_economy_enforces_hard_rate_limit() {
 fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
     let body = extract_fn_body(MANAGER_SRC, "reserve_tool_economy")
         .expect("reserve_tool_economy body must exist");
-    let refund_sites = body.matches("hard_rate_limit.refund").count();
+    // The hard-rate-limit token is refunded through the field-granular Class-C
+    // governance view (`hard_rate_limit_mut().refund(..)`) on every Phase-1
+    // failure branch (ADR-049 §9). Match the accessor form so a renamed bucket
+    // access does not silently drop a refund site.
+    let refund_sites = body.matches("hard_rate_limit_mut().refund").count();
     assert!(
         refund_sites >= 3,
-        "reserve_tool_economy must have at least 3 inline hard_rate_limit.refund sites \
+        "reserve_tool_economy must have at least 3 inline hard_rate_limit_mut().refund sites \
          (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
@@ -1330,7 +1334,7 @@ fn b3_heartbeat_monitor_instantiated() {
 
 /// Checkpoint generation must be wired into the context lifecycle.
 /// close_context must call force_create_checkpoint for archival.
-/// finalize_send must call create_checkpoint_if_due periodically AND broadcast
+/// finalize_send must call create_checkpoint_if_due_view periodically AND broadcast
 /// a due checkpoint to peers via send_checkpoint (§9.9.3, §23.7).
 #[test]
 fn b3_checkpoint_generation_wired() {
@@ -1345,8 +1349,10 @@ fn b3_checkpoint_generation_wired() {
     // finalize_send must DELEGATE periodic checkpoint creation + broadcast to
     // create_and_broadcast_checkpoint_if_due. Real call-site assertion (not a
     // bare string search): finalize_send → create_and_broadcast_checkpoint_if_due
-    // → create_checkpoint_if_due (create + retain locally) AND send_checkpoint
-    // (broadcast to peers for equivocation detection, §23.7).
+    // → create_checkpoint_if_due_view (create + retain locally) AND send_checkpoint
+    // (broadcast to peers for equivocation detection, §23.7). The callee token
+    // carries its `_view` suffix so the assertion names the ACTUAL field-granular
+    // entry and cannot be satisfied by a renamed sibling's substring.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
@@ -1360,9 +1366,9 @@ fn b3_checkpoint_generation_wired() {
         fn_body_contains(
             MANAGER_SRC,
             "create_and_broadcast_checkpoint_if_due",
-            "create_checkpoint_if_due",
+            "create_checkpoint_if_due_view(",
         ),
-        "create_and_broadcast_checkpoint_if_due must call create_checkpoint_if_due"
+        "create_and_broadcast_checkpoint_if_due must call create_checkpoint_if_due_view"
     );
     assert!(
         fn_body_contains(
@@ -1382,16 +1388,40 @@ fn b3_checkpoint_generation_wired() {
 /// ConsistencyCheckpoint message to compare_remote_checkpoint (§9.9.3).
 #[test]
 fn b3_merkle_proof_verification_wired() {
-    // compare_remote_checkpoint must exist and perform comparison.
-    let body = extract_fn_body(MANAGER_SRC, "compare_remote_checkpoint")
-        .expect("compare_remote_checkpoint must exist in manager source");
+    // The Merkle-root comparison + divergence classification live in the shared
+    // `classify_remote_checkpoint` core, which `compare_remote_checkpoint`
+    // delegates to (the cell-view receive path and the bare-state callers reach
+    // the SAME core). Assert the core performs the comparison, and that
+    // `compare_remote_checkpoint` actually reaches it + the equivocation emit.
+    let classify_body = extract_fn_body(MANAGER_SRC, "classify_remote_checkpoint")
+        .expect("classify_remote_checkpoint must exist in manager source");
     assert!(
-        body.contains("merkle_root") || body.contains("event_log_merkle_root"),
-        "compare_remote_checkpoint must compare Merkle roots"
+        classify_body.contains("merkle_root") || classify_body.contains("event_log_merkle_root"),
+        "classify_remote_checkpoint must compare Merkle roots"
     );
     assert!(
-        body.contains("Divergent") || body.contains("EquivocationDetected"),
-        "compare_remote_checkpoint must detect divergence / equivocation"
+        classify_body.contains("Divergent") || classify_body.contains("EquivocationDetected"),
+        "classify_remote_checkpoint must detect divergence / equivocation"
+    );
+    // compare_remote_checkpoint must REACH the comparison core and, on a divergent
+    // result, emit the equivocation alert (§9.9.3 / §9.9.4).
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "compare_remote_checkpoint",
+            "classify_remote_checkpoint",
+        ),
+        "compare_remote_checkpoint must delegate the Merkle/divergence comparison \
+         to classify_remote_checkpoint"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "compare_remote_checkpoint",
+            "emit_equivocation_alert",
+        ),
+        "compare_remote_checkpoint must emit an equivocation alert on a divergent \
+         checkpoint (§9.9.4)"
     );
 
     // Real call-site assertion: the receive path must actually REACH the

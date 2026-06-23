@@ -68,7 +68,6 @@ use scp_protocol::economy::types::Amount;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
 use crate::context::tools::invoke::{
     self, InvocationError, InvokeExecuteOutcome, ToolEconomyContext, build_tool_event,
     economy_pre_check, invoke_tool_execute_and_validate, post_tool_invocation_bookkeeping,
@@ -87,9 +86,14 @@ use crate::economy::integration::PreparedAction;
 /// shim fallback; once a command reaches this helper, the context actor
 /// already owns the target [`PerContextState`].
 #[must_use]
-#[allow(clippy::needless_pass_by_ref_mut)] // PerContextState is Send + !Sync; &mut keeps actor futures Send.
-pub fn try_consume_hard_rate_limit(state: &mut PerContextState, did: &DID, now_secs: u64) -> bool {
-    state.governance.hard_rate_limit.try_consume(did, now_secs)
+pub fn try_consume_hard_rate_limit(
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
+    did: &DID,
+    now_secs: u64,
+) -> bool {
+    view.governance_class_c_mut()
+        .hard_rate_limit_mut()
+        .try_consume(did, now_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -100,9 +104,10 @@ pub fn try_consume_hard_rate_limit(state: &mut PerContextState, did: &DID, now_s
 ///
 /// Unknown-context no-op behavior remains in the supervisor shim
 /// fallback; the actor path only runs after mailbox lookup succeeds.
-#[allow(clippy::needless_pass_by_ref_mut)] // PerContextState is Send + !Sync; &mut keeps actor futures Send.
-pub fn refund_hard_rate_limit(state: &mut PerContextState, did: &DID) {
-    state.governance.hard_rate_limit.refund(did);
+pub fn refund_hard_rate_limit(mut view: crate::context::actor::class_s::ClassCMut<'_>, did: &DID) {
+    view.governance_class_c_mut()
+        .hard_rate_limit_mut()
+        .refund(did);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +205,32 @@ impl ToolEconomyTicket {
             velocity_token,
             escrow: None,
             policy_for_capture: None,
+            metrics_for_capture: ObservableMetrics::default(),
+            needs_hard_rate_limit_refund: true,
+            consumed: false,
+        }
+    }
+
+    /// Test-only constructor for an escrow-BEARING ticket carrying a budget
+    /// deduction and a captured policy, so the capture path
+    /// ([`settle_tool_economy_capture`]) actually runs payment capture against a
+    /// supplied adapter. Used by the RED-CS3 tool-settle fail-closed test, which
+    /// pairs this with a failing-capture adapter to exercise the
+    /// payment-capture-failure early-return path.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test_with_escrow(
+        actor_did: DID,
+        escrow: PreparedAction,
+        policy: scp_protocol::economy::types::EconomicPolicy,
+    ) -> Self {
+        let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
+        let velocity_token = tracker.record_message(&actor_did, 0);
+        Self {
+            actor_did,
+            deducted_cost: Some(Amount::new(50)),
+            velocity_token,
+            escrow: Some(escrow),
+            policy_for_capture: Some(policy),
             metrics_for_capture: ObservableMetrics::default(),
             needs_hard_rate_limit_refund: true,
             consumed: false,
@@ -358,7 +389,7 @@ impl ToolEconomyTicket {
 /// reversal); the caller folds that into its Class-S fail-closed persist
 /// decision exactly as it does for a carrier rollback.
 pub async fn reverse_caller_reservation_record(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
 ) -> bool {
@@ -379,24 +410,23 @@ pub async fn reverse_caller_reservation_record(
         );
     }
 
-    // Reverse this restored actor's OWNED economy bookkeeping. Keyed by
-    // `record.actor_did`; routing already guarantees this is the right context's
-    // restored state, so there is no instance to confuse. No spawn-generation
-    // gate (see the doc-comment): a fresh respawn-stamped generation never
-    // matches the pre-crash record, so gating would wrongly skip every real
-    // crash-recovery refund and durably over-charge the caller.
-    state
-        .governance
-        .velocity_tracker
+    // Reverse this restored actor's OWNED economy bookkeeping (Class-C governance
+    // economy fields, reached through the field-granular `GovernanceClassCMut`
+    // view — this helper cannot touch Class-S). Keyed by `record.actor_did`;
+    // routing already guarantees this is the right context's restored state, so
+    // there is no instance to confuse. No spawn-generation gate (see the
+    // doc-comment): a fresh respawn-stamped generation never matches the
+    // pre-crash record, so gating would wrongly skip every real crash-recovery
+    // refund and durably over-charge the caller.
+    let gov = view.governance_class_c_mut();
+    gov.velocity_tracker_mut()
         .rollback_one_at(&record.actor_did, record.recorded_at_secs);
     if let Some(cost) = record.deducted_cost {
-        state
-            .governance
-            .budget_tracker
+        gov.budget_tracker_mut()
             .reverse_spend(&record.actor_did, cost);
     }
     if record.needs_hard_rate_limit_refund {
-        state.governance.hard_rate_limit.refund(&record.actor_did);
+        gov.hard_rate_limit_mut().refund(&record.actor_did);
     }
     true
 }
@@ -461,213 +491,302 @@ impl std::fmt::Debug for ToolEconomyReservation {
 /// escrow-authorization failures.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
     now_secs: u64,
 ) -> Result<ToolEconomyReservation, ContextError> {
+    // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
+    // + fail-closed persist on the PAID path are routed through
+    // `commit_class_s_keep_compensating` below; the pre-persist bookkeeping that
+    // runs regardless (hard rate limit, velocity, pre-check) is ALL Class-C, so
+    // it is routed through the non-persisting `class_c_view()` (the run loop
+    // coalesce-persists the bookkeeping mutations), with the view dropped before
+    // the combinator call.
+    //
+    // The §19 economy pre-check needs `&mut budget_tracker` held SIMULTANEOUSLY
+    // with `&velocity_tracker` (plus `&economic_policy` / `&consequence_rules` /
+    // `&message_pricing`) — two-plus disjoint fields of the SAME governance
+    // bucket. `GovernanceClassCMut::economy_pre_check_borrows()` destructures the
+    // view into exactly those five disjoint `&mut`/`&` field references at once,
+    // so the whole pre-check runs without re-borrowing the view between steps.
+    // The borrows struct is dropped before the error arm's `velocity_tracker_mut`
+    // rollback / `hard_rate_limit_mut` refund so those `&mut self` reborrows are
+    // permitted (NLL).
     let event_log = &deps.event_log;
     let key_resolver = &deps.key_resolver;
     let clock = deps.clock.as_ref();
     let payment_adapter = deps.payment_adapter.clone();
 
-    let handle = state.handle.clone();
-    let role_state = state.role_state.clone();
-
-    // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
-    // the tool path. try_consume before any Phase-1 bookkeeping.
-    if !state
-        .governance
-        .hard_rate_limit
-        .try_consume(invoker_did, now_secs)
+    let handle;
+    let role_state;
+    let velocity_token;
+    let metrics;
+    let economic_policy;
+    let action_cost;
     {
-        return Err(ContextError::RateLimited {
-            resource: "tool_invoke".to_owned(),
-            message: "hard rate limit exceeded for invoker".to_owned(),
-        });
-    }
+        let mut view = cell.class_c_view();
 
-    let velocity_token = state
-        .governance
-        .velocity_tracker
-        .record_message(invoker_did, now_secs);
+        handle = view.handle_mut().clone();
+        role_state = view.role_state().clone();
+        let member_count = u64::try_from(view.membership_class_c_mut().count()).unwrap_or(u64::MAX);
 
-    let velocity = state
-        .governance
-        .velocity_tracker
-        .get_velocity(invoker_did, now_secs);
-    let member_count = u64::try_from(state.membership.count()).unwrap_or(u64::MAX);
-    let aggregate = state
-        .governance
-        .velocity_tracker
-        .aggregate_velocity(now_secs);
-    let metrics = ObservableMetrics {
-        sender_velocity: velocity,
-        member_count,
-        context_message_rate: aggregate,
-        relay_queue_depth: 0,
-        time_of_day: now_secs % 86400,
-        storage_usage: 0,
-    };
+        let gov = view.governance_class_c_mut();
 
-    let economic_policy = state.governance.economic_policy.clone();
-    let consequence_rules = state.governance.consequence_rules.clone();
-    let message_pricing = state.governance.message_pricing.clone();
+        // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
+        // the tool path. try_consume before any Phase-1 bookkeeping.
+        if !gov.hard_rate_limit_mut().try_consume(invoker_did, now_secs) {
+            return Err(ContextError::RateLimited {
+                resource: "tool_invoke".to_owned(),
+                message: "hard rate limit exceeded for invoker".to_owned(),
+            });
+        }
 
-    let (events_snapshot, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
-            now_secs,
-            event_log.as_ref(),
-        );
+        velocity_token = gov
+            .velocity_tracker_mut()
+            .record_message(invoker_did, now_secs);
 
-    let mut participation_cache: HashMap<
-        String,
-        scp_protocol::trust::participation::ParticipationRecord,
-    > = HashMap::new();
-
-    let action_cost = {
-        let economy = ToolEconomyContext {
-            economic_policy: economic_policy.as_ref(),
-            budget_tracker: &mut state.governance.budget_tracker,
-            spending_ucan,
-            context_id,
-            now: now_secs,
-            events: &events_snapshot,
-            convergent_now,
-            participation_cache: &mut participation_cache,
-            consequence_rules: &consequence_rules,
-            payment_adapter: payment_adapter.clone(),
-            metrics: metrics.clone(),
-            velocity_tracker: Some(&state.governance.velocity_tracker),
-            message_pricing: message_pricing.as_ref(),
+        let velocity = gov
+            .velocity_tracker_mut()
+            .get_velocity(invoker_did, now_secs);
+        let aggregate = gov.velocity_tracker_mut().aggregate_velocity(now_secs);
+        metrics = ObservableMetrics {
+            sender_velocity: velocity,
+            member_count,
+            context_message_rate: aggregate,
+            relay_queue_depth: 0,
+            time_of_day: now_secs % 86400,
+            storage_usage: 0,
         };
 
-        match economy_pre_check(&economy, invoker_did) {
-            Ok(cost) => cost,
-            Err(err) => {
-                state
-                    .governance
-                    .velocity_tracker
-                    .rollback(invoker_did, velocity_token);
-                state.governance.hard_rate_limit.refund(invoker_did);
-                return Err(invocation_error_to_context(err));
-            }
-        }
-    };
+        // `economic_policy` is cloned out for the later escrow-authorization
+        // `.await` (which holds no view borrow). The pre-check's own reads of
+        // `economic_policy` / `consequence_rules` / `message_pricing` come from
+        // `economy_pre_check_borrows()` below, so no separate clones are needed.
+        economic_policy = gov.economic_policy_mut().clone();
 
-    if action_cost.0 > 0 {
-        let Some(spending) = spending_ucan else {
-            state
-                .governance
-                .velocity_tracker
+        let (events_snapshot, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                view.receive_buffer_mut(),
+                context_id,
+                now_secs,
+                event_log.as_ref(),
+            );
+
+        let mut participation_cache: HashMap<
+            String,
+            scp_protocol::trust::participation::ParticipationRecord,
+        > = HashMap::new();
+
+        action_cost = {
+            // `economy_pre_check_borrows()` hands back `&mut budget_tracker` held
+            // simultaneously with `&velocity_tracker` / `&economic_policy` /
+            // `&consequence_rules` / `&message_pricing` — the disjoint borrows the
+            // pre-check needs at once. Scoped to this block so it drops before the
+            // error arm's `velocity_tracker_mut` rollback (NLL).
+            let pre_check_result = {
+                let borrows = view.governance_class_c_mut().economy_pre_check_borrows();
+                let economy = ToolEconomyContext {
+                    economic_policy: borrows.economic_policy.as_ref(),
+                    budget_tracker: borrows.budget_tracker,
+                    spending_ucan,
+                    context_id,
+                    now: now_secs,
+                    events: &events_snapshot,
+                    convergent_now,
+                    participation_cache: &mut participation_cache,
+                    consequence_rules: borrows.consequence_rules,
+                    payment_adapter: payment_adapter.clone(),
+                    metrics: metrics.clone(),
+                    velocity_tracker: Some(borrows.velocity_tracker),
+                    message_pricing: borrows.message_pricing.as_ref(),
+                };
+                economy_pre_check(&economy, invoker_did)
+            };
+
+            match pre_check_result {
+                Ok(cost) => cost,
+                Err(err) => {
+                    let gov = view.governance_class_c_mut();
+                    gov.velocity_tracker_mut()
+                        .rollback(invoker_did, velocity_token);
+                    gov.hard_rate_limit_mut().refund(invoker_did);
+                    return Err(invocation_error_to_context(err));
+                }
+            }
+        };
+
+        // The paid path requires a spending UCAN before any Class-S nonce work.
+        // Validated here (outside the combinator) so the velocity/hard-rate
+        // rollback for a missing UCAN runs without staging a Class-S mutation.
+        if action_cost.0 > 0 && spending_ucan.is_none() {
+            let gov = view.governance_class_c_mut();
+            gov.velocity_tracker_mut()
                 .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
+            gov.hard_rate_limit_mut().refund(invoker_did);
             return Err(ContextError::PermissionDenied(
                 "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
             ));
-        };
-        if let Err(err) = crate::context::economy_logic::validate_spending_ucan_or_error(
-            spending,
-            invoker_did,
-            context_id,
-            &mut state.governance.class_s.spending_nonce_tracker,
-            &state.governance.revoked_spending_ucan_cids,
-            key_resolver,
-            clock,
-        ) {
-            state
-                .governance
-                .velocity_tracker
-                .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
-            return Err(err);
         }
+        // `view` is dropped here, releasing `cell` for the combinator call.
     }
 
+    // PAID path (`action_cost.0 > 0`, spending UCAN present): the spending-UCAN
+    // replay validation, budget charge, and spending-nonce consume are Class-S
+    // (+ Class-C) mutations that MUST be durably persisted fail-closed BEFORE
+    // the reservation is acknowledged — otherwise an actor crash in the ≤50ms
+    // coalesce window would roll the nonce consume back, letting the same
+    // spending UCAN nonce be replayed after the caller already saw the spend
+    // succeed. `commit_class_s_keep_compensating` performs that fail-closed
+    // persist: `f` consumes the nonce (Class-S — KEPT on persist failure, since
+    // un-consuming re-opens the replay window) and charges the in-memory budget
+    // (Class-C); on persist failure `on_persist_failure` REVERSES the Class-C
+    // budget reservation and the velocity tick (which did not durably land),
+    // while the consumed nonce is intentionally retained. The hard-rate-limit
+    // refund runs in the outer error arm below — `ClassCMut` holds no reference
+    // to the `hard_rate_limit` token bucket, so the persist-failure refund
+    // cannot be expressed through that view.
+    //
+    // FREE path (`action_cost.0 == 0`): no spending UCAN nonce is consumed and
+    // no budget is charged, so — exactly as before — NO fail-closed persist runs
+    // (the velocity tick / hard-rate consume ride the ordinary best-effort
+    // persist elsewhere); the combinator is skipped entirely.
     let deducted_cost = if action_cost.0 > 0 {
-        if state
-            .governance
-            .budget_tracker
-            .record_spend(invoker_did, action_cost)
-            .is_err()
-        {
-            let remaining = state.governance.budget_tracker.remaining(invoker_did).0;
-            state
-                .governance
-                .velocity_tracker
-                .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
-            return Err(invocation_error_to_context(
-                InvocationError::BudgetExceeded {
-                    did: invoker_did.to_string(),
-                    cost: action_cost.0,
-                    remaining,
+        let combinator_result = cell
+            .commit_class_s_keep_compensating(
+                deps,
+                context_id,
+                |mut view| {
+                    let state = view.rest_mut();
+                    // Spending UCAN replay validation (Class-S nonce dedup record).
+                    let spending = spending_ucan.ok_or_else(|| {
+                        ContextError::PermissionDenied(
+                            "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
+                        )
+                    })?;
+                    if let Err(err) =
+                        crate::context::economy_logic::validate_spending_ucan_or_error(
+                            spending,
+                            invoker_did,
+                            context_id,
+                            &mut state.governance.class_s.spending_nonce_tracker,
+                            &state.governance.revoked_spending_ucan_cids,
+                            key_resolver,
+                            clock,
+                        )
+                    {
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        // hard rate limit is refunded once in the outer error arm
+                        // (it is not reachable through the `ClassCMut` compensation
+                        // view, and a second refund would over-credit the bucket).
+                        return Err(err);
+                    }
+
+                    // Budget charge (Class-C). Reversed by `on_persist_failure`
+                    // if the persist does not land.
+                    if state
+                        .governance
+                        .budget_tracker
+                        .record_spend(invoker_did, action_cost)
+                        .is_err()
+                    {
+                        let remaining =
+                            state.governance.budget_tracker.remaining(invoker_did).0;
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        // hard rate limit refunded once in the outer error arm.
+                        return Err(invocation_error_to_context(
+                            InvocationError::BudgetExceeded {
+                                did: invoker_did.to_string(),
+                                cost: action_cost.0,
+                                remaining,
+                            },
+                        ));
+                    }
+                    let deducted_cost = Some(action_cost);
+
+                    // Spending-nonce consume (Class-S). On commit failure, roll
+                    // the just-charged budget + velocity back inline and reject
+                    // before any persist runs (hard rate limit refunded once in
+                    // the outer error arm).
+                    if let Err(e) =
+                        scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
+                            spending,
+                            &mut state.governance.class_s.spending_nonce_tracker,
+                        )
+                    {
+                        if let Some(cost) = deducted_cost {
+                            state
+                                .governance
+                                .budget_tracker
+                                .reverse_spend(invoker_did, cost);
+                        }
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(ContextError::PermissionDenied(format!(
+                            "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
+                        )));
+                    }
+
+                    // `value` = the deducted cost; `external` = the handle the
+                    // persist-failure reversal needs to reverse the Class-C
+                    // budget reservation.
+                    Ok((deducted_cost, deducted_cost))
                 },
-            ));
+                // KEEP-direction Class-S (nonce stays consumed). Reverse the
+                // Class-C budget reservation + velocity tick the failed persist
+                // did not make durable. `view` is a `ClassCMut` — it cannot
+                // re-touch Class-S (and cannot reach `hard_rate_limit`, which is
+                // refunded in the outer arm below).
+                async |charged_cost: Option<Amount>, mut view, _deps| {
+                    let gov = view.governance_class_c_mut();
+                    if let Some(cost) = charged_cost {
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
+                    }
+                    gov.velocity_tracker_mut()
+                        .rollback(invoker_did, velocity_token);
+                },
+            )
+            .await;
+
+        match combinator_result {
+            Ok(deducted_cost) => deducted_cost,
+            Err(err) => {
+                // Single hard-rate-limit refund site for every combinator error
+                // path (`f`-reject and persist-failure alike). `f` and
+                // `on_persist_failure` perform the velocity / budget reversals they
+                // can reach; the hard rate limit is NOT reachable through the
+                // `ClassCMut` compensation view, so its refund runs here — exactly
+                // once, matching the original inline single refund (a second refund
+                // would over-credit the token bucket). The refund is a Class-C
+                // governance mutation routed through the non-persisting
+                // `class_c_view()` (the reserve path's persist already happened in
+                // the combinator above; this error arm injects no extra persist).
+                cell.class_c_view()
+                    .governance_class_c_mut()
+                    .hard_rate_limit_mut()
+                    .refund(invoker_did);
+                return Err(err);
+            }
         }
-        Some(action_cost)
     } else {
         None
     };
 
-    if deducted_cost.is_some()
-        && let Some(spending) = spending_ucan
-        && let Err(e) = scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
-            spending,
-            &mut state.governance.class_s.spending_nonce_tracker,
-        )
-    {
-        if let Some(cost) = deducted_cost {
-            state
-                .governance
-                .budget_tracker
-                .reverse_spend(invoker_did, cost);
-        }
-        state
-            .governance
-            .velocity_tracker
-            .rollback(invoker_did, velocity_token);
-        state.governance.hard_rate_limit.refund(invoker_did);
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
-        )));
-    }
-
-    // ADR-049 §9 Class S: the spending-nonce consume is security-critical
-    // monotonic state that does NOT survive an actor crash (it lives in the
-    // actor-owned `spending_nonce_tracker`). It MUST be durably persisted
-    // BEFORE this reservation is acknowledged to the caller — otherwise an
-    // actor crash in the ≤50ms coalesce window would roll the consume back,
-    // letting the same spending UCAN nonce be replayed after the caller already
-    // saw the spend succeed. Persist fail-closed: on a persist failure, reverse
-    // the budget/velocity/rate-limit reservation and return an error so the
-    // operation is NOT acknowledged. (The consumed nonce is intentionally NOT
-    // un-consumed — leaving it consumed is the conservative/fail-closed
-    // direction for replay protection; un-consuming would re-open the replay
-    // window, the exact failure this guard prevents.)
-    if deducted_cost.is_some()
-        && spending_ucan.is_some()
-        && let Err(persist_err) =
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)
-    {
-        if let Some(cost) = deducted_cost {
-            state
-                .governance
-                .budget_tracker
-                .reverse_spend(invoker_did, cost);
-        }
-        state
-            .governance
-            .velocity_tracker
-            .rollback(invoker_did, velocity_token);
-        state.governance.hard_rate_limit.refund(invoker_did);
-        return Err(persist_err);
-    }
-
+    // The escrow authorization is an EXTERNAL `.await` that touches no actor
+    // state; do it without holding a state borrow. Only the failure arm mutates
+    // Class-C governance economy, routed through the non-persisting
+    // `class_c_view()` (the paid-path persist already ran in the combinator
+    // above; this reserve error arm injects no extra persist).
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
         (Some(policy), Some(adapter)) => {
             match invoke::authorize_tool_payment(
@@ -681,17 +800,14 @@ pub async fn reserve_tool_economy(
             {
                 Ok(prepared) => prepared,
                 Err(auth_err) => {
+                    let mut view = cell.class_c_view();
+                    let gov = view.governance_class_c_mut();
                     if let Some(cost) = deducted_cost {
-                        state
-                            .governance
-                            .budget_tracker
-                            .reverse_spend(invoker_did, cost);
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
                     }
-                    state
-                        .governance
-                        .velocity_tracker
+                    gov.velocity_tracker_mut()
                         .rollback(invoker_did, velocity_token);
-                    state.governance.hard_rate_limit.refund(invoker_did);
+                    gov.hard_rate_limit_mut().refund(invoker_did);
                     return Err(invocation_error_to_context(auth_err));
                 }
             }
@@ -710,10 +826,11 @@ pub async fn reserve_tool_economy(
         consumed: false,
     };
 
+    // `generation` is a Class-C structural field read through the cell `Deref`.
     Ok(ToolEconomyReservation {
         handle,
         role_state,
-        generation: state.generation,
+        generation: cell.generation,
         ticket,
     })
 }
@@ -728,19 +845,35 @@ pub async fn reserve_tool_economy(
 /// escrowed payment, and finally commits the ticket.
 ///
 /// Returns the triggered consequences and the optional payment receipt.
-/// On payment-capture failure the ticket is reversed (budget / velocity /
-/// rate-limit) and the error surfaced.
+///
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED
+/// `&mut Option<ClassSCommitToken>` that this function POPULATES with a
+/// fail-closed-persist obligation if consequence enforcement performed a
+/// downward-authorization mutation (a `suspended_capabilities` GROW or an
+/// `AssignRole` `member_capabilities` replacement). The token is a caller-owned
+/// sink rather than part of the return value SO IT SURVIVES THE PAYMENT-CAPTURE
+/// ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
+/// capture, and on capture failure this function returns `Err` early — a
+/// returned token would be STRANDED/DROPPED by that `?` (tripping the token's Drop
+/// guard on a path that legitimately must still persist, or losing the obligation
+/// entirely — the RED-CS3 hole). With the token living in the caller's `Option`,
+/// passed by `&mut`, an early `return Err` here does NOT drop it; the cell-holding
+/// caller ([`settle_tool_economy`]) commits it fail-closed AFTER the call
+/// regardless of Ok/Err. On payment-capture failure the ticket is reversed (budget
+/// / velocity / rate-limit) and the error surfaced; the in-memory downward-auth
+/// mutation is NOT reversed (keep-direction).
 ///
 /// # Errors
 ///
 /// Propagates [`ContextError::PermissionDenied`] when payment capture
 /// fails after a successful execution.
 pub async fn settle_tool_economy_capture(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
     ticket: ToolEconomyTicket,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -756,12 +889,15 @@ pub async fn settle_tool_economy_capture(
     let now = clock.now_secs();
     let (events_for_consequences, convergent_now) =
         crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
+            view.receive_buffer_mut(),
             context_id,
             now,
             event_log.as_ref(),
         );
-    let consequence_rules = state.governance.consequence_rules.clone();
+    let consequence_rules = view
+        .governance_class_c_mut()
+        .consequence_rules_mut()
+        .clone();
 
     let consequences = post_tool_invocation_bookkeeping(
         &events_for_consequences,
@@ -769,12 +905,26 @@ pub async fn settle_tool_economy_capture(
         context_id,
         now,
         convergent_now,
-        &mut state.governance.participation_cache,
+        view.governance_class_c_mut().participation_cache_mut(),
         &consequence_rules,
     );
 
-    let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
-    crate::context::governance_logic::enforce_triggered_consequences(
+    // Consequence path (ADR-049 §9 / RED-CS3). `consequence_split()` yields the
+    // consequence-engine split — disjoint Class-C / structural borrows plus the
+    // consequence-only `ConsequenceRoleStateMut` (the ONE role view exposing the
+    // downward-auth GROW + demotion) — from the field-granular cell view, with NO
+    // whole `&mut PerContextState` and NO `&mut` reach into any PRIVATIZED Class-S
+    // sub-struct. (`ceiling` is read-only even here; the GROW
+    // `suspended_capabilities` / the `member_capabilities` demotion are applied
+    // through methods.) Consequence EVALUATION stays best-effort (the run loop
+    // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
+    // which the cell-holding caller performs when `downward_auth_applied` is set.
+    let mut split = view.consequence_split();
+    // The GROW arms the caller-owned `downward_auth_sink` directly (GAP-A closed),
+    // so the mutation's fail-closed-persist obligation survives the payment-capture
+    // error path below (a returned token would be stranded/dropped by the early
+    // `return Err` — RED-CS3).
+    let _ = crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
             context_id,
@@ -786,6 +936,7 @@ pub async fn settle_tool_economy_capture(
             event_log: event_log.as_ref(),
             event_tx: event_tx.as_ref(),
         },
+        downward_auth_sink,
     );
 
     let payment_receipt = match (
@@ -804,18 +955,17 @@ pub async fn settle_tool_economy_capture(
             {
                 Ok(receipt) => receipt,
                 Err(capture_err) => {
+                    // Reverse the Class-C governance economy bookkeeping through
+                    // the field-granular `GovernanceClassCMut` view (no `&mut`
+                    // path to any Class-S sub-struct; coalesce-persisted).
+                    let gov = view.governance_class_c_mut();
                     if let Some(cost) = ticket.deducted_cost {
-                        state
-                            .governance
-                            .budget_tracker
-                            .reverse_spend(invoker_did, cost);
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
                     }
-                    state
-                        .governance
-                        .velocity_tracker
+                    gov.velocity_tracker_mut()
                         .rollback(invoker_did, ticket.velocity_token);
                     if ticket.needs_hard_rate_limit_refund {
-                        state.governance.hard_rate_limit.refund(invoker_did);
+                        gov.hard_rate_limit_mut().refund(invoker_did);
                     }
                     let mut ticket = ticket;
                     ticket.consumed = true;
@@ -857,12 +1007,14 @@ pub async fn settle_tool_economy_capture(
 /// state. Returns `true` when the local rollback ran (generations matched),
 /// `false` when only the external escrow was voided (mismatch).
 pub async fn rollback_tool_economy_generation_checked(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     reservation_generation: u64,
     ticket: ToolEconomyTicket,
 ) -> bool {
-    if reservation_generation != state.generation {
+    // `generation` is a Class-C structural field reached through the view; read
+    // it via the field-granular accessor (the view holds no whole `&mut`).
+    if reservation_generation != *view.generation_mut() {
         // Confused-deputy guard (mirrors `settle_tool_economy`): the reservation
         // belongs to a now-replaced actor instance. Void only the external
         // escrow and consume; the context-local bookkeeping lived in the gone
@@ -872,12 +1024,12 @@ pub async fn rollback_tool_economy_generation_checked(
             .await;
         return false;
     }
-    rollback_tool_economy(state, deps, ticket).await;
+    rollback_tool_economy(view, deps, ticket).await;
     true
 }
 
 pub async fn rollback_tool_economy(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     mut ticket: ToolEconomyTicket,
 ) {
@@ -888,18 +1040,18 @@ pub async fn rollback_tool_economy(
         invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
     }
 
-    state
-        .governance
-        .velocity_tracker
+    // Reverse the Class-C governance economy bookkeeping through the
+    // field-granular `GovernanceClassCMut` view (this helper cannot touch
+    // Class-S — it holds no `&mut` path to it).
+    let gov = view.governance_class_c_mut();
+    gov.velocity_tracker_mut()
         .rollback(&ticket.actor_did, ticket.velocity_token);
     if let Some(cost) = ticket.deducted_cost {
-        state
-            .governance
-            .budget_tracker
+        gov.budget_tracker_mut()
             .reverse_spend(&ticket.actor_did, cost);
     }
     if ticket.needs_hard_rate_limit_refund {
-        state.governance.hard_rate_limit.refund(&ticket.actor_did);
+        gov.hard_rate_limit_mut().refund(&ticket.actor_did);
         ticket.needs_hard_rate_limit_refund = false;
     }
 }
@@ -1104,7 +1256,7 @@ pub struct ToolSettleOutcome {
 /// Propagates the capture path's [`ContextError`] on payment-capture
 /// failure. The rollback path is infallible.
 pub async fn settle_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -1119,10 +1271,11 @@ pub async fn settle_tool_economy(
     // economy state. Reject without touching this state — void only the
     // EXTERNAL escrow (a real payment hold from the prior instance's
     // reserve) and consume the ticket so it does not leak or trip the
-    // unbalanced-Drop guard.
-    if request.generation() != state.generation {
+    // unbalanced-Drop guard. `generation` is a Class-C structural field read
+    // through the `Deref` to `&PerContextState`.
+    if request.generation() != cell.generation {
         let expected = request.generation();
-        let actual = state.generation;
+        let actual = cell.generation;
         let ticket = request.into_ticket();
         ticket
             .void_external_and_consume(deps.payment_adapter.as_ref())
@@ -1139,8 +1292,60 @@ pub async fn settle_tool_economy(
             // Read the committed cost before the ticket is consumed by
             // the capture path so it can be threaded into the event.
             let cost = ticket.deducted_cost;
-            let (consequences, payment_receipt) =
-                settle_tool_economy_capture(state, deps, context_id, invoker_did, ticket).await?;
+            // The capture path runs consequence enforcement plus post-invocation
+            // participation bookkeeping — it reaches the receive buffer, role
+            // state, membership, and the checkpoint counter in ADDITION to the
+            // Class-C governance economy fields. `class_c_view()` hands out a
+            // `ClassCMut` holding all of those as disjoint field references;
+            // `consequence_split()` (inside `settle_tool_economy_capture`) yields
+            // the `ConsequenceStateSplit` shape (consequence-only GROW role view)
+            // with NO whole `&mut PerContextState` and NO Class-S reach. Evaluation
+            // coalesces
+            // through the run loop; the downward-auth outcomes — a
+            // consequence-engine capability suspension or an `AssignRole` demotion
+            // — populate the caller-owned `downward_auth_obligation` token sink and
+            // are persisted fail-closed below (ADR-049 §9, RED-CS3). The sink is
+            // owned HERE (not returned by the callee) so the obligation survives the
+            // callee's payment-capture error path — a returned token would be
+            // stranded/dropped by that early `return Err`, tripping its Drop guard on
+            // a path that must still persist or losing the obligation. The token
+            // carrier (vs. a `bool`) makes a populated-but-undischarged obligation a
+            // Drop-guard PANIC in debug/CI.
+            let mut downward_auth_obligation: Option<
+                crate::context::actor::class_s::ClassSCommitToken,
+            > = None;
+            let capture_result = settle_tool_economy_capture(
+                cell.class_c_view(),
+                deps,
+                context_id,
+                invoker_did,
+                ticket,
+                &mut downward_auth_obligation,
+            )
+            .await;
+            // Fail-closed persist (token `commit`) of an applied downward-auth
+            // mutation (keep-direction), run on BOTH the Ok and Err arms: the
+            // mutation is already in memory; commit it before acking so a
+            // coalesce-window crash cannot silently re-grant the removed authority.
+            // `take()` discharges the Drop guard. The view above has been consumed,
+            // so the `&mut cell` borrow is released here. ERROR PRECEDENCE: when the
+            // capture itself failed, the commit still runs; if the commit ALSO
+            // fails, the §9 durability failure (`PersistenceFailed`) is surfaced over
+            // the original capture error (durability is the security obligation), and
+            // the original capture cause is preserved in its message. When the
+            // commit succeeds, the original capture error is surfaced unchanged.
+            if let Some(token) = downward_auth_obligation.take()
+                && let Err(persist_err) = token.commit(cell, deps, context_id)
+            {
+                return Err(match capture_result {
+                    Ok(_) => persist_err,
+                    Err(capture_err) => ContextError::PersistenceFailed(format!(
+                        "{persist_err} (after a tool-settle payment-capture failure: \
+                         {capture_err})"
+                    )),
+                });
+            }
+            let (consequences, payment_receipt) = capture_result?;
             Ok(ToolSettleOutcome {
                 consequences,
                 payment_receipt,
@@ -1148,7 +1353,7 @@ pub async fn settle_tool_economy(
             })
         }
         ToolSettleRequest::Rollback { ticket, .. } => {
-            rollback_tool_economy(state, deps, ticket).await;
+            rollback_tool_economy(cell.class_c_view(), deps, ticket).await;
             Ok(ToolSettleOutcome::default())
         }
     }
@@ -1193,6 +1398,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::actor::state::PerContextState;
 
     fn test_did() -> DID {
         DID::from("did:test:tools-rate-limit")
@@ -1205,22 +1411,26 @@ mod tests {
     #[test]
     fn consume_hard_rate_limit_uses_actor_owned_state() {
         let did = test_did();
-        let mut state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
+        let state = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
+        // The helpers take the field-granular `ClassCMut`; wrap the test state in
+        // a `ClassSCell` to construct the view.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
-        assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+        assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
     #[test]
     fn refund_hard_rate_limit_restores_actor_owned_bucket() {
         let did = test_did();
-        let mut state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
+        let state = PerContextState::new_for_test_encrypted([10u8; 32], 1, test_admin());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         for _ in 0..10 {
-            assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+            assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
         }
-        assert!(!try_consume_hard_rate_limit(&mut state, &did, 10));
-        refund_hard_rate_limit(&mut state, &did);
-        assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+        assert!(!try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
+        refund_hard_rate_limit(cell.class_c_view(), &did);
+        assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
     fn ticket_with_budget(did: &DID) -> ToolEconomyTicket {
@@ -1264,5 +1474,348 @@ mod tests {
         let ticket = ticket_with_budget(&did);
         ticket.void_external_and_consume(None).await;
         // No panic on Drop ⇒ the ticket was consumed.
+    }
+
+    /// ADR-049 §9 (RED-CS3): the tool-settle CAPTURE-FAILURE path must NOT
+    /// strand an applied capability suspension on best-effort persistence.
+    /// A consequence suspends the invoker in memory BEFORE the fallible payment
+    /// capture; if capture then fails, `settle_tool_economy_capture` returns
+    /// `Err` early — so the suspension obligation is carried on a CALLER-OWNED
+    /// `&mut Option<ClassSCommitToken>` token sink (not a returned token the `?`
+    /// would strand/drop). This test drives the capture path with a FAILING adapter
+    /// and a suspending state and asserts the function returns `Err` while the
+    /// obligation STILL persists fail-closed (the token survived the error) and the
+    /// suspension is retained in memory. Without the fix (a returned token) the
+    /// obligation would be stranded by the `?`.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
+    mod tool_settle_fail_closed {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use scp_identity::DID;
+        use scp_protocol::context::params::Capability;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::state::PerContextState;
+        use crate::context::builder::ContextEventLogProvider;
+        use crate::context::providers::MerkleEventLogProvider;
+        use crate::economy::adapter::PaymentMetadata;
+        use crate::economy::adapter::{
+            AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError,
+            PaymentReceipt, RefundConfirmation, VerificationResult,
+        };
+        use crate::economy::integration::{ActionEnvelope, PreparedAction};
+        use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
+
+        const ADMIN: &str = "did:dht:z6MkAdminToolSettle";
+        const INVOKER: &str = "did:dht:z6MkInvokerToolSettle";
+        const PAYEE: &str = "did:dht:z6MkPayeeToolSettle";
+        const CTX_BYTE: u8 = 0x7c;
+
+        /// A payment adapter whose `capture` ALWAYS fails — the path that drives
+        /// `complete_tool_payment` into its error arm. `verify_authorization`
+        /// must succeed first (it runs before capture in `process_paid_action`).
+        struct FailingCaptureAdapter;
+        impl PaymentAdapter for FailingCaptureAdapter {
+            fn adapter_id(&self) -> &'static str {
+                "failing-capture"
+            }
+            fn capabilities(&self) -> AdapterCapabilities {
+                AdapterCapabilities {
+                    supported_currencies: vec![CurrencyCode::from("USD")],
+                    supports_streaming: false,
+                    supports_batch_auth: false,
+                    supports_single_step: false,
+                    min_amount: None,
+                    max_amount: None,
+                    typical_settlement_ms: 0,
+                    requires_facilitator: false,
+                }
+            }
+            async fn authorize(
+                &self,
+                payer: &DID,
+                payee: &DID,
+                amount: Amount,
+                currency: CurrencyCode,
+                _metadata: PaymentMetadata,
+            ) -> Result<PaymentAuthorization, PaymentError> {
+                Ok(auth(payer, payee, amount, currency))
+            }
+            async fn verify_authorization(
+                &self,
+                _auth: &PaymentAuthorization,
+            ) -> Result<(), PaymentError> {
+                Ok(())
+            }
+            async fn capture(
+                &self,
+                _auth: &PaymentAuthorization,
+            ) -> Result<PaymentReceipt, PaymentError> {
+                Err(PaymentError::AdapterError("induced capture failure".into()))
+            }
+            async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+                Ok(())
+            }
+            async fn verify(
+                &self,
+                _receipt: &PaymentReceipt,
+            ) -> Result<VerificationResult, PaymentError> {
+                Ok(VerificationResult {
+                    valid: true,
+                    adapter_id: "failing-capture".to_owned(),
+                    verified_amount: Amount(0),
+                    verified_currency: CurrencyCode::from("USD"),
+                    verification_timestamp: 0,
+                })
+            }
+            async fn refund(
+                &self,
+                _receipt: &PaymentReceipt,
+                _amount: Option<Amount>,
+            ) -> Result<RefundConfirmation, PaymentError> {
+                Ok(RefundConfirmation {
+                    refund_id: [0u8; 32],
+                    original_receipt_id: [0u8; 32],
+                    refunded_amount: Amount(0),
+                    currency: CurrencyCode::from("USD"),
+                    adapter_proof: vec![],
+                })
+            }
+        }
+
+        fn auth(
+            payer: &DID,
+            payee: &DID,
+            amount: Amount,
+            currency: CurrencyCode,
+        ) -> PaymentAuthorization {
+            PaymentAuthorization {
+                auth_id: [9u8; 32],
+                payer: payer.clone(),
+                payee: payee.clone(),
+                amount,
+                currency,
+                adapter_id: "failing-capture".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            }
+        }
+
+        fn paid_policy() -> EconomicPolicy {
+            EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_tool_invoke: Some(Amount(50)),
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["failing-capture".to_owned()],
+                pricing_formula: None,
+                payee: DID(PAYEE.to_owned()),
+            }
+        }
+
+        /// An escrow-bearing ticket whose capture will run (escrow + policy set),
+        /// carrying a budget deduction. Consumed by the capture path.
+        fn escrow_ticket() -> super::super::ToolEconomyTicket {
+            let invoker = DID(INVOKER.to_owned());
+            super::super::ToolEconomyTicket::new_for_test_with_escrow(
+                invoker.clone(),
+                PreparedAction {
+                    envelope: ActionEnvelope {
+                        actor: invoker.clone(),
+                        action_type: PaidActionType::ToolInvoke,
+                        context_id: None,
+                        authorization: Some(auth(
+                            &invoker,
+                            &DID(PAYEE.to_owned()),
+                            Amount(50),
+                            CurrencyCode::from("USD"),
+                        )),
+                        payload: Vec::new(),
+                    },
+                    evaluated_cost: Amount(50),
+                },
+                paid_policy(),
+            )
+        }
+
+        async fn build_deps() -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                ADMIN.to_owned(),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn ContextEventLogProvider> =
+                Box::new(MerkleEventLogProvider::new());
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_primitives::Clock> =
+                Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+            let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+                Arc::new(FailingCaptureAdapter);
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(Box::new(super::FailToolPersistence)),
+                Some(payment_adapter),
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(ADMIN.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        fn seed_state() -> PerContextState {
+            let mut state = PerContextState::new_for_test_encrypted(
+                [CTX_BYTE; 32],
+                1_700_000_000,
+                DID(ADMIN.to_owned()),
+            );
+            state
+                .membership
+                .add_member(DID(INVOKER.to_owned()), "member".to_owned(), Vec::new());
+            state.role_state.members.insert(INVOKER.to_owned());
+            state.role_state.member_capabilities.insert(
+                INVOKER.to_owned(),
+                std::iter::once(Capability::MessagesWrite).collect(),
+            );
+            // Buffer per-author MessageSent events so a MessageVelocity rule with
+            // threshold 1 fires for INVOKER when the settle runs its consequence
+            // evaluation (the trigger type is immaterial to the persist path under
+            // test — any rule producing a SuspendAccess outcome exercises it).
+            for seq in 0..5u64 {
+                state.receive_buffer.push(
+                    scp_protocol::context::membership::ContextEvent::MessageSent {
+                        sender_did: DID(INVOKER.to_owned()),
+                        sequence_number: seq,
+                        payload: Vec::new(),
+                    },
+                );
+            }
+            state.governance.consequence_rules.push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: Duration::from_hours(1),
+            });
+            state
+        }
+
+        /// The capture-failure path persists the applied suspension fail-closed:
+        /// the surfaced error reflects the §9 durability failure (over the
+        /// capture error) and the suspension is retained in memory.
+        #[tokio::test]
+        async fn tool_settle_capture_failure_persists_suspension_fail_closed() {
+            let deps = build_deps().await;
+            let mut cell = ClassSCell::new(seed_state());
+            let ctx_str = hex::encode([CTX_BYTE; 32]);
+
+            let request = super::super::ToolSettleRequest::Capture {
+                generation: cell.generation,
+                ticket: escrow_ticket(),
+            };
+            let result = super::super::settle_tool_economy(
+                &mut cell,
+                &deps,
+                &ctx_str,
+                &DID(INVOKER.to_owned()),
+                request,
+            )
+            .await;
+
+            // Capture failed, but the suspension's fail-closed persist still ran
+            // and itself failed → the §9 durability error surfaces (with the
+            // capture cause preserved in its message).
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::context::ContextError::PersistenceFailed(_))
+                ),
+                "a tool-settle whose capture fails AFTER a consequence suspension must \
+                 still persist the suspension fail-closed; a failing persist surfaces \
+                 PersistenceFailed; got {result:?}"
+            );
+            let suspended = cell
+                .role_state
+                .suspended_for(INVOKER)
+                .expect("INVOKER must have been suspended by the tool-rate consequence");
+            assert!(
+                suspended.contains(&Capability::MessagesWrite),
+                "the suspended capability is retained in memory (keep-direction) even \
+                 though the payment capture failed"
+            );
+        }
+    }
+
+    /// Persistence whose `persist_context` ALWAYS fails — drives the tool-settle
+    /// fail-closed path. Defined at the `tests` module scope so the nested
+    /// `tool_settle_fail_closed` module can reference it via `super::`.
+    struct FailToolPersistence;
+    impl crate::context::persistence::ContextPersistence for FailToolPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
     }
 }

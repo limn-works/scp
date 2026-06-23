@@ -76,7 +76,7 @@ use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::roles::{self, Capability, CapabilityCeiling, ContextRoleState};
+use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 
@@ -202,7 +202,7 @@ pub fn export_context_blocks(
 /// - Crypto / transport / event-log failures are propagated.
 #[allow(clippy::too_many_lines)]
 pub async fn leave_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     caller_did: &DID,
@@ -211,151 +211,172 @@ pub async fn leave_context(
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = state::context_id_to_bytes(&context_id);
 
-    // PR #1606 C6: refuse if a commit fault marker is set.
-    governance_helpers::check_commit_fault(state)?;
+    // ADR-049 §9 Class S: a member leaving removes their own membership (a
+    // downward-authorization transition for that member) — STRUCTURAL fail-closed.
+    // The whole removal body (MLS remove + membership/role/access/routing cleanup
+    // + the `MemberLeft` event-log append) runs inside the Class-S `_keep`
+    // combinator's `rest_mut()` view, so the fail-closed persist is performed BY
+    // the combinator (replacing the former inline `persist_state_fail_closed`).
+    // KEEP-direction: a removal that did not durably land is NOT rolled back in
+    // memory — re-admitting a member the caller was told had left is the unsafe
+    // direction; the persist error is surfaced instead so the leave is not
+    // acknowledged as durable. The body is entirely synchronous (the only
+    // `.await`, the close-on-empty transition, runs AFTER the persist), so it
+    // fits the sync `_keep` closure. `check_commit_fault` reads through the whole
+    // `&mut PerContextState` the view hands back; `try_broadcast_commit_or_enqueue`
+    // is passed only the three disjoint Class-C fields it mutates (via
+    // `CommitBroadcastBorrows`), borrowed from that same state.
+    let should_close = cell.commit_class_s_keep(deps, &context_id, |mut view| {
+        let state = view.rest_mut();
 
-    // Authorization: self-removal always allowed; otherwise MemberRemove
-    // required.
-    if caller_did != member_did
-        && !state
-            .role_state
-            .member_has_capability(caller_did, &Capability::MemberRemove)
-    {
-        return Err(ContextError::PermissionDenied(
-            "caller lacks permission to remove this member".into(),
-        ));
-    }
+        // PR #1606 C6: refuse if a commit fault marker is set.
+        governance_helpers::check_commit_fault(state)?;
 
-    let is_broadcast = state.broadcast_context.is_some();
-
-    // Crypto operations -- skip for broadcast mode (no MLS).
-    // H9: MLS group removal FIRST (hard security boundary), then sender
-    // key cleanup as best-effort. MLS removal is the cryptographic
-    // enforcement; sender key removal is defense-in-depth (§9.16).
-    if !is_broadcast {
-        let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
-        if let Err(e) = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, member_did)
+        // Authorization: self-removal always allowed; otherwise MemberRemove
+        // required.
+        if caller_did != member_did
+            && !state
+                .role_state
+                .member_has_capability(caller_did, &Capability::MemberRemove)
         {
-            tracing::warn!(
-                context_id = %context_id,
-                member = %member_did,
-                error = %e,
-                "remove_member_sender_key failed after MLS removal — \
-                 sender key layer may retain stale key"
-            );
+            return Err(ContextError::PermissionDenied(
+                "caller lacks permission to remove this member".into(),
+            ));
         }
 
-        // Broadcast the MLS Commit to remaining members so they can
-        // advance their group epoch and ratchet key material. PR #1606
-        // C6: on transport failure, the commit is durably enqueued for
-        // retry.
-        governance_helpers::try_broadcast_commit_or_enqueue(
-            state,
-            deps,
+        let is_broadcast = state.broadcast_context.is_some();
+
+        // Crypto operations -- skip for broadcast mode (no MLS).
+        // H9: MLS group removal FIRST (hard security boundary), then sender
+        // key cleanup as best-effort. MLS removal is the cryptographic
+        // enforcement; sender key removal is defense-in-depth (§9.16).
+        if !is_broadcast {
+            let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
+            if let Err(e) = deps
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, member_did)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    member = %member_did,
+                    error = %e,
+                    "remove_member_sender_key failed after MLS removal — \
+                     sender key layer may retain stale key"
+                );
+            }
+
+            // Broadcast the MLS Commit to remaining members so they can
+            // advance their group epoch and ratchet key material. PR #1606
+            // C6: on transport failure, the commit is durably enqueued for
+            // retry.
+            governance_helpers::try_broadcast_commit_or_enqueue(
+                governance_helpers::CommitBroadcastBorrows {
+                    pending_commits: &mut state.pending_commits,
+                    commit_fault: &mut state.commit_fault,
+                    receive_buffer: &mut state.receive_buffer,
+                },
+                deps,
+                &context_id,
+                remove_output.commit_bytes,
+                &CommitOperation::LeaveContext {
+                    member_did: member_did.clone(),
+                },
+            );
+
+            // Rotate the local sender key and distribute to remaining members
+            // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
+            // security boundary. If rotation fails, log but continue.
+            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after leave — \
+                     remaining members retain old sender key"
+                );
+            }
+            if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after leave"
+                );
+            }
+        }
+
+        // State check + membership removal -- the actor owns state for the
+        // duration of this command, so no relock dance is required.
+        state::require_active(&state.handle)?;
+
+        // For broadcast contexts, unsubscribe from the BroadcastContext.
+        // rotate_keys=true for forward secrecy after departure.
+        if let Some(ref mut bc) = state.broadcast_context {
+            // Ignore MemberNotFound -- the member may be an author who was
+            // never a subscriber. Propagate all other errors (e.g.
+            // CryptoFailed from epoch overflow during key rotation).
+            match bc.unsubscribe(member_did, true) {
+                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !state.membership.remove_member(member_did) {
+            return Err(ContextError::MemberNotFound(member_did.to_string()));
+        }
+
+        // Remove from role state.
+        state.role_state.members.remove(member_did.as_ref());
+        state.role_state.assignments.remove(member_did.as_ref());
+        state
+            .role_state
+            .member_capabilities
+            .remove(member_did.as_ref());
+
+        // Destroy the departing member's access key (§9.17.2, ADR-038).
+        state
+            .access
+            .access_key_store
+            .remove(&context_id, member_did.as_ref());
+
+        // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
+        // a broadcast context (which carries no peer registry).
+        if let Some(reg) = state.routing.peer_registry_mut() {
+            reg.remove(member_did);
+        }
+
+        // Emit MemberLeft event to receive buffer.
+        let left_event = ContextEvent::MemberLeft {
+            member_did: member_did.clone(),
+        };
+        state::emit_event_into(
+            &mut state.receive_buffer,
+            left_event,
             &context_id,
-            remove_output.commit_bytes,
-            &CommitOperation::LeaveContext {
-                member_did: member_did.clone(),
-            },
+            deps.event_tx.as_ref(),
         );
 
-        // Rotate the local sender key and distribute to remaining members
-        // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
-        // security boundary. If rotation fails, log but continue.
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "rotate_sender_key failed after leave — \
-                 remaining members retain old sender key"
-            );
-        }
-        if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after leave"
-            );
-        }
-    }
+        let should_close = state.membership.count() == 0;
 
-    // State check + membership removal -- the actor owns state for the
-    // duration of this command, so no relock dance is required.
-    state::require_active(&state.handle)?;
+        // Append MemberLeft event to event log.
+        deps.event_log.append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            member_did.as_ref(),
+            // Committer-assigned: the leaving member's clock — the source of the
+            // `created_at` on its outgoing leave commit. This is the
+            // convergent-by-construction value WHEN cross-member leaf replication
+            // lands: the receive-side append path is currently dormant, so this
+            // leaf is committer-appended-only and is NOT yet replicated to other
+            // members. Cross-member convergence of membership leaves is the
+            // forward step under ADR-051 (§7.3.1, §9.9.3).
+            deps.clock.now_secs(),
+        )?;
+        state.checkpoint_events_since += 1;
 
-    // For broadcast contexts, unsubscribe from the BroadcastContext.
-    // rotate_keys=true for forward secrecy after departure.
-    if let Some(ref mut bc) = state.broadcast_context {
-        // Ignore MemberNotFound -- the member may be an author who was
-        // never a subscriber. Propagate all other errors (e.g.
-        // CryptoFailed from epoch overflow during key rotation).
-        match bc.unsubscribe(member_did, true) {
-            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
+        Ok(should_close)
+    })?;
 
-    if !state.membership.remove_member(member_did) {
-        return Err(ContextError::MemberNotFound(member_did.to_string()));
-    }
-
-    // Remove from role state.
-    state.role_state.members.remove(member_did.as_ref());
-    state.role_state.assignments.remove(member_did.as_ref());
-    state
-        .role_state
-        .member_capabilities
-        .remove(member_did.as_ref());
-
-    // Destroy the departing member's access key (§9.17.2, ADR-038).
-    state
-        .access
-        .access_key_store
-        .remove(&context_id, member_did.as_ref());
-
-    // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
-    // a broadcast context (which carries no peer registry).
-    if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.remove(member_did);
-    }
-
-    // Emit MemberLeft event to receive buffer.
-    let left_event = ContextEvent::MemberLeft {
-        member_did: member_did.clone(),
-    };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        left_event,
-        &context_id,
-        deps.event_tx.as_ref(),
-    );
-
-    let should_close = state.membership.count() == 0;
-
-    // Append MemberLeft event to event log.
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        member_did.as_ref(),
-        // Committer-assigned: the leaving member's clock — the source of the
-        // `created_at` on its outgoing leave commit. This is the
-        // convergent-by-construction value WHEN cross-member leaf replication
-        // lands: the receive-side append path is currently dormant, so this
-        // leaf is committer-appended-only and is NOT yet replicated to other
-        // members. Cross-member convergence of membership leaves is the
-        // forward step under ADR-051 (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
-    state.checkpoint_events_since += 1;
-
-    // ADR-049 §9 Class S: a member leaving removes their own membership (a
-    // downward-authorization transition for that member) — persist fail-closed
-    // so a crash cannot re-admit a member who was told their leave succeeded.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
-
-    // If member count reaches zero, transition to Closing.
+    // If member count reaches zero, transition to Closing. Runs AFTER the
+    // fail-closed persist above, matching the prior ordering.
     if should_close {
         handle.transition_to(&ContextState::Closing).await?;
     }
@@ -433,12 +454,12 @@ pub fn drain_and_deliver_sender_keys(
 ///
 /// See [`close_context_with_key`].
 pub async fn close_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
 ) -> Result<CloseResult, ContextError> {
-    close_context_with_key(state, deps, handle, initiator_did, None).await
+    close_context_with_key(cell, deps, handle, initiator_did, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +481,7 @@ pub async fn close_context(
 ///   `SingleAdmin` (the close must route through governance).
 /// - Errors propagated from [`ttl::close_context`].
 pub async fn close_context_with_key(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
@@ -468,12 +489,16 @@ pub async fn close_context_with_key(
 ) -> Result<CloseResult, ContextError> {
     let context_id = handle.context_id().to_owned();
 
+    // Pre-`ttl::close_context` GATES are read-only against the cell (`&*cell`
+    // Deref → `&PerContextState`); they stage no Class-S mutation, so no persist
+    // is owed for an early reject here.
+
     // State check inside actor body -- eliminates TOCTOU race.
-    state::require_active(&state.handle)?;
+    state::require_active(&cell.handle)?;
 
     // Gate: multi-admin models must use governance path (SCP-270, ADR-031).
     if !matches!(
-        state.governance.engine.model_config(),
+        cell.governance.engine.model_config(),
         GovernanceModelConfig::SingleAdmin { .. }
     ) {
         return Err(ContextError::PermissionDenied(
@@ -484,7 +509,7 @@ pub async fn close_context_with_key(
     }
 
     // Snapshot role_state for the ttl::close_context call.
-    let role_state = state.role_state.clone();
+    let role_state = cell.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
     // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
@@ -494,6 +519,11 @@ pub async fn close_context_with_key(
     // dormant, so the leaf is committer-appended-only and is NOT yet
     // replicated to other members. Cross-member convergence is the forward
     // step under ADR-051 (§7.3.1, §9.9.3).
+    //
+    // This `.await` runs BEFORE the Class-S persist below and does NOT mutate
+    // `PerContextState` (it drives the shared `handle` lifecycle FSM), so it
+    // stays OUTSIDE the `_keep` combinator closure that wraps the subsequent
+    // state mutations + fail-closed persist.
     let result = ttl::close_context(
         handle,
         initiator_did,
@@ -503,95 +533,108 @@ pub async fn close_context_with_key(
     )
     .await?;
 
-    // Fix C: Re-check ContextClose capability after the state transition
-    // committed. If capability was revoked between the gate and the
-    // cleanup, log a warning for auditability — the state transition
-    // already happened (cannot undo).
-    if !state
-        .role_state
-        .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
-    {
-        tracing::warn!(
-            context_id = %context_id,
-            initiator_did = %initiator_did,
-            "ContextClose capability revoked between gate and cleanup — \
-             state transition already committed, proceeding with cleanup"
-        );
-    }
-
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    // Drop broadcast context state -- keys are zeroed by Zeroize.
-    state.broadcast_context = None;
-
-    // §9.10.4: clear pseudonym state on close. The local pseudonym is
-    // derived from secret key material; dropping it (by collapsing the
-    // routing axis to the no-pseudonym `Broadcast` variant) prevents leaking
-    // the routing ID or any learned peer pseudonyms after context teardown.
-    // The context is terminal at this point, so the routing axis no longer
-    // needs to agree with the (also torn-down) crypto axis.
-    state.routing = ContextRouting::Broadcast;
-
-    // Participation decay: clear participation cache and cooldown state
-    // on context close (#1530).
-    state.governance.decay_participation();
-
-    // Final checkpoint before close (§9.9.3): force-create a checkpoint
-    // to capture the terminal event log state. This ensures
-    // equivocation detection covers the full context lifetime.
-    // Best-effort: skip if no signing key is available.
-    if let Some(sk) = signing_key {
-        let now = deps.clock.now_secs();
-        let broadcast_context_is_none = state.broadcast_context.is_none();
-        let mls_epoch = state.epoch.mls_epoch;
-        let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
-            &context_id,
-            broadcast_context_is_none,
-            mls_epoch,
-            &mut state.checkpoint_events_since,
-            &mut state.checkpoint_last_time_secs,
-            &mut state.checkpoints,
-            initiator_did,
-            sk,
-            now,
-            deps.event_log.as_ref(),
-        );
-        tracing::debug!(
-            context_id = %context_id,
-            event_count = cp.event_count,
-            "final checkpoint created on close (§9.9.3)"
-        );
-    }
-
-    let close_event = ContextEvent::SystemClose {
-        initiator_did: initiator_did.clone(),
-    };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        close_event,
-        &context_id,
-        deps.event_tx.as_ref(),
-    );
-
-    // Metrics gauge refresh is a Supervisor-wide operation: it round-trips a
-    // mailbox query to EVERY registered context actor -- including this one,
-    // which is still executing inside its own close handler. Awaiting it here
-    // self-deadlocks: the query parks in our own mailbox behind the command we
-    // are still processing, so it cannot be answered until close returns, but
-    // close cannot return until the query is answered -- it unwinds only when
-    // the 30s send timeout fires (surfacing as `close_context exceeded 30s
-    // budget`). Detach it: the close handler returns, this actor's command loop
-    // frees, and the refresh then observes up-to-date state. Gauges are
-    // eventually-consistent metrics, so fire-and-forget is the correct coupling.
-    let supervisor = deps.supervisor.clone();
-    tokio::spawn(async move {
-        supervisor.update_context_gauges().await;
-    });
-
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
-    // (a closed context must not silently re-open on a crash) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
+    // (a closed context must not silently re-open on a crash) — STRUCTURAL
+    // fail-closed. All post-transition state mutations (timer/timeout cancel,
+    // broadcast/routing teardown, participation decay, final checkpoint, the
+    // `SystemClose` emit) run inside the Class-S `_keep` combinator's
+    // `rest_mut()` view, so the fail-closed persist is performed BY the
+    // combinator (replacing the former inline `persist_state_fail_closed`).
+    // KEEP-direction: a close that did not durably land is NOT rolled back in
+    // memory — silently re-opening a closed context is the unsafe direction; the
+    // persist error is surfaced instead. These mutations are all synchronous (the
+    // self-deadlock-avoiding gauge refresh is a detached `tokio::spawn` that
+    // borrows only `deps`), so they fit the sync `_keep` closure.
+    cell.commit_class_s_keep(deps, &context_id, |mut view| {
+        let state = view.rest_mut();
+
+        // Fix C: Re-check ContextClose capability after the state transition
+        // committed. If capability was revoked between the gate and the
+        // cleanup, log a warning for auditability — the state transition
+        // already happened (cannot undo).
+        if !state
+            .role_state
+            .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                initiator_did = %initiator_did,
+                "ContextClose capability revoked between gate and cleanup — \
+                 state transition already committed, proceeding with cleanup"
+            );
+        }
+
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        // Drop broadcast context state -- keys are zeroed by Zeroize.
+        state.broadcast_context = None;
+
+        // §9.10.4: clear pseudonym state on close. The local pseudonym is
+        // derived from secret key material; dropping it (by collapsing the
+        // routing axis to the no-pseudonym `Broadcast` variant) prevents leaking
+        // the routing ID or any learned peer pseudonyms after context teardown.
+        // The context is terminal at this point, so the routing axis no longer
+        // needs to agree with the (also torn-down) crypto axis.
+        state.routing = ContextRouting::Broadcast;
+
+        // Participation decay: clear participation cache and cooldown state
+        // on context close (#1530).
+        state.governance.decay_participation();
+
+        // Final checkpoint before close (§9.9.3): force-create a checkpoint
+        // to capture the terminal event log state. This ensures
+        // equivocation detection covers the full context lifetime.
+        // Best-effort: skip if no signing key is available.
+        if let Some(sk) = signing_key {
+            let now = deps.clock.now_secs();
+            let broadcast_context_is_none = state.broadcast_context.is_none();
+            let mls_epoch = state.epoch.mls_epoch;
+            let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
+                &context_id,
+                broadcast_context_is_none,
+                mls_epoch,
+                &mut state.checkpoint_events_since,
+                &mut state.checkpoint_last_time_secs,
+                &mut state.checkpoints,
+                initiator_did,
+                sk,
+                now,
+                deps.event_log.as_ref(),
+            );
+            tracing::debug!(
+                context_id = %context_id,
+                event_count = cp.event_count,
+                "final checkpoint created on close (§9.9.3)"
+            );
+        }
+
+        let close_event = ContextEvent::SystemClose {
+            initiator_did: initiator_did.clone(),
+        };
+        state::emit_event_into(
+            &mut state.receive_buffer,
+            close_event,
+            &context_id,
+            deps.event_tx.as_ref(),
+        );
+
+        // Metrics gauge refresh is a Supervisor-wide operation: it round-trips a
+        // mailbox query to EVERY registered context actor -- including this one,
+        // which is still executing inside its own close handler. Awaiting it here
+        // self-deadlocks: the query parks in our own mailbox behind the command we
+        // are still processing, so it cannot be answered until close returns, but
+        // close cannot return until the query is answered -- it unwinds only when
+        // the 30s send timeout fires (surfacing as `close_context exceeded 30s
+        // budget`). Detach it: the close handler returns, this actor's command loop
+        // frees, and the refresh then observes up-to-date state. Gauges are
+        // eventually-consistent metrics, so fire-and-forget is the correct coupling.
+        let supervisor = deps.supervisor.clone();
+        tokio::spawn(async move {
+            supervisor.update_context_gauges().await;
+        });
+
+        Ok(())
+    })?;
 
     Ok(result)
 }
@@ -621,13 +664,22 @@ pub async fn close_context_with_key(
 ///   `EconomyTicket` is rolled back.
 #[allow(clippy::too_many_lines)]
 pub async fn join_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     key_package: KeyPackage,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<(), ContextError> {
+    // ADR-049 §9 Class-S cell seam: the join tail no longer derives a bare
+    // `&mut PerContextState` via `state_mut()`. The Phase-1 READS below
+    // (version / lifecycle / sybil gates) go through `&*cell` (the cell Derefs to
+    // `&PerContextState`); the Class-C bookkeeping MUTATIONS (hard-rate-limit
+    // consume + velocity record, and every later economy reversal) go through a
+    // short-lived `cell.class_c_view()` re-borrowed at each step so it drops
+    // before the next `.await` (NLL). The spending-nonce consume still routes
+    // through `begin_class_s_conditional` / the deferred `ClassSCommitToken`
+    // exactly as before — the keep-direction is unchanged.
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let member_did = key_package.owner_did.clone();
@@ -637,8 +689,7 @@ pub async fn join_context(
     // stored context's params (not the caller-supplied handle params)
     // so this check is authoritative even when the caller passes an
     // ephemeral handle with default params (e.g. UniFFI bridge).
-    state
-        .handle
+    cell.handle
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
@@ -649,70 +700,92 @@ pub async fn join_context(
     // Phase 1: state + sybil + economy enforcement against actor-owned
     // state. This happens BEFORE any crypto mutations so that a rejected
     // payment never grants MLS group access or sender keys.
-    state::require_active(&state.handle)?;
+    state::require_active(&cell.handle)?;
 
     // Defense-in-depth: re-check version compatibility after the eager
     // crypto validation. Governance could theoretically change the
     // min_protocol_version between the early check and here.
-    state
-        .handle
+    cell.handle
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
     // M13: Sybil resistance check BEFORE economy enforcement so that
     // a rejected sybil attacker doesn't consume budget. Fail-closed.
+    // Read-only: routed through `&*cell` (the shared sybil-policy + governance
+    // reads), dropped before the Class-C mutations below.
     crate::context::lifecycle_logic::evaluate_sybil_resistance(
-        state.handle.params().sybil_policy.as_ref(),
-        &state.governance,
+        cell.handle.params().sybil_policy.as_ref(),
+        &cell.governance,
         &member_did,
         deps.clock.now_secs(),
     )?;
 
     // Defense-in-depth hard rate limit on joins (Matrix-style token
-    // bucket). On any subsequent failure we refund the token.
+    // bucket). On any subsequent failure we refund the token. Class-C:
+    // the hard-rate-limit consume + velocity record are routed through a
+    // `class_c_view()` borrow that drops at the end of this block.
     let now_secs = deps.clock.now_secs();
-    if !state
-        .governance
-        .hard_rate_limit
-        .try_consume(&member_did, now_secs)
-    {
-        return Err(ContextError::RateLimited {
-            resource: "join".to_owned(),
-            message: "hard rate limit exceeded for joiner".to_owned(),
-        });
-    }
-    // Record the join in the velocity tracker so subsequent §19.7
-    // escalation observes the same activity surface as message sends.
-    // F5: capture the rollback token so a join failure refunds THIS
-    // entry specifically rather than racing concurrent joiners.
-    let velocity_token = state
-        .governance
-        .velocity_tracker
-        .record_message(&member_did, now_secs);
-
-    let member_count = state.membership.count();
-    let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy(
-        &mut state.governance,
-        member_count,
-        &member_did,
-        now_secs,
-        spending_ucan,
-        &context_id,
-        &*deps.clock,
-        &deps.key_resolver,
-    ) {
-        Ok(cost) => cost,
-        Err(e) => {
-            // No ticket exists yet — roll back inline against actor-owned
-            // state.
-            state
-                .governance
-                .velocity_tracker
-                .rollback(&member_did, velocity_token);
-            state.governance.hard_rate_limit.refund(&member_did);
-            return Err(e);
+    let velocity_token = {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        if !gov.hard_rate_limit_mut().try_consume(&member_did, now_secs) {
+            return Err(ContextError::RateLimited {
+                resource: "join".to_owned(),
+                message: "hard rate limit exceeded for joiner".to_owned(),
+            });
         }
+        // Record the join in the velocity tracker so subsequent §19.7
+        // escalation observes the same activity surface as message sends.
+        // F5: capture the rollback token so a join failure refunds THIS
+        // entry specifically rather than racing concurrent joiners.
+        gov.velocity_tracker_mut()
+            .record_message(&member_did, now_secs)
     };
+
+    // ADR-049 §9 Class S: route the join-path spending-nonce consume through the
+    // DEFERRED-persist combinator. `enforce_join_economy` burns the nonce inside
+    // the `begin_class_s_conditional` closure; the returned `Option<ClassSCommitToken>`
+    // is `Some` only on the PAID branch (a non-zero cost AND a spending UCAN —
+    // the same gating the Phase-5 fail-closed persist uses) and is held across
+    // the MLS / membership `.await`s below, committed at Phase 5 (or by each
+    // pre-finalize abort path, keep-direction). The combinator owns the cell for
+    // the duration of its closure; the remaining body re-borrows the cell through
+    // short-lived `class_c_view()` / `&*cell` borrows at each step (no
+    // `state_mut()` escape hatch).
+    let (deducted_cost, mut spending_nonce_token) =
+        match cell.begin_class_s_conditional(&context_id, |mut view| {
+            let state = view.rest_mut();
+            let member_count = state.membership.count();
+            let governance = &mut state.governance;
+            let cost = crate::context::lifecycle_logic::enforce_join_economy(
+                governance,
+                member_count,
+                &member_did,
+                now_secs,
+                spending_ucan,
+                &context_id,
+                &*deps.clock,
+                &deps.key_resolver,
+            )?;
+            // A spending-UCAN nonce is burned iff a non-zero cost was charged AND
+            // a spending UCAN was presented — the same gating the Phase-5
+            // fail-closed persist uses.
+            let did_consume_nonce = cost.is_some() && spending_ucan.is_some();
+            Ok((cost, did_consume_nonce))
+        }) {
+            Ok(cost_and_token) => cost_and_token,
+            Err(e) => {
+                // No ticket and no token exist yet (the consume did not happen) —
+                // roll back inline through the Class-C view (velocity entry +
+                // hard-rate-limit token); the view drops before the early return.
+                let mut view = cell.class_c_view();
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(&member_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(&member_did);
+                return Err(e);
+            }
+        };
     // F4: wrap the Phase 1 state in an EconomyTicket so every
     // downstream error path (adapter, MLS, sender-key) is forced
     // to roll back velocity + hard_rate_limit + budget, not just
@@ -727,23 +800,45 @@ pub async fn join_context(
 
     // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
     // If authorization fails, rollback the ticket — no MLS state touched.
-    let auth = match crate::context::economy_helpers::authorize_paid_action(
-        state,
+    //
+    // The authorize is SPLIT (ADR-049 §9 cell seam): the sync `prepare` half
+    // reads state through `&*cell` and returns owned inputs (the borrow drops at
+    // the call boundary), then the async `hold` half awaits the escrow create
+    // with NO state borrow live — so the actor future stays `Send`
+    // (`PerContextState` is `!Sync`). `None` from `prepare` means no adapter / no
+    // policy / zero cost, i.e. the legacy `Ok(None)` short-circuit.
+    let auth = match crate::context::economy_helpers::authorize_paid_action_prepare(
+        &*cell,
         deps,
         scp_protocol::economy::types::PaidActionType::ContextJoin,
         &member_did,
-        &context_id,
-    )
-    .await
-    {
-        Ok(auth) => auth,
-        Err(payment_err) => {
-            crate::context::economy_logic::rollback_economy_ticket_inline(
-                &mut state.governance,
-                ticket,
-            );
-            return Err(payment_err);
-        }
+    ) {
+        None => None,
+        Some(inputs) => match crate::context::economy_helpers::authorize_paid_action_hold(
+            inputs,
+            &member_did,
+            &context_id,
+        )
+        .await
+        {
+            Ok(auth) => auth,
+            Err(payment_err) => {
+                // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+                // before the existing Class-C reversal. Both the nonce-commit and
+                // the ticket rollback go through `&*cell` / a `class_c_view()` (no
+                // `state_mut()`); the view inside `rollback_join_economy_ticket`
+                // drops before the return.
+                let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+                    spending_nonce_token.take(),
+                    &*cell,
+                    deps,
+                    &context_id,
+                    payment_err,
+                );
+                rollback_join_economy_ticket(cell, ticket);
+                return Err(err);
+            }
+        },
     };
 
     // Phase 3: MLS add_member + sender key distribution (crypto mutations).
@@ -755,15 +850,22 @@ pub async fn join_context(
     {
         Ok(output) => output,
         Err(e) => {
-            if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
-                    .await;
-            }
-            crate::context::economy_logic::rollback_economy_ticket_inline(
-                &mut state.governance,
-                ticket,
+            // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+            // before the existing escrow-void + ticket rollback. Nonce-commit +
+            // escrow-void run through `&*cell` (shared, no mutation); the ticket
+            // rollback opens a `class_c_view()` that drops before the return.
+            let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+                spending_nonce_token.take(),
+                &*cell,
+                deps,
+                &context_id,
+                e,
             );
-            return Err(e);
+            if let Some(a) = auth {
+                crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+            }
+            rollback_join_economy_ticket(cell, ticket);
+            return Err(err);
         }
     };
 
@@ -776,14 +878,20 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
-        }
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
-            ticket,
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            &*cell,
+            deps,
+            &context_id,
+            e,
         );
-        return Err(e);
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+        }
+        rollback_join_economy_ticket(cell, ticket);
+        return Err(err);
     }
 
     // Drain pending HPKE-sealed sender key distribution messages and
@@ -796,38 +904,60 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
-        }
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
-            ticket,
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            &*cell,
+            deps,
+            &context_id,
+            e,
         );
-        return Err(e);
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+        }
+        rollback_join_economy_ticket(cell, ticket);
+        return Err(err);
     }
 
     // Phase 4: Membership mutation. On failure: void escrow + rollback
-    // ticket + rollback MLS state.
-    if let Err(e) = join_context_membership(state, deps, &context_id, &member_did, add_output) {
+    // ticket + rollback MLS state. Routed through `cell.class_c_view()` — the
+    // membership / role / access / receive-buffer mutations are all Class-C.
+    if let Err(e) = join_context_membership(
+        &mut cell.class_c_view(),
+        deps,
+        &context_id,
+        &member_did,
+        add_output,
+    ) {
         let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
-        if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
-        }
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
-            ticket,
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before the existing escrow-void + ticket rollback.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            &*cell,
+            deps,
+            &context_id,
+            e,
         );
-        return Err(e);
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
+        }
+        rollback_join_economy_ticket(cell, ticket);
+        return Err(err);
     }
 
     // Phase 4.5: Store local pseudonym after membership mutation succeeds.
     // §9.10.4: `set_local_pseudonym` is a no-op on a broadcast context (which
     // carries no pseudonym state), so this only updates encrypted contexts.
+    // Routed through the Class-C routing view; the view drops immediately.
     if let Some(pseudonym) = local_pseudonym {
-        state.routing.set_local_pseudonym(pseudonym);
+        cell.class_c_view()
+            .routing_mut()
+            .set_local_pseudonym(pseudonym);
     }
 
     // Phase 5: commit the economy ticket (in-memory budget debit) and append
@@ -863,12 +993,22 @@ pub async fn join_context(
         // (§7.3.1, §9.9.3).
         now_secs,
     ) {
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // before voiding the escrow hold (mirrors the money-ordering rule
+        // below). The membership / MLS state already applied is NOT reversed.
+        let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            &*cell,
+            deps,
+            &context_id,
+            e,
+        );
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
-        return Err(e);
+        return Err(err);
     }
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
     // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
@@ -896,25 +1036,34 @@ pub async fn join_context(
     // persist failure we VOID the escrow hold instead (releasing the funds) so
     // the charge is atomic with durability; the consumed nonce stays consumed,
     // so the joiner's retry is idempotent and they are charged at most once.
-    if deducted_cost.is_some() && spending_ucan.is_some() {
-        if let Err(e) =
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)
-        {
-            // Durability failed before the charge was captured — release the
-            // escrow hold so the joiner is not charged for an unacknowledged
-            // join, and surface the error. The consumed nonce stays consumed.
+    // The deferred token is `Some` exactly on the paid (nonce-burning) branch —
+    // the same gating the legacy `deducted_cost.is_some() && spending_ucan.is_some()`
+    // expressed.
+    debug_assert_eq!(
+        spending_nonce_token.is_some(),
+        deducted_cost.is_some() && spending_ucan.is_some(),
+        "spending-nonce token must be Some iff a paid join burned a nonce",
+    );
+    if let Some(t) = spending_nonce_token.take() {
+        // Paid join: commit the deferred token (fail-closed persist, ADR-049 §9
+        // keep-direction). On failure release the escrow hold so the joiner is
+        // not charged for an unacknowledged join, then surface the error. The
+        // consumed nonce stays consumed. `t.commit` + `void_paid_action` take a
+        // shared `&PerContextState`, supplied via `&*cell`.
+        if let Err(e) = t.commit(&*cell, deps, &context_id) {
             if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
-                    .await;
+                crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
             }
             return Err(e);
         }
     } else {
-        crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id);
     }
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
-    capture_join_payment(state, deps, auth, &member_did, &context_id, deducted_cost).await;
+    // `capture_join_payment` takes the cell so its escrow-capture `.await` runs
+    // OUTSIDE any view borrow and the receipt is surfaced through a `ClassCMut`.
+    capture_join_payment(cell, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     Ok(())
 }
@@ -925,6 +1074,13 @@ pub async fn join_context(
 
 /// Performs the membership state mutations for [`join_context`] (Phase 4).
 ///
+/// Takes a [`ClassCMut`](crate::context::actor::class_s::ClassCMut) view rather
+/// than `&mut PerContextState`: every mutation here is Class-C (participation
+/// cache, role state, membership set, access-key store, receive buffer), so it
+/// routes through the field-granular accessors with no whole-state borrow and no
+/// `state_mut()`. The §9 fail-closed invariant is unaffected — these are the
+/// coalesce-persisted Class-C bookkeeping mutations the run loop flushes.
+///
 /// # Errors
 ///
 /// - [`ContextError::ContextNotActive`] if the context is no longer
@@ -932,44 +1088,54 @@ pub async fn join_context(
 /// - Errors from `roles::system_assign_role` propagated as
 ///   [`ContextError::MembershipFailed`].
 pub fn join_context_membership(
-    state: &mut PerContextState,
+    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
 ) -> Result<(), ContextError> {
-    state::require_active(&state.handle)?;
+    state::require_active(view.handle_mut())?;
 
-    crate::context::lifecycle_logic::post_join_bookkeeping(
-        &mut state.governance,
-        &state.receive_buffer,
-        context_id,
-        member_did,
-        deps.clock.now_secs(),
-        deps.event_log.as_ref(),
-    );
+    // Participation bookkeeping needs `&mut participation_cache` held alongside
+    // `&receive_buffer`. `split_class_c()` hands back both as disjoint borrows at
+    // once (the `ConsequenceStateSplit` shape); the split drops before the
+    // role / membership / access mutations below re-borrow the view.
+    {
+        let mut split = view.split_class_c();
+        crate::context::lifecycle_logic::post_join_bookkeeping(
+            split.governance.participation_cache_mut(),
+            split.receive_buffer,
+            context_id,
+            member_did,
+            deps.clock.now_secs(),
+            deps.event_log.as_ref(),
+        );
+    }
 
-    // Add member to role state.
-    state.role_state.members.insert(member_did.to_string());
-
-    // Assign default "member" role.
+    // Add member to role state + assign the default "member" role through the
+    // field-granular Class-C role view (ADR-049 §9): structural member insert +
+    // the view's `system_assign_role` (which mints + inserts assignments /
+    // member_capabilities + runs the SHRINK-only suspension prune over its own
+    // disjoint fields). No whole `&mut ContextRoleState`, no downward-auth GROW.
     //
-    // H2: Use system_assign_role to bypass the RoleAssign capability
-    // check. The join handshake is a self-service flow that already
-    // passed economy / sybil / capacity / version gates above —
-    // re-checking `RoleAssign` against the creator would silently fail
-    // every join after the creator has been demoted out of an admin
-    // role. The default "member" role assignment carries no ambient
-    // authority (it's the protocol-defined floor), so there is nothing
-    // to authorize a second time.
-    let creator_did = state.role_state.creator_did.clone();
-    let tokens =
-        roles::system_assign_role(&mut state.role_state, member_did, "member", &*deps.clock)
+    // H2: `system_assign_role` bypasses the RoleAssign capability check. The join
+    // handshake is a self-service flow that already passed economy / sybil /
+    // capacity / version gates above — re-checking `RoleAssign` against the creator
+    // would silently fail every join after the creator has been demoted out of an
+    // admin role. The default "member" role assignment carries no ambient authority
+    // (it's the protocol-defined floor), so there is nothing to authorize again.
+    let (creator_did, tokens) = {
+        let mut rs = view.role_state_class_c_mut();
+        rs.members_mut().insert(member_did.to_string());
+        let creator_did = rs.creator_did().to_owned();
+        let tokens = rs
+            .system_assign_role(member_did, "member", &*deps.clock)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        (creator_did, tokens)
+    };
 
     // Add to membership tracking.
-    state
-        .membership
+    view.membership_class_c_mut()
         .add_member(member_did.clone(), "member".into(), tokens);
 
     // Generate access key for the new member (§9.17.2 step 2).
@@ -978,8 +1144,7 @@ pub fn join_context_membership(
     // the Welcome payload / out-of-band key exchange.
     let member_access_key =
         scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .set(context_id, member_did, member_access_key);
 
@@ -989,7 +1154,7 @@ pub fn join_context_membership(
         role_name: "member".into(),
     };
     state::emit_event_into(
-        &mut state.receive_buffer,
+        view.receive_buffer_mut(),
         join_event,
         context_id,
         deps.event_tx.as_ref(),
@@ -998,7 +1163,7 @@ pub fn join_context_membership(
     // Emit WelcomeGenerated event if the add produced a Welcome message.
     if !add_output.welcome_bytes.is_empty() {
         state::emit_event_into(
-            &mut state.receive_buffer,
+            view.receive_buffer_mut(),
             ContextEvent::WelcomeGenerated {
                 context_id: context_id.to_owned(),
                 creator_did: DID(creator_did),
@@ -1028,34 +1193,62 @@ pub fn join_context_membership(
 /// Best-effort: capture failure is logged + audited via a
 /// `PaymentCaptureFailed` event log entry but does NOT roll back the
 /// budget (H8 — service was rendered).
+///
+/// ADR-049 §9 Class-S cell seam: takes the `&mut ClassSCell` so the escrow
+/// capture+verify `.await` ([`capture_and_verify_paid_action`]) runs OUTSIDE any
+/// view borrow, and the Class-C surfacing of the receipt (or the failure event)
+/// is applied afterward through a short-lived `class_c_view()` — no
+/// whole-`&mut PerContextState`, no `state_mut()`.
 pub async fn capture_join_payment(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
     member_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    if let Some(a) = auth
-        && let Err(e) =
-            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
-    {
-        // H8: do NOT rollback budget — service was delivered (member joined).
-        tracing::warn!(
-            context_id,
-            "payment capture failed after successful join: {e}"
-        );
-        // H19: surface the capture failure as a local `ContextEvent` (no durable
-        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
-        record_payment_capture_failure(
-            state,
-            deps,
-            context_id,
-            "join_context",
-            member_did,
-            &e.to_string(),
-            deducted_cost,
-        );
+    let Some(a) = auth else { return };
+    // Async capture + verify runs with NO state borrow held.
+    match crate::context::economy_helpers::capture_and_verify_paid_action(a).await {
+        Ok(Some(receipt)) => {
+            // Surface the verified receipt through the Class-C view: emit the
+            // local `ContextEvent::PaymentReceived`, then record it in the bounded
+            // `payment_receipts` ring (ADR-051 §6 / §9.9.3; no durable leaf). The
+            // two field `&mut` reborrows are taken one at a time (the view cannot
+            // hand out both simultaneously) — sequencing matches the wrapper's
+            // emit-then-record order, behaviour-neutral.
+            let mut view = cell.class_c_view();
+            crate::context::economy_helpers::emit_payment_received_event(
+                view.receive_buffer_mut(),
+                deps,
+                &receipt,
+                context_id,
+            );
+            crate::context::economy_helpers::record_payment_receipt(
+                view.payment_receipts_mut(),
+                &receipt,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // H8: do NOT rollback budget — service was delivered (member joined).
+            tracing::warn!(
+                context_id,
+                "payment capture failed after successful join: {e}"
+            );
+            // H19: surface the capture failure as a local `ContextEvent` (no
+            // durable Merkle leaf — per-payee, non-convergent; ADR-051 §6 /
+            // phase-2.md §2). Routed through the receive-buffer view.
+            record_payment_capture_failure(
+                cell.class_c_view().receive_buffer_mut(),
+                deps,
+                context_id,
+                "join_context",
+                member_did,
+                &e.to_string(),
+                deducted_cost,
+            );
+        }
     }
 }
 
@@ -1073,7 +1266,7 @@ pub async fn capture_join_payment(
 /// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
-    state: &mut PerContextState,
+    receive_buffer: &mut ReceiveBuffer,
     deps: &ActorDeps,
     context_id: &str,
     action: &str,
@@ -1087,11 +1280,30 @@ fn record_payment_capture_failure(
         error: error_msg.to_owned(),
         cost: cost.map(scp_protocol::economy::types::Amount::value),
     };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        event,
-        context_id,
-        deps.event_tx.as_ref(),
+    state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
+}
+
+/// Reverses a Phase-1 [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// for [`join_context`] through a `class_c_view()` borrow that drops before the
+/// caller's early return (so the cell is free for the subsequent `.await`s).
+///
+/// Thin cell-holder wrapper over the shared
+/// [`crate::context::economy_logic::rollback_economy_ticket_inline_view`] (also
+/// driven by the send path): the velocity entry, hard-rate-limit token, and
+/// budget debit are all Class-C, so they reverse through the field-granular
+/// `GovernanceClassCMut` accessors with no whole-state borrow. Consumes the
+/// ticket so its `Drop` guard stays quiet.
+fn rollback_join_economy_ticket(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    ticket: crate::context::economy_logic::EconomyTicket,
+) {
+    // Shared with the send path: reverse the three Class-C governance fields
+    // through the field-granular `GovernanceClassCMut` view. The `&mut view`
+    // borrow drops before the caller's early return (so the cell is free for the
+    // subsequent `.await`s).
+    crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        cell.class_c_view().governance_class_c_mut(),
+        ticket,
     );
 }
 
@@ -3451,11 +3663,13 @@ mod restore_reconcile_tests {
             now_secs,
             admin.clone(),
         );
-        state.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::MemberInvite,
-            Capability::MessagesWrite,
-            Capability::MessagesRead,
-        ]);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MemberInvite,
+                Capability::MessagesWrite,
+                Capability::MessagesRead,
+            ]));
         state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
             locked: false,
             cost_schedule: scp_protocol::economy::types::CostSchedule {
@@ -3505,8 +3719,10 @@ mod restore_reconcile_tests {
         // the persist failure is never reached and no escrow side effect runs.
         deps.persistence = Arc::new(FailingJoinPersistence);
 
+        // `join_context` now takes the Class-S cell; wrap the owned state.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = lifecycle_helpers::join_context(
-            &mut state,
+            &mut cell,
             &deps,
             &handle,
             key_package,
@@ -3559,9 +3775,15 @@ mod restore_reconcile_tests {
             .expect("join_context_membership follows join_context");
         let body = &rest[..end_rel];
 
+        // ADR-049 §9: the paid path's fail-closed persist now rides the deferred
+        // `ClassSCommitToken`'s `commit` (which calls `persist_state_fail_closed`
+        // internally) rather than an inline `persist_state_fail_closed` call. The
+        // Phase-5 commit site is the `t.commit(&*cell, deps, &context_id)` below
+        // (the cell seam routes the shared persist through `&*cell`); the ordering
+        // invariant is asserted relative to it.
         let persist_idx = body
-            .find("persist_state_fail_closed(state, deps, &context_id)")
-            .expect("join_context must fail-closed persist on the paid path");
+            .find("t.commit(&*cell, deps, &context_id)")
+            .expect("join_context must commit the deferred fail-closed token on the paid path");
         let capture_idx = body
             .find("capture_join_payment(")
             .expect("join_context must capture the escrow");
@@ -3579,7 +3801,7 @@ mod restore_reconcile_tests {
         // AFTER the persist call for the failure escape hatch specifically.
         let post_persist = &body[persist_idx..capture_idx];
         assert!(
-            post_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            post_persist.contains("void_paid_action(deps, a, &context_id)"),
             "the persist-failure branch must void the escrow (between the \
              fail-closed persist and the success-path capture) so a durability \
              failure releases the hold instead of charging the joiner"
@@ -3653,9 +3875,12 @@ mod restore_reconcile_tests {
         // Encrypted (non-broadcast) send: with `MessageSent` no longer a durable
         // leaf (M12), the FAILING event-log append is never invoked by
         // `finalize_send` for this send, so it SUCCEEDS. `signing_key = None`
-        // skips the post-send checkpoint path.
+        // skips the post-send checkpoint path. `finalize_send` is actor-shape
+        // (ADR-049 §9): wrap the state in the owning `ClassSCell` for the call,
+        // then reclaim it via `into_inner` for the post-send read below.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &context_id,
             &context_id_bytes,
@@ -3663,9 +3888,10 @@ mod restore_reconcile_tests {
             reserved,
             b"payload",
             None,
-            false, // spending_nonce_committed
+            None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
         );
+        let mut state = cell.into_inner();
 
         assert!(
             result.is_ok(),
@@ -3728,10 +3954,12 @@ mod restore_reconcile_tests {
         );
 
         // The fail-closed persist runs after the append; the append-failure
-        // branch sits strictly between commit and that persist.
+        // branch sits strictly between commit and that persist. ADR-049 §9: the
+        // paid path's fail-closed persist now rides the deferred token's
+        // `t.commit(&*cell, deps, &context_id)` (Phase 5; cell seam).
         let persist_idx = body
-            .find("persist_state_fail_closed(state, deps, &context_id)")
-            .expect("join_context must fail-closed persist on the paid path");
+            .find("t.commit(&*cell, deps, &context_id)")
+            .expect("join_context must commit the deferred fail-closed token on the paid path");
         assert!(
             append_idx < persist_idx,
             "the MemberJoined append must precede the fail-closed persist"
@@ -3742,7 +3970,7 @@ mod restore_reconcile_tests {
         // silently (no Drop impl) and the hold leaks.
         let append_to_persist = &body[append_idx..persist_idx];
         assert!(
-            append_to_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            append_to_persist.contains("void_paid_action(deps, a, &context_id)"),
             "the MemberJoined append-failure branch (between the ticket commit and \
              the fail-closed persist) must void the escrow so a failing append \
              releases the hold instead of leaking it (ADR-049 §9 round-9)"
@@ -3818,16 +4046,21 @@ mod restore_reconcile_tests {
         assert_eq!(state.checkpoint_events_since, 0);
 
         let payer = DID("did:dht:z6MkPayer".to_owned());
-        let auth = crate::context::economy_helpers::authorize_paid_action(
-            &mut state,
-            &deps,
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &payer,
-            &context_id,
-        )
-        .await
-        .expect("authorize_paid_action")
-        .expect("a paid action is authorized for a per_message policy");
+        // Drive the prepare/hold split directly (the production join + send paths
+        // both use it; there is no whole-`&mut` wrapper).
+        let auth = {
+            let inputs = crate::context::economy_helpers::authorize_paid_action_prepare(
+                &state,
+                &deps,
+                scp_protocol::economy::types::PaidActionType::MessageSend,
+                &payer,
+            )
+            .expect("prepare yields auth inputs for a per_message policy");
+            crate::context::economy_helpers::authorize_paid_action_hold(inputs, &payer, &context_id)
+                .await
+                .expect("authorize_paid_action hold")
+                .expect("a paid action is authorized for a per_message policy")
+        };
 
         let receipt = crate::context::economy_helpers::complete_paid_action(
             &mut state,
@@ -3921,16 +4154,19 @@ mod restore_reconcile_tests {
         );
 
         // One more real capture pushes past capacity, evicting the oldest.
-        let auth2 = crate::context::economy_helpers::authorize_paid_action(
-            &mut state,
-            &deps,
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &payer,
-            &context_id,
-        )
-        .await
-        .expect("authorize_paid_action (2)")
-        .expect("a paid action is authorized for a per_message policy (2)");
+        let auth2 = {
+            let inputs = crate::context::economy_helpers::authorize_paid_action_prepare(
+                &state,
+                &deps,
+                scp_protocol::economy::types::PaidActionType::MessageSend,
+                &payer,
+            )
+            .expect("prepare yields auth inputs for a per_message policy (2)");
+            crate::context::economy_helpers::authorize_paid_action_hold(inputs, &payer, &context_id)
+                .await
+                .expect("authorize_paid_action hold (2)")
+                .expect("a paid action is authorized for a per_message policy (2)")
+        };
         let receipt2 = crate::context::economy_helpers::complete_paid_action(
             &mut state,
             &deps,
@@ -3964,6 +4200,149 @@ mod restore_reconcile_tests {
                 .receipt_id,
             receipt2.receipt_id,
             "the newest receipt is pushed onto the back of the ring"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 §9 — leave_context / close_context route their downward-auth
+    // transition through `commit_class_s_keep` (FAIL-CLOSED, keep-direction).
+    // These drive a FAILING persistence backend end-to-end and assert the
+    // helper returns the §9 durability error AND the removal/close mutation is
+    // RETAINED in memory (keep-direction: never rolled back on persist failure —
+    // re-admitting a removed member / re-opening a closed context is unsafe).
+    // -----------------------------------------------------------------------
+
+    /// `leave_context` (broadcast self-removal) persists fail-closed: under a
+    /// failing persistence backend it returns `PersistenceFailed`, and the
+    /// member removal STAYS applied in memory (keep-direction).
+    #[tokio::test]
+    async fn leave_context_persist_failure_keeps_removal_fail_closed() {
+        use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+
+        let sup = build_supervisor(Box::new(FailingJoinPersistence));
+        let admin = DID("did:dht:z6MkLeaveFailClosed".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-leave-fail-closed".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+        // Broadcast-mode state: leave skips MLS (no crypto group needed), so the
+        // whole removal body runs synchronously inside `commit_class_s_keep`.
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
+            context_id_bytes,
+            now,
+            admin.clone(),
+        );
+        // The departing member must be on the authoritative roster for
+        // `remove_member` to succeed and reach the persist.
+        let leaver = DID("did:dht:z6MkLeaver".to_owned());
+        state
+            .membership
+            .add_member(leaver.clone(), "member".to_owned(), Vec::new());
+        state.broadcast_context = Some(
+            BroadcastContext::new(
+                context_id.clone(),
+                &ContextMode::Broadcast,
+                BroadcastAdmission::Open,
+            )
+            .expect("broadcast context"),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        // Self-removal (caller == member): always permitted, no MemberRemove cap.
+        let result =
+            lifecycle_helpers::leave_context(&mut cell, &deps, &handle, &leaver, &leaver).await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "a leave whose fail-closed persist fails must surface the §9 durability \
+             error (not a silent ack): got {result:?}"
+        );
+        assert!(
+            !cell.membership.contains(leaver.as_ref()),
+            "keep-direction: the member removal STAYS in memory through a persist \
+             failure — re-admitting a departed member is the unsafe direction"
+        );
+    }
+
+    /// `close_context` persists fail-closed: under a failing persistence backend
+    /// it returns `PersistenceFailed`, and the close teardown STAYS applied in
+    /// memory (keep-direction — a closed context must not silently re-open).
+    #[tokio::test]
+    async fn close_context_persist_failure_keeps_close_fail_closed() {
+        use scp_protocol::context::roles::Capability;
+
+        let sup = build_supervisor(Box::new(FailingJoinPersistence));
+        let admin = DID("did:dht:z6MkCloseFailClosed".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-close-fail-closed".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+        // Default test governance is SingleAdmin (the close-path model gate).
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now,
+            admin.clone(),
+        );
+        // The initiator needs `ContextClose` (the `ttl::close_context` role gate).
+        state.role_state.members.insert(admin.as_ref().to_owned());
+        state.role_state.member_capabilities.insert(
+            admin.as_ref().to_owned(),
+            std::iter::once(Capability::ContextClose).collect(),
+        );
+        // A non-default routing axis so the close teardown's collapse to
+        // `Broadcast` is observable as a retained mutation.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let result = lifecycle_helpers::close_context(&mut cell, &deps, &handle, &admin).await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PersistenceFailed(_))),
+            "a close whose fail-closed persist fails must surface the §9 durability \
+             error (not a silent ack): got {result:?}"
+        );
+        // Keep-direction: the close teardown (routing collapsed to `Broadcast`,
+        // broadcast_context cleared) STAYS in memory through the persist failure —
+        // silently re-opening a closed context is the unsafe direction.
+        assert!(
+            matches!(cell.routing, ContextRouting::Broadcast),
+            "keep-direction: the close teardown's routing collapse is retained on \
+             persist failure (a closed context must not re-open)"
+        );
+        assert!(
+            cell.broadcast_context.is_none(),
+            "keep-direction: the close teardown stays applied through persist failure"
         );
     }
 }

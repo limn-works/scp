@@ -1511,7 +1511,6 @@ pub fn ensure_registered(
 
     let ceiling_strings = if handle_ceiling.is_empty() {
         scp_core::context::roles::default_ceiling()
-            .capabilities
             .iter()
             .map(scp_core::context::roles::Capability::ucan_capability_name)
             .collect::<HashSet<String>>()
@@ -1728,7 +1727,6 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
     let map = ucan_registry(bi);
 
     let ceiling_strings = scp_core::context::roles::default_ceiling()
-        .capabilities
         .iter()
         .map(scp_core::context::roles::Capability::ucan_capability_name)
         .collect::<HashSet<String>>();

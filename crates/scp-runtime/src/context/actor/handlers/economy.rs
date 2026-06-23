@@ -13,10 +13,10 @@
 
 use std::time::Duration;
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 use crate::economy::receipt::ReceiptVerificationError;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
@@ -27,40 +27,44 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch an [`EconomyCommand`] against actor-owned state and
 /// capability-reduced dependencies.
-pub async fn dispatch(
-    state: &mut PerContextState,
+///
+/// Read-only domain: the cell is threaded as `&mut ClassSCell` to match
+/// the actor dispatch seam, but this domain reads NOTHING from the owned
+/// state (receipt verification flows entirely through the payment
+/// adapter on `deps`). It is therefore taken as `_cell` — no
+/// [`ClassSCell::state_mut`] escape hatch, no [`Deref`](std::ops::Deref)
+/// read (ADR-049 §9). The `&mut` referent also keeps the spawned dispatch
+/// future `Send`, which a shared `&ClassSCell` would not (`ClassSCell` is
+/// not `Sync`).
+#[allow(clippy::needless_pass_by_ref_mut)]
+pub(crate) async fn dispatch(
+    _cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(state, deps, cmd).await
+    dispatch_inner(deps, cmd).await
 }
 
-async fn dispatch_inner(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    cmd: EconomyCommand,
-) -> Outcome<()> {
+async fn dispatch_inner(deps: &ActorDeps, cmd: EconomyCommand) -> Outcome<()> {
     match cmd {
         EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
-            handle_verify_payment_receipts(state, deps, *receipts, reply).await
+            handle_verify_payment_receipts(deps, *receipts, reply).await
         }
     }
 }
 
 /// Handle [`EconomyCommand::VerifyPaymentReceipts`] — delegates to
 /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
-/// under a 30s timeout. Read-only — the helper does not mutate
+/// under a 30s timeout. Read-only — the helper does not read or mutate
 /// per-context state; it calls the configured payment adapter's
 /// `verify_dyn` method per receipt and collates results.
 async fn handle_verify_payment_receipts(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     receipts: Vec<crate::economy::adapter::PaymentReceipt>,
     reply: crate::context::actor::commands::VerifyPaymentReceiptsReply,
 ) -> Outcome<()> {
-    let verify_fut =
-        crate::context::economy_helpers::verify_payment_receipts(state, deps, &receipts);
+    let verify_fut = crate::context::economy_helpers::verify_payment_receipts(deps, &receipts);
 
     let results = match tokio::time::timeout(HANDLER_TIMEOUT, verify_fut).await {
         Ok(vec) => vec,

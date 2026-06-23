@@ -5,9 +5,11 @@
 //! # Phase 2A.4 + Phase 2A finalization -- actor-shape dispatch
 //!
 //! The handler's primary entry point [`dispatch`] takes
-//! `(&mut PerContextState, &ActorDeps, ToolsCommand)` and routes the
+//! `(&mut ClassSCell, &ActorDeps, ToolsCommand)` and routes the
 //! actor-owned hard-rate-limit helpers plus the tool-economy reserve /
-//! settle phases through [`crate::context::tools_helpers`]. The economy
+//! settle phases through [`crate::context::tools_helpers`] (the Class-C
+//! mutations flow through the cell's non-persisting `class_c_view()`). The
+//! economy
 //! pipeline's non-`Send` executor runs supervisor-side between the
 //! [`ToolsCommand::ReserveToolEconomy`] and [`ToolsCommand::SettleToolEconomy`]
 //! mailbox round-trips (see
@@ -46,7 +48,6 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
-use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -54,8 +55,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`ToolsCommand`] against actor-owned state and
 /// capability-reduced dependencies.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
@@ -66,9 +67,9 @@ pub async fn dispatch(
             now_secs,
             reply,
             ..
-        } => handle_try_consume_hard_rate_limit(state, &did, now_secs, reply).await,
+        } => handle_try_consume_hard_rate_limit(cell, &did, now_secs, reply).await,
         ToolsCommand::RefundHardRateLimit { did, reply, .. } => {
-            handle_refund_hard_rate_limit(state, &did, reply).await
+            handle_refund_hard_rate_limit(cell, &did, reply).await
         }
         ToolsCommand::ReserveToolEconomy {
             context_id,
@@ -78,7 +79,7 @@ pub async fn dispatch(
             reply,
         } => {
             handle_reserve_tool_economy(
-                state,
+                cell,
                 deps,
                 &context_id,
                 &invoker_did,
@@ -94,8 +95,7 @@ pub async fn dispatch(
             request,
             reply,
         } => {
-            handle_settle_tool_economy(state, deps, &context_id, &invoker_did, *request, reply)
-                .await
+            handle_settle_tool_economy(cell, deps, &context_id, &invoker_did, *request, reply).await
         }
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
@@ -113,13 +113,21 @@ pub async fn dispatch(
 /// refund attempt on a timed-out consume is unsafe. Surfacing the
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     did: &scp_identity::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let consume_fut =
-        async { crate::context::tools_helpers::try_consume_hard_rate_limit(state, did, now_secs) };
+    // Class-C hard-rate consume through the non-persisting `class_c_view()` —
+    // this dispatch arm reports `ok_mutated`/`err_mutated` and the run loop
+    // coalesce-persists; no per-site persist is injected.
+    let consume_fut = async {
+        crate::context::tools_helpers::try_consume_hard_rate_limit(
+            cell.class_c_view(),
+            did,
+            now_secs,
+        )
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
         Ok(consumed) => {
@@ -152,11 +160,14 @@ async fn handle_try_consume_hard_rate_limit(
 /// [`tools_helpers::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     did: &scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let refund_fut = async { crate::context::tools_helpers::refund_hard_rate_limit(state, did) };
+    // Class-C hard-rate refund through the non-persisting `class_c_view()` (run
+    // loop coalesce-persists; no per-site persist injected).
+    let refund_fut =
+        async { crate::context::tools_helpers::refund_hard_rate_limit(cell.class_c_view(), did) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -180,7 +191,7 @@ async fn handle_refund_hard_rate_limit(
 /// `Send` reservation the supervisor carries across the executor.
 #[allow(clippy::too_many_arguments)]
 async fn handle_reserve_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_identity::DID,
@@ -191,7 +202,7 @@ async fn handle_reserve_tool_economy(
     >,
 ) -> Outcome<()> {
     let reserve_fut = crate::context::tools_helpers::reserve_tool_economy(
-        state,
+        cell,
         deps,
         context_id,
         invoker_did,
@@ -227,7 +238,7 @@ async fn handle_reserve_tool_economy(
 /// [`tools_helpers::settle_tool_economy`](crate::context::tools_helpers::settle_tool_economy)
 /// on owned state under a 30s timeout.
 async fn handle_settle_tool_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &scp_identity::DID,
@@ -235,7 +246,7 @@ async fn handle_settle_tool_economy(
     reply: oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
 ) -> Outcome<()> {
     let settle_fut = crate::context::tools_helpers::settle_tool_economy(
-        state,
+        cell,
         deps,
         context_id,
         invoker_did,

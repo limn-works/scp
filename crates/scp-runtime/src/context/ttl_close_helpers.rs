@@ -47,10 +47,11 @@ use scp_protocol::context::{ContextError, ContextState};
 use tokio::sync::Notify;
 
 use crate::context::ContextHandle;
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::state::{context_id_to_bytes, strip_event_payload};
-use crate::context::ttl::{self, TtlExtension};
+use crate::context::ttl::{self, TtlExtension, TtlTimer};
 
 // ---------------------------------------------------------------------------
 // 1. handle_ttl_expiry
@@ -76,7 +77,7 @@ use crate::context::ttl::{self, TtlExtension};
 /// runs synchronously here (the actor's coalesced persist tick will
 /// catch any subsequent mutations).
 pub async fn handle_ttl_expiry(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
@@ -86,14 +87,17 @@ pub async fn handle_ttl_expiry(
     // TTL deadline held in convergent state (every member holds the identical
     // value), never local `now()` (§7.3.1, §9.9.3). Fall back to the clock only
     // if no deadline was recorded (defensive; the timer fires off a deadline).
-    let expiry_deadline_secs = state
+    let expiry_deadline_secs = cell
         .ttl
         .timer
         .deadline_unix_secs
         .unwrap_or_else(|| deps.clock.now_secs());
 
     // Async TTL expiry logic. Pass transport for best-effort relay
-    // ciphertext deletion (§5.11).
+    // ciphertext deletion (§5.11). Drives the lifecycle transition through
+    // the `ContextHandle` FSM (Class-C; NOT a `PerContextState` Class-S
+    // field), so the subsequent in-state mutations are Class-C with the
+    // best-effort persist below — no Class-S combinator (ADR-049 §9).
     let result = ttl::try_ttl_expiry_cleanup(
         handle,
         deps.crypto.as_ref(),
@@ -107,28 +111,42 @@ pub async fn handle_ttl_expiry(
     // Cancel governance timeout task, decay participation, and emit
     // appropriate event onto the actor's owned state. Matches the legacy
     // single-lock-acquisition shape; the actor owns `state` so no
-    // re-locking is required.
-    state.governance.timeout_task.cancel();
-    // Participation decay on TTL expiry (#1530): clear participation
-    // cache and cooldown state so stale data does not carry over if the
-    // context is later restored.
-    state.governance.decay_participation();
-    if result.is_complete() {
-        let event = ContextEvent::Expired;
-        emit_event(state, event, &context_id, deps.event_tx.as_ref());
+    // re-locking is required. All Class-C with the coalesced (best-effort)
+    // persist below — routed through the non-persisting Class-C view.
+    {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        gov.timeout_task_mut().cancel();
+        // Participation decay on TTL expiry (#1530): clear participation
+        // cache and cooldown state so stale data does not carry over if the
+        // context is later restored. Inlines `GovernanceState::decay_participation`
+        // (not exposed on the Class-C governance view) over its four Class-C
+        // fields.
+        gov.participation_cache_mut().clear();
+        gov.cooldown_until_mut().clear();
+        gov.proposal_timestamps_mut().clear();
+        gov.velocity_tracker_mut().clear();
+    }
+    let event = if result.is_complete() {
+        ContextEvent::Expired
     } else {
-        let event = ContextEvent::ExpiryFailed {
+        ContextEvent::ExpiryFailed {
             reason: result.to_string(),
             state_transitioned: result.state_transitioned(),
             mls_destroyed: result.mls_destroyed(),
             sender_key_destroyed: result.sender_key_destroyed(),
             event_logged: result.event_logged(),
-        };
-        emit_event(state, event, &context_id, deps.event_tx.as_ref());
-    }
+        }
+    };
+    emit_event(
+        cell.class_c_view().receive_buffer_mut(),
+        event,
+        &context_id,
+        deps.event_tx.as_ref(),
+    );
 
     // Persist context state after TTL expiry (best-effort).
-    persist_state_best_effort(state, deps, &context_id);
+    persist_state_best_effort(cell, deps, &context_id);
 
     if result.has_failures() {
         let msg = result.errors().join("; ");
@@ -164,29 +182,34 @@ pub async fn handle_ttl_expiry(
 /// best-effort fire-and-forget. The handler wraps this in
 /// `async { ... }` for the dispatcher's `tokio::time::timeout` budget.
 pub fn propose_ttl_extension(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
     proposed_duration: std::time::Duration,
 ) -> Result<bool, ContextError> {
-    if !state.membership.contains(member_did) {
+    if !cell.membership.contains(member_did) {
         return Err(ContextError::MemberNotFound(member_did.to_string()));
     }
 
-    let member_count = state.membership.count();
+    let member_count = cell.membership.count();
 
-    // Initialize extension proposal if not already in progress.
-    let extension = state
-        .ttl
-        .extension
-        .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
+    // Initialize extension proposal if not already in progress, then record
+    // the consent. `ttl.extension` is Class-C with the coalesced (best-effort)
+    // persist below — route through the non-persisting Class-C view (ADR-049 §9).
+    let unanimous = {
+        let mut view = cell.class_c_view();
+        let extension = view
+            .ttl_mut()
+            .extension
+            .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
 
-    extension.add_consent(member_did.clone());
-    let unanimous = extension.is_unanimous();
+        extension.add_consent(member_did.clone());
+        extension.is_unanimous()
+    };
 
     // Persist context state after proposal consent (best-effort).
-    persist_state_best_effort(state, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id);
 
     Ok(unanimous)
 }
@@ -205,16 +228,19 @@ pub fn propose_ttl_extension(
 /// `state.ttl.timer` task and installs the replacement onto the
 /// supervisor's tracked `task_set`. See the module-level doc.
 pub async fn reset_ttl_timer(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_duration: std::time::Duration,
     handle: ContextHandle,
 ) {
     // Clear extension state; `spawn_ttl_timer` aborts the prior task and
-    // resets the cancel signal (mutate owned state).
-    state.ttl.extension = None;
-
+    // resets the cancel signal (mutate owned state). Both `ttl.extension`
+    // and `ttl.timer` are Class-C with the coalesced (best-effort) persist
+    // below — route through the non-persisting Class-C view (ADR-049 §9).
+    // The view borrow spans the `spawn_ttl_timer` await (it borrows only the
+    // timer) and ends before the persist's shared read.
+    //
     // Reset (consensual TTL extension via `reset_ttl_timer`): no convergent
     // deadline is threaded here, so arm relative to the local clock (the prior
     // behaviour). The governance ExtendTtl path computes the convergent
@@ -222,10 +248,15 @@ pub async fn reset_ttl_timer(
     // through `start_ttl_timer` with an explicit override; cross-member
     // convergence of a freshly-proposed extension duration is a forward step
     // under ADR-051.
-    spawn_ttl_timer(state, deps, context_id, new_duration, None, handle).await;
+    {
+        let mut view = cell.class_c_view();
+        let ttl = view.ttl_mut();
+        ttl.extension = None;
+        spawn_ttl_timer(&mut ttl.timer, deps, context_id, new_duration, None, handle).await;
+    }
 
     // Persist context state after TTL reset (best-effort).
-    persist_state_best_effort(state, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +269,12 @@ pub async fn reset_ttl_timer(
 /// `state.ttl.timer` and reaches the supervisor's tracked `task_set` /
 /// actor registry through `deps.supervisor` — see the module doc.
 pub async fn start_ttl_timer(
-    state: &mut PerContextState,
+    // SHARED across domains: the ttl_close actor handler passes
+    // `cell.class_c_view().ttl_mut().timer` (no `state_mut`); the governance
+    // `execute_extend_ttl` path passes `&mut state.ttl.timer`. Taking the
+    // narrow `&mut TtlTimer` (the only state it touches, all Class-C) lets
+    // both reach it without a whole `&mut PerContextState` (ADR-049 §9).
+    timer: &mut TtlTimer,
     deps: &ActorDeps,
     context_id: &str,
     duration: std::time::Duration,
@@ -254,7 +290,7 @@ pub async fn start_ttl_timer(
     deadline_override: Option<u64>,
     handle: ContextHandle,
 ) {
-    spawn_ttl_timer(state, deps, context_id, duration, deadline_override, handle).await;
+    spawn_ttl_timer(timer, deps, context_id, duration, deadline_override, handle).await;
 }
 
 /// Computes the CONVERGENT initial-TTL expiry deadline (Unix seconds) for a
@@ -311,7 +347,16 @@ pub const fn convergent_ttl_deadline_secs(
 /// `tracked_spawn` returns `None` and no timer is installed — matching
 /// the legacy `task_set_ref() == None` early-return.
 async fn spawn_ttl_timer(
-    state: &mut PerContextState,
+    // Takes ONLY the `&mut TtlTimer` it mutates (Class-C timer state),
+    // not a whole `&mut PerContextState` / `&mut ClassSCell`. This is the
+    // shared-helper seam: the ttl_close actor handler reaches it through
+    // `cell.class_c_view().ttl_mut()` (no `state_mut`), while the
+    // governance `execute_extend_ttl` path (out of this domain's scope)
+    // passes `&mut state.ttl.timer` directly — neither needs a whole
+    // `&mut` (ADR-049 §9). FLAG: the narrowing changed the shared
+    // `start_ttl_timer` signature, so the one governance call site is
+    // updated to match.
+    timer: &mut TtlTimer,
     deps: &ActorDeps,
     context_id: &str,
     duration: std::time::Duration,
@@ -337,19 +382,18 @@ async fn spawn_ttl_timer(
     // the replacement timer can be cancelled independently of the old
     // one (mirrors the legacy reset's `cancel = Arc::new(Notify::new())`
     // + `task = None`).
-    if let Some(prior) = state.ttl.timer.task.take() {
-        prior.abort();
-    }
     let cancel = Arc::new(Notify::new());
-    state.ttl.timer.cancel = Arc::clone(&cancel);
-
-    // Record the absolute expiry deadline that the timer fire will stamp on
-    // the `ContextExpired`/`ContextClosed` leaf. A `deadline_override` is the
-    // CONVERGENT value (see the parameter doc); only when it is absent do we
-    // fall back to local arm-time `now + duration`.
     let deadline_secs = deadline_override
         .unwrap_or_else(|| deps.clock.now_secs().saturating_add(duration.as_secs()));
-    state.ttl.timer.deadline_unix_secs = Some(deadline_secs);
+    if let Some(prior) = timer.task.take() {
+        prior.abort();
+    }
+    timer.cancel = Arc::clone(&cancel);
+    // Record the absolute expiry deadline that the timer fire will stamp
+    // on the `ContextExpired`/`ContextClosed` leaf. A `deadline_override`
+    // is the CONVERGENT value (see the parameter doc); only when it is
+    // absent do we fall back to local arm-time `now + duration`.
+    timer.deadline_unix_secs = Some(deadline_secs);
 
     // Clone the cross-actor providers the FireTimer pipeline needs. The
     // timer task itself only resolves the actor + mailboxes FireTimer;
@@ -397,7 +441,7 @@ async fn spawn_ttl_timer(
 
     // Store the abort handle for cancel / is_active checks on owned
     // state. `None` only in the degraded no-task-set config.
-    state.ttl.timer.task = abort_handle;
+    timer.task = abort_handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +462,7 @@ async fn spawn_ttl_timer(
 /// actor-shape contract so a future expansion can mutate per-context
 /// state without changing the signature.
 pub async fn finalize_close(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
@@ -428,7 +472,7 @@ pub async fn finalize_close(
     // held in convergent state when this is a timer-driven close; fall back to
     // the closer's clock for a governance/explicit close with no TTL deadline.
     // Never a per-member local `now()` for the timer case (§7.3.1, §9.9.3).
-    let close_ts = state
+    let close_ts = cell
         .ttl
         .timer
         .deadline_unix_secs
@@ -463,17 +507,17 @@ pub async fn finalize_close(
 /// — kept local so this module does not depend on the broadcast
 /// helpers' private surface.
 fn emit_event(
-    state: &mut PerContextState,
+    receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
     event: ContextEvent,
     context_id: &str,
     tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 ) {
     if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
-        let _ = state.receive_buffer.push(event);
+        let _ = receive_buffer.push(event);
         return;
     }
 
-    let _ = state.receive_buffer.push(event.clone());
+    let _ = receive_buffer.push(event.clone());
     if let Some(tx) = tx {
         let sanitized = strip_event_payload(&event);
         let _ = tx.send((context_id.to_owned(), sanitized));

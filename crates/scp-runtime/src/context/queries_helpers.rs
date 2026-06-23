@@ -56,7 +56,8 @@
 //!   [`grant_budget_for_test`], [`remaining_budget_for_test`],
 //!   [`velocity_for_test`] — `#[cfg(feature = "testing")]` accessors.
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
-//!   Mutates `checkpoint_events_since` on divergent compare.
+//!   Reads membership and mutates `last_seen_remote_checkpoint` +
+//!   `receive_buffer` (via a `ClassCMut` view) on divergent compare.
 //! - [`prove_event_inclusion`], [`prove_event_consistency`] — Merkle
 //!   proofs. Delegate to the event-log provider, which builds the proof
 //!   directly against its own canonical tree (no per-context twin tree).
@@ -65,7 +66,7 @@
 //!
 //! - [`event_log_entries`] — passthrough on `deps.event_log` (no per-
 //!   context state).
-//! - [`create_checkpoint_if_due`],
+//! - [`create_checkpoint_if_due_view`],
 //!   [`force_create_checkpoint_fields`] — field-disjoint signatures
 //!   used by `messaging_helpers` / `lifecycle_helpers` actor paths to
 //!   drive §9.9.3 checkpointing.
@@ -88,16 +89,18 @@
 //! per-context actor-shape twin to disambiguate against.
 
 use scp_identity::DID;
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::roles::{Capability, ContextRoleState, RoleAssignment};
 use scp_protocol::context::{ContextError, ContextParams};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::context::ContextHandle;
+use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::state::{self, CommitFaultMarker, PendingCommit};
+use crate::context::state::{self, CommitFaultMarker, EpochState, PendingCommit};
 
 /// Maximum number of checkpoints retained per context. Older checkpoints
 /// are drained when this limit is exceeded to prevent unbounded growth.
@@ -202,8 +205,14 @@ pub const fn needs_reconnect(state: &PerContextState) -> bool {
 /// Mutating — called by the reconnection driver after a context completes
 /// the six-phase protocol successfully so a later restore does not
 /// re-drive the already-synced context.
-pub const fn clear_needs_reconnect(state: &mut PerContextState) {
-    state.epoch.needs_reconnect = false;
+///
+/// Field-narrowed (ADR-049 §9) to `&mut EpochState` so a cell-holder calls it
+/// with `cell.class_c_view().epoch_mut()` (no whole-state `state_mut()`), while
+/// a bare-`&mut PerContextState` holder passes `&mut state.epoch`. The
+/// `needs_reconnect` flag is Class-C reconnection liveness state, not a
+/// fail-closed Class-S witness.
+pub const fn clear_needs_reconnect(epoch: &mut EpochState) {
+    epoch.needs_reconnect = false;
 }
 
 /// Reads this actor's current lifecycle
@@ -228,9 +237,17 @@ pub const fn clear_needs_reconnect(state: &mut PerContextState) {
 /// dispatch path already uses.
 #[allow(clippy::needless_pass_by_ref_mut)]
 pub(in crate::context) async fn read_context_state(
-    state: &mut PerContextState,
+    handle: ContextHandle,
 ) -> scp_protocol::context::ContextState {
-    state.handle.state().await
+    // Takes an OWNED (Arc-backed, cheap to clone) handle rather than
+    // borrowing `&PerContextState` across the await: a borrowed
+    // `&PerContextState` future is not `Send` (`PerContextState` is
+    // intentionally `Send` + `!Sync` — its event callback is `dyn FnMut +
+    // Send`, not `Sync`), and the spawned actor run loop requires `Send`.
+    // The prior `&mut PerContextState` signature obtained `Send` via the
+    // `&mut` referent; a Class-C read site must not take a whole `&mut`, so
+    // the caller clones `state.handle` (Deref read) and hands it in by value.
+    handle.state().await
 }
 
 /// Returns `true` if the given DID is a member of the context.
@@ -335,7 +352,7 @@ pub fn drain_events(state: &mut PerContextState) -> Vec<ContextEvent> {
 /// Emits a `DegradedMode` event into the receive buffer (and the
 /// optional event broadcast channel from `deps.event_tx`).
 pub fn report_degraded_mode(
-    state: &mut PerContextState,
+    receive_buffer: &mut ReceiveBuffer,
     deps: &ActorDeps,
     context_id: &str,
     compat: scp_protocol::envelope::VersionCompatibility,
@@ -355,12 +372,7 @@ pub fn report_degraded_mode(
             remote_version: (remote_major, remote_minor),
             unsupported_features,
         };
-        state::emit_event_into(
-            &mut state.receive_buffer,
-            event,
-            context_id,
-            deps.event_tx.as_ref(),
-        );
+        state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
     }
 }
 
@@ -396,14 +408,14 @@ pub fn event_log_entries(
 ///   `ContextClose` (admin) capability.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 pub fn generate_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -411,15 +423,14 @@ pub fn generate_context_access_key(
         ));
     }
 
-    if !state.membership.contains(member_did) {
+    if !view.membership_class_c_mut().contains(member_did) {
         return Err(ContextError::MemberNotFound(format!(
             "member not found: {member_did}"
         )));
     }
 
     let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .set(context_id, member_did, key);
     Ok(())
@@ -434,14 +445,14 @@ pub fn generate_context_access_key(
 /// - [`ContextError::MemberNotFound`] if no access key exists for
 ///   `member_did`.
 pub fn revoke_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -449,8 +460,7 @@ pub fn revoke_context_access_key(
         ));
     }
 
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .remove(context_id, member_did)
         .ok_or_else(|| {
@@ -467,14 +477,14 @@ pub fn revoke_context_access_key(
 ///   `ContextClose` (admin) capability.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 pub fn restore_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -482,15 +492,14 @@ pub fn restore_context_access_key(
         ));
     }
 
-    if !state.membership.contains(member_did) {
+    if !view.membership_class_c_mut().contains(member_did) {
         return Err(ContextError::MemberNotFound(format!(
             "member not found: {member_did}"
         )));
     }
 
     let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .set(context_id, member_did, key);
     Ok(())
@@ -593,67 +602,6 @@ pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u6
 // Checkpoint operations (§9.9.3, ADR-011 AC-8) — actor-shape entries
 // ===========================================================================
 
-/// Creates a consistency checkpoint when due (§9.9.3 thresholds).
-///
-/// Takes per-field references so callers may pass disjoint sub-borrows
-/// of the unified [`PerContextState`] (ADR-049 §Decision 1). The `now`
-/// value is supplied by the caller (typically `deps.clock.now_secs()`)
-/// so the body remains pure.
-///
-/// A checkpoint is due when either:
-/// - 50 events have been appended since the last checkpoint, or
-/// - 10 minutes have elapsed since the last checkpoint.
-#[allow(clippy::too_many_arguments)] // Required to avoid a per-call wrapper struct allocation.
-pub fn create_checkpoint_if_due(
-    context_id: &str,
-    broadcast_context_is_none: bool,
-    mls_epoch: u64,
-    checkpoints: &mut Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
-    checkpoint_events_since: &mut u64,
-    checkpoint_last_time_secs: &mut u64,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-    now: u64,
-    event_log: &dyn ContextEventLogProvider,
-) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
-    let events_due = *checkpoint_events_since >= 50;
-    // Time-based checkpoints require at least one event — creating a
-    // checkpoint for zero events is wasteful and indistinguishable from
-    // the previous checkpoint.
-    let time_due =
-        *checkpoint_events_since > 0 && now.saturating_sub(*checkpoint_last_time_secs) >= 600;
-
-    if !events_due && !time_due {
-        return None;
-    }
-
-    let cp = build_checkpoint(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        sender_did,
-        signing_key,
-        now,
-        event_log,
-    );
-
-    *checkpoint_events_since = 0;
-    *checkpoint_last_time_secs = now;
-    checkpoints.push(cp.clone());
-
-    if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
-        checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
-    }
-
-    tracing::debug!(
-        context_id,
-        event_count = cp.event_count,
-        "consistency checkpoint created (§9.9.3)"
-    );
-
-    Some(cp)
-}
-
 /// Unconditionally creates a consistency checkpoint regardless of
 /// whether the event/time thresholds have been reached. Takes per-field
 /// references so callers may pass disjoint sub-borrows of the unified
@@ -696,6 +644,126 @@ pub fn force_create_checkpoint_fields(
     );
 
     cp
+}
+
+/// Unconditionally creates a consistency checkpoint via a [`ClassCMut`] view,
+/// the actor-shape sibling of [`force_create_checkpoint_fields`].
+///
+/// Identical semantics, but reaches the three Class-C checkpoint fields
+/// (`checkpoint_events_since`, `checkpoint_last_time_secs`, `checkpoints`)
+/// through the view's field-granular accessors — touched in SEPARATE
+/// statements so each `&mut` borrow ends before the next, which is what lets
+/// the actor handler drive this with no whole `&mut PerContextState`.
+/// `broadcast_context_is_none` and `mls_epoch` are read by the caller from the
+/// view (their borrows released) before this call. Returns the built checkpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn force_create_checkpoint_view(
+    view: &mut ClassCMut,
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let cp = build_checkpoint(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        sender_did,
+        signing_key,
+        now,
+        event_log,
+    );
+
+    // Sequential per-field view accessors: each `&mut` borrow ends before the
+    // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
+    // borrow) is needed.
+    *view.checkpoint_events_since_mut() = 0;
+    *view.checkpoint_last_time_secs_mut() = now;
+    {
+        let checkpoints = view.checkpoints_mut();
+        checkpoints.push(cp.clone());
+        if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
+    }
+
+    tracing::info!(
+        context_id,
+        event_count = cp.event_count,
+        "forced final checkpoint on context close (§9.9.3)"
+    );
+
+    cp
+}
+
+/// Creates a consistency checkpoint when due (§9.9.3 thresholds) via a
+/// [`ClassCMut`] view — the actor-shape checkpoint entry for the send path.
+///
+/// Same §9.9.3 gating (50-event / 600-second thresholds) and semantics as the
+/// unconditional [`force_create_checkpoint_view`], but reaches the three Class-C
+/// checkpoint
+/// fields (`checkpoint_events_since`, `checkpoint_last_time_secs`,
+/// `checkpoints`) through the view's field-granular accessors, touched in
+/// SEPARATE statements so each `&mut` borrow ends before the next — which is
+/// what lets the send path drive this with no whole `&mut PerContextState` (nor
+/// a 3-field simultaneous borrow). `broadcast_context_is_none` and `mls_epoch`
+/// are read by the caller from the view (their borrows released) before this
+/// call. Returns the built checkpoint when one was due, else `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_checkpoint_if_due_view(
+    view: &mut ClassCMut,
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+    let events_since = *view.checkpoint_events_since_mut();
+    let last_time = *view.checkpoint_last_time_secs_mut();
+    let events_due = events_since >= 50;
+    // Time-based checkpoints require at least one event — creating a checkpoint
+    // for zero events is wasteful and indistinguishable from the previous one.
+    let time_due = events_since > 0 && now.saturating_sub(last_time) >= 600;
+
+    if !events_due && !time_due {
+        return None;
+    }
+
+    let cp = build_checkpoint(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        sender_did,
+        signing_key,
+        now,
+        event_log,
+    );
+
+    // Sequential per-field view accessors: each `&mut` borrow ends before the
+    // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
+    // borrow) is needed.
+    *view.checkpoint_events_since_mut() = 0;
+    *view.checkpoint_last_time_secs_mut() = now;
+    {
+        let checkpoints = view.checkpoints_mut();
+        checkpoints.push(cp.clone());
+        if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
+    }
+
+    tracing::debug!(
+        context_id,
+        event_count = cp.event_count,
+        "consistency checkpoint created (§9.9.3)"
+    );
+
+    Some(cp)
 }
 
 /// Builds a signed checkpoint from the current event log. Pure function
@@ -759,12 +827,12 @@ fn build_checkpoint(
 /// - [`ContextError::CryptoFailed`] if the public key cannot be resolved
 ///   or the signature verification fails.
 fn verify_remote_checkpoint_authenticity(
-    state: &PerContextState,
+    sender_is_member: bool,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<(), ContextError> {
-    if !state.membership.contains(remote.sender_did.as_ref()) {
+    if !sender_is_member {
         return Err(ContextError::MemberNotFound(format!(
             "checkpoint sender {} is not a member of context {context_id}",
             remote.sender_did
@@ -790,28 +858,36 @@ fn verify_remote_checkpoint_authenticity(
     })
 }
 
-/// Compares a remote checkpoint against local event-log state for
-/// equivocation detection (§9.9.3, ADR-011 AC-8).
-///
-/// Actor-shape — uses `deps.event_log`, `deps.key_resolver`, and
-/// `deps.event_tx` directly; mutates `state.checkpoint_events_since`
-/// and pushes a `ContextEvent::EquivocationDetected` event into the
-/// receive buffer when divergent.
+/// Verify-and-classify CORE of [`compare_remote_checkpoint`]: runs the
+/// membership + signature gate and the Merkle-root/count comparison WITHOUT
+/// touching per-context state. `sender_is_member` is read by the caller (so the
+/// caller chooses how it borrows the roster — a [`ClassCMut`] view accessor or a
+/// bare-state field). Returns the [`CheckpointComparison`] plus
+/// `Some(local_root)` when the result is `Divergent` (the caller then applies
+/// the two Class-C field mutations — dedup + receive-buffer emit — in whatever
+/// borrow shape it holds). This split is what lets BOTH the actor handler
+/// (cell/view) and the receive path (`deliver_checkpoint_message`, bare state)
+/// share one classify path while each applies the field writes itself.
 ///
 /// # Errors
 ///
-/// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a
-///   member of the context.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be
-///   resolved or the Ed25519 signature verification fails.
-pub fn compare_remote_checkpoint(
-    state: &mut PerContextState,
+/// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
+/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved or the
+///   Ed25519 signature verification fails.
+fn classify_remote_checkpoint(
+    sender_is_member: bool,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
-) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+) -> Result<
+    (
+        scp_event_log::checkpoint::CheckpointComparison,
+        Option<[u8; 32]>,
+    ),
+    ContextError,
+> {
     // Membership + Ed25519 signature gate (fail-closed before any compare).
-    verify_remote_checkpoint_authenticity(state, deps, context_id, remote)?;
+    verify_remote_checkpoint_authenticity(sender_is_member, deps, context_id, remote)?;
 
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let local_root = deps
@@ -870,14 +946,64 @@ pub fn compare_remote_checkpoint(
         },
     };
 
-    // Record an EquivocationDetected event in the receive buffer when divergent
-    // (NOT appended to the durable Merkle log — see `record_equivocation_if_fresh`)
-    // — deduped per distinct divergent checkpoint (replay defense).
-    if matches!(
+    let divergence_root = if matches!(
         comparison,
         scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
     ) {
-        record_equivocation_if_fresh(state, deps, context_id, remote, local_root);
+        Some(local_root)
+    } else {
+        None
+    };
+    Ok((comparison, divergence_root))
+}
+
+/// Compares a remote checkpoint against local event-log state for
+/// equivocation detection (§9.9.3, ADR-011 AC-8).
+///
+/// Actor-shape — uses `deps.event_log`, `deps.key_resolver`, and
+/// `deps.event_tx` directly. Reads membership and mutates two Class-C fields
+/// via the [`ClassCMut`] view: it records the divergent `(count, root)` in
+/// `last_seen_remote_checkpoint` and pushes a
+/// `ContextEvent::EquivocationDetected` event into the receive buffer when
+/// divergent. The two `&mut` Class-C fields are touched SEQUENTIALLY through the
+/// view accessors (freshness gate over `last_seen_remote_checkpoint`, then the
+/// receive-buffer emit), so no whole `&mut PerContextState` is needed.
+///
+/// # Errors
+///
+/// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a
+///   member of the context.
+/// - [`ContextError::CryptoFailed`] if the public key cannot be
+///   resolved or the Ed25519 signature verification fails.
+pub fn compare_remote_checkpoint(
+    view: &mut ClassCMut,
+    deps: &ActorDeps,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+    // Membership read via the restricted `MembershipClassCMut` (this path never
+    // mutates the roster); its borrow ends before the divergence recording below.
+    let sender_is_member = view
+        .membership_class_c_mut()
+        .contains(remote.sender_did.as_ref());
+    let (comparison, divergence_root) =
+        classify_remote_checkpoint(sender_is_member, deps, context_id, remote)?;
+
+    // Record an EquivocationDetected event in the receive buffer when divergent
+    // (NOT appended to the durable Merkle log — see `emit_equivocation_alert`) —
+    // deduped per distinct divergent checkpoint (replay defense). The two Class-C
+    // `&mut` fields are touched SEQUENTIALLY through the view: the freshness gate
+    // over `last_seen_remote_checkpoint` completes before the receive-buffer emit.
+    if let Some(local_root) = divergence_root
+        && divergence_is_fresh(view.last_seen_remote_checkpoint_mut(), context_id, remote)
+    {
+        emit_equivocation_alert(
+            view.receive_buffer_mut(),
+            deps,
+            context_id,
+            remote,
+            local_root,
+        );
     }
 
     Ok(comparison)
@@ -913,15 +1039,43 @@ pub fn compare_remote_checkpoint(
 /// discarded) but no further `(count, root)` is inserted, so a malicious
 /// sender cannot pin unbounded memory.
 fn record_equivocation_if_fresh(
-    state: &mut PerContextState,
+    last_seen_remote_checkpoint: &mut std::collections::HashMap<
+        DID,
+        std::collections::HashSet<(u64, [u8; 32])>,
+    >,
+    receive_buffer: &mut ReceiveBuffer,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     local_root: [u8; 32],
 ) {
+    // Field-disjoint split so the two `&mut` Class-C fields are touched
+    // SEQUENTIALLY — the freshness/dedup step over `last_seen_remote_checkpoint`
+    // completes (its borrow ends) before the receive-buffer emit. This lets the
+    // actor handler thread each `&mut` from a `ClassCMut` view in turn (the view
+    // hands out one field `&mut` at a time), with no whole `&mut PerContextState`.
+    if divergence_is_fresh(last_seen_remote_checkpoint, context_id, remote) {
+        emit_equivocation_alert(receive_buffer, deps, context_id, remote, local_root);
+    }
+}
+
+/// Freshness/dedup gate for a divergent remote checkpoint over the per-sender
+/// `(event_count, remote_merkle_root)` set (Class-C field
+/// `last_seen_remote_checkpoint`). Returns `true` when the caller MUST emit a
+/// fresh `EquivocationDetected` alert: a NEW `(count, root)` (recorded, bounded
+/// by [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`]) or a distinct divergence
+/// past the cap (still emitted, never silently dropped — §9.9.4). Returns
+/// `false` for an exact `(count, root)` re-presentation (replay-suppressed).
+fn divergence_is_fresh(
+    last_seen_remote_checkpoint: &mut std::collections::HashMap<
+        DID,
+        std::collections::HashSet<(u64, [u8; 32])>,
+    >,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> bool {
     let incoming = (remote.event_count, remote.merkle_root);
-    let seen = state
-        .last_seen_remote_checkpoint
+    let seen = last_seen_remote_checkpoint
         .entry(remote.sender_did.clone())
         .or_default();
 
@@ -936,16 +1090,32 @@ fn record_equivocation_if_fresh(
             event_count = remote.event_count,
             "duplicate divergent checkpoint suppressed (replay defense, §9.9.3)"
         );
-        return;
+        return false;
     }
 
-    // Bound the per-sender set: still emit the alert below (never silently
-    // drop a §9.9.4 security event) but stop growing the set once a sender
-    // has pinned MAX_SEQUENTIAL_COMMITS distinct divergences.
+    // Bound the per-sender set: still emit the alert (never silently drop a
+    // §9.9.4 security event) but stop growing the set once a sender has pinned
+    // MAX_SEQUENTIAL_COMMITS distinct divergences.
     if (seen.len() as u64) < scp_protocol::sync::MAX_SEQUENTIAL_COMMITS {
         seen.insert(incoming);
     }
+    true
+}
 
+/// Emits a fresh `EquivocationDetected` alert into the in-memory receive buffer
+/// (Class-C field `receive_buffer`) and the optional broadcast channel, carrying
+/// the full forensic roots. Deliberately NOT appended to the durable Merkle
+/// event log: a receiver-minted leaf is not sender-authenticated, so appending
+/// it would let two honest receivers diverge their own roots and false-positive
+/// §9.9.3. The per-sender `(count, root)` set in [`divergence_is_fresh`] is the
+/// sole replay-dedup.
+fn emit_equivocation_alert(
+    receive_buffer: &mut ReceiveBuffer,
+    deps: &ActorDeps,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    local_root: [u8; 32],
+) {
     tracing::warn!(
         context_id,
         remote_sender = %remote.sender_did,
@@ -953,13 +1123,6 @@ fn record_equivocation_if_fresh(
         "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
     );
 
-    // The divergence is surfaced through the in-memory receive buffer (and the
-    // broadcast channel) for SDK observation, carrying the full forensic roots.
-    // It is deliberately NOT appended to the durable Merkle event log: a
-    // receiver-minted EquivocationDetected leaf is not sender-authenticated, so
-    // appending it would let two honest receivers diverge their own roots and
-    // false-positive §9.9.3. The per-sender `(count, root)` set above is the
-    // sole replay-dedup.
     let event = ContextEvent::EquivocationDetected {
         context_id: context_id.to_owned(),
         remote_sender_did: remote.sender_did.clone(),
@@ -967,12 +1130,7 @@ fn record_equivocation_if_fresh(
         local_merkle_root: local_root,
         remote_merkle_root: remote.merkle_root,
     };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    state::emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
 }
 
 // ===========================================================================
@@ -1214,9 +1372,23 @@ mod equivocation_dedup_tests {
         let remote = checkpoint("did:example:bob", 5, [0xAB; 32]);
         let local_root = [0xCD; 32];
 
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &remote, local_root);
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &remote,
+            local_root,
+        );
         // Identical re-presentation: same sender, same count, same root.
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &remote, local_root);
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &remote,
+            local_root,
+        );
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -1243,8 +1415,22 @@ mod equivocation_dedup_tests {
 
         let first = checkpoint("did:example:bob", 5, [0x11; 32]);
         let second = checkpoint("did:example:bob", 5, [0x22; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &first, local_root);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &second, local_root);
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &first,
+            local_root,
+        );
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &second,
+            local_root,
+        );
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -1274,13 +1460,27 @@ mod equivocation_dedup_tests {
         // later replay; because the set is full by then, that first
         // `(count, root)` is NOT retained, so the replay re-appends.
         let first = checkpoint("did:example:mallory", 0, [0x00; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &first, local_root);
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &first,
+            local_root,
+        );
         for i in 1..cap {
             let mut root = [0u8; 32];
             root[0] = (i & 0xFF) as u8;
             root[1] = ((i >> 8) & 0xFF) as u8;
             let cp = checkpoint("did:example:mallory", i, root);
-            record_equivocation_if_fresh(&mut state, &deps, "ctx", &cp, local_root);
+            record_equivocation_if_fresh(
+                &mut state.last_seen_remote_checkpoint,
+                &mut state.receive_buffer,
+                &deps,
+                "ctx",
+                &cp,
+                local_root,
+            );
         }
 
         let seen_len = state
@@ -1300,7 +1500,14 @@ mod equivocation_dedup_tests {
         // the set does NOT grow. Equivocation is buffer-only, so observe the
         // buffered alert rather than a Merkle append.
         let over = checkpoint("did:example:mallory", cap + 1, [0xFF; 32]);
-        record_equivocation_if_fresh(&mut state, &deps, "ctx", &over, local_root);
+        record_equivocation_if_fresh(
+            &mut state.last_seen_remote_checkpoint,
+            &mut state.receive_buffer,
+            &deps,
+            "ctx",
+            &over,
+            local_root,
+        );
         assert_eq!(
             state.receive_buffer.drain_equivocation_alerts().len(),
             1,

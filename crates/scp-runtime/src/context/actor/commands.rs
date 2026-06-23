@@ -1779,7 +1779,7 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 /// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`,
-/// `rollback_economy_ticket_inline`)
+/// `rollback_economy_ticket_inline_view`)
 /// are `pub(super)` helpers invoked by the messaging path. Commit 12
 /// rewires the sender-side pipeline to construct economy commands
 /// internally rather than calling the helpers directly; commit 10

@@ -36,7 +36,7 @@
 //! 7. [`send_message`] — top-level send path (actor-shape).
 //! 8. [`deliver_incoming`] — top-level receive path (actor-shape).
 //! 9. [`encrypt_and_send`] — Phase 2 encrypt + transport fan-out.
-//! 10. [`authorize_send_payment`] — Phase 1.5 escrow auth.
+//! 10. [`authorize_send_payment_prepare`] — Phase 1.5 escrow auth.
 //! 11. [`capture_send_payment`] — Phase 3 escrow capture.
 //! 12. [`finalize_send`] — event-log append + consequence eval +
 //!     checkpoint + persistence.
@@ -72,6 +72,7 @@ use scp_protocol::provenance::attach::SourceContextInfo;
 use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rules};
 
 use crate::context::ContextHandle;
+use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
@@ -213,44 +214,113 @@ pub fn build_encrypted_envelope(
 
 /// Enforces economic policy for message sends (#1537, #1593).
 ///
-/// Actor-shape variant: takes `&mut PerContextState` directly, no
-/// supervisor lock dance.
+/// Actor-shape variant: takes the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+/// and routes the spending-nonce consume through
+/// [`begin_class_s_conditional`](crate::context::actor::class_s::ClassSCell::begin_class_s_conditional)
+/// so the consume is DEFERRED-persisted (ADR-049 §9, keep-direction). The
+/// returned [`ClassSCommitToken`](crate::context::actor::class_s::ClassSCommitToken)
+/// is `Some` ONLY on the PAID branch (a non-zero cost was charged AND a spending
+/// UCAN was presented — i.e. `enforce_economy` actually burned a nonce); the
+/// free / best-effort branch returns `None` so the caller's existing best-effort
+/// persist is kept. `send_message` threads the token down to `finalize_send`,
+/// which discharges it (or each early-abort path commits it before its
+/// Class-C reversal).
 pub fn enforce_send_economy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     sender_did: &DID,
     now: u64,
     spending_ucan: Option<&UcanToken>,
     context_id: &str,
     clock: &dyn Clock,
     key_resolver: &KeyResolver,
-) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
-    let pricing_default =
-        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
-    let member_count = state.membership.count();
-    let governance = &mut state.governance;
-    let pricing = governance
-        .message_pricing
-        .as_ref()
-        .unwrap_or(&pricing_default);
-    crate::context::economy_logic::enforce_economy(
-        crate::context::economy_logic::EnforceEconomyRequest {
-            economic_policy: governance.economic_policy.as_ref(),
-            budget_tracker: &mut governance.budget_tracker,
-            velocity_tracker: &governance.velocity_tracker,
-            member_count,
-            action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
-            actor_did: sender_did,
-            now,
-            spending_ucan,
-            action_label: "messages:write",
-            context_id,
-            clock,
-            pricing,
-            nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
-            revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-            key_resolver,
+) -> Result<
+    (
+        Option<scp_protocol::economy::types::Amount>,
+        Option<crate::context::actor::class_s::ClassSCommitToken>,
+    ),
+    ContextError,
+> {
+    cell.begin_class_s_conditional(context_id, |mut view| {
+        let state = view.rest_mut();
+        let pricing_default =
+            scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+        let member_count = state.membership.count();
+        let governance = &mut state.governance;
+        let pricing = governance
+            .message_pricing
+            .as_ref()
+            .unwrap_or(&pricing_default);
+        let cost = crate::context::economy_logic::enforce_economy(
+            crate::context::economy_logic::EnforceEconomyRequest {
+                economic_policy: governance.economic_policy.as_ref(),
+                budget_tracker: &mut governance.budget_tracker,
+                velocity_tracker: &governance.velocity_tracker,
+                member_count,
+                action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+                actor_did: sender_did,
+                now,
+                spending_ucan,
+                action_label: "messages:write",
+                context_id,
+                clock,
+                pricing,
+                nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
+                revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+                key_resolver,
+            },
+        )?;
+        // A spending-UCAN nonce is burned (Class-S consume) iff `enforce_economy`
+        // charged a non-zero cost AND a spending UCAN was presented — the same
+        // gating the deferred fail-closed persist uses. The free / zero-cost
+        // branch burns no nonce, so it issues no token.
+        let did_consume_nonce = cost.is_some() && spending_ucan.is_some();
+        Ok((cost, did_consume_nonce))
+    })
+}
+
+/// Discharge a deferred spending-nonce [`ClassSCommitToken`] on a `send_message`
+/// EARLY-ABORT path (ADR-049 §9, keep-direction) and return the error to
+/// propagate.
+///
+/// The early-abort paths in `send_message` occur AFTER `enforce_send_economy`
+/// burned the spending-UCAN nonce but BEFORE `finalize_send`. The burned nonce
+/// MUST be persisted fail-closed on these paths too (keep-direction: a crash in
+/// the coalesce window must not un-burn it and re-open replay), so each commits
+/// the token here BEFORE its existing escrow-void + economy-ticket rollback.
+///
+/// Returns the error the abort path should propagate:
+/// - token `None` (the consume did not happen — free / pre-consume abort) ⇒ the
+///   original `abort_err` unchanged;
+/// - token `Some` and its fail-closed persist SUCCEEDS ⇒ the original
+///   `abort_err` (the consume is now durable; the send still aborts for its own
+///   reason);
+/// - token `Some` and its fail-closed persist FAILS ⇒ the
+///   [`ContextError::PersistenceFailed`] (fail-closed: a durability failure of
+///   the burned nonce takes precedence, mirroring `finalize_send`'s persist-fail
+///   arm). The consume is KEPT in memory either way.
+///
+/// The caller runs its existing Class-C reversal (escrow void, ticket rollback,
+/// sequence rollback) AFTER this returns, regardless of which error comes back.
+///
+/// Shared with the join path (`lifecycle_helpers::join_context`), whose
+/// pre-finalize abort paths have the identical keep-direction obligation.
+///
+/// Internal cross-module helper — `pub` only so the sibling `crate::context`
+/// dispatch modules can call it; not part of the SDK surface.
+pub fn commit_send_nonce_token_on_abort(
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    abort_err: ContextError,
+) -> ContextError {
+    match token {
+        None => abort_err,
+        Some(t) => match t.commit(state, deps, context_id) {
+            Ok(()) => abort_err,
+            Err(persist_err) => persist_err,
         },
-    )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +443,7 @@ pub fn verify_and_unwrap(
 /// received event can opt into a durable append without re-plumbing the
 /// buffered-drain call sites.
 pub fn deliver_plaintext_or_announcement(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     sender_did: &str,
     plaintext: &[u8],
     context_id: &str,
@@ -382,7 +452,7 @@ pub fn deliver_plaintext_or_announcement(
     // §9.10.4: run the shared announcement-ingest validator. The buffered path
     // maps a rejection to `None` (silent drop) — the message has already been
     // buffered/reordered, so there is no caller to return a typed error to.
-    match ingest_pseudonym_announcement(state, sender_did, plaintext, context_id, event_tx) {
+    match ingest_pseudonym_announcement(view, sender_did, plaintext, context_id, event_tx) {
         AnnouncementOutcome::Recorded => {
             tracing::debug!(
                 context_id,
@@ -414,7 +484,7 @@ pub fn deliver_plaintext_or_announcement(
                 sender_did: DID(sender_did.to_owned()),
                 payload: plaintext.to_vec(),
             };
-            emit_event_into(&mut state.receive_buffer, event, context_id, event_tx);
+            emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             None
         }
     }
@@ -527,7 +597,7 @@ pub enum AnnouncementOutcome {
 /// velocity, event-log append, consequence evaluation) stays at that call site
 /// and is NOT part of this shared core.
 fn ingest_pseudonym_announcement(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     sender_did: &str,
     plaintext: &[u8],
     context_id: &str,
@@ -578,7 +648,7 @@ fn ingest_pseudonym_announcement(
     // broadcast context carries no peer registry — reject as a spec-level
     // violation. Otherwise reject a routing ID already claimed by a DIFFERENT
     // member (same-DID re-announce for key rotation stays allowed), then insert.
-    let Some(pseudonym_registry) = state.routing.peer_registry_mut() else {
+    let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() else {
         crate::metrics::record_pseudonym_announcement_rejected();
         tracing::warn!(
             context_id,
@@ -607,12 +677,13 @@ fn ingest_pseudonym_announcement(
     pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
 
     // Record + emit. The validator stops here; per-site follow-up runs at the
-    // call site.
+    // call site. The `routing_mut()` borrow above has ended (NLL) before this
+    // disjoint `receive_buffer` emit.
     let event = ContextEvent::PseudonymAnnounced {
         member_did: announced_did,
         pseudonym: announcement.pseudonym,
     };
-    emit_event_into(&mut state.receive_buffer, event, context_id, event_tx);
+    emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
     AnnouncementOutcome::Recorded
 }
 
@@ -640,9 +711,20 @@ fn ingest_pseudonym_announcement(
 /// consequence eval, and increment the checkpoint counter, only skipping the
 /// append. The `Some` branch remains so a future sender-authenticated received
 /// event can opt into a durable append without re-plumbing this helper.
+///
+/// Arms `obligation` (the caller's `&mut Option<ClassSCommitToken>` sink) iff
+/// consequence enforcement performed a downward-authorization mutation (a
+/// `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+/// replacement) — the GROW methods do the arming, so it cannot be forgotten
+/// (ADR-049 §9, RED-CS3, GAP-A). The cell holder discharges the populated sink
+/// fail-closed after the borrowing view drops; evaluation otherwise stays
+/// best-effort / coalesced. The returned `bool` mirrors whether the sink was
+/// armed (retained as the RED-CS3b engine signal for callers that observe it).
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
+    obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
@@ -662,13 +744,12 @@ pub fn run_buffered_post_delivery(
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
-) {
+) -> bool {
     let now = clock.now_secs();
 
     // Velocity tracking — always record for buffered messages.
-    state
-        .governance
-        .velocity_tracker
+    view.governance_class_c_mut()
+        .velocity_tracker_mut()
         .record_message(&DID(sender_did.to_owned()), now);
 
     // Durable Merkle append ONLY for sender-authenticated events. Application
@@ -689,11 +770,20 @@ pub fn run_buffered_post_delivery(
         );
     }
 
-    let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
-    if !consequence_rules.is_empty() {
+    let consequence_rules: Vec<ConsequenceRule> = view
+        .governance_class_c_mut()
+        .consequence_rules_mut()
+        .clone();
+    // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement performed a
+    // downward-authorization mutation on this delivery (a capability suspension
+    // or an `AssignRole` demotion) — propagated to the cell-holding caller so the
+    // mutation persists fail-closed (keep-direction).
+    let downward_auth_applied = if consequence_rules.is_empty() {
+        false
+    } else {
         let (events, convergent_now) =
             crate::context::governance_logic::event_log_entries_for_consequences(
-                &state.receive_buffer,
+                view.receive_buffer_mut(),
                 context_id,
                 now,
                 event_log,
@@ -706,13 +796,9 @@ pub fn run_buffered_post_delivery(
             convergent_now,
         );
         let member_did = DID(sender_did.to_owned());
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
-        };
+        // The `receive_buffer` read above has ended (NLL) before `consequence_split`
+        // reborrows the disjoint consequence fields (incl. the GROW role view).
+        let mut split = view.consequence_split();
         crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -725,15 +811,45 @@ pub fn run_buffered_post_delivery(
                 event_log,
                 event_tx,
             },
-        );
-    }
+            obligation,
+        )
+    };
 
-    state.checkpoint_events_since += 1;
+    *view.checkpoint_events_since_mut() += 1;
+    downward_auth_applied
 }
 
 // ---------------------------------------------------------------------------
 // 7. send_message (top-level, actor-shape)
 // ---------------------------------------------------------------------------
+
+/// Discharges a [`send_message`] Phase-1 routing/envelope ABORT (ADR-049 §9,
+/// keep-direction): persists the burned spending-nonce token FAIL-CLOSED (a
+/// Class-S obligation owed on every terminal path, via a SHARED
+/// `&PerContextState` auto-derefed from `cell`) BEFORE reversing the Class-C
+/// economy ticket through a fresh `ClassCMut` governance view, then returns the
+/// (possibly persist-promoted) error.
+///
+/// Each call site has ALREADY reversed its own sequence reservation (or reserved
+/// none) inside the view before invoking this — so this helper never touches the
+/// per-sender sequence. Returns the original `abort_err` when the token persists
+/// cleanly (or no token was burned), or the [`ContextError::PersistenceFailed`]
+/// when the fail-closed persist of the burned nonce itself fails.
+fn discharge_send_abort(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
+    ticket: crate::context::economy_logic::EconomyTicket,
+    abort_err: ContextError,
+) -> Result<(), ContextError> {
+    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err);
+    crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        cell.class_c_view().governance_class_c_mut(),
+        ticket,
+    );
+    Err(err)
+}
 
 /// Sends a message within a context (actor-shape).
 ///
@@ -753,7 +869,7 @@ pub fn run_buffered_post_delivery(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub async fn send_message(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
@@ -766,9 +882,19 @@ pub async fn send_message(
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
 
-    state::require_active(&state.handle)?;
-    // Fail-close on commit fault.
-    governance_helpers::check_commit_fault_marker(state.commit_fault.as_ref())?;
+    // Pre-economy active + commit-fault gates run FIRST (matching the legacy
+    // ordering: `require_active` → `check_commit_fault_marker` → signer-`None` →
+    // capability → rate-limit), so the surfaced error precedence on a
+    // multiply-invalid call is unchanged. Both reads run through a short-lived
+    // non-persisting Class-C view whose `&mut` borrow ends (NLL) before the
+    // signer match below.
+    {
+        let mut view = cell.class_c_view();
+        state::require_active(view.handle_mut())?;
+        // Fail-close on commit fault.
+        governance_helpers::check_commit_fault_marker(view.commit_fault_mut().as_ref())?;
+    }
+
     // ADR-039: pair the signing key with its persona into a single
     // `MessageSigner` up front — both the broadcast envelope build and the
     // encrypted stamp+sign site below read the key and the stamped
@@ -788,44 +914,59 @@ pub async fn send_message(
             ));
         }
     };
-    // H7: capability check BEFORE budget deduction.
-    if state.broadcast_context.is_none()
-        && !state
-            .role_state
-            .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
-    {
-        let is_suspended = state
-            .role_state
-            .suspended_capabilities
-            .get(sender_did.as_ref())
-            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
-        let msg = if is_suspended {
-            format!("member {sender_did} write access has been revoked")
-        } else {
-            format!("member {sender_did} does not have messages:write capability")
-        };
-        return Err(ContextError::PermissionDenied(msg));
-    }
-    // Hard rate limit consume — defense-in-depth.
-    let now_secs = deps.clock.now_secs();
-    if !state
-        .governance
-        .hard_rate_limit
-        .try_consume(sender_did, now_secs)
-    {
-        return Err(ContextError::RateLimited {
-            resource: "send".to_owned(),
-            message: "hard rate limit exceeded for sender".to_owned(),
-        });
-    }
-    // M4: record velocity BEFORE economy enforcement.
-    let velocity_token = state
-        .governance
-        .velocity_tracker
-        .record_message(sender_did, now_secs);
 
-    let deducted_cost = match enforce_send_economy(
-        state,
+    // ADR-049 §9 Class-S cell seam: the pre-economy gate runs through the
+    // non-persisting Class-C view (the `&mut view` borrow ends — NLL — before
+    // the cell-taking `enforce_send_economy` leaf). Each gate/mutation is
+    // Class-C / structural (capability read, hard-rate-limit consume, velocity
+    // record); the spending-nonce consume itself is the only Class-S mutation
+    // and lives in `enforce_send_economy`.
+    let now_secs = deps.clock.now_secs();
+    let velocity_token = {
+        let mut view = cell.class_c_view();
+        // H7: capability check BEFORE budget deduction.
+        if view.broadcast_context_mut().is_none() {
+            let role = view.role_state_class_c_mut();
+            if !role.member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite) {
+                let is_suspended = role
+                    .suspended_capabilities()
+                    .get(sender_did.as_ref())
+                    .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+                let msg = if is_suspended {
+                    format!("member {sender_did} write access has been revoked")
+                } else {
+                    format!("member {sender_did} does not have messages:write capability")
+                };
+                return Err(ContextError::PermissionDenied(msg));
+            }
+        }
+        // Hard rate limit consume — defense-in-depth.
+        if !view
+            .governance_class_c_mut()
+            .hard_rate_limit_mut()
+            .try_consume(sender_did, now_secs)
+        {
+            return Err(ContextError::RateLimited {
+                resource: "send".to_owned(),
+                message: "hard rate limit exceeded for sender".to_owned(),
+            });
+        }
+        // M4: record velocity BEFORE economy enforcement.
+        view.governance_class_c_mut()
+            .velocity_tracker_mut()
+            .record_message(sender_did, now_secs)
+    };
+
+    // `enforce_send_economy` is the spending-nonce-bearing leaf and takes the
+    // cell; the view borrow above has ended (NLL) so `cell` is free here.
+    // `enforce_send_economy` routes the spending-nonce consume through the
+    // DEFERRED-persist combinator (ADR-049 §9): it returns the cost plus an
+    // `Option<ClassSCommitToken>` that is `Some` only on the PAID (nonce-burning)
+    // branch. That token's fail-closed persist is owed on EVERY terminal path
+    // below (keep-direction) — the Err arm here issues NO token (nothing was
+    // consumed), so it is unchanged.
+    let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
+        cell,
         sender_did,
         now_secs,
         spending_ucan,
@@ -833,15 +974,17 @@ pub async fn send_message(
         &*deps.clock,
         &deps.key_resolver,
     ) {
-        Ok(cost) => cost,
+        Ok(cost_and_token) => cost_and_token,
         Err(e) => {
-            // Roll back velocity + hard-rate-limit. No EconomyTicket
-            // exists yet; rollback inline against actor-owned state.
-            state
-                .governance
-                .velocity_tracker
+            // Roll back velocity + hard-rate-limit. No EconomyTicket exists yet;
+            // rollback inline through the non-persisting Class-C governance view.
+            // No token was issued (the consume did not happen), so nothing to
+            // commit.
+            let mut view = cell.class_c_view();
+            let gov = view.governance_class_c_mut();
+            gov.velocity_tracker_mut()
                 .rollback(sender_did, velocity_token);
-            state.governance.hard_rate_limit.refund(sender_did);
+            gov.hard_rate_limit_mut().refund(sender_did);
             return Err(e);
         }
     };
@@ -854,112 +997,167 @@ pub async fn send_message(
         consumed: false,
     };
 
-    let (broadcast_envelope, recipients_data, sequence, is_broadcast, send_routing_ids) =
-        if let Some(ref mut bc) = state.broadcast_context {
+    // Phase 1 routing/envelope build runs through the non-persisting Class-C
+    // view. An abort here owes the keep-direction nonce-token persist (Class-S,
+    // FAIL-CLOSED via `&*cell`) BEFORE its Class-C reversal — but the token
+    // commit needs a SHARED `&PerContextState` that cannot overlap the `&mut
+    // view`. So the view block computes the routing tuple OR a typed
+    // [`SendAbort`] carrying the error and whether the sequence was reserved; the
+    // abort is then discharged AFTER the view borrow ends (NLL), committing the
+    // token through `&*cell` and reversing the economy ticket / sequence through
+    // a fresh view.
+    // The view block computes the routing tuple OR returns a typed `Err` carrying
+    // the abort error. Each abort variant fully reverses its OWN Class-C side
+    // effects inside the view (the `PseudonymRegistryEmpty` arm rolls the reserved
+    // sequence; the others reserved none). The abort is discharged AFTER the view
+    // borrow ends (NLL): the keep-direction nonce-token persist needs a SHARED
+    // `&PerContextState` (auto-derefed from `cell`) that cannot overlap the
+    // `&mut view`, and the economy-ticket reversal takes a fresh view.
+    #[allow(clippy::type_complexity)]
+    let routing: Result<
+        (
+            Option<BroadcastEnvelope>,
+            std::collections::HashMap<String, AccessKey>,
+            u64,
+            bool,
+            Vec<[u8; 32]>,
+        ),
+        ContextError,
+    > = {
+        let mut view = cell.class_c_view();
+        if let Some(bc) = view.broadcast_context_mut().as_mut() {
             // `signer` was validated non-`None` at the top of the function; the
             // broadcast envelope is signed with the same key the encrypted path
             // would stamp, sourced from the one `MessageSigner`.
-            let env =
-                match build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key())
-                {
-                    Ok(env) => env,
-                    Err(e) => {
-                        crate::context::economy_logic::rollback_economy_ticket_inline(
-                            &mut state.governance,
-                            ticket,
-                        );
-                        return Err(e);
-                    }
-                };
-            // Broadcast: SHA-256(context_id) per spec §5.14.
-            let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
-            (
-                Some(env),
-                std::collections::HashMap::new(),
-                0,
-                true,
-                vec![broadcast_rid],
+            build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key()).map(
+                |env| {
+                    // Broadcast: SHA-256(context_id) per spec §5.14.
+                    let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
+                    (
+                        Some(env),
+                        std::collections::HashMap::new(),
+                        0,
+                        true,
+                        vec![broadcast_rid],
+                    )
+                },
             )
         } else {
             // Encrypted: assign sequence under actor-owned tracker.
-            let Some(seq) = state.membership.next_sequence_number(sender_did) else {
-                crate::context::economy_logic::rollback_economy_ticket_inline(
-                    &mut state.governance,
+            let Some(seq) = view
+                .membership_class_c_mut()
+                .next_sequence_number(sender_did)
+            else {
+                return discharge_send_abort(
+                    cell,
+                    deps,
+                    &context_id,
+                    spending_nonce_token.take(),
                     ticket,
+                    ContextError::MemberNotFound(format!(
+                        "cannot assign sequence: {sender_did} is not a member"
+                    )),
                 );
-                return Err(ContextError::MemberNotFound(format!(
-                    "cannot assign sequence: {sender_did} is not a member"
-                )));
             };
             // §9.10.4: encrypted contexts fan out to each member's pseudonym
-            // routing ID. App data embeds NO correlating routing value: the
-            // outer envelope's cleartext `routing_id` is the all-zero sentinel
-            // (set in `build_encrypted_envelope`), and the transport address is
-            // the per-member pseudonym. The shared `context_routing_id` — which
-            // a relay can derive from the public context ID — appears in neither
-            // the envelope field nor the transport address for application data,
-            // so a relay cannot read a shared correlator off app-data blobs.
+            // routing ID. App data embeds NO correlating routing value: the outer
+            // envelope's cleartext `routing_id` is the all-zero sentinel (set in
+            // `build_encrypted_envelope`), and the transport address is the
+            // per-member pseudonym. The shared `context_routing_id` — which a relay
+            // can derive from the public context ID — appears in neither the
+            // envelope field nor the transport address for application data, so a
+            // relay cannot read a shared correlator off app-data blobs.
             //
             // KNOWN LIMITATION (§9.10.4): the ONE remaining residual is that
             // fan-out sends the SAME MLS ciphertext to all per-member pseudonym
             // addresses. A relay can still correlate pseudonyms by blob-matching
-            // (observing identical encrypted blobs across addresses). This is
-            // not full unlinkability. Per-recipient re-encryption would fix it
-            // but increases bandwidth by O(N); deferred to relay-blinding, which
+            // (observing identical encrypted blobs across addresses). This is not
+            // full unlinkability. Per-recipient re-encryption would fix it but
+            // increases bandwidth by O(N); deferred to relay-blinding, which
             // §9.10.4 already documents.
             //
-            // Announcement bootstrap channel: `PseudonymAnnouncement` payloads
-            // are the ONLY messages permitted to use the shared routing ID, and
-            // they go there EXCLUSIVELY — never unioned with peer pseudonyms.
-            // Every member subscribes to the shared RID for MLS management
-            // traffic, so a single publish reaches every current subscriber
-            // regardless of whether we have learned their pseudonym yet. App
-            // data continues to fan out to known peer pseudonyms only.
+            // Announcement bootstrap channel: `PseudonymAnnouncement` payloads are
+            // the ONLY messages permitted to use the shared routing ID, and they go
+            // there EXCLUSIVELY — never unioned with peer pseudonyms. Every member
+            // subscribes to the shared RID for MLS management traffic, so a single
+            // publish reaches every current subscriber regardless of whether we
+            // have learned their pseudonym yet. App data continues to fan out to
+            // known peer pseudonyms only.
             //
-            // Invariant: this branch is the `else` of
-            // `broadcast_context.is_some()`, so routing must be pseudonymous.
+            // Invariant: this branch is the `else` of `broadcast_context.is_some()`,
+            // so routing must be pseudonymous.
+            let routing_is_broadcast = view.routing_mut().is_broadcast();
             debug_assert!(
-                !state.routing.is_broadcast(),
+                !routing_is_broadcast,
                 "send fan-out reached the pseudonymous branch with broadcast routing"
             );
             let is_announcement = is_pseudonym_announcement_payload(payload);
-            let member_count = state.membership.count();
-            let routing_ids: Vec<[u8; 32]> = if is_announcement {
+            let member_count = view.membership_class_c_mut().count();
+            if is_announcement {
                 // Bootstrap path: address the shared RID ONLY.
-                vec![scp_protocol::context::context_routing_id(&context_id)]
+                let routing_ids = vec![scp_protocol::context::context_routing_id(&context_id)];
+                let recipients = view.access_mut().access_key_store.get_all(&context_id);
+                Ok((None, recipients, seq, false, routing_ids))
             } else {
-                let peer_pseudonyms: Vec<[u8; 32]> = state
-                    .routing
+                let peer_pseudonyms: Vec<[u8; 32]> = view
+                    .routing_mut()
                     .peer_registry()
                     .map(|reg| reg.values().copied().collect())
                     .unwrap_or_default();
                 if member_count > 1 && peer_pseudonyms.is_empty() {
-                    // App-data send into an encrypted multi-member context
-                    // with an empty pseudonym registry would produce zero
-                    // sends and silently drop the payload — masking a
-                    // bidirectional bootstrap deadlock. Raise a typed error
-                    // so callers can distinguish "peers have not announced
-                    // yet; retry later" from a transport failure, and roll
-                    // back the economy ticket + sequence reservation.
-                    crate::context::economy_logic::rollback_economy_ticket_inline(
-                        &mut state.governance,
-                        ticket,
-                    );
-                    state.membership.rollback_sequence_number(sender_did);
-                    return Err(ContextError::PseudonymRegistryEmpty {
+                    // App-data send into an encrypted multi-member context with an
+                    // empty pseudonym registry would produce zero sends and silently
+                    // drop the payload — masking a bidirectional bootstrap deadlock.
+                    // Raise a typed error so callers can distinguish "peers have not
+                    // announced yet; retry later" from a transport failure, and roll
+                    // back the economy ticket + sequence reservation. The sequence
+                    // reservation IS rolled back here (it was taken above), so the
+                    // discharge must NOT roll it again — hence the explicit reversal
+                    // here rather than relying on the (sequence-agnostic) discharge.
+                    //
+                    // Ordering note: the rollback runs HERE (inside the `&mut view`)
+                    // BEFORE the keep-direction nonce persist in `discharge_send_abort`
+                    // (which needs a non-overlapping `&*cell` shared borrow), so the
+                    // persisted snapshot reflects the rolled-BACK (reusable) sequence.
+                    // This is safe: the message was never transmitted, and the
+                    // per-sender outbound counter only needs monotonicity for sequences
+                    // actually sent — persisting the reusable value cannot reorder or
+                    // replay a delivered message.
+                    view.membership_class_c_mut()
+                        .rollback_sequence_number(sender_did);
+                    let err = ContextError::PseudonymRegistryEmpty {
                         context_id: context_id.clone(),
                         member_count,
-                    });
+                    };
+                    // `view`'s last use is the sequence rollback above; its borrow
+                    // ends here (NLL) so `cell` is free for the discharge below.
+                    return discharge_send_abort(
+                        cell,
+                        deps,
+                        &context_id,
+                        spending_nonce_token.take(),
+                        ticket,
+                        err,
+                    );
                 }
-                peer_pseudonyms
-            };
-            (
-                None,
-                state.access.access_key_store.get_all(&context_id),
-                seq,
-                false,
-                routing_ids,
-            )
+                let recipients = view.access_mut().access_key_store.get_all(&context_id);
+                Ok((None, recipients, seq, false, peer_pseudonyms))
+            }
+        }
+    };
+    let (broadcast_envelope, recipients_data, sequence, is_broadcast, send_routing_ids) =
+        match routing {
+            Ok(tuple) => tuple,
+            Err(err) => {
+                return discharge_send_abort(
+                    cell,
+                    deps,
+                    &context_id,
+                    spending_nonce_token.take(),
+                    ticket,
+                    err,
+                );
+            }
         };
 
     // §9.10.4 lone-member no-op: a single-member encrypted context produces an
@@ -978,27 +1176,63 @@ pub async fn send_message(
     // multi-member empty-registry case hard-fails above with
     // `PseudonymRegistryEmpty` before reaching here.
     if !is_broadcast && send_routing_ids.is_empty() {
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
+        // Keep-direction (ADR-049 §9): even on this no-charge no-op exit, a
+        // spending-UCAN nonce burned in Phase 1 MUST persist fail-closed — a
+        // crash in the coalesce window must not un-burn it and re-open replay.
+        // Commit the token first; if its persist fails, surface that error
+        // (fail-closed) instead of the no-op `Ok(())`. The Class-C reversal
+        // (ticket + sequence) runs regardless.
+        // The token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
+        let nonce_persist = spending_nonce_token
+            .take()
+            .map_or(Ok(()), |t| t.commit(cell, deps, &context_id));
+        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+            cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
-        state.membership.rollback_sequence_number(sender_did);
-        return Ok(());
+        cell.class_c_view()
+            .membership_class_c_mut()
+            .rollback_sequence_number(sender_did);
+        return nonce_persist;
     }
 
-    // Payment flow: authorize (hold) before action.
-    let auth = match authorize_send_payment(state, deps, &context_id, sender_did).await {
-        Ok(auth) => auth,
-        Err(e) => {
-            crate::context::economy_logic::rollback_economy_ticket_inline(
-                &mut state.governance,
-                ticket,
-            );
-            if !is_broadcast {
-                state.membership.rollback_sequence_number(sender_did);
+    // Payment flow: authorize (hold) before action. The sync PREPARE reads the
+    // SHARED `&PerContextState` (via `&*cell`) and its borrow drops at the call
+    // boundary (the result is owned); the async HOLD then awaits with NO cell
+    // borrow held — so the actor future stays `Send` (`ClassSCell` is not `Sync`,
+    // so a `&ClassSCell` held across the await would poison it).
+    let auth = match authorize_send_payment_prepare(&*cell, deps, sender_did) {
+        None => None,
+        Some(inputs) => match crate::context::economy_helpers::authorize_paid_action_hold(
+            inputs,
+            sender_did,
+            &context_id,
+        )
+        .await
+        {
+            Ok(auth) => auth,
+            Err(e) => {
+                // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+                // (via `&*cell`) before the existing Class-C reversal.
+                let err = commit_send_nonce_token_on_abort(
+                    spending_nonce_token.take(),
+                    cell,
+                    deps,
+                    &context_id,
+                    e,
+                );
+                crate::context::economy_logic::rollback_economy_ticket_inline_view(
+                    cell.class_c_view().governance_class_c_mut(),
+                    ticket,
+                );
+                if !is_broadcast {
+                    cell.class_c_view()
+                        .membership_class_c_mut()
+                        .rollback_sequence_number(sender_did);
+                }
+                return Err(err);
             }
-            return Err(e);
-        }
+        },
     };
 
     // Phase 2: encrypt + send.
@@ -1016,18 +1250,31 @@ pub async fn send_message(
         MessageType::Content,
     );
     if let Err(e) = phase2_result {
+        // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
+        // (via `&*cell`) BEFORE the existing escrow-void + ticket rollback. If the
+        // persist fails, surface that error (fail-closed); the Class-C reversal
+        // runs either way.
+        let err = commit_send_nonce_token_on_abort(
+            spending_nonce_token.take(),
+            cell,
+            deps,
+            &context_id,
+            e,
+        );
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
+        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+            cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
         if !is_broadcast {
-            state.membership.rollback_sequence_number(sender_did);
+            cell.class_c_view()
+                .membership_class_c_mut()
+                .rollback_sequence_number(sender_did);
         }
-        return Err(e);
+        return Err(err);
     }
 
     // Phase 3: finalize, then capture escrow + commit ticket.
@@ -1050,10 +1297,18 @@ pub async fn send_message(
     // fail-closed direction; un-consuming would re-open the replay window) and
     // surfacing the error so the caller does not observe a phantom success.
     // Non-spending / free sends keep the best-effort persist inside
-    // `finalize_send` (the common path is not regressed).
-    let spending_nonce_committed = deducted_cost.is_some() && spending_ucan.is_some();
+    // `finalize_send` (the common path is not regressed). The deferred
+    // [`ClassSCommitToken`] carries the fail-closed-persist obligation: it is
+    // `Some` exactly on the paid (nonce-burning) branch, so the assertion below
+    // pins the token's presence to the legacy `deducted_cost.is_some() &&
+    // spending_ucan.is_some()` gating.
+    debug_assert_eq!(
+        spending_nonce_token.is_some(),
+        deducted_cost.is_some() && spending_ucan.is_some(),
+        "spending-nonce token must be Some iff a paid send burned a nonce",
+    );
     if let Err(e) = finalize_send(
-        state,
+        cell,
         deps,
         &context_id,
         &context_id_bytes,
@@ -1064,7 +1319,7 @@ pub async fn send_message(
         // human/device-originated `#active` signals; they need only the raw
         // key, which we hand over from the one `MessageSigner`.
         Some(signer.key()),
-        spending_nonce_committed,
+        spending_nonce_token.take(),
         is_broadcast,
     ) {
         // Fail-closed persist of the Class-S nonce consume failed. Reverse the
@@ -1077,17 +1332,17 @@ pub async fn send_message(
         // counter one below correct. The consumed nonce is intentionally left
         // consumed (the fail-closed direction).
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline(
-            &mut state.governance,
+        crate::context::economy_logic::rollback_economy_ticket_inline_view(
+            cell.class_c_view().governance_class_c_mut(),
             ticket,
         );
         return Err(e);
     }
 
     let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-    capture_send_payment(state, deps, auth, sender_did, &context_id, deducted_cost).await;
+    capture_send_payment(cell, deps, auth, sender_did, &context_id, deducted_cost).await;
     Ok(())
 }
 
@@ -1131,29 +1386,42 @@ pub enum DeliverOutcome {
 /// Sync — no await points in the actor body. The handler wraps the
 /// call in `async {...}` so the per-call transport-timeout budget
 /// still applies.
+///
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// the receive cascade (in-order delivery, force-drained gaps, or timed-out-gap
+/// drains) POPULATES with a fail-closed-persist obligation if consequence
+/// enforcement performs a downward-authorization mutation (a capability suspension
+/// or an `AssignRole` demotion). The cell-holding handler
+/// ([`crate::context::actor::handlers::messaging`]) owns the `Option`, mints it
+/// `None`, and — when populated — `commit`s the token (a fail-closed,
+/// keep-direction persist) before acking; evaluation otherwise stays best-effort /
+/// coalesced. The token carrier (vs. the prior `bool`) makes a populated-but-
+/// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
+/// dropped flag.
 #[allow(clippy::too_many_lines)]
 pub fn deliver_incoming(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<DeliverOutcome, ContextError> {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
-    state::require_active(&state.handle)?;
+    state::require_active(view.handle_mut())?;
 
     // Phase 1: read local member DID + access key (lock-free local_dids).
     let local_dids = deps.local_dids.load_full();
-    let local_member_did = state
-        .membership
+    let local_member_did = view
+        .membership_class_c_mut()
         .member_dids()
         .find(|d| local_dids.contains(*d))
         .map(std::string::ToString::to_string)
         .ok_or_else(|| {
             ContextError::CryptoFailed("no local member found in this context".into())
         })?;
-    let access_key = state
-        .access
+    let access_key = view
+        .access_mut()
         .access_key_store
         .get(context_id, &local_member_did)
         .cloned();
@@ -1189,8 +1457,7 @@ pub fn deliver_incoming(
 
     // Recovery admin gate (only evaluated when message_type == Recovery).
     let sender_is_admin = if inner.message_type == MessageType::Recovery {
-        state
-            .role_state
+        view.role_state_class_c_mut()
             .member_has_capability(&sender_did, &Capability::ContextClose)
     } else {
         false
@@ -1217,7 +1484,7 @@ pub fn deliver_incoming(
     // here — after signature/integrity verification, before the anti-replay /
     // reorder sequence machinery — and returns `Handled`.
     if inner.message_type == MessageType::ConsistencyCheckpoint {
-        return deliver_checkpoint_message(state, deps, context_id, &sender_did, &plaintext);
+        return deliver_checkpoint_message(view, deps, context_id, &sender_did, &plaintext);
     }
 
     // Heartbeat dispatch (§9.9.2). A heartbeat is NOT application content: it
@@ -1234,14 +1501,15 @@ pub fn deliver_incoming(
 
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
-    let sequence_check = validate_and_drain_timeouts(state, deps, context_id, &inner, now_ms)?;
+    let sequence_check =
+        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)?;
 
     let is_local_sender = sender_did == local_member_did;
 
     match sequence_check {
         SequenceCheck::Expected => {
             let consumed_as_announcement = deliver_message_and_drain_buffered(
-                state,
+                view,
                 deps,
                 context_id,
                 &context_id_bytes,
@@ -1249,6 +1517,7 @@ pub fn deliver_incoming(
                 &inner,
                 &plaintext,
                 is_local_sender,
+                downward_auth_sink,
             )?;
             if consumed_as_announcement {
                 Ok(DeliverOutcome::Handled)
@@ -1258,13 +1527,14 @@ pub fn deliver_incoming(
         }
         SequenceCheck::Ahead { expected: _ } => {
             buffer_ahead_message(
-                state,
+                view,
                 deps,
                 context_id,
                 &inner,
                 &sender_did,
                 &plaintext,
                 now_ms,
+                downward_auth_sink,
             );
             Ok(DeliverOutcome::Handled)
         }
@@ -1293,7 +1563,7 @@ pub fn deliver_incoming(
 /// error from `compare_remote_checkpoint` (member-not-found or signature
 /// failure).
 fn deliver_checkpoint_message(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &str,
@@ -1320,9 +1590,11 @@ fn deliver_checkpoint_message(
 
     // Equivocation detection (§9.9.3): verifies the checkpoint signature,
     // compares Merkle roots, and emits ContextEvent::EquivocationDetected into
-    // the receive buffer when divergent (tier (a) of §23.7).
+    // the receive buffer when divergent (tier (a) of §23.7). The receive path
+    // now threads a `ClassCMut` view (from `deliver_incoming`), so it uses the
+    // view entry rather than the bare-state sibling.
     crate::context::queries_helpers::compare_remote_checkpoint(
-        state,
+        view,
         deps,
         context_id,
         &message.checkpoint,
@@ -1559,8 +1831,7 @@ pub fn send_heartbeat(
     {
         let is_suspended = state
             .role_state
-            .suspended_capabilities
-            .get(sender_did.as_ref())
+            .suspended_for(sender_did.as_ref())
             .is_some_and(|s| s.contains(&Capability::MessagesWrite));
         let msg = if is_suspended {
             format!("member {sender_did} write access has been revoked")
@@ -1613,24 +1884,32 @@ pub fn send_heartbeat(
 }
 
 // ---------------------------------------------------------------------------
-// 10. authorize_send_payment
+// 10. authorize_send_payment_prepare
 // ---------------------------------------------------------------------------
 
 /// Authorizes escrow for send payment (Phase 1.5 of [`send_message`]).
-pub async fn authorize_send_payment(
-    state: &mut PerContextState,
+/// Sync PREPARE half of the send-path payment authorization (ADR-049 §9): reads
+/// the SHARED `&PerContextState` (via `&*cell`) to evaluate whether a non-zero
+/// cost applies and, if so, returns the OWNED, `Send` inputs the async escrow
+/// hold needs. Returns `None` when no adapter / no policy / zero cost
+/// short-circuits authorization.
+///
+/// The split exists so the cell borrow drops at the call boundary (the result is
+/// owned), leaving the cell free for the `send_message` body's subsequent
+/// `.await` of [`crate::context::economy_helpers::authorize_paid_action_hold`] —
+/// a `&ClassSCell` held ACROSS that await would make the actor future non-`Send`
+/// (`ClassSCell` is not `Sync`).
+pub fn authorize_send_payment_prepare(
+    cell: &crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    context_id: &str,
     sender_did: &DID,
-) -> Result<Option<crate::context::economy_logic::PaidActionAuthorization>, ContextError> {
-    crate::context::economy_helpers::authorize_paid_action(
-        state,
+) -> Option<crate::context::economy_helpers::OwnedAuthInputs> {
+    crate::context::economy_helpers::authorize_paid_action_prepare(
+        cell,
         deps,
         scp_protocol::economy::types::PaidActionType::MessageSend,
         sender_did,
-        context_id,
     )
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,33 +1921,57 @@ pub async fn authorize_send_payment(
 /// but does NOT roll back budget (H8). On failure a
 /// `PaymentCaptureFailed` event is appended (H19).
 pub async fn capture_send_payment(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
     sender_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    if let Some(a) = auth
-        && let Err(e) =
-            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
-    {
-        // H8: do NOT rollback budget — service was delivered.
-        tracing::warn!(
-            context_id,
-            "payment capture failed after successful send: {e}"
-        );
-        // H19: surface the capture failure as a local `ContextEvent` (no durable
-        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
-        record_payment_capture_failure(
-            state,
-            deps,
-            context_id,
-            "send_message",
-            sender_did,
-            &e.to_string(),
-            deducted_cost,
-        );
+    let Some(a) = auth else {
+        return;
+    };
+    // Capture splits the provider-driven async half (`capture_and_verify_paid_action`,
+    // NO state borrow — awaited with the cell free) from the field-narrowed sync
+    // surfacing (`surface_paid_action_receipt`, supplied the two Class-C fields
+    // from a non-persisting `ClassCMut` view). The coalesced persist is driven by
+    // the actor run loop on `Outcome::ok_mutated`.
+    match crate::context::economy_helpers::capture_and_verify_paid_action(a).await {
+        Ok(Some(receipt)) => {
+            let mut view = cell.class_c_view();
+            // The two disjoint Class-C `&mut` fields are taken SEQUENTIALLY through
+            // the view inside `surface_paid_action_receipt`'s own field-narrowed
+            // sub-calls; pass them one at a time so no two view accessors overlap.
+            crate::context::economy_helpers::emit_payment_received_event(
+                view.receive_buffer_mut(),
+                deps,
+                &receipt,
+                context_id,
+            );
+            crate::context::economy_helpers::record_payment_receipt(
+                view.payment_receipts_mut(),
+                &receipt,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // H8: do NOT rollback budget — service was delivered.
+            tracing::warn!(
+                context_id,
+                "payment capture failed after successful send: {e}"
+            );
+            // H19: surface the capture failure as a local `ContextEvent` (no durable
+            // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
+            record_payment_capture_failure(
+                cell.class_c_view().receive_buffer_mut(),
+                deps,
+                context_id,
+                "send_message",
+                sender_did,
+                &e.to_string(),
+                deducted_cost,
+            );
+        }
     }
 }
 
@@ -1686,7 +1989,7 @@ pub async fn capture_send_payment(
 /// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
-    state: &mut PerContextState,
+    receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
     deps: &ActorDeps,
     context_id: &str,
     action: &str,
@@ -1700,12 +2003,7 @@ fn record_payment_capture_failure(
         error: error_msg.to_owned(),
         cost: cost.map(scp_protocol::economy::types::Amount::value),
     };
-    emit_event_into(
-        &mut state.receive_buffer,
-        event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
+    emit_event_into(receive_buffer, event, context_id, deps.event_tx.as_ref());
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,7 +2015,7 @@ fn record_payment_capture_failure(
 /// budget; pure bookkeeping with no error path (a missing Merkle root or a
 /// zero-count record is simply not cached).
 fn record_send_participation(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -1739,9 +2037,8 @@ fn record_send_participation(
         )
         && record.participation_count > 0
     {
-        state
-            .governance
-            .participation_cache
+        view.governance_class_c_mut()
+            .participation_cache_mut()
             .insert(sender_did.to_string(), record);
     }
 }
@@ -1754,15 +2051,18 @@ fn record_send_participation(
 /// stays `async` because it threads through escrow / transport awaits
 /// before `finalize_send`.
 ///
-/// `spending_nonce_committed` selects the ADR-049 §9 persistence class for the
-/// final snapshot (BLACK-001): when `true` (a paid send committed a spending-
-/// UCAN nonce in Phase 1 — `enforce_send_economy` mutated the actor-owned
+/// `token` carries the ADR-049 §9 deferred-persist obligation for this send
+/// (BLACK-001): it is `Some` when a paid send burned a spending-UCAN nonce in
+/// Phase 1 (`enforce_send_economy` mutated the actor-owned
 /// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
-/// actor crash), the persist is FAIL-CLOSED: a persist failure returns
+/// actor crash), and `None` for a free / non-spending send. When `Some`, the
+/// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
 /// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
 /// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
-/// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
-/// the persist stays best-effort (Class C) — the common path is not regressed.
+/// path in `reserve_tool_economy`. When `None`, the persist stays best-effort
+/// (Class C) — the common path is not regressed. The token is consumed on EVERY
+/// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
+/// expiry must still persist the burned nonce, keep-direction).
 ///
 /// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
 ///
@@ -1786,7 +2086,7 @@ fn record_send_participation(
 /// deferred responsibility, discharged here.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_send(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -1794,7 +2094,7 @@ pub fn finalize_send(
     sequence: u64,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
-    spending_nonce_committed: bool,
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
     // M12: `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 /
@@ -1809,96 +2109,142 @@ pub fn finalize_send(
     // re-check the lifecycle state — a TTL expiry could land between
     // Phase 1 and finalize within the same command if the actor's TTL
     // arm fires (Phase 2A.9 wires this). For Phase 2A.7 this matches
-    // the legacy contract: rollback the sequence number and exit.
-    if state::require_active(&state.handle).is_err() {
+    // the legacy contract: rollback the sequence number and exit. The
+    // handle read goes through the Class-C view (its borrow ends before the
+    // shared-`&` token commit below).
+    if state::require_active(cell.class_c_view().handle_mut()).is_err() {
         // Only encrypted sends reserved a sequence (broadcast publishes carry 0
         // and never call `next_sequence_number`) — broadcast must not roll back.
         if !is_broadcast {
-            state.membership.rollback_sequence_number(sender_did);
+            cell.class_c_view()
+                .membership_class_c_mut()
+                .rollback_sequence_number(sender_did);
         }
-        // A spending-UCAN nonce committed in Phase 1 stays CONSUMED (a late TTL
-        // expiry must not freshen it); persist it fail-closed so a crash before
-        // coalesce cannot roll the consume back (ADR-049 §9 Class S).
-        if spending_nonce_committed {
-            persist_state_fail_closed(state, deps, context_id)?;
+        // A spending-UCAN nonce burned in Phase 1 stays CONSUMED (a late TTL
+        // expiry must not freshen it); commit its deferred token so it persists
+        // fail-closed — a crash before coalesce cannot roll the consume back
+        // (ADR-049 §9 Class S, keep-direction). A free send carries no token. The
+        // token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
+        if let Some(t) = token {
+            t.commit(cell, deps, context_id)?;
         }
         return Ok(());
     }
 
     let now = deps.clock.now_secs();
-    let sent_event = ContextEvent::MessageSent {
-        sender_did: sender_did.clone(),
-        sequence_number: sequence,
-        payload: payload.to_vec(),
-    };
-    emit_event_into(
-        &mut state.receive_buffer,
-        sent_event,
-        context_id,
-        deps.event_tx.as_ref(),
-    );
-
-    // Consequence enforcement.
-    let (send_events, convergent_now) =
-        crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
-            context_id,
-            now,
-            &*deps.event_log,
-        );
-    let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
-    let send_triggered = evaluate_consequence_rules(
-        &consequence_rules,
-        &send_events,
-        sender_did.as_ref(),
-        now,
-        convergent_now,
-    );
+    // ADR-049 §9 (RED-CS3): `true` when consequence enforcement performs a
+    // downward-authorization mutation (a capability suspension or an `AssignRole`
+    // demotion), so the final persist is upgraded to fail-closed (keep-direction)
+    // — a coalesce-window crash must not lose the mutation. Bound from the view
+    // block below so the value is set exactly once, then folded into a token
+    // obligation (free branch only) at the persist site.
+    // The GROW methods arm this sink directly when a downward-auth mutation is
+    // applied (GAP-A: arming is coupled to the mutation, not a separate call). It
+    // is owned here at the cell boundary and reconciled with the send's nonce
+    // `token` below.
+    let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> = None;
+    // Class-C field mutations run through the non-persisting view (coalesced —
+    // the run loop persists on `mutated`); the view borrow ends (NLL) before the
+    // cell-taking checkpoint-broadcast + fail-closed persist below.
     {
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
+        let mut view = cell.class_c_view();
+        let sent_event = ContextEvent::MessageSent {
+            sender_did: sender_did.clone(),
+            sequence_number: sequence,
+            payload: payload.to_vec(),
         };
-        crate::context::governance_logic::enforce_triggered_consequences(
-            &mut split,
-            &crate::context::governance_logic::EnforceConsequencesCtx {
-                context_id,
-                member_did: sender_did,
-                now,
-                triggered: &send_triggered,
-                rules: &consequence_rules,
-                clock: &*deps.clock,
-                event_log: &*deps.event_log,
-                event_tx: deps.event_tx.as_ref(),
-            },
+        emit_event_into(
+            view.receive_buffer_mut(),
+            sent_event,
+            context_id,
+            deps.event_tx.as_ref(),
         );
+
+        // Consequence enforcement.
+        let (send_events, convergent_now) =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                view.receive_buffer_mut(),
+                context_id,
+                now,
+                &*deps.event_log,
+            );
+        let consequence_rules: Vec<ConsequenceRule> = view
+            .governance_class_c_mut()
+            .consequence_rules_mut()
+            .clone();
+        let send_triggered = evaluate_consequence_rules(
+            &consequence_rules,
+            &send_events,
+            sender_did.as_ref(),
+            now,
+            convergent_now,
+        );
+        {
+            let mut split = view.consequence_split();
+            // ADR-049 §9 (RED-CS3): a downward-auth mutation (a
+            // `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+            // replacement) ARMS `downward_auth_sink` via the GROW method itself.
+            // When armed, the final persist below is upgraded to fail-closed so the
+            // mutation is durable before this send acks.
+            let _ = crate::context::governance_logic::enforce_triggered_consequences(
+                &mut split,
+                &crate::context::governance_logic::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: sender_did,
+                    now,
+                    triggered: &send_triggered,
+                    rules: &consequence_rules,
+                    clock: &*deps.clock,
+                    event_log: &*deps.event_log,
+                    event_tx: deps.event_tx.as_ref(),
+                },
+                &mut downward_auth_sink,
+            );
+        }
+
+        // Participation record (#1530).
+        record_send_participation(
+            &mut view,
+            deps,
+            context_id,
+            context_id_bytes,
+            sender_did,
+            &send_events,
+            now,
+        );
+
+        // Checkpoint tracking (§9.9.3).
+        *view.checkpoint_events_since_mut() += 1;
     }
+    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now);
 
-    // Participation record (#1530).
-    record_send_participation(
-        state,
-        deps,
-        context_id,
-        context_id_bytes,
-        sender_did,
-        &send_events,
-        now,
-    );
-
-    // Checkpoint tracking (§9.9.3).
-    state.checkpoint_events_since += 1;
-    create_and_broadcast_checkpoint_if_due(state, deps, context_id, sender_did, signing_key, now);
+    // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
+    // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
+    // RED-CS3):
+    // - FREE branch (`token.is_none()`): the armed sink token IS the obligation —
+    //   pass it straight through.
+    // - PAID branch (`token.is_some()`): the nonce `token` already owes a
+    //   fail-closed `commit` that covers the same GROW (one persist makes the whole
+    //   in-memory state durable). An armed sink token here is genuinely REDUNDANT;
+    //   it is subsumed by the nonce token (consuming it without a second persist).
+    let downward_auth_obligation = match (downward_auth_sink, token.is_some()) {
+        (Some(sink_token), false) => Some(sink_token),
+        (Some(sink_token), true) => {
+            // The nonce token's commit covers this GROW — subsume the redundant one.
+            sink_token.subsume(context_id);
+            None
+        }
+        (None, _) => None,
+    };
 
     persist_finalized_send(
-        state,
+        cell,
         deps,
         context_id,
         sender_did,
-        spending_nonce_committed,
+        token,
         is_broadcast,
+        downward_auth_obligation,
     )
 }
 
@@ -1907,15 +2253,16 @@ pub fn finalize_send(
 /// detect relay equivocation (§23.7).
 ///
 /// Factored out of [`finalize_send`] to keep that function within the clippy
-/// line budget. The local retention (pushing into `state.checkpoints`) happens
-/// inside `create_checkpoint_if_due`; the broadcast is **best-effort** — a
+/// line budget. The local retention (pushing into the view's `checkpoints`)
+/// happens inside `create_checkpoint_if_due_view`; the broadcast is
+/// **best-effort** — a
 /// transport failure is logged but never rolls back the just-completed
 /// application send, because the checkpoint is an independent
 /// consistency-monitoring artifact, not part of the message's delivery
 /// guarantee. A missing signing key (e.g. a context with no local custody)
 /// skips checkpoint creation entirely.
 fn create_and_broadcast_checkpoint_if_due(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
@@ -1925,22 +2272,27 @@ fn create_and_broadcast_checkpoint_if_due(
     let Some(sk) = signing_key else {
         return;
     };
-    let broadcast_context_is_none = state.broadcast_context.is_none();
-    let mls_epoch = state.epoch.mls_epoch;
-    let due_checkpoint = crate::context::queries_helpers::create_checkpoint_if_due(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        &mut state.checkpoints,
-        &mut state.checkpoint_events_since,
-        &mut state.checkpoint_last_time_secs,
-        sender_did,
-        sk,
-        now,
-        &*deps.event_log,
-    );
+    // Build + retain the checkpoint through the non-persisting Class-C view
+    // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
+    // ends before the shared-`&` `send_checkpoint` read below (NLL).
+    let due_checkpoint = {
+        let mut view = cell.class_c_view();
+        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let mls_epoch = view.epoch_mut().mls_epoch;
+        crate::context::queries_helpers::create_checkpoint_if_due_view(
+            &mut view,
+            context_id,
+            broadcast_context_is_none,
+            mls_epoch,
+            sender_did,
+            sk,
+            now,
+            &*deps.event_log,
+        )
+    };
+    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
     if let Some(checkpoint) = due_checkpoint
-        && let Err(e) = send_checkpoint(deps, state, context_id, sender_did, sk, &checkpoint)
+        && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint)
     {
         tracing::warn!(
             context_id,
@@ -1961,23 +2313,61 @@ fn create_and_broadcast_checkpoint_if_due(
 /// This is the LAST of [`finalize_send`]'s rollback sites (the persist-failure
 /// path); it shares the single sequence-rollback ownership invariant documented
 /// on [`finalize_send`] (gated `!is_broadcast`, no caller double-revert).
+///
+/// `downward_auth_obligation` (ADR-049 §9, RED-CS3): a fail-closed-persist token
+/// minted ONLY on the FREE-send branch when this send's consequence enforcement
+/// performed a downward-authorization mutation (a `suspended_capabilities` GROW or
+/// an `AssignRole` `member_capabilities` replacement). On the PAID branch the
+/// downward-auth mutation rides the nonce `token`'s own fail-closed `commit` (one
+/// persist covers all in-memory state), so `finalize_send` mints no separate
+/// obligation there and this is `None`. The free path commits this token to upgrade
+/// from best-effort to fail-closed so a coalesce-window crash cannot silently
+/// re-grant removed authority. The token carrier (vs. the prior `bool`) makes a
+/// populated-but-undischarged obligation a Drop-guard PANIC in debug/CI.
 fn persist_finalized_send(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
-    spending_nonce_committed: bool,
+    token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
+    downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<(), ContextError> {
-    if spending_nonce_committed {
-        if let Err(e) = persist_state_fail_closed(state, deps, context_id) {
-            if !is_broadcast {
-                state.membership.rollback_sequence_number(sender_did);
+    match token {
+        // Paid send: commit the deferred nonce token — its `commit` performs the
+        // fail-closed persist (ADR-049 §9 Class S, keep-direction) of ALL in-memory
+        // state, so a downward-auth mutation applied on this send is already covered
+        // (no separate obligation is minted on this branch, so
+        // `downward_auth_obligation` is `None` here). The token's `commit` takes a
+        // SHARED `&PerContextState` (via `&*cell`). On failure roll the reserved
+        // sequence back through the Class-C view (this fn owns that rollback; the
+        // caller does not double-revert) and surface the error.
+        Some(t) => {
+            debug_assert!(
+                downward_auth_obligation.is_none(),
+                "paid send mints no separate downward-auth obligation — the nonce \
+                 token's commit covers the GROW",
+            );
+            if let Err(e) = t.commit(cell, deps, context_id) {
+                if !is_broadcast {
+                    cell.class_c_view()
+                        .membership_class_c_mut()
+                        .rollback_sequence_number(sender_did);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
-    } else {
-        persist_state_best_effort(state, deps, context_id);
+        // Free / non-spending send: best-effort persist (Class C — not regressed)
+        // UNLESS this send applied a downward-auth mutation (a capability
+        // suspension or an `AssignRole` demotion), in which case the downward-auth
+        // obligation's token commits fail-closed (ADR-049 §9, keep-direction).
+        None => {
+            if let Some(obligation) = downward_auth_obligation {
+                obligation.commit(cell, deps, context_id)?;
+            } else {
+                persist_state_best_effort(cell, deps, context_id);
+            }
+        }
     }
     Ok(())
 }
@@ -2370,12 +2760,19 @@ pub fn decrypt_and_dispatch(
 // ---------------------------------------------------------------------------
 
 /// Validates timestamp and sequence, then drains timed-out gaps.
+///
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if draining a timed-out gap
+/// runs consequence enforcement that performs a downward-authorization mutation (a
+/// capability suspension or an `AssignRole` demotion), so the cell-holding caller
+/// commits it fail-closed.
 pub fn validate_and_drain_timeouts(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<SequenceCheck, ContextError> {
     // Timestamp validation first.
     let tv = scp_protocol::envelope::validation::TimestampValidator::default();
@@ -2383,16 +2780,15 @@ pub fn validate_and_drain_timeouts(
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
     // Sequence check: replay detection + gap detection (§9.8.5).
-    let check = state
-        .sequence_tracker
+    let check = view
+        .sequence_tracker_mut()
         .validate(inner)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // Drain timed-out gaps.
+    // Drain timed-out gaps. `drain_timed_out_gaps` bundles the simultaneous
+    // `&mut reorder_buffer` + `&sequence_tracker` borrow internally.
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let timed_out = state
-        .reorder_buffer
-        .drain_timed_out(now_ms, &state.sequence_tracker);
+    let timed_out = view.drain_timed_out_gaps(now_ms);
     for (gap_info, messages) in timed_out {
         let gap_event = ContextEvent::SequenceGapDetected {
             sender_did: DID(gap_info.sender_did.clone()),
@@ -2401,35 +2797,38 @@ pub fn validate_and_drain_timeouts(
             reason: format!("{:?}", gap_info.reason),
         };
         emit_event_into(
-            &mut state.receive_buffer,
+            view.receive_buffer_mut(),
             gap_event,
             context_id,
             deps.event_tx.as_ref(),
         );
         for msg in &messages {
             // Re-check membership and capability.
-            if !state.membership.contains(&msg.sender_did)
-                || !state
-                    .role_state
+            if !view.membership_class_c_mut().contains(&msg.sender_did)
+                || !view
+                    .role_state_class_c_mut()
                     .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
             {
                 continue;
             }
-            state.sequence_tracker.advance(
+            view.sequence_tracker_mut().advance(
                 &msg.inner.context_id,
                 &msg.sender_did,
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
             let event_name = deliver_plaintext_or_announcement(
-                state,
+                view,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            run_buffered_post_delivery(
-                state,
+            // The GROW arms `downward_auth_sink` directly (no separate
+            // `note_downward_auth` call to forget — GAP-A closed).
+            let _ = run_buffered_post_delivery(
+                view,
+                downward_auth_sink,
                 context_id,
                 &context_id_bytes,
                 &msg.sender_did,
@@ -2456,14 +2855,22 @@ pub fn validate_and_drain_timeouts(
 
 /// Buffers an out-of-order message that arrived ahead of expected
 /// sequence. Force-delivers oldest gap on overflow.
+///
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if a force-drained gap message
+/// runs consequence enforcement that performs a downward-authorization mutation (a
+/// capability suspension or an `AssignRole` demotion), so the cell-holding caller
+/// commits it fail-closed.
+#[allow(clippy::too_many_arguments)]
 pub fn buffer_ahead_message(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
@@ -2472,10 +2879,10 @@ pub fn buffer_ahead_message(
         received_at: now_ms,
     };
 
-    if let Some((mut gap_info, messages)) = state.reorder_buffer.buffer(buffered_msg) {
+    if let Some((mut gap_info, messages)) = view.reorder_buffer_mut().buffer(buffered_msg) {
         let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-        let expected = state
-            .sequence_tracker
+        let expected = view
+            .sequence_tracker_mut()
             .expected_sequence(context_id, sender_did)
             .unwrap_or(1);
         gap_info.expected_sequence = expected;
@@ -2487,35 +2894,38 @@ pub fn buffer_ahead_message(
             reason: format!("{:?}", gap_info.reason),
         };
         emit_event_into(
-            &mut state.receive_buffer,
+            view.receive_buffer_mut(),
             gap_event,
             context_id,
             deps.event_tx.as_ref(),
         );
 
         for msg in &messages {
-            if !state.membership.contains(&msg.sender_did)
-                || !state
-                    .role_state
+            if !view.membership_class_c_mut().contains(&msg.sender_did)
+                || !view
+                    .role_state_class_c_mut()
                     .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
             {
                 continue;
             }
-            state.sequence_tracker.advance(
+            view.sequence_tracker_mut().advance(
                 &msg.inner.context_id,
                 &msg.sender_did,
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
             let event_name = deliver_plaintext_or_announcement(
-                state,
+                view,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            run_buffered_post_delivery(
-                state,
+            // The GROW arms `downward_auth_sink` directly (no separate
+            // `note_downward_auth` call to forget — GAP-A closed).
+            let _ = run_buffered_post_delivery(
+                view,
+                downward_auth_sink,
                 context_id,
                 &context_id_bytes,
                 &msg.sender_did,
@@ -2542,10 +2952,17 @@ pub fn buffer_ahead_message(
 /// pushes the event, and drains any consecutive buffered messages.
 /// Returns `true` when the message was consumed as a pseudonym
 /// announcement (internal protocol message).
+///
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a `&mut Option<ClassSCommitToken>`
+/// POPULATED with a fail-closed-persist obligation if this delivery (or any
+/// consecutively-drained buffered message) runs consequence enforcement that
+/// performs a downward-authorization mutation (a capability suspension or an
+/// `AssignRole` demotion), so the cell-holding caller commits the mutated state
+/// fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_message_and_drain_buffered(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -2553,38 +2970,38 @@ pub fn deliver_message_and_drain_buffered(
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     plaintext: &[u8],
     skip_velocity: bool,
+    downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
 
-    state::require_active(&state.handle)?;
+    state::require_active(view.handle_mut())?;
 
-    if !state.membership.contains(sender_did) {
+    if !view.membership_class_c_mut().contains(sender_did) {
         return Err(ContextError::MemberNotFound(format!(
             "sender {sender_did} is not a member of this context"
         )));
     }
-    if !state
-        .role_state
-        .member_has_capability(sender_did, &Capability::MessagesWrite)
     {
-        let is_suspended = state
-            .role_state
-            .suspended_capabilities
-            .get(sender_did)
-            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
-        let msg = if is_suspended {
-            format!("member {sender_did} write access has been revoked")
-        } else {
-            format!("member {sender_did} does not have messages:write capability")
-        };
-        return Err(ContextError::PermissionDenied(msg));
+        let role = view.role_state_class_c_mut();
+        if !role.member_has_capability(sender_did, &Capability::MessagesWrite) {
+            let is_suspended = role
+                .suspended_capabilities()
+                .get(sender_did)
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+            let msg = if is_suspended {
+                format!("member {sender_did} write access has been revoked")
+            } else {
+                format!("member {sender_did} does not have messages:write capability")
+            };
+            return Err(ContextError::PermissionDenied(msg));
+        }
     }
 
     // §9.10.4: run the shared announcement-ingest validator. The direct path
     // maps a rejection to a typed `Err(PermissionDenied)` (there IS a caller to
     // surface it to), and on success runs the in-order follow-up below.
     match ingest_pseudonym_announcement(
-        state,
+        view,
         sender_did,
         plaintext,
         context_id,
@@ -2607,37 +3024,42 @@ pub fn deliver_message_and_drain_buffered(
             // receive), so appending it would false-positive §9.9.3 equivocation
             // detection — the same reason received application messages are
             // buffer-only.
-            state
-                .sequence_tracker
-                .advance(context_id, sender_did, inner.sequence, inner.timestamp);
+            view.sequence_tracker_mut().advance(
+                context_id,
+                sender_did,
+                inner.sequence,
+                inner.timestamp,
+            );
             let next_expected = inner.sequence.saturating_add(1);
             let consecutive =
-                state
-                    .reorder_buffer
+                view.reorder_buffer_mut()
                     .drain_consecutive(context_id, sender_did, next_expected);
             for msg in &consecutive {
-                if !state.membership.contains(&msg.sender_did)
-                    || !state
-                        .role_state
+                if !view.membership_class_c_mut().contains(&msg.sender_did)
+                    || !view
+                        .role_state_class_c_mut()
                         .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
                 {
                     continue;
                 }
-                state.sequence_tracker.advance(
+                view.sequence_tracker_mut().advance(
                     &msg.inner.context_id,
                     &msg.sender_did,
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
                 let event_name = deliver_plaintext_or_announcement(
-                    state,
+                    view,
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                run_buffered_post_delivery(
-                    state,
+                // The GROW arms `downward_auth_sink` directly (no separate
+                // `note_downward_auth` call to forget — GAP-A closed).
+                let _ = run_buffered_post_delivery(
+                    view,
+                    downward_auth_sink,
                     context_id,
                     context_id_bytes,
                     &msg.sender_did,
@@ -2657,17 +3079,18 @@ pub fn deliver_message_and_drain_buffered(
 
             let now = deps.clock.now_secs();
             if !skip_velocity {
-                state
-                    .governance
-                    .velocity_tracker
+                view.governance_class_c_mut()
+                    .velocity_tracker_mut()
                     .record_message(&DID(sender_did.to_owned()), now);
             }
-            let consequence_rules: Vec<ConsequenceRule> =
-                state.governance.consequence_rules.clone();
+            let consequence_rules: Vec<ConsequenceRule> = view
+                .governance_class_c_mut()
+                .consequence_rules_mut()
+                .clone();
             if !consequence_rules.is_empty() {
                 let (recv_events, convergent_now) =
                     crate::context::governance_logic::event_log_entries_for_consequences(
-                        &state.receive_buffer,
+                        view.receive_buffer_mut(),
                         context_id,
                         now,
                         &*deps.event_log,
@@ -2680,14 +3103,9 @@ pub fn deliver_message_and_drain_buffered(
                     convergent_now,
                 );
                 let recv_member_did = DID(sender_did.to_owned());
-                let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-                    governance: &mut state.governance,
-                    role_state: &mut state.role_state,
-                    membership: &state.membership,
-                    receive_buffer: &mut state.receive_buffer,
-                    checkpoint_events_since: &mut state.checkpoint_events_since,
-                };
-                crate::context::governance_logic::enforce_triggered_consequences(
+                let mut split = view.consequence_split();
+                // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+                let _ = crate::context::governance_logic::enforce_triggered_consequences(
                     &mut split,
                     &crate::context::governance_logic::EnforceConsequencesCtx {
                         context_id,
@@ -2699,24 +3117,24 @@ pub fn deliver_message_and_drain_buffered(
                         event_log: &*deps.event_log,
                         event_tx: deps.event_tx.as_ref(),
                     },
+                    downward_auth_sink,
                 );
             }
-            state.checkpoint_events_since += 1;
+            *view.checkpoint_events_since_mut() += 1;
 
             return Ok(true);
         }
     }
 
     // Normal message: advance tracker + deliver.
-    state
-        .sequence_tracker
+    view.sequence_tracker_mut()
         .advance(context_id, sender_did, inner.sequence, inner.timestamp);
     let recv_event = ContextEvent::MessageReceived {
         sender_did: sender_did_obj,
         payload: plaintext.to_vec(),
     };
     emit_event_into(
-        &mut state.receive_buffer,
+        view.receive_buffer_mut(),
         recv_event,
         context_id,
         deps.event_tx.as_ref(),
@@ -2724,32 +3142,34 @@ pub fn deliver_message_and_drain_buffered(
 
     // Drain consecutive buffered (§9.8.5).
     let next_expected = inner.sequence.saturating_add(1);
-    let consecutive = state
-        .reorder_buffer
-        .drain_consecutive(context_id, sender_did, next_expected);
+    let consecutive =
+        view.reorder_buffer_mut()
+            .drain_consecutive(context_id, sender_did, next_expected);
     for msg in &consecutive {
-        if !state.membership.contains(&msg.sender_did)
-            || !state
-                .role_state
+        if !view.membership_class_c_mut().contains(&msg.sender_did)
+            || !view
+                .role_state_class_c_mut()
                 .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
         {
             continue;
         }
-        state.sequence_tracker.advance(
+        view.sequence_tracker_mut().advance(
             &msg.inner.context_id,
             &msg.sender_did,
             msg.inner.sequence,
             msg.inner.timestamp,
         );
         let event_name = deliver_plaintext_or_announcement(
-            state,
+            view,
             &msg.sender_did,
             &msg.plaintext,
             context_id,
             deps.event_tx.as_ref(),
         );
-        run_buffered_post_delivery(
-            state,
+        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+        let _ = run_buffered_post_delivery(
+            view,
+            downward_auth_sink,
             context_id,
             context_id_bytes,
             &msg.sender_did,
@@ -2776,16 +3196,18 @@ pub fn deliver_message_and_drain_buffered(
     // H16: defense-in-depth velocity + consequence eval on receive.
     let now = deps.clock.now_secs();
     if !skip_velocity {
-        state
-            .governance
-            .velocity_tracker
+        view.governance_class_c_mut()
+            .velocity_tracker_mut()
             .record_message(&DID(sender_did.to_owned()), now);
     }
-    let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
+    let consequence_rules: Vec<ConsequenceRule> = view
+        .governance_class_c_mut()
+        .consequence_rules_mut()
+        .clone();
     if !consequence_rules.is_empty() {
         let (recv_events, convergent_now) =
             crate::context::governance_logic::event_log_entries_for_consequences(
-                &state.receive_buffer,
+                view.receive_buffer_mut(),
                 context_id,
                 now,
                 &*deps.event_log,
@@ -2798,14 +3220,9 @@ pub fn deliver_message_and_drain_buffered(
             convergent_now,
         );
         let recv_member_did = DID(sender_did.to_owned());
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
-        };
-        crate::context::governance_logic::enforce_triggered_consequences(
+        let mut split = view.consequence_split();
+        // The GROW arms `downward_auth_sink` directly (GAP-A closed).
+        let _ = crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
@@ -2817,10 +3234,11 @@ pub fn deliver_message_and_drain_buffered(
                 event_log: &*deps.event_log,
                 event_tx: deps.event_tx.as_ref(),
             },
+            downward_auth_sink,
         );
     }
 
-    state.checkpoint_events_since += 1;
+    *view.checkpoint_events_since_mut() += 1;
     crate::metrics::record_message_received();
 
     Ok(false)
@@ -2834,14 +3252,17 @@ pub fn deliver_message_and_drain_buffered(
 /// the announcing member's DID to their per-context pseudonym routing
 /// ID. Best-effort — internal log on transport / serialization failure.
 pub async fn send_pseudonym_announcement(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
     signing_key: &ed25519_dalek::SigningKey,
 ) {
     let context_id = handle.context_id().to_owned();
-    let Some(pseudonym) = state.routing.local_pseudonym() else {
+    // Read the routing pseudonym via Deref; the borrow ends before the
+    // cell-taking `send_message` call below (which reaches the spending-nonce
+    // leaf).
+    let Some(pseudonym) = cell.routing.local_pseudonym() else {
         return;
     };
     let announcement = state::PseudonymAnnouncement {
@@ -2857,7 +3278,7 @@ pub async fn send_pseudonym_announcement(
         return;
     };
     if let Err(e) = send_message(
-        state,
+        cell,
         deps,
         handle,
         sender_did,
@@ -2987,6 +3408,7 @@ mod pseudonym_routing_tests {
     use super::{
         AnnouncementOutcome, deliver_plaintext_or_announcement, ingest_pseudonym_announcement,
     };
+    use crate::context::actor::class_s::ClassCMut;
     use crate::context::actor::state::PerContextState;
 
     const ALICE: &str = "did:dht:z6MkAliceIngest";
@@ -3019,7 +3441,13 @@ mod pseudonym_routing_tests {
         let alice_pseudonym = [0x42u8; 32];
         let bytes = announcement_bytes(ALICE, alice_pseudonym);
 
-        let result = deliver_plaintext_or_announcement(&mut state, ALICE, &bytes, &ctx, None);
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &bytes,
+            &ctx,
+            None,
+        );
         // A recorded announcement is a buffer-only routing signal — NO durable
         // Merkle leaf is minted on receive (§9.9.3), so the typed-append channel
         // is `None`. The registry update is the observable effect.
@@ -3041,7 +3469,7 @@ mod pseudonym_routing_tests {
         // the registry update below is the observable effect.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut state,
+                &mut ClassCMut::from_state(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, first),
                 &ctx,
@@ -3052,7 +3480,7 @@ mod pseudonym_routing_tests {
         // Same DID re-announces a rotated routing ID — legitimate key rotation.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut state,
+                &mut ClassCMut::from_state(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, rotated),
                 &ctx,
@@ -3075,7 +3503,13 @@ mod pseudonym_routing_tests {
         // The announcement claims BOB but the authenticated sender is ALICE.
         let forged = announcement_bytes(BOB, [0x42u8; 32]);
 
-        let result = deliver_plaintext_or_announcement(&mut state, ALICE, &forged, &ctx, None);
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &forged,
+            &ctx,
+            None,
+        );
         assert_eq!(result, None, "a forged-DID announcement must be dropped");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert!(
@@ -3095,7 +3529,13 @@ mod pseudonym_routing_tests {
             let mut state = encrypted_state();
             let bytes = announcement_bytes(ALICE, reserved);
             assert_eq!(
-                deliver_plaintext_or_announcement(&mut state, ALICE, &bytes, &ctx, None),
+                deliver_plaintext_or_announcement(
+                    &mut ClassCMut::from_state(&mut state),
+                    ALICE,
+                    &bytes,
+                    &ctx,
+                    None
+                ),
                 None,
                 "a reserved pseudonym value must be dropped"
             );
@@ -3121,7 +3561,7 @@ mod pseudonym_routing_tests {
         // assertions below distinguish Recorded (inserted) from Rejected.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut state,
+                &mut ClassCMut::from_state(&mut state),
                 ALICE,
                 &announcement_bytes(ALICE, shared_rid),
                 &ctx,
@@ -3132,7 +3572,7 @@ mod pseudonym_routing_tests {
         // Bob tries to claim Alice's already-registered routing ID → collision.
         assert_eq!(
             deliver_plaintext_or_announcement(
-                &mut state,
+                &mut ClassCMut::from_state(&mut state),
                 BOB,
                 &announcement_bytes(BOB, shared_rid),
                 &ctx,
@@ -3155,7 +3595,13 @@ mod pseudonym_routing_tests {
         let ctx = ctx_hex(0x22);
         let bytes = announcement_bytes(BOB, [0x42u8; 32]);
         assert_eq!(
-            deliver_plaintext_or_announcement(&mut state, BOB, &bytes, &ctx, None),
+            deliver_plaintext_or_announcement(
+                &mut ClassCMut::from_state(&mut state),
+                BOB,
+                &bytes,
+                &ctx,
+                None
+            ),
             None,
             "an announcement on a broadcast context (no peer registry) must be dropped"
         );
@@ -3170,8 +3616,13 @@ mod pseudonym_routing_tests {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
         let buffered_before = state.receive_buffer.event_log_entries().len();
-        let result =
-            deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            b"hello world",
+            &ctx,
+            None,
+        );
         // A non-announcement application message is pushed to the in-memory
         // receive buffer but NOT minted as a durable Merkle leaf (a
         // receiver-minted MessageReceived leaf is not sender-authenticated and
@@ -3195,7 +3646,13 @@ mod pseudonym_routing_tests {
         // NotAnnouncement: ordinary app data.
         let mut s = encrypted_state();
         assert!(matches!(
-            ingest_pseudonym_announcement(&mut s, ALICE, b"plain", &ctx, None),
+            ingest_pseudonym_announcement(
+                &mut ClassCMut::from_state(&mut s),
+                ALICE,
+                b"plain",
+                &ctx,
+                None
+            ),
             AnnouncementOutcome::NotAnnouncement
         ));
 
@@ -3203,7 +3660,7 @@ mod pseudonym_routing_tests {
         let mut s = encrypted_state();
         assert!(matches!(
             ingest_pseudonym_announcement(
-                &mut s,
+                &mut ClassCMut::from_state(&mut s),
                 ALICE,
                 &announcement_bytes(ALICE, [9u8; 32]),
                 &ctx,
@@ -3217,7 +3674,7 @@ mod pseudonym_routing_tests {
         let mut s = encrypted_state();
         assert!(matches!(
             ingest_pseudonym_announcement(
-                &mut s,
+                &mut ClassCMut::from_state(&mut s),
                 ALICE,
                 &announcement_bytes(BOB, [9u8; 32]),
                 &ctx,
@@ -3336,8 +3793,13 @@ mod pseudonym_routing_tests {
         // Deliver an ordinary application message via the buffered ingest entry
         // point. It is pushed to the receive buffer but returns `None` (no
         // sender-authenticated Merkle leaf — §9.9.3).
-        let event_name =
-            deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
+        let event_name = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            b"hello world",
+            &ctx,
+            None,
+        );
         assert_eq!(
             event_name, None,
             "a received application message must not mint a durable Merkle leaf"
@@ -3346,8 +3808,10 @@ mod pseudonym_routing_tests {
         // Post-delivery governance MUST run unconditionally, mirroring the
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
-        run_buffered_post_delivery(
-            &mut state,
+        let mut obligation = None;
+        let _suspended = run_buffered_post_delivery(
+            &mut ClassCMut::from_state(&mut state),
+            &mut obligation,
             &ctx,
             &ctx_bytes,
             ALICE,
@@ -3356,6 +3820,11 @@ mod pseudonym_routing_tests {
             &clock,
             &event_log,
             None,
+        );
+        // No GROW occurs on this velocity-trigger path, so no obligation is armed.
+        assert!(
+            obligation.is_none(),
+            "a non-GROW post-delivery must not arm a fail-closed obligation"
         );
 
         // (a) Velocity was recorded for the sender.
@@ -3635,8 +4104,23 @@ mod pseudonym_routing_tests {
         // skip governance for the `None`-typed application message.
         let incoming = drain_test_inner(&ctx, 1);
         let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
-        validate_and_drain_timeouts(&mut state, &deps, &ctx, &incoming, now_ms)
-            .expect("validate_and_drain_timeouts");
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
+        validate_and_drain_timeouts(
+            &mut ClassCMut::from_state(&mut state),
+            &deps,
+            &ctx,
+            &incoming,
+            now_ms,
+            &mut downward_auth_applied,
+        )
+        .expect("validate_and_drain_timeouts");
+        // The `SuspendAccess` action is a downward-auth GROW, so the drain
+        // populated the sink; discharge it (commit performs the fail-closed persist)
+        // so the token's Drop guard is satisfied.
+        if let Some(token) = downward_auth_applied.take() {
+            let _ = token.commit(&state, &deps, &ctx);
+        }
 
         // (a) Velocity recorded for the buffered sender via the drain path.
         let velocity = state.governance.velocity_tracker.snapshot_entries();
@@ -3759,10 +4243,25 @@ mod pseudonym_routing_tests {
         let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
         let inner = drain_test_inner(&ctx, 1);
 
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let consumed = deliver_message_and_drain_buffered(
-            &mut state, &deps, &ctx, &ctx_bytes, ALICE, &inner, &plaintext, false,
+            &mut ClassCMut::from_state(&mut state),
+            &deps,
+            &ctx,
+            &ctx_bytes,
+            ALICE,
+            &inner,
+            &plaintext,
+            false,
+            &mut downward_auth_applied,
         )
         .expect("deliver_message_and_drain_buffered");
+        // No consequence rules are installed here, so the sink stays `None`; the
+        // `take()` is a no-op that satisfies the token's Drop guard either way.
+        if let Some(token) = downward_auth_applied.take() {
+            let _ = token.commit(&state, &deps, &ctx);
+        }
 
         // The announcement WAS recognized + processed (consumed as an internal
         // protocol message) and inserted into the in-memory peer registry.

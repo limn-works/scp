@@ -60,8 +60,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// actor-shape messaging helpers). The send-sequence tracker
 /// (`state.send_tracker`) is reserved internally inside
 /// [`handle_send_message`].
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
@@ -69,8 +69,17 @@ pub async fn dispatch(
         MessagingCommand::Placeholder { reply } => reply_not_implemented(reply),
         MessagingCommand::SendMessage { payload, reply } => {
             let p = *payload;
+            // SendMessage reaches the spending-nonce leaf
+            // (`enforce_send_economy`) via `send_message`, so it is threaded the
+            // cell. The pure Class-C variants below (`ReportDegradedMode`,
+            // `BuildLocalCheckpoint`, `CompareRemoteCheckpoint`, `DeliverIncoming`)
+            // are threaded the cell too and reach their fields through the
+            // non-persisting `class_c_view`: the entire receive cascade makes only
+            // Class-C / structural mutations (sequence/reorder/receive buffers,
+            // membership[read], role[read], routing, the ConsequenceStateSplit
+            // Class-C fields), so no whole-state `state_mut()` is needed.
             handle_send_message(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 p.params,
@@ -88,17 +97,17 @@ pub async fn dispatch(
             context_id,
             envelope_bytes,
             reply,
-        } => handle_deliver_incoming(state, deps, &context_id, &envelope_bytes, reply).await,
+        } => handle_deliver_incoming(cell, deps, &context_id, &envelope_bytes, reply).await,
         MessagingCommand::DrainEvents { context_id, reply } => {
-            handle_drain_events(state, &context_id, reply).await
+            handle_drain_events(cell, &context_id, reply).await
         }
         MessagingCommand::DrainEquivocationAlerts { context_id, reply } => {
-            handle_drain_equivocation_alerts(state, &context_id, reply).await
+            handle_drain_equivocation_alerts(cell, &context_id, reply).await
         }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
             handle_send_pseudonym_announcement(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -114,21 +123,21 @@ pub async fn dispatch(
             member_did,
             pseudonym,
             reply,
-        } => handle_seed_peer_pseudonym(state, member_did, pseudonym, reply),
+        } => handle_seed_peer_pseudonym(cell, member_did, pseudonym, reply),
         #[cfg(feature = "testing")]
         MessagingCommand::TestInsertMember {
             context_id: _,
             member_did,
             role,
             reply,
-        } => handle_test_insert_member(state, deps, &member_did, &role, reply),
+        } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
             unsupported_features,
             reply,
         } => handle_report_degraded_mode(
-            state,
+            cell,
             deps,
             &context_id,
             compat,
@@ -140,25 +149,20 @@ pub async fn dispatch(
             sender_did,
             signing_key,
             reply,
-        } => handle_build_local_checkpoint(
-            state,
-            deps,
-            &context_id,
-            &sender_did,
-            &signing_key,
-            reply,
-        ),
+        } => {
+            handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signing_key, reply)
+        }
         MessagingCommand::CompareRemoteCheckpoint {
             context_id,
             remote,
             reply,
-        } => handle_compare_remote_checkpoint(state, deps, &context_id, &remote, reply),
+        } => handle_compare_remote_checkpoint(cell, deps, &context_id, &remote, reply),
         MessagingCommand::SendHeartbeat {
             context_id,
             sender_did,
             signing_key,
             reply,
-        } => handle_send_heartbeat(state, deps, &context_id, &sender_did, &signing_key, reply),
+        } => handle_send_heartbeat(&*cell, deps, &context_id, &sender_did, &signing_key, reply),
     }
 }
 
@@ -170,19 +174,23 @@ pub async fn dispatch(
 /// match so the dispatcher stays a flat one-line-per-arm router.
 #[cfg(feature = "testing")]
 fn handle_seed_peer_pseudonym(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     member_did: scp_identity::DID,
     pseudonym: [u8; 32],
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let result = if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.insert(member_did, pseudonym);
-        Ok(())
-    } else {
-        Err(ContextError::NotPseudonymousContext {
-            context_id: state.handle.context_id().to_owned(),
-        })
-    };
+    // Pure read via `Deref` on the cell (the error branch needs the context id).
+    let context_id = cell.handle.context_id().to_owned();
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); route the
+    // peer-registry insert through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let result = view.routing_mut().peer_registry_mut().map_or(
+        Err(ContextError::NotPseudonymousContext { context_id }),
+        |reg| {
+            reg.insert(member_did, pseudonym);
+            Ok(())
+        },
+    );
     let _ = reply.send(result);
     Outcome::ok(())
 }
@@ -198,25 +206,32 @@ fn handle_seed_peer_pseudonym(
 /// map). Rejects an inactive context so a mis-targeted test fails loudly.
 #[cfg(feature = "testing")]
 fn handle_test_insert_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     member_did: &scp_identity::DID,
     role: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C structural mutation (the run loop persists on `mutated`):
+    // the member roster insert, the system role assignment, and the membership
+    // add all route through the non-persisting `class_c_view`. A member ADD is a
+    // coalesce-window-rollback-acceptable structural change (ADR-049 §9), not a
+    // downward-auth GROW, so it needs no fail-closed Class-S persist.
     let result = (|| {
-        crate::context::state::require_active(&state.handle)?;
-        state.role_state.members.insert(member_did.to_string());
-        let tokens = scp_protocol::context::roles::system_assign_role(
-            &mut state.role_state,
-            member_did.as_ref(),
-            role,
-            &*deps.clock,
-        )
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-        state
-            .membership
-            .add_member(member_did.clone(), role.to_owned(), tokens);
+        crate::context::state::require_active(&cell.handle)?;
+        let tokens = {
+            let mut view = cell.class_c_view();
+            let mut role_state = view.role_state_class_c_mut();
+            role_state.members_mut().insert(member_did.to_string());
+            role_state
+                .system_assign_role(member_did.as_ref(), role, &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?
+        };
+        cell.class_c_view().membership_class_c_mut().add_member(
+            member_did.clone(),
+            role.to_owned(),
+            tokens,
+        );
         Ok(())
     })();
     let _ = reply.send(result);
@@ -237,7 +252,7 @@ fn handle_test_insert_member(
 /// stays correct.
 #[allow(clippy::too_many_arguments)]
 async fn handle_send_message(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
@@ -249,6 +264,12 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // ADR-049 §9 Class-S cell seam: held so `send_message` (which reaches the
+    // spending-nonce leaf) receives it. The send-tracker bookkeeping is a
+    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
+    // routes through the non-persisting `class_c_view` — its `&mut` borrow ends
+    // before the cell-taking `send_message` call.
+    let mut view = cell.class_c_view();
     // Step 1: reserve + commit a sequence number against the
     // actor-owned tracker. The Phase 2A wire sequence is still driven
     // by `MembershipState::next_sequence_number` inside the helper —
@@ -260,9 +281,9 @@ async fn handle_send_message(
     // manually decrement to mirror the RAII rollback semantics; the
     // helper does not read `send_tracker` so the early commit is
     // observationally identical.
-    let high_water_before = state.send_tracker.last_issued();
+    let high_water_before = view.send_tracker_mut().last_issued();
     {
-        let reservation = SequenceReservation::reserve(&mut state.send_tracker);
+        let reservation = SequenceReservation::reserve(view.send_tracker_mut());
         reservation.commit();
     }
 
@@ -277,7 +298,7 @@ async fn handle_send_message(
         // Manual rollback — restore the high-water mark prior to
         // reservation. `from_persisted` rebuilds the tracker at the
         // given last-issued value.
-        state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+        *view.send_tracker_mut() = SendSequenceTracker::from_persisted(high_water_before);
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -287,8 +308,11 @@ async fn handle_send_message(
     // per-call transport-timeout budget.
     let sk = signing_key.map(crate::context::actor::commands::SigningKeyBytes::to_signing_key);
     let sk_ref = sk.as_ref();
+    // `send_message` is the spending-nonce-bearing path and takes the cell; the
+    // `state` borrow above has ended (NLL) so `cell` is free here. The failure
+    // arms re-derive the bare state for the send-tracker rollback.
     let send_fut = crate::context::messaging_helpers::send_message(
-        state,
+        cell,
         deps,
         &handle,
         sender_did,
@@ -305,13 +329,15 @@ async fn handle_send_message(
             (Outcome::ok_mutated(()), Ok(()))
         }
         Ok(Err(e)) => {
-            // Rollback on failure.
-            state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            // Rollback on failure (coalesced Class-C via `class_c_view`).
+            *cell.class_c_view().send_tracker_mut() =
+                SendSequenceTracker::from_persisted(high_water_before);
             let sketch = outcome_error_sketch(&e);
             (Outcome::err_mutated(sketch), Err(e))
         }
         Err(_elapsed) => {
-            state.send_tracker = SendSequenceTracker::from_persisted(high_water_before);
+            *cell.class_c_view().send_tracker_mut() =
+                SendSequenceTracker::from_persisted(high_water_before);
             let err = ContextError::TransportTimeout(format!(
                 "send_message exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
@@ -331,29 +357,82 @@ async fn handle_send_message(
 /// budget. Precedent: `handlers::broadcast::handle_broadcast_*` wraps
 /// sync helpers the same way.
 async fn handle_deliver_incoming(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    let deliver_fut = async {
-        crate::context::messaging_helpers::deliver_incoming(state, deps, context_id, envelope_bytes)
+    // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation populated when the
+    // receive cascade performs a downward-auth mutation (a `suspended_capabilities`
+    // GROW or an `AssignRole` `member_capabilities` replacement). Owned HERE as a
+    // `&mut Option<ClassSCommitToken>` sink, at the cell boundary, so the obligation
+    // is `commit`ted (a fail-closed, keep-direction persist) once the borrowing
+    // `class_c_view` drops — it must not ride only the coalesced persist (a ≤50ms
+    // crash would silently re-grant the member's removed authority). The token
+    // carrier (vs. the prior `bool`) makes a populated-but-undischarged obligation a
+    // Drop-guard PANIC in debug/CI, so a missed discharge cannot slip through.
+    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
+        None;
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the receive
+    // cascade reaches its Class-C fields through the non-persisting `class_c_view`
+    // (sequence/reorder/receive buffers, membership[read], role[read], routing,
+    // ConsequenceStateSplit Class-C only). The downward-auth mutations it can make
+    // — a consequence-engine capability suspension or an `AssignRole` demotion —
+    // populate `downward_auth_obligation` and are persisted fail-closed below, not
+    // through the view.
+    let (outcome, reply_result) = {
+        let mut view = cell.class_c_view();
+        let deliver_fut = async {
+            crate::context::messaging_helpers::deliver_incoming(
+                &mut view,
+                deps,
+                context_id,
+                envelope_bytes,
+                &mut downward_auth_obligation,
+            )
+        };
+
+        match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
+            Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
+            Ok(Err(e)) => {
+                let sketch = outcome_error_sketch(&e);
+                (Outcome::err_mutated(sketch), Err(e))
+            }
+            Err(_elapsed) => {
+                let err = ContextError::TransportTimeout(format!(
+                    "deliver_incoming exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                ));
+                let sketch = outcome_error_sketch(&err);
+                (Outcome::err_mutated(sketch), Err(err))
+            }
+        }
+        // `view` drops here, releasing the `&mut cell` borrow.
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
-        Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
+    // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
+    // keep-direction): the mutation (suspension or `AssignRole` demotion) is
+    // already in memory; committing the obligation's token makes it durable before
+    // acking, closing the coalesce-window crash hole (RED-CS3). `take()` discharges
+    // the Drop guard. On persist failure the mutation STAYS in memory (the token's
+    // `commit` is keep-direction) and the §9 durability error is surfaced in place
+    // of the original reply (durability is the security obligation). When the
+    // deliver itself already errored (`Ok(Err(_))`), that original cause is
+    // preserved in the surfaced message so it is not lost. Skipped (the obligation
+    // stays `None`) when no downward-auth mutation occurred (the ordinary coalesced
+    // persist via `mutated` is sufficient).
+    let reply_result = if let Some(token) = downward_auth_obligation.take() {
+        match token.commit(cell, deps, context_id) {
+            Ok(()) => reply_result,
+            Err(persist_err) => Err(match reply_result {
+                Ok(_) => persist_err,
+                Err(deliver_err) => ContextError::PersistenceFailed(format!(
+                    "{persist_err} (after a delivery error: {deliver_err})"
+                )),
+            }),
         }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "deliver_incoming exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
+    } else {
+        reply_result
     };
 
     let _ = reply.send(reply_result);
@@ -366,11 +445,14 @@ async fn handle_deliver_incoming(
 /// events on the reply channel; never propagates `ContextNotRegistered`
 /// because the actor IS the registration.
 async fn handle_drain_events(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let drain_fut = async { state.receive_buffer.drain() };
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
+    // receive buffer through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let drain_fut = async { view.receive_buffer_mut().drain() };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
@@ -396,11 +478,14 @@ async fn handle_drain_events(
 /// it so catch-up does not destroy buffered application traffic
 /// (messages, membership changes) that arrived during the sync.
 async fn handle_drain_equivocation_alerts(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let drain_fut = async { state.receive_buffer.drain_equivocation_alerts() };
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); drain the
+    // equivocation alerts through the non-persisting `class_c_view`.
+    let mut view = cell.class_c_view();
+    let drain_fut = async { view.receive_buffer_mut().drain_equivocation_alerts() };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
@@ -419,7 +504,7 @@ async fn handle_drain_equivocation_alerts(
 
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`] (actor-shape).
 async fn handle_send_pseudonym_announcement(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -439,7 +524,7 @@ async fn handle_send_pseudonym_announcement(
 
     let sk = signing_key.to_signing_key();
     let send_fut = crate::context::messaging_helpers::send_pseudonym_announcement(
-        state, deps, &handle, sender_did, &sk,
+        cell, deps, &handle, sender_did, &sk,
     );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
@@ -470,15 +555,19 @@ async fn handle_send_pseudonym_announcement(
 /// [`Outcome::ok_mutated`] because the receive buffer may have grown by
 /// one event.
 fn handle_report_degraded_mode(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     compat: scp_protocol::envelope::VersionCompatibility,
     unsupported_features: Vec<String>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the
+    // `DegradedMode` event lands in the receive buffer via the non-persisting
+    // `class_c_view`. `report_degraded_mode` is field-narrowed to the single
+    // `&mut ReceiveBuffer` it mutates.
     crate::context::queries_helpers::report_degraded_mode(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         deps,
         context_id,
         compat,
@@ -492,9 +581,10 @@ fn handle_report_degraded_mode(
 ///
 /// Forces a signed consistency checkpoint from the current event-log
 /// state via
-/// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields),
-/// threading disjoint sub-borrows of the actor-owned state exactly as
-/// the periodic broadcast path does, then broadcasts it to peers via
+/// [`force_create_checkpoint_view`](crate::context::queries_helpers::force_create_checkpoint_view),
+/// which reaches the three Class-C checkpoint fields through a
+/// non-persisting [`class_c_view`](crate::context::actor::class_s::ClassSCell::class_c_view)
+/// (the run loop coalesce-persists), then broadcasts it to peers via
 /// [`send_checkpoint`](crate::context::messaging_helpers::send_checkpoint)
 /// (best-effort — a transport failure is logged but does not fail the
 /// command). The send happens inside the actor turn so the FFI-layer
@@ -508,7 +598,7 @@ fn handle_report_degraded_mode(
 /// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
 /// checkpoint ring and counters changed.
 fn handle_build_local_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_identity::DID,
@@ -517,29 +607,34 @@ fn handle_build_local_checkpoint(
 ) -> Outcome<()> {
     let sk = signing_key.to_signing_key();
     let now = deps.clock.now_secs();
-    let broadcast_context_is_none = state.broadcast_context.is_none();
-    let mls_epoch = state.epoch.mls_epoch;
-    let checkpoint = crate::context::queries_helpers::force_create_checkpoint_fields(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        &mut state.checkpoint_events_since,
-        &mut state.checkpoint_last_time_secs,
-        &mut state.checkpoints,
-        sender_did,
-        &sk,
-        now,
-        &*deps.event_log,
-    );
+    // Build + retain the checkpoint through the non-persisting Class-C view
+    // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
+    // ends before the shared-`&` `send_checkpoint` read below (NLL).
+    let checkpoint = {
+        let mut view = cell.class_c_view();
+        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let mls_epoch = view.epoch_mut().mls_epoch;
+        crate::context::queries_helpers::force_create_checkpoint_view(
+            &mut view,
+            context_id,
+            broadcast_context_is_none,
+            mls_epoch,
+            sender_did,
+            &sk,
+            now,
+            &*deps.event_log,
+        )
+    };
 
     // Broadcast the freshly-built checkpoint to peers over the regular
     // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
     // failure is logged but never fails the build (the reconnection driver
     // still receives + records the local checkpoint). Mirrors the
     // periodic `create_and_broadcast_checkpoint_if_due` contract.
+    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
     if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
         deps,
-        state,
+        &*cell,
         context_id,
         sender_did,
         &sk,
@@ -569,14 +664,22 @@ fn handle_build_local_checkpoint(
 /// separately) / `Ahead` / `Consistent` / `Divergent`
 /// classification and any `MemberNotFound` / `CryptoFailed` error.
 fn handle_compare_remote_checkpoint(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
 ) -> Outcome<()> {
-    let result =
-        crate::context::queries_helpers::compare_remote_checkpoint(state, deps, context_id, remote);
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the
+    // equivocation dedup set + receive-buffer emit land through the non-persisting
+    // `class_c_view`. `compare_remote_checkpoint` is narrowed to the Class-C view:
+    // it reads membership and mutates `last_seen_remote_checkpoint` + `receive_buffer`.
+    let result = crate::context::queries_helpers::compare_remote_checkpoint(
+        &mut cell.class_c_view(),
+        deps,
+        context_id,
+        remote,
+    );
     let mutated = result.is_ok();
     let _ = reply.send(result);
     if mutated {

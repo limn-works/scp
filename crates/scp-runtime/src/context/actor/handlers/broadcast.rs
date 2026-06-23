@@ -47,6 +47,7 @@ use std::time::Duration;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::{
     ApplyBroadcastPublishPayload, BlockBroadcastSubscriberReply, BroadcastAdmissionReply,
     BroadcastBlockPayload, BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
@@ -56,12 +57,11 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for broadcast handlers.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`BroadcastCommand`] against actor-owned state and deps.
+/// Dispatch a [`BroadcastCommand`] against actor-owned cell and deps.
 ///
 /// The single-shot `PublishBroadcast` / `PublishBroadcastContent`
 /// variants require a key custody reference which cannot cross the actor
@@ -69,33 +69,33 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// the caller to the two-phase reserve/apply path. The custody-free
 /// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` /
 /// `ReleaseBroadcastReservation` variants ARE handled here against
-/// actor-owned state.
-pub async fn dispatch(
-    state: &mut PerContextState,
+/// actor-owned cell.
+pub(crate) async fn dispatch(
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(state, deps, cmd)).await
+    Box::pin(dispatch_inner(cell, deps, cmd)).await
 }
 
 async fn dispatch_inner(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
     match cmd {
         BroadcastCommand::Placeholder { reply } => reply_not_implemented(reply),
         BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-            handle_subscribe_broadcast(state, deps, *payload, reply).await
+            handle_subscribe_broadcast(cell, deps, *payload, reply).await
         }
         BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-            handle_unsubscribe_broadcast(state, deps, *payload, reply).await
+            handle_unsubscribe_broadcast(cell, deps, *payload, reply).await
         }
         BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-            handle_block_broadcast_subscriber(state, deps, *payload, reply).await
+            handle_block_broadcast_subscriber(cell, deps, *payload, reply).await
         }
         BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-            handle_unblock_broadcast_subscriber(state, deps, *payload, reply).await
+            handle_unblock_broadcast_subscriber(cell, deps, *payload, reply).await
         }
         BroadcastCommand::HandleBroadcastKeyRequest {
             context_id,
@@ -105,7 +105,7 @@ async fn dispatch_inner(
             reply,
         } => {
             handle_handle_broadcast_key_request(
-                state,
+                cell,
                 deps,
                 &context_id,
                 &author_did,
@@ -116,15 +116,15 @@ async fn dispatch_inner(
             .await
         }
         BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-            handle_broadcast_subscriber_count(state, &context_id, reply).await
+            handle_broadcast_subscriber_count(cell, &context_id, reply).await
         }
         BroadcastCommand::IsBroadcastSubscriber {
             context_id,
             did,
             reply,
-        } => handle_is_broadcast_subscriber(state, &context_id, &did, reply).await,
+        } => handle_is_broadcast_subscriber(cell, &context_id, &did, reply).await,
         BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-            handle_broadcast_admission(state, &context_id, reply).await
+            handle_broadcast_admission(cell, &context_id, reply).await
         }
         BroadcastCommand::PublishBroadcast { reply, .. } => {
             const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody reference; \
@@ -139,13 +139,13 @@ async fn dispatch_inner(
             Outcome::err(ContextError::InvalidState(MSG.to_owned()))
         }
         BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-            handle_reserve_broadcast_publish(state, deps, *payload, reply).await
+            handle_reserve_broadcast_publish(cell, deps, *payload, reply).await
         }
         BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-            handle_apply_broadcast_publish(state, deps, *payload, reply).await
+            handle_apply_broadcast_publish(cell, deps, *payload, reply).await
         }
         BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
-            handle_release_broadcast_reservation(state, *payload, reply)
+            handle_release_broadcast_reservation(cell, *payload, reply)
         }
         BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
             reply_saga_deferred(reply)
@@ -154,7 +154,7 @@ async fn dispatch_inner(
 }
 
 async fn handle_subscribe_broadcast(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: SubscribeBroadcastPayload,
     reply: SubscribeBroadcastReply,
@@ -169,7 +169,7 @@ async fn handle_subscribe_broadcast(
             NoopProofResolver,
             std::collections::hash_map::RandomState,
         >(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.subscriber_did,
@@ -199,7 +199,7 @@ async fn handle_subscribe_broadcast(
 }
 
 async fn handle_unsubscribe_broadcast(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: UnsubscribeBroadcastPayload,
     reply: UnsubscribeBroadcastReply,
@@ -208,7 +208,7 @@ async fn handle_unsubscribe_broadcast(
 
     let unsub_fut = async {
         crate::context::broadcast_helpers::unsubscribe_broadcast(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.subscriber_did,
@@ -236,7 +236,7 @@ async fn handle_unsubscribe_broadcast(
 }
 
 async fn handle_block_broadcast_subscriber(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: BroadcastBlockPayload,
     reply: BlockBroadcastSubscriberReply,
@@ -245,7 +245,7 @@ async fn handle_block_broadcast_subscriber(
 
     let block_fut = async {
         crate::context::broadcast_helpers::block_broadcast_subscriber(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.author_did,
@@ -273,7 +273,7 @@ async fn handle_block_broadcast_subscriber(
 }
 
 async fn handle_unblock_broadcast_subscriber(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: BroadcastBlockPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -282,7 +282,7 @@ async fn handle_unblock_broadcast_subscriber(
 
     let unblock_fut = async {
         crate::context::broadcast_helpers::unblock_broadcast_subscriber(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.author_did,
@@ -310,7 +310,7 @@ async fn handle_unblock_broadcast_subscriber(
 }
 
 async fn handle_handle_broadcast_key_request(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     author_did: &scp_identity::DID,
@@ -320,7 +320,7 @@ async fn handle_handle_broadcast_key_request(
 ) -> Outcome<()> {
     let key_req_fut = async {
         crate::context::broadcast_helpers::handle_broadcast_key_request(
-            state,
+            cell,
             deps,
             author_did,
             requester_did,
@@ -348,11 +348,11 @@ async fn handle_handle_broadcast_key_request(
 }
 
 async fn handle_broadcast_subscriber_count(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
 ) -> Outcome<()> {
-    let count_fut = async { crate::context::broadcast_helpers::broadcast_subscriber_count(state) };
+    let count_fut = async { crate::context::broadcast_helpers::broadcast_subscriber_count(cell) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -370,12 +370,12 @@ async fn handle_broadcast_subscriber_count(
 }
 
 async fn handle_is_broadcast_subscriber(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     context_id: &str,
     did: &str,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let is_fut = async { crate::context::broadcast_helpers::is_broadcast_subscriber(state, did) };
+    let is_fut = async { crate::context::broadcast_helpers::is_broadcast_subscriber(cell, did) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, is_fut).await {
         Ok(is) => (Outcome::ok(()), Ok(is)),
@@ -393,11 +393,11 @@ async fn handle_is_broadcast_subscriber(
 }
 
 async fn handle_broadcast_admission(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     context_id: &str,
     reply: BroadcastAdmissionReply,
 ) -> Outcome<()> {
-    let admission_fut = async { crate::context::broadcast_helpers::broadcast_admission(state) };
+    let admission_fut = async { crate::context::broadcast_helpers::broadcast_admission(cell) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, admission_fut).await {
         Ok(admission) => (Outcome::ok(()), Ok(admission)),
@@ -415,7 +415,7 @@ async fn handle_broadcast_admission(
 }
 
 async fn handle_reserve_broadcast_publish(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: ReserveBroadcastPublishPayload,
     reply: ReserveBroadcastPublishReply,
@@ -423,11 +423,11 @@ async fn handle_reserve_broadcast_publish(
     let context_id = p.context_id.clone();
 
     let reserve_fut = async {
-        crate::context::broadcast_helpers::reserve_broadcast_publish(state, deps, &p.author_did)
+        crate::context::broadcast_helpers::reserve_broadcast_publish(cell, deps, &p.author_did)
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
-        // Reservation mutates actor state (consumes the sequence), so the
+        // Reservation mutates actor cell (consumes the sequence), so the
         // outcome is `mutated` even on the happy path — the apply or a
         // later release reconciles it.
         Ok(Ok(out)) => (Outcome::ok_mutated(()), Ok(out)),
@@ -449,7 +449,7 @@ async fn handle_reserve_broadcast_publish(
 }
 
 async fn handle_apply_broadcast_publish(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     p: ApplyBroadcastPublishPayload,
     reply: PublishBroadcastReply,
@@ -458,7 +458,7 @@ async fn handle_apply_broadcast_publish(
 
     let apply_fut = async {
         crate::context::broadcast_helpers::apply_broadcast_publish(
-            state,
+            cell,
             deps,
             &p.context_id,
             &p.reservation_id,
@@ -487,12 +487,12 @@ async fn handle_apply_broadcast_publish(
 }
 
 fn handle_release_broadcast_reservation(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     p: ReleaseBroadcastReservationPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let ReleaseBroadcastReservationPayload { reservation_id, .. } = p;
-    crate::context::broadcast_helpers::release_broadcast_reservation(state, &reservation_id);
+    crate::context::broadcast_helpers::release_broadcast_reservation(cell, &reservation_id);
     let _ = reply.send(Ok(()));
     // Releasing rolls the reserved sequence back — that is a mutation.
     Outcome::ok_mutated(())

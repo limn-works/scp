@@ -230,10 +230,10 @@ impl ContextActor {
         Self {
             context_id,
             inbox,
-            // Wrap the owned state in the Class-S fail-closed-persist cell.
-            // PR1 scaffolding: handlers still receive `&mut PerContextState`
-            // via `ClassSCell::state_mut()` at the dispatch boundary, so this
-            // is a pure ownership change with no behaviour difference.
+            // Wrap the owned state in the Class-S fail-closed-persist cell. The
+            // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
+            // `state_mut`); every handler mutates through the cell's persist-on-
+            // commit combinators or the airtight `class_c_view()` (ADR-049 §9).
             state: Some(class_s::ClassSCell::new(state)),
             deps: Some(deps),
             ttl_timer: None,
@@ -463,11 +463,16 @@ impl ContextActor {
             )
         };
 
-        // PR1 scaffolding: obtain the bare `&mut PerContextState` via the
-        // temporary `state_mut()` escape hatch and pass it to handlers EXACTLY
-        // as before. No handler is migrated to the `ClassSCell` combinators in
-        // PR1, so dispatch behaviour is byte-for-byte unchanged.
-        let outcome = Self::dispatch_state(cell.state_mut(), &deps, cmd).await;
+        // `dispatch_state` receives the `&mut ClassSCell` directly and threads
+        // it into every domain handler. Every domain mutates through the cell's
+        // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
+        // for Class-S transitions, and the airtight `class_c_view()` /
+        // `commit_class_c_best_effort` for Class-C / structural state. There is
+        // no `state_mut()` escape hatch (deleted), and the broadcast member-
+        // removal in `unsubscribe_broadcast` routes through the restricted
+        // `MembershipClassCMut::remove_subscriber` (a public-content subscriber
+        // unsubscribe is best-effort-acceptable; see its doc, ADR-049 §9).
+        let outcome = Self::dispatch_state(&mut cell, &deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;
         }
@@ -490,7 +495,7 @@ impl ContextActor {
     /// Returns the handler's [`Outcome`]; the run-loop reads
     /// `outcome.mutated` to decide whether to set `self.dirty`.
     async fn dispatch_state(
-        state: &mut state::PerContextState,
+        cell: &mut class_s::ClassSCell,
         deps: &deps::ActorDeps,
         cmd: ContextCommand,
     ) -> Outcome<()> {
@@ -503,7 +508,7 @@ impl ContextActor {
                 // migration window. The send-sequence tracker
                 // (`state.send_tracker`) is reserved internally inside
                 // the handler.
-                handlers::messaging::dispatch(state, deps, sub).await
+                handlers::messaging::dispatch(cell, deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
                 // Phase 2A.9 — lifecycle domain migrated to actor-shape
@@ -516,7 +521,7 @@ impl ContextActor {
                 // queries_helpers. `_supervisor` is unused on this arm
                 // because the shim escape happens through the
                 // capability-reduced handle inside the dispatch body.
-                Box::pin(handlers::lifecycle::dispatch(state, deps, sub)).await
+                Box::pin(handlers::lifecycle::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Governance(sub) => {
                 // Phase 2A.8 — governance domain partially migrated to
@@ -528,14 +533,14 @@ impl ContextActor {
                 // the escape happens through the capability-reduced
                 // handle. Removed in Phase 2A finalization with the
                 // rest of the supervisor shim.
-                Box::pin(handlers::governance::dispatch(state, deps, sub)).await
+                Box::pin(handlers::governance::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Broadcast(sub) => {
                 // Phase 2A.5 — broadcast domain migrated to the
                 // actor-shape handler for non-publish commands.
                 // Publish variants still require the custody-generic
                 // supervisor shim because `KeyCustody` is not dyn-safe.
-                Box::pin(handlers::broadcast::dispatch(state, deps, sub)).await
+                Box::pin(handlers::broadcast::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Economy(sub) => {
                 // Phase 2A.3 — economy domain migrated to the
@@ -543,7 +548,7 @@ impl ContextActor {
                 // back to `dispatch_from_shim` for callers that do not
                 // have a target context actor during the migration
                 // window.
-                handlers::economy::dispatch(state, deps, sub).await
+                handlers::economy::dispatch(cell, deps, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
                 // Phase 2A.1 — trust_recovery domain migrated to
@@ -553,7 +558,7 @@ impl ContextActor {
                 // intercepted on the supervisor before this arm
                 // executes (it never reaches the per-context actor
                 // mailbox).
-                Box::pin(handlers::trust_recovery::dispatch(state, deps, sub)).await
+                Box::pin(handlers::trust_recovery::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Standing(sub) => {
                 // Phase 2A.2 — standing domain migrated to the
@@ -569,7 +574,7 @@ impl ContextActor {
                 // back to `dispatch_from_shim` when no per-context
                 // actor exists for the target context during the
                 // migration window.
-                handlers::ttl_close::dispatch(state, deps, sub).await
+                handlers::ttl_close::dispatch(cell, deps, sub).await
             }
             ContextCommand::Tools(sub) => {
                 // Phase 2A.4 -- tools domain migrated to the
@@ -577,7 +582,7 @@ impl ContextActor {
                 // helpers. Supervisor dispatch still falls back to
                 // `dispatch_from_shim` for missing actors during the
                 // migration window.
-                handlers::tools::dispatch(state, deps, sub).await
+                handlers::tools::dispatch(cell, deps, sub).await
             }
             // Phase 2A.10 — queries domain migrated to the actor-shape
             // handler. The actor's owned `state` + `deps.event_log` +
@@ -589,10 +594,10 @@ impl ContextActor {
             // [`Supervisor::dispatch_queries_direct`] when no actor
             // exists (the prior locked-DashMap shim was deleted in the
             // Phase 2A finalization queries+lifecycle session).
-            ContextCommand::Queries(sub) => handlers::queries::dispatch(state, deps, sub).await,
+            ContextCommand::Queries(sub) => handlers::queries::dispatch(cell, deps, sub).await,
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
-            ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(state, deps, msg).await,
+            ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(cell, deps, msg).await,
             // Test-only fault injection (ADR-049 §10 watchdog tests). The
             // `panic!` lives here in `actor/mod.rs` — deliberately NOT in
             // any `handlers/*.rs` module — so the production handler
@@ -611,7 +616,7 @@ impl ContextActor {
                 }
             }
             ContextCommand::LifecycleControl(sub) => {
-                handlers::lifecycle_control::dispatch(state, deps, sub).await
+                handlers::lifecycle_control::dispatch(cell, deps, sub).await
             }
         }
     }
@@ -1755,8 +1760,10 @@ mod tests {
         let pseudonym = [0x42u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1764,6 +1771,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_ALICE, pseudonym),
             true,
+            &mut downward_auth_applied,
         )
         .expect("a legitimate announcement is consumed, not an error");
         assert!(consumed, "an announcement is reported as consumed (true)");
@@ -1783,8 +1791,10 @@ mod tests {
         // Authenticated sender is ALICE, but the announcement claims BOB.
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1792,6 +1802,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
             true,
+            &mut downward_auth_applied,
         );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -1815,8 +1826,10 @@ mod tests {
         let ctx_bytes = [0x33u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1824,6 +1837,7 @@ mod tests {
             &inner,
             &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
             true,
+            &mut downward_auth_applied,
         );
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -1840,8 +1854,11 @@ mod tests {
 
         for (seq, rid) in [(1u64, [0x42u8; 32]), (2u64, [0x43u8; 32])] {
             let inner = minimal_inner(&ctx, DIRECT_ALICE, seq);
+            let mut downward_auth_applied: Option<
+                crate::context::actor::class_s::ClassSCommitToken,
+            > = None;
             let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-                &mut state,
+                &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
                 &deps,
                 &ctx,
                 &ctx_bytes,
@@ -1849,6 +1866,7 @@ mod tests {
                 &inner,
                 &announcement_bytes(DIRECT_ALICE, rid),
                 true,
+                &mut downward_auth_applied,
             )
             .expect("same-DID re-announce must succeed");
             assert!(consumed);

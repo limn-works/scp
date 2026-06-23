@@ -1288,9 +1288,13 @@ pub struct PerContextState {
     /// committed/reservation witnesses whose ≤50 ms coalesce-window rollback
     /// would re-open a replay / re-invoke / double-settle window the caller
     /// already observed as closed. See [`ClassSState`] for the per-field
-    /// security rationale. Fields stay `pub(crate)` — privatization behind a
-    /// mutator-combinator boundary is a LATER PR.
-    pub(crate) class_s: ClassSState,
+    /// security rationale. Privatized to `pub(in crate::context)`: the field is
+    /// unnameable outside `crate::context`, and within it the ONLY mutable reach
+    /// is through the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+    /// persist-on-commit combinators (no `state_mut`, no `DerefMut`). The `&mut`
+    /// in the snapshot/serialization paths (`build_snapshot_from_state`) reads it
+    /// shared. ADR-049 §9.
+    pub(in crate::context) class_s: ClassSState,
 
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1
@@ -1327,16 +1331,10 @@ pub struct PerContextState {
 /// skeleton test path does not touch role logic, so a hand-rolled
 /// empty shape is sufficient.
 fn empty_role_state_for_test() -> ContextRoleState {
-    ContextRoleState {
-        context_id: String::new(),
-        creator_did: String::new(),
-        ceiling: scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
-        role_definitions: HashMap::new(),
-        assignments: HashMap::new(),
-        members: HashSet::new(),
-        member_capabilities: HashMap::new(),
-        suspended_capabilities: HashMap::new(),
-    }
+    // ADR-049 §9: `ContextRoleState`'s `ceiling` / `suspended_capabilities` fields
+    // are private, so the skeleton is built via the crate's `empty_for_test`
+    // constructor rather than a cross-crate struct literal.
+    ContextRoleState::empty_for_test()
 }
 
 impl PerContextState {
@@ -1349,30 +1347,6 @@ impl PerContextState {
     #[must_use]
     pub const fn saga_pending(&self) -> &HashMap<SagaId, SagaPreparedState> {
         &self.class_s.saga_pending
-    }
-
-    /// Pushes an event to the receive buffer and, if a broadcast channel
-    /// is provided, sends a sanitized copy there too. Mirrors the
-    /// security invariants of the standalone
-    /// [`crate::context::state::emit_event_into`] helper:
-    ///
-    /// - `WelcomeGenerated` events carry MLS key material and are NEVER
-    ///   sent on the broadcast channel (receive buffer only).
-    /// - `MessageReceived` / `MessageSent` payloads contain decrypted
-    ///   plaintext and are stripped (replaced with empty `Vec`) before
-    ///   broadcast to preserve encryption-as-access-control.
-    pub(crate) fn emit_event(
-        &mut self,
-        event: scp_protocol::context::membership::ContextEvent,
-        context_id: &str,
-        tx: Option<
-            &tokio::sync::broadcast::Sender<(
-                String,
-                scp_protocol::context::membership::ContextEvent,
-            )>,
-        >,
-    ) {
-        crate::context::state::emit_event_into(&mut self.receive_buffer, event, context_id, tx);
     }
 
     /// Construct a fresh encrypted-mode actor state for test use. Populates

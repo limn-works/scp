@@ -36,6 +36,7 @@ use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 
+use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::{
     BroadcastReservationId, PendingBroadcastPublish, PerContextState,
@@ -56,7 +57,7 @@ use crate::context::state::{context_id_to_bytes, require_active, strip_event_pay
 /// - [`ContextError::PermissionDenied`] if the context is gated and no valid
 ///   `messagesRead` UCAN is supplied.
 pub fn subscribe_broadcast<D, N, R, P, S>(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     subscriber_did: &DID,
@@ -73,15 +74,21 @@ where
 {
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-    state
-        .handle
+    require_active(&cell.handle)?;
+    cell.handle
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
+    // All in-state mutations below are Class-C (broadcast subscriber roster
+    // ADD, broadcast metadata, receive buffer, checkpoint counter) with the
+    // best-effort persist below — routed through the non-persisting Class-C
+    // view (ADR-049 §9). Member ADD is a structural Class-C op (the restricted
+    // `MembershipClassCMut` exposes it; member REMOVAL is the downward-auth
+    // Class-S op it withholds — see `unsubscribe_broadcast`).
     let (result, snapshot) = {
-        let bc = state
-            .broadcast_context
+        let mut view = cell.class_c_view();
+        let bc = view
+            .broadcast_context_mut()
             .as_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -90,18 +97,23 @@ where
         (result, snapshot)
     };
 
-    state
-        .membership
-        .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
+    {
+        let mut view = cell.class_c_view();
+        view.membership_class_c_mut().add_member(
+            subscriber_did.clone(),
+            "subscriber".into(),
+            vec![],
+        );
+    }
     emit_event(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         result.event.clone(),
         context_id,
         deps.event_tx.as_ref(),
     );
 
     persist_broadcast_snapshot(deps, context_id, &snapshot);
-    persist_state_best_effort(state, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id);
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -111,7 +123,7 @@ where
         // timestamp, copied by every member (§7.3.1, §9.9.3).
         timestamp,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
 }
@@ -128,7 +140,7 @@ where
 /// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
 ///   context.
 pub fn unsubscribe_broadcast(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     subscriber_did: &DID,
@@ -136,11 +148,12 @@ pub fn unsubscribe_broadcast(
 ) -> Result<UnsubscribeResult, ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     let (result, snapshot) = {
-        let bc = state
-            .broadcast_context
+        let mut view = cell.class_c_view();
+        let bc = view
+            .broadcast_context_mut()
             .as_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -149,9 +162,22 @@ pub fn unsubscribe_broadcast(
         (result, snapshot)
     };
 
-    state.membership.remove_member(subscriber_did);
+    // SECURITY CARVE-OUT (ADR-049 §9): a broadcast UNSUBSCRIBE removes a
+    // SUBSCRIBER from the roster best-effort, NOT a regular member. A broadcast
+    // context's subscriber roster carries NO key secrecy — content is public,
+    // per-author broadcast keys (not MLS group keys) protect publication, and
+    // the unsubscribe is not an MLS-gated authorization boundary — so a
+    // coalesce-window rollback at most re-lists a public-content subscriber for
+    // the window, with no membership-secrecy consequence. The restricted
+    // `MembershipClassCMut::remove_subscriber` (scoped by name + contract to the
+    // broadcast roster) expresses exactly this best-effort removal; the general
+    // `remove_member` (a fail-closed downward-auth Class-S op) is deliberately
+    // NOT exposed on the view. Behaviour is unchanged (best-effort, coalesced).
+    cell.class_c_view()
+        .membership_class_c_mut()
+        .remove_subscriber(subscriber_did);
     emit_event(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberLeft {
             member_did: subscriber_did.clone(),
         },
@@ -160,7 +186,7 @@ pub fn unsubscribe_broadcast(
     );
 
     persist_broadcast_snapshot(deps, context_id, &snapshot);
-    persist_state_best_effort(state, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id);
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -171,7 +197,7 @@ pub fn unsubscribe_broadcast(
         // member (§7.3.1, §9.9.3).
         deps.clock.now_secs(),
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
 }
@@ -230,11 +256,11 @@ pub struct BroadcastPublishReservationOutcome {
 /// - [`ContextError::PermissionDenied`] if the sender is not an author or
 ///   write access is suspended.
 pub fn reserve_broadcast_publish(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     author_did: &DID,
 ) -> Result<BroadcastPublishReservationOutcome, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     // Suspension-aware capability check (§9.17, ADR-038). In broadcast
     // contexts, authors may be registered with the BroadcastContext
@@ -242,11 +268,11 @@ pub fn reserve_broadcast_publish(
     // suspension overlay directly: only members whose MessagesWrite
     // capability has been explicitly suspended via governance Revoke are
     // blocked here. The downstream `bc.reserve_publish` enforces author
-    // registration.
-    if state
+    // registration. READ of the downward-auth `suspended_capabilities`
+    // overlay via Deref (a read cannot violate the §9 invariant).
+    if cell
         .role_state
-        .suspended_capabilities
-        .get(author_did.as_ref())
+        .suspended_for(author_did.as_ref())
         .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     {
         return Err(ContextError::PermissionDenied(format!(
@@ -257,8 +283,13 @@ pub fn reserve_broadcast_publish(
     let timestamp = deps.clock.now_millis();
     let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
 
-    let bc = state
-        .broadcast_context
+    // Reserve the broadcast sequence + build the signing payload. Both the
+    // broadcast metadata reservation and the pending-publish insert are
+    // Class-C (the handler reports `mutated`; the run loop coalesce-persists)
+    // — routed through the non-persisting Class-C view (ADR-049 §9).
+    let mut view = cell.class_c_view();
+    let bc = view
+        .broadcast_context_mut()
         .as_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -283,7 +314,7 @@ pub fn reserve_broadcast_publish(
     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
     let reservation_id = BroadcastReservationId::new_random();
-    state.pending_broadcast_publishes.insert(
+    view.pending_broadcast_publishes_mut().insert(
         reservation_id.clone(),
         PendingBroadcastPublish {
             author_did: author_did.clone(),
@@ -322,7 +353,7 @@ pub fn reserve_broadcast_publish(
 /// - [`ContextError::CryptoFailed`] on a signature-length mismatch, an
 ///   epoch change between phases, or a seal failure.
 pub fn apply_broadcast_publish(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reservation_id: &BroadcastReservationId,
@@ -332,9 +363,11 @@ pub fn apply_broadcast_publish(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Resolve the reservation first so a stale/duplicate apply is a
-    // clean typed error and never touches sequence state.
-    let pending = state
-        .pending_broadcast_publishes
+    // clean typed error and never touches sequence state. Class-C
+    // pending-publish map (coalesced persist) — non-persisting Class-C view.
+    let pending = cell
+        .class_c_view()
+        .pending_broadcast_publishes_mut()
         .remove(reservation_id)
         .ok_or_else(|| {
             ContextError::InvalidState(format!(
@@ -347,7 +380,7 @@ pub fn apply_broadcast_publish(
     // (it was consumed at phase 1 but never sealed). `apply_guarded`
     // owns that rollback discipline.
     apply_guarded(
-        state,
+        cell,
         deps,
         context_id,
         &context_id_bytes,
@@ -361,7 +394,7 @@ pub fn apply_broadcast_publish(
 /// [`apply_broadcast_publish`] can guarantee the reserved sequence is
 /// released on every error path.
 fn apply_guarded(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -371,22 +404,25 @@ fn apply_guarded(
 ) -> Result<BroadcastEnvelope, ContextError> {
     // Seal under the reserved sequence. On any failure before the seal
     // succeeds, release the reserved sequence so it is not burned.
-    let envelope = match seal_reserved(state, pending, signature, payload) {
+    let envelope = match seal_reserved(cell, pending, signature, payload) {
         Ok(env) => env,
         Err(e) => {
-            release_reserved(state, pending);
+            release_reserved(cell, pending);
             return Err(e);
         }
     };
 
     // Seal succeeded — the broadcast sequence is now permanently consumed
-    // (matches legacy: a post-seal transport failure burns it too).
-    let seq = state
-        .membership
+    // (matches legacy: a post-seal transport failure burns it too). The
+    // per-sender sequence bump is Class-C structural bookkeeping (exposed on
+    // the restricted `MembershipClassCMut`) — non-persisting Class-C view.
+    let seq = cell
+        .class_c_view()
+        .membership_class_c_mut()
         .next_sequence_number(pending.author_did.as_ref())
         .ok_or_else(|| ContextError::MemberNotFound(pending.author_did.to_string()))?;
     emit_event(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MessageSent {
             sender_did: pending.author_did.clone(),
             sequence_number: seq,
@@ -415,12 +451,12 @@ fn apply_guarded(
 /// up to the seal — performs no event emission or transport. Returns the
 /// sealed envelope without mutating membership / checkpoint counters.
 fn seal_reserved(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     pending: &PendingBroadcastPublish,
     signature: &[u8],
     payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
         ContextError::CryptoFailed(format!(
@@ -430,8 +466,11 @@ fn seal_reserved(
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-    let bc = state
-        .broadcast_context
+    // Broadcast metadata seal is Class-C (coalesced persist) — non-persisting
+    // Class-C view (ADR-049 §9).
+    let mut view = cell.class_c_view();
+    let bc = view
+        .broadcast_context_mut()
         .as_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -462,8 +501,9 @@ fn seal_reserved(
 
 /// Roll back the reserved sequence for a pending publish that will not be
 /// applied. No-op if the context is no longer a broadcast context.
-fn release_reserved(state: &mut PerContextState, pending: &PendingBroadcastPublish) {
-    if let Some(bc) = state.broadcast_context.as_mut() {
+fn release_reserved(cell: &mut ClassSCell, pending: &PendingBroadcastPublish) {
+    // Broadcast metadata rollback is Class-C (coalesced persist) — view.
+    if let Some(bc) = cell.class_c_view().broadcast_context_mut().as_mut() {
         bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
     }
 }
@@ -473,12 +513,21 @@ fn release_reserved(state: &mut PerContextState, pending: &PendingBroadcastPubli
 /// stored reservation and rolls the reserved sequence back if it is still
 /// the head. No-op if the reservation id is unknown.
 pub fn release_broadcast_reservation(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     reservation_id: &BroadcastReservationId,
 ) {
-    if let Some(pending) = state.pending_broadcast_publishes.remove(reservation_id)
-        && let Some(bc) = state.broadcast_context.as_mut()
-    {
+    // Both the pending-publish map and the broadcast metadata are Class-C
+    // (coalesced persist) — route through the non-persisting Class-C view.
+    // Separate the two `&mut` reaches (remove the reservation, then roll the
+    // sequence back) so each view borrow is short-lived (ADR-049 §9).
+    let Some(pending) = cell
+        .class_c_view()
+        .pending_broadcast_publishes_mut()
+        .remove(reservation_id)
+    else {
+        return;
+    };
+    if let Some(bc) = cell.class_c_view().broadcast_context_mut().as_mut() {
         bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
     }
 }
@@ -496,7 +545,7 @@ pub fn release_broadcast_reservation(
 ///   context.
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
 pub fn block_broadcast_subscriber(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     author_did: &DID,
@@ -504,11 +553,14 @@ pub fn block_broadcast_subscriber(
 ) -> Result<BlockResult, ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
+    // Class-C broadcast metadata + receive buffer + checkpoint counter
+    // (best-effort/coalesced persist) — non-persisting Class-C view (ADR-049 §9).
     let (result, snapshot) = {
-        let bc = state
-            .broadcast_context
+        let mut view = cell.class_c_view();
+        let bc = view
+            .broadcast_context_mut()
             .as_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -518,7 +570,7 @@ pub fn block_broadcast_subscriber(
     };
 
     emit_event(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberBlocked {
             blocked_did: subscriber_did.clone(),
             author_did: author_did.clone(),
@@ -538,7 +590,7 @@ pub fn block_broadcast_subscriber(
         // (§7.3.1, §9.9.3).
         deps.clock.now_secs(),
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
 }
@@ -557,7 +609,7 @@ pub fn block_broadcast_subscriber(
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
 /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
 pub fn unblock_broadcast_subscriber(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     author_did: &DID,
@@ -565,11 +617,14 @@ pub fn unblock_broadcast_subscriber(
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
+    // Class-C broadcast metadata + receive buffer + checkpoint counter
+    // (best-effort/coalesced persist) — non-persisting Class-C view (ADR-049 §9).
     let snapshot = {
-        let bc = state
-            .broadcast_context
+        let mut view = cell.class_c_view();
+        let bc = view
+            .broadcast_context_mut()
             .as_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
@@ -578,7 +633,7 @@ pub fn unblock_broadcast_subscriber(
     };
 
     emit_event(
-        state,
+        cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberUnblocked {
             unblocked_did: subscriber_did.clone(),
             author_did: author_did.clone(),
@@ -598,7 +653,7 @@ pub fn unblock_broadcast_subscriber(
         // (§7.3.1, §9.9.3).
         deps.clock.now_secs(),
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -615,7 +670,7 @@ pub fn unblock_broadcast_subscriber(
 /// controlled DID, and [`ContextError::MembershipFailed`] if the actor is not a
 /// broadcast context.
 pub fn handle_broadcast_key_request(
-    state: &mut PerContextState,
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     author_did: &DID,
     requester_did: &DID,
@@ -627,7 +682,7 @@ pub fn handle_broadcast_key_request(
         )));
     }
 
-    let bc = state
+    let bc = cell
         .broadcast_context
         .as_ref()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
@@ -641,9 +696,8 @@ pub fn handle_broadcast_key_request(
 
 /// Returns the number of subscribers in a broadcast context.
 #[must_use]
-pub fn broadcast_subscriber_count(state: &mut PerContextState) -> Option<usize> {
-    state
-        .broadcast_context
+pub fn broadcast_subscriber_count(cell: &mut ClassSCell) -> Option<usize> {
+    cell.broadcast_context
         .as_ref()
         .map(BroadcastContext::subscriber_count)
 }
@@ -654,9 +708,8 @@ pub fn broadcast_subscriber_count(state: &mut PerContextState) -> Option<usize> 
 
 /// Returns `true` if the given DID is a subscriber in a broadcast context.
 #[must_use]
-pub fn is_broadcast_subscriber(state: &mut PerContextState, did: &str) -> bool {
-    state
-        .broadcast_context
+pub fn is_broadcast_subscriber(cell: &mut ClassSCell, did: &str) -> bool {
+    cell.broadcast_context
         .as_ref()
         .is_some_and(|bc| bc.is_subscriber(did))
 }
@@ -667,9 +720,8 @@ pub fn is_broadcast_subscriber(state: &mut PerContextState, did: &str) -> bool {
 
 /// Returns the admission policy for a broadcast context.
 #[must_use]
-pub fn broadcast_admission(state: &mut PerContextState) -> Option<BroadcastAdmission> {
-    state
-        .broadcast_context
+pub fn broadcast_admission(cell: &mut ClassSCell) -> Option<BroadcastAdmission> {
+    cell.broadcast_context
         .as_ref()
         .map(BroadcastContext::admission)
 }
@@ -679,17 +731,17 @@ pub fn broadcast_admission(state: &mut PerContextState) -> Option<BroadcastAdmis
 // ---------------------------------------------------------------------------
 
 fn emit_event(
-    state: &mut PerContextState,
+    receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
     event: ContextEvent,
     context_id: &str,
     tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 ) {
     if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
-        let _ = state.receive_buffer.push(event);
+        let _ = receive_buffer.push(event);
         return;
     }
 
-    let _ = state.receive_buffer.push(event.clone());
+    let _ = receive_buffer.push(event.clone());
     if let Some(tx) = tx {
         let sanitized = strip_event_payload(&event);
         let _ = tx.send((context_id.to_owned(), sanitized));

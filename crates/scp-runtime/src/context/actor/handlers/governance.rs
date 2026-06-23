@@ -63,8 +63,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The migration-window shim — `dispatch_from_shim`, the
 /// supervisor-shape `handle_*` helpers, and the `*_legacy` bodies they
 /// delegated to — was removed at Phase 2A finalization.
-pub async fn dispatch(
-    state: &mut crate::context::actor::state::PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -73,7 +73,7 @@ pub async fn dispatch(
     // future each variant wraps) cross clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_state(state, deps, cmd)).await
+    Box::pin(dispatch_state(cell, deps, cmd)).await
 }
 
 /// Actor-shape variant dispatch. Every governance variant now takes
@@ -87,7 +87,7 @@ pub async fn dispatch(
               unified dispatch surface that pipeline-wiring tests assert"
 )]
 async fn dispatch_state(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -97,20 +97,20 @@ async fn dispatch_state(
             context_id: _,
             proposal_id,
             reply,
-        } => handle_get_proposal_actor(state, &proposal_id, reply),
+        } => handle_get_proposal_actor(cell, &proposal_id, reply),
         GovernanceCommand::ListProposals {
             context_id: _,
             reply,
-        } => handle_list_proposals_actor(state, reply),
+        } => handle_list_proposals_actor(cell, reply),
         GovernanceCommand::MigrationState {
             context_id: _,
             reply,
-        } => handle_migration_state_actor(state, reply),
+        } => handle_migration_state_actor(cell, reply),
         GovernanceCommand::TombstoneMigratedContext { context_id, reply } => {
-            handle_tombstone_migrated_context_actor(state, deps, &context_id, reply).await
+            handle_tombstone_migrated_context_actor(cell, deps, &context_id, reply).await
         }
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
-            handle_acknowledge_commit_fault_actor(state, &context_id, reply)
+            handle_acknowledge_commit_fault_actor(cell, &context_id, reply)
         }
         GovernanceCommand::WithdrawGovernanceVote {
             context_id,
@@ -119,7 +119,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_withdraw_governance_vote_actor(
-                state,
+                cell,
                 deps,
                 &context_id,
                 &proposal_id,
@@ -134,7 +134,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_ceiling_modification_actor(
-                state,
+                cell,
                 deps,
                 &context_id,
                 current_timestamp,
@@ -148,7 +148,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_economic_policy_change_actor(
-                state,
+                cell,
                 deps,
                 &context_id,
                 current_timestamp,
@@ -157,20 +157,25 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
+            // The Class-S cell is threaded into the execute-governance path so the
+            // downstream `execute_*` leaves it reaches can later migrate onto the
+            // fail-closed combinator.
             Box::pin(handle_execute_governance_action_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::ProposeGovernanceAction { payload, reply } => {
+            // Threaded as the cell: the auto-execute path inside reaches the
+            // governance leaves via `execute_governance_action`.
             Box::pin(handle_propose_governance_action_actor(
-                state, deps, *payload, reply, false,
+                cell, deps, *payload, reply, false,
             ))
             .await
         }
         GovernanceCommand::ProposeGovernanceActionChecked { payload, reply } => {
             Box::pin(handle_propose_governance_action_checked_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
@@ -180,33 +185,33 @@ async fn dispatch_state(
             reply,
         } => {
             Box::pin(handle_vote_on_proposal_actor(
-                state, deps, *payload, approve, reply,
+                cell, deps, *payload, approve, reply,
             ))
             .await
         }
         GovernanceCommand::ApproveGovernanceProposal { payload, reply } => {
             Box::pin(handle_approve_governance_proposal_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::RejectGovernanceProposal { payload, reply } => {
             Box::pin(handle_reject_governance_proposal_actor(
-                state, deps, *payload, reply,
+                cell, deps, *payload, reply,
             ))
             .await
         }
         GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(state, deps, reply)
+            handle_evaluate_periodic_consequences_actor(cell, deps, reply)
         }
         GovernanceCommand::ProcessPendingCommits { reply } => {
-            Box::pin(handle_process_pending_commits_actor(state, deps, reply)).await
+            Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
         }
         GovernanceCommand::EvaluateTimeouts { reply } => {
-            Box::pin(handle_evaluate_timeouts_actor(state, deps, reply)).await
+            Box::pin(handle_evaluate_timeouts_actor(cell, deps, reply)).await
         }
         GovernanceCommand::StartTimeoutTask { reply } => {
-            handle_start_timeout_task_actor(state, deps, reply).await
+            handle_start_timeout_task_actor(cell, deps, reply).await
         }
         // Placeholder is a no-op handshake target reserved for mailbox
         // tests. Returns NotImplemented synchronously; no state mutation.
@@ -286,13 +291,13 @@ fn handle_migration_state_actor(
 
 /// Handle [`GovernanceCommand::TombstoneMigratedContext`] (actor-shape).
 async fn handle_tombstone_migrated_context_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let tombstone_fut =
-        crate::context::governance_helpers::tombstone_migrated_context(state, deps, context_id);
+        crate::context::governance_helpers::tombstone_migrated_context(cell, deps, context_id);
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
         Ok(Err(e)) => {
@@ -313,11 +318,11 @@ async fn handle_tombstone_migrated_context_actor(
 
 /// Handle [`GovernanceCommand::AcknowledgeCommitFault`] (actor-shape).
 fn handle_acknowledge_commit_fault_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
-    let result = crate::context::governance_helpers::acknowledge_commit_fault(state, context_id);
+    let result = crate::context::governance_helpers::acknowledge_commit_fault(cell, context_id);
     let outcome = match &result {
         Ok(_) => Outcome::ok_mutated(()),
         Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
@@ -328,7 +333,7 @@ fn handle_acknowledge_commit_fault_actor(
 
 /// Handle [`GovernanceCommand::WithdrawGovernanceVote`] (actor-shape).
 async fn handle_withdraw_governance_vote_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
@@ -336,7 +341,7 @@ async fn handle_withdraw_governance_vote_actor(
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -362,14 +367,14 @@ async fn handle_withdraw_governance_vote_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] (actor-shape).
 async fn handle_apply_pending_ceiling_modification_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
-        state,
+        cell,
         deps,
         context_id,
         current_timestamp,
@@ -401,7 +406,7 @@ async fn handle_apply_pending_ceiling_modification_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] (actor-shape).
 async fn handle_propose_governance_action_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionReply,
@@ -423,7 +428,7 @@ async fn handle_propose_governance_action_actor(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_inner(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposer_did,
@@ -458,7 +463,7 @@ async fn handle_propose_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceActionChecked`] (actor-shape).
 async fn handle_propose_governance_action_checked_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionCheckedReply,
@@ -471,7 +476,7 @@ async fn handle_propose_governance_action_checked_actor(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_checked(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposer_did,
@@ -514,7 +519,7 @@ async fn handle_propose_governance_action_checked_actor(
 /// `GovernanceVote` capability path is reached through the dedicated
 /// `ApproveGovernanceProposal` / `RejectGovernanceProposal` commands.
 async fn handle_vote_on_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     approve: bool,
@@ -527,7 +532,7 @@ async fn handle_vote_on_proposal_actor(
 
     let vote_fut = async move {
         Box::pin(crate::context::governance_helpers::vote_on_proposal_inner(
-            state,
+            cell,
             deps,
             &p.context_id,
             &proposal_id,
@@ -561,7 +566,7 @@ async fn handle_vote_on_proposal_actor(
 
 /// Handle [`GovernanceCommand::ApproveGovernanceProposal`] (actor-shape).
 async fn handle_approve_governance_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -574,7 +579,7 @@ async fn handle_approve_governance_proposal_actor(
     let approve_fut = async move {
         Box::pin(
             crate::context::governance_helpers::approve_governance_proposal(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposal_id,
@@ -608,7 +613,7 @@ async fn handle_approve_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::RejectGovernanceProposal`] (actor-shape).
 async fn handle_reject_governance_proposal_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
@@ -621,7 +626,7 @@ async fn handle_reject_governance_proposal_actor(
     let reject_fut = async move {
         Box::pin(
             crate::context::governance_helpers::reject_governance_proposal(
-                state,
+                cell,
                 deps,
                 &p.context_id,
                 &proposal_id,
@@ -655,7 +660,7 @@ async fn handle_reject_governance_proposal_actor(
 
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] (actor-shape).
 async fn handle_execute_governance_action_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     payload: ExecuteGovernanceActionPayload,
     reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
@@ -678,7 +683,7 @@ async fn handle_execute_governance_action_actor(
         // "executor DID" / spec §7.3.1).
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
-                state,
+                cell,
                 deps,
                 &payload.context_id,
                 &payload.proposal_id,
@@ -715,14 +720,14 @@ async fn handle_execute_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] (actor-shape).
 async fn handle_apply_pending_economic_policy_change_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
-        state,
+        cell,
         deps,
         context_id,
         current_timestamp,
@@ -774,30 +779,32 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 /// `Supervisor::contexts` DashMap directly); the actor-shape variant
 /// operates on `&mut state` and never touches the supervisor's DashMap.
 fn handle_evaluate_periodic_consequences_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
 
     use crate::context::governance_logic::{
-        ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences,
-        event_log_entries_for_consequences,
+        EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
     };
 
-    let rules = state.governance.consequence_rules.clone();
+    // Reads of the Class-C consequence config / membership go through the
+    // cell's `Deref` (`&PerContextState`); no whole-state `&mut` is taken until
+    // the enforcement loop, which routes through the Class-C view.
+    let rules = cell.governance.consequence_rules.clone();
     if rules.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
     let now = deps.clock.now_secs();
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
     let member_dids: Vec<scp_identity::DID> =
-        state.membership.members().map(|m| m.did.clone()).collect();
+        cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
     let (events, convergent_now) = event_log_entries_for_consequences(
-        &state.receive_buffer,
+        &cell.receive_buffer,
         &context_id,
         now,
         deps.event_log.as_ref(),
@@ -815,23 +822,56 @@ fn handle_evaluate_periodic_consequences_actor(
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
-    let mut split = ConsequenceStateSplit::from_state(state);
-    for (member_did, triggered) in &results {
-        enforce_triggered_consequences(
-            &mut split,
-            &EnforceConsequencesCtx {
-                context_id: &context_id,
-                member_did,
-                now,
-                triggered,
-                rules: &rules,
-                clock: deps.clock.as_ref(),
-                event_log: deps.event_log.as_ref(),
-                event_tx: deps.event_tx.as_ref(),
-            },
-        );
+    // Consequence EVALUATION rides the run loop's coalesced persist — the
+    // non-persisting Class-C view supplies the disjoint `consequence_split()`
+    // borrows `ConsequenceStateSplit` needs (its `role_state` is the
+    // consequence-only GROW view). The downward-auth outcomes it can produce — a
+    // capability suspension (a `suspended_capabilities` GROW) or an `AssignRole`
+    // demotion (a `member_capabilities` replacement) — are OR-accumulated here and
+    // persisted fail-closed below (ADR-049 §9, RED-CS3): a coalesce-window crash
+    // must not silently re-grant a member's removed authority.
+    // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation, owned HERE as a
+    // token sink at the cell boundary and populated when a swept consequence
+    // applies a downward-auth GROW (idempotent across the sweep — one owed
+    // persist). The token carrier (vs. a `bool`) makes a populated-but-undischarged
+    // obligation a Drop-guard PANIC in debug/CI.
+    let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
+        None;
+    {
+        let mut view = cell.class_c_view();
+        let mut split = view.consequence_split();
+        for (member_did, triggered) in &results {
+            // The GROW arms `downward_auth_obligation` directly (idempotent across
+            // the sweep — one owed persist; no separate `note_downward_auth` call to
+            // forget — GAP-A closed).
+            let _ = enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &context_id,
+                    member_did,
+                    now,
+                    triggered,
+                    rules: &rules,
+                    clock: deps.clock.as_ref(),
+                    event_log: deps.event_log.as_ref(),
+                    event_tx: deps.event_tx.as_ref(),
+                },
+                &mut downward_auth_obligation,
+            );
+        }
+        // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
-    let _ = reply.send(Ok(()));
+
+    // Fail-closed persist of an applied downward-auth mutation (keep-direction):
+    // the mutation (suspension or `AssignRole` demotion) is already in memory;
+    // committing the obligation's token makes it durable before acking (`take()`
+    // discharges the Drop guard). On persist failure the mutation STAYS and the
+    // error is surfaced to the caller; the handler still reports `mutated` so the
+    // run loop also persists.
+    let reply_result = downward_auth_obligation
+        .take()
+        .map_or(Ok(()), |token| token.commit(cell, deps, &context_id));
+    let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
 
@@ -945,7 +985,7 @@ fn compute_commit_retry_outcomes(
 /// member holds the notion, so two honest members would diverge at equal
 /// event count (§9.9.3). No durable consumer reads them.
 fn apply_commit_retry_outcomes(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     outcomes: Vec<CommitRetryOutcome>,
@@ -954,7 +994,13 @@ fn apply_commit_retry_outcomes(
 
     use crate::context::state::CommitFaultMarker;
 
-    let queue_len = state.pending_commits.len();
+    // Coalesced: all mutations are Class-C / structural (the pending-commit
+    // queue, the fault marker, and the local-only broadcast-retry lifecycle
+    // events) and ride the run loop's coalesced persist — the non-persisting
+    // Class-C view holds the disjoint field references without injecting a
+    // per-site persist.
+    let mut view = cell.class_c_view();
+    let queue_len = view.pending_commits_mut().len();
     let mut to_remove: Vec<usize> = Vec::new();
     for outcome in outcomes {
         if outcome.index >= queue_len {
@@ -965,7 +1011,7 @@ fn apply_commit_retry_outcomes(
                 attempts,
                 operation,
             } => {
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastSucceeded {
                         operation: operation.label(),
                         attempts,
@@ -981,12 +1027,12 @@ fn apply_commit_retry_outcomes(
                 new_retry_count,
                 operation,
             } => {
-                if let Some(entry) = state.pending_commits.get_mut(outcome.index) {
+                if let Some(entry) = view.pending_commits_mut().get_mut(outcome.index) {
                     entry.retry_count = new_retry_count;
                     entry.next_attempt_at = next_attempt_at;
                     entry.last_error = Some(error.clone());
                 }
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastPending {
                         operation: operation.label(),
                         error,
@@ -1002,13 +1048,13 @@ fn apply_commit_retry_outcomes(
                 operation,
             } => {
                 let now_failed = deps.clock.now_secs();
-                state.commit_fault = Some(CommitFaultMarker {
+                *view.commit_fault_mut() = Some(CommitFaultMarker {
                     operation: operation.clone(),
                     reason: reason.clone(),
                     failed_at: now_failed,
                     retry_count: attempts,
                 });
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastFailed {
                         operation: operation.label(),
                         reason,
@@ -1023,7 +1069,7 @@ fn apply_commit_retry_outcomes(
     }
     to_remove.sort_unstable_by(|a, b| b.cmp(a));
     for idx in to_remove {
-        state.pending_commits.remove(idx);
+        view.pending_commits_mut().remove(idx);
     }
 }
 
@@ -1045,23 +1091,24 @@ fn apply_commit_retry_outcomes(
 /// between phases — this preserves the legacy "queue is only mutated
 /// by this task between phases" invariant.
 async fn handle_process_pending_commits_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     use crate::context::state::PendingCommit;
 
-    if state.commit_fault.is_some() {
+    // Reads go through the cell's `Deref` (`&PerContextState`).
+    if cell.commit_fault.is_some() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
-    let snapshot: Vec<PendingCommit> = state.pending_commits.iter().cloned().collect();
+    let snapshot: Vec<PendingCommit> = cell.pending_commits.iter().cloned().collect();
     if snapshot.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
     let now = deps.clock.now_secs();
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
 
     let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
     if outcomes.is_empty() {
@@ -1075,7 +1122,7 @@ async fn handle_process_pending_commits_actor(
     // appended to the canonical Merkle log (they are per-committer; only the
     // broadcasting member holds the notion, so honest members would diverge at
     // equal event count — §9.9.3).
-    apply_commit_retry_outcomes(state, deps, &context_id, outcomes);
+    apply_commit_retry_outcomes(cell, deps, &context_id, outcomes);
 
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
@@ -1095,7 +1142,7 @@ async fn handle_process_pending_commits_actor(
 /// drives the cadence; per-actor governance-timeout actors land in Phase
 /// 2B per ADR-049.
 async fn handle_evaluate_timeouts_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
@@ -1108,10 +1155,14 @@ async fn handle_evaluate_timeouts_actor(
     };
     use crate::context::governance_helpers::build_governance_context;
 
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
 
-    // Phase 1: read state, process proposals, detect deadlock.
-    let current_state = state.handle.try_read_state();
+    // Phase 1: read state, process proposals, detect deadlock. Reads go through
+    // the cell's `Deref` (`&PerContextState`); every Class-C mutation routes
+    // through a short-lived non-persisting Class-C view whose borrow is dropped
+    // before the next call — coalesced (no per-site persist; the run loop
+    // flushes after the handler reports `mutated`).
+    let current_state = cell.handle.try_read_state();
     if !matches!(
         current_state,
         Some(scp_protocol::context::ContextState::Active)
@@ -1123,45 +1174,52 @@ async fn handle_evaluate_timeouts_actor(
         return Outcome::ok(());
     }
 
-    let gov_ctx = build_governance_context(state, deps.clock.as_ref());
+    let gov_ctx = build_governance_context(&*cell, deps.clock.as_ref());
 
-    let current_members: HashSet<DID> = state.membership.members().map(|m| m.did.clone()).collect();
-    let departed: Vec<DID> = state
+    let current_members: HashSet<DID> = cell.membership.members().map(|m| m.did.clone()).collect();
+    let departed: Vec<DID> = cell
         .governance
         .last_known_members
         .difference(&current_members)
         .cloned()
         .collect();
-    state.governance.last_known_members = current_members;
 
-    state.governance.evict_stale_entries(deps.clock.now_secs());
+    let mls_epoch = cell.epoch.mls_epoch;
+    let recovery_in_progress = cell.governance.deadlock.recovery_in_progress;
+    let active_voters = collect_active_voters(cell.governance.engine.as_ref());
 
-    let epoch_resets: Vec<DID> = std::mem::take(&mut state.governance.pending_epoch_resets);
+    // Class-C writes: refresh the last-known-member set, evict stale liveness
+    // entries, drain the epoch-reset queue. Each is a short-lived view borrow.
+    let epoch_resets: Vec<DID> = {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        *gov.last_known_members_mut() = current_members;
+        gov.evict_stale_entries(deps.clock.now_secs());
+        std::mem::take(gov.pending_epoch_resets_mut())
+    };
 
-    let mls_epoch = state.epoch.mls_epoch;
-    let recovery_in_progress = state.governance.deadlock.recovery_in_progress;
-
-    let active_voters = collect_active_voters(state.governance.engine.as_ref());
-
-    let result = process_pending_proposals(
-        state.governance.engine.as_mut(),
-        &gov_ctx,
-        &departed,
-        &epoch_resets,
-    );
-
-    update_detection_state(
-        &mut state.governance.deadlock,
-        state.governance.engine.as_ref(),
-        &gov_ctx,
-        &active_voters,
-    );
-
-    let conditions = crate::context::governance::timeout::detect_deadlock(
-        state.governance.engine.as_ref(),
-        &gov_ctx,
-        &state.governance.deadlock,
-    );
+    // `process_pending_proposals` mutates the engine; `update_detection_state`
+    // needs `&mut deadlock` AND `&engine` simultaneously (disjoint fields, via
+    // `detection_borrows`); `detect_deadlock` reads both. All three run inside a
+    // single view borrow that drops before the translate / emit steps.
+    let result;
+    let conditions;
+    {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        result = process_pending_proposals(
+            gov.engine_mut().as_mut(),
+            &gov_ctx,
+            &departed,
+            &epoch_resets,
+        );
+        let (deadlock, engine) = gov.detection_borrows();
+        update_detection_state(&mut *deadlock, engine, &gov_ctx, &active_voters);
+        // `detect_deadlock` reads both engine and deadlock; the same disjoint
+        // borrows (now reborrowed shared) serve it.
+        conditions =
+            crate::context::governance::timeout::detect_deadlock(engine, &gov_ctx, deadlock);
+    }
 
     // Phase 2: translate timeout events.
     let ctx_events = crate::context::governance_helpers::translate_timeout_events(
@@ -1176,28 +1234,33 @@ async fn handle_evaluate_timeouts_actor(
         || (conditions.is_empty() && recovery_in_progress)
         || (!conditions.is_empty() && !recovery_in_progress);
     if needs_write {
+        let mut view = cell.class_c_view();
         for ctx_event in ctx_events {
-            state.emit_event(ctx_event, &context_id, deps.event_tx.as_ref());
+            view.emit_event(ctx_event, &context_id, deps.event_tx.as_ref());
         }
         if conditions.is_empty() && recovery_in_progress {
-            state.governance.deadlock.recovery_in_progress = false;
+            view.governance_class_c_mut()
+                .deadlock_mut()
+                .recovery_in_progress = false;
         } else if !conditions.is_empty() && !recovery_in_progress {
-            state.governance.deadlock.recovery_in_progress = true;
+            view.governance_class_c_mut()
+                .deadlock_mut()
+                .recovery_in_progress = true;
         }
     }
 
     // Phase 4: periodic consequence evaluation (#1531). Reuses the
     // actor-shape sweep body via direct call rather than a nested
-    // mailbox dispatch — both operate on `&mut state` already owned by
-    // this handler.
+    // mailbox dispatch — both operate on the `cell` already owned by
+    // this handler. No view borrow is live here.
     let (consequence_reply_tx, _consequence_reply_rx) = oneshot::channel();
-    let _ = handle_evaluate_periodic_consequences_actor(state, deps, consequence_reply_tx);
+    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx);
 
     // Phase 5 (PR #1606 C6): drain MLS commit retry queue. Same pattern
     // as Phase 4 — direct in-handler call.
     let (commits_reply_tx, _commits_reply_rx) = oneshot::channel();
     let _ = Box::pin(handle_process_pending_commits_actor(
-        state,
+        cell,
         deps,
         commits_reply_tx,
     ))
@@ -1218,11 +1281,351 @@ async fn handle_evaluate_timeouts_actor(
 /// Awaits the `tracked_spawn` task_set push so the abort handle is
 /// installed on `state.governance.timeout_task` before replying.
 async fn handle_start_timeout_task_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    crate::context::governance_helpers::spawn_governance_timeout_task(state, deps).await;
+    crate::context::governance_helpers::spawn_governance_timeout_task(cell, deps).await;
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod consequence_fail_closed_tests {
+    //! ADR-049 §9 (RED-CS3): when the consequence ENGINE auto-suspends a member,
+    //! the suspension OUTCOME must persist FAIL-CLOSED — a coalesce-window crash
+    //! must not silently re-grant the denied capability. This drives the periodic
+    //! consequence sweep against a member who trips a `MessageVelocity`
+    //! `SuspendAccess` rule, with a persistence provider whose every write FAILS,
+    //! and asserts (a) the handler reply surfaces `PersistenceFailed` rather than
+    //! `Ok`, and (b) the suspension is RETAINED in memory (keep-direction), not
+    //! lost.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use scp_identity::DID;
+    use scp_protocol::context::membership::ContextEvent;
+    use scp_protocol::context::params::Capability;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use tokio::sync::oneshot;
+
+    use crate::context::ContextError;
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::persistence::ContextPersistence;
+    use crate::context::providers::MerkleEventLogProvider;
+
+    const ADMIN: &str = "did:dht:z6MkAdminFailClosed";
+    const SUBJECT: &str = "did:dht:z6MkSubjectFailClosed";
+    const CTX_BYTE: u8 = 0x5c;
+
+    /// Persistence whose `persist_context` ALWAYS fails — the fail-closed path.
+    struct FailPersistence;
+    impl ContextPersistence for FailPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Builds `ActorDeps` wired with the always-failing persistence and a fresh
+    /// in-memory Merkle event log (the sweep reads the receive buffer for the
+    /// non-convergent `MessageVelocity` evidence; the durable log stays empty).
+    async fn build_fail_closed_deps() -> ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_primitives::Clock> =
+            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(FailPersistence)),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Seeds a `PerContextState` where SUBJECT is a member holding
+    /// `MessagesWrite`, has buffered enough `MessageSent` events to trip a
+    /// `MessageVelocity` threshold of 1, and the context carries a
+    /// `MessageVelocity` → `SuspendAccess` consequence rule.
+    fn seed_state() -> PerContextState {
+        let mut state = PerContextState::new_for_test_encrypted(
+            [CTX_BYTE; 32],
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        // SUBJECT must be a present member with at least one derived capability,
+        // so `suspend_all` (SuspendAccess) actually populates the suspended set.
+        state
+            .membership
+            .add_member(DID(SUBJECT.to_owned()), "member".to_owned(), Vec::new());
+        state.role_state.members.insert(SUBJECT.to_owned());
+        state.role_state.member_capabilities.insert(
+            SUBJECT.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+        // Buffer per-author MessageSent events so a MessageVelocity rule with
+        // threshold 1 fires for SUBJECT on the next sweep.
+        for seq in 0..5u64 {
+            state.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: DID(SUBJECT.to_owned()),
+                sequence_number: seq,
+                payload: Vec::new(),
+            });
+        }
+        // The consequence rule: a non-convergent MessageVelocity trigger whose
+        // action is SuspendAccess (suspend every held capability).
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_hours(1),
+        });
+        state
+    }
+
+    /// The consequence-engine auto-suspension persists FAIL-CLOSED: with a
+    /// failing persistence provider, the periodic sweep handler surfaces the
+    /// persist error AND retains the in-memory suspension (keep-direction).
+    #[tokio::test]
+    async fn periodic_sweep_suspension_persists_fail_closed() {
+        let deps = build_fail_closed_deps().await;
+        let mut cell = ClassSCell::new(seed_state());
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let outcome =
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx);
+
+        // The reply surfaces the fail-closed persist error — the suspension
+        // OUTCOME was NOT acknowledged as durable while the write failed.
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(
+            matches!(reply, Err(ContextError::PersistenceFailed(_))),
+            "a consequence suspension whose fail-closed persist fails must surface \
+             PersistenceFailed, not Ok; got {reply:?}"
+        );
+
+        // Keep-direction: the suspension STAYS in memory even though the persist
+        // failed (it must not be silently un-applied — that would re-open the
+        // re-grant window on the next coalesced write).
+        let suspended = cell
+            .role_state
+            .suspended_for(SUBJECT)
+            .expect("SUBJECT must have been suspended by the sweep");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "the suspended capability is retained in memory (keep-direction) after \
+             the fail-closed persist failure"
+        );
+
+        // The handler still reports a mutation so the actor's coalesced persist
+        // also re-attempts the write.
+        assert!(
+            outcome.mutated,
+            "the sweep mutated state (the suspension), so the outcome is `mutated`"
+        );
+    }
+
+    /// SEND path: when a `send` trips a consequence that suspends the sender,
+    /// the free (non-paid) send persists the suspension FAIL-CLOSED before
+    /// acking — `finalize_send` surfaces the persist error and retains the
+    /// suspension (keep-direction). Guards the `persist_finalized_send`
+    /// free-path upgrade (ADR-049 §9, RED-CS3).
+    #[tokio::test]
+    async fn send_suspension_persists_fail_closed() {
+        let deps = build_fail_closed_deps().await;
+        // Seed SUBJECT as a member who will trip a MessageVelocity SuspendAccess
+        // rule on the next send (the send itself emits the MessageSent that, with
+        // the pre-seeded buffer, crosses the threshold-1 window).
+        let state = seed_state();
+        // The send path requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        let mut cell = ClassSCell::new(state);
+        let ctx_str = hex::encode([CTX_BYTE; 32]);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+
+        // Free (non-paid) send: no token, no signing key, not broadcast.
+        let result = crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_str,
+            &ctx_bytes,
+            &DID(SUBJECT.to_owned()),
+            0,
+            b"payload",
+            None,
+            None,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a send that applies a consequence suspension must persist fail-closed; \
+             a failing persist must surface PersistenceFailed, not Ok; got {result:?}"
+        );
+        let suspended = cell
+            .role_state
+            .suspended_for(SUBJECT)
+            .expect("SUBJECT must have been suspended by the send-path consequence");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "the suspended capability is retained in memory (keep-direction) after \
+             the send-path fail-closed persist failure"
+        );
+    }
+
+    /// RECEIVE path: when a received message trips a consequence that suspends
+    /// the sender, the receive cascade OR-sets the caller-owned suspension sink
+    /// so the cell-holding receive handler persists fail-closed. This drives the
+    /// cascade at `deliver_message_and_drain_buffered` (the lowest boundary that
+    /// runs receive-side consequence enforcement) and asserts the sink is set,
+    /// proving the downward-auth signal reaches the cell boundary (ADR-049 §9,
+    /// RED-CS3). The fail-closed persist mechanism itself is proven by the
+    /// periodic- and send-path tests above.
+    #[tokio::test]
+    async fn receive_suspension_sets_fail_closed_sink() {
+        let deps = build_fail_closed_deps().await;
+        let state = seed_state();
+        // The receive cascade requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        let mut cell = ClassSCell::new(state);
+        let ctx_str = hex::encode([CTX_BYTE; 32]);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+
+        let inner = scp_protocol::envelope::inner::InnerEnvelope {
+            version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: ctx_str.clone(),
+            sender_did: SUBJECT.to_owned(),
+            epoch: 0,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signature: [0u8; 64],
+            extensions: std::collections::HashMap::new(),
+        };
+
+        let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
+        let mut view = cell.class_c_view();
+        let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut view,
+            &deps,
+            &ctx_str,
+            &ctx_bytes,
+            SUBJECT,
+            &inner,
+            b"hello",
+            false,
+            &mut downward_auth_sink,
+        )
+        .expect("delivery of an in-order application message succeeds");
+
+        assert!(
+            downward_auth_sink.is_some(),
+            "a received message that trips a suspension consequence must POPULATE the \
+             caller-owned token sink so the cell holder commits the suspension fail-closed"
+        );
+        // Discharge the obligation so the token's Drop guard does not trip. This
+        // test runs under a FAILING persistence backend (it proves the SIGNAL
+        // reaches the cell boundary; the actual fail-closed persist is proven by
+        // the send/periodic tests), so `commit` returns the expected §9 durability
+        // error — the keep-direction `commit` consumes the token regardless, which
+        // is all that is needed to satisfy the Drop guard.
+        if let Some(token) = downward_auth_sink.take() {
+            let persist = token.commit(&cell, &deps, &ctx_str);
+            assert!(
+                matches!(persist, Err(ContextError::PersistenceFailed(_))),
+                "the failing backend surfaces the §9 durability error on commit; got \
+                 {persist:?}"
+            );
+        }
+        // The `view` borrow of `cell` ends here (NLL) so the assertions below can
+        // read the cell directly.
+        // The suspension landed in memory through the cascade (the cell holder
+        // would then persist it fail-closed via the now-set sink).
+        let suspended = cell
+            .role_state
+            .suspended_for(SUBJECT)
+            .expect("SUBJECT must have been suspended by the receive-path consequence");
+        assert!(suspended.contains(&Capability::MessagesWrite));
+    }
 }

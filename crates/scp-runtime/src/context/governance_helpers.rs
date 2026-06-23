@@ -39,7 +39,7 @@ use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
     ProposalId, ProposalStatus, PruningPolicy,
 };
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::ToolRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
 use scp_protocol::context::tools::interface::ToolInterface;
@@ -257,14 +257,14 @@ pub fn migration_state(state: &PerContextState) -> Option<MigrationState> {
 ///   provider attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn tombstone_migrated_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
-    let handle_state = state
+    let handle_state = cell
         .handle
         .try_read_state()
         .ok_or(ContextError::ContextNotActive)?;
@@ -274,7 +274,7 @@ pub async fn tombstone_migrated_context(
         ));
     }
 
-    let migration = state.migration_state.as_ref().ok_or_else(|| {
+    let migration = cell.migration_state.as_ref().ok_or_else(|| {
         ContextError::PermissionDenied(
             "no migration state found despite MigratingOut state".to_owned(),
         )
@@ -294,8 +294,10 @@ pub async fn tombstone_migrated_context(
     // members), never local `now()` (§7.3.1, §9.9.3).
     let tombstone_ts = migration.grace_period_end;
 
-    state
-        .handle
+    // The handle FSM is an external effect; the `.await` runs BEFORE the fail-
+    // closed persist (the combinator closure is sync). A failed transition
+    // returns early, before any `state`-field mutation or persist.
+    cell.handle
         .transition_to(&ContextState::Tombstoned)
         .await
         .map_err(|_| {
@@ -304,23 +306,29 @@ pub async fn tombstone_migrated_context(
             )
         })?;
 
-    let tombstone_event = ContextEvent::ContextTombstoned {
-        destination_context_id: destination_id.clone(),
-        migration_proposal_id: migration_pid,
-    };
-    emit(state, tombstone_event, context_id, deps);
-
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    state.broadcast_context = None;
-    state.migration_state = None;
-    // M7: Participation decay on tombstone (#1530).
-    state.governance.decay_participation();
-
     // ADR-049 §9 Class S: tombstoning is a terminal lifecycle transition (the
-    // context is migrated out and must not silently re-open) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // context is migrated out and must not silently re-open) — route the in-state
+    // cleanup through `commit_class_s_keep` so it persists fail-closed (keep-
+    // direction: on persist failure the tombstone STAYS — silently re-opening a
+    // migrated-out context is the unsafe direction). The emit + timer/broadcast/
+    // migration/participation cleanup (Class-C) ride the fail-closed persist via
+    // `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        let tombstone_event = ContextEvent::ContextTombstoned {
+            destination_context_id: destination_id.clone(),
+            migration_proposal_id: migration_pid,
+        };
+        emit(state, tombstone_event, context_id, deps);
+
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        state.broadcast_context = None;
+        state.migration_state = None;
+        // M7: Participation decay on tombstone (#1530).
+        state.governance.decay_participation();
+        Ok(())
+    })?;
 
     let tombstone_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
@@ -335,7 +343,7 @@ pub async fn tombstone_migrated_context(
         tombstone_payload,
         tombstone_ts,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -352,14 +360,20 @@ pub async fn tombstone_migrated_context(
 /// - [`ContextError::InvalidState`] if no fault marker is set.
 #[instrument(skip_all, fields(context_id))]
 pub fn acknowledge_commit_fault(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
 ) -> Result<CommitFaultMarker, ContextError> {
-    state.commit_fault.take().ok_or_else(|| {
-        ContextError::InvalidState(format!(
-            "context {context_id} has no commit fault to acknowledge"
-        ))
-    })
+    // Clearing the commit-fault marker is a coalesced Class-C mutation (the
+    // handler reports `mutated`; the run loop flushes the persist). Take it
+    // through the non-persisting Class-C view — no per-site persist injected.
+    cell.class_c_view()
+        .commit_fault_mut()
+        .take()
+        .ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "context {context_id} has no commit fault to acknowledge"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -377,26 +391,29 @@ pub fn acknowledge_commit_fault(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn withdraw_governance_vote(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
 ) -> Result<ProposalStatus, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
-    let gov_ctx = build_governance_context(state, &*deps.clock);
+    // `gov_ctx` is a pure projection over `&PerContextState` (cell `Deref`).
+    let gov_ctx = build_governance_context(&*cell, &*deps.clock);
     // Committer-assigned convergent leaf timestamp for the withdrawal commit:
     // the same value the engine context observes and the outgoing commit
     // envelope is stamped with; receivers copy it from the inbound envelope.
     // Never a per-member local reading divergent from the commit (§7.3.1,
     // §9.9.3).
     let withdraw_ts = gov_ctx.now;
-    let (status, events) = state
-        .governance
-        .engine
-        .withdraw_vote(proposal_id, voter_did, &gov_ctx)
-        .map_err(|e| ContextError::PermissionDenied(e.to_string()))?;
+    let (status, events) = {
+        let mut view = cell.class_c_view();
+        view.governance_class_c_mut()
+            .engine_mut()
+            .withdraw_vote(proposal_id, voter_did, &gov_ctx)
+            .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
+    };
 
     let context_id_bytes = context_id_to_bytes(context_id);
     let mut event_count: u64 = 0;
@@ -409,11 +426,15 @@ pub async fn withdraw_governance_vote(
         )?;
         event_count += 1;
     }
-    if event_count > 0 {
-        state.checkpoint_events_since += event_count;
-    }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // Best-effort persist (matches the pre-migration unconditional
+    // `persist_state_best_effort`); the checkpoint bump remains conditional on
+    // events having been appended.
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        if event_count > 0 {
+            *view.checkpoint_events_since_mut() += event_count;
+        }
+    });
 
     Ok(status)
 }
@@ -432,25 +453,36 @@ pub async fn withdraw_governance_vote(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_ceiling_modification(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
-    let pending = match &state.governance.pending_ceiling_modification {
+    let pending = match &cell.governance.pending_ceiling_modification {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
 
-    state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
-    state.governance.pending_ceiling_modification = None;
-
     // ADR-049 §9 Class S: applying a ceiling modification is a downward-
-    // authorization transition (the effective capability ceiling lowers) —
-    // persist fail-closed so a crash cannot restore the prior, broader ceiling.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization transition (the effective capability ceiling lowers) — route
+    // the ceiling-lower + pending-clear through `commit_class_s_keep` so it
+    // persists fail-closed (keep-direction: on persist failure the lowered
+    // ceiling STAYS — restoring the prior, broader ceiling is the unsafe
+    // direction). The not-yet-effective early return above ran before any
+    // mutation. The `ceiling` set + pending clear (Class-C) ride the fail-closed
+    // persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        // ADR-049 §9: downward-auth ceiling WRITE via the named `set_ceiling`
+        // mutator, inside this fail-closed-persisting `commit_class_s_keep`.
+        state.role_state.set_ceiling(CapabilityCeiling::new(
+            pending.new_capabilities.iter().cloned(),
+        ));
+        state.governance.pending_ceiling_modification = None;
+        Ok(())
+    })?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -462,7 +494,7 @@ pub async fn apply_pending_ceiling_modification(
         // never local `now()` (§7.3.1, §9.9.3).
         pending.effective_at,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
 }
@@ -481,22 +513,29 @@ pub async fn apply_pending_ceiling_modification(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_economic_policy_change(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    require_active(&state.handle)?;
+    // Applying a matured pending economic-policy change is Class-C governance
+    // config. The active-state gate + effective-window read go through the
+    // cell's `Deref`; the `economic_policy` set + `pending` clear (Class-C) ride
+    // `commit_class_c_best_effort`, preserving the prior best-effort persist
+    // exactly. The not-yet-effective early return runs before any mutation.
+    require_active(&cell.handle)?;
 
-    let pending = match &state.governance.pending_economic_policy_change {
+    let pending = match &cell.governance.pending_economic_policy_change {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
 
-    state.governance.economic_policy = Some(pending.new_policy);
-    state.governance.pending_economic_policy_change = None;
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    let effective_at = pending.effective_at;
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        let gov = view.governance_class_c_mut();
+        *gov.economic_policy_mut() = Some(pending.new_policy);
+        *gov.pending_economic_policy_change_mut() = None;
+    });
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -506,9 +545,9 @@ pub async fn apply_pending_economic_policy_change(
         // Timer-triggered deferred application: the convergent leaf timestamp is
         // the pre-computed effective deadline (deterministic across members),
         // never local `now()` (§7.3.1, §9.9.3).
-        pending.effective_at,
+        effective_at,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
 }
@@ -539,7 +578,7 @@ fn persist_broadcast_snapshot(
 /// Detects and handles conflicts when a proposal becomes approved
 /// (ADR-031 §7).
 pub fn detect_and_handle_conflicts(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     new_proposal: &GovernanceProposal,
 ) -> Vec<GovernanceEvent> {
@@ -555,13 +594,19 @@ pub fn detect_and_handle_conflicts(
     // H10: assign the monotonic seq for the new proposal up front, and
     // bump the counter immediately so any nested or concurrent call
     // cannot reuse it.
-    let new_seq = state.governance.next_proposal_seq;
-    state.governance.next_proposal_seq = state.governance.next_proposal_seq.saturating_add(1);
+    let new_seq = {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        let seq = gov.next_proposal_seq();
+        *gov.next_proposal_seq_mut() = seq.saturating_add(1);
+        seq
+    };
 
-    // Check for conflicts with existing approved proposals.
+    // Check for conflicts with existing approved proposals (read via the
+    // cell's `Deref`).
     let mut conflicts = Vec::new();
     for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in
-        &state.governance.approved_proposals
+        &cell.governance.approved_proposals
     {
         if actions_conflict(
             &new_proposal.action,
@@ -607,7 +652,7 @@ pub fn detect_and_handle_conflicts(
                 // here: it would force widening the `governance.freeze` tuple and
                 // its expiry/leaf-deadline consumers for no authorization gain.
                 let freeze_start = new_proposal.created_at.max(conflicting_proposal.created_at);
-                state.governance.freeze =
+                *cell.class_c_view().governance_class_c_mut().freeze_mut() =
                     Some((new_proposal.proposal_id, conflicting_id, freeze_start));
                 events.push(GovernanceEvent::ConflictDetected {
                     proposal_a: new_proposal.proposal_id,
@@ -615,7 +660,10 @@ pub fn detect_and_handle_conflicts(
                 });
             }
             std::cmp::Ordering::Less => {
-                state.governance.approved_proposals.remove(&conflicting_id);
+                cell.class_c_view()
+                    .governance_class_c_mut()
+                    .approved_proposals_mut()
+                    .remove(&conflicting_id);
                 events.push(GovernanceEvent::ConflictResolved {
                     winner_id: new_proposal.proposal_id,
                     loser_id: conflicting_id,
@@ -633,10 +681,13 @@ pub fn detect_and_handle_conflicts(
 
     if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id))
     {
-        state.governance.approved_proposals.insert(
-            new_proposal.proposal_id,
-            (new_proposal.clone(), new_seq, current_timestamp),
-        );
+        cell.class_c_view()
+            .governance_class_c_mut()
+            .approved_proposals_mut()
+            .insert(
+                new_proposal.proposal_id,
+                (new_proposal.clone(), new_seq, current_timestamp),
+            );
     }
 
     events
@@ -648,17 +699,19 @@ pub fn detect_and_handle_conflicts(
 
 /// Checks for and resolves expired governance freezes (ADR-031 §7).
 pub fn check_and_resolve_expired_freezes(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
 ) -> Vec<GovernanceEvent> {
     let current_timestamp = deps.clock.now_secs();
 
-    if let Some((proposal_a, proposal_b, freeze_start)) = state.governance.freeze
+    if let Some((proposal_a, proposal_b, freeze_start)) = cell.governance.freeze
         && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
     {
-        state.governance.approved_proposals.remove(&proposal_a);
-        state.governance.approved_proposals.remove(&proposal_b);
-        state.governance.freeze = None;
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        gov.approved_proposals_mut().remove(&proposal_a);
+        gov.approved_proposals_mut().remove(&proposal_b);
+        *gov.freeze_mut() = None;
 
         return vec![
             GovernanceEvent::ConflictResolved {
@@ -717,7 +770,7 @@ fn fail_close_remove_member(
 
 /// Executes a `SuspendMember` governance action.
 pub fn execute_suspend_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -729,35 +782,43 @@ pub fn execute_suspend_member(
         actor_did,
         timestamp_secs,
     } = meta;
-    require_active(&state.handle)?;
-
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    state
-        .role_state
-        .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
-
-    emit(
-        state,
-        ContextEvent::CapabilitiesSuspended {
-            did: did.clone(),
-            capabilities: capabilities.to_vec(),
-        },
-        context_id,
-        deps,
-    );
 
     // ADR-049 §9 Class S: member suspension is a downward-authorization
-    // transition — persist fail-closed so a crash cannot un-suspend a member
-    // the caller was told was suspended.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // transition — route the `role_state` mutation + emit through
+    // `commit_class_s_keep` so it persists fail-closed (keep-direction: on
+    // persist failure the suspension STAYS applied — un-suspending a member the
+    // caller was told was suspended is the unsafe direction). The
+    // reject-before-mutate guards return `Err` from inside the closure (no
+    // persist runs); the `role_state` strip + emit (Class-C) ride the SAME
+    // fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        if !view.role_state.ceiling().contains(&Capability::MemberBan) {
+            return Err(ContextError::PermissionDenied(
+                "member:ban (MemberBan) capability not in ceiling".to_owned(),
+            ));
+        }
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        let state = view.rest_mut();
+        state
+            .role_state
+            .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
+
+        emit(
+            state,
+            ContextEvent::CapabilitiesSuspended {
+                did: did.clone(),
+                capabilities: capabilities.to_vec(),
+            },
+            context_id,
+            deps,
+        );
+        Ok(())
+    })?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -766,7 +827,7 @@ pub fn execute_suspend_member(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -779,7 +840,7 @@ pub fn execute_suspend_member(
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
 pub fn execute_revoke(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -793,87 +854,104 @@ pub fn execute_revoke(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // SECURITY-FLAG (ADR-049 §9, FC→FC, no behaviour change): revocation
+    // (capability / access / write) is a DOWNWARD-AUTHORIZATION Class-S
+    // transition — it MUST persist fail-closed so a crash cannot re-grant
+    // authority the caller was told was revoked. The suspension /
+    // read-exclusion / access-key writes + their checks are STAGED inside the
+    // `commit_class_s_keep` closure (reached via `view.rest_mut()`, which the
+    // fail-closed combinator may hand out), and the combinator performs the
+    // SAME fail-closed persist the prior inline `persist_state_fail_closed`
+    // did (keep-direction: a downward suspension stays applied even if the
+    // persist fails — un-applying it would re-grant the revoked authority).
+    // A check reject (`Err` from the closure) returns before any persist,
+    // exactly as the prior early returns did. The post-persist external work
+    // (broadcast snapshot, event-log append, sender-key rotation, the
+    // coalesced `checkpoint_events_since` bump) is UNCHANGED and runs after.
+    let (rotated, bc_snap, needs_sender_key_rotation) =
+        cell.commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
+            require_active(&state.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    let mut rotated = 0usize;
-    let mut bc_snap = None;
-
-    // Write revocation.
-    if matches!(access, AccessScope::Write | AccessScope::Both) {
-        state
-            .role_state
-            .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
-
-        if let Some(ref mut bc) = state.broadcast_context {
-            match bc.block_author(&did.0) {
-                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
+            if !state.role_state.ceiling().contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                ));
             }
-            bc_snap = Some(bc.to_snapshot());
-        }
+            if !state.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
 
-        emit(
-            state,
-            ContextEvent::WriteAccessRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+            let mut rotated = 0usize;
+            let mut bc_snap = None;
 
-    // Read revocation.
-    if matches!(access, AccessScope::Read | AccessScope::Both) {
-        state
-            .role_state
-            .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
+            // Write revocation.
+            if matches!(access, AccessScope::Write | AccessScope::Both) {
+                state
+                    .role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
 
-        state.access.read_exclusion_list.insert(did.clone());
-
-        if let Some(ref mut bc) = state.broadcast_context {
-            match bc.governance_ban_subscriber(&did.0, access) {
-                Ok(r) => {
-                    rotated = r.rotated_authors.len();
+                if let Some(ref mut bc) = state.broadcast_context {
+                    match bc.block_author(&did.0) {
+                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    bc_snap = Some(bc.to_snapshot());
                 }
-                Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
+
+                emit(
+                    state,
+                    ContextEvent::WriteAccessRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
             }
-            bc_snap = Some(bc.to_snapshot());
-        } else {
-            state
-                .access
-                .access_key_store
-                .remove(context_id, did.as_ref());
-        }
 
-        emit(
-            state,
-            ContextEvent::ReadAccessRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-        emit(
-            state,
-            ContextEvent::AccessKeyRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+            // Read revocation.
+            if matches!(access, AccessScope::Read | AccessScope::Both) {
+                state
+                    .role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
 
-    let needs_sender_key_rotation = matches!(access, AccessScope::Write | AccessScope::Both)
-        && state.broadcast_context.is_none();
+                state.access.read_exclusion_list.insert(did.clone());
 
-    // ADR-049 §9 Class S: revocation (capability / access / write) is a
-    // downward-authorization transition — persist fail-closed so a crash cannot
-    // re-grant authority the caller was told was revoked.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+                if let Some(ref mut bc) = state.broadcast_context {
+                    match bc.governance_ban_subscriber(&did.0, access) {
+                        Ok(r) => {
+                            rotated = r.rotated_authors.len();
+                        }
+                        Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    bc_snap = Some(bc.to_snapshot());
+                } else {
+                    state
+                        .access
+                        .access_key_store
+                        .remove(context_id, did.as_ref());
+                }
+
+                emit(
+                    state,
+                    ContextEvent::ReadAccessRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
+                emit(
+                    state,
+                    ContextEvent::AccessKeyRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
+            }
+
+            let needs_sender_key_rotation =
+                matches!(access, AccessScope::Write | AccessScope::Both)
+                    && state.broadcast_context.is_none();
+
+            Ok((rotated, bc_snap, needs_sender_key_rotation))
+        })?;
+
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
@@ -889,7 +967,9 @@ pub fn execute_revoke(
         access_revoked_payload,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
+    // as before the combinator migration — NOT covered by the FC persist above).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -924,7 +1004,7 @@ pub fn execute_revoke(
 
 /// Executes a `RestoreAccess` governance action.
 pub fn execute_restore_access(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -938,78 +1018,100 @@ pub fn execute_restore_access(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // SECURITY-FLAG (ADR-049 §9, CONSCIOUS SAFE STRENGTHENING best-effort→FC):
+    // restoring access (clearing a suspension / read-exclusion, re-minting the
+    // access key) was persisted BEST-EFFORT. It is routed here through
+    // `commit_class_s_keep`, a FAIL-CLOSED persist. This is strictly safer and
+    // shrinks the best-effort allowlist: a coalesce-window rollback of a
+    // restore would silently re-suspend a member the caller was told was
+    // restored — a liveness regression, not a security one — but failing closed
+    // here never re-opens an authorization the caller observed as denied (the
+    // direction §9 protects), so the strengthening introduces no new risk and
+    // removes one. Keep-direction: a restore that did not durably land stays
+    // applied in memory and the persist error surfaces (the member is, if
+    // anything, MORE permissioned in memory than on disk — the safe direction).
+    // The check rejects (`Err` from the closure) run before any persist exactly
+    // as the prior early returns did. The post-persist external work (broadcast
+    // snapshot, event-log append, coalesced `checkpoint_events_since` bump) is
+    // unchanged.
+    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-
-    let suspended_set = state.role_state.suspended_capabilities.get(did.as_ref());
-    let nothing_suspended_for_request =
-        suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
-    let read_excluded = state.access.read_exclusion_list.contains(did);
-    let read_requested = capabilities.contains(&Capability::MessagesRead);
-    if nothing_suspended_for_request && !(read_requested && read_excluded) {
-        return Err(ContextError::NothingToRestore(format!(
-            "no suspended capabilities to restore for {did}"
-        )));
-    }
-
-    state
-        .role_state
-        .restore_capabilities(did.as_ref(), capabilities);
-
-    let has_read = capabilities.contains(&Capability::MessagesRead);
-    let bc_snap = if has_read {
-        state.access.read_exclusion_list.remove(did);
-
-        let snap = state.broadcast_context.as_mut().map(|bc| {
-            bc.governance_unban_subscriber(&did.0);
-            bc.to_snapshot()
-        });
-
-        if state.broadcast_context.is_none() {
-            let restored_key =
-                scp_protocol::crypto::access_keys::generate_access_key(context_id, did.as_ref());
-            state
-                .access
-                .access_key_store
-                .set(context_id, did.as_ref(), restored_key);
+        if !state.role_state.ceiling().contains(&Capability::MemberBan) {
+            return Err(ContextError::PermissionDenied(
+                "member:ban (MemberBan) capability not in ceiling".to_owned(),
+            ));
         }
 
-        emit(
-            state,
-            ContextEvent::ReadAccessRestored { did: did.clone() },
-            context_id,
-            deps,
-        );
-        emit(
-            state,
-            ContextEvent::AccessKeyRestored {
-                did: did.clone(),
-                new_epoch: 1,
-            },
-            context_id,
-            deps,
-        );
+        let suspended_set = state.role_state.suspended_for(did.as_ref());
+        let nothing_suspended_for_request =
+            suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
+        let read_excluded = state.access.read_exclusion_list.contains(did);
+        let read_requested = capabilities.contains(&Capability::MessagesRead);
+        if nothing_suspended_for_request && !(read_requested && read_excluded) {
+            return Err(ContextError::NothingToRestore(format!(
+                "no suspended capabilities to restore for {did}"
+            )));
+        }
 
-        snap
-    } else {
-        None
-    };
+        state
+            .role_state
+            .restore_capabilities(did.as_ref(), capabilities);
 
-    if capabilities.contains(&Capability::MessagesWrite) {
-        emit(
-            state,
-            ContextEvent::WriteAccessRestored { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+        let has_read = capabilities.contains(&Capability::MessagesRead);
+        let bc_snap = if has_read {
+            state.access.read_exclusion_list.remove(did);
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+            let snap = state.broadcast_context.as_mut().map(|bc| {
+                bc.governance_unban_subscriber(&did.0);
+                bc.to_snapshot()
+            });
+
+            if state.broadcast_context.is_none() {
+                let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
+                    context_id,
+                    did.as_ref(),
+                );
+                state
+                    .access
+                    .access_key_store
+                    .set(context_id, did.as_ref(), restored_key);
+            }
+
+            emit(
+                state,
+                ContextEvent::ReadAccessRestored { did: did.clone() },
+                context_id,
+                deps,
+            );
+            emit(
+                state,
+                ContextEvent::AccessKeyRestored {
+                    did: did.clone(),
+                    new_epoch: 1,
+                },
+                context_id,
+                deps,
+            );
+
+            snap
+        } else {
+            None
+        };
+
+        if capabilities.contains(&Capability::MessagesWrite) {
+            emit(
+                state,
+                ContextEvent::WriteAccessRestored { did: did.clone() },
+                context_id,
+                deps,
+            );
+        }
+
+        Ok(bc_snap)
+    })?;
+
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
@@ -1019,7 +1121,8 @@ pub fn execute_restore_access(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    // Coalesced Class-C counter bump (rides the next run-loop persist).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -1029,7 +1132,7 @@ pub fn execute_restore_access(
 // ---------------------------------------------------------------------------
 
 pub fn execute_add_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1043,67 +1146,81 @@ pub fn execute_add_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     let add_output = deps
         .crypto
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    state.role_state.members.insert(did.to_string());
-    let tokens = roles::system_assign_role(&mut state.role_state, did, role, &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-    let creator_did = state.role_state.creator_did.clone();
+    // The fallible role assignment + structural member insert run through the
+    // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
+    // inserts assignments / member_capabilities and runs the SHRINK-only suspension
+    // prune over the view's own disjoint fields — no whole `&mut ContextRoleState`,
+    // no downward-auth GROW. It runs in a NON-PERSISTING Class-C view borrow (the
+    // run-loop / the best-effort persist below covers it): this site is best-effort
+    // BY DESIGN — member ADD is coalesce-window-rollback acceptable (ADR-049 §9), so
+    // the suspension prune rides the SAME best-effort persist it always did. It is
+    // NOT strengthened to fail-closed.
+    let tokens = {
+        let mut view = cell.class_c_view();
+        let mut role_state = view.role_state_class_c_mut();
+        role_state.members_mut().insert(did.to_string());
+        role_state
+            .system_assign_role(did, role, &*deps.clock)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?
+    };
+    let creator_did = cell.role_state.creator_did.clone();
 
-    state
-        .membership
-        .add_member(did.clone(), role.to_owned(), tokens);
+    // Infallible in-state mutations + the MemberJoined / WelcomeGenerated emits,
+    // all riding ONE best-effort persist (unchanged from the pre-migration
+    // single `persist_state_best_effort`).
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.membership_class_c_mut()
+            .add_member(did.clone(), role.to_owned(), tokens);
 
-    let access_key =
-        scp_protocol::crypto::access_keys::generate_access_key(context_id, did.as_ref());
-    state
-        .access
-        .access_key_store
-        .set(context_id, did.as_ref(), access_key);
+        let access_key =
+            scp_protocol::crypto::access_keys::generate_access_key(context_id, did.as_ref());
+        view.access_mut()
+            .access_key_store
+            .set(context_id, did.as_ref(), access_key);
 
-    emit(
-        state,
-        ContextEvent::MemberJoined {
-            member_did: did.clone(),
-            role_name: role.to_owned(),
-        },
-        context_id,
-        deps,
-    );
-
-    // Emit the WelcomeGenerated event inline against actor-owned state.
-    if !add_output.welcome_bytes.is_empty() {
-        emit(
-            state,
-            ContextEvent::WelcomeGenerated {
-                context_id: context_id.to_owned(),
-                creator_did: DID(creator_did),
+        view.emit_event(
+            ContextEvent::MemberJoined {
                 member_did: did.clone(),
-                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
-                    add_output.welcome_bytes,
-                ),
-                commit_bytes: scp_protocol::context::membership::RedactedBytes(
-                    add_output.commit_bytes,
-                ),
+                role_name: role.to_owned(),
             },
             context_id,
-            deps,
+            deps.event_tx.as_ref(),
         );
-    }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        // Emit the WelcomeGenerated event inline against actor-owned state.
+        if !add_output.welcome_bytes.is_empty() {
+            view.emit_event(
+                ContextEvent::WelcomeGenerated {
+                    context_id: context_id.to_owned(),
+                    creator_did: DID(creator_did),
+                    member_did: did.clone(),
+                    welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                        add_output.welcome_bytes,
+                    ),
+                    commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                        add_output.commit_bytes,
+                    ),
+                },
+                context_id,
+                deps.event_tx.as_ref(),
+            );
+        }
+    });
+
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::MemberJoined,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1112,7 +1229,7 @@ pub fn execute_add_member(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_member(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1125,102 +1242,116 @@ pub fn execute_remove_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    // H9: MLS group removal FIRST (hard security boundary).
-    let remove_output = deps
-        .crypto
-        .remove_member(&context_id_bytes, did)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    if let Err(e) = deps
-        .crypto
-        .remove_member_sender_key(&context_id_bytes, did.as_ref())
-    {
-        return fail_close_remove_member(
-            state,
-            deps,
-            context_id,
-            did,
-            "remove_member_sender_key",
-            &e.to_string(),
-        );
-    }
-
-    if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-        return fail_close_remove_member(
-            state,
-            deps,
-            context_id,
-            did,
-            "rotate_sender_key",
-            &e.to_string(),
-        );
-    }
-
-    state.membership.remove_member(did);
-    state.role_state.members.remove(did.as_ref());
-    state.role_state.assignments.remove(did.as_ref());
-    state.role_state.member_capabilities.remove(did.as_ref());
-
-    state
-        .access
-        .access_key_store
-        .remove(context_id, did.as_ref());
-
-    // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
-    // broadcast context (which carries no peer registry).
-    if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.remove(did);
-    }
-
-    emit(
-        state,
-        ContextEvent::MemberLeft {
-            member_did: did.clone(),
-        },
-        context_id,
-        deps,
-    );
-
-    try_broadcast_commit_or_enqueue(
-        state,
-        deps,
-        context_id,
-        remove_output.commit_bytes,
-        &CommitOperation::RemoveMember {
-            target_did: did.clone(),
-        },
-    );
-
-    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        deps,
-        context_id,
-        &context_id_bytes,
-    ) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to deliver rotated sender keys after member removal"
-        );
-    }
-
     // ADR-049 §9 Class S: member removal is a downward-authorization
-    // transition — persist fail-closed so a crash cannot re-admit a removed
-    // member.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // transition — route the membership/role_state strip (and the MLS commit
+    // boundary that precedes it) through `commit_class_s_keep` so the removal
+    // persists fail-closed (keep-direction: on persist failure the removal
+    // STAYS — re-admitting a removed member is the unsafe direction). The
+    // reject-before-mutate guard and the two MLS fail-close arms return `Err`
+    // from inside the closure (no persist runs — preserving today's behavior
+    // where the fail-close `commit_fault` marker is set but NOT persisted before
+    // the early return). All structural mutations + emit + broadcast + sender-
+    // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+
+        require_active(&state.handle)?;
+
+        if !state.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        // H9: MLS group removal FIRST (hard security boundary).
+        let remove_output = deps
+            .crypto
+            .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        if let Err(e) = deps
+            .crypto
+            .remove_member_sender_key(&context_id_bytes, did.as_ref())
+        {
+            return fail_close_remove_member(
+                state,
+                deps,
+                context_id,
+                did,
+                "remove_member_sender_key",
+                &e.to_string(),
+            );
+        }
+
+        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+            return fail_close_remove_member(
+                state,
+                deps,
+                context_id,
+                did,
+                "rotate_sender_key",
+                &e.to_string(),
+            );
+        }
+
+        state.membership.remove_member(did);
+        state.role_state.members.remove(did.as_ref());
+        state.role_state.assignments.remove(did.as_ref());
+        state.role_state.member_capabilities.remove(did.as_ref());
+
+        state
+            .access
+            .access_key_store
+            .remove(context_id, did.as_ref());
+
+        // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
+        // broadcast context (which carries no peer registry).
+        if let Some(reg) = state.routing.peer_registry_mut() {
+            reg.remove(did);
+        }
+
+        emit(
+            state,
+            ContextEvent::MemberLeft {
+                member_did: did.clone(),
+            },
+            context_id,
+            deps,
+        );
+
+        try_broadcast_commit_or_enqueue(
+            CommitBroadcastBorrows {
+                pending_commits: &mut state.pending_commits,
+                commit_fault: &mut state.commit_fault,
+                receive_buffer: &mut state.receive_buffer,
+            },
+            deps,
+            context_id,
+            remove_output.commit_bytes,
+            &CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+        );
+
+        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            context_id,
+            &context_id_bytes,
+        ) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::MemberLeft,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1229,7 +1360,7 @@ pub fn execute_remove_member(
 // ---------------------------------------------------------------------------
 
 pub fn execute_change_role(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1243,31 +1374,37 @@ pub fn execute_change_role(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    let tokens = roles::system_assign_role(&mut state.role_state, did, new_role, &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    if let Some(info) = state.membership.get_mut(did) {
-        new_role.clone_into(&mut info.role_name);
-        info.tokens = tokens;
-    }
-
     // ADR-049 §9 Class S: a role change can be a demotion (downward
-    // authorization) — persist fail-closed so a crash cannot restore authority
-    // a demotion removed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization) — route the role assignment through `commit_class_s_keep`
+    // so it persists fail-closed (keep-direction: on persist failure the new
+    // role STAYS — restoring authority a demotion removed is the unsafe
+    // direction). The reject-before-mutate guards return `Err` from inside the
+    // closure (no persist runs); the `role_state` + membership mutation (Class-C)
+    // rides the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
+
+        let state = view.rest_mut();
+        let tokens = roles::system_assign_role(&mut state.role_state, did, new_role, &*deps.clock)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        if let Some(info) = state.membership.get_mut(did) {
+            new_role.clone_into(&mut info.role_name);
+            info.tokens = tokens;
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::RoleAssigned,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1276,7 +1413,7 @@ pub fn execute_change_role(
 // ---------------------------------------------------------------------------
 
 pub fn execute_register_tool(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     registration: &ToolRegistration,
@@ -1289,29 +1426,39 @@ pub fn execute_register_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Tool registration is an UPWARD grant (Class-C governance config). The
+    // fallible guards read through the cell's `Deref` (no mutation); the
+    // `registered_tools` push (Class-C) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::ToolRegister) {
+    if !cell
+        .role_state
+        .ceiling()
+        .contains(&Capability::ToolRegister)
+    {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool registration capability".into(),
         ));
     }
 
-    if state.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+    if cell.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
         return Err(ContextError::LimitExceeded(format!(
             "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
         )));
     }
-    state.governance.registered_tools.push(registration.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .registered_tools_mut()
+            .push(registration.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRegistered,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1320,7 +1467,7 @@ pub fn execute_register_tool(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_tool(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     tool_id: &str,
@@ -1333,26 +1480,31 @@ pub fn execute_remove_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    state
-        .governance
-        .registered_tools
-        .retain(|t| t.tool_id != tool_id);
-
     // ADR-049 §9 Class S: removing a registered tool revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
-    // `execute_register_tool`'s upward grant). Persist fail-closed so an actor
-    // crash in the ≤50ms coalesce window cannot roll the removal back and
-    // re-grant invocation of a tool the caller was told was removed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // `execute_register_tool`'s upward grant). Route through `commit_class_s_keep`
+    // so the removal persists fail-closed (keep-direction: on persist failure the
+    // tool STAYS removed — re-granting invocation of a tool the caller was told
+    // was removed is the unsafe direction). The reject-before-mutate guard
+    // returns `Err` from inside the closure (no persist runs); the
+    // `registered_tools` retain (Class-C) rides the SAME fail-closed persist via
+    // `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        view.rest_mut()
+            .governance
+            .registered_tools
+            .retain(|t| t.tool_id != tool_id);
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRemoved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1361,7 +1513,7 @@ pub fn execute_remove_tool(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_ceiling(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_ceiling: &[Capability],
@@ -1374,74 +1526,81 @@ pub fn execute_modify_ceiling(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: staging a pending ceiling modification is part of a
+    // ceiling-lowering decision chain (downward authorization) — route it
+    // through `commit_class_s_keep` so the pending record persists fail-closed
+    // (keep-direction: on persist failure the staged modification STAYS — losing
+    // a pending downward-authorization record is the unsafe direction). The
+    // reject-before-mutate guards return `Err` from inside the closure (no
+    // persist runs); the `pending_ceiling_modification` set + emit (Class-C) ride
+    // the SAME fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    if !matches!(
-        state.handle.params().ceiling_policy,
-        scp_protocol::context::params::CeilingPolicy::Governed
-    ) {
-        return Err(ContextError::PermissionDenied(
-            "ceiling_policy is not Governed".to_owned(),
-        ));
-    }
+        if !matches!(
+            state.handle.params().ceiling_policy,
+            scp_protocol::context::params::CeilingPolicy::Governed
+        ) {
+            return Err(ContextError::PermissionDenied(
+                "ceiling_policy is not Governed".to_owned(),
+            ));
+        }
 
-    if state.governance.pending_ceiling_modification.is_some() {
-        return Err(ContextError::PermissionDenied(
-            "a ceiling modification is already pending notification period".to_owned(),
-        ));
-    }
+        if state.governance.pending_ceiling_modification.is_some() {
+            return Err(ContextError::PermissionDenied(
+                "a ceiling modification is already pending notification period".to_owned(),
+            ));
+        }
 
-    // Convergent notification/activation window: anchor on the committer-
-    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
-    // copies the same value), never local `now()`. `effective_at =
-    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
-    // members, so the deferred ceiling change activates at the same instant
-    // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
-    // the `CeilingModified` leaf when the change applies.
-    //
-    // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
-    // only against third parties — the proposer can backdate it freely. Used
-    // alone as the apply gate, a proposer could set `created_at` far in the
-    // past so `effective_at <= commit time` and collapse the mandatory
-    // notification window to zero. To keep activation convergent yet
-    // non-backdatable, also record `observed_at` — THIS member's local clock at
-    // commit-processing time (not proposer-controlled). `is_effective` requires
-    // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
-    // never be shorter than `PERIOD` of locally observed time (§5.3.2).
-    let notified_at = timestamp_secs;
-    let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
-    let observed_at = deps.clock.now_secs();
-    state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
-        new_capabilities: new_ceiling.to_vec(),
-        notified_at,
-        effective_at,
-        observed_at,
-        proposal_id,
-    });
-
-    emit(
-        state,
-        ContextEvent::CeilingChangeNotification {
+        // Convergent notification/activation window: anchor on the committer-
+        // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+        // copies the same value), never local `now()`. `effective_at =
+        // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+        // members, so the deferred ceiling change activates at the same instant
+        // everywhere (§7.3.1, §9.9.3). This convergent value is also what lands on
+        // the `CeilingModified` leaf when the change applies.
+        //
+        // SECURITY: `proposal.created_at` is proposer-chosen and signature-bound
+        // only against third parties — the proposer can backdate it freely. Used
+        // alone as the apply gate, a proposer could set `created_at` far in the
+        // past so `effective_at <= commit time` and collapse the mandatory
+        // notification window to zero. To keep activation convergent yet
+        // non-backdatable, also record `observed_at` — THIS member's local clock at
+        // commit-processing time (not proposer-controlled). `is_effective` requires
+        // `current >= max(effective_at, observed_at + PERIOD)`, so the window can
+        // never be shorter than `PERIOD` of locally observed time (§5.3.2).
+        let notified_at = timestamp_secs;
+        let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+        let observed_at = deps.clock.now_secs();
+        state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
             new_capabilities: new_ceiling.to_vec(),
             notified_at,
             effective_at,
+            observed_at,
             proposal_id,
-        },
-        context_id,
-        deps,
-    );
+        });
 
-    // ADR-049 §9 Class S: the pending ceiling modification is part of a
-    // ceiling-lowering decision chain (downward authorization) — persist
-    // fail-closed so the pending record cannot be lost on a crash.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        emit(
+            state,
+            ContextEvent::CeilingChangeNotification {
+                new_capabilities: new_ceiling.to_vec(),
+                notified_at,
+                effective_at,
+                proposal_id,
+            },
+            context_id,
+            deps,
+        );
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::CeilingModificationPending,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1450,7 +1609,7 @@ pub fn execute_modify_ceiling(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_close_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _reason: Option<&str>,
@@ -1463,32 +1622,39 @@ pub async fn execute_close_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-    let handle = state.handle.clone();
+    require_active(&cell.handle)?;
+    let handle = cell.handle.clone();
 
-    // Transition to Closing via the state machine. The actor owns
-    // `state` so this is a single linear sequence.
+    // Transition to Closing via the state machine. The handle FSM is an external
+    // (cloned) effect, so the `.await` runs BEFORE the fail-closed persist (the
+    // combinator closure is sync). A failed transition returns early, before any
+    // `state`-field mutation or persist.
     handle
         .transition_to(&ContextState::Closing)
         .await
         .map_err(|_| ContextError::PermissionDenied("cannot transition to Closing".to_owned()))?;
 
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    state.broadcast_context = None;
-    state.governance.decay_participation();
-
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
-    // (a closed context must not silently re-open on a crash) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // (a closed context must not silently re-open on a crash) — route the in-
+    // state cleanup through `commit_class_s_keep` so it persists fail-closed
+    // (keep-direction: on persist failure the close STAYS — silently re-opening a
+    // closed context is the unsafe direction). The timer/broadcast/participation
+    // cleanup (Class-C) rides the fail-closed persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        state.broadcast_context = None;
+        state.governance.decay_participation();
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextClosing,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1501,7 +1667,7 @@ pub async fn execute_close_context(
 /// override per ADR-031 §4d and spec §5.10.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_extend_ttl(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     additional_secs: u64,
@@ -1515,10 +1681,10 @@ pub async fn execute_extend_ttl(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(&cell.handle)?;
 
     let member_dids: std::collections::HashSet<&str> =
-        state.membership.member_dids().map(|d| &**d).collect();
+        cell.membership.member_dids().map(|d| &**d).collect();
     let approval_dids: std::collections::HashSet<&str> =
         approvals.iter().map(|v| &*v.voter_did).collect();
     let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
@@ -1538,51 +1704,71 @@ pub async fn execute_extend_ttl(
             rejected_payload,
             timestamp_secs,
         )?;
-        state.checkpoint_events_since += 1;
+        let missing_len = missing.len();
+        let member_count = member_dids.len();
+        // Drop the `member_dids` / `missing` borrows of `cell` (held via
+        // `member_dids()`) before taking the Class-C view.
+        drop(missing);
+        drop(member_dids);
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
         return Err(ContextError::PermissionDenied(format!(
-            "TTL extension requires unanimous consent — {} of {} members have not approved",
-            missing.len(),
-            member_dids.len()
+            "TTL extension requires unanimous consent — {missing_len} of {member_count} members have not approved",
         )));
     }
 
     let consenting: Vec<String> = approval_dids.iter().map(|d| (*d).to_owned()).collect();
-
-    state.ttl.timer.cancel();
-    let old_dl = state.ttl.timer.deadline_unix_secs.unwrap_or(0);
+    drop(approval_dids);
+    drop(member_dids);
 
     let now = deps.clock.now_secs();
-    let remaining_secs = state.ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
-        *deadline = deadline.saturating_add(additional_secs);
-        deadline.saturating_sub(now)
-    });
+    // Snapshot the context handle for the re-armed timer BEFORE taking the
+    // Class-C view (read via `Deref`).
+    let handle = cell.handle.clone();
 
-    let new_dl = state.ttl.timer.deadline_unix_secs.unwrap_or(0);
+    // Coalesced TTL-timer re-arm: the timer fields are Class-C / structural
+    // (SCP-021). A single non-persisting Class-C view borrow holds `&mut ttl`
+    // across the `start_ttl_timer(...).await`, then drops before the best-effort
+    // persist — no fail-closed strengthening, no extra persist injected.
+    let (old_dl, new_dl) = {
+        let mut view = cell.class_c_view();
+        let ttl = view.ttl_mut();
+        ttl.timer.cancel();
+        let old_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
+        let remaining_secs = ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
+            *deadline = deadline.saturating_add(additional_secs);
+            deadline.saturating_sub(now)
+        });
+        let new_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
+        ttl.timer.cancel = Arc::new(tokio::sync::Notify::new());
+        ttl.timer.task = None;
 
-    state.ttl.timer.cancel = Arc::new(tokio::sync::Notify::new());
-    state.ttl.timer.task = None;
+        // Phase 2A.6 Option B: actor-shape ttl_close_helpers::start_ttl_timer
+        // exists. Call it if a remaining duration is set.
+        if let Some(secs) = remaining_secs {
+            crate::context::ttl_close_helpers::start_ttl_timer(
+                // ADR-049 §9: `start_ttl_timer` was narrowed from
+                // `&mut PerContextState` to `&mut TtlTimer` so the ttl_close actor
+                // handler can reach it through the non-persisting Class-C view; the
+                // governance path passes the same timer directly. Behaviour
+                // unchanged — the helper only ever touched `state.ttl.timer`.
+                &mut ttl.timer,
+                deps,
+                context_id,
+                std::time::Duration::from_secs(secs),
+                // The extended deadline `new_dl` was computed convergently above as
+                // `old_deadline + additional_secs` (anchored on the prior
+                // convergent deadline). Pass it through as the override so the
+                // re-armed timer records that convergent value — not the local
+                // arm-time `now + remaining` — on the `ContextExpired` leaf.
+                Some(new_dl),
+                handle,
+            )
+            .await;
+        }
+        (old_dl, new_dl)
+    };
 
-    // Phase 2A.6 Option B: actor-shape ttl_close_helpers::start_ttl_timer
-    // exists. Call it if a remaining duration is set.
-    if let Some(secs) = remaining_secs {
-        let handle = state.handle.clone();
-        crate::context::ttl_close_helpers::start_ttl_timer(
-            state,
-            deps,
-            context_id,
-            std::time::Duration::from_secs(secs),
-            // The extended deadline `new_dl` was computed convergently above as
-            // `old_deadline + additional_secs` (anchored on the prior
-            // convergent deadline). Pass it through as the override so the
-            // re-armed timer records that convergent value — not the local
-            // arm-time `now + remaining` — on the `ContextExpired` leaf.
-            Some(new_dl),
-            handle,
-        )
-        .await;
-    }
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
 
     let extended_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
@@ -1599,7 +1785,7 @@ pub async fn execute_extend_ttl(
         extended_payload,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1608,7 +1794,7 @@ pub async fn execute_extend_ttl(
 // ---------------------------------------------------------------------------
 
 pub fn execute_transfer_admin(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_admin: &DID,
@@ -1621,45 +1807,52 @@ pub fn execute_transfer_admin(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    if !state.membership.contains(new_admin) {
-        return Err(ContextError::MemberNotFound(new_admin.to_string()));
-    }
-
-    let current_admins: Vec<String> = state
-        .role_state
-        .assignments
-        .iter()
-        .filter(|(_, a)| a.role_name == "admin")
-        .map(|(did, _)| did.clone())
-        .collect();
-    for admin_did in &current_admins {
-        roles::system_assign_role(&mut state.role_state, admin_did, "member", &*deps.clock)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-        if let Some(info) = state.membership.get_mut(admin_did) {
-            "member".clone_into(&mut info.role_name);
-        }
-    }
-    let tokens = roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-    if let Some(info) = state.membership.get_mut(new_admin) {
-        "admin".clone_into(&mut info.role_name);
-        info.tokens = tokens;
-    }
-
     // ADR-049 §9 Class S: admin transfer is an authorization transition (the
-    // prior admin loses admin authority) — persist fail-closed so a crash
-    // cannot restore the prior admin's authority after the transfer was
-    // acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // prior admin loses admin authority) — route the role reassignment through
+    // `commit_class_s_keep` so it persists fail-closed (keep-direction: on persist
+    // failure the transfer STAYS — restoring the prior admin's authority after
+    // the transfer was acknowledged is the unsafe direction). The reject-before-
+    // mutate guards return `Err` from inside the closure (no persist runs); the
+    // `role_state` + membership reassignment (Class-C) rides the SAME fail-closed
+    // persist via `view.rest_mut()`.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
+
+        if !state.membership.contains(new_admin) {
+            return Err(ContextError::MemberNotFound(new_admin.to_string()));
+        }
+
+        let current_admins: Vec<String> = state
+            .role_state
+            .assignments
+            .iter()
+            .filter(|(_, a)| a.role_name == "admin")
+            .map(|(did, _)| did.clone())
+            .collect();
+        for admin_did in &current_admins {
+            roles::system_assign_role(&mut state.role_state, admin_did, "member", &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            if let Some(info) = state.membership.get_mut(admin_did) {
+                "member".clone_into(&mut info.role_name);
+            }
+        }
+        let tokens =
+            roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        if let Some(info) = state.membership.get_mut(new_admin) {
+            "admin".clone_into(&mut info.role_name);
+            info.tokens = tokens;
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::AdminTransferred,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1668,7 +1861,7 @@ pub fn execute_transfer_admin(
 // ---------------------------------------------------------------------------
 
 pub fn execute_create_child_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _params: &ContextParams,
@@ -1681,11 +1874,14 @@ pub fn execute_create_child_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Pure read-gate + event-log append; the only state mutation is the
+    // coalesced checkpoint counter (no site persist today). Guards read through
+    // the cell's `Deref`; the counter bumps via the non-persisting Class-C view.
+    require_active(&cell.handle)?;
 
-    if !state
+    if !cell
         .role_state
-        .ceiling
+        .ceiling()
         .contains(&Capability::ChildContextCreate)
     {
         return Err(ContextError::PermissionDenied(
@@ -1699,7 +1895,7 @@ pub fn execute_create_child_context(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1708,7 +1904,7 @@ pub fn execute_create_child_context(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_pruning_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_policy: &PruningPolicy,
@@ -1758,17 +1954,21 @@ pub fn execute_modify_pruning_policy(
         }
     }
 
-    require_active(&state.handle)?;
-    state.governance.pruning_policy = Some(new_policy.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // Validation guards above read only the borrowed `new_policy`. The
+    // active-state gate reads through the cell's `Deref`; the `pruning_policy`
+    // set (Class-C governance config) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly.
+    require_active(&cell.handle)?;
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::PruningPolicyModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1777,7 +1977,7 @@ pub fn execute_modify_pruning_policy(
 // ---------------------------------------------------------------------------
 
 pub fn execute_add_signer(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1790,56 +1990,68 @@ pub fn execute_add_signer(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: adding a threshold signer is an UPWARD governance
+    // grant. Migrating onto `commit_class_s_keep` STRENGTHENS the prior
+    // best-effort persist to fail-closed (keep-direction): on persist failure
+    // the in-memory grant STAYS granted — a granted-and-kept signer is the
+    // fail-closed-correct direction (un-granting an already-acknowledged signer
+    // is the unsafe move). The Class-S `threshold_signers.push` and the Class-C
+    // capability/token grants ride the SAME fail-closed persist (both inside the
+    // closure); the reject-before-mutate guards return `Err` (no persist).
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-    if state.governance.class_s.threshold_signers.contains(did) {
-        return Err(ContextError::PermissionDenied(format!(
-            "DID is already a signer: {did}"
-        )));
-    }
-    if state.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
-        return Err(ContextError::LimitExceeded(format!(
-            "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
-        )));
-    }
-    state.governance.class_s.threshold_signers.push(did.clone());
-
-    let creator_did = state.role_state.creator_did.clone();
-    let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
-    for cap in &capabilities {
-        let att = roles::UcanAttestation {
-            with: format!("scp:ctx:{context_id}/{cap}"),
-            can: "invoke".to_owned(),
-        };
-        let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&*deps.clock);
-        let token = roles::UcanToken {
-            iss: creator_did.clone(),
-            aud: did.to_string(),
-            att: vec![att],
-            nnc: nonce,
-        };
-        state
-            .role_state
-            .member_capabilities
-            .entry(did.to_string())
-            .or_default()
-            .insert(cap.clone());
-        if let Some(info) = state.membership.get_mut(did) {
-            info.tokens.push(token);
+        if !view.membership.contains(did) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
         }
-    }
+        if view.governance.class_s.threshold_signers.contains(did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "DID is already a signer: {did}"
+            )));
+        }
+        if view.governance.class_s.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+            return Err(ContextError::LimitExceeded(format!(
+                "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
+            )));
+        }
+        view.governance_class_s_mut()
+            .threshold_signers
+            .push(did.clone());
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        let state = view.rest_mut();
+        let creator_did = state.role_state.creator_did.clone();
+        let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+        for cap in &capabilities {
+            let att = roles::UcanAttestation {
+                with: format!("scp:ctx:{context_id}/{cap}"),
+                can: "invoke".to_owned(),
+            };
+            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&*deps.clock);
+            let token = roles::UcanToken {
+                iss: creator_did.clone(),
+                aud: did.to_string(),
+                att: vec![att],
+                nnc: nonce,
+            };
+            state
+                .role_state
+                .member_capabilities
+                .entry(did.to_string())
+                .or_default()
+                .insert(cap.clone());
+            if let Some(info) = state.membership.get_mut(did) {
+                info.tokens.push(token);
+            }
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerAdded,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1848,7 +2060,7 @@ pub fn execute_add_signer(
 // ---------------------------------------------------------------------------
 
 pub fn execute_remove_signer(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -1861,56 +2073,65 @@ pub fn execute_remove_signer(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: removing a threshold signer TIGHTENS governance
+    // authorization. `commit_class_s_keep` is the keep-direction: on persist
+    // failure the removal STAYS removed — re-admitting an already-acknowledged
+    // removed signer is the unsafe direction, so keeping the tightening is
+    // fail-closed-correct. (The prior fail-closed persist is preserved; only the
+    // rollback DIRECTION on persist failure is the keep choice.) The Class-S
+    // `threshold_signers.retain` rides the same fail-closed persist as the
+    // Class-C capability/token strip. The reject-before-mutate guards return
+    // `Err` from inside the closure (no persist); the threshold-floor guard
+    // undoes its own `retain` before returning, exactly as before.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    let before = state.governance.class_s.threshold_signers.len();
-    state
-        .governance
-        .class_s
-        .threshold_signers
-        .retain(|s| s != did);
-    if state.governance.class_s.threshold_signers.len() == before {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-    if state.governance.class_s.threshold_value > 0 {
-        let remaining =
-            u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-        if state.governance.class_s.threshold_value > remaining {
-            state.governance.class_s.threshold_signers.push(did.clone());
-            return Err(ContextError::PermissionDenied(format!(
-                "removing signer would leave {remaining} signers < threshold {}",
-                state.governance.class_s.threshold_value
-            )));
+        let before = view.governance.class_s.threshold_signers.len();
+        view.governance_class_s_mut()
+            .threshold_signers
+            .retain(|s| s != did);
+        if view.governance.class_s.threshold_signers.len() == before {
+            return Err(ContextError::MemberNotFound(did.to_string()));
         }
-    }
+        if view.governance.class_s.threshold_value > 0 {
+            let remaining =
+                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            if view.governance.class_s.threshold_value > remaining {
+                let threshold_value = view.governance.class_s.threshold_value;
+                view.governance_class_s_mut()
+                    .threshold_signers
+                    .push(did.clone());
+                return Err(ContextError::PermissionDenied(format!(
+                    "removing signer would leave {remaining} signers < threshold {threshold_value}"
+                )));
+            }
+        }
 
-    if let Some(caps) = state.role_state.member_capabilities.get_mut(did.as_ref()) {
-        caps.retain(|c| {
-            !matches!(
-                c,
-                Capability::GovernancePropose | Capability::GovernanceVote
-            )
-        });
-    }
-    if let Some(info) = state.membership.get_mut(did) {
-        info.tokens.retain(|t| {
-            !t.att.iter().any(|a| {
-                a.with.contains("governance:propose") || a.with.contains("governance:vote")
-            })
-        });
-    }
-
-    // ADR-049 §9 Class S: removing a threshold signer tightens governance
-    // authorization — persist fail-closed so a crash cannot re-admit a removed
-    // signer.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        let state = view.rest_mut();
+        if let Some(caps) = state.role_state.member_capabilities.get_mut(did.as_ref()) {
+            caps.retain(|c| {
+                !matches!(
+                    c,
+                    Capability::GovernancePropose | Capability::GovernanceVote
+                )
+            });
+        }
+        if let Some(info) = state.membership.get_mut(did) {
+            info.tokens.retain(|t| {
+                !t.att.iter().any(|a| {
+                    a.with.contains("governance:propose") || a.with.contains("governance:vote")
+                })
+            });
+        }
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerRemoved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1919,7 +2140,7 @@ pub fn execute_remove_signer(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_threshold(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_threshold: u32,
@@ -1932,28 +2153,31 @@ pub fn execute_modify_threshold(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    let signer_count =
-        u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-    if new_threshold == 0 || new_threshold > signer_count {
-        return Err(ContextError::PermissionDenied(format!(
-            "threshold must be 1..={signer_count}, got {new_threshold}"
-        )));
-    }
-    state.governance.class_s.threshold_value = new_threshold;
-
     // ADR-049 §9 Class S: changing the governance threshold is an
-    // authorization-control transition — persist fail-closed so a crash cannot
-    // revert to a weaker threshold the caller was told had changed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // authorization-control transition. The reject-before-mutate guards run
+    // inside the closure (returning `Err` skips the persist and drops the
+    // snapshot); on persist failure the combinator RESTORES `threshold_value`
+    // so the caller never observes success for an undurable change.
+    cell.commit_class_s_restore(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        let signer_count =
+            u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+        if new_threshold == 0 || new_threshold > signer_count {
+            return Err(ContextError::PermissionDenied(format!(
+                "threshold must be 1..={signer_count}, got {new_threshold}"
+            )));
+        }
+        view.governance_class_s_mut().threshold_value = new_threshold;
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ThresholdModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1962,7 +2186,7 @@ pub fn execute_modify_threshold(
 // ---------------------------------------------------------------------------
 
 pub fn execute_establish_tool_interface(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     interface: &ToolInterface,
@@ -1975,11 +2199,15 @@ pub fn execute_establish_tool_interface(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Establishing a tool interface is Class-C governance config. The fallible
+    // guards read through the cell's `Deref`; the `tool_interfaces` push
+    // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
+    // best-effort persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state
+    if !cell
         .role_state
-        .ceiling
+        .ceiling()
         .contains(&Capability::ToolInterface)
     {
         return Err(ContextError::PermissionDenied(
@@ -1987,21 +2215,23 @@ pub fn execute_establish_tool_interface(
         ));
     }
 
-    if state.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+    if cell.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
             "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
         )));
     }
-    state.governance.tool_interfaces.push(interface.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .tool_interfaces_mut()
+            .push(interface.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolInterfaceEstablished,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2010,7 +2240,7 @@ pub fn execute_establish_tool_interface(
 // ---------------------------------------------------------------------------
 
 pub fn execute_reset_member(
-    state: &mut PerContextState,
+    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -2024,9 +2254,9 @@ pub fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(view.handle_mut())?;
 
-    if !state.membership.contains(did) {
+    if !view.membership_class_c_mut().contains(did.as_ref()) {
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
@@ -2041,7 +2271,7 @@ pub fn execute_reset_member(
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     try_broadcast_commit_or_enqueue(
-        state,
+        view.commit_broadcast_borrows(),
         deps,
         context_id,
         remove_output.commit_bytes,
@@ -2051,7 +2281,7 @@ pub fn execute_reset_member(
         },
     );
     try_broadcast_commit_or_enqueue(
-        state,
+        view.commit_broadcast_borrows(),
         deps,
         context_id,
         add_output.commit_bytes,
@@ -2100,8 +2330,10 @@ pub fn execute_reset_member(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
-    state.governance.pending_epoch_resets.push(did.clone());
+    *view.checkpoint_events_since_mut() += 1;
+    view.governance_class_c_mut()
+        .pending_epoch_resets_mut()
+        .push(did.clone());
 
     Ok(())
 }
@@ -2116,7 +2348,7 @@ pub fn execute_reset_member(
 )]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_resolve_conflict(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_a: &ProposalId,
@@ -2131,105 +2363,103 @@ pub fn execute_resolve_conflict(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
-
-    let (freeze_a, freeze_b, _) = state.governance.freeze.ok_or_else(|| {
-        ContextError::PermissionDenied(
-            "context is not in governance freeze state — no conflict to resolve".into(),
-        )
-    })?;
-    let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
-        || (*proposal_a == freeze_b && *proposal_b == freeze_a);
-    if !proposals_match {
-        return Err(ContextError::PermissionDenied(
-            "ResolveConflict proposals do not match the governance freeze".into(),
-        ));
-    }
-
-    let action_a = state
-        .governance
-        .approved_proposals
-        .get(proposal_a)
-        .map(|(p, _, _)| &p.action);
-    let action_b = state
-        .governance
-        .approved_proposals
-        .get(proposal_b)
-        .map(|(p, _, _)| &p.action);
-
-    let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
-        return Err(ContextError::PermissionDenied(
-            "one or both conflict proposals are not in the approved set — \
-             cannot verify conflict"
-                .into(),
-        ));
-    };
-
-    let proposer_a = &state.governance.approved_proposals[proposal_a]
-        .0
-        .proposer_did;
-    let proposer_b = &state.governance.approved_proposals[proposal_b]
-        .0
-        .proposer_did;
-    if !scp_protocol::sync::conflict_resolution::actions_conflict(
-        act_a, proposer_a, act_b, proposer_b,
-    ) {
-        return Err(ContextError::PermissionDenied(
-            "the specified proposals do not conflict per \
-             sync::conflict_resolution::actions_conflict"
-                .into(),
-        ));
-    }
-
-    match resolution {
-        scp_protocol::context::governance::ConflictResolution::AcceptProposal { winner_id } => {
-            let loser = if *winner_id == *proposal_a {
-                proposal_b
-            } else if *winner_id == *proposal_b {
-                proposal_a
-            } else {
-                return Err(ContextError::PermissionDenied(format!(
-                    "winner_id {winner_id:?} is not one of the conflicting proposals"
-                )));
-            };
-            let now = deps.clock.now_secs();
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*loser, now);
-        }
-        scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
-            let now = deps.clock.now_secs();
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*proposal_a, now);
-            state
-                .governance
-                .class_s
-                .executed_proposals
-                .insert(*proposal_b, now);
-        }
-    }
-
-    state.governance.freeze = None;
-
     // ADR-049 §9 Class S: `executed_proposals` is security-critical replay-
     // protection state that does NOT survive an actor crash (it lives in the
-    // actor-owned `GovernanceState`). Persist fail-closed BEFORE acknowledging
-    // the resolution — if the persist fails, return an error rather than
-    // reporting success on a mutation an actor crash could roll back (which
-    // would let an already-resolved/superseded proposal be re-executed).
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    // actor-owned `GovernanceState`). `commit_class_s_keep` persists fail-closed
+    // BEFORE acknowledging the resolution — un-recording an executed-proposal
+    // marker re-opens the replay window (the canonical keep criterion), so on
+    // persist failure the markers STAY recorded and the persist error is
+    // returned. All reject-before-mutate guards return `Err` from inside the
+    // closure (no persist runs); `governance.freeze = None` (Class-C) rides the
+    // same fail-closed persist.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
+
+        let (freeze_a, freeze_b, _) = view.governance.freeze.ok_or_else(|| {
+            ContextError::PermissionDenied(
+                "context is not in governance freeze state — no conflict to resolve".into(),
+            )
+        })?;
+        let proposals_match = (*proposal_a == freeze_a && *proposal_b == freeze_b)
+            || (*proposal_a == freeze_b && *proposal_b == freeze_a);
+        if !proposals_match {
+            return Err(ContextError::PermissionDenied(
+                "ResolveConflict proposals do not match the governance freeze".into(),
+            ));
+        }
+
+        let action_a = view
+            .governance
+            .approved_proposals
+            .get(proposal_a)
+            .map(|(p, _, _)| &p.action);
+        let action_b = view
+            .governance
+            .approved_proposals
+            .get(proposal_b)
+            .map(|(p, _, _)| &p.action);
+
+        let (Some(act_a), Some(act_b)) = (action_a, action_b) else {
+            return Err(ContextError::PermissionDenied(
+                "one or both conflict proposals are not in the approved set — \
+                 cannot verify conflict"
+                    .into(),
+            ));
+        };
+
+        let proposer_a = &view.governance.approved_proposals[proposal_a]
+            .0
+            .proposer_did;
+        let proposer_b = &view.governance.approved_proposals[proposal_b]
+            .0
+            .proposer_did;
+        if !scp_protocol::sync::conflict_resolution::actions_conflict(
+            act_a, proposer_a, act_b, proposer_b,
+        ) {
+            return Err(ContextError::PermissionDenied(
+                "the specified proposals do not conflict per \
+                 sync::conflict_resolution::actions_conflict"
+                    .into(),
+            ));
+        }
+
+        match resolution {
+            scp_protocol::context::governance::ConflictResolution::AcceptProposal { winner_id } => {
+                let loser = if *winner_id == *proposal_a {
+                    proposal_b
+                } else if *winner_id == *proposal_b {
+                    proposal_a
+                } else {
+                    return Err(ContextError::PermissionDenied(format!(
+                        "winner_id {winner_id:?} is not one of the conflicting proposals"
+                    )));
+                };
+                let now = deps.clock.now_secs();
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*loser, now);
+            }
+            scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
+                let now = deps.clock.now_secs();
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*proposal_a, now);
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .insert(*proposal_b, now);
+            }
+        }
+
+        view.rest_mut().governance.freeze = None;
+        Ok(())
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceConflictResolved,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2238,7 +2468,7 @@ pub fn execute_resolve_conflict(
 // ---------------------------------------------------------------------------
 
 pub fn execute_promote_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     approvals: &[scp_protocol::context::governance::SignedVote],
@@ -2251,10 +2481,15 @@ pub fn execute_promote_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Promotion clears the TTL timer + promotes the handle's memory scope —
+    // both Class-C structural state. The active-state + promotable-policy +
+    // unanimity guards read through the cell's `Deref`; the `ttl` / `handle`
+    // mutations ride `commit_class_c_best_effort`, preserving the prior
+    // best-effort persist exactly.
+    require_active(&cell.handle)?;
 
     if !matches!(
-        state.handle.params().promotion_policy,
+        cell.handle.params().promotion_policy,
         scp_protocol::context::params::PromotionPolicy::Promotable
     ) {
         return Err(ContextError::PermissionDenied(
@@ -2263,7 +2498,7 @@ pub fn execute_promote_context(
     }
 
     let member_dids: std::collections::HashSet<&str> =
-        state.membership.member_dids().map(|d| &**d).collect();
+        cell.membership.member_dids().map(|d| &**d).collect();
     let approval_dids: std::collections::HashSet<&str> =
         approvals.iter().map(|v| &*v.voter_did).collect();
     let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
@@ -2274,19 +2509,22 @@ pub fn execute_promote_context(
             member_dids.len()
         )));
     }
+    drop(member_dids);
+    drop(approval_dids);
 
-    state.ttl.timer.cancel();
-    state.ttl.timer.deadline_unix_secs = None;
-    state.handle.promote_memory_scope();
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        let ttl = view.ttl_mut();
+        ttl.timer.cancel();
+        ttl.timer.deadline_unix_secs = None;
+        view.handle_mut().promote_memory_scope();
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextPromoted,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2296,7 +2534,7 @@ pub fn execute_promote_context(
 
 #[allow(clippy::too_many_lines)]
 pub fn execute_rotate_content_keys(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reason: Option<&str>,
@@ -2309,68 +2547,79 @@ pub fn execute_rotate_content_keys(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
+    // (the prior wrapping/content keys are superseded) — route the rotation
+    // through `commit_class_s_keep` so it persists fail-closed (keep-direction:
+    // on persist failure the rotation STAYS — reverting to the pre-rotation key
+    // state after the rotation was acknowledged is the unsafe direction). The
+    // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
+    // SAME fail-closed persist via `view.rest_mut()`. The closure returns the
+    // optional broadcast snapshot so its separate best-effort persist can run
+    // AFTER the fail-closed persist, exactly as before.
+    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
-        bc.rotate_all_author_keys()?;
-        let snap = Some(bc.to_snapshot());
-        (None, snap)
-    } else {
-        let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+        let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
+            bc.rotate_all_author_keys()?;
+            let snap = Some(bc.to_snapshot());
+            (None, snap)
+        } else {
+            let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-        let member_dids: Vec<String> = state
-            .membership
-            .member_dids()
-            .map(|d| d.0.clone())
-            .collect();
-        let current_epoch = state
-            .access
-            .access_key_store
-            .get_all(context_id)
-            .values()
-            .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
-            .max()
-            .unwrap_or(0);
-        let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-        let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-            context_id,
-            &did_refs,
-            current_epoch,
-        )
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        for new_key in rotation.new_keys {
-            let did = new_key.member_did().to_owned();
-            state.access.access_key_store.set(context_id, &did, new_key);
-        }
-        (Some(epoch_out), None)
-    };
+            let member_dids: Vec<String> = state
+                .membership
+                .member_dids()
+                .map(|d| d.0.clone())
+                .collect();
+            let current_epoch = state
+                .access
+                .access_key_store
+                .get_all(context_id)
+                .values()
+                .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                .max()
+                .unwrap_or(0);
+            let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+            let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                context_id,
+                &did_refs,
+                current_epoch,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            for new_key in rotation.new_keys {
+                let did = new_key.member_did().to_owned();
+                state.access.access_key_store.set(context_id, &did, new_key);
+            }
+            (Some(epoch_out), None)
+        };
 
-    emit(
-        state,
-        ContextEvent::ContentKeysRotated {
-            reason: reason.map(String::from),
-        },
-        context_id,
-        deps,
-    );
-
-    if let Some(epoch_out) = epoch_output {
-        try_broadcast_commit_or_enqueue(
+        emit(
             state,
-            deps,
-            context_id,
-            epoch_out.commit_bytes,
-            &CommitOperation::RotateContentKeys {
+            ContextEvent::ContentKeysRotated {
                 reason: reason.map(String::from),
             },
+            context_id,
+            deps,
         );
-    }
 
-    // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
-    // (the prior wrapping/content keys are superseded) — persist fail-closed so
-    // a crash cannot revert to the pre-rotation key state after the rotation
-    // was acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+        if let Some(epoch_out) = epoch_output {
+            try_broadcast_commit_or_enqueue(
+                CommitBroadcastBorrows {
+                    pending_commits: &mut state.pending_commits,
+                    commit_fault: &mut state.commit_fault,
+                    receive_buffer: &mut state.receive_buffer,
+                },
+                deps,
+                context_id,
+                epoch_out.commit_bytes,
+                &CommitOperation::RotateContentKeys {
+                    reason: reason.map(String::from),
+                },
+            );
+        }
+        Ok(bc_snap)
+    })?;
     if let Some(ref snap) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, snap);
     }
@@ -2381,7 +2630,7 @@ pub fn execute_rotate_content_keys(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2391,7 +2640,7 @@ pub fn execute_rotate_content_keys(
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_reconfigure_governance(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
@@ -2417,65 +2666,61 @@ pub fn execute_reconfigure_governance(
 
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
+    // is an authorization-control transition — persist fail-closed so a crash
+    // cannot revert to the prior governance configuration after the
+    // reconfiguration was acknowledged. The combinator's own Class-S
+    // snapshot/restore SUBSUMES the former hand-rolled `original_signers` /
+    // `original_threshold` save+rollback: a validation failure returns `Err`
+    // from inside the closure (snapshot dropped, nothing persisted), and a
+    // persist failure restores both Class-S sub-structs.
+    cell.commit_class_s_restore(deps, context_id, |mut view| {
+        require_active(&view.handle)?;
 
-    let original_signers = state.governance.class_s.threshold_signers.clone();
-    let original_threshold = state.governance.class_s.threshold_value;
-
-    let reconfigure_result: Result<(), ContextError> = (|| {
         for change in changes {
             match change {
                 scp_protocol::context::governance::GovernanceReconfigAction::RemoveInactiveSigner {
                     did,
                 } => {
-                    state.governance.class_s.threshold_signers.retain(|s| s != did);
+                    view.governance_class_s_mut()
+                        .threshold_signers
+                        .retain(|s| s != did);
                 }
                 scp_protocol::context::governance::GovernanceReconfigAction::ReduceThreshold {
                     new_threshold,
                 } => {
-                    let signer_count = u32::try_from(state.governance.class_s.threshold_signers.len())
-                        .unwrap_or(u32::MAX);
+                    let signer_count =
+                        u32::try_from(view.governance.class_s.threshold_signers.len())
+                            .unwrap_or(u32::MAX);
                     if *new_threshold == 0 || *new_threshold > signer_count {
                         return Err(ContextError::PermissionDenied(format!(
                             "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
                         )));
                     }
-                    state.governance.class_s.threshold_value = *new_threshold;
+                    view.governance_class_s_mut().threshold_value = *new_threshold;
                 }
             }
         }
 
-        if state.governance.class_s.threshold_value > 0 {
+        if view.governance.class_s.threshold_value > 0 {
             let remaining =
-                u32::try_from(state.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
-            if state.governance.class_s.threshold_value > remaining {
+                u32::try_from(view.governance.class_s.threshold_signers.len()).unwrap_or(u32::MAX);
+            if view.governance.class_s.threshold_value > remaining {
                 return Err(ContextError::PermissionDenied(format!(
                     "reconfiguration left {remaining} signers < threshold {}",
-                    state.governance.class_s.threshold_value,
+                    view.governance.class_s.threshold_value,
                 )));
             }
         }
         Ok(())
-    })();
-
-    if let Err(e) = reconfigure_result {
-        state.governance.class_s.threshold_signers = original_signers;
-        state.governance.class_s.threshold_value = original_threshold;
-        return Err(e);
-    }
-
-    // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
-    // is an authorization-control transition — persist fail-closed so a crash
-    // cannot revert to the prior governance configuration after the
-    // reconfiguration was acknowledged.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+    })?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceReconfigured,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2484,7 +2729,7 @@ pub fn execute_reconfigure_governance(
 // ---------------------------------------------------------------------------
 
 pub fn execute_set_economic_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     policy: &EconomicPolicy,
@@ -2500,9 +2745,16 @@ pub fn execute_set_economic_policy(
 
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Staging a pending economic-policy change is Class-C governance config. The
+    // validation + active-state + locked/already-pending guards read through
+    // the cell's `Deref`; the pending-change set + notification emit (Class-C)
+    // ride `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly. The notification `emit` is inlined as `emit_event_into`
+    // over the view's `receive_buffer_mut()` (identical to the free `emit`
+    // helper, which the airtight Class-C view cannot be handed whole-state to).
+    require_active(&cell.handle)?;
 
-    if let Some(existing) = &state.governance.economic_policy
+    if let Some(existing) = &cell.governance.economic_policy
         && existing.locked
     {
         return Err(ContextError::PermissionDenied(
@@ -2510,7 +2762,7 @@ pub fn execute_set_economic_policy(
         ));
     }
 
-    if state.governance.pending_economic_policy_change.is_some() {
+    if cell.governance.pending_economic_policy_change.is_some() {
         return Err(ContextError::PermissionDenied(
             "an economic policy change is already pending notification period".to_owned(),
         ));
@@ -2538,33 +2790,35 @@ pub fn execute_set_economic_policy(
     let notified_at = timestamp_secs;
     let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
     let observed_at = deps.clock.now_secs();
-    state.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
-        new_policy: policy.clone(),
-        notified_at,
-        effective_at,
-        observed_at,
-        proposal_id,
-    });
-
-    emit(
-        state,
-        ContextEvent::EconomicPolicyChangeNotification {
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view
+            .governance_class_c_mut()
+            .pending_economic_policy_change_mut() = Some(PendingEconomicPolicyChange {
+            new_policy: policy.clone(),
             notified_at,
             effective_at,
+            observed_at,
             proposal_id,
-        },
-        context_id,
-        deps,
-    );
+        });
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        emit_event_into(
+            view.receive_buffer_mut(),
+            ContextEvent::EconomicPolicyChangeNotification {
+                notified_at,
+                effective_at,
+                proposal_id,
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyChanged,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2574,7 +2828,7 @@ pub fn execute_set_economic_policy(
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_approve_spend(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     spender: &DID,
@@ -2589,15 +2843,21 @@ pub fn execute_approve_spend(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Granting spend budget is Class-C governance state. The fallible guards
+    // read through the cell's `Deref`; the `budget_tracker.grant` (Class-C)
+    // rides `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state.membership.contains(spender.as_ref()) {
+    if !cell.membership.contains(spender.as_ref()) {
         return Err(ContextError::MemberNotFound(spender.to_string()));
     }
 
-    state.governance.budget_tracker.grant(spender, amount);
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .budget_tracker_mut()
+            .grant(spender, amount);
+    });
     let spend_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
             spender: spender.as_ref().to_owned(),
@@ -2620,7 +2880,7 @@ pub fn execute_approve_spend(
 // ---------------------------------------------------------------------------
 
 pub fn execute_lock_economic_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     meta: CommitMeta<'_>,
@@ -2632,9 +2892,15 @@ pub fn execute_lock_economic_policy(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Locking the economic policy is Class-C governance config. The active-state
+    // gate + presence/already-locked checks read through the cell's `Deref`;
+    // the `locked = true` set (Class-C) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly. The reject checks run
+    // BEFORE the commit closure (the closure is infallible) so a rejected lock
+    // triggers no persist, matching the prior reject-before-persist behaviour.
+    require_active(&cell.handle)?;
 
-    match &mut state.governance.economic_policy {
+    match &cell.governance.economic_policy {
         None => {
             return Err(ContextError::PermissionDenied(
                 "cannot lock economic policy: no policy is set".to_owned(),
@@ -2645,19 +2911,21 @@ pub fn execute_lock_economic_policy(
                 "economic policy is already locked".to_owned(),
             ));
         }
-        Some(policy) => {
-            policy.locked = true;
-        }
+        Some(_) => {}
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        if let Some(policy) = view.governance_class_c_mut().economic_policy_mut() {
+            policy.locked = true;
+        }
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyLocked,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2666,7 +2934,7 @@ pub fn execute_lock_economic_policy(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_hard_rate_limit(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
@@ -2685,9 +2953,16 @@ pub fn execute_modify_hard_rate_limit(
         ))
     })?;
 
-    require_active(&state.handle)?;
+    // The hard rate limiter is Class-C defense-in-depth state. Validation +
+    // the preserved-state snapshot read happen BEFORE the commit (reading the
+    // limiter through the cell's `Deref`); the limiter REPLACEMENT (Class-C)
+    // rides `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly. A validation/sanitization reject returns `Err` before
+    // the commit closure runs, so no persist fires — matching the prior
+    // reject-before-persist behaviour.
+    require_active(&cell.handle)?;
 
-    let mut preserved_state = state.governance.hard_rate_limit.snapshot_entries();
+    let mut preserved_state = cell.governance.hard_rate_limit.snapshot_entries();
     scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
         &mut preserved_state,
         new_config,
@@ -2699,20 +2974,20 @@ pub fn execute_modify_hard_rate_limit(
             "ModifyHardRateLimit: preserved state sanitization failed: {e}"
         ))
     })?;
-    state.governance.hard_rate_limit =
-        scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-            new_config.clone(),
-            preserved_state,
-        );
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view.governance_class_c_mut().hard_rate_limit_mut() =
+            scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                new_config.clone(),
+                preserved_state,
+            );
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::HardRateLimitModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2735,7 +3010,7 @@ pub fn execute_modify_hard_rate_limit(
 /// spawned actor's `.run()` future be provably `Send`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn execute_propose_context_migration<'a>(
-    state: &'a mut PerContextState,
+    cell: &'a mut crate::context::actor::class_s::ClassSCell,
     deps: &'a ActorDeps,
     context_id: &'a str,
     new_context_params: &'a scp_protocol::context::params::ContextParams,
@@ -2774,15 +3049,16 @@ pub fn execute_propose_context_migration<'a>(
             proposal_id,
         });
 
-        require_active(&state.handle)?;
+        // Reads via the cell's `Deref`; `transition_to` takes `&self`.
+        require_active(&cell.handle)?;
 
-        if state.migration_state.is_some() {
+        if cell.migration_state.is_some() {
             return Err(ContextError::PermissionDenied(
                 "context migration is already in progress".to_owned(),
             ));
         }
 
-        let creator = state
+        let creator = cell
             .membership
             .members()
             .find(|m| m.role_name == "admin")
@@ -2793,23 +3069,12 @@ pub fn execute_propose_context_migration<'a>(
                 )
             })?;
 
-        state
-            .handle
+        cell.handle
             .transition_to(&ContextState::MigratingOut)
             .await
             .map_err(|_| {
                 ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
             })?;
-
-        state.migration_state = Some(MigrationState {
-            destination_context_id: destination_context_id.clone(),
-            reason: reason.to_owned(),
-            grace_period_end,
-            auto_invite,
-            proposal_id,
-        });
-
-        let buffer_len_before_migration = state.receive_buffer.len();
 
         // Buffer migration events WITHOUT broadcasting (rollback-able block).
         let proposed_event = ContextEvent::ContextMigrationProposed {
@@ -2823,8 +3088,23 @@ pub fn execute_propose_context_migration<'a>(
             destination_context_id: destination_context_id.clone(),
             grace_period_end,
         };
-        state.receive_buffer.push(proposed_event.clone());
-        state.receive_buffer.push(started_event.clone());
+
+        // Coalesced Class-C staging (migration_state + buffered events) in a
+        // view borrow that drops before the `create_context` await.
+        let buffer_len_before_migration = {
+            let mut view = cell.class_c_view();
+            *view.migration_state_mut() = Some(MigrationState {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_end,
+                auto_invite,
+                proposal_id,
+            });
+            let buffer_len_before_migration = view.receive_buffer_mut().len();
+            view.receive_buffer_mut().push(proposed_event.clone());
+            view.receive_buffer_mut().push(started_event.clone());
+            buffer_len_before_migration
+        };
 
         // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
         // (bootstrap form — constructs fresh PerContextState, registers
@@ -2855,10 +3135,17 @@ pub fn execute_propose_context_migration<'a>(
             None,
         ));
         if let Err(e) = create_fut.await {
-            // Roll back: revert source to Active and clear migration state.
-            let _ = state.handle.transition_to(&ContextState::Active).await;
-            state.migration_state = None;
-            state.receive_buffer.truncate(buffer_len_before_migration);
+            // Roll back: revert source to Active and clear migration state. The
+            // `transition_to` await runs with no view borrow live; the Class-C
+            // rollback (clear migration state + truncate the buffered events)
+            // then runs in a short view borrow.
+            let _ = cell.handle.transition_to(&ContextState::Active).await;
+            {
+                let mut view = cell.class_c_view();
+                *view.migration_state_mut() = None;
+                view.receive_buffer_mut()
+                    .truncate(buffer_len_before_migration);
+            }
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
@@ -2870,14 +3157,14 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
         deps.event_log.append_context_event(
             &context_id_bytes,
             scp_event_log::EventType::ContextMigrationStarted,
             actor_did,
             timestamp_secs,
         )?;
-        state.checkpoint_events_since += 1;
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
         Ok(MigrationProposedResult {
             destination_context_id,
@@ -2891,7 +3178,7 @@ pub fn execute_propose_context_migration<'a>(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_cancel_context_migration(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     meta: CommitMeta<'_>,
@@ -2903,7 +3190,8 @@ pub async fn execute_cancel_context_migration(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    let s = state
+    // Reads via the cell's `Deref`; `transition_to` takes `&self`.
+    let s = cell
         .handle
         .try_read_state()
         .ok_or(ContextError::ContextNotActive)?;
@@ -2913,8 +3201,7 @@ pub async fn execute_cancel_context_migration(
         ));
     }
 
-    state
-        .handle
+    cell.handle
         .transition_to(&ContextState::Active)
         .await
         .map_err(|_| {
@@ -2923,23 +3210,27 @@ pub async fn execute_cancel_context_migration(
             )
         })?;
 
-    let migration = state.migration_state.take().ok_or_else(|| {
-        ContextError::PermissionDenied(
-            "no migration state found despite MigratingOut state".to_owned(),
-        )
-    })?;
-    let original_proposal_id = migration.proposal_id;
+    // Class-C migration-state clear + cancel-event emit run after the
+    // transition await, in a short non-persisting view borrow.
+    let original_proposal_id = {
+        let mut view = cell.class_c_view();
+        let migration = view.migration_state_mut().take().ok_or_else(|| {
+            ContextError::PermissionDenied(
+                "no migration state found despite MigratingOut state".to_owned(),
+            )
+        })?;
+        let original_proposal_id = migration.proposal_id;
+        view.emit_event(
+            ContextEvent::ContextMigrationCancelled {
+                original_proposal_id,
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+        original_proposal_id
+    };
 
-    emit(
-        state,
-        ContextEvent::ContextMigrationCancelled {
-            original_proposal_id,
-        },
-        context_id,
-        deps,
-    );
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
     let cancel_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::ContextMigrationCancelledPayload {
             original_proposal_id,
@@ -2953,7 +3244,7 @@ pub async fn execute_cancel_context_migration(
         cancel_payload,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2976,7 +3267,7 @@ pub async fn execute_cancel_context_migration(
 /// submission (actor-owned state — no TOCTOU window).
 #[allow(clippy::too_many_lines)]
 pub async fn propose_governance_action_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -2991,16 +3282,22 @@ pub async fn propose_governance_action_inner(
     ),
     ContextError,
 > {
+    // ADR-049 §9 Class-S cell seam: the pre-execute body reads through the
+    // cell's `Deref` and routes each Class-C mutation through the non-persisting
+    // `class_c_view()`; the single best-effort persist is at the tail (preserved
+    // from the legacy `state_mut` body). The cell is handed to the auto-execute
+    // path once these reads/mutations complete.
+    //
     // CancelContextMigration is allowed during MigratingOut (§5.11A);
     // all other actions require Active state.
     if matches!(action, GovernanceAction::CancelContextMigration) {
-        require_migrating_out(&state.handle)?;
+        require_migrating_out(&cell.handle)?;
     } else {
-        require_active(&state.handle)?;
+        require_active(&cell.handle)?;
     }
 
     if check_propose_capability
-        && !state
+        && !cell
             .role_state
             .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
     {
@@ -3011,10 +3308,9 @@ pub async fn propose_governance_action_inner(
 
     // Presence-only members (read + write both suspended) lose
     // GovernancePropose capability.
-    if state
+    if cell
         .role_state
-        .suspended_capabilities
-        .get(proposer_did.as_ref())
+        .suspended_for(proposer_did.as_ref())
         .is_some_and(|s| {
             s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
         })
@@ -3026,20 +3322,19 @@ pub async fn propose_governance_action_inner(
 
     // Eligibility check (#1530). The composite proposer-eligibility gate
     // (pending-removal + participation threshold + earned-capacity rate
-    // limit) runs against actor-owned `&mut PerContextState` via
-    // `actor_check_proposer_eligibility`.
-    actor_check_proposer_eligibility(state, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
+    // limit) runs against actor-owned state via `actor_check_proposer_eligibility`.
+    actor_check_proposer_eligibility(cell, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
 
     // SCP-272: Check and auto-resolve expired governance freezes.
     // Timer-triggered expiry: capture the pre-computed freeze deadline
     // (freeze_start + timeout) BEFORE resolution clears the freeze, so the
     // GovernanceFreezeExpired leaf carries that convergent deadline rather than
     // a per-member local `now()` (§7.3.1, §9.9.3).
-    let freeze_expiry_deadline = state
+    let freeze_expiry_deadline = cell
         .governance
         .freeze
         .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
-    let freeze_events = check_and_resolve_expired_freezes(state, deps);
+    let freeze_events = check_and_resolve_expired_freezes(cell, deps);
     if !freeze_events.is_empty() {
         let cid_bytes = context_id_to_bytes(context_id);
         // The freeze was present when `freeze_events` is non-empty (expiry just
@@ -3053,12 +3348,12 @@ pub async fn propose_governance_action_inner(
                     proposer_did.as_ref(),
                     freeze_ts,
                 )?;
-                state.checkpoint_events_since += 1;
+                *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
     }
 
-    if state.governance.freeze.is_some()
+    if cell.governance.freeze.is_some()
         && !matches!(action, GovernanceAction::ResolveConflict { .. })
     {
         return Err(ContextError::GovernanceFailed(
@@ -3066,16 +3361,21 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
-    let gov_ctx = build_governance_context(state, &*deps.clock);
-    let (proposal, events) = state
-        .governance
-        .engine
-        .propose(proposer_did, action, &gov_ctx, signing_key)
-        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+    let gov_ctx = build_governance_context(&*cell, &*deps.clock);
+    let (proposal, events) = {
+        let mut view = cell.class_c_view();
+        view.governance_class_c_mut().engine_mut().propose(
+            proposer_did,
+            action,
+            &gov_ctx,
+            signing_key,
+        )
+    }
+    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
-    state
-        .governance
-        .proposal_timestamps
+    cell.class_c_view()
+        .governance_class_c_mut()
+        .proposal_timestamps_mut()
         .entry(proposer_did.to_string())
         .or_default()
         .push(deps.clock.now_secs());
@@ -3083,7 +3383,7 @@ pub async fn propose_governance_action_inner(
     let should_execute = proposal.status == ProposalStatus::Approved;
 
     let conflict_events = if should_execute {
-        detect_and_handle_conflicts(state, deps, &proposal)
+        detect_and_handle_conflicts(cell, deps, &proposal)
     } else {
         Vec::new()
     };
@@ -3092,7 +3392,7 @@ pub async fn propose_governance_action_inner(
         matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
     });
 
-    let in_freeze = state.governance.freeze.is_some();
+    let in_freeze = cell.governance.freeze.is_some();
 
     // Emit conflict events to the event log.
     if !conflict_events.is_empty() {
@@ -3125,19 +3425,22 @@ pub async fn propose_governance_action_inner(
             }
         }
         if conflict_event_count > 0 {
-            state.checkpoint_events_since += conflict_event_count;
+            *cell.class_c_view().checkpoint_events_since_mut() += conflict_event_count;
         }
     }
 
     // If the proposal was auto-approved (SingleAdmin), execute
     // immediately — unless invalidated by conflict or in freeze.
     let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
+        // The top `state` borrow has ended (NLL); hand the cell to the execute
+        // path so the governance leaves it reaches can later migrate.
+        //
+        // Auto-execute (SingleAdmin / quorum==0): the proposer IS the
+        // committing member, so the executor is the proposer. Preserves the
+        // existing leaf bytes on this path.
         Some(
-            // Auto-execute (SingleAdmin / quorum==0): the proposer IS the
-            // committing member, so the executor is the proposer. Preserves the
-            // existing leaf bytes on this path.
             Box::pin(execute_governance_action(
-                state,
+                cell,
                 deps,
                 context_id,
                 &proposal.proposal_id,
@@ -3149,7 +3452,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
 
     Ok((proposal, events, execution_result))
 }
@@ -3159,7 +3462,7 @@ pub async fn propose_governance_action_inner(
 /// bypass, participation-threshold gate, and earned-capacity rate limit.
 #[allow(clippy::too_many_lines)]
 fn actor_check_proposer_eligibility(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     proposer_did: &DID,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
@@ -3167,8 +3470,8 @@ fn actor_check_proposer_eligibility(
     use scp_protocol::context::params::GovernanceModel;
     use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
 
-    // Pending-removal defense-in-depth.
-    for (proposal, _seq, _ts) in state.governance.approved_proposals.values() {
+    // Pending-removal defense-in-depth (read via the cell's `Deref`).
+    for (proposal, _seq, _ts) in cell.governance.approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
             && did == proposer_did
         {
@@ -3180,15 +3483,15 @@ fn actor_check_proposer_eligibility(
 
     // SingleAdmin bypass: the sole authority is always eligible.
     if matches!(
-        state.handle.params().governance,
+        cell.handle.params().governance,
         GovernanceModel::SingleAdmin
     ) {
         return Ok(());
     }
 
     // Participation refresh + cache + threshold.
-    let context_id = state.handle.context_id().to_owned();
-    if !state
+    let context_id = cell.handle.context_id().to_owned();
+    if !cell
         .governance
         .participation_cache
         .contains_key(proposer_did.as_ref())
@@ -3200,7 +3503,7 @@ fn actor_check_proposer_eligibility(
         // Participation-record path consumes only the merged event set;
         // `convergent_now` (the consequence window anchor) is unused here.
         let (events, _convergent_now) =
-            event_log_entries_for_consequences(&state.receive_buffer, &context_id, now, event_log);
+            event_log_entries_for_consequences(&cell.receive_buffer, &context_id, now, event_log);
         if !events.is_empty() {
             match compute_participation_record(
                 &events,
@@ -3222,9 +3525,9 @@ fn actor_check_proposer_eligibility(
                 }
                 Ok(record) => {
                     if record.participation_count > 0 {
-                        state
-                            .governance
-                            .participation_cache
+                        cell.class_c_view()
+                            .governance_class_c_mut()
+                            .participation_cache_mut()
                             .insert(proposer_did.to_string(), record);
                     }
                 }
@@ -3232,7 +3535,7 @@ fn actor_check_proposer_eligibility(
         }
     }
 
-    if let Some(record) = state
+    if let Some(record) = cell
         .governance
         .participation_cache
         .get(proposer_did.as_ref())
@@ -3245,10 +3548,10 @@ fn actor_check_proposer_eligibility(
     }
 
     // Earned capacity enforcement (§9.3).
-    if let Some(sybil_policy) = state.handle.params().sybil_policy.as_ref() {
+    if let Some(sybil_policy) = cell.handle.params().sybil_policy.as_ref() {
         let assessment = crate::context::lifecycle_logic::build_identity_assessment(
             proposer_did,
-            &state.governance,
+            &cell.governance,
             now,
         );
         let (_level, capacity) =
@@ -3258,9 +3561,10 @@ fn actor_check_proposer_eligibility(
         let max_proposals = capacity.max_governance_proposals_per_window;
         let window_start = now.saturating_sub(window_secs);
 
-        let timestamps = state
-            .governance
-            .proposal_timestamps
+        let mut view = cell.class_c_view();
+        let timestamps = view
+            .governance_class_c_mut()
+            .proposal_timestamps_mut()
             .entry(proposer_did.to_string())
             .or_default();
 
@@ -3302,7 +3606,7 @@ fn actor_check_proposer_eligibility(
 /// path as the proposal submission (no TOCTOU).
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action_checked(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposer_did: &DID,
@@ -3310,7 +3614,7 @@ pub async fn propose_governance_action_checked(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalOutcome, ContextError> {
     let (proposal, _events, execution_result) = propose_governance_action_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposer_did,
@@ -3338,7 +3642,7 @@ pub async fn propose_governance_action_checked(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3347,12 +3651,14 @@ pub async fn vote_on_proposal_inner(
     signing_key: &ed25519_dalek::SigningKey,
     check_vote_capability: bool,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
-    require_active(&state.handle)?;
+    // ADR-049 §9 Class-S cell seam: the pre-execute body reads through the
+    // cell's `Deref` and routes each Class-C mutation through the non-persisting
+    // `class_c_view()`; the single best-effort persist is at the tail (preserved
+    // from the legacy `state_mut` body). The cell is handed to the auto-execute
+    // path once these reads/mutations complete.
+    require_active(&cell.handle)?;
 
-    let suspended = state
-        .role_state
-        .suspended_capabilities
-        .get(voter_did.as_ref());
+    let suspended = cell.role_state.suspended_for(voter_did.as_ref());
     if suspended.is_some_and(|s| s.contains(&Capability::GovernanceVote)) {
         return Err(ContextError::PermissionDenied(
             "member does not have governance:vote capability".into(),
@@ -3367,7 +3673,7 @@ pub async fn vote_on_proposal_inner(
     }
 
     if check_vote_capability
-        && !state
+        && !cell
             .role_state
             .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
     {
@@ -3376,23 +3682,20 @@ pub async fn vote_on_proposal_inner(
         )));
     }
 
-    let gov_ctx = build_governance_context(state, &*deps.clock);
-    let (status, events) = if approve {
-        state
-            .governance
-            .engine
-            .approve(proposal_id, voter_did, &gov_ctx, signing_key)
-            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
-    } else {
-        state
-            .governance
-            .engine
-            .reject(proposal_id, voter_did, &gov_ctx, signing_key)
-            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
-    };
+    let gov_ctx = build_governance_context(&*cell, &*deps.clock);
+    let (status, events) = {
+        let mut view = cell.class_c_view();
+        let engine = view.governance_class_c_mut().engine_mut();
+        if approve {
+            engine.approve(proposal_id, voter_did, &gov_ctx, signing_key)
+        } else {
+            engine.reject(proposal_id, voter_did, &gov_ctx, signing_key)
+        }
+    }
+    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
     let proposal_for_execution = if status == ProposalStatus::Approved {
-        state.governance.engine.get_proposal(proposal_id).cloned()
+        cell.governance.engine.get_proposal(proposal_id).cloned()
     } else {
         None
     };
@@ -3400,7 +3703,7 @@ pub async fn vote_on_proposal_inner(
     let conflict_events = proposal_for_execution
         .as_ref()
         .map_or_else(Vec::new, |proposal| {
-            detect_and_handle_conflicts(state, deps, proposal)
+            detect_and_handle_conflicts(cell, deps, proposal)
         });
 
     // Emit conflict events to the event log.
@@ -3435,7 +3738,7 @@ pub async fn vote_on_proposal_inner(
             }
         }
         if conflict_event_count > 0 {
-            state.checkpoint_events_since += conflict_event_count;
+            *cell.class_c_view().checkpoint_events_since_mut() += conflict_event_count;
         }
     }
 
@@ -3444,8 +3747,11 @@ pub async fn vote_on_proposal_inner(
     });
 
     if let Some(proposal) = proposal_for_execution {
-        let in_freeze = state.governance.freeze.is_some();
+        let in_freeze = cell.governance.freeze.is_some();
         if !in_freeze && !invalidated_by_conflict {
+            // The top `state` borrow has ended (NLL); hand the cell to the execute
+            // path so the governance leaves it reaches can later migrate.
+            //
             // Quorum-approval path: the executor is THIS voter — the member
             // whose approval crossed quorum and therefore committed the action
             // (ADR-031 §7.3.1 "committing member"). This is the divergence-
@@ -3453,7 +3759,7 @@ pub async fn vote_on_proposal_inner(
             // native disagree with WASM whenever proposer != quorum-crossing
             // voter.
             Box::pin(execute_governance_action(
-                state,
+                cell,
                 deps,
                 context_id,
                 &proposal.proposal_id,
@@ -3463,7 +3769,7 @@ pub async fn vote_on_proposal_inner(
         }
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
 
     Ok((status, events))
 }
@@ -3485,7 +3791,7 @@ pub async fn vote_on_proposal_inner(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn approve_governance_proposal(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3493,7 +3799,7 @@ pub async fn approve_governance_proposal(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -3515,7 +3821,7 @@ pub async fn approve_governance_proposal(
 /// as the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn reject_governance_proposal(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &ProposalId,
@@ -3523,7 +3829,7 @@ pub async fn reject_governance_proposal(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -3544,7 +3850,7 @@ pub async fn reject_governance_proposal(
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
 pub fn dispatch_content_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -3558,7 +3864,7 @@ pub fn dispatch_content_governance_action(
     match action {
         GovernanceAction::AddSigner { did } => {
             execute_add_signer(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3572,7 +3878,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::RemoveSigner { did } => {
             execute_remove_signer(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3586,7 +3892,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
             execute_modify_threshold(
-                state,
+                cell,
                 deps,
                 context_id,
                 *new_threshold,
@@ -3600,7 +3906,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::EstablishToolInterface { interface } => {
             execute_establish_tool_interface(
-                state,
+                cell,
                 deps,
                 context_id,
                 interface,
@@ -3614,7 +3920,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
-                state,
+                &mut cell.class_c_view(),
                 deps,
                 context_id,
                 did,
@@ -3633,7 +3939,7 @@ pub fn dispatch_content_governance_action(
             resolution,
         } => {
             execute_resolve_conflict(
-                state,
+                cell,
                 deps,
                 context_id,
                 proposal_a,
@@ -3649,7 +3955,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::RotateContentKeys { reason } => {
             execute_rotate_content_keys(
-                state,
+                cell,
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3670,7 +3976,7 @@ pub fn dispatch_content_governance_action(
             justification,
         } => {
             execute_reconfigure_governance(
-                state,
+                cell,
                 deps,
                 context_id,
                 changes,
@@ -3736,7 +4042,7 @@ pub fn dispatch_content_governance_action(
 /// methods, returning typed [`GovernanceActionResult`] variants.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_context_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
@@ -3750,7 +4056,7 @@ pub async fn dispatch_context_governance_action(
     match action {
         GovernanceAction::AddMember { did, role } => {
             execute_add_member(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3765,7 +4071,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveMember { did, .. } => {
             execute_remove_member(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3779,7 +4085,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ChangeRole { did, new_role } => {
             execute_change_role(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3794,7 +4100,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RegisterTool { registration } => {
             execute_register_tool(
-                state,
+                cell,
                 deps,
                 context_id,
                 registration,
@@ -3808,7 +4114,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RemoveTool { tool_id } => {
             execute_remove_tool(
-                state,
+                cell,
                 deps,
                 context_id,
                 tool_id,
@@ -3822,7 +4128,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
             execute_modify_ceiling(
-                state,
+                cell,
                 deps,
                 context_id,
                 new_ceiling,
@@ -3836,7 +4142,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CloseContext { reason } => {
             execute_close_context(
-                state,
+                cell,
                 deps,
                 context_id,
                 reason.as_deref(),
@@ -3851,7 +4157,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::TransferAdmin { new_admin } => {
             execute_transfer_admin(
-                state,
+                cell,
                 deps,
                 context_id,
                 new_admin,
@@ -3865,7 +4171,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CreateChildContext { params } => {
             execute_create_child_context(
-                state,
+                cell,
                 deps,
                 context_id,
                 params,
@@ -3879,7 +4185,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
             execute_modify_pruning_policy(
-                state,
+                cell,
                 deps,
                 context_id,
                 new_policy,
@@ -3903,7 +4209,7 @@ pub async fn dispatch_context_governance_action(
             // future remains provably `Send` — see the function-level
             // doc for ADR-049 Phase 2A finalization rationale.
             let result = execute_propose_context_migration(
-                state,
+                cell,
                 deps,
                 context_id,
                 new_context_params,
@@ -3921,7 +4227,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CancelContextMigration => {
             execute_cancel_context_migration(
-                state,
+                cell,
                 deps,
                 context_id,
                 CommitMeta {
@@ -3941,7 +4247,7 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
         | GovernanceAction::ReconfigureGovernance { .. } => dispatch_content_governance_action(
-            state,
+            cell,
             deps,
             context_id,
             action,
@@ -3982,7 +4288,7 @@ pub async fn dispatch_context_governance_action(
 /// Dispatches an approved governance action to its implementation method.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal: &GovernanceProposal,
@@ -4005,7 +4311,7 @@ pub async fn dispatch_governance_action(
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
             execute_suspend_member(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4024,37 +4330,42 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::SuspendAccess { did } => {
-            // Suspend all capabilities for the member.
-            require_active(&state.handle)?;
+            // Suspend all capabilities for the member. ADR-049 §9 Class S:
+            // `suspend_all` strips a member's ENTIRE capability set — a downward-
+            // authorization transition, identical in shape to
+            // `execute_suspend_member`'s `suspend_capabilities`. Route through
+            // `commit_class_s_keep` so it persists fail-closed (keep-direction: on
+            // persist failure the ban STAYS — re-granting the suspended member's
+            // capabilities after the caller was told the ban applied is the unsafe
+            // direction). The reject-before-mutate guards return `Err` from inside
+            // the closure (no persist runs); the `suspend_all` + emit (Class-C)
+            // ride the SAME fail-closed persist via `view.rest_mut()`.
+            cell.commit_class_s_keep(deps, context_id, |mut view| {
+                let state = view.rest_mut();
+                require_active(&state.handle)?;
 
-            if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
-                ));
-            }
-            if !state.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
+                if !state.role_state.ceiling().contains(&Capability::MemberBan) {
+                    return Err(ContextError::PermissionDenied(
+                        "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                    ));
+                }
+                if !state.membership.contains(did) {
+                    return Err(ContextError::MemberNotFound(did.to_string()));
+                }
 
-            state.role_state.suspend_all(did.as_ref());
+                state.role_state.suspend_all(did.as_ref());
 
-            emit(
-                state,
-                ContextEvent::CapabilitiesSuspended {
-                    did: did.clone(),
-                    capabilities: vec![],
-                },
-                context_id,
-                deps,
-            );
-
-            // ADR-049 §9 Class S: `suspend_all` strips a member's ENTIRE
-            // capability set — a downward-authorization transition, identical
-            // in shape to `execute_suspend_member`'s `suspend_capabilities`.
-            // Persist fail-closed so an actor crash in the ≤50ms coalesce
-            // window cannot roll the ban back and re-grant the suspended
-            // member's capabilities after the caller was told the ban applied.
-            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+                emit(
+                    state,
+                    ContextEvent::CapabilitiesSuspended {
+                        did: did.clone(),
+                        capabilities: vec![],
+                    },
+                    context_id,
+                    deps,
+                );
+                Ok(())
+            })?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log.append_context_event(
                 &context_id_bytes,
@@ -4062,12 +4373,12 @@ pub async fn dispatch_governance_action(
                 actor,
                 ts,
             )?;
-            state.checkpoint_events_since += 1;
+            *cell.class_c_view().checkpoint_events_since_mut() += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
             let r = execute_revoke(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4086,7 +4397,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
             execute_restore_access(
-                state,
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4106,7 +4417,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::PromoteContext => {
             execute_promote_context(
-                state,
+                cell,
                 deps,
                 context_id,
                 &proposal.approvals,
@@ -4120,7 +4431,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
             execute_extend_ttl(
-                state,
+                cell,
                 deps,
                 context_id,
                 *additional_secs,
@@ -4136,7 +4447,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
             execute_set_economic_policy(
-                state,
+                cell,
                 deps,
                 context_id,
                 policy,
@@ -4154,7 +4465,7 @@ pub async fn dispatch_governance_action(
             purpose,
         } => {
             execute_approve_spend(
-                state,
+                cell,
                 deps,
                 context_id,
                 spender,
@@ -4170,7 +4481,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::LockEconomicPolicy => {
             execute_lock_economic_policy(
-                state,
+                cell,
                 deps,
                 context_id,
                 CommitMeta {
@@ -4183,7 +4494,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
             execute_modify_hard_rate_limit(
-                state,
+                cell,
                 deps,
                 context_id,
                 new_config,
@@ -4217,7 +4528,7 @@ pub async fn dispatch_governance_action(
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration => {
             dispatch_context_governance_action(
-                state,
+                cell,
                 deps,
                 context_id,
                 &proposal.action,
@@ -4400,14 +4711,20 @@ pub fn finalize_governance_action(
                 None
             };
 
-            let mut split = ConsequenceStateSplit {
-                governance: &mut state.governance,
-                role_state: &mut state.role_state,
-                membership: &state.membership,
-                receive_buffer: &mut state.receive_buffer,
-                checkpoint_events_since: &mut state.checkpoint_events_since,
-            };
-            enforce_triggered_consequences(
+            // ADR-049 §9 (RED-CS3): a consequence here may apply a downward-auth
+            // mutation (a capability suspension or an `AssignRole` demotion), which
+            // ARMS `downward_auth_sink` via the GROW method. On THIS path the
+            // fail-closed persist is already owed by the caller —
+            // `execute_governance_action` runs this whole
+            // `finalize_governance_action` body inside the deferred
+            // `ClassSCommitToken::discharge_with`, which performs a SINGLE
+            // FAIL-CLOSED persist of the post-finalize state (keep-direction). So an
+            // armed sink here is REDUNDANT — it is subsumed by the caller's
+            // discharge (no second persist) below.
+            let mut downward_auth_sink: Option<crate::context::actor::class_s::ClassSCommitToken> =
+                None;
+            let mut split = ConsequenceStateSplit::from_state(state);
+            let _ = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id,
@@ -4419,16 +4736,11 @@ pub fn finalize_governance_action(
                     event_log: &*deps.event_log,
                     event_tx: deps.event_tx.as_ref(),
                 },
+                &mut downward_auth_sink,
             );
             if let Some((target, triggered)) = triggered_target {
-                let mut split = ConsequenceStateSplit {
-                    governance: &mut state.governance,
-                    role_state: &mut state.role_state,
-                    membership: &state.membership,
-                    receive_buffer: &mut state.receive_buffer,
-                    checkpoint_events_since: &mut state.checkpoint_events_since,
-                };
-                enforce_triggered_consequences(
+                let mut split = ConsequenceStateSplit::from_state(state);
+                let _ = enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {
                         context_id,
@@ -4440,7 +4752,13 @@ pub fn finalize_governance_action(
                         event_log: &*deps.event_log,
                         event_tx: deps.event_tx.as_ref(),
                     },
+                    &mut downward_auth_sink,
                 );
+            }
+            // Covered fail-closed by the caller's `discharge_with` commit (above):
+            // subsume any armed obligation so EXACTLY ONE persist is owed.
+            if let Some(token) = downward_auth_sink.take() {
+                token.subsume(context_id);
             }
         }
     }
@@ -4476,8 +4794,13 @@ pub fn finalize_governance_action(
         }
     }
 
-    // 4. Persist the updated context state (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // 4. Persistence is no longer performed here. ADR-049 §9 (authorized
+    // strengthening): the caller `execute_governance_action` now persists the
+    // whole post-finalize state via the deferred `ClassSCommitToken`'s
+    // FAIL-CLOSED `commit` (previously this was a best-effort persist), so the
+    // `executed_proposals` replay marker and every other finalize mutation are
+    // durable before the governance action is acknowledged. `state`, `deps`, and
+    // `context_id` remain used above (MLS-epoch / event-log append / cache).
 
     Ok(())
 }
@@ -4497,7 +4820,7 @@ pub fn finalize_governance_action(
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 #[instrument(skip_all, fields(context_id))]
 pub async fn execute_governance_action(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     // Identifier of the proposal to execute. The authoritative proposal is
@@ -4523,15 +4846,24 @@ pub async fn execute_governance_action(
     //   member" / ADR-051 §6.
     executor_did: Option<&DID>,
 ) -> Result<GovernanceActionResult, ContextError> {
+    // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
+    // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
+    // proposal status/context match, replay-marker presence) — read through the
+    // cell's `Deref` (`&*cell`), no mutation. The `executed_proposals`
+    // replay-marker WRITE below routes through the deferred-persist
+    // `begin_class_s` combinator; the downstream dispatch chain takes the cell
+    // directly.
+
     // PR #1606 C6 fail-close gate + atomically check replay AND mark as
     // executed before dispatch. Actor-owned state — single linear sequence.
-    check_commit_fault(state)?;
+    check_commit_fault(cell)?;
 
     // Resolve the authoritative proposal from the engine. Clone so the engine
-    // borrow is dropped before we mutate `state` below. A missing proposal
-    // means the caller referenced something the quorum-validated engine never
-    // retained — reject rather than trust caller-supplied data.
-    let proposal = state
+    // borrow (taken via the cell's `Deref`) is dropped before the Class-S
+    // replay-marker WRITE below. A missing proposal means the caller referenced
+    // something the quorum-validated engine never retained — reject rather than
+    // trust caller-supplied data.
+    let proposal = cell
         .governance
         .engine
         .get_proposal(proposal_id)
@@ -4565,7 +4897,10 @@ pub async fn execute_governance_action(
         )));
     }
 
-    if state
+    // Atomically check replay AND mark as executed before dispatch (the
+    // commit-fault gate already ran above). Actor-owned state — single linear
+    // sequence.
+    if cell
         .governance
         .class_s
         .executed_proposals
@@ -4576,38 +4911,63 @@ pub async fn execute_governance_action(
         ));
     }
     let now = deps.clock.now_secs();
-    state
-        .governance
-        .class_s
-        .executed_proposals
-        .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
-    state
-        .governance
-        .class_s
-        .executed_proposals
-        .insert(proposal.proposal_id, now);
 
     // Governance action costing: no PaidActionType::GovernanceAction
     // variant exists yet. Governance actions are free until the economy
     // spec adds a governance cost tier. Tracked by #1537.
 
+    // ADR-049 §9 Class S: route the `executed_proposals` replay-marker
+    // (retain TTL + insert) through the DEFERRED-persist combinator. The mark is
+    // applied in memory now; its fail-closed persist is DEFERRED until the
+    // dispatch + finalize either succeed (committed below) or abort (the marker
+    // is un-marked, then the removal is itself committed fail-closed —
+    // keep-direction: the replay window must be closed durably whichever way it
+    // resolves). The top `state` borrow has ended (NLL) so the cell is free for
+    // the combinator and the downstream dispatch chain.
+    let ((), token) = cell.begin_class_s(context_id, |mut view| {
+        let class_s = view.governance_class_s_mut();
+        class_s
+            .executed_proposals
+            .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
+        class_s.executed_proposals.insert(proposal.proposal_id, now);
+        Ok(())
+    })?;
+
     let result =
-        match dispatch_governance_action(state, deps, context_id, proposal, executor_did).await {
+        match dispatch_governance_action(cell, deps, context_id, proposal, executor_did).await {
             Ok(r) => r,
             Err(e) => {
-                // Roll back the executed marker on dispatch failure so the
-                // proposal can be retried (e.g. after a transient crypto
-                // error).
-                state
-                    .governance
-                    .class_s
-                    .executed_proposals
-                    .remove(&proposal.proposal_id);
+                // Roll back the executed marker on dispatch failure so the proposal
+                // can be retried (e.g. after a transient crypto error). The removal
+                // is itself a Class-S transition that must be durable fail-closed
+                // (keep-direction: a crash must not resurrect the marker and block
+                // the retry). It is staged through the deferred-persist token's own
+                // ClassSMut flow — `discharge_with` runs the removal closure
+                // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
+                // and then performs the SINGLE fail-closed persist the token already
+                // owed, so the removed-marker state is what lands durably (no
+                // `state_mut`, exactly one persist — the one the token deferred).
+                token.discharge_with(cell, deps, context_id, |mut view| {
+                    view.governance_class_s_mut()
+                        .executed_proposals
+                        .remove(&proposal.proposal_id);
+                    Ok(())
+                })?;
                 return Err(e);
             }
         };
 
-    finalize_governance_action(state, deps, context_id, proposal, executor_did)?;
+    // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
+    // own persist was best-effort; the executed-marker durability now rides the
+    // token's FAIL-CLOSED `commit` instead. `finalize_governance_action` is a
+    // Class-C body reached through the token's `discharge_with` ClassSMut view
+    // (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED by the SINGLE
+    // deferred persist the token owed — no whole-state `state_mut`. On a finalize
+    // error the persist STILL runs (keep-direction — the executed marker stays
+    // set and must persist) and `discharge_with` surfaces the finalize error.
+    token.discharge_with(cell, deps, context_id, |mut view| {
+        finalize_governance_action(view.rest_mut(), deps, context_id, proposal, executor_did)
+    })?;
 
     Ok(result)
 }
@@ -4615,6 +4975,26 @@ pub async fn execute_governance_action(
 // ---------------------------------------------------------------------------
 // try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
 // ---------------------------------------------------------------------------
+
+/// The three disjoint Class-C `&mut` fields
+/// [`try_broadcast_commit_or_enqueue`] mutates, threaded as ONE struct so the
+/// caller holds all three at once (they are distinct fields of
+/// [`PerContextState`], so the borrow checker accepts the simultaneous `&mut`).
+///
+/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast
+/// helper touches ONLY the MLS Commit retry queue (`pending_commits`), the
+/// queue-full fail-close marker (`commit_fault`), and the local receive buffer
+/// (`receive_buffer`). All three are Class-C / structural / best-effort (no
+/// fail-closed persist; see the function's doc), so the field-granular borrow is
+/// sound — there is no whole-state `&mut` and no reach to any Class-S sub-struct.
+pub struct CommitBroadcastBorrows<'a> {
+    /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
+    pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
+    /// `&mut` to the queue-full fail-close marker (Class-C / structural).
+    pub commit_fault: &'a mut Option<CommitFaultMarker>,
+    /// `&mut` to the local receive buffer (Class-C / structural).
+    pub receive_buffer: &'a mut ReceiveBuffer,
+}
 
 /// Attempts to broadcast an MLS Commit and, on transport failure,
 /// enqueues the commit in the persistent retry queue (PR #1606 C6).
@@ -4631,8 +5011,22 @@ pub async fn execute_governance_action(
 /// retry queue (or a `commit_fault` marker when the queue is full) rather
 /// than propagated. Dropping the durable commit-lifecycle appends removed the
 /// function's only `Result`-returning path.
+///
+/// # Field-granular borrows (ADR-049 §9)
+///
+/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut`
+/// fields it actually touches (`pending_commits`, `commit_fault`,
+/// `receive_buffer`) — rather than a whole `&mut PerContextState`. A cell holder
+/// supplies them from a non-persisting [`crate::context::actor::class_s::ClassCMut`]
+/// view (`view.commit_broadcast_borrows()`); a bare-`&mut state` caller supplies
+/// them by disjoint field borrow. All three fields are Class-C / structural and
+/// best-effort: the enqueue is a retry-queue bookkeeping insert, the
+/// `commit_fault` marker is the queue-full fail-close surfaced LOCALLY only
+/// (never a durable Merkle leaf — see the §9.9.3 note above), and the
+/// `receive_buffer` emit is a local `ContextEvent`. None requires a fail-closed
+/// persist, so the field-granular best-effort shape is sound.
 pub fn try_broadcast_commit_or_enqueue(
-    state: &mut PerContextState,
+    borrows: CommitBroadcastBorrows<'_>,
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
@@ -4641,6 +5035,11 @@ pub fn try_broadcast_commit_or_enqueue(
     if commit_bytes.is_empty() {
         return;
     }
+    let CommitBroadcastBorrows {
+        pending_commits,
+        commit_fault,
+        receive_buffer,
+    } = borrows;
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     match deps.transport.send_message(&routing_id, &commit_bytes) {
         Ok(()) => {}
@@ -4660,36 +5059,36 @@ pub fn try_broadcast_commit_or_enqueue(
             let label = operation.label();
 
             // N2: Cap the pending commits queue.
-            if state.pending_commits.len() >= MAX_PENDING_COMMITS {
-                state.commit_fault = Some(CommitFaultMarker {
+            if pending_commits.len() >= MAX_PENDING_COMMITS {
+                *commit_fault = Some(CommitFaultMarker {
                     operation: operation.clone(),
                     reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
                     retry_count: 1,
                     failed_at: now,
                 });
-                emit(
-                    state,
+                emit_event_into(
+                    receive_buffer,
                     ContextEvent::CommitBroadcastFailed {
                         operation: label,
                         reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
                         attempts: 1,
                     },
                     context_id,
-                    deps,
+                    deps.event_tx.as_ref(),
                 );
                 return;
             }
-            state.pending_commits.push_back(pending);
+            pending_commits.push_back(pending);
             let label_for_event = label.clone();
-            emit(
-                state,
+            emit_event_into(
+                receive_buffer,
                 ContextEvent::CommitBroadcastPending {
                     operation: label_for_event,
                     error: error_str.clone(),
                     attempt: 1,
                 },
                 context_id,
-                deps,
+                deps.event_tx.as_ref(),
             );
             tracing::warn!(
                 context_id = %context_id,
@@ -4882,10 +5281,15 @@ async fn tick_governance_timeout(
 /// abort handle is available to install before returning. Called from
 /// the actor handler for
 /// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask).
-pub async fn spawn_governance_timeout_task(state: &mut PerContextState, deps: &ActorDeps) {
+pub async fn spawn_governance_timeout_task(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+) {
     use crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
 
-    let context_id = state.handle.context_id().to_owned();
+    // Reads of the context id go through the cell's `Deref`; no whole-state
+    // `&mut` is taken across the spawn `.await`.
+    let context_id = cell.handle.context_id().to_owned();
     let supervisor = deps.supervisor.clone();
     let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
 
@@ -4911,8 +5315,15 @@ pub async fn spawn_governance_timeout_task(state: &mut PerContextState, deps: &A
     // cancel signal + abort handle on actor-owned state. In the degraded
     // no-task-set config `tracked_spawn` returns `None`; nothing to
     // install (matches the legacy `task_set_ref() == None` early-return).
+    // Coalesced: the timeout-task handle is Class-C / structural (a transient
+    // abort handle, not durable authorization state) — installed through the
+    // non-persisting Class-C view AFTER the spawn `.await` resolves, with no
+    // per-site persist injected.
     if let Some(abort) = deps.supervisor.tracked_spawn(loop_fut).await {
-        state.governance.timeout_task.install(cancel, abort);
+        cell.class_c_view()
+            .governance_class_c_mut()
+            .timeout_task_mut()
+            .install(cancel, abort);
     }
 }
 

@@ -442,9 +442,7 @@ mod tests {
 
 // The agent-binding live-pipeline tests live in their own file (the whole file
 // is `#![cfg(test)]`). The `mod` declaration is placed at the very END of this
-// module, after the trailing `#[cfg(test)] mod tests` block, so it is a
-// trailing column-0 test gate — nothing column-0 production follows it. This
-// keeps the ADR-049 §9 Class-S fail-closed scanner's trailing-test-module
-// cutoff unambiguous (see `scripts/check-class-s-fail-closed.sh`).
+// module, after the trailing `#[cfg(test)] mod tests` block, so all test-only
+// items sit together at the tail of the module.
 #[cfg(test)]
 mod agent_binding_pipeline_tests;

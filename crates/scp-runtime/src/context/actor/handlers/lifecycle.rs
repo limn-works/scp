@@ -72,17 +72,17 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `RevokeContextAccessKey`, `RestoreContextAccessKey`) call the
 /// actor-shape helpers in [`crate::context::queries_helpers`] (Phase
 /// 2A.10) directly on `&mut state` — no supervisor shim involved.
-pub async fn dispatch(
-    state: &mut PerContextState,
+pub(crate) async fn dispatch(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_actor_inner(state, deps, cmd)).await
+    Box::pin(dispatch_actor_inner(cell, deps, cmd)).await
 }
 
 #[allow(clippy::too_many_lines)]
 async fn dispatch_actor_inner(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -109,8 +109,12 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
+            // JoinContext reaches the spending-nonce path (`enforce_join_economy`)
+            // via `join_context`, so it is threaded the cell — as are the
+            // leave/close arms below, which route their member-removal /
+            // lifecycle-close fail-closed persists through the Class-S combinator.
             handle_join_context_actor(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -124,7 +128,7 @@ async fn dispatch_actor_inner(
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
             handle_leave_context_actor(
-                state,
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -136,14 +140,14 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context_actor(state, deps, p.context_id, p.params, p.initiator_did, reply)
+            handle_close_context_actor(cell, deps, p.context_id, p.params, p.initiator_did, reply)
                 .await
         }
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context_actor(state, deps, context_id, exporter_did, reply),
+        } => handle_export_context_actor(&*cell, deps, context_id, exporter_did, reply),
         LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
@@ -170,7 +174,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_generate_context_access_key_actor(
-            state,
+            cell,
             &context_id,
             &member_did,
             &caller_did,
@@ -182,7 +186,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_revoke_context_access_key_actor(
-            state,
+            cell,
             &context_id,
             &member_did,
             &caller_did,
@@ -194,22 +198,24 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_restore_context_access_key_actor(
-            state,
+            cell,
             &context_id,
             &member_did,
             &caller_did,
             reply,
         ),
         LifecycleCommand::FlushSnapshot { reply } => {
-            handle_flush_snapshot_actor(state, deps, reply)
+            handle_flush_snapshot_actor(&*cell, deps, reply)
         }
-        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(state, deps, reply),
-        LifecycleCommand::ReportBufferLen { reply } => handle_report_buffer_len_actor(state, reply),
+        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(&*cell, deps, reply),
+        LifecycleCommand::ReportBufferLen { reply } => {
+            handle_report_buffer_len_actor(&*cell, reply)
+        }
         LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
-            handle_clear_needs_reconnect_actor(state, &context_id, reply)
+            handle_clear_needs_reconnect_actor(cell, &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
-            handle_issue_mls_update_actor(state, deps, &context_id, reply)
+            handle_issue_mls_update_actor(cell, deps, &context_id, reply)
         }
     }
 }
@@ -220,7 +226,7 @@ async fn dispatch_actor_inner(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_join_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -240,7 +246,7 @@ async fn handle_join_context_actor(
     }
 
     let join_fut = crate::context::lifecycle_helpers::join_context(
-        state,
+        cell,
         deps,
         &handle,
         key_package,
@@ -268,7 +274,7 @@ async fn handle_join_context_actor(
 }
 
 async fn handle_leave_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -287,7 +293,7 @@ async fn handle_leave_context_actor(
     }
 
     let leave_fut = crate::context::lifecycle_helpers::leave_context(
-        state,
+        cell,
         deps,
         &handle,
         &caller_did,
@@ -314,7 +320,7 @@ async fn handle_leave_context_actor(
 }
 
 async fn handle_close_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     _params: scp_protocol::context::params::ContextParams,
@@ -335,10 +341,13 @@ async fn handle_close_context_actor(
     // reject with "context already exists" (the gate saw a live context).
     // The payload `params` is ignored: `state.handle` already carries the
     // authoritative creation-time params, and they are immutable.
-    let handle = state.handle.clone();
+    //
+    // `cell.handle.clone()` reads through the cell's `Deref` (the clone ends the
+    // borrow before the `&mut cell` close call below).
+    let handle = cell.handle.clone();
 
     let close_fut =
-        crate::context::lifecycle_helpers::close_context(state, deps, &handle, &initiator_did);
+        crate::context::lifecycle_helpers::close_context(cell, deps, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -384,14 +393,21 @@ fn handle_export_context_actor(
 // ---------------------------------------------------------------------------
 
 fn handle_generate_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation (the run loop persists on `mutated`): route the
+    // role/membership reads + access-key-store write through the non-persisting
+    // `class_c_view()`. The field-narrowed helper takes the `ClassCMut` view, so
+    // no whole-state `state_mut()` is taken.
     let result = crate::context::queries_helpers::generate_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -402,14 +418,18 @@ fn handle_generate_context_access_key_actor(
 }
 
 fn handle_revoke_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
     let result = crate::context::queries_helpers::revoke_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -420,14 +440,18 @@ fn handle_revoke_context_access_key_actor(
 }
 
 fn handle_restore_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
     let result = crate::context::queries_helpers::restore_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -624,11 +648,14 @@ fn handle_report_buffer_len_actor(
 /// Called by the reconnection driver after the six-phase protocol
 /// completes for a context. Synchronous; always replies `Ok(())`.
 fn handle_clear_needs_reconnect_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    crate::context::queries_helpers::clear_needs_reconnect(state);
+    // Field-narrowed Class-C mutation: clear `needs_reconnect` through the
+    // non-persisting `class_c_view().epoch_mut()` (coalesced persist via the run
+    // loop's `mutated` flag), not a whole-state `state_mut()`.
+    crate::context::queries_helpers::clear_needs_reconnect(cell.class_c_view().epoch_mut());
     tracing::debug!(
         context_id,
         "cleared needs_reconnect after reconnection (§23.11)"
@@ -647,7 +674,7 @@ fn handle_clear_needs_reconnect_actor(
 /// Commit bytes for the caller to distribute to all members. Used by the
 /// reconnection driver's Phase 5.
 fn handle_issue_mls_update_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
@@ -655,7 +682,8 @@ fn handle_issue_mls_update_actor(
     use crate::context::state::context_id_to_bytes;
 
     // Broadcast contexts have no MLS group — an Update is meaningless.
-    if state.broadcast_context.is_some() {
+    // Pure read via `Deref` on the cell.
+    if cell.broadcast_context.is_some() {
         let _ = reply.send(Err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate on broadcast context {context_id} — no MLS group to ratchet"
         ))));
@@ -670,9 +698,13 @@ fn handle_issue_mls_update_actor(
 
     // advance_epoch ratchets the supervisor-owned MLS group to a new
     // epoch; mirror the local epoch onto actor-owned state so a
-    // subsequent LocalMlsEpoch query reflects the advance.
+    // subsequent LocalMlsEpoch query reflects the advance. This is a
+    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
+    // routes through the non-persisting `class_c_view`.
     let mutated = if result.is_ok() {
-        state.epoch.mls_epoch = state.epoch.mls_epoch.saturating_add(1);
+        let mut view = cell.class_c_view();
+        let epoch = view.epoch_mut();
+        epoch.mls_epoch = epoch.mls_epoch.saturating_add(1);
         true
     } else {
         false

@@ -379,8 +379,19 @@ pub struct CapabilityCeiling {
     ///
     /// Serialized in a deterministic (content-sorted) order so the signed
     /// context-export digest is reproducible (§23.16.8, ADR-050).
+    ///
+    /// PRIVATE (`pub(crate)`) — ADR-049 §9: the ceiling is a downward-authorization
+    /// Class-S surface (a ceiling tightening that a coalesce-window rollback
+    /// re-widens silently re-grants authority the caller observed as narrowed).
+    /// Privatizing the backing set forces every cross-crate read through the
+    /// inspection methods ([`Self::contains`], [`Self::iter`], [`Self::intersect`],
+    /// [`Self::to_ucan_string_set`]) and every whole-ceiling WRITE through a named,
+    /// greppable mutator ([`ContextRoleState::set_ceiling`]) that lives only behind
+    /// a whole `&mut ContextRoleState` (post-migration, reachable only inside a
+    /// fail-closed-persisting combinator). No best-effort view exposes a `&mut` to
+    /// it.
     #[serde(with = "crate::serde_util::serde_sorted_set")]
-    pub capabilities: HashSet<Capability>,
+    pub(crate) capabilities: HashSet<Capability>,
 }
 
 impl CapabilityCeiling {
@@ -425,6 +436,43 @@ impl CapabilityCeiling {
     #[must_use]
     pub fn len(&self) -> usize {
         self.capabilities.len()
+    }
+
+    /// Iterates the capabilities permitted by this ceiling (read-only).
+    ///
+    /// Replaces direct `ceiling.capabilities.iter()` field access now that the
+    /// backing set is private (ADR-049 §9). A shared iterator cannot mutate the
+    /// downward-auth ceiling, so it raises no fail-closed obligation.
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.capabilities.iter()
+    }
+
+    /// Returns the set-intersection of this ceiling with `other` as a plain
+    /// capability set (read-only over both ceilings).
+    ///
+    /// Replaces direct `a.capabilities.intersection(&b.capabilities)` field
+    /// access (e.g. child-ceiling inheritance, §5.13.1) now that the backing set
+    /// is private (ADR-049 §9).
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> HashSet<Capability> {
+        self.capabilities
+            .intersection(&other.capabilities)
+            .cloned()
+            .collect()
+    }
+
+    /// TEST-ONLY mutable access to the backing capability set.
+    ///
+    /// Gated `#[cfg(any(test, feature = "testing"))]` — never compiled into a
+    /// production (non-`testing`) build. Used by determinism / canonicalization +
+    /// tamper-detection tests (including downstream `scp-runtime` export tests,
+    /// which enable `scp-protocol/testing`) that need to mutate the set in place.
+    /// Production ceiling writes go through [`ContextRoleState::set_ceiling`], which
+    /// replaces the WHOLE ceiling behind a fail-closed-persisting combinator
+    /// (ADR-049 §9).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn capabilities_mut(&mut self) -> &mut HashSet<Capability> {
+        &mut self.capabilities
     }
 
     /// Returns the capabilities as UCAN-formatted string names.
@@ -810,7 +858,16 @@ pub struct ContextRoleState {
     /// The DID of the context creator (UCAN root issuer).
     pub creator_did: String,
     /// The immutable capability ceiling.
-    pub ceiling: CapabilityCeiling,
+    ///
+    /// PRIVATE (`pub(crate)`) — ADR-049 §9 downward-authorization Class-S field. A
+    /// ceiling tightening that a coalesce-window rollback re-widens silently
+    /// re-grants authority the caller observed as narrowed. Cross-crate reads go
+    /// through [`Self::ceiling`]; the whole-ceiling WRITE goes through the named
+    /// [`Self::set_ceiling`] mutator (reachable only behind a whole
+    /// `&mut ContextRoleState`, which post-migration exists only inside a
+    /// fail-closed-persisting combinator). The Class-C role views expose `ceiling`
+    /// READ-ONLY.
+    pub(crate) ceiling: CapabilityCeiling,
     /// All role definitions (built-in and custom).
     pub role_definitions: HashMap<String, RoleDefinition>,
     /// Current role assignments: member DID -> assignment.
@@ -835,8 +892,21 @@ pub struct ContextRoleState {
     /// Each inner capability set is serialized in a deterministic
     /// (content-sorted) order so the signed context-export digest is
     /// reproducible (§23.16.8, ADR-050).
+    ///
+    /// PRIVATE (`pub(crate)`) — ADR-049 §9 downward-authorization Class-S field. A
+    /// suspension GROW that a coalesce-window rollback loses silently re-grants a
+    /// capability the caller observed as denied. Cross-crate reads go through
+    /// [`Self::suspended_for`]. The inherent GROW mutators
+    /// ([`Self::suspend_capabilities`], [`Self::suspend_all`]) are `pub`, so they are
+    /// reachable through ANY whole `&mut ContextRoleState` ("path B") AND via the
+    /// runtime's consequence-only role view; EITHER way the §9 obligation is on the
+    /// CALLER — persist the GROW fail-closed before ack (see those methods' docs).
+    /// The runtime's general-purpose FIELD-GRANULAR Class-C role view deliberately
+    /// exposes only the SHRINK-only [`Self::prune_suspensions_to_role_grants`] and a
+    /// read — no GROW accessor — so a GROW through THAT view is a compile error; the
+    /// privatization keeps OUTSIDE-CRATE code from writing the field directly.
     #[serde(default, with = "crate::serde_util::serde_sorted_set_map")]
-    pub suspended_capabilities: HashMap<String, HashSet<Capability>>,
+    pub(crate) suspended_capabilities: HashMap<String, HashSet<Capability>>,
 }
 
 impl ContextRoleState {
@@ -918,6 +988,28 @@ impl ContextRoleState {
         })
     }
 
+    /// Construct an EMPTY `ContextRoleState` skeleton (ADR-049 §9). `#[doc(hidden)]`
+    /// — a test-fixture constructor (the only callers are the actor test-state
+    /// builders), exposed `pub` rather than `#[cfg(test)]` so cross-crate test
+    /// fixtures can build the skeleton now that the fields are private. Production
+    /// construction goes through [`Self::new`] (which validates the ceiling / role
+    /// definitions and auto-assigns the creator to `admin`); this empty shape
+    /// touches no role logic and grants no authority.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn empty_for_test() -> Self {
+        Self {
+            context_id: String::new(),
+            creator_did: String::new(),
+            ceiling: CapabilityCeiling::new(std::iter::empty()),
+            role_definitions: HashMap::new(),
+            assignments: HashMap::new(),
+            members: HashSet::new(),
+            member_capabilities: HashMap::new(),
+            suspended_capabilities: HashMap::new(),
+        }
+    }
+
     /// Returns `true` if the given member has the specified capability.
     ///
     /// Suspension-aware: returns `false` if the capability is in the member's
@@ -942,6 +1034,20 @@ impl ContextRoleState {
     /// The capabilities are added to the member's suspended set. While
     /// suspended, `member_has_capability` returns `false` for these
     /// capabilities even if the member's role grants them.
+    ///
+    /// # §9 caller obligation (ADR-049 §9 — downward-auth GROW)
+    ///
+    /// This is a DOWNWARD-AUTHORIZATION GROW: it narrows a member's effective
+    /// authority, and a coalesce-window crash that rolled it back would silently
+    /// re-grant a capability the caller observed as denied. As an inherent `pub`
+    /// method it is reachable through ANY whole `&mut ContextRoleState` (this is
+    /// "path B" in the runtime's `class_s` module docs). The CALLER MUST persist the
+    /// resulting `suspended_capabilities` GROW **fail-closed before ack**: hold the
+    /// `&mut ContextRoleState` only inside a fail-closed-persisting combinator, or
+    /// use the consequence-only role view
+    /// (`scp_runtime::…::ConsequenceRoleStateMut`). Do NOT call this on a
+    /// best-effort / coalesced path — the runtime's field-granular best-effort role
+    /// view deliberately exposes no GROW accessor for exactly this reason.
     pub fn suspend_capabilities(
         &mut self,
         member_did: &str,
@@ -972,6 +1078,16 @@ impl ContextRoleState {
     ///
     /// Copies every capability from the member's current capability set into
     /// their suspended set. Equivalent to a full application-level block.
+    ///
+    /// # §9 caller obligation (ADR-049 §9 — downward-auth GROW)
+    ///
+    /// Like [`Self::suspend_capabilities`], this is a DOWNWARD-AUTHORIZATION GROW
+    /// reachable through any whole `&mut ContextRoleState` ("path B"). The CALLER
+    /// MUST persist the resulting `suspended_capabilities` GROW **fail-closed before
+    /// ack** (hold the `&mut` inside a fail-closed-persisting combinator, or use the
+    /// consequence-only role view); do NOT call it on a best-effort / coalesced
+    /// path, where a crash-window rollback would silently re-grant the blocked
+    /// member's authority.
     pub fn suspend_all(&mut self, member_did: &str) {
         if let Some(caps) = self.member_capabilities.get(member_did) {
             let all_caps: HashSet<Capability> = caps.clone();
@@ -1006,6 +1122,293 @@ impl ContextRoleState {
                 self.suspended_capabilities.remove(member_did);
             }
         }
+    }
+
+    /// Read-only access to the immutable capability ceiling (ADR-049 §9
+    /// downward-auth Class-S — the backing field is private). Replaces direct
+    /// `state.ceiling` field reads.
+    #[must_use]
+    pub const fn ceiling(&self) -> &CapabilityCeiling {
+        &self.ceiling
+    }
+
+    /// Replace the WHOLE capability ceiling (ADR-049 §9 downward-auth Class-S
+    /// mutator). NAMED and greppable: a ceiling modification is a
+    /// downward-authorization transition (§5.3.2) that, in the runtime, runs only
+    /// behind a whole `&mut ContextRoleState` inside a fail-closed-persisting
+    /// combinator — there is no `set_ceiling` on any best-effort role view. A
+    /// coalesce-window rollback of a ceiling tightening would silently re-widen the
+    /// authorization envelope, which is why the WRITE is centralized here rather
+    /// than via a public field.
+    pub fn set_ceiling(&mut self, ceiling: CapabilityCeiling) {
+        self.ceiling = ceiling;
+    }
+
+    /// TEST-ONLY mutable access to the ceiling (ADR-049 §9). Gated
+    /// `#[cfg(any(test, feature = "testing"))]` — never compiled into a production
+    /// build. Used by downstream tamper-detection tests (e.g. `scp-runtime`'s
+    /// export tests, which enable `scp-protocol/testing`) that forge a ceiling
+    /// mutation in a signed snapshot. Production code replaces the whole ceiling
+    /// via [`Self::set_ceiling`] behind a fail-closed-persisting combinator.
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn ceiling_mut(&mut self) -> &mut CapabilityCeiling {
+        &mut self.ceiling
+    }
+
+    /// Read-only access to a member's suspended-capability set, if any (ADR-049 §9
+    /// downward-auth Class-S — the backing map is private). Replaces direct
+    /// `state.suspended_capabilities.get(member_did)` reads.
+    #[must_use]
+    pub fn suspended_for(&self, member_did: &str) -> Option<&HashSet<Capability>> {
+        self.suspended_capabilities.get(member_did)
+    }
+
+    /// Mint and structurally apply a system-level role assignment over `self`
+    /// (consequence-engine / membership path). Inherent-method form of the
+    /// [`system_assign_role`] free function — operating on `self.*` so a
+    /// field-granular role view can forward to it without a whole `&mut`
+    /// `ContextRoleState`.
+    ///
+    /// Bypasses the `RoleAssign` capability check (the governance consequence
+    /// engine must be able to demote regardless of who holds `RoleAssign`). The
+    /// `member_capabilities` REPLACEMENT it performs is a downward-auth shrink on a
+    /// demotion (ADR-049 §9) — the caller persists fail-closed when used on the
+    /// consequence path; the SHRINK-only suspension prune it runs rolls back in
+    /// lockstep with that same persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleError::MemberNotInContext`] if the member is not in the
+    /// context, or [`RoleError::RoleNotFound`] if the role doesn't exist.
+    pub fn system_assign_role(
+        &mut self,
+        member_did: &str,
+        role_name: &str,
+        clock: &dyn Clock,
+    ) -> Result<Vec<UcanToken>, RoleError> {
+        // 1. Verify member is in the context.
+        if !self.members.contains(member_did) {
+            return Err(RoleError::MemberNotInContext(member_did.to_owned()));
+        }
+
+        // 2. Look up the role definition.
+        let role_def = self
+            .role_definitions
+            .get(role_name)
+            .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
+            .clone();
+
+        // 2a. Mint-time ceiling enforcement (spec §7.2.1 step 8 — "the same
+        // all-attestations rule applies at mint time"). EVERY capability in the
+        // role definition must be within the context's immutable ceiling before
+        // any token is minted, even on the system path. Mirrors the gate-local
+        // re-check in `assign_role`.
+        validate_role_definition(&role_def, &self.ceiling)?;
+
+        // 3. Mint UCAN tokens for each capability in the role.
+        let tokens = mint_role_tokens(
+            &self.context_id,
+            &self.creator_did,
+            member_did,
+            &role_def,
+            clock,
+        );
+
+        // 4. Update state: replace any previous assignment.
+        let assignment = RoleAssignment {
+            member_did: member_did.to_owned(),
+            role_name: role_name.to_owned(),
+            tokens: tokens.clone(),
+        };
+        self.assignments.insert(member_did.to_owned(), assignment);
+        self.member_capabilities
+            .insert(member_did.to_owned(), role_def.capabilities.clone());
+
+        // Same prune-suspensions-to-role-grants invariant as `assign_role` —
+        // system-level reassignment must also clean up stale suspensions so a
+        // consequence-engine-triggered demotion cannot leave dangling entries for
+        // capabilities the demoted role no longer grants.
+        self.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
+
+        Ok(tokens)
+    }
+
+    /// Destructure `self` into DISJOINT field references for the cross-crate
+    /// field-granular role views (ADR-049 §9). The downward-auth `ceiling` is
+    /// handed out SHARED `&` (read-only); the suspended-capability map is handed
+    /// out `&mut` ONLY so the holder can run the SHRINK-only prune (the GROW
+    /// methods live on the consequence-only view that owns a fail-closed persist).
+    /// `context_id` / `creator_did` are stable structural identity, shared `&`.
+    ///
+    /// This single destructure is what lets `scp-runtime` build the field-granular
+    /// `RoleStateClassCMut` / consequence role view WITHOUT naming the private
+    /// fields from outside this crate — the seam that admits the privatization of
+    /// `ceiling` / `suspended_capabilities`.
+    pub fn class_c_parts(&mut self) -> ContextRoleClassCParts<'_> {
+        let Self {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        } = self;
+        ContextRoleClassCParts {
+            context_id,
+            creator_did,
+            ceiling,
+            role_definitions,
+            assignments,
+            members,
+            member_capabilities,
+            suspended_capabilities,
+        }
+    }
+}
+
+/// DISJOINT field references over a [`ContextRoleState`], the cross-crate seam
+/// for `scp-runtime`'s field-granular Class-C / consequence role views
+/// (ADR-049 §9).
+///
+/// Produced by [`ContextRoleState::class_c_parts`]. The downward-authorization
+/// `ceiling` is exposed SHARED `&` (read-only); the structural Class-C fields are
+/// `&mut`; the per-member suspension map is `&mut` so the consumer can run the
+/// SHRINK-only prune or (on the consequence-only view) a GROW. Because the
+/// individual references are disjoint, the consumer can hold a read of `ceiling`
+/// while writing the structural fields in one borrow.
+///
+/// # Seam contract — confinement is the CONSUMING VIEW's responsibility
+///
+/// This struct is intentionally NOT self-protecting: its fields are RAW `&mut`
+/// (including the downward-auth `suspended_capabilities`, and `member_capabilities`
+/// which is an authorization input). It does NOT itself enforce the §9
+/// shrink/GROW-only narrowing — it is the disjoint-borrow PRIMITIVE, and the
+/// confinement (no GROW accessor, SHRINK-only prune, fail-closed persist) is built
+/// by the CONSUMING `scp-runtime` view that wraps it
+/// (`RoleStateClassCMut` for best-effort, `ConsequenceRoleStateMut` for the
+/// fail-closed consequence path). Today the SOLE consumers are those two runtime
+/// views (plus this struct's own `system_assign_role` / SHRINK-only prune helpers).
+/// A FUTURE second consumer MUST NOT assume the seam narrows anything for it: it has
+/// to apply the same §9 discipline (expose no unpersisted downward-auth GROW; route
+/// any `suspended_capabilities` / `member_capabilities` shrink through a fail-closed
+/// persist). A full structural seal of this parts struct is deliberately out of
+/// scope (single consumer set; sealing it would fight the disjoint-borrow ergonomics
+/// it exists to provide).
+///
+/// ACCEPTED RESIDUAL (ADR-049 §9): both [`ContextRoleState::class_c_parts`] and
+/// these `pub` raw `&mut` fields are `pub` (NOT `pub(crate)`) because `scp-runtime`
+/// constructs the views CROSS-CRATE and must name them. That `pub` surface is
+/// §9-safe NOT by access modifier but by REACHABILITY: producing a
+/// `ContextRoleClassCParts` requires a `&mut ContextRoleState`, and in the actor
+/// the only `&mut ContextRoleState` is reached through `ClassSCell` — which has NO
+/// `DerefMut` and holds the role state behind PRIVATE fields, so no caller outside
+/// the runtime's fail-closed view layer can obtain the `&mut` needed to call
+/// `class_c_parts` in the first place. Tightening `class_c_parts` to `pub(crate)`
+/// is therefore both impossible (cross-crate consumer) AND unnecessary (the cell's
+/// `!DerefMut` + private fields already block the reach). The residual a maintainer
+/// would have to introduce — a NEW production `&mut ContextRoleState` source outside
+/// a fail-closed combinator — is an in-file-insider action, a code-review
+/// responsibility.
+pub struct ContextRoleClassCParts<'a> {
+    /// Shared `&` to the context identifier (structural identity, stable).
+    pub context_id: &'a str,
+    /// Shared `&` to the creator DID (structural identity, stable).
+    pub creator_did: &'a str,
+    /// Shared `&` to the immutable capability ceiling — DOWNWARD-AUTH Class-S,
+    /// read-only (ceiling modifications are fail-closed governance, §5.3.2).
+    pub ceiling: &'a CapabilityCeiling,
+    /// `&mut` to all role definitions (Class-C / structural).
+    pub role_definitions: &'a mut HashMap<String, RoleDefinition>,
+    /// `&mut` to the current role assignments (Class-C / structural).
+    pub assignments: &'a mut HashMap<String, RoleAssignment>,
+    /// `&mut` to the member DID set (Class-C / structural).
+    pub members: &'a mut HashSet<String>,
+    /// `&mut` to the per-member GRANTED capability sets. An authorization input
+    /// (`member_has_capability` reads it), so a downward SHRINK is itself a §9
+    /// hazard — the consuming view restricts how this is written (the runtime's
+    /// best-effort role view exposes it READ-ONLY + a `system_assign_role` replace;
+    /// a DEMOTION goes through the fail-closed consequence view).
+    pub member_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
+    /// `&mut` to the per-member suspension map. DOWNWARD-AUTH Class-S. This RAW
+    /// `&mut` does not itself confine anything: the consuming runtime view decides
+    /// the surface — the general-purpose `RoleStateClassCMut` exposes only the
+    /// SHRINK-only prune + a read (no GROW accessor), while the consequence-only
+    /// `ConsequenceRoleStateMut` exposes the GROW (persisted fail-closed by its
+    /// caller). The inherent `pub` `ContextRoleState::suspend_*` GROW is also
+    /// reachable through a whole `&mut` ("path B"), persisted fail-closed by its
+    /// combinator. Confinement is the consuming view's responsibility (see the type
+    /// doc's seam contract).
+    pub suspended_capabilities: &'a mut HashMap<String, HashSet<Capability>>,
+}
+
+impl ContextRoleClassCParts<'_> {
+    /// SHRINK-only prune of a member's suspensions to the capabilities the
+    /// `new_role_capabilities` set still grants (ADR-049 §9). Operates over the
+    /// disjoint `suspended_capabilities` ref; can only REMOVE entries.
+    pub fn prune_suspensions_to_role_grants(
+        &mut self,
+        member_did: &str,
+        new_role_capabilities: &HashSet<Capability>,
+    ) {
+        if let Some(suspended) = self.suspended_capabilities.get_mut(member_did) {
+            suspended.retain(|cap| new_role_capabilities.contains(cap));
+            if suspended.is_empty() {
+                self.suspended_capabilities.remove(member_did);
+            }
+        }
+    }
+
+    /// Mint + structurally apply a system-level role assignment over the disjoint
+    /// field references (ADR-049 §9). The token-minting logic stays inside
+    /// `scp-protocol` (it needs the private `mint_role_tokens`); the runtime
+    /// field-granular role views delegate here so they need no whole
+    /// `&mut ContextRoleState`. Reads `context_id` / `creator_did` /
+    /// `role_definitions` shared; writes `assignments` / `member_capabilities`;
+    /// runs the SHRINK-only suspension prune.
+    ///
+    /// # Errors
+    ///
+    /// [`RoleError::MemberNotInContext`] if the member is absent;
+    /// [`RoleError::RoleNotFound`] if the role is undefined.
+    pub fn system_assign_role(
+        &mut self,
+        member_did: &str,
+        role_name: &str,
+        clock: &dyn Clock,
+    ) -> Result<Vec<UcanToken>, RoleError> {
+        if !self.members.contains(member_did) {
+            return Err(RoleError::MemberNotInContext(member_did.to_owned()));
+        }
+        let role_def = self
+            .role_definitions
+            .get(role_name)
+            .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
+            .clone();
+        // Mint-time ceiling enforcement (spec §7.2.1 step 8): every capability in
+        // the role definition must be within the immutable ceiling before any
+        // token is minted, even on this field-granular system path.
+        validate_role_definition(&role_def, self.ceiling)?;
+        let tokens = mint_role_tokens(
+            self.context_id,
+            self.creator_did,
+            member_did,
+            &role_def,
+            clock,
+        );
+        self.assignments.insert(
+            member_did.to_owned(),
+            RoleAssignment {
+                member_did: member_did.to_owned(),
+                role_name: role_name.to_owned(),
+                tokens: tokens.clone(),
+            },
+        );
+        self.member_capabilities
+            .insert(member_did.to_owned(), role_def.capabilities.clone());
+        self.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
+        Ok(tokens)
     }
 }
 
@@ -1118,53 +1521,13 @@ pub fn system_assign_role(
     role_name: &str,
     clock: &dyn Clock,
 ) -> Result<Vec<UcanToken>, RoleError> {
-    // 1. Verify member is in the context.
-    if !state.members.contains(member_did) {
-        return Err(RoleError::MemberNotInContext(member_did.to_owned()));
-    }
-
-    // 2. Look up the role definition.
-    let role_def = state
-        .role_definitions
-        .get(role_name)
-        .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
-        .clone();
-
-    // 2a. Mint-time ceiling enforcement (spec §7.2.1 step 8 — "the same
-    // all-attestations rule applies at mint time"). EVERY capability in the
-    // role definition must be within the context's immutable ceiling before any
-    // token is minted, even on the system path. Mirrors the gate-local re-check
-    // in `assign_role`.
-    validate_role_definition(&role_def, &state.ceiling)?;
-
-    // 3. Mint UCAN tokens for each capability in the role.
-    let tokens = mint_role_tokens(
-        &state.context_id,
-        &state.creator_did,
-        member_did,
-        &role_def,
-        clock,
-    );
-
-    // 4. Update state: replace any previous assignment.
-    let assignment = RoleAssignment {
-        member_did: member_did.to_owned(),
-        role_name: role_name.to_owned(),
-        tokens: tokens.clone(),
-    };
-    state.assignments.insert(member_did.to_owned(), assignment);
-    state
-        .member_capabilities
-        .insert(member_did.to_owned(), role_def.capabilities.clone());
-
-    // Same prune-suspensions-to-role-grants invariant as
-    // `assign_role` — system-level reassignment must also clean up
-    // stale suspensions so a consequence-engine-triggered demotion
-    // cannot leave dangling entries for capabilities the demoted
-    // role no longer grants.
-    state.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
-
-    Ok(tokens)
+    // Thin forwarder to the inherent method (ADR-049 §9): the body lives on
+    // `ContextRoleState::system_assign_role` so a field-granular role view can
+    // mint a role over its own disjoint fields without a whole `&mut`. Retained
+    // `pub` (not removed) because `scp-runtime` and tests still call the free form.
+    // Mint-time ceiling enforcement (spec §7.2.1 step 8) now lives inside that
+    // inherent method, so the forwarder inherits it.
+    state.system_assign_role(member_did, role_name, clock)
 }
 
 // ---------------------------------------------------------------------------

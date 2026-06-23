@@ -3,13 +3,17 @@
 //! in ADR-049 commit 12.
 
 use scp_identity::DID;
-use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
+use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
-use scp_protocol::context::roles;
-use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
 
-use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_event_into};
+use super::actor::class_s::{ClassSCommitToken, ConsequenceRoleStateMut};
+// Re-export the consequence split (defined in `class_s`) for the consequence
+// callers that reach it via this module's path. `pub(in crate::context)` matches
+// the type's `pub(crate)` effective reach within the context module tree without
+// tripping `redundant_pub_crate` (the module itself is private to `context`).
+pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
+use super::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
@@ -80,44 +84,20 @@ fn append_consequence_event(
     }
 }
 
-/// Field-disjoint mutable borrows of the per-context state needed by
-/// the consequence-enforcement chain.
-///
-/// Both [`super::state::PerContextState`] (legacy) and
-/// [`crate::context::actor::state::PerContextState`] (actor) implement
-/// the same `governance: GovernanceState`, `role_state: ContextRoleState`,
-/// `membership: MembershipState`, `receive_buffer: ReceiveBuffer`, and
-/// `checkpoint_events_since: u64` fields with identical types. Splitting
-/// the borrows here lets the enforcement helpers stay generic over the
-/// parent state struct while preserving Rust's ability to disjointly
-/// borrow each subfield (a single trait method returning `&mut Self`
-/// would block the multiple mutable borrows the body actually needs).
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can drive the same enforcement pipeline as the legacy
-/// `&Supervisor`-shape `messaging_helpers_legacy` without duplicating
-/// the ~300 lines of consequence dispatch + escalation logic.
-pub struct ConsequenceStateSplit<'a> {
-    pub governance: &'a mut GovernanceState,
-    pub role_state: &'a mut ContextRoleState,
-    pub membership: &'a MembershipState,
-    pub receive_buffer: &'a mut ReceiveBuffer,
-    pub checkpoint_events_since: &'a mut u64,
-}
-
-impl<'a> ConsequenceStateSplit<'a> {
-    /// Build a split-borrow from the unified [`PerContextState`]
-    /// (ADR-049 §Decision 1 — single `PerContextState`).
-    pub const fn from_state(ctx: &'a mut PerContextState) -> Self {
-        Self {
-            governance: &mut ctx.governance,
-            role_state: &mut ctx.role_state,
-            membership: &ctx.membership,
-            receive_buffer: &mut ctx.receive_buffer,
-            checkpoint_events_since: &mut ctx.checkpoint_events_since,
-        }
-    }
-}
+// `ConsequenceStateSplit` (the consequence-engine split) is DEFINED in
+// `super::actor::class_s` and RE-EXPORTED here (`use` above). It is its own
+// struct — NOT an alias of `ClassCSplit` (ADR-049 §9 / RED-CS3 / R1): its
+// `role_state` is the consequence-only `ConsequenceRoleStateMut`, the one role
+// view that exposes the downward-authorization GROW mutators
+// (`suspend_capabilities` / `suspend_all`) and the demotion (`system_assign_role`).
+// Best-effort callers receive `ClassCSplit` (via `ClassCMut::split_class_c`),
+// whose `RoleStateClassCMut` has NO GROW, so a best-effort downward-auth GROW with
+// no fail-closed persist is a COMPILE error by construction (BLACK-CS-03 closed).
+// The consequence sites build this split via `ClassCMut::consequence_split` (cell
+// path) or `ConsequenceStateSplit::from_state` (cell-free governance-helper path);
+// the cell-holding caller persists any applied GROW / demotion FAIL-CLOSED before
+// acking — `enforce_triggered_consequences` returns the downward-auth flag it acts
+// on (RED-CS3).
 
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
 /// providers, scope identifiers, and pre-evaluated rule data into one
@@ -173,32 +153,87 @@ pub struct EnforceConsequencesCtx<'a> {
 /// `checkpoint_events_since` counter is incremented only when a durable leaf is
 /// actually appended, so it matches the true durable-leaf count (a §9.9.3
 /// checkpoint-position drift otherwise).
+///
+/// **Downward-authorization fail-closed contract (ADR-049 §9, RED-CS3):** the
+/// `obligation` sink is ARMED (populated with a [`ClassSCommitToken`]) iff at
+/// least one triggered consequence performed a **downward-authorization
+/// mutation** that reduced a member's effective authority (`member_has_capability`
+/// = `member_capabilities` − `suspended_capabilities`). There are TWO such
+/// mutations and the sink covers BOTH: (1) a `suspended_capabilities` GROW
+/// (`suspend_capabilities` / `suspend_all`, i.e. `SuspendCapability` /
+/// `SuspendAccess` / the H10 `SuspendAll` escalation), and (2) an `AssignRole`
+/// `member_capabilities` REPLACEMENT (`system_assign_role`) — a demotion shrinks
+/// the member's granted set. The arming is done BY the GROW methods themselves
+/// (each takes the same `&mut Option<ClassSCommitToken>` sink as a required
+/// parameter — GAP-A closed), so a downward-auth mutation cannot be applied
+/// WITHOUT arming the owed persist. EVALUATION itself (cooldowns, velocity ticks,
+/// event emission, the `checkpoint_events_since` bump, durable Merkle appends)
+/// stays best-effort / coalesced — it is the hot per-message path and is NOT
+/// persisted synchronously here. Only the rare downward-auth OUTCOME must be
+/// durable fail-closed before the actor acks, because a coalesce-window crash
+/// would otherwise restore the pre-mutation role state and silently re-grant the
+/// removed authority. The in-memory mutation is applied here; the cell-holding
+/// caller, after the borrowing view drops, discharges any populated sink with a
+/// fail-closed persist of the already-mutated state (keep-direction: the
+/// suspension / demotion STAYS on persist failure). When the sink stays `None`,
+/// no downward-auth transition occurred and the caller's ordinary coalesced
+/// persist is sufficient.
+///
+/// The returned `bool` mirrors whether the sink was armed (the RED-CS3b
+/// engine-level downward-auth signal); it is retained for callers / tests that
+/// observe the signal directly, but the obligation arming itself is now carried by
+/// the sink, not by the caller reacting to the return value.
+#[must_use]
 pub fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-) {
+    obligation: &mut Option<ClassSCommitToken>,
+) -> bool {
     let context_id_bytes = context_id_to_bytes(args.context_id);
+    let mut downward_auth_applied = false;
     for consequence in args.triggered {
-        process_one_triggered_consequence(state, args, &context_id_bytes, consequence);
+        downward_auth_applied |= process_one_triggered_consequence(
+            state,
+            args,
+            &context_id_bytes,
+            consequence,
+            obligation,
+        );
     }
+    downward_auth_applied
 }
 
 /// Single-consequence body of [`enforce_triggered_consequences`].
 /// Extracted so the public function stays under `clippy::too_many_lines`.
+///
+/// Returns `true` iff THIS consequence performed a downward-authorization
+/// mutation owing a fail-closed persist (ADR-049 §9): a `suspended_capabilities`
+/// GROW (the success-path `SuspendCapability` / `SuspendAccess`, or the H10
+/// failure escalation to `SuspendAll`) OR an `AssignRole` `member_capabilities`
+/// replacement (a demotion shrinks the member's effective authority). The caller
+/// OR-accumulates this across the triggered set to decide whether a fail-closed
+/// persist of the already-mutated state is owed.
 fn process_one_triggered_consequence(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
-) {
+    obligation: &mut Option<ClassSCommitToken>,
+) -> bool {
     let member_did = args.member_did;
     let now = args.now;
 
-    // Cooldown tracking: skip if this rule fired within its window.
-    if let Some(&last_fired) = state.governance.cooldown_until.get(&consequence.rule_index)
+    // Cooldown tracking: skip if this rule fired within its window. The cooldown
+    // map is a Class-C governance field reached through the field-granular
+    // `GovernanceClassCMut` accessor (the view holds no whole `&mut GovernanceState`
+    // and cannot reach `governance.class_s`).
+    if let Some(&last_fired) = state
+        .governance
+        .cooldown_until_mut()
+        .get(&consequence.rule_index)
         && now < last_fired
     {
-        return;
+        return false;
     }
 
     // TOCTOU/ghost guard: skip entirely if the member is absent AND
@@ -211,7 +246,7 @@ fn process_one_triggered_consequence(
             member = %member_did,
             "skipping consequence: ghost DID with no evidence"
         );
-        return;
+        return false;
     }
 
     let action_type = consequence_action_type(&consequence.action);
@@ -259,33 +294,40 @@ fn process_one_triggered_consequence(
             action_type,
             durable,
         );
-        return;
+        return false;
     }
 
-    let success = dispatch_enforcement_action(
-        state.role_state,
+    let enforcement = dispatch_enforcement_action(
+        &mut state.role_state,
         member_did,
         consequence,
         args.clock,
         args.context_id,
+        obligation,
     );
 
-    if !success {
+    if !enforcement.success {
         emit_failure_escalation(
             state,
             args,
-            context_id_bytes,
             consequence,
             &trigger_kind,
             action_type,
             durable,
+            obligation,
         );
-        return; // skip cooldown recording — failed action doesn't count
+        // The H10 escalation unconditionally applies `suspend_all` (a Class-S
+        // `suspended_capabilities` mutation), so this path always owes a
+        // fail-closed persist regardless of which action originally failed.
+        return true; // skip cooldown recording — failed action doesn't count
     }
 
-    // Record cooldown: prevent re-firing within the rule's window.
+    // Record cooldown: prevent re-firing within the rule's window. Written
+    // through the field-granular `GovernanceClassCMut` accessor (Class-C; a
+    // coalesce-window rollback of a cooldown tick is acceptable — it is not a
+    // Class-S replay/authorization witness).
     if let Some(rule) = args.rules.get(consequence.rule_index) {
-        state.governance.cooldown_until.insert(
+        state.governance.cooldown_until_mut().insert(
             consequence.rule_index,
             now.saturating_add(rule.window.as_secs()),
         );
@@ -300,6 +342,15 @@ fn process_one_triggered_consequence(
         action_type,
         durable,
     );
+
+    // `true` iff this successful action reduced the member's effective authority
+    // and therefore owes a fail-closed persist (ADR-049 §9): a
+    // `suspended_capabilities` GROW (`SuspendCapability` / `SuspendAccess`) OR an
+    // `AssignRole` `member_capabilities` REPLACEMENT. `member_capabilities` is an
+    // authorization input — an `AssignRole` demotion is a downward-auth change, NOT
+    // a coalesce-safe "structural role state" mutation, which is exactly the
+    // misconception that left an earlier demotion-rollback window open.
+    enforcement.downward_auth
 }
 
 /// Emits a `ConsequenceTriggered` event. When `durable`, appends the durable
@@ -424,27 +475,89 @@ fn emit_consequence_enforced_success(
     emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
 }
 
+/// Outcome of a single [`dispatch_enforcement_action`] call.
+///
+/// `success` is the pre-existing enforced/failed signal that gates the H10
+/// escalation and cooldown recording. `downward_auth` is the ADR-049 §9
+/// signal: `true` iff the action REDUCED the member's effective authority and
+/// therefore owes a fail-closed persist before the actor acks.
+///
+/// "Effective authority" is `member_has_capability` =
+/// `member_capabilities` − `suspended_capabilities`. There are TWO ways an
+/// enforcement action shrinks it, and `downward_auth` covers BOTH:
+///
+/// 1. **`suspended_capabilities` GROW** — `suspend_capabilities` / `suspend_all`
+///    add to the denied set. This is the capability-suspension direction
+///    (`SuspendCapability` with a non-empty set, `SuspendAccess`, and the H10
+///    `SuspendAll` escalation).
+/// 2. **`member_capabilities` REPLACEMENT** — `AssignRole` →
+///    [`roles::system_assign_role`] REPLACES `member_capabilities[member]` with
+///    the new role's capability set (roles.rs `system_assign_role`). On a
+///    DEMOTION (e.g. admin→member) this is a downward-auth shrink: the member
+///    loses capabilities they previously held.
+///
+/// A coalesce-window crash (the ~50ms `COALESCE_INTERVAL` best-effort persist)
+/// would restore the pre-mutation role state from the snapshot, silently
+/// re-granting the just-removed authority. So any action in either category
+/// MUST be persisted fail-closed (keep-direction). `downward_auth` is the flag
+/// the caller OR-accumulates to decide between the fail-closed persist (when
+/// any `true`) and the ordinary coalesced persist (when all `false`).
+///
+/// The two fields are distinct: an empty `SuspendCapability` neither succeeds
+/// nor reduces authority (`success: false`, `downward_auth: false`), while an
+/// `AssignRole` always owes a fail-closed persist (`downward_auth: true`)
+/// because over-persisting a promotion is harmless (a coalesce-loss of a
+/// promotion is upward — the member temporarily lacks a capability they will
+/// regain, the safe direction).
+struct EnforcementOutcome {
+    /// Whether the action was enforced (vs. failed → H10 escalation).
+    success: bool,
+    /// Whether the action reduced the member's effective authority (a
+    /// `suspended_capabilities` GROW or a `member_capabilities` replacement),
+    /// and therefore owes a fail-closed persist (ADR-049 §9).
+    downward_auth: bool,
+}
+
 /// Per-arm enforcement dispatch. Each match arm calls a named function as
 /// an `expression_statement` so the pipeline wiring gates can detect the
 /// `call_expression` per-variant.
 fn dispatch_enforcement_action(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     consequence: &TriggeredConsequence,
     clock: &dyn scp_primitives::Clock,
     context_id: &str,
-) -> bool {
+    obligation: &mut Option<ClassSCommitToken>,
+) -> EnforcementOutcome {
     match &consequence.action {
         scp_protocol::trust::consequence::ConsequenceAction::Enforcement(severity) => {
             use scp_protocol::trust::consequence::EnforcementSeverity;
             match severity {
                 EnforcementSeverity::SuspendCapability { capabilities } => {
-                    enforce_suspend(role_state, member_did, capabilities)
+                    // A non-empty suspend GROWS `suspended_capabilities`
+                    // (success ⟺ downward_auth here); an empty set does neither.
+                    // The GROW method arms `obligation` on a real mutation.
+                    let suspended = enforce_suspend(
+                        role_state,
+                        member_did,
+                        capabilities,
+                        obligation,
+                        context_id,
+                    );
+                    EnforcementOutcome {
+                        success: suspended,
+                        downward_auth: suspended,
+                    }
                 }
                 EnforcementSeverity::SuspendAccess => {
-                    // SuspendAccess: suspend all capabilities via role_state.
-                    role_state.suspend_all(member_did.as_ref());
-                    true
+                    // SuspendAccess: suspend all capabilities via role_state — a
+                    // `suspended_capabilities` GROW, so it is downward-auth. The
+                    // GROW method arms `obligation` when it inserts a suspension.
+                    role_state.suspend_all(member_did.as_ref(), obligation, context_id);
+                    EnforcementOutcome {
+                        success: true,
+                        downward_auth: true,
+                    }
                 }
                 EnforcementSeverity::RevokeAccess { .. }
                 | EnforcementSeverity::RemoveMember { .. } => {
@@ -459,12 +572,37 @@ fn dispatch_enforcement_action(
                         "RevokeAccess/RemoveMember reached consequence dispatch; \
                          this should have been rejected at validation time"
                     );
-                    false
+                    EnforcementOutcome {
+                        success: false,
+                        downward_auth: false,
+                    }
                 }
             }
         }
         scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
-            enforce_assign_role(role_state, member_did, to_role, clock)
+            // AssignRole → `system_assign_role` REPLACES
+            // `member_capabilities[member]` with the new role's capability set
+            // (roles.rs `system_assign_role`). On a DEMOTION (e.g. admin→member)
+            // this is a downward-auth SHRINK of the member's effective authority
+            // (`member_has_capability` = `member_capabilities` −
+            // `suspended_capabilities`), so it MUST be persisted fail-closed: a
+            // coalesce-window crash would restore the pre-demotion (HIGHER)
+            // `member_capabilities` from the snapshot and silently re-grant the
+            // removed authority. `downward_auth: true` UNCONDITIONALLY is both
+            // correct and the simplest correct option — over-persisting a
+            // PROMOTION is harmless: a coalesce-loss of a promotion is upward
+            // (the member temporarily lacks a capability they will regain, the
+            // safe direction). We deliberately do NOT diff capability sets to
+            // detect demotion-vs-promotion; unconditional `true` is sound and
+            // simpler. (The SHRINK-only `prune_suspensions_to_role_grants` that
+            // `system_assign_role` also runs is incidental — it rolls back in
+            // lockstep with the same-persist `member_capabilities` replacement.)
+            EnforcementOutcome {
+                success: enforce_assign_role(
+                    role_state, member_did, to_role, clock, obligation, context_id,
+                ),
+                downward_auth: true,
+            }
         }
     }
 }
@@ -479,15 +617,27 @@ fn dispatch_enforcement_action(
 /// With the B1 unification, capabilities are typed [`Capability`] values
 /// (no string parsing needed). The previous string-based
 /// `parse_suspension_capability` round-trip is eliminated.
+///
+/// Returns `true` iff it actually mutated `suspended_capabilities` (a non-empty
+/// `caps`); an empty `caps` is a no-op and returns `false`. This doubles as the
+/// downward-auth fail-closed signal (ADR-049 §9): a mutation owes a fail-closed
+/// persist, a no-op does not.
 fn enforce_suspend(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     caps: &[Capability],
+    obligation: &mut Option<ClassSCommitToken>,
+    context_id: &str,
 ) -> bool {
     if caps.is_empty() {
         return false;
     }
-    role_state.suspend_capabilities(member_did.as_ref(), caps.iter().cloned());
+    role_state.suspend_capabilities(
+        member_did.as_ref(),
+        caps.iter().cloned(),
+        obligation,
+        context_id,
+    );
     true
 }
 
@@ -501,12 +651,16 @@ fn enforce_suspend(
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_assign_role(
-    role_state: &mut ContextRoleState,
+    role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     to_role: &str,
     clock: &dyn scp_primitives::Clock,
+    obligation: &mut Option<ClassSCommitToken>,
+    context_id: &str,
 ) -> bool {
-    roles::system_assign_role(role_state, member_did, to_role, clock).is_ok()
+    role_state
+        .system_assign_role(member_did.as_ref(), to_role, clock, obligation, context_id)
+        .is_ok()
 }
 
 /// H10 + H4: when enforcement fails, escalate to `SuspendAll` AND emit two
@@ -516,14 +670,18 @@ fn enforce_assign_role(
 fn emit_failure_escalation(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
-    context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
     durable: bool,
+    obligation: &mut Option<ClassSCommitToken>,
 ) {
     let context_id = args.context_id;
     let member_did = args.member_did;
+    // Recomputed from `args.context_id` (a pure SHA-256) on this RARE
+    // failure-escalation path rather than threaded as a parameter — keeps the
+    // signature within the `clippy::too_many_arguments` budget without bundling.
+    let context_id_bytes = &context_id_to_bytes(context_id);
     tracing::warn!(
         context_id,
         member = %member_did,
@@ -533,8 +691,11 @@ fn emit_failure_escalation(
 
     // H10: escalate to SuspendAll when enforcement fails. The local enforcement
     // (and its cooldown skip so the escalation fires immediately) is unconditional
-    // — independent of whether the trigger is convergent.
-    state.role_state.suspend_all(member_did.as_ref());
+    // — independent of whether the trigger is convergent. The GROW method arms
+    // `obligation` so the escalation's suspension is persisted fail-closed.
+    state
+        .role_state
+        .suspend_all(member_did.as_ref(), obligation, context_id);
 
     // The two audit records (failure then escalation) are durable Merkle leaves
     // only for convergent triggers (ADR-051 §6); for a velocity/rate trigger
@@ -756,7 +917,11 @@ mod convergence_tests {
 
         {
             let mut split = ConsequenceStateSplit::from_state(&mut state);
-            enforce_triggered_consequences(
+            // The `rule()` helper's action is `SuspendAccess`, which always
+            // mutates `suspended_capabilities` for a present member, so the
+            // downward-auth obligation sink must be ARMED (ADR-049 §9).
+            let mut obligation = None;
+            let suspended = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id: &context_id_str,
@@ -768,7 +933,17 @@ mod convergence_tests {
                     event_log: &event_log,
                     event_tx: Some(&tx),
                 },
+                &mut obligation,
             );
+            assert!(
+                suspended,
+                "SuspendAccess against a present member applies a suspension"
+            );
+            let token =
+                obligation.expect("a SuspendAccess GROW arms the fail-closed obligation sink");
+            // No persistence backend is wired in this convergence-discriminator
+            // test, so defuse the obligation instead of driving a real persist.
+            token.defuse_for_test();
         }
 
         let root_after = event_log

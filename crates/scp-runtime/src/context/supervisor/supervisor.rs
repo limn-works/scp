@@ -13887,8 +13887,11 @@ mod tests {
         state
             .membership
             .add_member(target.clone(), "member".to_owned(), Vec::new());
-        state.role_state.ceiling =
-            scp_protocol::context::roles::CapabilityCeiling::new([Capability::MemberBan]);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MemberBan,
+            ]));
         state
             .role_state
             .member_capabilities
@@ -13908,10 +13911,14 @@ mod tests {
         persistence.persist_context(&ctx_key, &pre).unwrap();
 
         // Perform the downward-authorization transition. `execute_revoke`
-        // calls `persist_state_best_effort` synchronously before returning, so
-        // the persisted snapshot now reflects the suspension.
+        // routes the suspension through `commit_class_s_keep` (a fail-closed
+        // persist) synchronously before returning, so the persisted snapshot
+        // now reflects the suspension. It takes `&mut ClassSCell`, so wrap the
+        // local `state` in a cell for the call, then unwrap it back out for the
+        // subsequent `spawn_actor_with_state` hand-off.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::governance_helpers::execute_revoke(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &target,
@@ -13923,6 +13930,7 @@ mod tests {
             },
         )
         .expect("execute_revoke (Both scope) must succeed");
+        let state = cell.into_inner();
 
         // Sanity: the just-persisted snapshot already carries the revocation,
         // proving the sync persist happened inside the helper (no coalesce).
@@ -13933,8 +13941,7 @@ mod tests {
         assert!(
             persisted
                 .role_state
-                .suspended_capabilities
-                .get(target.as_ref())
+                .suspended_for(target.as_ref())
                 .is_some_and(|c| c.contains(&Capability::MessagesWrite)),
             "sync-persisted snapshot must show MessagesWrite suspended"
         );
@@ -13968,8 +13975,7 @@ mod tests {
         assert!(
             after
                 .role_state
-                .suspended_capabilities
-                .get(target.as_ref())
+                .suspended_for(target.as_ref())
                 .is_some_and(|c| {
                     c.contains(&Capability::MessagesWrite) && c.contains(&Capability::MessagesRead)
                 }),
@@ -14000,11 +14006,12 @@ mod tests {
     /// — a code path that mutates a Class-S field and then acknowledges the
     /// operation WITHOUT a fail-closed persist (e.g. the message-send / paid-
     /// join nonce-consume sites that earlier rounds missed while the tool-invoke
-    /// site was fixed). That complementary half is enforced by
-    /// `scripts/check-class-s-fail-closed.sh`, which scans every consume site
-    /// and requires a fail-closed persist before acknowledgment. The two
-    /// together — field round-trip HERE, consume-site fail-closed THERE — are
-    /// what the §9 enforcement actually guarantees.
+    /// site was fixed). That complementary half is now enforced at COMPILE TIME
+    /// by the `ClassSCell` boundary (no `DerefMut` / `state_mut`; the only `&mut`
+    /// reach to a Class-S field is through a persist-on-commit combinator), plus
+    /// the `class_s_no_persist_mutator_whitelist_is_bounded` tripwire test in
+    /// `context::actor::class_s`. The two together — field round-trip HERE,
+    /// mutation-must-persist THERE — are what the §9 enforcement guarantees.
     ///
     /// The mechanism that catches a NEW coalesced-only security FIELD:
     ///
@@ -14505,9 +14512,9 @@ mod tests {
     /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
     /// persist GATING is fail-closed, structurally identical to the tool-invoke
     /// path. Asserted against the PRODUCTION `finalize_send`: with a persistence
-    /// backend that always fails, `finalize_send(spending_nonce_committed = true)`
-    /// returns an error (the paid send is NOT acknowledged while its
-    /// nonce-consume is unpersisted), whereas `spending_nonce_committed = false`
+    /// backend that always fails, `finalize_send` with a `Some(ClassSCommitToken)`
+    /// (a paid send) returns an error (the paid send is NOT acknowledged while
+    /// its nonce-consume is unpersisted), whereas a `None` token
     /// (a free / non-spending send) swallows the same failure and returns `Ok`
     /// (the common path stays best-effort, un-regressed).
     ///
@@ -14525,7 +14532,7 @@ mod tests {
         let ctx_id_bytes = [0xDAu8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let sender = DID("did:example:send-fail-closed".to_owned());
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             sender.clone(),
@@ -14537,10 +14544,15 @@ mod tests {
             .unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
 
+        // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
+        // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
+        // shared `&*cell`) and the Class-C field mutations (via `class_c_view`).
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
         // A paid send (spending nonce committed) MUST surface the persist
         // failure — fail-closed.
         let paid = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14548,7 +14560,9 @@ mod tests {
             0,
             b"paid",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: a deferred spending-nonce token whose fail-closed
+            // commit drives the persist (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         );
         assert!(
@@ -14560,7 +14574,7 @@ mod tests {
         // A free send (no spending nonce) swallows the same failure — the
         // common path stays best-effort, un-regressed.
         let free = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14568,7 +14582,9 @@ mod tests {
             1,
             b"free",
             Some(&signing_key),
-            /* spending_nonce_committed = */ false,
+            // Free send: no token (previously the `false` bool) — keeps the
+            // best-effort persist, un-regressed.
+            None,
             /* is_broadcast = */ false,
         );
         assert!(
@@ -14607,7 +14623,7 @@ mod tests {
 
         // Seed the post-`commit_spending_ucan_nonce` tracker state (the same
         // shape `snapshot_entries` persists), then run the PRODUCTION send-path
-        // finalize with `spending_nonce_committed = true` — the exact gating the
+        // finalize with a `Some(ClassSCommitToken)` — the exact gating the
         // metered send path uses. This drives the real fail-closed persist.
         let consumed_nonce = "1700000000000-aabbccddeeff00112233445566778899".to_owned();
         let mut seed_entries = std::collections::HashMap::new();
@@ -14621,8 +14637,12 @@ mod tests {
             );
         let deps = test_actor_deps(&sup).await;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
+        // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
+        // hand off to `spawn_actor_with_state`.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14630,10 +14650,13 @@ mod tests {
             0,
             b"paid-send",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: deferred token whose fail-closed commit persists the
+            // consumed nonce (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         )
         .expect("fail-closed finalize of the send-path consumed nonce must succeed");
+        let state = cell.into_inner();
 
         let handle = sup
             .spawn_actor_with_state(state, deps, None)
@@ -14838,9 +14861,12 @@ mod tests {
         persistence.persist_context(&ctx_key, &active_snap).unwrap();
 
         // Run the real close path. It drives the handle to Closing and
-        // sync-persists before returning.
+        // sync-persists before returning. `close_context` now takes a
+        // `&mut ClassSCell` (the close fail-closed persist is performed by the
+        // Class-S `_keep` combinator), so wrap the bare test state in a cell.
         let handle_clone = state.handle.clone();
-        crate::context::lifecycle_helpers::close_context(&mut state, &deps, &handle_clone, &admin)
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::lifecycle_helpers::close_context(&mut cell, &deps, &handle_clone, &admin)
             .await
             .expect("close_context must succeed for a SingleAdmin context");
 
@@ -14944,8 +14970,7 @@ mod tests {
             .expect("snapshot present after respawn");
         let suspended = snap
             .role_state
-            .suspended_capabilities
-            .get(target.as_ref())
+            .suspended_for(target.as_ref())
             .expect("the banned member's suspension must survive the crash");
         assert!(
             suspended.contains(&Capability::MessagesWrite)
@@ -15077,8 +15102,12 @@ mod tests {
             "reservation must advance the counter by exactly 1"
         );
 
+        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
+        // owning `ClassSCell` for the call, then reclaim it via `into_inner` for
+        // the post-send sequence-rollback assertion below.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -15086,9 +15115,12 @@ mod tests {
             reserved,
             b"paid",
             Some(&signing_key),
-            /* spending_nonce_committed = */ true,
+            // Paid send: deferred token whose fail-closed commit fails here,
+            // driving the sequence-rollback path (previously the `true` bool).
+            Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         );
+        let state = cell.into_inner();
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
             "a paid send whose fail-closed persist fails must surface the error: got {result:?}"
@@ -15347,10 +15379,11 @@ mod tests {
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
-        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::ToolInterface,
-            Capability::ToolInvokeAll,
-        ]);
+        st.role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::ToolInterface,
+                Capability::ToolInvokeAll,
+            ]));
         // Established (both-approved) outbound interface caller→target for
         // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
         // passes. Source/target ids are the hex id-form §6.2.4 stores.
@@ -15399,10 +15432,11 @@ mod tests {
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
-        st.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
-            Capability::ToolInterface,
-            Capability::ToolInvokeAll,
-        ]);
+        st.role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::ToolInterface,
+                Capability::ToolInvokeAll,
+            ]));
         st.governance.registered_tools.push(ToolRegistration {
             tool_id: XCTX_TOOL.to_owned(),
             name: "Calculator".to_owned(),

@@ -2284,16 +2284,15 @@ mod tests {
             !export
                 .snapshot
                 .role_state
-                .ceiling
-                .capabilities
+                .ceiling()
                 .contains(&Capability::MediaVoice),
             "precondition: MediaVoice must not already be in the default ceiling"
         );
         export
             .snapshot
             .role_state
-            .ceiling
-            .capabilities
+            .ceiling_mut()
+            .capabilities_mut()
             .insert(Capability::MediaVoice);
 
         let err = validate_export_for_import(&export, &test_verifying_key())
@@ -2346,12 +2345,12 @@ mod tests {
         // MediaVoice / MediaVideo are NOT in default_ceiling, so these are
         // genuine additions exercising the ceiling set serializer.
         base.role_state
-            .ceiling
-            .capabilities
+            .ceiling_mut()
+            .capabilities_mut()
             .insert(Capability::MediaVoice);
         base.role_state
-            .ceiling
-            .capabilities
+            .ceiling_mut()
+            .capabilities_mut()
             .insert(Capability::MediaVideo);
         base.role_state.members.insert("did:key:m-a".to_owned());
         base.role_state.members.insert("did:key:m-b".to_owned());
@@ -2361,7 +2360,7 @@ mod tests {
         let mut shuffled = base.clone();
         reinsert_reversed(&mut shuffled.read_exclusion_list);
         reinsert_reversed(&mut shuffled.executed_proposals);
-        reinsert_reversed(&mut shuffled.role_state.ceiling.capabilities);
+        reinsert_reversed(shuffled.role_state.ceiling_mut().capabilities_mut());
         reinsert_reversed(&mut shuffled.role_state.members);
 
         let sign = sign_with_test_key;
@@ -2528,8 +2527,8 @@ mod tests {
         snapshot.executed_proposals.insert([8u8; 32]);
         snapshot
             .role_state
-            .ceiling
-            .capabilities
+            .ceiling_mut()
+            .capabilities_mut()
             .insert(Capability::MemberInvite);
         snapshot.role_state.members.insert("did:key:m1".to_owned());
         snapshot.role_state.members.insert("did:key:m2".to_owned());
@@ -2563,8 +2562,7 @@ mod tests {
         assert!(
             decoded
                 .role_state
-                .ceiling
-                .capabilities
+                .ceiling()
                 .contains(&Capability::MemberInvite)
         );
         // The nonce-dedup cache survives the persistence round-trip value-stable.
