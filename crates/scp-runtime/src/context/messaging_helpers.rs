@@ -712,10 +712,11 @@ fn ingest_pseudonym_announcement(
 /// append. The `Some` branch remains so a future sender-authenticated received
 /// event can opt into a durable append without re-plumbing this helper.
 ///
-/// Returns `true` iff consequence enforcement applied a capability suspension (a
-/// Class-S `suspended_capabilities` mutation). The caller threads this up to the
-/// cell holder, which persists the suspension fail-closed (ADR-049 §9, RED-CS3)
-/// — evaluation otherwise stays best-effort / coalesced.
+/// Returns `true` iff consequence enforcement performed a downward-authorization
+/// mutation (a `suspended_capabilities` GROW or an `AssignRole`
+/// `member_capabilities` replacement). The caller threads this up to the cell
+/// holder, which persists the mutated state fail-closed (ADR-049 §9, RED-CS3) —
+/// evaluation otherwise stays best-effort / coalesced.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
@@ -769,10 +770,11 @@ pub fn run_buffered_post_delivery(
         .governance_class_c_mut()
         .consequence_rules_mut()
         .clone();
-    // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement applied a
-    // capability suspension on this delivery — propagated to the cell-holding
-    // caller so the suspension persists fail-closed (keep-direction).
-    let suspension_applied = if consequence_rules.is_empty() {
+    // ADR-049 §9 (RED-CS3): `true` iff consequence enforcement performed a
+    // downward-authorization mutation on this delivery (a capability suspension
+    // or an `AssignRole` demotion) — propagated to the cell-holding caller so the
+    // mutation persists fail-closed (keep-direction).
+    let downward_auth_applied = if consequence_rules.is_empty() {
         false
     } else {
         let (events, convergent_now) =
@@ -809,7 +811,7 @@ pub fn run_buffered_post_delivery(
     };
 
     *view.checkpoint_events_since_mut() += 1;
-    suspension_applied
+    downward_auth_applied
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,19 +1382,20 @@ pub enum DeliverOutcome {
 /// call in `async {...}` so the per-call transport-timeout budget
 /// still applies.
 ///
-/// `suspension_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if the receive
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if the receive
 /// cascade (in-order delivery, force-drained gaps, or timed-out-gap drains) runs
-/// consequence enforcement that applies a capability suspension. The
-/// cell-holding handler ([`crate::context::actor::handlers::messaging`]) owns the
-/// `bool` and, when set, persists the suspension fail-closed (keep-direction)
-/// before acking — evaluation otherwise stays best-effort / coalesced.
+/// consequence enforcement that performs a downward-authorization mutation (a
+/// capability suspension or an `AssignRole` demotion). The cell-holding handler
+/// ([`crate::context::actor::handlers::messaging`]) owns the `bool` and, when
+/// set, persists the mutated state fail-closed (keep-direction) before acking —
+/// evaluation otherwise stays best-effort / coalesced.
 #[allow(clippy::too_many_lines)]
 pub fn deliver_incoming(
     view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
-    suspension_sink: &mut bool,
+    downward_auth_sink: &mut bool,
 ) -> Result<DeliverOutcome, ContextError> {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
@@ -1490,7 +1493,7 @@ pub fn deliver_incoming(
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
     let sequence_check =
-        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, suspension_sink)?;
+        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)?;
 
     let is_local_sender = sender_did == local_member_did;
 
@@ -1505,7 +1508,7 @@ pub fn deliver_incoming(
                 &inner,
                 &plaintext,
                 is_local_sender,
-                suspension_sink,
+                downward_auth_sink,
             )?;
             if consumed_as_announcement {
                 Ok(DeliverOutcome::Handled)
@@ -1522,7 +1525,7 @@ pub fn deliver_incoming(
                 &sender_did,
                 &plaintext,
                 now_ms,
-                suspension_sink,
+                downward_auth_sink,
             );
             Ok(DeliverOutcome::Handled)
         }
@@ -2121,11 +2124,12 @@ pub fn finalize_send(
     }
 
     let now = deps.clock.now_secs();
-    // ADR-049 §9 (RED-CS3): `true` when consequence enforcement applies a
-    // capability suspension, so the final persist is upgraded to fail-closed
-    // (keep-direction) — a coalesce-window crash must not lose the suspension.
-    // Bound from the view block below so the value is set exactly once.
-    let suspension_applied;
+    // ADR-049 §9 (RED-CS3): `true` when consequence enforcement performs a
+    // downward-authorization mutation (a capability suspension or an `AssignRole`
+    // demotion), so the final persist is upgraded to fail-closed (keep-direction)
+    // — a coalesce-window crash must not lose the mutation. Bound from the view
+    // block below so the value is set exactly once.
+    let downward_auth_applied;
     // Class-C field mutations run through the non-persisting view (coalesced —
     // the run loop persists on `mutated`); the view borrow ends (NLL) before the
     // cell-taking checkpoint-broadcast + fail-closed persist below.
@@ -2164,23 +2168,25 @@ pub fn finalize_send(
         );
         {
             let mut split = view.split_class_c();
-            // ADR-049 §9 (RED-CS3): the returned flag is `true` iff a capability
-            // suspension was applied (a Class-S `suspended_capabilities`
-            // mutation). When set, the final persist below is upgraded to
-            // fail-closed so the suspension is durable before this send acks.
-            suspension_applied = crate::context::governance_logic::enforce_triggered_consequences(
-                &mut split,
-                &crate::context::governance_logic::EnforceConsequencesCtx {
-                    context_id,
-                    member_did: sender_did,
-                    now,
-                    triggered: &send_triggered,
-                    rules: &consequence_rules,
-                    clock: &*deps.clock,
-                    event_log: &*deps.event_log,
-                    event_tx: deps.event_tx.as_ref(),
-                },
-            );
+            // ADR-049 §9 (RED-CS3): the returned flag is `true` iff a downward-auth
+            // mutation was applied (a `suspended_capabilities` GROW or an
+            // `AssignRole` `member_capabilities` replacement). When set, the final
+            // persist below is upgraded to fail-closed so the mutation is durable
+            // before this send acks.
+            downward_auth_applied =
+                crate::context::governance_logic::enforce_triggered_consequences(
+                    &mut split,
+                    &crate::context::governance_logic::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: sender_did,
+                        now,
+                        triggered: &send_triggered,
+                        rules: &consequence_rules,
+                        clock: &*deps.clock,
+                        event_log: &*deps.event_log,
+                        event_tx: deps.event_tx.as_ref(),
+                    },
+                );
         }
 
         // Participation record (#1530).
@@ -2206,7 +2212,7 @@ pub fn finalize_send(
         sender_did,
         token,
         is_broadcast,
-        suspension_applied,
+        downward_auth_applied,
     )
 }
 
@@ -2276,13 +2282,13 @@ fn create_and_broadcast_checkpoint_if_due(
 /// path); it shares the single sequence-rollback ownership invariant documented
 /// on [`finalize_send`] (gated `!is_broadcast`, no caller double-revert).
 ///
-/// `suspension_applied` (ADR-049 §9, RED-CS3): when this send's consequence
-/// enforcement applied a capability suspension (a Class-S
-/// `suspended_capabilities` mutation), the persist MUST be fail-closed
-/// (keep-direction) so a coalesce-window crash cannot silently re-grant a denied
-/// capability. The paid path is already fail-closed (the token's `commit`); the
-/// free path is upgraded from best-effort to fail-closed here when a suspension
-/// occurred.
+/// `downward_auth_applied` (ADR-049 §9, RED-CS3): when this send's consequence
+/// enforcement performed a downward-authorization mutation (a
+/// `suspended_capabilities` GROW or an `AssignRole` `member_capabilities`
+/// replacement), the persist MUST be fail-closed (keep-direction) so a
+/// coalesce-window crash cannot silently re-grant removed authority. The paid
+/// path is already fail-closed (the token's `commit`); the free path is upgraded
+/// from best-effort to fail-closed here when a downward-auth mutation occurred.
 fn persist_finalized_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -2290,7 +2296,7 @@ fn persist_finalized_send(
     sender_did: &DID,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
-    suspension_applied: bool,
+    downward_auth_applied: bool,
 ) -> Result<(), ContextError> {
     match token {
         // Paid send: commit the deferred token — its `commit` performs the
@@ -2298,8 +2304,8 @@ fn persist_finalized_send(
         // `commit` takes a SHARED `&PerContextState` (via `&*cell`). On failure
         // roll the reserved sequence back through the Class-C view (this fn owns
         // that rollback; the caller does not double-revert) and surface the error.
-        // A suspension applied on this send is already covered by the token's
-        // fail-closed persist.
+        // A downward-auth mutation applied on this send is already covered by the
+        // token's fail-closed persist.
         Some(t) => {
             if let Err(e) = t.commit(cell, deps, context_id) {
                 if !is_broadcast {
@@ -2311,10 +2317,11 @@ fn persist_finalized_send(
             }
         }
         // Free / non-spending send: best-effort persist (Class C — not regressed)
-        // UNLESS this send applied a capability suspension, in which case the
-        // downward-auth Class-S transition must persist fail-closed (ADR-049 §9).
+        // UNLESS this send applied a downward-auth mutation (a capability
+        // suspension or an `AssignRole` demotion), in which case the downward-auth
+        // transition must persist fail-closed (ADR-049 §9).
         None => {
-            if suspension_applied {
+            if downward_auth_applied {
                 persist_state_fail_closed(cell, deps, context_id)?;
             } else {
                 persist_state_best_effort(cell, deps, context_id);
@@ -2713,16 +2720,17 @@ pub fn decrypt_and_dispatch(
 
 /// Validates timestamp and sequence, then drains timed-out gaps.
 ///
-/// `suspension_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if draining a
-/// timed-out gap runs consequence enforcement that applies a capability
-/// suspension, so the cell-holding caller can persist it fail-closed.
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if draining a
+/// timed-out gap runs consequence enforcement that performs a
+/// downward-authorization mutation (a capability suspension or an `AssignRole`
+/// demotion), so the cell-holding caller can persist it fail-closed.
 pub fn validate_and_drain_timeouts(
     view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
-    suspension_sink: &mut bool,
+    downward_auth_sink: &mut bool,
 ) -> Result<SequenceCheck, ContextError> {
     // Timestamp validation first.
     let tv = scp_protocol::envelope::validation::TimestampValidator::default();
@@ -2774,7 +2782,7 @@ pub fn validate_and_drain_timeouts(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            *suspension_sink |= run_buffered_post_delivery(
+            *downward_auth_sink |= run_buffered_post_delivery(
                 view,
                 context_id,
                 &context_id_bytes,
@@ -2803,9 +2811,10 @@ pub fn validate_and_drain_timeouts(
 /// Buffers an out-of-order message that arrived ahead of expected
 /// sequence. Force-delivers oldest gap on overflow.
 ///
-/// `suspension_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if a force-drained
-/// gap message runs consequence enforcement that applies a capability
-/// suspension, so the cell-holding caller can persist it fail-closed.
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if a force-drained
+/// gap message runs consequence enforcement that performs a downward-authorization
+/// mutation (a capability suspension or an `AssignRole` demotion), so the
+/// cell-holding caller can persist it fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub fn buffer_ahead_message(
     view: &mut ClassCMut,
@@ -2815,7 +2824,7 @@ pub fn buffer_ahead_message(
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
-    suspension_sink: &mut bool,
+    downward_auth_sink: &mut bool,
 ) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
@@ -2866,7 +2875,7 @@ pub fn buffer_ahead_message(
                 context_id,
                 deps.event_tx.as_ref(),
             );
-            *suspension_sink |= run_buffered_post_delivery(
+            *downward_auth_sink |= run_buffered_post_delivery(
                 view,
                 context_id,
                 &context_id_bytes,
@@ -2895,10 +2904,11 @@ pub fn buffer_ahead_message(
 /// Returns `true` when the message was consumed as a pseudonym
 /// announcement (internal protocol message).
 ///
-/// `suspension_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if this delivery
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): OR-set to `true` if this delivery
 /// (or any consecutively-drained buffered message) runs consequence enforcement
-/// that applies a capability suspension, so the cell-holding caller can persist
-/// the suspension fail-closed (keep-direction).
+/// that performs a downward-authorization mutation (a capability suspension or an
+/// `AssignRole` demotion), so the cell-holding caller can persist the mutated
+/// state fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub fn deliver_message_and_drain_buffered(
@@ -2910,7 +2920,7 @@ pub fn deliver_message_and_drain_buffered(
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     plaintext: &[u8],
     skip_velocity: bool,
-    suspension_sink: &mut bool,
+    downward_auth_sink: &mut bool,
 ) -> Result<bool, ContextError> {
     let sender_did_obj = DID(sender_did.to_owned());
 
@@ -2995,7 +3005,7 @@ pub fn deliver_message_and_drain_buffered(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                *suspension_sink |= run_buffered_post_delivery(
+                *downward_auth_sink |= run_buffered_post_delivery(
                     view,
                     context_id,
                     context_id_bytes,
@@ -3041,7 +3051,7 @@ pub fn deliver_message_and_drain_buffered(
                 );
                 let recv_member_did = DID(sender_did.to_owned());
                 let mut split = view.split_class_c();
-                *suspension_sink |=
+                *downward_auth_sink |=
                     crate::context::governance_logic::enforce_triggered_consequences(
                         &mut split,
                         &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -3102,7 +3112,7 @@ pub fn deliver_message_and_drain_buffered(
             context_id,
             deps.event_tx.as_ref(),
         );
-        *suspension_sink |= run_buffered_post_delivery(
+        *downward_auth_sink |= run_buffered_post_delivery(
             view,
             context_id,
             context_id_bytes,
@@ -3155,7 +3165,7 @@ pub fn deliver_message_and_drain_buffered(
         );
         let recv_member_did = DID(sender_did.to_owned());
         let mut split = view.split_class_c();
-        *suspension_sink |= crate::context::governance_logic::enforce_triggered_consequences(
+        *downward_auth_sink |= crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
@@ -4029,14 +4039,14 @@ mod pseudonym_routing_tests {
         // skip governance for the `None`-typed application message.
         let incoming = drain_test_inner(&ctx, 1);
         let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
-        let mut suspension_applied = false;
+        let mut downward_auth_applied = false;
         validate_and_drain_timeouts(
             &mut ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &incoming,
             now_ms,
-            &mut suspension_applied,
+            &mut downward_auth_applied,
         )
         .expect("validate_and_drain_timeouts");
 
@@ -4161,7 +4171,7 @@ mod pseudonym_routing_tests {
         let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
         let inner = drain_test_inner(&ctx, 1);
 
-        let mut suspension_applied = false;
+        let mut downward_auth_applied = false;
         let consumed = deliver_message_and_drain_buffered(
             &mut ClassCMut::from_state(&mut state),
             &deps,
@@ -4171,7 +4181,7 @@ mod pseudonym_routing_tests {
             &inner,
             &plaintext,
             false,
-            &mut suspension_applied,
+            &mut downward_auth_applied,
         )
         .expect("deliver_message_and_drain_buffered");
 

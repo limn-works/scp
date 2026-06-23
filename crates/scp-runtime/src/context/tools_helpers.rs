@@ -846,18 +846,20 @@ pub async fn reserve_tool_economy(
 ///
 /// Returns the triggered consequences and the optional payment receipt.
 ///
-/// `suspension_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED `&mut bool` that this
-/// function OR-sets to `true` if consequence enforcement applied a capability
-/// suspension (a Class-S `suspended_capabilities` mutation). The flag is a
-/// caller-owned sink rather than part of the return value SO IT SURVIVES THE
-/// PAYMENT-CAPTURE ERROR PATH: the suspension is applied in memory BEFORE the
-/// fallible payment capture, and on capture failure this function returns `Err`
-/// early — a return-value flag would be lost to that `?`, leaving the suspension
-/// on best-effort-only persistence (the RED-CS3 hole). With a `&mut` sink the
-/// cell-holding caller ([`settle_tool_economy`]) persists the suspension
+/// `downward_auth_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED `&mut bool` that
+/// this function OR-sets to `true` if consequence enforcement performed a
+/// downward-authorization mutation (a `suspended_capabilities` GROW or an
+/// `AssignRole` `member_capabilities` replacement). The flag is a caller-owned
+/// sink rather than part of the return value SO IT SURVIVES THE PAYMENT-CAPTURE
+/// ERROR PATH: the mutation is applied in memory BEFORE the fallible payment
+/// capture, and on capture failure this function returns `Err` early — a
+/// return-value flag would be lost to that `?`, leaving the mutation on
+/// best-effort-only persistence (the RED-CS3 hole). With a `&mut` sink the
+/// cell-holding caller ([`settle_tool_economy`]) persists the mutated state
 /// fail-closed AFTER the call regardless of Ok/Err. On payment-capture failure
 /// the ticket is reversed (budget / velocity / rate-limit) and the error
-/// surfaced; the in-memory suspension is NOT reversed (keep-direction).
+/// surfaced; the in-memory downward-auth mutation is NOT reversed
+/// (keep-direction).
 ///
 /// # Errors
 ///
@@ -869,7 +871,7 @@ pub async fn settle_tool_economy_capture(
     context_id: &str,
     invoker_did: &DID,
     ticket: ToolEconomyTicket,
-    suspension_sink: &mut bool,
+    downward_auth_sink: &mut bool,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -911,18 +913,19 @@ pub async fn settle_tool_economy_capture(
     // cell view, with NO whole `&mut PerContextState` and NO `&mut` reach into any
     // of the three PRIVATIZED Class-S sub-structs. (Its `role_state` borrow is the
     // dual-use `ContextRoleState` STRUCTURAL residual — see ADR-049 §9 "Known
-    // residual" — through which `ceiling` / `suspended_capabilities` remain
-    // nameable. The auto-suspension's BEHAVIORAL §9 hole is closed: when
-    // enforcement applies a suspension the cell-holding caller persists it
-    // FAIL-CLOSED, RED-CS3.) Consequence EVALUATION stays best-effort (the run loop
-    // coalesce-persists); only a suspension OUTCOME owes a fail-closed persist,
-    // which the cell-holding caller performs when `suspension_applied` is set
+    // residual" — through which `ceiling` / `suspended_capabilities` /
+    // `member_capabilities` remain nameable. The BEHAVIORAL §9 hole is closed:
+    // when enforcement applies a downward-auth mutation (a suspension or an
+    // `AssignRole` demotion) the cell-holding caller persists it FAIL-CLOSED,
+    // RED-CS3.) Consequence EVALUATION stays best-effort (the run loop
+    // coalesce-persists); only a downward-auth OUTCOME owes a fail-closed persist,
+    // which the cell-holding caller performs when `downward_auth_applied` is set
     // (ADR-049 §9, RED-CS3).
     let mut split = view.split_class_c();
-    // OR-set the caller-owned sink so the suspension's fail-closed-persist
+    // OR-set the caller-owned sink so the mutation's fail-closed-persist
     // obligation survives the payment-capture error path below (a return-value
     // flag would be stranded by the early `return Err` — RED-CS3).
-    *suspension_sink |= crate::context::governance_logic::enforce_triggered_consequences(
+    *downward_auth_sink |= crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
             context_id,
@@ -1297,35 +1300,36 @@ pub async fn settle_tool_economy(
             // `split_class_c()` (inside `settle_tool_economy_capture`) yields
             // exactly the `ConsequenceStateSplit` shape with NO whole
             // `&mut PerContextState` and NO Class-S reach. Evaluation coalesces
-            // through the run loop; the ONE Class-S outcome — a consequence-engine
-            // capability suspension — is signalled via the caller-owned
-            // `suspension_applied` sink and persisted fail-closed below (ADR-049
-            // §9, RED-CS3). The sink is owned HERE (not returned by the callee)
-            // so the obligation survives the callee's payment-capture error path
-            // — a return-value flag would be stranded by that early `return Err`,
-            // leaving the suspension on best-effort-only persistence.
-            let mut suspension_applied = false;
+            // through the run loop; the downward-auth outcomes — a
+            // consequence-engine capability suspension or an `AssignRole` demotion
+            // — are signalled via the caller-owned `downward_auth_applied` sink and
+            // persisted fail-closed below (ADR-049 §9, RED-CS3). The sink is owned
+            // HERE (not returned by the callee) so the obligation survives the
+            // callee's payment-capture error path — a return-value flag would be
+            // stranded by that early `return Err`, leaving the mutation on
+            // best-effort-only persistence.
+            let mut downward_auth_applied = false;
             let capture_result = settle_tool_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
                 ticket,
-                &mut suspension_applied,
+                &mut downward_auth_applied,
             )
             .await;
-            // Fail-closed persist of an applied capability suspension
-            // (keep-direction), run on BOTH the Ok and Err arms: the suspension
+            // Fail-closed persist of an applied downward-auth mutation
+            // (keep-direction), run on BOTH the Ok and Err arms: the mutation
             // is already in memory; make it durable before acking so a
-            // coalesce-window crash cannot silently re-grant the denied
-            // capability. The view above has been consumed, so the `&mut cell`
+            // coalesce-window crash cannot silently re-grant the removed
+            // authority. The view above has been consumed, so the `&mut cell`
             // borrow is released here. ERROR PRECEDENCE: when the capture itself
             // failed, the persist still runs; if the persist ALSO fails, the
             // §9 durability failure (`PersistenceFailed`) is surfaced over the
             // original capture error (durability is the security obligation), and
             // the original capture cause is preserved in its message. When the
             // persist succeeds, the original capture error is surfaced unchanged.
-            if suspension_applied
+            if downward_auth_applied
                 && let Err(persist_err) =
                     crate::context::messaging_helpers::persist_state_fail_closed(
                         cell, deps, context_id,

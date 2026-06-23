@@ -816,16 +816,17 @@ fn handle_evaluate_periodic_consequences_actor(
     // Consequence EVALUATION rides the run loop's coalesced persist — the
     // non-persisting Class-C view supplies the same disjoint `ClassCSplit`
     // borrows `ConsequenceStateSplit` needs (it is a type alias for
-    // `ClassCSplit`). The ONE Class-S outcome it can produce — a capability
-    // suspension — is OR-accumulated here and persisted fail-closed below
-    // (ADR-049 §9, RED-CS3): a coalesce-window crash must not silently re-grant
-    // an auto-suspended member's denied capability.
-    let mut suspension_applied = false;
+    // `ClassCSplit`). The downward-auth outcomes it can produce — a capability
+    // suspension (a `suspended_capabilities` GROW) or an `AssignRole` demotion (a
+    // `member_capabilities` replacement) — are OR-accumulated here and persisted
+    // fail-closed below (ADR-049 §9, RED-CS3): a coalesce-window crash must not
+    // silently re-grant a member's removed authority.
+    let mut downward_auth_applied = false;
     {
         let mut view = cell.class_c_view();
         let mut split = view.split_class_c();
         for (member_did, triggered) in &results {
-            suspension_applied |= enforce_triggered_consequences(
+            downward_auth_applied |= enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id: &context_id,
@@ -842,11 +843,12 @@ fn handle_evaluate_periodic_consequences_actor(
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
 
-    // Fail-closed persist of an applied capability suspension (keep-direction):
-    // the suspension is already in memory; make it durable before acking. On
-    // persist failure the suspension STAYS and the error is surfaced to the
-    // caller; the handler still reports `mutated` so the run loop also persists.
-    let reply_result = if suspension_applied {
+    // Fail-closed persist of an applied downward-auth mutation (keep-direction):
+    // the mutation (suspension or `AssignRole` demotion) is already in memory;
+    // make it durable before acking. On persist failure the mutation STAYS and the
+    // error is surfaced to the caller; the handler still reports `mutated` so the
+    // run loop also persists.
+    let reply_result = if downward_auth_applied {
         crate::context::messaging_helpers::persist_state_fail_closed(cell, deps, &context_id)
     } else {
         Ok(())
@@ -1565,7 +1567,7 @@ mod consequence_fail_closed_tests {
             extensions: std::collections::HashMap::new(),
         };
 
-        let mut suspension_sink = false;
+        let mut downward_auth_sink = false;
         let mut view = cell.class_c_view();
         let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
             &mut view,
@@ -1576,12 +1578,12 @@ mod consequence_fail_closed_tests {
             &inner,
             b"hello",
             false,
-            &mut suspension_sink,
+            &mut downward_auth_sink,
         )
         .expect("delivery of an in-order application message succeeds");
 
         assert!(
-            suspension_sink,
+            downward_auth_sink,
             "a received message that trips a suspension consequence must OR-set the \
              caller-owned sink so the cell holder persists the suspension fail-closed"
         );

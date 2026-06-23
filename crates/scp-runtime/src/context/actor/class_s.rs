@@ -4296,7 +4296,7 @@ impl ClassSCell {
     /// `SuspendCapability` consequence through the SAME path the receive handler
     /// uses — `enforce_triggered_consequences` against the cell's
     /// `class_c_view().split_class_c()` — to set the in-memory suspension and the
-    /// `suspension_applied` flag, then performs the handler's fail-closed persist
+    /// `downward_auth_applied` flag, then performs the handler's fail-closed persist
     /// (`persist_state_fail_closed`) under a FAILING persistence backend. It
     /// asserts (a) the handler surfaces the §9 durability error
     /// (`PersistenceFailed`) rather than a silent coalesced ack, AND (b) the
@@ -4345,7 +4345,7 @@ impl ClassSCell {
         }];
 
         // Drive the suspension through the handler's exact view path.
-        let suspension_applied = {
+        let downward_auth_applied = {
             let mut view = cell.class_c_view();
             let mut split = view.split_class_c();
             enforce_triggered_consequences(
@@ -4363,7 +4363,7 @@ impl ClassSCell {
             )
         };
         assert!(
-            suspension_applied,
+            downward_auth_applied,
             "a SuspendCapability against a present member applies a downward-auth \
              suspension and must signal the fail-closed flag (RED-CS3)"
         );
@@ -4375,7 +4375,7 @@ impl ClassSCell {
             "the suspension is applied in memory before the persist"
         );
 
-        // The handler persists fail-closed when `suspension_applied` (messaging.rs).
+        // The handler persists fail-closed when `downward_auth_applied` (messaging.rs).
         // Under FailPersistence it must surface the §9 durability error.
         let persist =
             crate::context::messaging_helpers::persist_state_fail_closed(&cell, &deps, &ctx);
@@ -4394,6 +4394,145 @@ impl ClassSCell {
                 .is_some_and(|caps| caps.contains(&Capability::MessagesWrite)),
             "keep-direction: the auto-suspension stays in memory through a persist \
              failure, so the denied capability is not silently re-granted (RED-CS3)"
+        );
+    }
+
+    /// ADR-049 §9 (RED-CS3) — a consequence-engine `AssignRole` DEMOTION is
+    /// persisted FAIL-CLOSED, exactly like a capability suspension. An
+    /// `AssignRole` consequence → `system_assign_role` REPLACES the member's
+    /// `member_capabilities` with the new role's set; on a demotion (admin→member
+    /// here) that is a downward-auth SHRINK of effective authority
+    /// (`member_capabilities` − `suspended_capabilities`). A coalesce-window crash
+    /// would restore the pre-demotion (HIGHER) `member_capabilities` from the
+    /// snapshot, silently re-granting the demoted member's removed authority — the
+    /// §9 invariant violation this test guards.
+    ///
+    /// It drives the demotion through the SAME view path the receive handler uses
+    /// (`enforce_triggered_consequences` against `class_c_view().split_class_c()`)
+    /// and asserts (a) the `downward_auth_applied` flag is `true` (so the caller
+    /// routes the persist fail-closed, not best-effort coalesced), (b) under a
+    /// FAILING persistence backend the handler's fail-closed persist surfaces the
+    /// §9 durability error (`PersistenceFailed`), and (c) the demotion is RETAINED
+    /// in memory (keep-direction) — the member's `member_capabilities` reflect the
+    /// LOWER role even when the persist failed.
+    #[tokio::test]
+    async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
+        use crate::context::governance_logic::{
+            EnforceConsequencesCtx, enforce_triggered_consequences,
+        };
+        use scp_protocol::context::roles::{Capability, RoleDefinition};
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, TriggeredConsequence,
+        };
+
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let mut cell = ClassSCell::new(fresh_state(0x72));
+        let ctx = ctx_hex(0x72);
+        let subject = DID("did:example:demote-subject".to_owned());
+
+        // Seed: a HIGH role ({MessagesRead, MessagesWrite}) and a LOW role
+        // ({MessagesRead}); the subject starts holding the HIGH role's
+        // capabilities. The subject must be present in BOTH `membership` (the
+        // present-member gate in `process_one_triggered_consequence`) AND
+        // `role_state.members` (the `system_assign_role` member check).
+        {
+            let mut view = cell.class_c_view();
+            view.membership_class_c_mut().add_member(
+                subject.clone(),
+                "high".to_owned(),
+                Vec::new(),
+            );
+            let role_state = view.role_state_mut();
+            role_state.role_definitions.insert(
+                "high".to_owned(),
+                RoleDefinition {
+                    name: "high".to_owned(),
+                    capabilities: HashSet::from([
+                        Capability::MessagesRead,
+                        Capability::MessagesWrite,
+                    ]),
+                },
+            );
+            role_state.role_definitions.insert(
+                "low".to_owned(),
+                RoleDefinition {
+                    name: "low".to_owned(),
+                    capabilities: HashSet::from([Capability::MessagesRead]),
+                },
+            );
+            role_state.members.insert(subject.as_ref().to_owned());
+            role_state.member_capabilities.insert(
+                subject.as_ref().to_owned(),
+                HashSet::from([Capability::MessagesRead, Capability::MessagesWrite]),
+            );
+        }
+
+        // An `AssignRole { to_role: "low" }` consequence demotes the subject,
+        // replacing `member_capabilities[subject]` with the LOWER set — a
+        // downward-auth mutation that MUST signal the fail-closed flag.
+        let rules = vec![ConsequenceRule {
+            trigger: scp_protocol::trust::consequence::ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "low".to_owned(),
+            },
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        }];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: rules[0].action.clone(),
+            evidence: Vec::new(),
+        }];
+
+        // Drive the demotion through the handler's exact view path.
+        let downward_auth_applied = {
+            let mut view = cell.class_c_view();
+            let mut split = view.split_class_c();
+            enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &ctx,
+                    member_did: &subject,
+                    now: 1_700_000_100,
+                    triggered: &triggered,
+                    rules: &rules,
+                    clock: deps.clock.as_ref(),
+                    event_log: deps.event_log.as_ref(),
+                    event_tx: None,
+                },
+            )
+        };
+        assert!(
+            downward_auth_applied,
+            "an AssignRole demotion shrinks `member_capabilities` and must signal \
+             the downward-auth fail-closed flag (RED-CS3)"
+        );
+        assert_eq!(
+            cell.role_state.member_capabilities.get(subject.as_ref()),
+            Some(&HashSet::from([Capability::MessagesRead])),
+            "the demotion is applied in memory before the persist: the member now \
+             holds only the LOWER role's capabilities (MessagesWrite removed)"
+        );
+
+        // The handler persists fail-closed when `downward_auth_applied`
+        // (messaging.rs / governance.rs). Under FailPersistence it must surface
+        // the §9 durability error rather than a silent coalesced ack.
+        let persist =
+            crate::context::messaging_helpers::persist_state_fail_closed(&cell, &deps, &ctx);
+        let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "the §9 durability error must surface (not a silent coalesced ack): {err:?}"
+        );
+
+        // KEEP-direction: the demotion is RETAINED in memory after the failed
+        // persist — it is not silently lost on a coalesce-window crash, so the
+        // demoted member's removed authority is not silently re-granted.
+        assert_eq!(
+            cell.role_state.member_capabilities.get(subject.as_ref()),
+            Some(&HashSet::from([Capability::MessagesRead])),
+            "keep-direction: the demotion stays in memory through a persist failure, \
+             so the demoted member does not regain the higher role's authority (RED-CS3)"
         );
     }
 

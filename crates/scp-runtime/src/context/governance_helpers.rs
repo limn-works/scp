@@ -4697,17 +4697,18 @@ pub fn finalize_governance_action(
                 None
             };
 
-            // ADR-049 §9 (RED-CS3): a consequence here may apply a capability
-            // suspension. On THIS path the fail-closed persist is already owed by
-            // the caller — `execute_governance_action` runs this whole
+            // ADR-049 §9 (RED-CS3): a consequence here may apply a downward-auth
+            // mutation (a capability suspension or an `AssignRole` demotion). On
+            // THIS path the fail-closed persist is already owed by the caller —
+            // `execute_governance_action` runs this whole
             // `finalize_governance_action` body inside the deferred
             // `ClassSCommitToken::discharge_with`, which performs a SINGLE
             // FAIL-CLOSED persist of the post-finalize state (keep-direction).
-            // So the returned suspension flag needs no separate persist here; it
-            // is accumulated only to honour the `#[must_use]` contract and make
+            // So the returned downward-auth flag needs no separate persist here;
+            // it is accumulated only to honour the `#[must_use]` contract and make
             // the coverage explicit.
             let mut split = ConsequenceStateSplit::from_state(state);
-            let mut suspension_applied = enforce_triggered_consequences(
+            let mut downward_auth_applied = enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id,
@@ -4722,7 +4723,7 @@ pub fn finalize_governance_action(
             );
             if let Some((target, triggered)) = triggered_target {
                 let mut split = ConsequenceStateSplit::from_state(state);
-                suspension_applied |= enforce_triggered_consequences(
+                downward_auth_applied |= enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {
                         context_id,
@@ -4738,7 +4739,7 @@ pub fn finalize_governance_action(
             }
             // Covered fail-closed by the caller's `discharge_with` commit (above);
             // the flag is consumed (not separately persisted) on this path.
-            let _ = suspension_applied;
+            let _ = downward_auth_applied;
         }
     }
 

@@ -98,22 +98,25 @@ fn append_consequence_event(
 ///   and CANNOT reach `governance.class_s`, so a consequence helper cannot
 ///   accidentally mutate a Class-S governance field with no fail-closed persist.
 /// - `role_state: &'a mut ContextRoleState` — a whole-substruct `&mut` that can
-///   reach the dual-use downward-auth Class-S fields `ceiling` /
-///   `suspended_capabilities`. The consequence anti-spam suspension
-///   (`suspend_all` / `suspend_capabilities`) mutates `suspended_capabilities`
-///   through it IN MEMORY during evaluation — but that suspension is no longer a
-///   §9 BYPASS: [`enforce_triggered_consequences`] now RETURNS a downward-auth
-///   flag (`true` iff a suspension was applied), and the cell-holding caller
-///   persists the suspension FAIL-CLOSED (keep-direction) before acking
-///   (ADR-049 §9, RED-CS3). So the behavioral hole (a coalesce-window crash
-///   losing the suspension and re-granting a denied capability) is CLOSED. The
-///   whole-`&mut` itself REMAINS for now (a structural residual, not a
-///   behavioral one): the consequence path legitimately needs to apply the
-///   in-memory suspension, and the field-granular [`RoleStateClassCMut`] exposes
-///   `suspended_capabilities` read-only. `ceiling` is never written on this
-///   path. Narrowing `role_state` to a field-granular shape (mutating
-///   `suspended_capabilities` through a method while the persist stays
-///   fail-closed at the caller) is the remaining cleanup, tracked alongside
+///   reach the dual-use downward-auth fields `ceiling` /
+///   `suspended_capabilities` AND the authorization-input field
+///   `member_capabilities`. The consequence path mutates `role_state` IN MEMORY
+///   during evaluation in two downward-auth ways — an anti-spam suspension
+///   (`suspend_all` / `suspend_capabilities`, a `suspended_capabilities` GROW)
+///   and an `AssignRole` demotion (`system_assign_role`, a `member_capabilities`
+///   REPLACEMENT) — but neither is a §9 BYPASS:
+///   [`enforce_triggered_consequences`] now RETURNS a downward-auth flag (`true`
+///   iff a downward-auth mutation was applied — either direction), and the
+///   cell-holding caller persists the mutated state FAIL-CLOSED (keep-direction)
+///   before acking (ADR-049 §9, RED-CS3). So the behavioral hole (a
+///   coalesce-window crash losing the suspension/demotion and re-granting removed
+///   authority) is CLOSED. The whole-`&mut` itself REMAINS for now (a structural
+///   residual, not a behavioral one): the consequence path legitimately needs to
+///   apply the in-memory mutations, and the field-granular [`RoleStateClassCMut`]
+///   exposes `suspended_capabilities` read-only. `ceiling` is never written on
+///   this path. Narrowing `role_state` to a field-granular shape (mutating
+///   through methods while the persist stays fail-closed at the caller) is the
+///   remaining cleanup, tracked alongside
 ///   [`super::actor::class_s::ClassCMut::role_state_mut`].
 /// - `membership: &'a MembershipState` (read-only), `receive_buffer`,
 ///   `checkpoint_events_since` — unchanged.
@@ -189,42 +192,49 @@ pub struct EnforceConsequencesCtx<'a> {
 /// checkpoint-position drift otherwise).
 ///
 /// **Downward-authorization fail-closed contract (ADR-049 §9, RED-CS3):** the
-/// return value is `true` iff at least one triggered consequence applied a
-/// **capability suspension** — a mutation of the Class-S downward-authorization
-/// field `ContextRoleState.suspended_capabilities` (via `suspend_capabilities` /
-/// `suspend_all`). EVALUATION itself (cooldowns, velocity ticks, event emission,
-/// the `checkpoint_events_since` bump, durable Merkle appends) stays best-effort
-/// / coalesced — it is the hot per-message path and is NOT persisted
-/// synchronously here. Only the rare suspension OUTCOME must be durable
-/// fail-closed before the actor acks, because a coalesce-window crash would
-/// otherwise lose the suspension and silently re-grant a denied capability. The
-/// in-memory suspension is applied here; the cell-holding caller observes this
-/// flag and, when `true`, performs a fail-closed persist of the
-/// already-mutated state (keep-direction: the suspension STAYS on persist
-/// failure). When `false`, no downward-auth transition occurred and the caller's
-/// ordinary coalesced persist is sufficient.
+/// return value is `true` iff at least one triggered consequence performed a
+/// **downward-authorization mutation** that reduced a member's effective
+/// authority (`member_has_capability` = `member_capabilities` −
+/// `suspended_capabilities`). There are TWO such mutations and the flag covers
+/// BOTH: (1) a `suspended_capabilities` GROW (`suspend_capabilities` /
+/// `suspend_all`, i.e. `SuspendCapability` / `SuspendAccess` / the H10
+/// `SuspendAll` escalation), and (2) an `AssignRole` `member_capabilities`
+/// REPLACEMENT (`system_assign_role`) — a demotion shrinks the member's granted
+/// set. EVALUATION itself (cooldowns, velocity ticks, event emission, the
+/// `checkpoint_events_since` bump, durable Merkle appends) stays best-effort /
+/// coalesced — it is the hot per-message path and is NOT persisted synchronously
+/// here. Only the rare downward-auth OUTCOME must be durable fail-closed before
+/// the actor acks, because a coalesce-window crash would otherwise restore the
+/// pre-mutation role state and silently re-grant the removed authority. The
+/// in-memory mutation is applied here; the cell-holding caller observes this flag
+/// and, when `true`, performs a fail-closed persist of the already-mutated state
+/// (keep-direction: the suspension / demotion STAYS on persist failure). When
+/// `false`, no downward-auth transition occurred and the caller's ordinary
+/// coalesced persist is sufficient.
 #[must_use]
 pub fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
 ) -> bool {
     let context_id_bytes = context_id_to_bytes(args.context_id);
-    let mut suspension_applied = false;
+    let mut downward_auth_applied = false;
     for consequence in args.triggered {
-        suspension_applied |=
+        downward_auth_applied |=
             process_one_triggered_consequence(state, args, &context_id_bytes, consequence);
     }
-    suspension_applied
+    downward_auth_applied
 }
 
 /// Single-consequence body of [`enforce_triggered_consequences`].
 /// Extracted so the public function stays under `clippy::too_many_lines`.
 ///
-/// Returns `true` iff THIS consequence applied a capability suspension (a
-/// Class-S `suspended_capabilities` mutation — either the success-path
-/// `SuspendCapability` / `SuspendAccess` action or the H10 failure escalation to
-/// `SuspendAll`). The caller OR-accumulates this across the triggered set to
-/// decide whether a fail-closed persist of the suspension is owed (ADR-049 §9).
+/// Returns `true` iff THIS consequence performed a downward-authorization
+/// mutation owing a fail-closed persist (ADR-049 §9): a `suspended_capabilities`
+/// GROW (the success-path `SuspendCapability` / `SuspendAccess`, or the H10
+/// failure escalation to `SuspendAll`) OR an `AssignRole` `member_capabilities`
+/// replacement (a demotion shrinks the member's effective authority). The caller
+/// OR-accumulates this across the triggered set to decide whether a fail-closed
+/// persist of the already-mutated state is owed.
 fn process_one_triggered_consequence(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
@@ -353,11 +363,14 @@ fn process_one_triggered_consequence(
         durable,
     );
 
-    // `true` iff this successful action was a capability suspension (a Class-S
-    // `suspended_capabilities` mutation owing a fail-closed persist); `false` for
-    // a non-suspending action (e.g. `AssignRole`, which mutates only Class-C
-    // structural role state).
-    enforcement.suspended
+    // `true` iff this successful action reduced the member's effective authority
+    // and therefore owes a fail-closed persist (ADR-049 §9): a
+    // `suspended_capabilities` GROW (`SuspendCapability` / `SuspendAccess`) OR an
+    // `AssignRole` `member_capabilities` REPLACEMENT. `member_capabilities` is an
+    // authorization input — an `AssignRole` demotion is a downward-auth change, NOT
+    // a coalesce-safe "structural role state" mutation, which is exactly the
+    // misconception that left an earlier demotion-rollback window open.
+    enforcement.downward_auth
 }
 
 /// Emits a `ConsequenceTriggered` event. When `durable`, appends the durable
@@ -485,23 +498,44 @@ fn emit_consequence_enforced_success(
 /// Outcome of a single [`dispatch_enforcement_action`] call.
 ///
 /// `success` is the pre-existing enforced/failed signal that gates the H10
-/// escalation and cooldown recording. `suspended` is the ADR-049 §9
-/// downward-authorization signal: `true` iff the action GREW the Class-S
-/// `ContextRoleState.suspended_capabilities` set (a `suspend_capabilities` /
-/// `suspend_all` capability suspension), so the caller can persist that mutation
-/// fail-closed. A SHRINK of that set (the `prune_suspensions_to_role_grants` an
-/// `AssignRole` runs) does NOT set `suspended`: a coalesce-window rollback of a
-/// prune can only re-suspend (re-narrow authority), the safe direction, so it
-/// owes no fail-closed persist. The two fields are distinct: `AssignRole` can
-/// succeed (and shrink-prune) without owing a fail-closed persist (`success:
-/// true`, `suspended: false`), and an empty `SuspendCapability` neither succeeds
-/// nor suspends (`success: false`, `suspended: false`).
+/// escalation and cooldown recording. `downward_auth` is the ADR-049 §9
+/// signal: `true` iff the action REDUCED the member's effective authority and
+/// therefore owes a fail-closed persist before the actor acks.
+///
+/// "Effective authority" is `member_has_capability` =
+/// `member_capabilities` − `suspended_capabilities`. There are TWO ways an
+/// enforcement action shrinks it, and `downward_auth` covers BOTH:
+///
+/// 1. **`suspended_capabilities` GROW** — `suspend_capabilities` / `suspend_all`
+///    add to the denied set. This is the capability-suspension direction
+///    (`SuspendCapability` with a non-empty set, `SuspendAccess`, and the H10
+///    `SuspendAll` escalation).
+/// 2. **`member_capabilities` REPLACEMENT** — `AssignRole` →
+///    [`roles::system_assign_role`] REPLACES `member_capabilities[member]` with
+///    the new role's capability set (roles.rs `system_assign_role`). On a
+///    DEMOTION (e.g. admin→member) this is a downward-auth shrink: the member
+///    loses capabilities they previously held.
+///
+/// A coalesce-window crash (the ~50ms `COALESCE_INTERVAL` best-effort persist)
+/// would restore the pre-mutation role state from the snapshot, silently
+/// re-granting the just-removed authority. So any action in either category
+/// MUST be persisted fail-closed (keep-direction). `downward_auth` is the flag
+/// the caller OR-accumulates to decide between the fail-closed persist (when
+/// any `true`) and the ordinary coalesced persist (when all `false`).
+///
+/// The two fields are distinct: an empty `SuspendCapability` neither succeeds
+/// nor reduces authority (`success: false`, `downward_auth: false`), while an
+/// `AssignRole` always owes a fail-closed persist (`downward_auth: true`)
+/// because over-persisting a promotion is harmless (a coalesce-loss of a
+/// promotion is upward — the member temporarily lacks a capability they will
+/// regain, the safe direction).
 struct EnforcementOutcome {
     /// Whether the action was enforced (vs. failed → H10 escalation).
     success: bool,
-    /// Whether the action mutated `suspended_capabilities` (a downward-auth
-    /// Class-S transition owing a fail-closed persist).
-    suspended: bool,
+    /// Whether the action reduced the member's effective authority (a
+    /// `suspended_capabilities` GROW or a `member_capabilities` replacement),
+    /// and therefore owes a fail-closed persist (ADR-049 §9).
+    downward_auth: bool,
 }
 
 /// Per-arm enforcement dispatch. Each match arm calls a named function as
@@ -519,20 +553,21 @@ fn dispatch_enforcement_action(
             use scp_protocol::trust::consequence::EnforcementSeverity;
             match severity {
                 EnforcementSeverity::SuspendCapability { capabilities } => {
-                    // A non-empty suspend mutates `suspended_capabilities`
-                    // (success ⟺ suspended here); an empty set does neither.
+                    // A non-empty suspend GROWS `suspended_capabilities`
+                    // (success ⟺ downward_auth here); an empty set does neither.
                     let suspended = enforce_suspend(role_state, member_did, capabilities);
                     EnforcementOutcome {
                         success: suspended,
-                        suspended,
+                        downward_auth: suspended,
                     }
                 }
                 EnforcementSeverity::SuspendAccess => {
-                    // SuspendAccess: suspend all capabilities via role_state.
+                    // SuspendAccess: suspend all capabilities via role_state — a
+                    // `suspended_capabilities` GROW, so it is downward-auth.
                     role_state.suspend_all(member_did.as_ref());
                     EnforcementOutcome {
                         success: true,
-                        suspended: true,
+                        downward_auth: true,
                     }
                 }
                 EnforcementSeverity::RevokeAccess { .. }
@@ -550,27 +585,32 @@ fn dispatch_enforcement_action(
                     );
                     EnforcementOutcome {
                         success: false,
-                        suspended: false,
+                        downward_auth: false,
                     }
                 }
             }
         }
         scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
-            // AssignRole mutates the structural role state (`assignments` /
-            // `member_capabilities`) and, of the downward-auth pair, touches
-            // `suspended_capabilities` ONLY via the SHRINK-only
-            // `prune_suspensions_to_role_grants` `system_assign_role` runs (it
-            // drops the member's suspensions for capabilities the new role no
-            // longer grants). `suspended: false` is therefore correct — a prune
-            // owes NO fail-closed persist: a coalesce-window rollback can only
-            // RE-SUSPEND a dropped entry (re-narrow authority), never re-grant a
-            // removed capability, and it rolls back in lockstep with the
-            // same-persist `member_capabilities` replacement. Only the GROW
-            // direction (`suspend_capabilities` / `suspend_all`) owes a
-            // fail-closed persist (sets `suspended: true` in the arms above).
+            // AssignRole → `system_assign_role` REPLACES
+            // `member_capabilities[member]` with the new role's capability set
+            // (roles.rs `system_assign_role`). On a DEMOTION (e.g. admin→member)
+            // this is a downward-auth SHRINK of the member's effective authority
+            // (`member_has_capability` = `member_capabilities` −
+            // `suspended_capabilities`), so it MUST be persisted fail-closed: a
+            // coalesce-window crash would restore the pre-demotion (HIGHER)
+            // `member_capabilities` from the snapshot and silently re-grant the
+            // removed authority. `downward_auth: true` UNCONDITIONALLY is both
+            // correct and the simplest correct option — over-persisting a
+            // PROMOTION is harmless: a coalesce-loss of a promotion is upward
+            // (the member temporarily lacks a capability they will regain, the
+            // safe direction). We deliberately do NOT diff capability sets to
+            // detect demotion-vs-promotion; unconditional `true` is sound and
+            // simpler. (The SHRINK-only `prune_suspensions_to_role_grants` that
+            // `system_assign_role` also runs is incidental — it rolls back in
+            // lockstep with the same-persist `member_capabilities` replacement.)
             EnforcementOutcome {
                 success: enforce_assign_role(role_state, member_did, to_role, clock),
-                suspended: false,
+                downward_auth: true,
             }
         }
     }
