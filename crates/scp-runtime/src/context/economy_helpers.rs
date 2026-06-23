@@ -75,48 +75,19 @@ pub async fn verify_payment_receipts(
 }
 
 // ---------------------------------------------------------------------------
-// authorize_paid_action (escrow phase 1)
+// authorize_paid_action (escrow phase 1) — sync `prepare` + async `hold` split
 // ---------------------------------------------------------------------------
-
-/// Authorizes a paid action (escrow pattern, step 1).
-///
-/// Evaluates cost from actor-owned governance policy and metrics, checks
-/// spending authorization through the payment integration layer, and
-/// calls the configured adapter to create an escrow hold.
-///
-/// Returns `Ok(None)` when no payment adapter is configured, no economic
-/// policy is configured, or the evaluated cost is zero.
-///
-/// # Errors
-///
-/// Returns any error from the payment integration layer mapped to
-/// [`ContextError`].
-// Transitional Phase 2A surface: messaging/lifecycle call the legacy
-// twins until those domains migrate to actor-owned state.
 //
-// ADR-049 §9 Class-S cell seam: this `&mut PerContextState`-shaped wrapper is the
-// SEND-path surface (`messaging_helpers::authorize_send_payment`). It composes
-// the sync state-reading half ([`authorize_paid_action_prepare`]) with the async
-// escrow-hold half ([`authorize_paid_action_hold`]). The split exists because the
-// async future must be `Send`, but a borrow of `&PerContextState` held across an
+// ADR-049 §9 Class-S cell seam: paid-action authorization is split into a SYNC
+// state-reading half ([`authorize_paid_action_prepare`]) and an async escrow-hold
+// half ([`authorize_paid_action_hold`]). The split exists because the async
+// future must be `Send`, but a borrow of `&PerContextState` held across an
 // `.await` is NOT `Send` (`PerContextState` is `!Sync` — it owns a `!Sync`
-// `Box<dyn FnMut>` in the epoch-grace store). So the join tail reads state through
-// the SYNC prepare (a `&*cell` borrow that drops before the await — owned
+// `Box<dyn FnMut>` in the epoch-grace store). So a caller reads state through the
+// SYNC prepare (a `&*cell` borrow that drops before the await — owned
 // `OwnedAuthInputs` cross the boundary) and then awaits the hold with NO state
-// borrow live; the send path keeps its whole-`&mut` call shape via this wrapper.
-#[allow(dead_code)]
-pub async fn authorize_paid_action(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    action_type: PaidActionType,
-    payer_did: &DID,
-    context_id: &str,
-) -> Result<Option<PaidActionAuthorization>, ContextError> {
-    let Some(inputs) = authorize_paid_action_prepare(state, deps, action_type, payer_did) else {
-        return Ok(None);
-    };
-    authorize_paid_action_hold(inputs, payer_did, context_id).await
-}
+// borrow live. Both the send (`messaging_helpers::authorize_send_payment_prepare`)
+// and join (`lifecycle_helpers::join_context`) paths drive the pair directly.
 
 /// Owned inputs that cross the sync→async boundary of the authorize split. All
 /// fields are owned / `Send`, so the async [`authorize_paid_action_hold`] future

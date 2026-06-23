@@ -39,7 +39,7 @@ use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
     ProposalId, ProposalStatus, PruningPolicy,
 };
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::ToolRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
 use scp_protocol::context::tools::interface::ToolInterface;
@@ -1312,7 +1312,11 @@ pub fn execute_remove_member(
         );
 
         try_broadcast_commit_or_enqueue(
-            state,
+            CommitBroadcastBorrows {
+                pending_commits: &mut state.pending_commits,
+                commit_fault: &mut state.commit_fault,
+                receive_buffer: &mut state.receive_buffer,
+            },
             deps,
             context_id,
             remove_output.commit_bytes,
@@ -2222,7 +2226,7 @@ pub fn execute_establish_tool_interface(
 // ---------------------------------------------------------------------------
 
 pub fn execute_reset_member(
-    state: &mut PerContextState,
+    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -2236,9 +2240,9 @@ pub fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    require_active(view.handle_mut())?;
 
-    if !state.membership.contains(did) {
+    if !view.membership_class_c_mut().contains(did.as_ref()) {
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
@@ -2253,7 +2257,7 @@ pub fn execute_reset_member(
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     try_broadcast_commit_or_enqueue(
-        state,
+        view.commit_broadcast_borrows(),
         deps,
         context_id,
         remove_output.commit_bytes,
@@ -2263,7 +2267,7 @@ pub fn execute_reset_member(
         },
     );
     try_broadcast_commit_or_enqueue(
-        state,
+        view.commit_broadcast_borrows(),
         deps,
         context_id,
         add_output.commit_bytes,
@@ -2312,8 +2316,10 @@ pub fn execute_reset_member(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
-    state.governance.pending_epoch_resets.push(did.clone());
+    *view.checkpoint_events_since_mut() += 1;
+    view.governance_class_c_mut()
+        .pending_epoch_resets_mut()
+        .push(did.clone());
 
     Ok(())
 }
@@ -2585,7 +2591,11 @@ pub fn execute_rotate_content_keys(
 
         if let Some(epoch_out) = epoch_output {
             try_broadcast_commit_or_enqueue(
-                state,
+                CommitBroadcastBorrows {
+                    pending_commits: &mut state.pending_commits,
+                    commit_fault: &mut state.commit_fault,
+                    receive_buffer: &mut state.receive_buffer,
+                },
                 deps,
                 context_id,
                 epoch_out.commit_bytes,
@@ -3873,7 +3883,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
-                cell.state_mut(),
+                &mut cell.class_c_view(),
                 deps,
                 context_id,
                 did,
@@ -4844,6 +4854,26 @@ pub async fn execute_governance_action(
 // try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
 // ---------------------------------------------------------------------------
 
+/// The three disjoint Class-C `&mut` fields
+/// [`try_broadcast_commit_or_enqueue`] mutates, threaded as ONE struct so the
+/// caller holds all three at once (they are distinct fields of
+/// [`PerContextState`], so the borrow checker accepts the simultaneous `&mut`).
+///
+/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast
+/// helper touches ONLY the MLS Commit retry queue (`pending_commits`), the
+/// queue-full fail-close marker (`commit_fault`), and the local receive buffer
+/// (`receive_buffer`). All three are Class-C / structural / best-effort (no
+/// fail-closed persist; see the function's doc), so the field-granular borrow is
+/// sound — there is no whole-state `&mut` and no reach to any Class-S sub-struct.
+pub struct CommitBroadcastBorrows<'a> {
+    /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
+    pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
+    /// `&mut` to the queue-full fail-close marker (Class-C / structural).
+    pub commit_fault: &'a mut Option<CommitFaultMarker>,
+    /// `&mut` to the local receive buffer (Class-C / structural).
+    pub receive_buffer: &'a mut ReceiveBuffer,
+}
+
 /// Attempts to broadcast an MLS Commit and, on transport failure,
 /// enqueues the commit in the persistent retry queue (PR #1606 C6).
 ///
@@ -4859,8 +4889,22 @@ pub async fn execute_governance_action(
 /// retry queue (or a `commit_fault` marker when the queue is full) rather
 /// than propagated. Dropping the durable commit-lifecycle appends removed the
 /// function's only `Result`-returning path.
+///
+/// # Field-granular borrows (ADR-049 §9)
+///
+/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut`
+/// fields it actually touches (`pending_commits`, `commit_fault`,
+/// `receive_buffer`) — rather than a whole `&mut PerContextState`. A cell holder
+/// supplies them from a non-persisting [`crate::context::actor::class_s::ClassCMut`]
+/// view (`view.commit_broadcast_borrows()`); a bare-`&mut state` caller supplies
+/// them by disjoint field borrow. All three fields are Class-C / structural and
+/// best-effort: the enqueue is a retry-queue bookkeeping insert, the
+/// `commit_fault` marker is the queue-full fail-close surfaced LOCALLY only
+/// (never a durable Merkle leaf — see the §9.9.3 note above), and the
+/// `receive_buffer` emit is a local `ContextEvent`. None requires a fail-closed
+/// persist, so the field-granular best-effort shape is sound.
 pub fn try_broadcast_commit_or_enqueue(
-    state: &mut PerContextState,
+    borrows: CommitBroadcastBorrows<'_>,
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
@@ -4869,6 +4913,11 @@ pub fn try_broadcast_commit_or_enqueue(
     if commit_bytes.is_empty() {
         return;
     }
+    let CommitBroadcastBorrows {
+        pending_commits,
+        commit_fault,
+        receive_buffer,
+    } = borrows;
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     match deps.transport.send_message(&routing_id, &commit_bytes) {
         Ok(()) => {}
@@ -4888,36 +4937,36 @@ pub fn try_broadcast_commit_or_enqueue(
             let label = operation.label();
 
             // N2: Cap the pending commits queue.
-            if state.pending_commits.len() >= MAX_PENDING_COMMITS {
-                state.commit_fault = Some(CommitFaultMarker {
+            if pending_commits.len() >= MAX_PENDING_COMMITS {
+                *commit_fault = Some(CommitFaultMarker {
                     operation: operation.clone(),
                     reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
                     retry_count: 1,
                     failed_at: now,
                 });
-                emit(
-                    state,
+                emit_event_into(
+                    receive_buffer,
                     ContextEvent::CommitBroadcastFailed {
                         operation: label,
                         reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
                         attempts: 1,
                     },
                     context_id,
-                    deps,
+                    deps.event_tx.as_ref(),
                 );
                 return;
             }
-            state.pending_commits.push_back(pending);
+            pending_commits.push_back(pending);
             let label_for_event = label.clone();
-            emit(
-                state,
+            emit_event_into(
+                receive_buffer,
                 ContextEvent::CommitBroadcastPending {
                     operation: label_for_event,
                     error: error_str.clone(),
                     attempt: 1,
                 },
                 context_id,
-                deps,
+                deps.event_tx.as_ref(),
             );
             tracing::warn!(
                 context_id = %context_id,

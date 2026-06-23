@@ -72,13 +72,12 @@ pub(crate) async fn dispatch(
             // SendMessage reaches the spending-nonce leaf
             // (`enforce_send_economy`) via `send_message`, so it is threaded the
             // cell. The pure Class-C variants below (`ReportDegradedMode`,
-            // `BuildLocalCheckpoint`, `CompareRemoteCheckpoint`) are threaded the
-            // cell too and reach their fields through the non-persisting
-            // `class_c_view`. `DeliverIncoming` still takes `state_mut()`: its
-            // receive cascade is exercised directly with a bare
-            // `&mut PerContextState` by the `deliver_message_and_drain_buffered`
-            // unit tests, which cannot construct a `ClassCMut` view (no cell-free
-            // `ClassCMut::from_state`), so narrowing it is blocked outside this scope.
+            // `BuildLocalCheckpoint`, `CompareRemoteCheckpoint`, `DeliverIncoming`)
+            // are threaded the cell too and reach their fields through the
+            // non-persisting `class_c_view`: the entire receive cascade makes only
+            // Class-C / structural mutations (sequence/reorder/receive buffers,
+            // membership[read], role[read], routing, the ConsequenceStateSplit
+            // Class-C fields), so no whole-state `state_mut()` is needed.
             handle_send_message(
                 cell,
                 deps,
@@ -98,10 +97,7 @@ pub(crate) async fn dispatch(
             context_id,
             envelope_bytes,
             reply,
-        } => {
-            handle_deliver_incoming(cell.state_mut(), deps, &context_id, &envelope_bytes, reply)
-                .await
-        }
+        } => handle_deliver_incoming(cell, deps, &context_id, &envelope_bytes, reply).await,
         MessagingCommand::DrainEvents { context_id, reply } => {
             handle_drain_events(cell, &context_id, reply).await
         }
@@ -311,14 +307,24 @@ async fn handle_send_message(
 /// budget. Precedent: `handlers::broadcast::handle_broadcast_*` wraps
 /// sync helpers the same way.
 async fn handle_deliver_incoming(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation (the run loop persists on `mutated`); the entire
+    // receive cascade reaches its fields through the non-persisting `class_c_view`
+    // — it makes no Class-S mutation (sequence/reorder/receive buffers,
+    // membership[read], role[read], routing, ConsequenceStateSplit Class-C only).
+    let mut view = cell.class_c_view();
     let deliver_fut = async {
-        crate::context::messaging_helpers::deliver_incoming(state, deps, context_id, envelope_bytes)
+        crate::context::messaging_helpers::deliver_incoming(
+            &mut view,
+            deps,
+            context_id,
+            envelope_bytes,
+        )
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {

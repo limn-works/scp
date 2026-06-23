@@ -66,7 +66,7 @@
 //!
 //! - [`event_log_entries`] — passthrough on `deps.event_log` (no per-
 //!   context state).
-//! - [`create_checkpoint_if_due`],
+//! - [`create_checkpoint_if_due_view`],
 //!   [`force_create_checkpoint_fields`] — field-disjoint signatures
 //!   used by `messaging_helpers` / `lifecycle_helpers` actor paths to
 //!   drive §9.9.3 checkpointing.
@@ -602,67 +602,6 @@ pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u6
 // Checkpoint operations (§9.9.3, ADR-011 AC-8) — actor-shape entries
 // ===========================================================================
 
-/// Creates a consistency checkpoint when due (§9.9.3 thresholds).
-///
-/// Takes per-field references so callers may pass disjoint sub-borrows
-/// of the unified [`PerContextState`] (ADR-049 §Decision 1). The `now`
-/// value is supplied by the caller (typically `deps.clock.now_secs()`)
-/// so the body remains pure.
-///
-/// A checkpoint is due when either:
-/// - 50 events have been appended since the last checkpoint, or
-/// - 10 minutes have elapsed since the last checkpoint.
-#[allow(clippy::too_many_arguments)] // Required to avoid a per-call wrapper struct allocation.
-pub fn create_checkpoint_if_due(
-    context_id: &str,
-    broadcast_context_is_none: bool,
-    mls_epoch: u64,
-    checkpoints: &mut Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
-    checkpoint_events_since: &mut u64,
-    checkpoint_last_time_secs: &mut u64,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-    now: u64,
-    event_log: &dyn ContextEventLogProvider,
-) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
-    let events_due = *checkpoint_events_since >= 50;
-    // Time-based checkpoints require at least one event — creating a
-    // checkpoint for zero events is wasteful and indistinguishable from
-    // the previous checkpoint.
-    let time_due =
-        *checkpoint_events_since > 0 && now.saturating_sub(*checkpoint_last_time_secs) >= 600;
-
-    if !events_due && !time_due {
-        return None;
-    }
-
-    let cp = build_checkpoint(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        sender_did,
-        signing_key,
-        now,
-        event_log,
-    );
-
-    *checkpoint_events_since = 0;
-    *checkpoint_last_time_secs = now;
-    checkpoints.push(cp.clone());
-
-    if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
-        checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
-    }
-
-    tracing::debug!(
-        context_id,
-        event_count = cp.event_count,
-        "consistency checkpoint created (§9.9.3)"
-    );
-
-    Some(cp)
-}
-
 /// Unconditionally creates a consistency checkpoint regardless of
 /// whether the event/time thresholds have been reached. Takes per-field
 /// references so callers may pass disjoint sub-borrows of the unified
@@ -758,6 +697,73 @@ pub fn force_create_checkpoint_view(
     );
 
     cp
+}
+
+/// Creates a consistency checkpoint when due (§9.9.3 thresholds) via a
+/// [`ClassCMut`] view — the actor-shape checkpoint entry for the send path.
+///
+/// Same §9.9.3 gating (50-event / 600-second thresholds) and semantics as the
+/// unconditional [`force_create_checkpoint_view`], but reaches the three Class-C
+/// checkpoint
+/// fields (`checkpoint_events_since`, `checkpoint_last_time_secs`,
+/// `checkpoints`) through the view's field-granular accessors, touched in
+/// SEPARATE statements so each `&mut` borrow ends before the next — which is
+/// what lets the send path drive this with no whole `&mut PerContextState` (nor
+/// a 3-field simultaneous borrow). `broadcast_context_is_none` and `mls_epoch`
+/// are read by the caller from the view (their borrows released) before this
+/// call. Returns the built checkpoint when one was due, else `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_checkpoint_if_due_view(
+    view: &mut ClassCMut,
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+    let events_since = *view.checkpoint_events_since_mut();
+    let last_time = *view.checkpoint_last_time_secs_mut();
+    let events_due = events_since >= 50;
+    // Time-based checkpoints require at least one event — creating a checkpoint
+    // for zero events is wasteful and indistinguishable from the previous one.
+    let time_due = events_since > 0 && now.saturating_sub(last_time) >= 600;
+
+    if !events_due && !time_due {
+        return None;
+    }
+
+    let cp = build_checkpoint(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        sender_did,
+        signing_key,
+        now,
+        event_log,
+    );
+
+    // Sequential per-field view accessors: each `&mut` borrow ends before the
+    // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
+    // borrow) is needed.
+    *view.checkpoint_events_since_mut() = 0;
+    *view.checkpoint_last_time_secs_mut() = now;
+    {
+        let checkpoints = view.checkpoints_mut();
+        checkpoints.push(cp.clone());
+        if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
+    }
+
+    tracing::debug!(
+        context_id,
+        event_count = cp.event_count,
+        "consistency checkpoint created (§9.9.3)"
+    );
+
+    Some(cp)
 }
 
 /// Builds a signed checkpoint from the current event log. Pure function
@@ -993,42 +999,6 @@ pub fn compare_remote_checkpoint(
     {
         emit_equivocation_alert(
             view.receive_buffer_mut(),
-            deps,
-            context_id,
-            remote,
-            local_root,
-        );
-    }
-
-    Ok(comparison)
-}
-
-/// Bare-state sibling of [`compare_remote_checkpoint`] for the RECEIVE path
-/// (`deliver_checkpoint_message`), which already holds a `&mut PerContextState`
-/// (threaded down from `deliver_incoming`) and so cannot supply a [`ClassCMut`]
-/// view. Shares the [`classify_remote_checkpoint`] core; applies the divergence
-/// recording over the two disjoint Class-C fields (`last_seen_remote_checkpoint`
-/// + `receive_buffer`) borrowed directly from `state`.
-///
-/// # Errors
-///
-/// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved or the
-///   Ed25519 signature verification fails.
-pub fn compare_remote_checkpoint_bare(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
-) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
-    let sender_is_member = state.membership.contains(remote.sender_did.as_ref());
-    let (comparison, divergence_root) =
-        classify_remote_checkpoint(sender_is_member, deps, context_id, remote)?;
-
-    if let Some(local_root) = divergence_root {
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
             deps,
             context_id,
             remote,

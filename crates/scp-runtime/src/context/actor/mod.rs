@@ -1756,7 +1756,7 @@ mod tests {
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
         let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1784,7 +1784,7 @@ mod tests {
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1816,7 +1816,7 @@ mod tests {
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
 
         let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            &mut state,
+            &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
             &deps,
             &ctx,
             &ctx_bytes,
@@ -1841,7 +1841,7 @@ mod tests {
         for (seq, rid) in [(1u64, [0x42u8; 32]), (2u64, [0x43u8; 32])] {
             let inner = minimal_inner(&ctx, DIRECT_ALICE, seq);
             let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-                &mut state,
+                &mut crate::context::actor::class_s::ClassCMut::from_state(&mut state),
                 &deps,
                 &ctx,
                 &ctx_bytes,

@@ -257,7 +257,7 @@ pub const CONSISTENCY_CHECKPOINT_DOMAIN_SEPARATOR: &str = "SCP-CHECKPOINT-V1:";
 /// [`scp_event_log::checkpoint::verify_checkpoint_signature`]).
 ///
 /// The pre-ADR-049 duplicate that lived here has been removed: the actor
-/// state, `create_checkpoint_if_due`, the FFI bridges, and this sync layer
+/// state, `create_checkpoint_if_due_view`, the FFI bridges, and this sync layer
 /// all reference one type, so a checkpoint produced by the event log can be
 /// compared and embedded as equivocation evidence without a lossy conversion.
 ///

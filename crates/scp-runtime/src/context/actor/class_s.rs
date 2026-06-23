@@ -1027,6 +1027,24 @@ impl<'a> RoleStateClassCMut<'a> {
     pub(crate) const fn suspended_capabilities(&self) -> &HashMap<String, HashSet<Capability>> {
         self.suspended_capabilities
     }
+
+    /// Whether `member_did` currently holds `capability` (read). Mirrors
+    /// [`ContextRoleState::member_has_capability`] over the two fields this view
+    /// already holds: a suspension (DOWNWARD-AUTH Class-S, read here) masks an
+    /// otherwise-granted derived capability (Class-C). Pure read — no mutation,
+    /// so it neither reaches a Class-S `&mut` nor needs a fail-closed persist.
+    pub(crate) fn member_has_capability(&self, member_did: &str, capability: &Capability) -> bool {
+        if self
+            .suspended_capabilities
+            .get(member_did)
+            .is_some_and(|suspended| suspended.contains(capability))
+        {
+            return false;
+        }
+        self.member_capabilities
+            .get(member_did)
+            .is_some_and(|caps| caps.contains(capability))
+    }
 }
 
 /// RESTRICTED mutable view over the Class-C / structural mutation surface of a
@@ -1120,6 +1138,12 @@ impl<'a> MembershipClassCMut<'a> {
     /// [`MembershipState::get`].
     pub(crate) fn get(&self, did: &str) -> Option<&MemberInfo> {
         self.membership.get(did)
+    }
+
+    /// Iterate the member DIDs (read). Forwards
+    /// [`MembershipState::member_dids`].
+    pub(crate) fn member_dids(&self) -> impl Iterator<Item = &DID> {
+        self.membership.member_dids()
     }
 
     /// Remove a BROADCAST SUBSCRIBER from the roster (Class-C / best-effort).
@@ -1358,6 +1382,34 @@ impl<'a> ClassCMut<'a> {
         }
     }
 
+    /// Build a [`ClassCMut`] DIRECTLY from a `&mut PerContextState`, with NO
+    /// owning [`ClassSCell`] in scope.
+    ///
+    /// This is the cell-free bridge — the [`ClassCMut`] counterpart of
+    /// [`ClassCSplit::from_state`] — for the receive-cascade sites that hold a
+    /// bare `&mut PerContextState` (the `deliver_message_and_drain_buffered` unit
+    /// tests exercise `deliver_incoming` with a bare `&mut PerContextState`, with
+    /// no cell to call [`ClassSCell::class_c_view`] through). A cell holder
+    /// reaches the SAME view via `cell.class_c_view()`; this exposes it without a
+    /// cell.
+    ///
+    /// # Airtight BY CONSTRUCTION — identical to [`ClassSCell::class_c_view`]
+    ///
+    /// This delegates to [`Self::new`], which performs the SINGLE disjoint
+    /// destructure that is the airtightness guarantee: the whole
+    /// `&mut PerContextState` is consumed and only field-granular references
+    /// survive. It holds NO whole `&mut PerContextState`, NO whole
+    /// `&mut GovernanceState` (the `governance` bucket is wrapped in a
+    /// [`GovernanceClassCMut`], leaving `governance.class_s` in its `..` rest),
+    /// and NO `&mut` to [`ClassSState`] (the actor's `class_s` is bound a shared
+    /// `&`). A Class-S mutation through this view is therefore a COMPILE error by
+    /// construction — exactly as through the cell path — so the absence of a
+    /// fail-closed persist here is safe: every mutation it exposes is Class-C /
+    /// structural (coalesce-window rollback acceptable).
+    pub(crate) const fn from_state(state: &'a mut PerContextState) -> Self {
+        Self::new(state)
+    }
+
     /// Field-granular `&mut` access to the governance bucket via a
     /// [`GovernanceClassCMut`] sub-view, which exposes only the Class-C
     /// governance fields and CANNOT reach `governance.class_s`. This is the ONLY
@@ -1542,6 +1594,23 @@ impl<'a> ClassCMut<'a> {
         self.reorder_buffer
     }
 
+    /// Drain timed-out reorder-buffer gaps (Class-C / §9.8.5). Bundles the
+    /// simultaneous `&mut reorder_buffer` + `&sequence_tracker` borrow that
+    /// [`ReorderBuffer::drain_timed_out`] needs — both are distinct fields of
+    /// this view, so the aliasing is sound by construction, and keeping it behind
+    /// one method spares callers a borrow bundle. Best-effort: a coalesce-window
+    /// rollback of a drained gap is acceptable.
+    pub(crate) fn drain_timed_out_gaps(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<(
+        scp_protocol::envelope::validation::GapInfo,
+        Vec<scp_protocol::envelope::validation::BufferedMessage>,
+    )> {
+        self.reorder_buffer
+            .drain_timed_out(now_ms, self.sequence_tracker)
+    }
+
     /// `&mut` access to the MLS Commit retry queue (Class-C / §9.9.3).
     /// Best-effort rollback acceptable.
     pub(crate) const fn pending_commits_mut(&mut self) -> &mut VecDeque<PendingCommit> {
@@ -1552,6 +1621,21 @@ impl<'a> ClassCMut<'a> {
     /// Best-effort rollback acceptable.
     pub(crate) const fn commit_fault_mut(&mut self) -> &mut Option<CommitFaultMarker> {
         self.commit_fault
+    }
+
+    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast helper
+    /// ([`crate::context::governance_helpers::try_broadcast_commit_or_enqueue`])
+    /// mutates, bundled so a cell holder can pass all three at once. Each is a
+    /// distinct field of this view, so the simultaneous `&mut` is sound by
+    /// construction; all three are Class-C / structural / best-effort.
+    pub(crate) const fn commit_broadcast_borrows(
+        &mut self,
+    ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
+        crate::context::governance_helpers::CommitBroadcastBorrows {
+            pending_commits: self.pending_commits,
+            commit_fault: self.commit_fault,
+            receive_buffer: self.receive_buffer,
+        }
     }
 
     /// `&mut` access to the last-checkpoint timestamp (Class-C / §9.9.3).
@@ -1753,6 +1837,13 @@ impl ClassSCell {
     /// at which point the only path to a `&mut PerContextState` is through the
     /// persist-on-commit combinators, making the Class-S fail-closed invariant a
     /// compile error to violate.
+    ///
+    /// `dead_code` allow: the messaging-domain migration removed the LAST
+    /// production callers (`send_message` + the `DeliverIncoming` handler now
+    /// route through `class_c_view` / the cell). The method is retained only so
+    /// the FINAL migration step can delete it together with the
+    /// `PerContextState` Class-S field privatization in one atomic change.
+    #[allow(dead_code)]
     pub(in crate::context) const fn state_mut(&mut self) -> &mut PerContextState {
         &mut self.state
     }
@@ -2898,6 +2989,28 @@ mod tests {
             recorded_nonce: [0x3Cu8; 16],
             recorded_chain_depth: 1,
         })
+    }
+
+    /// Seed a straggler caller-reservation into the Class-S
+    /// `xctx_caller_reservations` map through the sanctioned fail-closed
+    /// combinator (the SAME path production `prepare_a` uses), so the
+    /// `clear_committed_reservation_idempotent` straggler-cleanup path can be
+    /// exercised on a pre-seeded reservation WITHOUT the `state_mut()` escape
+    /// hatch. Returns nothing; panics if the seed persist does not land.
+    fn seed_caller_reservation_for_test(
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        context_id: &str,
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        record: crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    ) {
+        cell.commit_class_s_restore(deps, context_id, |mut view| {
+            view.class_s_mut()
+                .xctx_caller_reservations
+                .insert(saga_id, record);
+            Ok::<(), ContextError>(())
+        })
+        .expect("seed caller reservation persists");
     }
 
     // ------------------------------------------------------------------
@@ -4348,15 +4461,16 @@ mod tests {
         use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
 
         let persist_calls = Arc::new(AtomicUsize::new(0));
-        let _deps = build_deps(Box::new(SpyPersistence {
+        let deps = build_deps(Box::new(SpyPersistence {
             persist_calls: Arc::clone(&persist_calls),
         }))
         .await;
         let mut cell = ClassSCell::new(fresh_state(0x91));
+        let ctx = ctx_hex(0x91);
         let saga_a = saga("saga-straggler");
 
-        // Seed a straggler reservation directly via the temporary state_mut
-        // escape (test fixture only).
+        // Seed a straggler reservation via the test-only seed helper, which
+        // routes through the sanctioned fail-closed combinator (no `state_mut`).
         let record = CallerReservationRecord {
             actor_did: DID("did:example:straggler".to_owned()),
             deducted_cost: None,
@@ -4364,10 +4478,11 @@ mod tests {
             recorded_at_secs: 1_700_000_000,
             escrow_authorization: None,
         };
-        cell.state_mut()
-            .class_s
-            .xctx_caller_reservations
-            .insert(saga_a.clone(), record);
+        seed_caller_reservation_for_test(&mut cell, &deps, &ctx, saga_a.clone(), record);
+
+        // Snapshot the persist count AFTER the seed (the seed's combinator
+        // persisted once, fail-closed); the clears below must add ZERO.
+        let persist_after_seed = persist_calls.load(Ordering::SeqCst);
 
         // First clear removes the straggler.
         assert!(
@@ -4385,10 +4500,11 @@ mod tests {
             "second clear is an idempotent no-op (returns false)"
         );
 
-        // The method NEVER persists — no combinator was invoked.
+        // The clear method NEVER persists — no combinator was invoked by either
+        // clear call (the count is unchanged from the post-seed snapshot).
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
-            0,
+            persist_after_seed,
             "clear_committed_reservation_idempotent performs NO persist"
         );
     }

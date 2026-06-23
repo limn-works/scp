@@ -508,7 +508,7 @@ pub fn enforce_economy(
 /// Bundle of per-DID economy state that Phase 1 of a paid action took
 /// ownership of. Every ticket **must** be consumed by either
 /// [`commit_economy_ticket`] (success path) or
-/// [`rollback_economy_ticket_inline`] (failure path). Dropping a ticket
+/// [`rollback_economy_ticket_inline_view`] (failure path). Dropping a ticket
 /// without consuming it leaks budget
 /// deduction, a velocity entry, and a hard-rate-limit token — the
 /// `#[must_use]` attribute makes this a compile-time warning, and the
@@ -576,27 +576,31 @@ pub fn commit_economy_ticket(
 /// race concurrent senders), and the hard-rate-limit token (when the
 /// Phase 1 path consumed one).
 ///
-/// Takes a `&mut GovernanceState` directly so callers may build it from
-/// a sub-borrow of the unified [`super::state::PerContextState`]
-/// (ADR-049 §Decision 1) — actor-shape callers that hold disjoint
-/// borrows on other fields, and the lock-shaped helpers that already
-/// drove the legacy wrapper, both reach this entry point.
+/// Reverses the three Class-C governance fields (`velocity_tracker`,
+/// `hard_rate_limit`, `budget_tracker`) through the actor-shape
+/// [`GovernanceClassCMut`](crate::context::actor::class_s::GovernanceClassCMut)
+/// view's field-granular accessors, touched SEQUENTIALLY so each `&mut` borrow
+/// ends before the next — so the cell-holding send / join paths reverse a Phase-1
+/// ticket with no whole `&mut GovernanceState` (nor a 3-field simultaneous
+/// borrow). Every field it reverses is Class-C (the consume it undoes is itself
+/// reversed by the economy-compensation hook when a persist does not land), so
+/// no fail-closed persist and no Class-S reach is involved.
 ///
 /// Consumes the ticket so the `Drop` guard does not fire.
-pub fn rollback_economy_ticket_inline(
-    governance: &mut super::state::GovernanceState,
+pub fn rollback_economy_ticket_inline_view(
+    governance: &mut crate::context::actor::class_s::GovernanceClassCMut,
     mut ticket: EconomyTicket,
 ) {
     ticket.consumed = true;
     governance
-        .velocity_tracker
+        .velocity_tracker_mut()
         .rollback(&ticket.actor_did, ticket.velocity_token);
     if ticket.needs_hard_rate_limit_refund {
-        governance.hard_rate_limit.refund(&ticket.actor_did);
+        governance.hard_rate_limit_mut().refund(&ticket.actor_did);
     }
     if let Some(cost) = ticket.deducted_cost {
         governance
-            .budget_tracker
+            .budget_tracker_mut()
             .reverse_spend(&ticket.actor_did, cost);
     }
 }

@@ -222,9 +222,10 @@ pub async fn leave_context(
     // direction; the persist error is surfaced instead so the leave is not
     // acknowledged as durable. The body is entirely synchronous (the only
     // `.await`, the close-on-empty transition, runs AFTER the persist), so it
-    // fits the sync `_keep` closure. Shared helpers
-    // (`try_broadcast_commit_or_enqueue`, `check_commit_fault`) are called through
-    // the whole `&mut PerContextState` the view hands back, UNCHANGED.
+    // fits the sync `_keep` closure. `check_commit_fault` reads through the whole
+    // `&mut PerContextState` the view hands back; `try_broadcast_commit_or_enqueue`
+    // is passed only the three disjoint Class-C fields it mutates (via
+    // `CommitBroadcastBorrows`), borrowed from that same state.
     let should_close = cell.commit_class_s_keep(deps, &context_id, |mut view| {
         let state = view.rest_mut();
 
@@ -269,7 +270,11 @@ pub async fn leave_context(
             // C6: on transport failure, the commit is durably enqueued for
             // retry.
             governance_helpers::try_broadcast_commit_or_enqueue(
-                state,
+                governance_helpers::CommitBroadcastBorrows {
+                    pending_commits: &mut state.pending_commits,
+                    commit_fault: &mut state.commit_fault,
+                    receive_buffer: &mut state.receive_buffer,
+                },
                 deps,
                 &context_id,
                 remove_output.commit_bytes,
@@ -1278,28 +1283,24 @@ fn record_payment_capture_failure(
 /// for [`join_context`] through a `class_c_view()` borrow that drops before the
 /// caller's early return (so the cell is free for the subsequent `.await`s).
 ///
-/// This is the cell-holder counterpart of
-/// [`crate::context::economy_logic::rollback_economy_ticket_inline`] (which the
-/// send path still calls with a bare `&mut GovernanceState`): the velocity entry,
-/// hard-rate-limit token, and budget debit are all Class-C, so they reverse
-/// through the field-granular `GovernanceClassCMut` accessors with no whole-state
-/// borrow. Consumes the ticket so its `Drop` guard stays quiet.
+/// Thin cell-holder wrapper over the shared
+/// [`crate::context::economy_logic::rollback_economy_ticket_inline_view`] (also
+/// driven by the send path): the velocity entry, hard-rate-limit token, and
+/// budget debit are all Class-C, so they reverse through the field-granular
+/// `GovernanceClassCMut` accessors with no whole-state borrow. Consumes the
+/// ticket so its `Drop` guard stays quiet.
 fn rollback_join_economy_ticket(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    mut ticket: crate::context::economy_logic::EconomyTicket,
+    ticket: crate::context::economy_logic::EconomyTicket,
 ) {
-    ticket.consumed = true;
-    let mut view = cell.class_c_view();
-    let gov = view.governance_class_c_mut();
-    gov.velocity_tracker_mut()
-        .rollback(&ticket.actor_did, ticket.velocity_token);
-    if ticket.needs_hard_rate_limit_refund {
-        gov.hard_rate_limit_mut().refund(&ticket.actor_did);
-    }
-    if let Some(cost) = ticket.deducted_cost {
-        gov.budget_tracker_mut()
-            .reverse_spend(&ticket.actor_did, cost);
-    }
+    // Shared with the send path: reverse the three Class-C governance fields
+    // through the field-granular `GovernanceClassCMut` view. The `&mut view`
+    // borrow drops before the caller's early return (so the cell is free for the
+    // subsequent `.await`s).
+    crate::context::economy_logic::rollback_economy_ticket_inline_view(
+        cell.class_c_view().governance_class_c_mut(),
+        ticket,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3868,9 +3869,12 @@ mod restore_reconcile_tests {
         // Encrypted (non-broadcast) send: with `MessageSent` no longer a durable
         // leaf (M12), the FAILING event-log append is never invoked by
         // `finalize_send` for this send, so it SUCCEEDS. `signing_key = None`
-        // skips the post-send checkpoint path.
+        // skips the post-send checkpoint path. `finalize_send` is actor-shape
+        // (ADR-049 §9): wrap the state in the owning `ClassSCell` for the call,
+        // then reclaim it via `into_inner` for the post-send read below.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &context_id,
             &context_id_bytes,
@@ -3881,6 +3885,7 @@ mod restore_reconcile_tests {
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
         );
+        let mut state = cell.into_inner();
 
         assert!(
             result.is_ok(),
@@ -4035,16 +4040,21 @@ mod restore_reconcile_tests {
         assert_eq!(state.checkpoint_events_since, 0);
 
         let payer = DID("did:dht:z6MkPayer".to_owned());
-        let auth = crate::context::economy_helpers::authorize_paid_action(
-            &mut state,
-            &deps,
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &payer,
-            &context_id,
-        )
-        .await
-        .expect("authorize_paid_action")
-        .expect("a paid action is authorized for a per_message policy");
+        // Drive the prepare/hold split directly (the production join + send paths
+        // both use it; there is no whole-`&mut` wrapper).
+        let auth = {
+            let inputs = crate::context::economy_helpers::authorize_paid_action_prepare(
+                &state,
+                &deps,
+                scp_protocol::economy::types::PaidActionType::MessageSend,
+                &payer,
+            )
+            .expect("prepare yields auth inputs for a per_message policy");
+            crate::context::economy_helpers::authorize_paid_action_hold(inputs, &payer, &context_id)
+                .await
+                .expect("authorize_paid_action hold")
+                .expect("a paid action is authorized for a per_message policy")
+        };
 
         let receipt = crate::context::economy_helpers::complete_paid_action(
             &mut state,
@@ -4138,16 +4148,19 @@ mod restore_reconcile_tests {
         );
 
         // One more real capture pushes past capacity, evicting the oldest.
-        let auth2 = crate::context::economy_helpers::authorize_paid_action(
-            &mut state,
-            &deps,
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &payer,
-            &context_id,
-        )
-        .await
-        .expect("authorize_paid_action (2)")
-        .expect("a paid action is authorized for a per_message policy (2)");
+        let auth2 = {
+            let inputs = crate::context::economy_helpers::authorize_paid_action_prepare(
+                &state,
+                &deps,
+                scp_protocol::economy::types::PaidActionType::MessageSend,
+                &payer,
+            )
+            .expect("prepare yields auth inputs for a per_message policy (2)");
+            crate::context::economy_helpers::authorize_paid_action_hold(inputs, &payer, &context_id)
+                .await
+                .expect("authorize_paid_action hold (2)")
+                .expect("a paid action is authorized for a per_message policy (2)")
+        };
         let receipt2 = crate::context::economy_helpers::complete_paid_action(
             &mut state,
             &deps,

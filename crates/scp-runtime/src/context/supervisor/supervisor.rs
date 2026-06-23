@@ -14490,7 +14490,7 @@ mod tests {
         let ctx_id_bytes = [0xDAu8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let sender = DID("did:example:send-fail-closed".to_owned());
-        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             sender.clone(),
@@ -14502,10 +14502,15 @@ mod tests {
             .unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
 
+        // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
+        // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
+        // shared `&*cell`) and the Class-C field mutations (via `class_c_view`).
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
         // A paid send (spending nonce committed) MUST surface the persist
         // failure — fail-closed.
         let paid = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14527,7 +14532,7 @@ mod tests {
         // A free send (no spending nonce) swallows the same failure — the
         // common path stays best-effort, un-regressed.
         let free = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14590,8 +14595,12 @@ mod tests {
             );
         let deps = test_actor_deps(&sup).await;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
+        // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
+        // hand off to `spawn_actor_with_state`.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -14605,6 +14614,7 @@ mod tests {
             /* is_broadcast = */ false,
         )
         .expect("fail-closed finalize of the send-path consumed nonce must succeed");
+        let state = cell.into_inner();
 
         let handle = sup
             .spawn_actor_with_state(state, deps, None)
@@ -15051,8 +15061,12 @@ mod tests {
             "reservation must advance the counter by exactly 1"
         );
 
+        // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
+        // owning `ClassSCell` for the call, then reclaim it via `into_inner` for
+        // the post-send sequence-rollback assertion below.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let result = crate::context::messaging_helpers::finalize_send(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &ctx_id_bytes,
@@ -15065,6 +15079,7 @@ mod tests {
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         );
+        let state = cell.into_inner();
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
             "a paid send whose fail-closed persist fails must surface the error: got {result:?}"
