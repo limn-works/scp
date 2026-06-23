@@ -352,7 +352,9 @@ pub enum Capability {
     GovernanceVote,               // Vote on governance proposals
     ContextClose,                 // Close the context
     ChildContextCreate,           // Create child contexts with this context as parent (§5.13)
-    Custom(String),               // Context-specific custom capability
+    Custom(String),               // Context-specific custom capability. As a ceiling
+                                  // entry it MUST be well-formed `{resource}:{action}`
+                                  // or an explicit `{resource}:*` wildcard (spec §5.3.1.1).
 }
 ```
 
@@ -361,6 +363,7 @@ pub enum Capability {
    - Ceiling is set at context creation via `ContextParams.ceiling`.
    - Ceiling mutability is determined by `ContextParams.ceiling_policy` (ADR-008): `Immutable` (default) returns `ContextError::CeilingImmutable` on modification; `Governed` allows modification through the context's governance model.
    - Role permission sets are validated against the ceiling at role definition time. A role cannot grant capabilities outside the ceiling.
+   - Every ceiling entry is validated for well-formedness at context creation (spec §5.3.1.1 is authoritative for the charset): a built-in category, a `{resource}:{action}` custom capability, or an explicit `{resource}:*` wildcard. `{resource}` and `{action}` are non-empty kebab-case tokens separated by exactly one colon; the asterisk is permitted only as the whole action segment of a `{resource}:*` wildcard — never in the resource position and never as a substring (so `*:*` and `*:read` are malformed, not an all-resources grant). A `Custom` entry with no action segment (a bare single token, e.g. `payments`) is malformed and rejected with `InvalidCeilingCategory` — it is never silently widened to a wildcard. Ceiling-entry strings are subject to the §9.1A string sanitization and the 256-byte length cap for context string fields (§9.1A "String field validation" table in spec §5.9).
 
 2. **`RoleDefinition` and built-in roles:**
 

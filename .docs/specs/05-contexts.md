@@ -75,7 +75,7 @@ The ceiling policy is visible in context metadata (§5.7) before opt-in. A prosp
 
 ### 5.3.1 Exhaustive Capability Categories
 
-The following is the complete enumeration of capability categories available for context ceiling declarations. These are the ONLY valid values in a ceiling array. SDKs MUST reject unrecognized capability categories at context creation time.
+The following is the complete enumeration of the **built-in** capability categories available for context ceiling declarations. These are the only built-in category strings. A ceiling array MAY also contain well-formed **custom** capabilities (§5.3.1.1, §7.2) defined outside this table. SDKs MUST reject any ceiling entry that is neither a recognized built-in category nor a well-formed custom capability at context creation time.
 
 | Category | Description | Gated by |
 |----------|-------------|----------|
@@ -99,9 +99,25 @@ The following is the complete enumeration of capability categories available for
 | `context:close` | Close context permanently (§5.4) | Role permission + governance |
 | `metadata:edit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
-**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A ceiling containing `tool:invoke:*` implicitly includes all `tool:invoke:{tool_id}` capabilities.
+**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A `tool:invoke:*` wildcard ceiling entry **covers** all `tool:invoke:{tool_id}` capabilities (wildcard coverage; distinct from the parsing rule in §5.3.1.1, under which no wildcard is ever inferred from a non-wildcard string).
 
-**Category validation.** At context creation, the SDK validates that every entry in the ceiling array is a recognized category string (exact match, case-sensitive). Unrecognized categories cause creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with categories it cannot enforce.
+**Category validation.** At context creation, the SDK validates that every entry in the ceiling array is well-formed per the ceiling-entry grammar below (§5.3.1.1). Built-in categories are matched exactly (case-sensitive); custom capabilities are accepted only when well-formed. Any entry that is neither a recognized built-in category nor a well-formed custom capability causes creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with built-in categories it cannot enforce, and it forecloses ambiguous custom entries that would otherwise require silent interpretation.
+
+#### 5.3.1.1 Ceiling-Entry Grammar
+
+A ceiling entry is **exactly one** of the following well-formed shapes:
+
+1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `tool:invoke:{tool_id}` and the resource wildcard `tool:invoke:*`).
+2. **A custom capability** of the form `{resource}:{action}` (§7.2) — the entry contains **exactly one** colon, and both `{resource}` and `{action}` are non-empty **kebab-case tokens**: lowercase ASCII alphanumerics and hyphens, `[a-z0-9-]+` (this charset is defined here — §5.3.1.1 is the authoritative definition — and is consistent with the kebab-case naming convention for capability URIs in §7.3.4.1). Neither token may contain a colon (`:`), an asterisk (`*`), whitespace, or any other character outside the kebab-case charset.
+3. **An explicit resource wildcard** of the form `{resource}:*` — grants every action under `{resource}`. Here `{resource}` is a non-empty kebab-case token (same `[a-z0-9-]+` charset, no `:`, no `*`, no whitespace) and the action segment is the **single literal `*`**. The `*` is permitted **only** as the entire action segment of a wildcard entry: an `*` appearing in the resource position (e.g. `*:read`), or as a substring of either token (e.g. `pay*ments`, `payments:wr*`), is malformed → `InvalidCeilingCategory`. A bare `*` or `*:*` therefore never names “all resources” — there is no resource wildcard.
+
+There is **no implicit or silent wildcard.** A wildcard must be written explicitly as `:*`.
+
+A **single-token custom with no action** (e.g. `payments` — no colon, no action segment) is **malformed** and MUST be rejected at context creation with `InvalidCeilingCategory`. It MUST NOT be silently interpreted as `payments:*` or any other capability — silent widening would defeat the legibility tenet (§5.7), under which members see the exact ceiling they opt into.
+
+A custom ceiling entry contains **exactly one** colon (the separator between resource and action). An entry with no colon, or with more than one colon (e.g. `payments:read:write`), is malformed → `InvalidCeilingCategory`. (This single-colon rule is specific to ceiling entries; it is *not* the multi-segment parsing used for capability/delegation URIs elsewhere, e.g. §7.3.4.)
+
+Ceiling-entry strings are subject to the same string sanitization as other context string fields (§9.1A): implementations MUST reject any entry containing control characters (U+0000–U+001F, U+007F–U+009F), HTML-special characters (`<`, `>`, `&`, `"`, `'`), or whitespace, and MUST reject any entry exceeding the 256-byte string length cap that applies to context string fields (per the §9.1A "String field validation" table in §5.9). Whitespace is never permitted inside the `{resource}` or `{action}` tokens — this already follows from the kebab-case charset above. Any other unrecognized or ill-formed string (empty resource, empty action, a token outside the kebab-case charset, a stray `*`, etc.) is likewise rejected with `InvalidCeilingCategory`.
 
 ### 5.3.2 Governed Ceiling Change Notification Protocol
 
