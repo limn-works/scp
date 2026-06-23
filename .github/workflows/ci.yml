@@ -142,6 +142,8 @@ jobs:
       # Other tree-sitter grammars remain unpinned to match the convention
       # used by the protocol-sync job below and minimize churn.
       - run: pip install 'pytest>=8,<10' 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
+      - name: Gate self-tests (extractor null-safety)
+        run: python3.12 -m pytest scripts/test_check_sdk_coverage.py -v
       - run: python3.12 scripts/check-sdk-coverage.py
       - run: python3.12 scripts/check-call-invariants.py
       - name: cfg-walker unit tests (regression guard for MAJOR-1/MINOR-1/MINOR-2)
