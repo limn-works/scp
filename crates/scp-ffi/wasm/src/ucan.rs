@@ -553,12 +553,12 @@ pub fn ucan_delegate(
 /// # Errors
 ///
 /// Returns `(message, code)` where `message` is the human-readable failure
-/// reason and `code` is the canonical `SCP-…` error code. UCAN parse errors
-/// are routed through `scp_ffi_common::ucan_errors::ucan_error_code` so the
+/// reason and `code` is the canonical `SCP-…` error code. All failure branches
+/// (token parse, capability-URI parse, validation-pipeline, state lookup) are
+/// routed through `scp_ffi_common::ucan_errors::ucan_error_code` so the
 /// classification stays in lockstep with the other three bridges
-/// (`OP_UCAN_VALIDATE_MALFORMED` parity gate). Non-parse failures (capability
-/// URI, validation-pipeline, state lookup) return the caller's fallback code
-/// as `None` — the caller decides which code envelope to wrap them in.
+/// (`OP_UCAN_VALIDATE_MALFORMED` parity gate). The caller's `unwrap_or` fallback
+/// is reached only when the token is absent (the `_ =>` missing-token branch).
 pub fn validate_tool_ucan_wasm(
     context_id: &str,
     tool_id: &str,
