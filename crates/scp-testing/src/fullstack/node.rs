@@ -463,6 +463,88 @@ impl FullStackNode {
             .await
     }
 
+    /// This node's `#active` Ed25519 verifying key. A governance test resolver
+    /// maps each member DID to its node's verifying key so the real engine can
+    /// verify propose/approve vote signatures (the default fullstack resolver
+    /// returns `None` because most tests do not exercise the vote path).
+    #[must_use]
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// Submits a governance proposal through the real `Supervisor`, signing the
+    /// proposer's vote with this node's `#active` key. Returns the created
+    /// proposal (its `proposal_id` is the engine-tracked handle for later
+    /// approval / execution).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn propose_governance(
+        &self,
+        context_id: &str,
+        action: scp_core::context::governance::GovernanceAction,
+    ) -> Result<scp_core::context::governance::GovernanceProposal, ContextError> {
+        let (proposal, _events, _execution) = self
+            .manager
+            .propose_governance_action(context_id, &self.did, action, &self.signing_key)
+            .await?;
+        Ok(proposal)
+    }
+
+    /// Casts an approval vote on a pending proposal through the real
+    /// `Supervisor`, signing with this node's `#active` key. Returns the
+    /// proposal status after the vote (e.g. `Approved` once quorum is crossed).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn approve_governance(
+        &self,
+        context_id: &str,
+        proposal_id: &scp_core::context::governance::ProposalId,
+    ) -> Result<scp_core::context::governance::ProposalStatus, ContextError> {
+        let (status, _events) = self
+            .manager
+            .vote_on_proposal(context_id, proposal_id, &self.did, true, &self.signing_key)
+            .await?;
+        Ok(status)
+    }
+
+    /// Dispatches a direct execute-by-id through the real `Supervisor` — the
+    /// FFI-shaped `ExecuteGovernanceAction` command, which carries ONLY the
+    /// proposal id. The runtime resolves the authoritative proposal from its
+    /// own quorum-validated engine; a caller cannot fabricate an approved
+    /// proposal or substitute an action.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor — including a rejection
+    /// of an untracked / unapproved / already-executed proposal id.
+    pub async fn execute_governance_by_id(
+        &self,
+        context_id: &str,
+        proposal_id: scp_core::context::governance::ProposalId,
+    ) -> Result<scp_core::context::state::GovernanceActionResult, ContextError> {
+        use scp_core::context::actor::commands::{
+            ExecuteGovernanceActionPayload, GovernanceCommand,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ExecuteGovernanceAction {
+            payload: Box::new(ExecuteGovernanceActionPayload {
+                context_id: context_id.to_owned(),
+                proposal_id,
+            }),
+            reply: tx,
+        };
+        self.manager.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "FullStackNode::execute_governance_by_id — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Opens a captured ciphertext through the MLS + sender-key + inner-envelope
     /// layers and returns the decrypted [`InnerEnvelope`] without unwrapping the
     /// access-key content layer.

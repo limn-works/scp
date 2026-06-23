@@ -52,15 +52,25 @@ async function main(): Promise<void> {
     await scp.contextJoin(ctx._rawHandle, member.did, null);
     console.log(`Member ${member.did} joined`);
 
-    // 6. Admin executes a governance action to change the member's role.
+    // 6. Admin proposes a governance action to change the member's role, then
+    //    executes the tracked, approved proposal BY ID. Execution takes only
+    //    the proposal id — the executor and consequence subject are resolved
+    //    from the tracked proposal's proposer, never passed by the caller.
     try {
       const action = JSON.stringify({
         ChangeRole: { did: member.did, new_role: "moderator" },
       });
-      const result = await scp.contextExecuteGovernanceAction(
+      const proposeResult = await scp.contextGovernancePropose(
         ctx._rawHandle,
         action,
         admin.did,
+      );
+      const proposalIdHex = JSON.parse(proposeResult).proposal_id as string;
+      console.log(`Proposal created: ${proposalIdHex}`);
+
+      const result = await scp.contextExecuteGovernanceAction(
+        ctx._rawHandle,
+        proposalIdHex,
       );
       console.log("Governance action result:", result);
     } catch (err) {

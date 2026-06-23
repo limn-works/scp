@@ -375,24 +375,28 @@ interface MembershipBindings {
  */
 interface GovernanceBindings {
     /**
-     * Executes an approved governance action on a context.
+     * Executes a previously-approved governance proposal BY ID.
      *
-     * All 24 governance action variants (ADR-031) are supported. The
-     * proposal must have `Approved` status. Role state is re-synced
-     * from the `ContextManager` after execution.
+     * The runtime resolves the authoritative proposal from the context
+     * actor's own quorum-validated governance engine using
+     * `proposalIdHex`; the caller supplies no proposal, action, status, or
+     * identity. An untracked / unapproved id is rejected, so a caller
+     * cannot fabricate an approved proposal. The executor and consequence
+     * subject are resolved from the tracked proposal's proposer. Role state
+     * is re-synced from the `ContextManager` after execution.
      *
      * @param contextHandle Opaque handle from context create.
-     * @param proposalJson JSON-serialized `GovernanceProposal` with
-     *   `Approved` status.
+     * @param proposalIdHex Hex-encoded id of the approved, tracked
+     *   proposal.
      * @return JSON string describing the governance action result
      *   (e.g., `"MemberAdded"`, `"RoleChanged"`, `"ContextClosed"`).
      * @throws BridgeException with `SCP-PERM-3001` if the proposal is
-     *   not approved or targets the wrong context, or with `SCP-CTX-2001`
-     *   for other governance execution failures.
+     *   not tracked / approved or targets the wrong context, or with
+     *   `SCP-CTX-2001` for other governance execution failures.
      */
     fun governanceExecute(
         contextHandle: Long,
-        proposalJson: String,
+        proposalIdHex: String,
     ): String
 
     /**
@@ -2067,16 +2071,21 @@ class GovernanceBridgeOps internal constructor(
     private val bridge: CoroutineBridge,
 ) {
     /**
-     * Execute a governance action on a context.
+     * Execute a previously-approved governance proposal BY ID.
+     *
+     * The runtime resolves the authoritative proposal from the context
+     * actor's own quorum-validated governance engine; the caller supplies no
+     * proposal, action, status, or identity. The executor and consequence
+     * subject are resolved from the tracked proposal's proposer.
      *
      * @param contextHandle Handle from context create.
-     * @param proposalJson JSON-encoded governance proposal.
+     * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
      * @return A string describing the governance action result.
      */
     suspend fun execute(
         contextHandle: Long,
-        proposalJson: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalJson) }
+        proposalIdHex: String,
+    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
 
     /**
      * Propose a governance action for voting (#621).

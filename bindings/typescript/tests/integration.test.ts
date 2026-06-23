@@ -1573,7 +1573,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
   // -------------------------------------------------------------------
 
   describe("Governance (real NAPI)", () => {
-    it("scp.contextExecuteGovernanceAction changes a member's role", async () => {
+    it("scp.contextExecuteGovernanceAction rejects an untracked proposal id", async () => {
+      // Direct execute is BY ID: the runtime resolves the authoritative
+      // proposal from the context actor's own quorum-validated engine. A
+      // fabricated id (a forgery) must be rejected — a caller cannot smuggle in
+      // an action via a hand-crafted "approved" proposal.
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
@@ -1584,46 +1588,25 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      const result = await scp.contextExecuteGovernanceAction(
-        ctx._rawHandle,
-        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
-        admin.did,
+
+      const fabricated = "ab".repeat(32);
+      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, fabricated)).rejects.toThrow(
+        /not tracked/,
       );
-      expect(typeof result).toBe("string");
-      const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
-      expect(newRole !== null).toBe(true);
-      expect(String(newRole).toLowerCase()).toContain("moderator");
+
+      // The forged execute applied nothing: the member's role is unchanged.
+      const role = await scp.contextMemberRole(ctx._rawHandle, member.did);
+      expect(role !== null).toBe(true);
+      expect(String(role).toLowerCase()).not.toContain("moderator");
     });
 
-    it("scp.contextExecuteGovernanceAction removes a member", async () => {
-      const admin = await scp.identityCreate("in_memory");
-      const member = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(
-        admin,
-        JSON.stringify({
-          ceiling: ["messages:read", "member:invite", "member:remove", "role:assign"],
-          governance: "single_admin",
-        }),
-      );
-      await scp.contextJoin(ctx._rawHandle, member.did);
-      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(true);
-      await scp.contextExecuteGovernanceAction(
-        ctx._rawHandle,
-        JSON.stringify({ RemoveMember: { did: member.did, reason: null } }),
-        admin.did,
-      );
-      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(false);
-    });
-
-    it("scp.contextExecuteGovernanceAction rejects invalid JSON", async () => {
+    it("scp.contextExecuteGovernanceAction rejects a malformed proposal id", async () => {
       const admin = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      await expect(
-        scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json", admin.did),
-      ).rejects.toThrow();
+      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, "not-hex")).rejects.toThrow();
     });
 
     it("scp.contextGovernanceListProposals returns a JSON array (initially empty)", async () => {

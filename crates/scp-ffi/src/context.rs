@@ -3004,12 +3004,18 @@ impl crate::scp::PyScp {
         Ok(context_id)
     }
 
-    /// Executes a governance action on a context.
+    /// Executes a previously-approved governance proposal by id.
+    ///
+    /// The runtime resolves the authoritative proposal from the context
+    /// actor's own quorum-validated governance engine using `proposal_id_hex`;
+    /// the bridge never supplies a proposal, action, or status. A caller
+    /// therefore cannot fabricate an approved proposal or substitute an
+    /// action — execution applies exactly the tracked, quorum-approved action.
     ///
     /// # Arguments
     ///
     /// * `handle` -- The context handle.
-    /// * `proposal_json` -- JSON-serialized `GovernanceProposal`.
+    /// * `proposal_id_hex` -- Hex-encoded 32-byte id of the approved proposal.
     ///
     /// # Returns
     ///
@@ -3018,14 +3024,14 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `RuntimeError` if the context manager is not initialized, the
-    /// proposal JSON is invalid, or governance execution fails.
+    /// proposal id is malformed or not tracked/approved, or execution fails.
     // FFI orchestration: validate + dispatch + map; grew at the origin/main actor merge
     #[allow(clippy::too_many_lines)]
-    #[pyo3(signature = (handle, proposal_json))]
+    #[pyo3(signature = (handle, proposal_id_hex))]
     pub fn governance_execute(
         &self,
         handle: &PyContextHandle,
-        proposal_json: &str,
+        proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
@@ -3035,26 +3041,19 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let handle_state = handle.state.clone();
-        let proposal_json_owned = proposal_json.to_owned();
+        let proposal_id = parse_proposal_id(proposal_id_hex)?;
+        let proposal_id_log = hex::encode(proposal_id);
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
                 ExecuteGovernanceActionPayload, GovernanceCommand, QueriesCommand,
             };
 
-            let proposal: scp_core::context::governance::GovernanceProposal =
-                serde_json::from_str(&proposal_json_owned).map_err(|e| {
-                    PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
-                })?;
-            scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
-                .map_err(|e| PyValueError::new_err(e.message))?;
-            let action_name = proposal.action.variant_name();
-
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::ExecuteGovernanceAction {
                 payload: Box::new(ExecuteGovernanceActionPayload {
                     context_id: context_id.clone(),
-                    proposal,
+                    proposal_id,
                 }),
                 reply: tx,
             };
@@ -3096,7 +3095,7 @@ impl crate::scp::PyScp {
                     }) {
                         tracing::warn!(
                             context_id = %context_id,
-                            action = action_name,
+                            proposal_id = %proposal_id_log,
                             error = %e,
                             "failed to sync role state after governance action — \
                              local capability checks may be stale"
@@ -3106,7 +3105,7 @@ impl crate::scp::PyScp {
                 None => {
                     tracing::warn!(
                         context_id = %context_id,
-                        action = action_name,
+                        proposal_id = %proposal_id_log,
                         "failed to sync role state after governance action — \
                          context not found in ContextManager"
                     );
@@ -3349,7 +3348,9 @@ impl crate::scp::PyScp {
 
             // Re-sync local role state cache from ContextManager after any
             // governance action that may have modified roles/membership (#560).
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     action = action_name,
@@ -3442,7 +3443,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -3524,7 +3527,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -3582,7 +3587,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -5588,13 +5595,36 @@ mod tests {
         assert_eq!(handle.mode(), "broadcast", "handle reflects broadcast mode");
     }
 
-    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
-    /// through the per-instance supervisor (ADR-049 actor model).
-    fn test_dispatch_execute_governance(
+    /// Test helper: execute a governance action through the GENUINE
+    /// propose flow on a `SingleAdmin` context.
+    ///
+    /// For `SingleAdmin` contexts, `propose_governance_action_checked`
+    /// auto-approves and auto-executes the action in one step, and (crucially)
+    /// the context actor's governance engine RETAINS the resulting approved
+    /// proposal. This is the only legitimate way to drive an execution after
+    /// the direct-execute quorum-bypass fix: a caller can no longer hand the
+    /// runtime a fabricated `Approved` proposal — execution is by-id against
+    /// the engine's own tracked, quorum-validated proposal.
+    ///
+    /// `creator_did` must be a real identity (registered custody + signing key)
+    /// because the engine verifies the proposer's vote signature against their
+    /// DID-resolved key.
+    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction` by id
+    /// through the per-instance supervisor (ADR-049 actor model) and return the
+    /// handler's `Result`.
+    ///
+    /// The payload now carries ONLY the proposal id — never a caller-supplied
+    /// proposal/action/status, and never a caller-supplied executor DID. The
+    /// runtime resolves the authoritative proposal from the context actor's own
+    /// quorum-validated governance engine; a caller therefore cannot fabricate
+    /// an `Approved` proposal or substitute an action. This helper exercises
+    /// that trust boundary directly.
+    fn test_dispatch_execute_by_id(
         bi: &crate::runtime::PyBridgeInstance,
         ctx_id: &str,
-        proposal: scp_core::context::governance::GovernanceProposal,
-    ) {
+        proposal_id: [u8; 32],
+    ) -> Result<scp_core::context::state::GovernanceActionResult, scp_core::context::ContextError>
+    {
         use scp_core::context::actor::commands::{
             ExecuteGovernanceActionPayload, GovernanceCommand,
         };
@@ -5607,13 +5637,47 @@ mod tests {
             let cmd = GovernanceCommand::ExecuteGovernanceAction {
                 payload: Box::new(ExecuteGovernanceActionPayload {
                     context_id: ctx_id_owned,
-                    proposal,
+                    proposal_id,
                 }),
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.unwrap();
-            rx.await.unwrap().unwrap();
-        });
+            rx.await.unwrap()
+        })
+    }
+
+    /// Test helper: create a fresh `SingleAdmin` context owned by `creator`,
+    /// returning `(bridge_instance, context_id)`. Used by the direct-execute
+    /// trust-boundary tests, which only need a live context with known
+    /// membership (they never drive a genuine proposal, so no real identity /
+    /// DID resolver wiring is required).
+    fn setup_singleadmin_ctx(
+        creator: &str,
+        ctx_prefix: &str,
+    ) -> (std::sync::Arc<crate::runtime::PyBridgeInstance>, String) {
+        let bi = __bi();
+        let ctx_id = format!("{ctx_prefix}-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let sup = crate::runtime::supervisor(&bi).unwrap();
+        let sup = Arc::clone(sup);
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::params::Capability::new("role:assign"),
+                scp_core::context::params::Capability::new("governance:propose"),
+                scp_core::context::params::Capability::new("governance:vote"),
+                scp_core::context::params::Capability::new("member:ban"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            params,
+            scp_identity::DID(creator.to_owned()),
+            None,
+        ))
+        .unwrap();
+        (bi, ctx_id)
     }
 
     /// Test helper that invokes `PyScp::evaluate_invitation` on a fresh
@@ -6233,170 +6297,79 @@ mod tests {
     // Role state sync after governance (#560)
     // -----------------------------------------------------------------------
 
-    use scp_ffi_common::test_helpers::approved_proposal;
+    // -----------------------------------------------------------------------
+    // Direct-execute trust boundary (governance quorum-bypass fix)
+    //
+    // `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a proposal id
+    // (never a caller-supplied proposal/action/status/executor). The runtime
+    // resolves the authoritative proposal from the context actor's OWN
+    // quorum-validated governance engine and stamps the tracked proposer as the
+    // executor; a caller cannot fabricate an `Approved` proposal or
+    // substitute an action. These tests exercise that boundary directly:
+    // executing an id the engine never tracked is rejected, and the rejection
+    // leaves context state untouched.
+    //
+    // The "action substitution" facet is structurally impossible now: the
+    // payload has no action/proposal field for a caller to populate.
+    // -----------------------------------------------------------------------
 
+    /// Executing an unknown/fabricated proposal id is rejected (the engine
+    /// never tracked it) — the forgery path.
     #[test]
-    fn role_state_syncs_after_change_role() {
+    fn direct_execute_rejects_untracked_proposal_id() {
         crate::init_runtime().ok();
-        let ctx_id = format!("sync-role-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkCreatorSync1";
-        let bi = __bi();
-        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
-        let sup = crate::runtime::supervisor(&bi).unwrap();
-        let rt = crate::runtime().unwrap();
-        let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
-            ..scp_core::context::ContextParams::default()
-        };
-        rt.block_on(sup.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
-        let new_did = "did:key:z6MkNewMember1";
-        let add = approved_proposal(
-            [1u8; 32],
-            &ctx_id,
-            scp_core::context::governance::GovernanceAction::AddMember {
-                did: scp_identity::DID(new_did.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
+        let creator = "did:key:z6MkCreatorForgery1";
+        let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery");
+
+        // A proposal id that was never proposed/tracked by the engine.
+        let fabricated = [0xABu8; 32];
+        let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
+        let err = result.expect_err("executing an untracked proposal id must be rejected");
+        assert!(
+            matches!(err, scp_core::context::ContextError::PermissionDenied(_)),
+            "untracked proposal must be PermissionDenied, got: {err:?}"
         );
-        test_dispatch_execute_governance(&bi, &ctx_id, add);
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
-        let change = approved_proposal(
-            [2u8; 32],
-            &ctx_id,
-            scp_core::context::governance::GovernanceAction::ChangeRole {
-                did: scp_identity::DID(new_did.to_owned()),
-                new_role: "observer".to_owned(),
-            },
-            creator,
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not tracked"),
+            "rejection should name the untracked proposal: {msg}"
         );
-        test_dispatch_execute_governance(&bi, &ctx_id, change);
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// A rejected direct-execute leaves context membership/role state unchanged
+    /// — the forgery cannot apply a phantom action as a side effect.
+    #[test]
+    fn direct_execute_rejection_does_not_mutate_state() {
+        crate::init_runtime().ok();
+        let creator = "did:key:z6MkCreatorForgery2";
+        let victim = "did:key:z6MkVictimNeverAdded";
+        let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery-state");
+
+        // Snapshot membership before the forged execute.
         crate::runtime::with_context(&bi, &ctx_id, |st| {
-            let assignment = st
-                .role_state
-                .assignments
-                .get(new_did)
-                .expect("member should have an assignment");
-            assert_eq!(
-                assignment.role_name, "observer",
-                "role should be observer after ChangeRole + sync"
+            assert!(
+                !st.role_state.members.contains(victim),
+                "victim must not be a member before the forged execute"
             );
             Ok(())
         })
         .unwrap();
-        crate::runtime::remove_context(&bi, &ctx_id);
-    }
 
-    #[test]
-    fn role_state_syncs_after_add_member() {
-        crate::init_runtime().ok();
-        let ctx_id = format!("sync-add-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkCreatorSync2";
-        let bi = __bi();
-        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
-        let sup = crate::runtime::supervisor(&bi).unwrap();
-        let rt = crate::runtime().unwrap();
-        let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
-            ..scp_core::context::ContextParams::default()
-        };
-        rt.block_on(sup.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
-        let new_did = "did:key:z6MkAdded1";
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(new_did));
-            Ok(())
-        })
-        .unwrap();
-        let add = approved_proposal(
-            [3u8; 32],
-            &ctx_id,
-            scp_core::context::governance::GovernanceAction::AddMember {
-                did: scp_identity::DID(new_did.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
+        let fabricated = [0x11u8; 32];
+        let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
+        assert!(
+            result.is_err(),
+            "forged direct-execute must be rejected, got: {result:?}"
         );
-        test_dispatch_execute_governance(&bi, &ctx_id, add);
+
+        // Membership must be unchanged: no phantom AddMember took effect.
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
         crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(st.role_state.members.contains(new_did));
-            assert_eq!(
-                st.role_state
-                    .assignments
-                    .get(new_did)
-                    .map(|a| a.role_name.as_str()),
-                Some("member")
+            assert!(
+                !st.role_state.members.contains(victim),
+                "rejected forgery must not have added the victim as a member"
             );
-            Ok(())
-        })
-        .unwrap();
-        crate::runtime::remove_context(&bi, &ctx_id);
-    }
-
-    #[test]
-    fn role_state_syncs_after_remove_member() {
-        crate::init_runtime().ok();
-        let ctx_id = format!("sync-rm-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkCreatorSync3";
-        let target = "did:key:z6MkRemoveTarget";
-        let bi = __bi();
-        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
-        let sup = crate::runtime::supervisor(&bi).unwrap();
-        let rt = crate::runtime().unwrap();
-        let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
-            ..scp_core::context::ContextParams::default()
-        };
-        rt.block_on(sup.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
-        let add = approved_proposal(
-            [4u8; 32],
-            &ctx_id,
-            scp_core::context::governance::GovernanceAction::AddMember {
-                did: scp_identity::DID(target.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
-        );
-        test_dispatch_execute_governance(&bi, &ctx_id, add);
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(st.role_state.members.contains(target));
-            Ok(())
-        })
-        .unwrap();
-        let rm = approved_proposal(
-            [5u8; 32],
-            &ctx_id,
-            scp_core::context::governance::GovernanceAction::RemoveMember {
-                did: scp_identity::DID(target.to_owned()),
-                reason: Some("test removal".to_owned()),
-            },
-            creator,
-        );
-        test_dispatch_execute_governance(&bi, &ctx_id, rm);
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(target));
-            assert!(!st.role_state.assignments.contains_key(target));
             Ok(())
         })
         .unwrap();
@@ -6925,8 +6898,6 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn multi_member_context_export_round_trips_as_creator() {
-        use scp_ffi_common::test_helpers::approved_proposal;
-
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
 
@@ -6947,7 +6918,11 @@ mod tests {
             let rt = crate::runtime().unwrap();
 
             let params = scp_core::context::ContextParams {
-                ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+                ceiling: vec![
+                    scp_core::context::params::Capability::new("role:assign"),
+                    scp_core::context::params::Capability::new("governance:propose"),
+                    scp_core::context::params::Capability::new("governance:vote"),
+                ],
                 ..scp_core::context::ContextParams::default()
             };
             rt.block_on(sup.create_context(
@@ -6960,18 +6935,23 @@ mod tests {
 
             // Add a SECOND member so the membership map holds 2+ DIDs with
             // non-deterministic iteration order — the precondition that made
-            // the old `member_dids().next()` exporter selection unsound.
+            // the old `member_dids().next()` exporter selection unsound. The
+            // member is recorded directly in role state via the runtime's
+            // `testing`-gated `test_insert_member` seam. The genuine governance
+            // flow is unavailable here: it would require the bridge governance
+            // key resolver to resolve the proposer's `#active` key from a
+            // published DID document, and in-memory test identities are never
+            // published. The exporter-selection invariant under test reads
+            // `role_state.creator_did` (NOT a membership-map iteration), so a
+            // membership-only seam is sufficient to recreate the 2+ member
+            // precondition the old `.next()` bug depended on.
             let second_member = "did:key:z6MkExportSecondMember";
-            let add = approved_proposal(
-                [9u8; 32],
+            rt.block_on(sup.test_insert_member(
                 &ctx_id,
-                scp_core::context::governance::GovernanceAction::AddMember {
-                    did: scp_identity::DID(second_member.to_owned()),
-                    role: "member".to_owned(),
-                },
-                &creator,
-            );
-            test_dispatch_execute_governance(&bi, &ctx_id, add);
+                scp_identity::DID(second_member.to_owned()),
+                "member",
+            ))
+            .expect("test_insert_member must record the second member");
             crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
 
             // Sanity: the context really has multiple members.

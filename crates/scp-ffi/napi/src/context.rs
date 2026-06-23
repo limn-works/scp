@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+use scp_core::context::governance::GovernanceAction;
 use scp_core::context::state::GovernanceActionResult;
 use scp_core::context::{ContextHandle, ContextState};
 use scp_identity::DID;
@@ -2710,58 +2710,29 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
 // Bridge functions — governance (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_execute_governance_action`].
+/// Per-bridge-instance implementation of
+/// `Scp::context_execute_governance_action`.
+///
+/// Executes a previously-approved governance proposal BY ID. The runtime
+/// resolves the authoritative proposal from the context actor's own
+/// quorum-validated governance engine; the bridge never supplies a proposal,
+/// action, or status. This closes the direct-execute quorum bypass — the
+/// previous implementation minted a fresh random id and fabricated a fully
+/// `Approved` proposal from a caller-supplied action, executing it with no
+/// engine involvement.
+///
+/// The surface takes only `(handle, proposal_id_hex)`: the executor (the
+/// `GovernanceActionExecuted` leaf `actor_did`) and the consequence subject are
+/// both resolved from the tracked proposal's proposer inside the runtime, never
+/// from a caller-supplied DID.
 pub(crate) async fn context_execute_governance_action_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
-    action_json: String,
-    proposer_did: String,
+    proposal_id_hex: String,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
-        NapiError::from(ScpNapiError::Validation {
-            message: format!("invalid governance action JSON: {e}"),
-            code: codes::VALID_7000.to_owned(),
-        })
-    })?;
-
-    // Defense-in-depth: validate user-controlled string fields at the FFI
-    // boundary before the action reaches the ContextManager (#1601).
-    scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
-        NapiError::from(ScpNapiError::Validation {
-            message: e.message,
-            code: codes::VALID_7000.to_owned(),
-        })
-    })?;
-
-    let action_name = action.variant_name();
-
-    // Generate a random proposal ID (32 bytes).
-    let mut proposal_id = [0u8; 32];
-    {
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut proposal_id);
-    }
-
-    let now = scp_primitives::SystemClock.now_secs();
-
-    // Currently all bridge governance actions are auto-approved (SingleAdmin).
-    // Multi-party governance (Threshold/Majority/Unanimity) requires the
-    // propose→vote→execute lifecycle exposed via ContextManager::propose_governance_action,
-    // which needs signing keys for vote signatures. This will be wired when
-    // multi-party governance is exposed through the NAPI bridge (SCP-270).
-    let proposal = GovernanceProposal {
-        proposal_id,
-        context_id: handle.context_id.clone(),
-        proposer_did: DID(proposer_did.clone()),
-        action,
-        status: ProposalStatus::Approved,
-        created_at: now,
-        voting_deadline: now + 3600, // 1 hour default
-        approvals: Vec::new(),
-        rejections: Vec::new(),
-        created_at_epoch: None,
-    };
+    let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
+    let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.
     use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
@@ -2771,7 +2742,7 @@ pub(crate) async fn context_execute_governance_action_on(
     let cmd = GovernanceCommand::ExecuteGovernanceAction {
         payload: Box::new(ExecuteGovernanceActionPayload {
             context_id: context_id.clone(),
-            proposal,
+            proposal_id,
         }),
         reply: tx,
     };
@@ -2790,7 +2761,7 @@ pub(crate) async fn context_execute_governance_action_on(
     if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
         tracing::warn!(
             context_id = %context_id,
-            action = action_name,
+            proposal_id = %proposal_id_log,
             error = %e,
             "failed to sync role state after governance action — \
              local capability checks may be stale"
@@ -4739,11 +4710,6 @@ fn parse_template_id_napi(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use scp_core::context::ContextParams;
-    // Sole consumers are the `allow_in_memory_custody`-gated governance/role
-    // tests below; gate the import so the bare/production test target has no
-    // unused import.
-    #[cfg(feature = "allow_in_memory_custody")]
-    use scp_core::context::governance::GovernanceAction;
     // Consumed only by the `allow_in_memory_custody`-gated membership helper +
     // test; gate the import so the bare/production test target is warning-clean.
     #[cfg(feature = "allow_in_memory_custody")]
@@ -4758,12 +4724,6 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
     use scp_identity::DID;
     use std::sync::Arc;
-
-    // Sole consumers are the `allow_in_memory_custody`-gated role-sync tests
-    // below; gate the import so the bare/production test target has no unused
-    // import.
-    #[cfg(feature = "allow_in_memory_custody")]
-    use scp_ffi_common::test_helpers::approved_proposal;
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
     /// supervisor. Mirrors the production rewire pattern but is callable
@@ -4838,16 +4798,23 @@ mod tests {
         rx.await.unwrap().unwrap().unwrap_or(0)
     }
 
-    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
-    /// through the supervisor. Only the `allow_in_memory_custody`-gated
-    /// role-sync tests call it, so it is gated to keep the bare test target
-    /// warning-clean.
+    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction` BY ID
+    /// through the supervisor and return the handler `Result`.
+    ///
+    /// The payload carries only the proposal id — never a caller-supplied
+    /// proposal/action/status/executor DID (the executor is resolved from the
+    /// tracked proposal's proposer). The runtime resolves the authoritative
+    /// proposal from the context actor's own quorum-validated engine; a caller
+    /// cannot fabricate an `Approved`
+    /// proposal or substitute an action. Used by the direct-execute
+    /// trust-boundary tests.
     #[cfg(feature = "allow_in_memory_custody")]
-    async fn test_dispatch_execute_governance(
+    async fn test_dispatch_execute_by_id(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
-        proposal: scp_core::context::governance::GovernanceProposal,
-    ) {
+        proposal_id: [u8; 32],
+    ) -> Result<scp_core::context::state::GovernanceActionResult, scp_core::context::ContextError>
+    {
         use scp_core::context::actor::commands::{
             ExecuteGovernanceActionPayload, GovernanceCommand,
         };
@@ -4857,12 +4824,12 @@ mod tests {
         let cmd = GovernanceCommand::ExecuteGovernanceAction {
             payload: Box::new(ExecuteGovernanceActionPayload {
                 context_id: ctx_id.to_owned(),
-                proposal,
+                proposal_id,
             }),
             reply: tx,
         };
         sup.dispatch_governance_command(cmd).await.unwrap();
-        rx.await.unwrap().unwrap();
+        rx.await.unwrap()
     }
 
     /// Test helper: dispatch `QueriesCommand::ContextParams` through the
@@ -4978,166 +4945,86 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Role state sync after governance (#560)
+    // Direct-execute trust boundary (governance quorum-bypass fix)
+    //
+    // `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a proposal id
+    // (never a caller-supplied proposal/action/status/executor). The runtime
+    // resolves the authoritative proposal from the context actor's OWN
+    // quorum-validated governance engine and stamps the tracked proposer as the
+    // executor; a caller cannot fabricate an `Approved` proposal or
+    // substitute an action. The previous NAPI implementation minted a fresh
+    // random id and a fully `Approved` proposal from a caller-supplied action
+    // — these tests guard the closed boundary.
+    //
+    // Action substitution is now structurally impossible: the bridge surface
+    // and the command payload have no action/proposal field to populate.
     // -----------------------------------------------------------------------
 
-    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
-    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
-    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
+    /// Executing an unknown/fabricated proposal id is rejected (the engine
+    /// never tracked it) — the forgery path.
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn role_state_syncs_after_change_role() {
+    async fn direct_execute_rejects_untracked_proposal_id() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         crate::runtime::init_supervisor_for_test_on(&bi);
-        let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkNapiCreator1";
+        let ctx_id = format!("napi-exec-forgery-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiForgery1";
         let params = ContextParams {
             ceiling: vec![Capability::new("role:assign")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
-        let new_did = "did:key:z6MkNapiMember1";
-        let add = approved_proposal(
-            [10u8; 32],
-            &ctx_id,
-            GovernanceAction::AddMember {
-                did: DID(new_did.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
+
+        let fabricated = [0xABu8; 32];
+        let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
+        let err = result.expect_err("executing an untracked proposal id must be rejected");
+        assert!(
+            matches!(err, scp_core::context::ContextError::PermissionDenied(_)),
+            "untracked proposal must be PermissionDenied, got: {err:?}"
         );
-        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        let change = approved_proposal(
-            [11u8; 32],
-            &ctx_id,
-            GovernanceAction::ChangeRole {
-                did: DID(new_did.to_owned()),
-                new_role: "observer".to_owned(),
-            },
-            creator,
+        assert!(
+            format!("{err}").contains("not tracked"),
+            "rejection should name the untracked proposal"
         );
-        test_dispatch_execute_governance(&bi, &ctx_id, change).await;
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            let assignment = st
-                .role_state
-                .assignments
-                .get(new_did)
-                .expect("member should have an assignment");
-            assert_eq!(assignment.role_name, "observer");
-            Ok(())
-        })
-        .unwrap();
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
-    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
-    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
+    /// A rejected direct-execute leaves context membership/role state unchanged
+    /// — the forgery cannot apply a phantom action as a side effect.
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn role_state_syncs_after_add_member() {
+    async fn direct_execute_rejection_does_not_mutate_state() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         crate::runtime::init_supervisor_for_test_on(&bi);
-        let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkNapiCreator2";
+        let ctx_id = format!("napi-exec-forgery-state-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiForgery2";
+        let victim = "did:key:z6MkNapiVictimNeverAdded";
         let params = ContextParams {
             ceiling: vec![Capability::new("role:assign")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
-        let new_did = "did:key:z6MkNapiAdded1";
+
         crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(new_did));
+            assert!(!st.role_state.members.contains(victim));
             Ok(())
         })
         .unwrap();
-        let add = approved_proposal(
-            [12u8; 32],
-            &ctx_id,
-            GovernanceAction::AddMember {
-                did: DID(new_did.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
-        );
-        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
+
+        let fabricated = [0x11u8; 32];
+        let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
+        assert!(result.is_err(), "forged direct-execute must be rejected");
+
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
         crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(st.role_state.members.contains(new_did));
-            assert_eq!(
-                st.role_state
-                    .assignments
-                    .get(new_did)
-                    .map(|a| a.role_name.as_str()),
-                Some("member")
+            assert!(
+                !st.role_state.members.contains(victim),
+                "rejected forgery must not have added the victim as a member"
             );
-            Ok(())
-        })
-        .unwrap();
-        crate::runtime::remove_context(&bi, &ctx_id);
-    }
-
-    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
-    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
-    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn role_state_syncs_after_remove_member() {
-        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_supervisor_for_test_on(&bi);
-        let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkNapiCreator3";
-        let target = "did:key:z6MkNapiRemTarget";
-        let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
-            ..ContextParams::default()
-        };
-        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
-        let add = approved_proposal(
-            [13u8; 32],
-            &ctx_id,
-            GovernanceAction::AddMember {
-                did: DID(target.to_owned()),
-                role: "member".to_owned(),
-            },
-            creator,
-        );
-        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(st.role_state.members.contains(target));
-            Ok(())
-        })
-        .unwrap();
-        let rm = approved_proposal(
-            [14u8; 32],
-            &ctx_id,
-            GovernanceAction::RemoveMember {
-                did: DID(target.to_owned()),
-                reason: Some("test removal".to_owned()),
-            },
-            creator,
-        );
-        test_dispatch_execute_governance(&bi, &ctx_id, rm).await;
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(target));
-            assert!(!st.role_state.assignments.contains_key(target));
             Ok(())
         })
         .unwrap();

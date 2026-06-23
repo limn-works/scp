@@ -115,6 +115,13 @@ pub async fn dispatch(
             pseudonym,
             reply,
         } => handle_seed_peer_pseudonym(state, member_did, pseudonym, reply),
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestInsertMember {
+            context_id: _,
+            member_did,
+            role,
+            reply,
+        } => handle_test_insert_member(state, deps, &member_did, &role, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -176,6 +183,42 @@ fn handle_seed_peer_pseudonym(
             context_id: state.handle.context_id().to_owned(),
         })
     };
+    let _ = reply.send(result);
+    Outcome::ok(())
+}
+
+/// Handle [`MessagingCommand::TestInsertMember`] (actor-shape, test-only).
+///
+/// Records a member directly into role state — `members` plus a role
+/// `assignment` — exactly as an executed `AddMember` governance action would
+/// for those two fields, but without the MLS Welcome / governance round-trip
+/// (which a single-node test cannot drive: the bridge governance key resolver
+/// only resolves DID-document-published identities). Used by tests that need a
+/// multi-member context (e.g. exporter selection over a 2+ member membership
+/// map). Rejects an inactive context so a mis-targeted test fails loudly.
+#[cfg(feature = "testing")]
+fn handle_test_insert_member(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    member_did: &scp_identity::DID,
+    role: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = (|| {
+        crate::context::state::require_active(&state.handle)?;
+        state.role_state.members.insert(member_did.to_string());
+        let tokens = scp_protocol::context::roles::system_assign_role(
+            &mut state.role_state,
+            member_did.as_ref(),
+            role,
+            &*deps.clock,
+        )
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        state
+            .membership
+            .add_member(member_did.clone(), role.to_owned(), tokens);
+        Ok(())
+    })();
     let _ = reply.send(result);
     Outcome::ok(())
 }

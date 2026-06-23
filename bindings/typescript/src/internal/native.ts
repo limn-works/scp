@@ -524,16 +524,14 @@ export function createNativeBridge(scp: SCP): Bridge {
     // Governance
     async contextExecuteGovernanceAction(
       handle: BridgeContextHandle,
-      actionJson: string,
-      proposerDid: string,
+      proposalIdHex: string,
     ): Promise<string> {
       return await (
         native.contextExecuteGovernanceAction as (
           h: BridgeContextHandle,
-          a: string,
           p: string,
         ) => Promise<string>
-      )(handle, actionJson, proposerDid);
+      )(handle, proposalIdHex);
     },
 
     // Governance lifecycle (#559)

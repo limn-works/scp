@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use tracing::{debug, info, warn};
 
@@ -199,15 +199,31 @@ pub struct IdentityBackedDidResolver {
     /// `scp_identity::resolver::DidResolver`.
     resolve_fn: Arc<AsyncResolveFn>,
 
-    /// Handle to the tokio runtime for async-sync bridging.
-    handle: tokio::runtime::Handle,
-
     /// Highest sequence number seen per DID. Used for rotation detection
     /// and downgrade prevention. Only increases; never decremented.
     seen_sequences: Arc<RwLock<HashMap<String, u64>>>,
 
     /// Rotation event log. Consumers can drain this to react to rotations.
     rotation_events: Arc<RwLock<Vec<DidRotatedEvent>>>,
+
+    /// Long-lived, dedicated runtime that drives async DID resolution from the
+    /// sync `DidResolver`/`DidPublicKeyResolver` trait methods.
+    ///
+    /// This is a HOT, SHARED path: a single UCAN delegation-chain validation
+    /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every non-WASM bridge
+    /// routes all DID resolution through here. Building a fresh tokio runtime
+    /// per call (current-thread `Builder::...build()`) was a per-resolution
+    /// allocation of an entire reactor + thread, amplified 32x per validation.
+    ///
+    /// Instead we build ONE small multi-thread runtime lazily on first use and
+    /// reuse it forever. `resolve_sync` drives futures on it via
+    /// `handle().block_on(...)` from a freshly-spawned scoped OS thread (never
+    /// from a thread already inside a runtime), so it stays deadlock-free from
+    /// the in-`block_on` caller posture (see `resolve_sync` docs). Because the
+    /// runtime owns its own worker threads, the spawned future makes progress
+    /// independently of the calling bridge runtime — we depend on neither a
+    /// nested `block_on` nor a free worker on the *shared* bridge runtime.
+    resolution_rt: OnceLock<tokio::runtime::Runtime>,
 }
 
 impl IdentityBackedDidResolver {
@@ -225,8 +241,11 @@ impl IdentityBackedDidResolver {
     ///
     /// * `resolver` — The identity resolver to delegate to. Typically
     ///   `DualLayerResolver`. Must be `'static + Send + Sync`.
-    /// * `handle` — Handle to the tokio runtime for async-sync bridging.
-    pub fn new<R>(resolver: Arc<R>, handle: tokio::runtime::Handle) -> Self
+    /// * `_handle` — Accepted for call-site stability across the FFI bridges.
+    ///   No longer retained: `resolve_sync` drives async resolution on a
+    ///   dedicated thread with its own runtime (see its docs), so this resolver
+    ///   does not depend on a borrowed runtime handle.
+    pub fn new<R>(resolver: Arc<R>, _handle: tokio::runtime::Handle) -> Self
     where
         R: scp_identity::resolver::DidResolver + 'static,
     {
@@ -237,9 +256,9 @@ impl IdentityBackedDidResolver {
 
         Self {
             resolve_fn,
-            handle,
             seen_sequences: Arc::new(RwLock::new(HashMap::new())),
             rotation_events: Arc::new(RwLock::new(Vec::new())),
+            resolution_rt: OnceLock::new(),
         }
     }
 
@@ -290,23 +309,97 @@ impl IdentityBackedDidResolver {
         }
     }
 
-    /// Calls the async resolve function from a sync context, bridging via
-    /// `block_in_place` (tokio multi-thread) or `block_on` (non-tokio thread).
+    /// Returns a handle to the long-lived, dedicated DID-resolution runtime,
+    /// building it ONCE on first use and reusing it forever after.
+    ///
+    /// A small fixed-size multi-thread runtime: it owns its own worker threads,
+    /// so a future driven on it via `handle().block_on(...)` makes progress
+    /// independently of any *other* (bridge) runtime the caller may be parked
+    /// in. Two workers are ample — DID resolution is short and bounded, and the
+    /// driving scoped thread only parks waiting for the result.
+    ///
+    /// Returns `Err(NetworkUnavailable)` only if the OS refuses to create the
+    /// runtime's threads on the very first call; subsequent calls reuse the
+    /// already-built runtime and never allocate.
+    fn resolution_handle(&self) -> Result<&tokio::runtime::Handle, ResolutionError> {
+        // Fast path: already built. This is the common case on a hot path — no
+        // allocation, no thread spawn, just a relaxed atomic load.
+        if let Some(rt) = self.resolution_rt.get() {
+            return Ok(rt.handle());
+        }
+        // Slow path (first use only): build fallibly, then publish into the
+        // `OnceLock`. `OnceLock::get_or_init` cannot carry a `Result`, so we
+        // build outside it and `set()` the result. If a concurrent caller wins
+        // the race, `set()` returns our runtime back to us (which we drop) and
+        // the already-stored one is used — either way the slot is populated.
+        let built = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("scp-did-resolve")
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                ResolutionError::NetworkUnavailable(format!(
+                    "failed to build DID-resolution runtime: {e}"
+                ))
+            })?;
+        let _ = self.resolution_rt.set(built);
+        // The slot is guaranteed populated now (by us or the race winner).
+        self.resolution_rt
+            .get()
+            .map(tokio::runtime::Runtime::handle)
+            .ok_or_else(|| {
+                ResolutionError::NetworkUnavailable(
+                    "DID-resolution runtime unexpectedly absent after init".to_owned(),
+                )
+            })
+    }
+
+    /// Calls the async resolve function from a sync context.
+    ///
+    /// The async resolution is driven to completion on the long-lived,
+    /// shared resolution runtime (see [`Self::resolution_handle`]) via
+    /// `handle().block_on(...)`. Critically, that `block_on` is invoked from a
+    /// freshly-spawned scoped OS thread — a thread that is NOT itself inside any
+    /// tokio runtime — and the result is handed back through `join()`. There is
+    /// NO per-call runtime construction: the reactor + worker threads are built
+    /// exactly once across the whole process (this is a hot, shared path —
+    /// every non-WASM bridge resolves all DIDs here, and a single UCAN
+    /// delegation chain resolves up to `MAX_CHAIN_DEPTH` = 32 DIDs).
+    ///
+    /// Why drive from a spawned scoped thread rather than the calling thread:
+    /// the sync `DidResolver` trait methods are invoked synchronously from deep
+    /// inside async bridge operations that the bridge drives via
+    /// `RUNTIME.block_on(...)` on the *calling* (non-worker) thread — e.g.
+    /// governance proposal verification resolves the proposer's DID while the
+    /// calling Python/JS thread is already executing `block_on`. Calling
+    /// `Handle::block_on` directly on such a thread panics with "Cannot start a
+    /// runtime from within a runtime", and `tokio::task::block_in_place` is
+    /// invalid there (the thread is not a runtime worker). Spawning a clean
+    /// thread sidesteps both: that thread enters `block_on` from no runtime
+    /// context, and because the resolution runtime owns its OWN workers, the
+    /// future is polled by those workers — we depend on neither a nested
+    /// `block_on` nor a free worker on the *shared bridge* runtime, so this is
+    /// deadlock-free from every caller posture.
+    ///
+    /// The async resolve future is `Send` (see `AsyncResolveFn`), so driving it
+    /// from another thread is sound. DID resolution is short and bounded
+    /// (in-memory DHT lookup or a single network round-trip), so the blocking
+    /// `join()` on the calling thread is acceptable.
     fn resolve_sync(&self, did: &str) -> Result<ResolvedDidDocument, ResolutionError> {
         let resolve_fn = Arc::clone(&self.resolve_fn);
         let did_owned = did.to_owned();
-        let handle = self.handle.clone();
+        let handle = self.resolution_handle()?.clone();
 
-        // Determine if we're inside a tokio runtime context.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Inside tokio: use block_in_place to avoid blocking a worker thread.
-            tokio::task::block_in_place(|| {
-                handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned))
-            })
-        } else {
-            // Outside tokio (e.g., PyO3 Python thread): use block_on directly.
-            handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned))
-        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned)))
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(ResolutionError::NetworkUnavailable(
+                        "DID-resolution thread panicked".to_owned(),
+                    ))
+                })
+        })
     }
 
     /// Checks sequence number for rotation detection and downgrade prevention.

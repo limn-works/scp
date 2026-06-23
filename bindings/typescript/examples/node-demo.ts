@@ -99,11 +99,16 @@ async function main(): Promise<void> {
     const changeBobRole = JSON.stringify({
       ChangeRole: { did: bob.did, new_role: "observer" },
     });
-    const govResult = await scp.contextExecuteGovernanceAction(
+    // Propose the action, then execute the tracked, approved proposal BY ID.
+    // Execution takes only the proposal id — the executor and consequence
+    // subject are resolved from the tracked proposal's proposer.
+    const proposeResult = await scp.contextGovernancePropose(
       ctx._rawHandle,
       changeBobRole,
       alice.did,
     );
+    const proposalIdHex = JSON.parse(proposeResult).proposal_id as string;
+    const govResult = await scp.contextExecuteGovernanceAction(ctx._rawHandle, proposalIdHex);
     console.log(`Governance result: ${govResult}`);
 
     const bobRole = await scp.contextMemberRole(ctx._rawHandle, bob.did);

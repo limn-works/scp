@@ -276,18 +276,23 @@ func validateDeployId(_ deployId: String) throws {
 // MARK: - Context Governance Extensions
 
 public extension Context {
-    /// Executes a governance action on this context.
+    /// Executes a previously-approved governance proposal BY ID.
     ///
-    /// Delegates to the UniFFI ``governanceExecute`` bridge function.
+    /// Delegates to the UniFFI ``governanceExecute`` bridge function. The
+    /// runtime resolves the authoritative proposal from the context actor's own
+    /// quorum-validated governance engine using `proposalIdHex`; the caller
+    /// supplies no proposal, action, status, or identity. An untracked /
+    /// unapproved id is rejected, so a caller cannot fabricate an approved
+    /// proposal. The executor and consequence subject are resolved from the
+    /// tracked proposal's proposer.
     ///
     /// - Parameters:
-    ///   - proposalJson: JSON-serialized ``GovernanceProposal``.
-    ///   - executeFn: Bridge function override for testing.
+    ///   - proposalIdHex: Hex-encoded id of the approved, tracked proposal.
     /// - Returns: A ``GovernanceActionResult`` describing the outcome.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or governance execution fails.
     func executeGovernanceAction(
-        proposalJson: String
+        proposalIdHex: String
     ) async throws -> GovernanceActionResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -296,7 +301,10 @@ public extension Context {
             )
         }
 
-        let raw = try await scp.governanceExecute(handle: handle, proposalJson: proposalJson)
+        let raw = try await scp.governanceExecute(
+            handle: handle,
+            proposalIdHex: proposalIdHex
+        )
         return GovernanceActionResult(rawValue: raw) ?? .executed
     }
 }

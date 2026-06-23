@@ -623,13 +623,17 @@ async fn context_ttl_operations() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn governance_execute_add_member() {
+async fn governance_execute_rejects_untracked_proposal() {
+    // Direct-execute by id: the runtime resolves the authoritative proposal
+    // from the context actor's own quorum-validated governance engine. A
+    // proposal id the engine never tracked (a forgery) MUST be rejected — a
+    // caller can no longer hand the bridge an action to run. The bridge surface
+    // takes only `(handle, proposal_id_hex)`; there is no action parameter (so
+    // action substitution is structurally impossible) and no caller identity —
+    // the executor and consequence subject are resolved from the tracked
+    // proposal's proposer.
     let scp = Scp::new_in_memory_for_test();
     let alice = scp
-        .identity_create("in_memory".to_owned(), None)
-        .await
-        .unwrap();
-    let bob = scp
         .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
@@ -638,18 +642,15 @@ async fn governance_execute_add_member() {
         .await
         .unwrap();
 
-    // Execute AddMember governance action
-    let action_json = serde_json::json!({
-        "AddMember": {
-            "did": bob.did(),
-            "role": "member"
-        }
-    })
-    .to_string();
-
-    let result = scp.governance_execute(handle, action_json).await;
-    // May succeed or fail depending on governance model, but should not panic
-    let _ = result;
+    // A 32-byte proposal id that was never proposed/tracked by the engine.
+    let fabricated = hex::encode([0xABu8; 32]);
+    let result = scp.governance_execute(handle, fabricated).await;
+    let err = result.expect_err("executing an untracked proposal id must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not tracked"),
+        "rejection should name the untracked proposal, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
