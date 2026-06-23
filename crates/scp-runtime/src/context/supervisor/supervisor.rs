@@ -14809,9 +14809,12 @@ mod tests {
         persistence.persist_context(&ctx_key, &active_snap).unwrap();
 
         // Run the real close path. It drives the handle to Closing and
-        // sync-persists before returning.
+        // sync-persists before returning. `close_context` now takes a
+        // `&mut ClassSCell` (the close fail-closed persist is performed by the
+        // Class-S `_keep` combinator), so wrap the bare test state in a cell.
         let handle_clone = state.handle.clone();
-        crate::context::lifecycle_helpers::close_context(&mut state, &deps, &handle_clone, &admin)
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::lifecycle_helpers::close_context(&mut cell, &deps, &handle_clone, &admin)
             .await
             .expect("close_context must succeed for a SingleAdmin context");
 

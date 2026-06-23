@@ -110,8 +110,9 @@ async fn dispatch_actor_inner(
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
             // JoinContext reaches the spending-nonce path (`enforce_join_economy`)
-            // via `join_context`, so it is threaded the cell; the other variants
-            // below take `state_mut()`.
+            // via `join_context`, so it is threaded the cell — as are the
+            // leave/close arms below, which route their member-removal /
+            // lifecycle-close fail-closed persists through the Class-S combinator.
             handle_join_context_actor(
                 cell,
                 deps,
@@ -127,7 +128,7 @@ async fn dispatch_actor_inner(
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
             handle_leave_context_actor(
-                cell.state_mut(),
+                cell,
                 deps,
                 p.context_id,
                 p.params,
@@ -139,15 +140,8 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context_actor(
-                cell.state_mut(),
-                deps,
-                p.context_id,
-                p.params,
-                p.initiator_did,
-                reply,
-            )
-            .await
+            handle_close_context_actor(cell, deps, p.context_id, p.params, p.initiator_did, reply)
+                .await
         }
         LifecycleCommand::ExportContext {
             context_id,
@@ -280,7 +274,7 @@ async fn handle_join_context_actor(
 }
 
 async fn handle_leave_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -299,7 +293,7 @@ async fn handle_leave_context_actor(
     }
 
     let leave_fut = crate::context::lifecycle_helpers::leave_context(
-        state,
+        cell,
         deps,
         &handle,
         &caller_did,
@@ -326,7 +320,7 @@ async fn handle_leave_context_actor(
 }
 
 async fn handle_close_context_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     _params: scp_protocol::context::params::ContextParams,
@@ -347,10 +341,13 @@ async fn handle_close_context_actor(
     // reject with "context already exists" (the gate saw a live context).
     // The payload `params` is ignored: `state.handle` already carries the
     // authoritative creation-time params, and they are immutable.
-    let handle = state.handle.clone();
+    //
+    // `cell.handle.clone()` reads through the cell's `Deref` (the clone ends the
+    // borrow before the `&mut cell` close call below).
+    let handle = cell.handle.clone();
 
     let close_fut =
-        crate::context::lifecycle_helpers::close_context(state, deps, &handle, &initiator_did);
+        crate::context::lifecycle_helpers::close_context(cell, deps, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),

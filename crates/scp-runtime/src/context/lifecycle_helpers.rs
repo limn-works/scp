@@ -202,7 +202,7 @@ pub fn export_context_blocks(
 /// - Crypto / transport / event-log failures are propagated.
 #[allow(clippy::too_many_lines)]
 pub async fn leave_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     caller_did: &DID,
@@ -211,151 +211,167 @@ pub async fn leave_context(
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = state::context_id_to_bytes(&context_id);
 
-    // PR #1606 C6: refuse if a commit fault marker is set.
-    governance_helpers::check_commit_fault(state)?;
+    // ADR-049 §9 Class S: a member leaving removes their own membership (a
+    // downward-authorization transition for that member) — STRUCTURAL fail-closed.
+    // The whole removal body (MLS remove + membership/role/access/routing cleanup
+    // + the `MemberLeft` event-log append) runs inside the Class-S `_keep`
+    // combinator's `rest_mut()` view, so the fail-closed persist is performed BY
+    // the combinator (replacing the former inline `persist_state_fail_closed`).
+    // KEEP-direction: a removal that did not durably land is NOT rolled back in
+    // memory — re-admitting a member the caller was told had left is the unsafe
+    // direction; the persist error is surfaced instead so the leave is not
+    // acknowledged as durable. The body is entirely synchronous (the only
+    // `.await`, the close-on-empty transition, runs AFTER the persist), so it
+    // fits the sync `_keep` closure. Shared helpers
+    // (`try_broadcast_commit_or_enqueue`, `check_commit_fault`) are called through
+    // the whole `&mut PerContextState` the view hands back, UNCHANGED.
+    let should_close = cell.commit_class_s_keep(deps, &context_id, |mut view| {
+        let state = view.rest_mut();
 
-    // Authorization: self-removal always allowed; otherwise MemberRemove
-    // required.
-    if caller_did != member_did
-        && !state
-            .role_state
-            .member_has_capability(caller_did, &Capability::MemberRemove)
-    {
-        return Err(ContextError::PermissionDenied(
-            "caller lacks permission to remove this member".into(),
-        ));
-    }
+        // PR #1606 C6: refuse if a commit fault marker is set.
+        governance_helpers::check_commit_fault(state)?;
 
-    let is_broadcast = state.broadcast_context.is_some();
-
-    // Crypto operations -- skip for broadcast mode (no MLS).
-    // H9: MLS group removal FIRST (hard security boundary), then sender
-    // key cleanup as best-effort. MLS removal is the cryptographic
-    // enforcement; sender key removal is defense-in-depth (§9.16).
-    if !is_broadcast {
-        let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
-        if let Err(e) = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, member_did)
+        // Authorization: self-removal always allowed; otherwise MemberRemove
+        // required.
+        if caller_did != member_did
+            && !state
+                .role_state
+                .member_has_capability(caller_did, &Capability::MemberRemove)
         {
-            tracing::warn!(
-                context_id = %context_id,
-                member = %member_did,
-                error = %e,
-                "remove_member_sender_key failed after MLS removal — \
-                 sender key layer may retain stale key"
-            );
+            return Err(ContextError::PermissionDenied(
+                "caller lacks permission to remove this member".into(),
+            ));
         }
 
-        // Broadcast the MLS Commit to remaining members so they can
-        // advance their group epoch and ratchet key material. PR #1606
-        // C6: on transport failure, the commit is durably enqueued for
-        // retry.
-        governance_helpers::try_broadcast_commit_or_enqueue(
-            state,
-            deps,
+        let is_broadcast = state.broadcast_context.is_some();
+
+        // Crypto operations -- skip for broadcast mode (no MLS).
+        // H9: MLS group removal FIRST (hard security boundary), then sender
+        // key cleanup as best-effort. MLS removal is the cryptographic
+        // enforcement; sender key removal is defense-in-depth (§9.16).
+        if !is_broadcast {
+            let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
+            if let Err(e) = deps
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, member_did)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    member = %member_did,
+                    error = %e,
+                    "remove_member_sender_key failed after MLS removal — \
+                     sender key layer may retain stale key"
+                );
+            }
+
+            // Broadcast the MLS Commit to remaining members so they can
+            // advance their group epoch and ratchet key material. PR #1606
+            // C6: on transport failure, the commit is durably enqueued for
+            // retry.
+            governance_helpers::try_broadcast_commit_or_enqueue(
+                state,
+                deps,
+                &context_id,
+                remove_output.commit_bytes,
+                &CommitOperation::LeaveContext {
+                    member_did: member_did.clone(),
+                },
+            );
+
+            // Rotate the local sender key and distribute to remaining members
+            // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
+            // security boundary. If rotation fails, log but continue.
+            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after leave — \
+                     remaining members retain old sender key"
+                );
+            }
+            if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after leave"
+                );
+            }
+        }
+
+        // State check + membership removal -- the actor owns state for the
+        // duration of this command, so no relock dance is required.
+        state::require_active(&state.handle)?;
+
+        // For broadcast contexts, unsubscribe from the BroadcastContext.
+        // rotate_keys=true for forward secrecy after departure.
+        if let Some(ref mut bc) = state.broadcast_context {
+            // Ignore MemberNotFound -- the member may be an author who was
+            // never a subscriber. Propagate all other errors (e.g.
+            // CryptoFailed from epoch overflow during key rotation).
+            match bc.unsubscribe(member_did, true) {
+                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !state.membership.remove_member(member_did) {
+            return Err(ContextError::MemberNotFound(member_did.to_string()));
+        }
+
+        // Remove from role state.
+        state.role_state.members.remove(member_did.as_ref());
+        state.role_state.assignments.remove(member_did.as_ref());
+        state
+            .role_state
+            .member_capabilities
+            .remove(member_did.as_ref());
+
+        // Destroy the departing member's access key (§9.17.2, ADR-038).
+        state
+            .access
+            .access_key_store
+            .remove(&context_id, member_did.as_ref());
+
+        // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
+        // a broadcast context (which carries no peer registry).
+        if let Some(reg) = state.routing.peer_registry_mut() {
+            reg.remove(member_did);
+        }
+
+        // Emit MemberLeft event to receive buffer.
+        let left_event = ContextEvent::MemberLeft {
+            member_did: member_did.clone(),
+        };
+        state::emit_event_into(
+            &mut state.receive_buffer,
+            left_event,
             &context_id,
-            remove_output.commit_bytes,
-            &CommitOperation::LeaveContext {
-                member_did: member_did.clone(),
-            },
+            deps.event_tx.as_ref(),
         );
 
-        // Rotate the local sender key and distribute to remaining members
-        // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
-        // security boundary. If rotation fails, log but continue.
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "rotate_sender_key failed after leave — \
-                 remaining members retain old sender key"
-            );
-        }
-        if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after leave"
-            );
-        }
-    }
+        let should_close = state.membership.count() == 0;
 
-    // State check + membership removal -- the actor owns state for the
-    // duration of this command, so no relock dance is required.
-    state::require_active(&state.handle)?;
+        // Append MemberLeft event to event log.
+        deps.event_log.append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            member_did.as_ref(),
+            // Committer-assigned: the leaving member's clock — the source of the
+            // `created_at` on its outgoing leave commit. This is the
+            // convergent-by-construction value WHEN cross-member leaf replication
+            // lands: the receive-side append path is currently dormant, so this
+            // leaf is committer-appended-only and is NOT yet replicated to other
+            // members. Cross-member convergence of membership leaves is the
+            // forward step under ADR-051 (§7.3.1, §9.9.3).
+            deps.clock.now_secs(),
+        )?;
+        state.checkpoint_events_since += 1;
 
-    // For broadcast contexts, unsubscribe from the BroadcastContext.
-    // rotate_keys=true for forward secrecy after departure.
-    if let Some(ref mut bc) = state.broadcast_context {
-        // Ignore MemberNotFound -- the member may be an author who was
-        // never a subscriber. Propagate all other errors (e.g.
-        // CryptoFailed from epoch overflow during key rotation).
-        match bc.unsubscribe(member_did, true) {
-            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
+        Ok(should_close)
+    })?;
 
-    if !state.membership.remove_member(member_did) {
-        return Err(ContextError::MemberNotFound(member_did.to_string()));
-    }
-
-    // Remove from role state.
-    state.role_state.members.remove(member_did.as_ref());
-    state.role_state.assignments.remove(member_did.as_ref());
-    state
-        .role_state
-        .member_capabilities
-        .remove(member_did.as_ref());
-
-    // Destroy the departing member's access key (§9.17.2, ADR-038).
-    state
-        .access
-        .access_key_store
-        .remove(&context_id, member_did.as_ref());
-
-    // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
-    // a broadcast context (which carries no peer registry).
-    if let Some(reg) = state.routing.peer_registry_mut() {
-        reg.remove(member_did);
-    }
-
-    // Emit MemberLeft event to receive buffer.
-    let left_event = ContextEvent::MemberLeft {
-        member_did: member_did.clone(),
-    };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        left_event,
-        &context_id,
-        deps.event_tx.as_ref(),
-    );
-
-    let should_close = state.membership.count() == 0;
-
-    // Append MemberLeft event to event log.
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        member_did.as_ref(),
-        // Committer-assigned: the leaving member's clock — the source of the
-        // `created_at` on its outgoing leave commit. This is the
-        // convergent-by-construction value WHEN cross-member leaf replication
-        // lands: the receive-side append path is currently dormant, so this
-        // leaf is committer-appended-only and is NOT yet replicated to other
-        // members. Cross-member convergence of membership leaves is the
-        // forward step under ADR-051 (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
-    state.checkpoint_events_since += 1;
-
-    // ADR-049 §9 Class S: a member leaving removes their own membership (a
-    // downward-authorization transition for that member) — persist fail-closed
-    // so a crash cannot re-admit a member who was told their leave succeeded.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
-
-    // If member count reaches zero, transition to Closing.
+    // If member count reaches zero, transition to Closing. Runs AFTER the
+    // fail-closed persist above, matching the prior ordering.
     if should_close {
         handle.transition_to(&ContextState::Closing).await?;
     }
@@ -433,12 +449,12 @@ pub fn drain_and_deliver_sender_keys(
 ///
 /// See [`close_context_with_key`].
 pub async fn close_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
 ) -> Result<CloseResult, ContextError> {
-    close_context_with_key(state, deps, handle, initiator_did, None).await
+    close_context_with_key(cell, deps, handle, initiator_did, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +476,7 @@ pub async fn close_context(
 ///   `SingleAdmin` (the close must route through governance).
 /// - Errors propagated from [`ttl::close_context`].
 pub async fn close_context_with_key(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
@@ -468,12 +484,16 @@ pub async fn close_context_with_key(
 ) -> Result<CloseResult, ContextError> {
     let context_id = handle.context_id().to_owned();
 
+    // Pre-`ttl::close_context` GATES are read-only against the cell (`&*cell`
+    // Deref → `&PerContextState`); they stage no Class-S mutation, so no persist
+    // is owed for an early reject here.
+
     // State check inside actor body -- eliminates TOCTOU race.
-    state::require_active(&state.handle)?;
+    state::require_active(&cell.handle)?;
 
     // Gate: multi-admin models must use governance path (SCP-270, ADR-031).
     if !matches!(
-        state.governance.engine.model_config(),
+        cell.governance.engine.model_config(),
         GovernanceModelConfig::SingleAdmin { .. }
     ) {
         return Err(ContextError::PermissionDenied(
@@ -484,7 +504,7 @@ pub async fn close_context_with_key(
     }
 
     // Snapshot role_state for the ttl::close_context call.
-    let role_state = state.role_state.clone();
+    let role_state = cell.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
     // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
@@ -494,6 +514,11 @@ pub async fn close_context_with_key(
     // dormant, so the leaf is committer-appended-only and is NOT yet
     // replicated to other members. Cross-member convergence is the forward
     // step under ADR-051 (§7.3.1, §9.9.3).
+    //
+    // This `.await` runs BEFORE the Class-S persist below and does NOT mutate
+    // `PerContextState` (it drives the shared `handle` lifecycle FSM), so it
+    // stays OUTSIDE the `_keep` combinator closure that wraps the subsequent
+    // state mutations + fail-closed persist.
     let result = ttl::close_context(
         handle,
         initiator_did,
@@ -503,95 +528,108 @@ pub async fn close_context_with_key(
     )
     .await?;
 
-    // Fix C: Re-check ContextClose capability after the state transition
-    // committed. If capability was revoked between the gate and the
-    // cleanup, log a warning for auditability — the state transition
-    // already happened (cannot undo).
-    if !state
-        .role_state
-        .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
-    {
-        tracing::warn!(
-            context_id = %context_id,
-            initiator_did = %initiator_did,
-            "ContextClose capability revoked between gate and cleanup — \
-             state transition already committed, proceeding with cleanup"
-        );
-    }
-
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
-    // Drop broadcast context state -- keys are zeroed by Zeroize.
-    state.broadcast_context = None;
-
-    // §9.10.4: clear pseudonym state on close. The local pseudonym is
-    // derived from secret key material; dropping it (by collapsing the
-    // routing axis to the no-pseudonym `Broadcast` variant) prevents leaking
-    // the routing ID or any learned peer pseudonyms after context teardown.
-    // The context is terminal at this point, so the routing axis no longer
-    // needs to agree with the (also torn-down) crypto axis.
-    state.routing = ContextRouting::Broadcast;
-
-    // Participation decay: clear participation cache and cooldown state
-    // on context close (#1530).
-    state.governance.decay_participation();
-
-    // Final checkpoint before close (§9.9.3): force-create a checkpoint
-    // to capture the terminal event log state. This ensures
-    // equivocation detection covers the full context lifetime.
-    // Best-effort: skip if no signing key is available.
-    if let Some(sk) = signing_key {
-        let now = deps.clock.now_secs();
-        let broadcast_context_is_none = state.broadcast_context.is_none();
-        let mls_epoch = state.epoch.mls_epoch;
-        let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
-            &context_id,
-            broadcast_context_is_none,
-            mls_epoch,
-            &mut state.checkpoint_events_since,
-            &mut state.checkpoint_last_time_secs,
-            &mut state.checkpoints,
-            initiator_did,
-            sk,
-            now,
-            deps.event_log.as_ref(),
-        );
-        tracing::debug!(
-            context_id = %context_id,
-            event_count = cp.event_count,
-            "final checkpoint created on close (§9.9.3)"
-        );
-    }
-
-    let close_event = ContextEvent::SystemClose {
-        initiator_did: initiator_did.clone(),
-    };
-    state::emit_event_into(
-        &mut state.receive_buffer,
-        close_event,
-        &context_id,
-        deps.event_tx.as_ref(),
-    );
-
-    // Metrics gauge refresh is a Supervisor-wide operation: it round-trips a
-    // mailbox query to EVERY registered context actor -- including this one,
-    // which is still executing inside its own close handler. Awaiting it here
-    // self-deadlocks: the query parks in our own mailbox behind the command we
-    // are still processing, so it cannot be answered until close returns, but
-    // close cannot return until the query is answered -- it unwinds only when
-    // the 30s send timeout fires (surfacing as `close_context exceeded 30s
-    // budget`). Detach it: the close handler returns, this actor's command loop
-    // frees, and the refresh then observes up-to-date state. Gauges are
-    // eventually-consistent metrics, so fire-and-forget is the correct coupling.
-    let supervisor = deps.supervisor.clone();
-    tokio::spawn(async move {
-        supervisor.update_context_gauges().await;
-    });
-
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
-    // (a closed context must not silently re-open on a crash) — persist
-    // fail-closed.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
+    // (a closed context must not silently re-open on a crash) — STRUCTURAL
+    // fail-closed. All post-transition state mutations (timer/timeout cancel,
+    // broadcast/routing teardown, participation decay, final checkpoint, the
+    // `SystemClose` emit) run inside the Class-S `_keep` combinator's
+    // `rest_mut()` view, so the fail-closed persist is performed BY the
+    // combinator (replacing the former inline `persist_state_fail_closed`).
+    // KEEP-direction: a close that did not durably land is NOT rolled back in
+    // memory — silently re-opening a closed context is the unsafe direction; the
+    // persist error is surfaced instead. These mutations are all synchronous (the
+    // self-deadlock-avoiding gauge refresh is a detached `tokio::spawn` that
+    // borrows only `deps`), so they fit the sync `_keep` closure.
+    cell.commit_class_s_keep(deps, &context_id, |mut view| {
+        let state = view.rest_mut();
+
+        // Fix C: Re-check ContextClose capability after the state transition
+        // committed. If capability was revoked between the gate and the
+        // cleanup, log a warning for auditability — the state transition
+        // already happened (cannot undo).
+        if !state
+            .role_state
+            .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                initiator_did = %initiator_did,
+                "ContextClose capability revoked between gate and cleanup — \
+                 state transition already committed, proceeding with cleanup"
+            );
+        }
+
+        state.ttl.timer.cancel();
+        state.governance.timeout_task.cancel();
+        // Drop broadcast context state -- keys are zeroed by Zeroize.
+        state.broadcast_context = None;
+
+        // §9.10.4: clear pseudonym state on close. The local pseudonym is
+        // derived from secret key material; dropping it (by collapsing the
+        // routing axis to the no-pseudonym `Broadcast` variant) prevents leaking
+        // the routing ID or any learned peer pseudonyms after context teardown.
+        // The context is terminal at this point, so the routing axis no longer
+        // needs to agree with the (also torn-down) crypto axis.
+        state.routing = ContextRouting::Broadcast;
+
+        // Participation decay: clear participation cache and cooldown state
+        // on context close (#1530).
+        state.governance.decay_participation();
+
+        // Final checkpoint before close (§9.9.3): force-create a checkpoint
+        // to capture the terminal event log state. This ensures
+        // equivocation detection covers the full context lifetime.
+        // Best-effort: skip if no signing key is available.
+        if let Some(sk) = signing_key {
+            let now = deps.clock.now_secs();
+            let broadcast_context_is_none = state.broadcast_context.is_none();
+            let mls_epoch = state.epoch.mls_epoch;
+            let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
+                &context_id,
+                broadcast_context_is_none,
+                mls_epoch,
+                &mut state.checkpoint_events_since,
+                &mut state.checkpoint_last_time_secs,
+                &mut state.checkpoints,
+                initiator_did,
+                sk,
+                now,
+                deps.event_log.as_ref(),
+            );
+            tracing::debug!(
+                context_id = %context_id,
+                event_count = cp.event_count,
+                "final checkpoint created on close (§9.9.3)"
+            );
+        }
+
+        let close_event = ContextEvent::SystemClose {
+            initiator_did: initiator_did.clone(),
+        };
+        state::emit_event_into(
+            &mut state.receive_buffer,
+            close_event,
+            &context_id,
+            deps.event_tx.as_ref(),
+        );
+
+        // Metrics gauge refresh is a Supervisor-wide operation: it round-trips a
+        // mailbox query to EVERY registered context actor -- including this one,
+        // which is still executing inside its own close handler. Awaiting it here
+        // self-deadlocks: the query parks in our own mailbox behind the command we
+        // are still processing, so it cannot be answered until close returns, but
+        // close cannot return until the query is answered -- it unwinds only when
+        // the 30s send timeout fires (surfacing as `close_context exceeded 30s
+        // budget`). Detach it: the close handler returns, this actor's command loop
+        // frees, and the refresh then observes up-to-date state. Gauges are
+        // eventually-consistent metrics, so fire-and-forget is the correct coupling.
+        let supervisor = deps.supervisor.clone();
+        tokio::spawn(async move {
+            supervisor.update_context_gauges().await;
+        });
+
+        Ok(())
+    })?;
 
     Ok(result)
 }
