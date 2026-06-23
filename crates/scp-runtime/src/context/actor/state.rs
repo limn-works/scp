@@ -1351,30 +1351,6 @@ impl PerContextState {
         &self.class_s.saga_pending
     }
 
-    /// Pushes an event to the receive buffer and, if a broadcast channel
-    /// is provided, sends a sanitized copy there too. Mirrors the
-    /// security invariants of the standalone
-    /// [`crate::context::state::emit_event_into`] helper:
-    ///
-    /// - `WelcomeGenerated` events carry MLS key material and are NEVER
-    ///   sent on the broadcast channel (receive buffer only).
-    /// - `MessageReceived` / `MessageSent` payloads contain decrypted
-    ///   plaintext and are stripped (replaced with empty `Vec`) before
-    ///   broadcast to preserve encryption-as-access-control.
-    pub(crate) fn emit_event(
-        &mut self,
-        event: scp_protocol::context::membership::ContextEvent,
-        context_id: &str,
-        tx: Option<
-            &tokio::sync::broadcast::Sender<(
-                String,
-                scp_protocol::context::membership::ContextEvent,
-            )>,
-        >,
-    ) {
-        crate::context::state::emit_event_into(&mut self.receive_buffer, event, context_id, tx);
-    }
-
     /// Construct a fresh encrypted-mode actor state for test use. Populates
     /// every field with a sensible default (empty collections, zero
     /// counters, `None` optionals). The production construction path for

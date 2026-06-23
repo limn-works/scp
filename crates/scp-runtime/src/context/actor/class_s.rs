@@ -543,7 +543,7 @@ pub(crate) struct GovernanceClassCMut<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `revoked_spending_ucan_cids_mut`, `proposal_timestamps_mut`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `revoked_spending_ucan_cids_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -796,6 +796,44 @@ impl<'a> GovernanceClassCMut<'a> {
             consequence_rules: self.consequence_rules,
             message_pricing: self.message_pricing,
         }
+    }
+
+    /// Evict stale governance liveness entries (participation cache, cooldowns,
+    /// proposal timestamps) keyed off the last-known-member set. Class-C
+    /// liveness cleanup — field-granular over this view's own fields: a
+    /// coalesce-window rollback of an eviction tick is acceptable (the caches
+    /// re-derive from the durable membership / proposal flow). The `&*` reborrow
+    /// narrows `last_known_members` to a shared `&` so it can be read inside the
+    /// `retain` closures while `participation_cache` / `proposal_timestamps` are
+    /// borrowed `&mut` — disjoint fields, no whole-bucket `&mut`.
+    pub(crate) fn evict_stale_entries(&mut self, now: u64) {
+        // M25: O(1) membership check per entry via HashSet::contains.
+        // last_known_members is HashSet<DID> which implements Borrow<str>,
+        // so we can look up &str keys directly.
+        let last_known_members = &*self.last_known_members;
+        self.participation_cache
+            .retain(|did, _| last_known_members.contains(did.as_str()));
+        // Evict expired cooldown entries.
+        self.cooldown_until.retain(|_, expiry| now < *expiry);
+        // Evict departed members from proposal timestamps.
+        self.proposal_timestamps
+            .retain(|did, _| last_known_members.contains(did.as_str()));
+    }
+
+    /// Disjoint borrows for the governance deadlock-detection update: a `&mut`
+    /// to the [`DeadlockDetectionState`] held simultaneously with a shared `&`
+    /// read of the governance [`GovernanceEngine`]. Both are distinct fields of
+    /// this view, so the borrow checker permits the single `&mut` alongside the
+    /// `&` read; the caller (`update_detection_state`) needs both at once.
+    ///
+    /// Both fields are Class-C / structural — the deadlock-detection bookkeeping
+    /// is per-tick liveness state whose coalesce-window rollback is acceptable,
+    /// and the engine read is configuration. No reference into any Class-S
+    /// sub-struct is produced.
+    pub(crate) fn detection_borrows(
+        &mut self,
+    ) -> (&mut DeadlockDetectionState, &dyn GovernanceEngine) {
+        (self.deadlock, self.engine.as_ref())
     }
 
     /// Reborrow this view into a shorter-lived [`GovernanceClassCMut`] over the
@@ -1218,7 +1256,7 @@ impl<'a> ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -1341,6 +1379,28 @@ impl<'a> ClassCMut<'a> {
     /// hand out directly: it contains no Class-S sub-struct.
     pub(crate) const fn receive_buffer_mut(&mut self) -> &mut ReceiveBuffer {
         self.receive_buffer
+    }
+
+    /// Emit a [`scp_protocol::context::membership::ContextEvent`] into the
+    /// receive buffer (and, for non-secret variants, a sanitized copy onto the
+    /// broadcast channel). Class-C / structural — field-granular over
+    /// `receive_buffer` ONLY, delegating to
+    /// [`crate::context::state::emit_event_into`] (the same security invariants:
+    /// `WelcomeGenerated` never broadcasts, message payloads are stripped before
+    /// broadcast). The buffered event is best-effort / coalesce-window-rollback
+    /// acceptable.
+    pub(crate) fn emit_event(
+        &mut self,
+        event: scp_protocol::context::membership::ContextEvent,
+        context_id: &str,
+        tx: Option<
+            &tokio::sync::broadcast::Sender<(
+                String,
+                scp_protocol::context::membership::ContextEvent,
+            )>,
+        >,
+    ) {
+        crate::context::state::emit_event_into(self.receive_buffer, event, context_id, tx);
     }
 
     /// `&mut` access to the whole role / ceiling / assignment state.

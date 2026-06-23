@@ -119,7 +119,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_withdraw_governance_vote_actor(
-                cell.state_mut(),
+                cell,
                 deps,
                 &context_id,
                 &proposal_id,
@@ -202,26 +202,16 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(cell.state_mut(), deps, reply)
+            handle_evaluate_periodic_consequences_actor(cell, deps, reply)
         }
         GovernanceCommand::ProcessPendingCommits { reply } => {
-            Box::pin(handle_process_pending_commits_actor(
-                cell.state_mut(),
-                deps,
-                reply,
-            ))
-            .await
+            Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
         }
         GovernanceCommand::EvaluateTimeouts { reply } => {
-            Box::pin(handle_evaluate_timeouts_actor(
-                cell.state_mut(),
-                deps,
-                reply,
-            ))
-            .await
+            Box::pin(handle_evaluate_timeouts_actor(cell, deps, reply)).await
         }
         GovernanceCommand::StartTimeoutTask { reply } => {
-            handle_start_timeout_task_actor(cell.state_mut(), deps, reply).await
+            handle_start_timeout_task_actor(cell, deps, reply).await
         }
         // Placeholder is a no-op handshake target reserved for mailbox
         // tests. Returns NotImplemented synchronously; no state mutation.
@@ -343,7 +333,7 @@ fn handle_acknowledge_commit_fault_actor(
 
 /// Handle [`GovernanceCommand::WithdrawGovernanceVote`] (actor-shape).
 async fn handle_withdraw_governance_vote_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
@@ -351,7 +341,7 @@ async fn handle_withdraw_governance_vote_actor(
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
-        state,
+        cell,
         deps,
         context_id,
         proposal_id,
@@ -772,30 +762,32 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 /// `Supervisor::contexts` DashMap directly); the actor-shape variant
 /// operates on `&mut state` and never touches the supervisor's DashMap.
 fn handle_evaluate_periodic_consequences_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
 
     use crate::context::governance_logic::{
-        ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences,
-        event_log_entries_for_consequences,
+        EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
     };
 
-    let rules = state.governance.consequence_rules.clone();
+    // Reads of the Class-C consequence config / membership go through the
+    // cell's `Deref` (`&PerContextState`); no whole-state `&mut` is taken until
+    // the enforcement loop, which routes through the Class-C view.
+    let rules = cell.governance.consequence_rules.clone();
     if rules.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
     let now = deps.clock.now_secs();
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
     let member_dids: Vec<scp_identity::DID> =
-        state.membership.members().map(|m| m.did.clone()).collect();
+        cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
     let (events, convergent_now) = event_log_entries_for_consequences(
-        &state.receive_buffer,
+        &cell.receive_buffer,
         &context_id,
         now,
         deps.event_log.as_ref(),
@@ -813,7 +805,12 @@ fn handle_evaluate_periodic_consequences_actor(
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
-    let mut split = ConsequenceStateSplit::from_state(state);
+    // Coalesced: the enforcement mutations ride the run loop's coalesced
+    // persist — the non-persisting Class-C view supplies the same disjoint
+    // `ClassCSplit` borrows `ConsequenceStateSplit` needs (it is a type alias
+    // for `ClassCSplit`), with no per-site persist injected.
+    let mut view = cell.class_c_view();
+    let mut split = view.split_class_c();
     for (member_did, triggered) in &results {
         enforce_triggered_consequences(
             &mut split,
@@ -943,7 +940,7 @@ fn compute_commit_retry_outcomes(
 /// member holds the notion, so two honest members would diverge at equal
 /// event count (§9.9.3). No durable consumer reads them.
 fn apply_commit_retry_outcomes(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     outcomes: Vec<CommitRetryOutcome>,
@@ -952,7 +949,13 @@ fn apply_commit_retry_outcomes(
 
     use crate::context::state::CommitFaultMarker;
 
-    let queue_len = state.pending_commits.len();
+    // Coalesced: all mutations are Class-C / structural (the pending-commit
+    // queue, the fault marker, and the local-only broadcast-retry lifecycle
+    // events) and ride the run loop's coalesced persist — the non-persisting
+    // Class-C view holds the disjoint field references without injecting a
+    // per-site persist.
+    let mut view = cell.class_c_view();
+    let queue_len = view.pending_commits_mut().len();
     let mut to_remove: Vec<usize> = Vec::new();
     for outcome in outcomes {
         if outcome.index >= queue_len {
@@ -963,7 +966,7 @@ fn apply_commit_retry_outcomes(
                 attempts,
                 operation,
             } => {
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastSucceeded {
                         operation: operation.label(),
                         attempts,
@@ -979,12 +982,12 @@ fn apply_commit_retry_outcomes(
                 new_retry_count,
                 operation,
             } => {
-                if let Some(entry) = state.pending_commits.get_mut(outcome.index) {
+                if let Some(entry) = view.pending_commits_mut().get_mut(outcome.index) {
                     entry.retry_count = new_retry_count;
                     entry.next_attempt_at = next_attempt_at;
                     entry.last_error = Some(error.clone());
                 }
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastPending {
                         operation: operation.label(),
                         error,
@@ -1000,13 +1003,13 @@ fn apply_commit_retry_outcomes(
                 operation,
             } => {
                 let now_failed = deps.clock.now_secs();
-                state.commit_fault = Some(CommitFaultMarker {
+                *view.commit_fault_mut() = Some(CommitFaultMarker {
                     operation: operation.clone(),
                     reason: reason.clone(),
                     failed_at: now_failed,
                     retry_count: attempts,
                 });
-                state.emit_event(
+                view.emit_event(
                     ContextEvent::CommitBroadcastFailed {
                         operation: operation.label(),
                         reason,
@@ -1021,7 +1024,7 @@ fn apply_commit_retry_outcomes(
     }
     to_remove.sort_unstable_by(|a, b| b.cmp(a));
     for idx in to_remove {
-        state.pending_commits.remove(idx);
+        view.pending_commits_mut().remove(idx);
     }
 }
 
@@ -1043,23 +1046,24 @@ fn apply_commit_retry_outcomes(
 /// between phases — this preserves the legacy "queue is only mutated
 /// by this task between phases" invariant.
 async fn handle_process_pending_commits_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     use crate::context::state::PendingCommit;
 
-    if state.commit_fault.is_some() {
+    // Reads go through the cell's `Deref` (`&PerContextState`).
+    if cell.commit_fault.is_some() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
-    let snapshot: Vec<PendingCommit> = state.pending_commits.iter().cloned().collect();
+    let snapshot: Vec<PendingCommit> = cell.pending_commits.iter().cloned().collect();
     if snapshot.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
     let now = deps.clock.now_secs();
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
 
     let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
     if outcomes.is_empty() {
@@ -1073,7 +1077,7 @@ async fn handle_process_pending_commits_actor(
     // appended to the canonical Merkle log (they are per-committer; only the
     // broadcasting member holds the notion, so honest members would diverge at
     // equal event count — §9.9.3).
-    apply_commit_retry_outcomes(state, deps, &context_id, outcomes);
+    apply_commit_retry_outcomes(cell, deps, &context_id, outcomes);
 
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
@@ -1093,7 +1097,7 @@ async fn handle_process_pending_commits_actor(
 /// drives the cadence; per-actor governance-timeout actors land in Phase
 /// 2B per ADR-049.
 async fn handle_evaluate_timeouts_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
@@ -1106,10 +1110,14 @@ async fn handle_evaluate_timeouts_actor(
     };
     use crate::context::governance_helpers::build_governance_context;
 
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
 
-    // Phase 1: read state, process proposals, detect deadlock.
-    let current_state = state.handle.try_read_state();
+    // Phase 1: read state, process proposals, detect deadlock. Reads go through
+    // the cell's `Deref` (`&PerContextState`); every Class-C mutation routes
+    // through a short-lived non-persisting Class-C view whose borrow is dropped
+    // before the next call — coalesced (no per-site persist; the run loop
+    // flushes after the handler reports `mutated`).
+    let current_state = cell.handle.try_read_state();
     if !matches!(
         current_state,
         Some(scp_protocol::context::ContextState::Active)
@@ -1121,45 +1129,52 @@ async fn handle_evaluate_timeouts_actor(
         return Outcome::ok(());
     }
 
-    let gov_ctx = build_governance_context(state, deps.clock.as_ref());
+    let gov_ctx = build_governance_context(&*cell, deps.clock.as_ref());
 
-    let current_members: HashSet<DID> = state.membership.members().map(|m| m.did.clone()).collect();
-    let departed: Vec<DID> = state
+    let current_members: HashSet<DID> = cell.membership.members().map(|m| m.did.clone()).collect();
+    let departed: Vec<DID> = cell
         .governance
         .last_known_members
         .difference(&current_members)
         .cloned()
         .collect();
-    state.governance.last_known_members = current_members;
 
-    state.governance.evict_stale_entries(deps.clock.now_secs());
+    let mls_epoch = cell.epoch.mls_epoch;
+    let recovery_in_progress = cell.governance.deadlock.recovery_in_progress;
+    let active_voters = collect_active_voters(cell.governance.engine.as_ref());
 
-    let epoch_resets: Vec<DID> = std::mem::take(&mut state.governance.pending_epoch_resets);
+    // Class-C writes: refresh the last-known-member set, evict stale liveness
+    // entries, drain the epoch-reset queue. Each is a short-lived view borrow.
+    let epoch_resets: Vec<DID> = {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        *gov.last_known_members_mut() = current_members;
+        gov.evict_stale_entries(deps.clock.now_secs());
+        std::mem::take(gov.pending_epoch_resets_mut())
+    };
 
-    let mls_epoch = state.epoch.mls_epoch;
-    let recovery_in_progress = state.governance.deadlock.recovery_in_progress;
-
-    let active_voters = collect_active_voters(state.governance.engine.as_ref());
-
-    let result = process_pending_proposals(
-        state.governance.engine.as_mut(),
-        &gov_ctx,
-        &departed,
-        &epoch_resets,
-    );
-
-    update_detection_state(
-        &mut state.governance.deadlock,
-        state.governance.engine.as_ref(),
-        &gov_ctx,
-        &active_voters,
-    );
-
-    let conditions = crate::context::governance::timeout::detect_deadlock(
-        state.governance.engine.as_ref(),
-        &gov_ctx,
-        &state.governance.deadlock,
-    );
+    // `process_pending_proposals` mutates the engine; `update_detection_state`
+    // needs `&mut deadlock` AND `&engine` simultaneously (disjoint fields, via
+    // `detection_borrows`); `detect_deadlock` reads both. All three run inside a
+    // single view borrow that drops before the translate / emit steps.
+    let result;
+    let conditions;
+    {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        result = process_pending_proposals(
+            gov.engine_mut().as_mut(),
+            &gov_ctx,
+            &departed,
+            &epoch_resets,
+        );
+        let (deadlock, engine) = gov.detection_borrows();
+        update_detection_state(&mut *deadlock, engine, &gov_ctx, &active_voters);
+        // `detect_deadlock` reads both engine and deadlock; the same disjoint
+        // borrows (now reborrowed shared) serve it.
+        conditions =
+            crate::context::governance::timeout::detect_deadlock(engine, &gov_ctx, deadlock);
+    }
 
     // Phase 2: translate timeout events.
     let ctx_events = crate::context::governance_helpers::translate_timeout_events(
@@ -1174,28 +1189,33 @@ async fn handle_evaluate_timeouts_actor(
         || (conditions.is_empty() && recovery_in_progress)
         || (!conditions.is_empty() && !recovery_in_progress);
     if needs_write {
+        let mut view = cell.class_c_view();
         for ctx_event in ctx_events {
-            state.emit_event(ctx_event, &context_id, deps.event_tx.as_ref());
+            view.emit_event(ctx_event, &context_id, deps.event_tx.as_ref());
         }
         if conditions.is_empty() && recovery_in_progress {
-            state.governance.deadlock.recovery_in_progress = false;
+            view.governance_class_c_mut()
+                .deadlock_mut()
+                .recovery_in_progress = false;
         } else if !conditions.is_empty() && !recovery_in_progress {
-            state.governance.deadlock.recovery_in_progress = true;
+            view.governance_class_c_mut()
+                .deadlock_mut()
+                .recovery_in_progress = true;
         }
     }
 
     // Phase 4: periodic consequence evaluation (#1531). Reuses the
     // actor-shape sweep body via direct call rather than a nested
-    // mailbox dispatch — both operate on `&mut state` already owned by
-    // this handler.
+    // mailbox dispatch — both operate on the `cell` already owned by
+    // this handler. No view borrow is live here.
     let (consequence_reply_tx, _consequence_reply_rx) = oneshot::channel();
-    let _ = handle_evaluate_periodic_consequences_actor(state, deps, consequence_reply_tx);
+    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx);
 
     // Phase 5 (PR #1606 C6): drain MLS commit retry queue. Same pattern
     // as Phase 4 — direct in-handler call.
     let (commits_reply_tx, _commits_reply_rx) = oneshot::channel();
     let _ = Box::pin(handle_process_pending_commits_actor(
-        state,
+        cell,
         deps,
         commits_reply_tx,
     ))
@@ -1216,11 +1236,11 @@ async fn handle_evaluate_timeouts_actor(
 /// Awaits the `tracked_spawn` task_set push so the abort handle is
 /// installed on `state.governance.timeout_task` before replying.
 async fn handle_start_timeout_task_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    crate::context::governance_helpers::spawn_governance_timeout_task(state, deps).await;
+    crate::context::governance_helpers::spawn_governance_timeout_task(cell, deps).await;
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
 }

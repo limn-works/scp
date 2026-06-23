@@ -1385,32 +1385,6 @@ impl GovernanceState {
         // data from a closed/expired context must not carry over.
         self.velocity_tracker.clear();
     }
-
-    /// Evicts stale entries from caches to prevent unbounded growth.
-    ///
-    /// Unlike [`decay_participation`](Self::decay_participation) (which
-    /// clears everything), this performs targeted eviction based on current
-    /// state:
-    /// - `participation_cache`: removes DIDs not in `last_known_members`.
-    /// - `cooldown_until`: removes entries where `now >= expiry`.
-    ///
-    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
-    /// the hoisted
-    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
-    /// free function can call it from outside the `manager/` submodule
-    /// tree.
-    pub(crate) fn evict_stale_entries(&mut self, now: u64) {
-        // M25: O(1) membership check per entry via HashSet::contains.
-        // last_known_members is HashSet<DID> which implements Borrow<str>,
-        // so we can look up &str keys directly.
-        self.participation_cache
-            .retain(|did, _| self.last_known_members.contains(did.as_str()));
-        // Evict expired cooldown entries.
-        self.cooldown_until.retain(|_, expiry| now < *expiry);
-        // Evict departed members from proposal timestamps.
-        self.proposal_timestamps
-            .retain(|did, _| self.last_known_members.contains(did.as_str()));
-    }
 }
 
 /// MLS epoch and reconnection state.
