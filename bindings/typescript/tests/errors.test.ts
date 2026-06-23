@@ -15,7 +15,6 @@ import {
   IdentityError,
   McpError,
   mapBridgeError,
-  PermissionError,
   ScpError,
   StorageError,
   ToolError,
@@ -55,12 +54,6 @@ describe("ScpError hierarchy", () => {
     expect(err).toBeInstanceOf(ScpError);
     expect(err).toBeInstanceOf(UcanPermissionError);
     expect(err.name).toBe("UcanPermissionError");
-  });
-
-  it("PermissionError alias points to UcanPermissionError", () => {
-    expect(PermissionError).toBe(UcanPermissionError);
-    const err = new PermissionError("denied", "SCP-PERM-3001");
-    expect(err).toBeInstanceOf(UcanPermissionError);
   });
 
   it("CryptoError extends ScpError", () => {

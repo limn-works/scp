@@ -240,7 +240,6 @@ export {
   IdentityError,
   McpError,
   mapBridgeError,
-  PermissionError,
   ScpError,
   StorageError,
   ToolError,
