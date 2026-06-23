@@ -1070,9 +1070,10 @@ pub struct VoteOnProposalPayload {
 
 /// Payload for [`GovernanceCommand::ExecuteGovernanceAction`].
 ///
-/// Carries only the *identifier* of an already-tracked proposal plus the
-/// authenticated executor DID — never a caller-supplied proposal, action, or
-/// status. The handler resolves the authoritative proposal from the context
+/// Carries only the *identifier* of an already-tracked proposal — never a
+/// caller-supplied proposal, action, status, or executor DID (the executor is
+/// resolved from the tracked proposal's `proposer_did`). The handler resolves
+/// the authoritative proposal from the context
 /// actor's own governance engine via `engine.get_proposal(proposal_id)` and
 /// rejects anything that is not present and `Approved`. This closes the
 /// direct-execute quorum-bypass: a caller cannot fabricate an `Approved`

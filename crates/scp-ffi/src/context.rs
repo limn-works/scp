@@ -6293,9 +6293,10 @@ mod tests {
     // Direct-execute trust boundary (governance quorum-bypass fix)
     //
     // `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a proposal id
-    // plus the authenticated executor DID. The runtime resolves the
-    // authoritative proposal from the context actor's OWN quorum-validated
-    // governance engine; a caller cannot fabricate an `Approved` proposal or
+    // (never a caller-supplied proposal/action/status/executor). The runtime
+    // resolves the authoritative proposal from the context actor's OWN
+    // quorum-validated governance engine and stamps the tracked proposer as the
+    // executor; a caller cannot fabricate an `Approved` proposal or
     // substitute an action. These tests exercise that boundary directly:
     // executing an id the engine never tracked is rejected, and the rejection
     // leaves context state untouched.

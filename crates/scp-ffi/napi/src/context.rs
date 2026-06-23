@@ -4801,10 +4801,11 @@ mod tests {
     /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction` BY ID
     /// through the supervisor and return the handler `Result`.
     ///
-    /// The payload carries only the proposal id and the authenticated executor
-    /// DID — never a caller-supplied proposal/action/status. The runtime
-    /// resolves the authoritative proposal from the context actor's own
-    /// quorum-validated engine; a caller cannot fabricate an `Approved`
+    /// The payload carries only the proposal id — never a caller-supplied
+    /// proposal/action/status/executor DID (the executor is resolved from the
+    /// tracked proposal's proposer). The runtime resolves the authoritative
+    /// proposal from the context actor's own quorum-validated engine; a caller
+    /// cannot fabricate an `Approved`
     /// proposal or substitute an action. Used by the direct-execute
     /// trust-boundary tests.
     #[cfg(feature = "allow_in_memory_custody")]
@@ -4947,9 +4948,10 @@ mod tests {
     // Direct-execute trust boundary (governance quorum-bypass fix)
     //
     // `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a proposal id
-    // plus the authenticated executor DID. The runtime resolves the
-    // authoritative proposal from the context actor's OWN quorum-validated
-    // governance engine; a caller cannot fabricate an `Approved` proposal or
+    // (never a caller-supplied proposal/action/status/executor). The runtime
+    // resolves the authoritative proposal from the context actor's OWN
+    // quorum-validated governance engine and stamps the tracked proposer as the
+    // executor; a caller cannot fabricate an `Approved` proposal or
     // substitute an action. The previous NAPI implementation minted a fresh
     // random id and a fully `Approved` proposal from a caller-supplied action
     // — these tests guard the closed boundary.
