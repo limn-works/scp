@@ -75,7 +75,7 @@ The ceiling policy is visible in context metadata (§5.7) before opt-in. A prosp
 
 ### 5.3.1 Exhaustive Capability Categories
 
-The following is the complete enumeration of capability categories available for context ceiling declarations. These are the ONLY valid values in a ceiling array. SDKs MUST reject unrecognized capability categories at context creation time.
+The following is the complete enumeration of the **built-in** capability categories available for context ceiling declarations. These are the only built-in category strings. A ceiling array MAY also contain well-formed **custom** capabilities (§5.3.1.1, §7.2) defined outside this table. SDKs MUST reject any ceiling entry that is neither a recognized built-in category nor a well-formed custom capability at context creation time.
 
 | Category | Description | Gated by |
 |----------|-------------|----------|
@@ -101,7 +101,19 @@ The following is the complete enumeration of capability categories available for
 
 **Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A ceiling containing `tool:invoke:*` implicitly includes all `tool:invoke:{tool_id}` capabilities.
 
-**Category validation.** At context creation, the SDK validates that every entry in the ceiling array is a recognized category string (exact match, case-sensitive). Unrecognized categories cause creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with categories it cannot enforce.
+**Category validation.** At context creation, the SDK validates that every entry in the ceiling array is well-formed per the ceiling-entry grammar below (§5.3.1.1). Built-in categories are matched exactly (case-sensitive); custom capabilities are accepted only when well-formed. Any entry that is neither a recognized built-in category nor a well-formed custom capability causes creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with built-in categories it cannot enforce, and it forecloses ambiguous custom entries that would otherwise require silent interpretation.
+
+#### 5.3.1.1 Ceiling-Entry Grammar
+
+A ceiling entry is **exactly one** of the following well-formed shapes:
+
+1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `tool:invoke:{tool_id}` and the resource wildcard `tool:invoke:*`).
+2. **A custom capability** of the form `{resource}:{action}` (§7.2) — both `{resource}` and `{action}` are non-empty and the entry carries an explicit action segment after the colon.
+3. **An explicit resource wildcard** of the form `{resource}:*` — grants every action under `{resource}`.
+
+There is **no implicit or silent wildcard.** A wildcard must be written explicitly as `:*`.
+
+A **single-token custom with no action** (e.g. `payments` — no colon, no action segment) is **malformed** and MUST be rejected at context creation with `InvalidCeilingCategory`. It MUST NOT be silently interpreted as `payments:*` or any other capability — silent widening would defeat the legibility tenet (§5.7), under which members see the exact ceiling they opt into. Any other unrecognized or ill-formed string (empty resource, empty action, control characters, etc.) is likewise rejected with `InvalidCeilingCategory`.
 
 ### 5.3.2 Governed Ceiling Change Notification Protocol
 
