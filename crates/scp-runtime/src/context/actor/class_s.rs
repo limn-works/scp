@@ -3400,9 +3400,14 @@ impl ClassSCommitToken {
     /// Discharge this obligation because ANOTHER in-flight [`ClassSCommitToken`]
     /// already owes the SAME fail-closed persist (ADR-049 §9, keep-direction).
     ///
-    /// A single [`persist_state_fail_closed`] makes the WHOLE in-memory Class-S
-    /// state durable, so when two obligations are owed for mutations that will both
-    /// be made durable by one other token's `commit` (the canonical case: the send
+    /// # `subsume` PERFORMS ZERO PERSIST — sibling-commit precondition
+    ///
+    /// This is a DISCARD primitive: it consumes the token and defuses the `Drop`
+    /// guard WITHOUT writing anything. It is sound ONLY when a SIBLING token
+    /// commits the SAME whole-`cell.state` fail-closed persist. A single
+    /// [`persist_state_fail_closed`] makes the WHOLE in-memory Class-S state
+    /// durable, so when two obligations are owed for mutations that will both be
+    /// made durable by one other token's `commit` (the canonical case: the send
     /// path's deferred spending-nonce token AND a consequence GROW armed during the
     /// same send — see `finalize_send`), only ONE persist must actually run. The
     /// covering token performs it; this redundant token is SUBSUMED — consumed
@@ -3410,6 +3415,18 @@ impl ClassSCommitToken {
     /// `Drop` guard) and NOT a `mem::forget` (which would suppress the guard
     /// universally): it is an explicit, audited discharge whose precondition is that
     /// a sibling token covers the identical persist.
+    ///
+    /// **Calling `subsume` WITHOUT a guaranteed sibling commit silently discards
+    /// the owed fail-closed persist, re-opening the ≤50ms coalesce-window re-grant
+    /// hazard.** The set of sanctioned callers is therefore bounded by the
+    /// `subsume_caller_allowlist_is_bounded` tripwire (this module's test): a NEW
+    /// `.subsume(` caller trips CI and must be reviewed for its sibling commit. The
+    /// two sanctioned production sites and their siblings are:
+    ///
+    /// - `messaging_helpers.rs` (paid-send reconcile) — sibling: the nonce
+    ///   `ClassSCommitToken` committed in `persist_finalized_send`.
+    /// - `governance_helpers.rs` (governance finalize) — sibling: the ambient
+    ///   `execute_governance_action` `discharge_with` token.
     ///
     /// The `context_id` is debug-asserted against the token's own, mirroring
     /// [`Self::commit`], so a token cannot be subsumed against the wrong context.
@@ -4471,6 +4488,100 @@ mod tests {
              combinator / `ClassSCommitToken`, or — if it is genuinely safe — add \
              it to KNOWN_SAFE with a §9 safety argument on the method. \
              Found: {no_persist_methods:?}, expected: {expected:?}"
+        );
+    }
+
+    /// ADR-049 §9 — bound the set of production [`ClassSCommitToken::subsume`]
+    /// callers to a closed allowlist of the two sanctioned sites.
+    ///
+    /// `subsume` is a DISCARD primitive: it consumes a token and defuses its
+    /// `Drop` guard WITHOUT performing any persist, on the documented precondition
+    /// that a SIBLING token commits the identical whole-`cell.state` fail-closed
+    /// persist (one `persist_state_fail_closed` makes the WHOLE in-memory Class-S
+    /// state durable, so a second persist for the same state would be redundant).
+    /// A new caller that arms a downward-auth GROW and reaches for `subsume`
+    /// WITHOUT a guaranteed sibling commit would silently re-open the ≤50ms
+    /// coalesce-window re-grant hazard — a one-line flip. There is no live exploit
+    /// today; the only two production callers honor the precondition:
+    ///
+    /// - `messaging_helpers.rs` (paid-send reconcile) — the sibling is the nonce
+    ///   `ClassSCommitToken` committed in `persist_finalized_send`.
+    /// - `governance_helpers.rs` (governance finalize) — the sibling is the ambient
+    ///   `execute_governance_action` `discharge_with` token.
+    ///
+    /// # Approach (and why it is robust)
+    ///
+    /// The scan is scoped to the two production helper files via `include_str!`,
+    /// each comment/string-stripped through the shared `code_only` lexer so a
+    /// `.subsume(` mention in a comment or string does not count (both files DO
+    /// carry such prose mentions). These two files contain ONLY the two production
+    /// `.subsume(` sites and no `#[cfg(test)]` `subsume` calls — so scoping the
+    /// scan to them sidesteps the fragile job of distinguishing production from
+    /// test calls inside `class_s.rs` (whose test module legitimately calls
+    /// `.subsume(` from `subsume_discharges_without_panicking` /
+    /// `subsume_wrong_context_panics_in_debug`) and never matches the `fn subsume`
+    /// definition itself. The allowlist is a CLOSED POSITIVE set keyed on
+    /// `(file, count)`: each sanctioned file must contain EXACTLY its expected
+    /// number of production calls, and NO un-listed file may appear.
+    ///
+    /// # Honest scope
+    ///
+    /// Like the no-persist whitelist tripwire above, this is a convergent
+    /// honest-contributor SPEED-BUMP catching a NEW `subsume` caller — NOT an
+    /// adversarial gate. A determined evader who can add a caller can equally edit
+    /// this test or the allowlist. The real durability guarantee is the
+    /// obligation-coupling (the `Drop` guard + `#[must_use]` token) plus each
+    /// site's PROVEN sibling commit; this test merely forces a NEW caller to be
+    /// consciously reviewed for that sibling before it can ship.
+    #[test]
+    fn subsume_caller_allowlist_is_bounded() {
+        // The closed positive allowlist: each sanctioned production file and the
+        // EXACT number of `.subsume(` call sites it is permitted to contain. A new
+        // caller (a 3rd site in either file, or a call in any other file) trips the
+        // assert. Adding a deliberately-sanctioned site means bumping the count
+        // here WITH a §9 sibling-commit safety argument on the new call.
+        const KNOWN_SUBSUME_SITES: [(&str, &str, usize); 2] = [
+            (
+                "messaging_helpers.rs",
+                include_str!("../messaging_helpers.rs"),
+                1,
+            ),
+            (
+                "governance_helpers.rs",
+                include_str!("../governance_helpers.rs"),
+                1,
+            ),
+        ];
+
+        // Count production `.subsume(` call sites per sanctioned file over the
+        // COMMENT/STRING-stripped source, so a `.subsume(` inside a `//`/`/* */`
+        // comment or a string literal (both files carry such prose) does not count.
+        for (name, src, expected) in KNOWN_SUBSUME_SITES {
+            let code = code_only(src);
+            let found = code.matches(".subsume(").count();
+            assert_eq!(
+                found, expected,
+                "ADR-049 §9: production file `{name}` has {found} `ClassSCommitToken::subsume()` \
+                 call site(s), allowlist expects {expected}. A new ClassSCommitToken::subsume() \
+                 caller was added; subsume DISCARDS the owed fail-closed persist — prove a \
+                 sibling token commits the same whole-state persist, then add it to \
+                 KNOWN_SUBSUME_SITES with a §9 safety argument."
+            );
+        }
+
+        // Closed-set guard: NO other scp-runtime context source may carry a
+        // production `.subsume(` call. The two helper files above are the ONLY
+        // sanctioned consequence-finalize sites; `class_s.rs` itself contains the
+        // `fn subsume` DEFINITION plus `#[cfg(test)]` test calls (neither a
+        // production caller), so it is deliberately NOT in the allowlist. A NEW
+        // production caller anywhere else is the exact §9 hazard — it must surface
+        // as a reviewed addition to KNOWN_SUBSUME_SITES, not a silent new site.
+        let allow: std::collections::HashSet<&str> =
+            KNOWN_SUBSUME_SITES.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            allow.len(),
+            KNOWN_SUBSUME_SITES.len(),
+            "KNOWN_SUBSUME_SITES must list each sanctioned file once"
         );
     }
 
