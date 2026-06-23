@@ -3,7 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-06-14
 **Phase:** Phase 6 (production readiness, security)
-**Related:** ADR-003 (Identity Key Rotation & Migration — defines the pre-rotation reveal/commitment flow, §4b), ADR-021 (UniFFI Bridge — defines the `KeyCustodyProvider` callback-interface pattern used by mobile platforms), ADR-025 (Device Attestation — sibling platform-keystore integration), spec §9.7.4.1 (Pre-Rotation Key Custody), §9.12 (Identity Key Migration & Recovery)
+**Related:** ADR-003 (Identity Key Rotation & Migration — defines the pre-rotation reveal/commitment flow, §4b), ADR-021 (UniFFI Bridge — defines the `KeyCustodyProvider` callback-interface pattern used by mobile platforms), ADR-025 (Apple Platform Adapter — sibling platform-keystore integration), spec §9.7.4.1 (Pre-Rotation Key Custody), §9.12 (Identity Key Migration & Recovery)
 
 ## Context
 
@@ -43,10 +43,12 @@ Close the gap by introducing a **dedicated pre-rotation custody callback interfa
 
 Define a new callback interface (UniFFI `[Trait, WithForeign]`, with the matching PyO3 `Py<PyAny>` and NAPI threadsafe-function adapters) that the SDK implements **independently** of its operational `KeyCustodyProvider`. Modeling it as a separate provider — not new methods on `KeyCustodyProvider` — is the mechanism that enforces §3's "MUST NOT be accessible through the same custody provider or authentication flow." The interface extends the Rust-core `PreRotationCustody` trait the core already consumes (the existing trait stores externally-generated keys via `store_committed_pre_rotation_key`; `generate()` has no current trait counterpart — it is a new in-substrate generation method added by this ADR):
 
-- `generate() -> PreRotationKeyHandle` — generate the keypair **inside the separate substrate** (hardware key, secondary-device enclave, cloud key vault, or an encrypted-offline/Shamir/BIP39 wrapper), never in shared process memory.
+- `generate() -> PreRotationKeyHandle` — generate the keypair **inside the separate substrate** (hardware key, secondary-device enclave, cloud key vault, or an encrypted-offline/Shamir/BIP39 wrapper), never in shared process memory. **`generate()` is required for backends that mint keys in-substrate (HSM, Secure Enclave, cloud vault). Import-only backends (BIP39 mnemonic restore, pre-generated offline backup) MUST return a typed error from `generate()` and the SDK MUST offer an alternative creation path (e.g., `from_mnemonic()` / `from_backup()`). Each SDK backend documents its capability set.**
 - `public_key(handle) -> [u8; 32]` — for the `SHA-256(public_key)` commitment.
 - `import_seed_bytes(seed: Zeroizing<[u8; 32]>) -> PreRotationKeyHandle` — install a known seed into the substrate. This is the method whose absence currently blocks migration; it is the reveal-time inverse of `consume`, used when the new identity adopts the revealed bytes as its operational `#0` (ADR-003 §4b).
-- `consume(handle) -> Zeroizing<[u8; 32]>` — destroy-and-export the private bytes atomically at migration time (the `migrate_identity` step-5 destroy-and-export described in the §9.7.4.1 "Partial-publish recovery" paragraph; §9.7.4.1 item 6 "Post-rotation key cycling" is the subsequent step — generating a fresh pre-rotation keypair after migration completes).
+- `consume(handle) -> Zeroizing<[u8; 32]>` — destroy-and-export the private bytes atomically at migration time (the `migrate_identity` step-5 destroy-and-export described in the §9.7.4.1 "Partial-publish recovery" paragraph; §9.7.4.1 item 6 "Post-rotation key cycling" is the subsequent step — generating a fresh pre-rotation keypair after migration completes). **Handle lifecycle invariant:** each `PreRotationKeyHandle` is single-use. The `CallbackPreRotationCustody` adapter MUST invalidate the handle in Rust immediately after `consume` returns — whether the callback succeeded or failed — so subsequent calls to `consume(same_handle)` or `public_key(same_handle)` return `Err(HandleNotFound)` regardless of what the foreign implementation does. This adapter-level enforcement closes the duplicated-handle / leaked-backstop risk that foreign implementations cannot be trusted to self-enforce.
+
+**Canonical migration flow (reveal → import, ADR-003 §4b):** at `migrate_identity` step 5, the bridge calls `consume(pre_rotation_handle)` to destroy-and-export the 32-byte seed, wraps the seed in `Zeroizing`, then calls the operational `KeyCustody::import_seed_bytes(seed)` to install the revealed pre-rotation bytes as the new `#0` signing key. The pre-rotation handle is invalidated in Rust before the operational import begins. A fresh pre-rotation handle is then generated via the selection ceremony (§9.7.4.1 §5, §9.7.4.1 item 6 post-rotation cycling) before the migration transaction completes.
 
 The bridge's `generate_ephemeral_ed25519_seed` / `InMemoryPreRotationCustody` path on the callback flow is replaced by a `CallbackPreRotationCustody` adapter that dispatches to this provider. `InMemoryPreRotationCustody` is retained **test-only** (it already lives under `scp_platform::testing`), consistent with the in-memory-storage-is-dev-only stance.
 
@@ -78,6 +80,19 @@ This is a **breaking addition to the FFI surface** (a new callback interface), s
 | Swift / Kotlin SDKs | Implement `PreRotationCustodyProvider` against Keychain/Keystore/Secure Enclave/FIDO2; implement the §5 selection ceremony. |
 | Python / TypeScript SDKs | Implement the cross-platform offline/Shamir/BIP39 backends for server and parity testing. |
 | Capability matrix | New operations registered across bridges; `check-sdk-coverage` (now fail-closed) enforces parity. |
+
+### Canonical method names (locked across bindings)
+
+Per-binding casing of the four interface methods — these names are fixed and MUST NOT drift:
+
+| Concept | Rust trait | UniFFI (`[Trait, WithForeign]`) | NAPI (JS object field) | PyO3 (`Py<PyAny>` attribute) | Swift | Kotlin |
+|---------|-----------|-------------------------------|------------------------|------------------------------|-------|--------|
+| generate in substrate | `generate` | `generate` | `generate` | `generate` | `generate()` | `generate()` |
+| read public key | `public_key` | `public_key` | `publicKey` | `public_key` | `publicKey()` | `publicKey()` |
+| import known seed | `import_seed_bytes` | `import_seed_bytes` | `importSeedBytes` | `import_seed_bytes` | `importSeedBytes()` | `importSeedBytes()` |
+| destroy-and-export | `consume` | `consume` | `consume` | `consume` | `consume()` | `consume()` |
+
+The `CallbackPreRotationCustody` adapter derives its method-call names from this table; bridge aliases (`bridge-aliases.json`) must use the bridge-layer names in the NAPI/UniFFI columns.
 
 ## Consequences
 
