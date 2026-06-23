@@ -68,7 +68,6 @@ use scp_protocol::economy::types::Amount;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
 use crate::context::tools::invoke::{
     self, InvocationError, InvokeExecuteOutcome, ToolEconomyContext, build_tool_event,
     economy_pre_check, invoke_tool_execute_and_validate, post_tool_invocation_bookkeeping,
@@ -476,27 +475,20 @@ pub async fn reserve_tool_economy(
     // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
     // + fail-closed persist on the PAID path are routed through
     // `commit_class_s_keep_compensating` below; the pre-persist bookkeeping that
-    // runs regardless (hard rate limit, velocity, pre-check) still mutates the
-    // bare `&mut PerContextState` through the temporary `state_mut()` escape
-    // hatch, with the borrow released before the combinator call.
+    // runs regardless (hard rate limit, velocity, pre-check) is ALL Class-C, so
+    // it is routed through the non-persisting `class_c_view()` (the run loop
+    // coalesce-persists the bookkeeping mutations), with the view dropped before
+    // the combinator call.
     //
-    // ── FLAG-RESERVE-PRECHECK (whole-state `state_mut`, blocked) ─────────────
-    // This pre-check block is the ONE reserve `state_mut()` that cannot route
-    // through `class_c_view()`: `economy_pre_check` takes a `ToolEconomyContext`
-    // that borrows `&mut state.governance.budget_tracker` AND
-    // `&state.governance.velocity_tracker` SIMULTANEOUSLY (two disjoint fields of
-    // the SAME governance bucket). `GovernanceClassCMut` holds both as disjoint
-    // field references, but its public surface exposes them only through
-    // accessor methods (`budget_tracker_mut()`, `velocity_tracker_mut()`), each
-    // of which reborrows `&mut self` — so two of them cannot be held live at
-    // once. Expressing this needs a `GovernanceClassCMut::split`-style accessor
-    // that returns multiple disjoint field `&mut`/`&` at once (a foundation
-    // addition in `class_s.rs`, out of scope for this saga+tools migration). All
-    // mutations here ARE Class-C and the borrow is released before the
-    // combinator call, so the §9 invariant is upheld; this `state_mut()` is a
-    // blocked production residual pending that foundation accessor. (The error
-    // arm's velocity rollback + hard-rate refund stay inside this same block, so
-    // they share its already-acquired borrow — no extra persist either way.)
+    // The §19 economy pre-check needs `&mut budget_tracker` held SIMULTANEOUSLY
+    // with `&velocity_tracker` (plus `&economic_policy` / `&consequence_rules` /
+    // `&message_pricing`) — two-plus disjoint fields of the SAME governance
+    // bucket. `GovernanceClassCMut::economy_pre_check_borrows()` destructures the
+    // view into exactly those five disjoint `&mut`/`&` field references at once,
+    // so the whole pre-check runs without re-borrowing the view between steps.
+    // The borrows struct is dropped before the error arm's `velocity_tracker_mut`
+    // rollback / `hard_rate_limit_mut` refund so those `&mut self` reborrows are
+    // permitted (NLL).
     let event_log = &deps.event_log;
     let key_resolver = &deps.key_resolver;
     let clock = deps.clock.as_ref();
@@ -509,38 +501,31 @@ pub async fn reserve_tool_economy(
     let economic_policy;
     let action_cost;
     {
-        let state = cell.state_mut();
+        let mut view = cell.class_c_view();
 
-        handle = state.handle.clone();
-        role_state = state.role_state.clone();
+        handle = view.handle_mut().clone();
+        role_state = view.role_state_mut().clone();
+        let member_count = u64::try_from(view.membership_class_c_mut().count()).unwrap_or(u64::MAX);
+
+        let gov = view.governance_class_c_mut();
 
         // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
         // the tool path. try_consume before any Phase-1 bookkeeping.
-        if !state
-            .governance
-            .hard_rate_limit
-            .try_consume(invoker_did, now_secs)
-        {
+        if !gov.hard_rate_limit_mut().try_consume(invoker_did, now_secs) {
             return Err(ContextError::RateLimited {
                 resource: "tool_invoke".to_owned(),
                 message: "hard rate limit exceeded for invoker".to_owned(),
             });
         }
 
-        velocity_token = state
-            .governance
-            .velocity_tracker
+        velocity_token = gov
+            .velocity_tracker_mut()
             .record_message(invoker_did, now_secs);
 
-        let velocity = state
-            .governance
-            .velocity_tracker
+        let velocity = gov
+            .velocity_tracker_mut()
             .get_velocity(invoker_did, now_secs);
-        let member_count = u64::try_from(state.membership.count()).unwrap_or(u64::MAX);
-        let aggregate = state
-            .governance
-            .velocity_tracker
-            .aggregate_velocity(now_secs);
+        let aggregate = gov.velocity_tracker_mut().aggregate_velocity(now_secs);
         metrics = ObservableMetrics {
             sender_velocity: velocity,
             member_count,
@@ -550,13 +535,15 @@ pub async fn reserve_tool_economy(
             storage_usage: 0,
         };
 
-        economic_policy = state.governance.economic_policy.clone();
-        let consequence_rules = state.governance.consequence_rules.clone();
-        let message_pricing = state.governance.message_pricing.clone();
+        // `economic_policy` is cloned out for the later escrow-authorization
+        // `.await` (which holds no view borrow). The pre-check's own reads of
+        // `economic_policy` / `consequence_rules` / `message_pricing` come from
+        // `economy_pre_check_borrows()` below, so no separate clones are needed.
+        economic_policy = gov.economic_policy_mut().clone();
 
         let (events_snapshot, convergent_now) =
             crate::context::governance_logic::event_log_entries_for_consequences(
-                &state.receive_buffer,
+                view.receive_buffer_mut(),
                 context_id,
                 now_secs,
                 event_log.as_ref(),
@@ -568,30 +555,38 @@ pub async fn reserve_tool_economy(
         > = HashMap::new();
 
         action_cost = {
-            let economy = ToolEconomyContext {
-                economic_policy: economic_policy.as_ref(),
-                budget_tracker: &mut state.governance.budget_tracker,
-                spending_ucan,
-                context_id,
-                now: now_secs,
-                events: &events_snapshot,
-                convergent_now,
-                participation_cache: &mut participation_cache,
-                consequence_rules: &consequence_rules,
-                payment_adapter: payment_adapter.clone(),
-                metrics: metrics.clone(),
-                velocity_tracker: Some(&state.governance.velocity_tracker),
-                message_pricing: message_pricing.as_ref(),
+            // `economy_pre_check_borrows()` hands back `&mut budget_tracker` held
+            // simultaneously with `&velocity_tracker` / `&economic_policy` /
+            // `&consequence_rules` / `&message_pricing` — the disjoint borrows the
+            // pre-check needs at once. Scoped to this block so it drops before the
+            // error arm's `velocity_tracker_mut` rollback (NLL).
+            let pre_check_result = {
+                let borrows = view.governance_class_c_mut().economy_pre_check_borrows();
+                let economy = ToolEconomyContext {
+                    economic_policy: borrows.economic_policy.as_ref(),
+                    budget_tracker: borrows.budget_tracker,
+                    spending_ucan,
+                    context_id,
+                    now: now_secs,
+                    events: &events_snapshot,
+                    convergent_now,
+                    participation_cache: &mut participation_cache,
+                    consequence_rules: borrows.consequence_rules,
+                    payment_adapter: payment_adapter.clone(),
+                    metrics: metrics.clone(),
+                    velocity_tracker: Some(borrows.velocity_tracker),
+                    message_pricing: borrows.message_pricing.as_ref(),
+                };
+                economy_pre_check(&economy, invoker_did)
             };
 
-            match economy_pre_check(&economy, invoker_did) {
+            match pre_check_result {
                 Ok(cost) => cost,
                 Err(err) => {
-                    state
-                        .governance
-                        .velocity_tracker
+                    let gov = view.governance_class_c_mut();
+                    gov.velocity_tracker_mut()
                         .rollback(invoker_did, velocity_token);
-                    state.governance.hard_rate_limit.refund(invoker_did);
+                    gov.hard_rate_limit_mut().refund(invoker_did);
                     return Err(invocation_error_to_context(err));
                 }
             }
@@ -601,16 +596,15 @@ pub async fn reserve_tool_economy(
         // Validated here (outside the combinator) so the velocity/hard-rate
         // rollback for a missing UCAN runs without staging a Class-S mutation.
         if action_cost.0 > 0 && spending_ucan.is_none() {
-            state
-                .governance
-                .velocity_tracker
+            let gov = view.governance_class_c_mut();
+            gov.velocity_tracker_mut()
                 .rollback(invoker_did, velocity_token);
-            state.governance.hard_rate_limit.refund(invoker_did);
+            gov.hard_rate_limit_mut().refund(invoker_did);
             return Err(ContextError::PermissionDenied(
                 "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
             ));
         }
-        // `state` borrow ends here, releasing `cell` for the combinator call.
+        // `view` is dropped here, releasing `cell` for the combinator call.
     }
 
     // PAID path (`action_cost.0 > 0`, spending UCAN present): the spending-UCAN
@@ -833,7 +827,7 @@ pub async fn reserve_tool_economy(
 /// Propagates [`ContextError::PermissionDenied`] when payment capture
 /// fails after a successful execution.
 pub async fn settle_tool_economy_capture(
-    state: &mut PerContextState,
+    mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
@@ -853,12 +847,15 @@ pub async fn settle_tool_economy_capture(
     let now = clock.now_secs();
     let (events_for_consequences, convergent_now) =
         crate::context::governance_logic::event_log_entries_for_consequences(
-            &state.receive_buffer,
+            view.receive_buffer_mut(),
             context_id,
             now,
             event_log.as_ref(),
         );
-    let consequence_rules = state.governance.consequence_rules.clone();
+    let consequence_rules = view
+        .governance_class_c_mut()
+        .consequence_rules_mut()
+        .clone();
 
     let consequences = post_tool_invocation_bookkeeping(
         &events_for_consequences,
@@ -866,11 +863,18 @@ pub async fn settle_tool_economy_capture(
         context_id,
         now,
         convergent_now,
-        &mut state.governance.participation_cache,
+        view.governance_class_c_mut().participation_cache_mut(),
         &consequence_rules,
     );
 
-    let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
+    // Best-effort consequence path (ADR-049 §9 line-194). `split_class_c()`
+    // yields exactly the `ConsequenceStateSplit` shape — the same five disjoint
+    // Class-C / structural borrows `from_state(&mut PerContextState)` produced —
+    // from the field-granular cell view, with NO whole `&mut PerContextState`
+    // and NO `&mut` reach into any Class-S sub-struct. Enforcement stays
+    // best-effort (the run loop coalesce-persists; no per-site fail-closed
+    // persist).
+    let mut split = view.split_class_c();
     crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -901,18 +905,17 @@ pub async fn settle_tool_economy_capture(
             {
                 Ok(receipt) => receipt,
                 Err(capture_err) => {
+                    // Reverse the Class-C governance economy bookkeeping through
+                    // the field-granular `GovernanceClassCMut` view (no `&mut`
+                    // path to any Class-S sub-struct; coalesce-persisted).
+                    let gov = view.governance_class_c_mut();
                     if let Some(cost) = ticket.deducted_cost {
-                        state
-                            .governance
-                            .budget_tracker
-                            .reverse_spend(invoker_did, cost);
+                        gov.budget_tracker_mut().reverse_spend(invoker_did, cost);
                     }
-                    state
-                        .governance
-                        .velocity_tracker
+                    gov.velocity_tracker_mut()
                         .rollback(invoker_did, ticket.velocity_token);
                     if ticket.needs_hard_rate_limit_refund {
-                        state.governance.hard_rate_limit.refund(invoker_did);
+                        gov.hard_rate_limit_mut().refund(invoker_did);
                     }
                     let mut ticket = ticket;
                     ticket.consumed = true;
@@ -1239,27 +1242,17 @@ pub async fn settle_tool_economy(
             // Read the committed cost before the ticket is consumed by
             // the capture path so it can be threaded into the event.
             let cost = ticket.deducted_cost;
-            // ── FLAG-SETTLE-CAPTURE (whole-state `state_mut`, blocked) ────────
-            // The capture path runs consequence enforcement via
-            // `ConsequenceStateSplit::from_state(&mut PerContextState)` plus
-            // post-invocation participation bookkeeping — it reaches the
-            // receive buffer, role state, membership, and the checkpoint counter
-            // in ADDITION to the Class-C governance economy fields. `ClassCMut`
-            // already holds all of those as disjoint field references
-            // (`split_class_c()` yields exactly the `ConsequenceStateSplit`
-            // shape), but `ConsequenceStateSplit` / `enforce_triggered_consequences`
-            // still take a whole `&mut GovernanceState`, not a
-            // `GovernanceClassCMut`. Migrating them onto `ClassCSplit` is the
-            // explicitly-deferred `ConsequenceStateSplit` migration (see the
-            // `ClassCSplit` doc in `class_s.rs`), which lives in
-            // `governance_logic.rs` — out of scope for this saga+tools migration.
-            // Until it lands, the capture path needs the whole `&mut`, so this
-            // ONE `state_mut()` is a blocked production residual. The settle
-            // entry takes the cell (not a bare `&mut`) so the ROLLBACK arm below
-            // can use the migrated `ClassCMut`-shaped `rollback_tool_economy`;
-            // capture coalesces through the run loop (no per-site persist).
+            // The capture path runs consequence enforcement plus post-invocation
+            // participation bookkeeping — it reaches the receive buffer, role
+            // state, membership, and the checkpoint counter in ADDITION to the
+            // Class-C governance economy fields. `class_c_view()` hands out a
+            // `ClassCMut` holding all of those as disjoint field references;
+            // `split_class_c()` (inside `settle_tool_economy_capture`) yields
+            // exactly the `ConsequenceStateSplit` shape with NO whole
+            // `&mut PerContextState` and NO Class-S reach. Capture coalesces
+            // through the run loop (no per-site fail-closed persist).
             let (consequences, payment_receipt) = settle_tool_economy_capture(
-                cell.state_mut(),
+                cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
@@ -1318,6 +1311,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::actor::state::PerContextState;
 
     fn test_did() -> DID {
         DID::from("did:test:tools-rate-limit")
