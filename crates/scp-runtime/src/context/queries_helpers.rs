@@ -95,10 +95,11 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::context::ContextHandle;
+use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::state::{self, CommitFaultMarker, PendingCommit};
+use crate::context::state::{self, CommitFaultMarker, EpochState, PendingCommit};
 
 /// Maximum number of checkpoints retained per context. Older checkpoints
 /// are drained when this limit is exceeded to prevent unbounded growth.
@@ -203,8 +204,14 @@ pub const fn needs_reconnect(state: &PerContextState) -> bool {
 /// Mutating — called by the reconnection driver after a context completes
 /// the six-phase protocol successfully so a later restore does not
 /// re-drive the already-synced context.
-pub const fn clear_needs_reconnect(state: &mut PerContextState) {
-    state.epoch.needs_reconnect = false;
+///
+/// Field-narrowed (ADR-049 §9) to `&mut EpochState` so a cell-holder calls it
+/// with `cell.class_c_view().epoch_mut()` (no whole-state `state_mut()`), while
+/// a bare-`&mut PerContextState` holder passes `&mut state.epoch`. The
+/// `needs_reconnect` flag is Class-C reconnection liveness state, not a
+/// fail-closed Class-S witness.
+pub const fn clear_needs_reconnect(epoch: &mut EpochState) {
+    epoch.needs_reconnect = false;
 }
 
 /// Reads this actor's current lifecycle
@@ -405,14 +412,14 @@ pub fn event_log_entries(
 ///   `ContextClose` (admin) capability.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 pub fn generate_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -420,15 +427,14 @@ pub fn generate_context_access_key(
         ));
     }
 
-    if !state.membership.contains(member_did) {
+    if !view.membership_class_c_mut().contains(member_did) {
         return Err(ContextError::MemberNotFound(format!(
             "member not found: {member_did}"
         )));
     }
 
     let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .set(context_id, member_did, key);
     Ok(())
@@ -443,14 +449,14 @@ pub fn generate_context_access_key(
 /// - [`ContextError::MemberNotFound`] if no access key exists for
 ///   `member_did`.
 pub fn revoke_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -458,8 +464,7 @@ pub fn revoke_context_access_key(
         ));
     }
 
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .remove(context_id, member_did)
         .ok_or_else(|| {
@@ -476,14 +481,14 @@ pub fn revoke_context_access_key(
 ///   `ContextClose` (admin) capability.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 pub fn restore_context_access_key(
-    state: &mut PerContextState,
+    view: &mut ClassCMut,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
-    if !state
-        .role_state
+    if !view
+        .role_state_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -491,15 +496,14 @@ pub fn restore_context_access_key(
         ));
     }
 
-    if !state.membership.contains(member_did) {
+    if !view.membership_class_c_mut().contains(member_did) {
         return Err(ContextError::MemberNotFound(format!(
             "member not found: {member_did}"
         )));
     }
 
     let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-    state
-        .access
+    view.access_mut()
         .access_key_store
         .set(context_id, member_did, key);
     Ok(())

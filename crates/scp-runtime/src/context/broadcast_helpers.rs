@@ -162,20 +162,20 @@ pub fn unsubscribe_broadcast(
         (result, snapshot)
     };
 
-    // FLAG (ADR-049 §9 — residual `state_mut`): member REMOVAL from the
-    // authoritative `MembershipState` roster is a downward-authorization
-    // Class-S op that the restricted `MembershipClassCMut` deliberately does
-    // NOT expose (a coalesce-window rollback of a removal silently re-admits a
-    // member the caller observed as removed). This site removes a broadcast
-    // SUBSCRIBER and persists BEST-EFFORT today. Routing it through the
-    // fail-closed `commit_class_s_*` combinator would CHANGE behaviour
-    // (best-effort → fail-closed), and the Class-C view structurally cannot
-    // express removal — so neither the view nor a behaviour-preserving
-    // combinator fits. Pending an architecture decision (add a
-    // `remove_member` mutator on `MembershipClassCMut`, or make broadcast
-    // unsubscribe fail-closed), this remains the one `state_mut` residual in
-    // the broadcast domain. Class-C state below still routes through the view.
-    cell.state_mut().membership.remove_member(subscriber_did);
+    // SECURITY CARVE-OUT (ADR-049 §9): a broadcast UNSUBSCRIBE removes a
+    // SUBSCRIBER from the roster best-effort, NOT a regular member. A broadcast
+    // context's subscriber roster carries NO key secrecy — content is public,
+    // per-author broadcast keys (not MLS group keys) protect publication, and
+    // the unsubscribe is not an MLS-gated authorization boundary — so a
+    // coalesce-window rollback at most re-lists a public-content subscriber for
+    // the window, with no membership-secrecy consequence. The restricted
+    // `MembershipClassCMut::remove_subscriber` (scoped by name + contract to the
+    // broadcast roster) expresses exactly this best-effort removal; the general
+    // `remove_member` (a fail-closed downward-auth Class-S op) is deliberately
+    // NOT exposed on the view. Behaviour is unchanged (best-effort, coalesced).
+    cell.class_c_view()
+        .membership_class_c_mut()
+        .remove_subscriber(subscriber_did);
     emit_event(
         cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberLeft {

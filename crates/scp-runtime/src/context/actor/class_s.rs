@@ -2451,6 +2451,74 @@ impl ClassSCommitToken {
         persist_state_fail_closed(state, deps, context_id)
     }
 
+    /// Discharge the deferred obligation, running ONE final (possibly fallible)
+    /// state mutation through a [`ClassSMut`] view immediately BEFORE the single
+    /// fail-closed persist this token already owed (ADR-049 §9, keep-direction).
+    ///
+    /// This is the deferred-persist analogue of [`ClassSCell::commit_class_s_keep`]:
+    /// a site that deferred its Class-S persist via [`ClassSCell::begin_class_s`]
+    /// sometimes learns, at a terminal, that ONE more state mutation must land
+    /// under the SAME (still-owed) persist. Two governance terminals use it:
+    /// - the `execute_governance_action` dispatch-failure arm un-marks the
+    ///   `executed_proposals` replay marker it staged (via
+    ///   `ClassSMut::governance_class_s_mut`), and that removal must be the
+    ///   state the deferred persist makes durable;
+    /// - the success / finalize-failure terminal runs `finalize_governance_action`
+    ///   (a Class-C body, reached via [`ClassSMut::rest_mut`]) and then performs
+    ///   the token's owed persist over the finalized state.
+    ///
+    /// Rather than re-acquire a `state_mut()` escape hatch to mutate, then call
+    /// [`Self::commit`] (two reaches, a whole-state `&mut`), this runs the
+    /// mutation through the same fail-closed-capable [`ClassSMut`] view the
+    /// combinators use and performs the token's single deferred persist over the
+    /// resulting state — EXACTLY ONE persist, KEEP-direction.
+    ///
+    /// `f` may itself fail. Keep-direction means the persist runs REGARDLESS of
+    /// `f`'s result (the partial mutations `f` made before erroring stay and are
+    /// made durable — un-doing them is the unsafe direction). The returned
+    /// `Result` surfaces `f`'s error FIRST when `f` failed (after persisting),
+    /// else the persist error, else `f`'s value — matching the prior
+    /// "mutate (maybe-Err), then `token.commit`, then return that error/value"
+    /// hand-written terminals.
+    ///
+    /// Takes `&mut ClassSCell` (not the bare `&PerContextState` [`Self::commit`]
+    /// takes) because building the [`ClassSMut`] view needs `&mut` to the owned
+    /// state; the cell is the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns `f`'s error (after the keep-direction persist still ran), or
+    /// [`ContextError::PersistenceFailed`] when the durable write fails (the
+    /// in-memory mutation `f` made is retained — keep-direction).
+    pub(crate) fn discharge_with<T>(
+        mut self,
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        context_id: &str,
+        f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
+    ) -> Result<T, ContextError> {
+        debug_assert_eq!(
+            self.context_id, context_id,
+            "ClassSCommitToken discharged against the wrong context",
+        );
+        // Run the final mutation through the view. Discharge the Drop obligation
+        // BEFORE the persist (so a persist Err still counts as committed —
+        // keep-direction) and perform the single deferred persist REGARDLESS of
+        // `f`'s result (keep-direction: a partial mutation `f` left must be made
+        // durable; un-doing it is the unsafe direction).
+        let f_result = f(ClassSMut::new(&mut cell.state));
+        self.consumed = true;
+        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id);
+        match (f_result, persist_result) {
+            // `f` failed: the persist still ran (keep); surface `f`'s error.
+            (Err(f_err), _) => Err(f_err),
+            // `f` succeeded but the persist failed: surface the persist error.
+            (Ok(_), Err(persist_err)) => Err(persist_err),
+            // Both succeeded.
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
     /// Mint a pre-consumed-context token for tests that drive a deferred-persist
     /// site's commit point directly (e.g. the `finalize_send` unit tests).
     #[cfg(test)]

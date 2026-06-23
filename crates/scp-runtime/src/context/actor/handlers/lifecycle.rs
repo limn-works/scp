@@ -180,7 +180,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_generate_context_access_key_actor(
-            cell.state_mut(),
+            cell,
             &context_id,
             &member_did,
             &caller_did,
@@ -192,7 +192,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_revoke_context_access_key_actor(
-            cell.state_mut(),
+            cell,
             &context_id,
             &member_did,
             &caller_did,
@@ -204,7 +204,7 @@ async fn dispatch_actor_inner(
             caller_did,
             reply,
         } => handle_restore_context_access_key_actor(
-            cell.state_mut(),
+            cell,
             &context_id,
             &member_did,
             &caller_did,
@@ -218,7 +218,7 @@ async fn dispatch_actor_inner(
             handle_report_buffer_len_actor(&*cell, reply)
         }
         LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
-            handle_clear_needs_reconnect_actor(cell.state_mut(), &context_id, reply)
+            handle_clear_needs_reconnect_actor(cell, &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
             handle_issue_mls_update_actor(cell, deps, &context_id, reply)
@@ -396,14 +396,21 @@ fn handle_export_context_actor(
 // ---------------------------------------------------------------------------
 
 fn handle_generate_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation (the run loop persists on `mutated`): route the
+    // role/membership reads + access-key-store write through the non-persisting
+    // `class_c_view()`. The field-narrowed helper takes the `ClassCMut` view, so
+    // no whole-state `state_mut()` is taken.
     let result = crate::context::queries_helpers::generate_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -414,14 +421,18 @@ fn handle_generate_context_access_key_actor(
 }
 
 fn handle_revoke_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
     let result = crate::context::queries_helpers::revoke_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -432,14 +443,18 @@ fn handle_revoke_context_access_key_actor(
 }
 
 fn handle_restore_context_access_key_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     member_did: &str,
     caller_did: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Coalesced Class-C mutation — see `handle_generate_context_access_key_actor`.
     let result = crate::context::queries_helpers::restore_context_access_key(
-        state, context_id, member_did, caller_did,
+        &mut cell.class_c_view(),
+        context_id,
+        member_did,
+        caller_did,
     );
     let outcome = match &result {
         Ok(()) => Outcome::ok_mutated(()),
@@ -636,11 +651,14 @@ fn handle_report_buffer_len_actor(
 /// Called by the reconnection driver after the six-phase protocol
 /// completes for a context. Synchronous; always replies `Ok(())`.
 fn handle_clear_needs_reconnect_actor(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    crate::context::queries_helpers::clear_needs_reconnect(state);
+    // Field-narrowed Class-C mutation: clear `needs_reconnect` through the
+    // non-persisting `class_c_view().epoch_mut()` (coalesced persist via the run
+    // loop's `mutated` flag), not a whole-state `state_mut()`.
+    crate::context::queries_helpers::clear_needs_reconnect(cell.class_c_view().epoch_mut());
     tracing::debug!(
         context_id,
         "cleared needs_reconnect after reconnection (§23.11)"

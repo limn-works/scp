@@ -854,25 +854,20 @@ async fn prepare_b(
     req: PrepareBRequest,
     reply: tokio::sync::oneshot::Sender<Result<PreparedBFields, ContextError>>,
 ) -> Outcome<()> {
-    // ── FLAG-PREPARE-B-CHECKS (Class-S cache-eviction read gate; blocked) ─────
-    // The validation gate (checks 1–6) is read-mostly, but check 5 (freshness /
-    // anti-replay) calls `NonceDedup::is_replayed`, which takes `&mut self` and
-    // EVICTS TTL-expired entries from `class_s.xctx_nonce_dedup` as a side effect
-    // — a Class-S `&mut` mutation with NO accompanying persist (the eviction is
-    // best-effort cache maintenance, not a fail-closed transition). The
-    // non-persisting Class-C escape (`class_c_view()`) exposes only a shared `&`
-    // READ of `class_s`, so it cannot host `is_replayed`'s `&mut` eviction; the
-    // persisting Class-S combinators would inject a persist this read gate does
-    // not have. Expressing "mutate Class-S, inject NO persist" for the dedup
-    // cache-eviction needs a foundation addition in `class_s.rs` (a `class_c`-
-    // style no-persist Class-S escape), out of scope here. So the read gate stays
-    // on `state_mut()`; the NLL borrow ends before the next `cell`-taking call.
-    // The step-7 inbound-rate consume (the ONLY Class-C mutation) has been
-    // HOISTED OUT of the gate to run through `class_c_view()` below.
-    let state = cell.state_mut();
-    // Run every read-only check (plus the dedup cache-eviction side effect) first;
-    // the step-7 inbound-rate Class-C consume runs after, through the view.
-    if let Err(err) = run_prepare_b_checks(state, deps, &req) {
+    // ── PREPARE-B-CHECKS (read-only gate through `&*cell`) ───────────────────
+    // The validation gate (checks 1–6) is now fully READ-ONLY: check 5
+    // (freshness / anti-replay) takes its decision via `NonceDedup::is_replayed_read`
+    // (`&self`), so no Class-S `&mut` mutation happens here. The mutating TTL
+    // eviction `is_replayed` used to fold into the read has been hoisted into
+    // the staging combinator's KEEP closure below (it already mutates
+    // `xctx_nonce_dedup` via `record`), so the eviction rides the SAME single
+    // fail-closed persist as the accepted-nonce record — preserving the prior
+    // "evict-then-decide-then-record under one persist" net effect with NO
+    // un-persisted Class-S mutation. The read gate therefore runs through the
+    // cell's shared-read `Deref` (`&*cell`), not `state_mut()`. The step-7
+    // inbound-rate consume (the ONLY Class-C mutation) is HOISTED OUT to run
+    // through `class_c_view()` below.
+    if let Err(err) = run_prepare_b_checks(&*cell, deps, &req) {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
@@ -957,7 +952,14 @@ async fn prepare_b(
         |mut view| {
             let class_s = view.class_s_mut();
             // (a) Record the accepted nonce in B's dedup cache (freshness state
-            //     lives on B) — KEEP direction.
+            //     lives on B) — KEEP direction. First evict TTL-expired entries
+            //     (the mutating side-effect hoisted out of the now-read-only
+            //     freshness check) so the net effect matches the prior
+            //     "evict-then-decide-then-record under one fail-closed persist".
+            //     Both eviction and record are KEEP-direction Class-S maintenance
+            //     of `xctx_nonce_dedup` covered by this combinator's single
+            //     persist.
+            class_s.xctx_nonce_dedup.evict_expired(now_secs);
             class_s
                 .xctx_nonce_dedup
                 .record(req.asserted_nonce, now_secs);
@@ -1001,7 +1003,7 @@ async fn prepare_b(
 /// not it ultimately validates). It runs as part of the InboundPolicy gate, so
 /// it precedes the freshness/chain-depth checks deliberately.
 fn run_prepare_b_checks(
-    state: &mut PerContextState,
+    state: &PerContextState,
     deps: &ActorDeps,
     req: &PrepareBRequest,
 ) -> Result<(), ContextError> {
@@ -1277,7 +1279,7 @@ fn validate_input_specificity(
 /// obligation is recorded in the spec §6.2.4 *Freshness / anti-replay* clause,
 /// mirroring the ADR-049 §3a forward-obligation discipline.
 fn validate_freshness(
-    state: &mut PerContextState,
+    state: &PerContextState,
     deps: &ActorDeps,
     req: &PrepareBRequest,
 ) -> Result<(), ContextError> {
@@ -1292,11 +1294,19 @@ fn validate_freshness(
         )));
     }
 
+    // PURE READ (ADR-049 §9): the replay decision uses `is_replayed_read`
+    // (`&self`), which applies the SAME TTL freshness filter as `is_replayed`
+    // inline but mutates nothing — so this whole gate runs through a shared
+    // `&PerContextState`. The mutating TTL eviction `is_replayed` used to fold
+    // in is hoisted into the staging combinator's KEEP closure in `prepare_b`
+    // (it already mutates `xctx_nonce_dedup` via `record`), so the eviction
+    // rides the SAME single fail-closed persist as the accepted-nonce record —
+    // no Class-S `&mut` mutation happens during the read-only check phase.
     let now_secs = deps.clock.now_secs();
     if state
         .class_s
         .xctx_nonce_dedup
-        .is_replayed(&req.asserted_nonce, now_secs)
+        .is_replayed_read(&req.asserted_nonce, now_secs)
     {
         return Err(ContextError::PermissionDenied(format!(
             "SCP-SAGA-13019: invocation nonce already seen in target dedup cache \
@@ -1920,31 +1930,20 @@ async fn commit_a(
             req.reservation.reservation.ticket,
         )
         .await;
-        // ── FLAG-COMMIT-A-REPLAY (idempotent Class-S remove, no-persist; blocked) ─
+        // ── COMMIT-A-REPLAY (idempotent Class-S remove, NO persist — SECURITY) ───
         // The durable reversal record (if still present) was consumed at the
         // FIRST Commit-A; remove any straggler so it cannot reverse settled
         // state. A removal here is rare (the first Commit-A already removed it),
-        // so it is NOT folded into a persist decision — `xctx_committed_invocations`
-        // already witnesses the committed terminal durably, and this arm replies
-        // `Ok(())` with NO persist today. Every persisting combinator
-        // (`commit_class_s_*` / `begin_class_s` + token `commit`) injects a
-        // fail-closed persist that DOES NOT exist here — a behaviour change (an
-        // extra durable write that could itself FAIL, turning this idempotent
-        // `Ok` re-ack into an error). The non-persisting Class-C escape
-        // (`class_c_view()`) STRUCTURALLY cannot reach `xctx_caller_reservations`
-        // (a Class-S field — the view exposes only a shared `&` read of
-        // `class_s`). Expressing "mutate Class-S, inject NO persist" for an
-        // idempotent cleanup needs a foundation addition in `class_s.rs` (a
-        // `class_c`-style no-persist Class-S escape), out of scope for this
-        // saga+tools migration. So this lone idempotent Class-S remove is the
-        // documented "rare straggler" outlier and stays on `state_mut()`; adding
-        // a persist to migrate it would be a forbidden idempotency-breaking
-        // behaviour change.
-        let _ = cell
-            .state_mut()
-            .class_s
-            .xctx_caller_reservations
-            .remove(&req.saga_id);
+        // so it is DELIBERATELY not folded into a persist decision —
+        // `xctx_committed_invocations` already witnesses the committed terminal
+        // durably (checked above via `contains`), and this arm replies `Ok(())`
+        // with NO persist. `clear_committed_reservation_idempotent` is the single
+        // named no-persist Class-S primitive for exactly this idempotent
+        // straggler cleanup: adding a fail-closed persist would turn this
+        // idempotent `Ok` re-ack into a fallible write (a behaviour change), and
+        // the committed terminal is already durable, so the removal is
+        // rebuilt-irrelevant on respawn. It can never widen to a closure form.
+        let _ = cell.clear_committed_reservation_idempotent(&req.saga_id);
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
@@ -4718,7 +4717,7 @@ mod tests {
         .await;
         let prepared_stale = rx.await.unwrap().expect("prepared-A (stale)");
         let stale_gen = prepared_stale.reservation.generation;
-        st_cell.state_mut().generation = st_cell.generation.wrapping_add(1);
+        st_cell.set_generation_for_test(st_cell.generation.wrapping_add(1));
         assert_ne!(
             stale_gen, st_cell.generation,
             "the respawn bumped the live generation past the reservation's"
@@ -4817,7 +4816,7 @@ mod tests {
         // Simulate the respawn-from-own-snapshot: bump the live generation past
         // the carrier's so the generation-checked carrier rollback refuses the
         // LOCAL write. The deduction + record are the rehydrated owned state.
-        st_cell.state_mut().generation = st_cell.generation.wrapping_add(1);
+        st_cell.set_generation_for_test(st_cell.generation.wrapping_add(1));
 
         // Measure ONLY the abort's persist.
         persist_calls.store(0, Ordering::SeqCst);
@@ -5391,7 +5390,7 @@ mod tests {
         // condition holds. A spawn-generation gate on the local reversal would
         // SKIP the refund here (over-charging the caller); the fix removes it, so
         // the refund runs regardless of generation.
-        st_cell.state_mut().generation = st_cell.generation.wrapping_add(7);
+        st_cell.set_generation_for_test(st_cell.generation.wrapping_add(7));
 
         // Reset the persist counter so we measure ONLY the recovery abort.
         persist_calls.store(0, Ordering::SeqCst);

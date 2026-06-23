@@ -815,7 +815,7 @@ pub fn execute_suspend_member(
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
 pub fn execute_revoke(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -829,98 +829,104 @@ pub fn execute_revoke(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // SECURITY-FLAG (ADR-049 §9, FC→FC, no behaviour change): revocation
+    // (capability / access / write) is a DOWNWARD-AUTHORIZATION Class-S
+    // transition — it MUST persist fail-closed so a crash cannot re-grant
+    // authority the caller was told was revoked. The suspension /
+    // read-exclusion / access-key writes + their checks are STAGED inside the
+    // `commit_class_s_keep` closure (reached via `view.rest_mut()`, which the
+    // fail-closed combinator may hand out), and the combinator performs the
+    // SAME fail-closed persist the prior inline `persist_state_fail_closed`
+    // did (keep-direction: a downward suspension stays applied even if the
+    // persist fails — un-applying it would re-grant the revoked authority).
+    // A check reject (`Err` from the closure) returns before any persist,
+    // exactly as the prior early returns did. The post-persist external work
+    // (broadcast snapshot, event-log append, sender-key rotation, the
+    // coalesced `checkpoint_events_since` bump) is UNCHANGED and runs after.
+    let (rotated, bc_snap, needs_sender_key_rotation) =
+        cell.commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
+            require_active(&state.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-    if !state.membership.contains(did) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
-    }
-
-    let mut rotated = 0usize;
-    let mut bc_snap = None;
-
-    // Write revocation.
-    if matches!(access, AccessScope::Write | AccessScope::Both) {
-        state
-            .role_state
-            .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
-
-        if let Some(ref mut bc) = state.broadcast_context {
-            match bc.block_author(&did.0) {
-                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
+            if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                ));
             }
-            bc_snap = Some(bc.to_snapshot());
-        }
+            if !state.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
 
-        emit(
-            state,
-            ContextEvent::WriteAccessRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+            let mut rotated = 0usize;
+            let mut bc_snap = None;
 
-    // Read revocation.
-    if matches!(access, AccessScope::Read | AccessScope::Both) {
-        state
-            .role_state
-            .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
+            // Write revocation.
+            if matches!(access, AccessScope::Write | AccessScope::Both) {
+                state
+                    .role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
 
-        state.access.read_exclusion_list.insert(did.clone());
-
-        if let Some(ref mut bc) = state.broadcast_context {
-            match bc.governance_ban_subscriber(&did.0, access) {
-                Ok(r) => {
-                    rotated = r.rotated_authors.len();
+                if let Some(ref mut bc) = state.broadcast_context {
+                    match bc.block_author(&did.0) {
+                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    bc_snap = Some(bc.to_snapshot());
                 }
-                Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
+
+                emit(
+                    state,
+                    ContextEvent::WriteAccessRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
             }
-            bc_snap = Some(bc.to_snapshot());
-        } else {
-            state
-                .access
-                .access_key_store
-                .remove(context_id, did.as_ref());
-        }
 
-        emit(
-            state,
-            ContextEvent::ReadAccessRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-        emit(
-            state,
-            ContextEvent::AccessKeyRevoked { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+            // Read revocation.
+            if matches!(access, AccessScope::Read | AccessScope::Both) {
+                state
+                    .role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
 
-    let needs_sender_key_rotation = matches!(access, AccessScope::Write | AccessScope::Both)
-        && state.broadcast_context.is_none();
+                state.access.read_exclusion_list.insert(did.clone());
 
-    // ADR-049 §9 Class S: revocation (capability / access / write) is a
-    // downward-authorization transition — persist fail-closed so a crash cannot
-    // re-grant authority the caller was told was revoked.
-    //
-    // RESIDUAL cell-escape-hatch at the production call site (FLAGGED in the
-    // report): this helper still takes a bare `&mut PerContextState` because an
-    // out-of-scope test caller (`supervisor.rs::execute_revoke_persists_synchronously`)
-    // passes one, and the task forbids editing supervisor.rs. Routing the
-    // production path through `commit_class_s_keep` would change this signature
-    // to take `&mut ClassSCell`, breaking that out-of-scope caller and the
-    // "supervisor tests must pass" gate. The inline fail-closed persist below
-    // already provides the keep-direction Class-S durability the combinator
-    // would; the call-site escape hatch is removed in the later finalize step
-    // that also updates the supervisor test caller.
-    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
+                if let Some(ref mut bc) = state.broadcast_context {
+                    match bc.governance_ban_subscriber(&did.0, access) {
+                        Ok(r) => {
+                            rotated = r.rotated_authors.len();
+                        }
+                        Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    bc_snap = Some(bc.to_snapshot());
+                } else {
+                    state
+                        .access
+                        .access_key_store
+                        .remove(context_id, did.as_ref());
+                }
+
+                emit(
+                    state,
+                    ContextEvent::ReadAccessRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
+                emit(
+                    state,
+                    ContextEvent::AccessKeyRevoked { did: did.clone() },
+                    context_id,
+                    deps,
+                );
+            }
+
+            let needs_sender_key_rotation =
+                matches!(access, AccessScope::Write | AccessScope::Both)
+                    && state.broadcast_context.is_none();
+
+            Ok((rotated, bc_snap, needs_sender_key_rotation))
+        })?;
+
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
@@ -936,7 +942,9 @@ pub fn execute_revoke(
         access_revoked_payload,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
+    // as before the combinator migration — NOT covered by the FC persist above).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -971,7 +979,7 @@ pub fn execute_revoke(
 
 /// Executes a `RestoreAccess` governance action.
 pub fn execute_restore_access(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
@@ -985,78 +993,100 @@ pub fn execute_restore_access(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // SECURITY-FLAG (ADR-049 §9, CONSCIOUS SAFE STRENGTHENING best-effort→FC):
+    // restoring access (clearing a suspension / read-exclusion, re-minting the
+    // access key) was persisted BEST-EFFORT. It is routed here through
+    // `commit_class_s_keep`, a FAIL-CLOSED persist. This is strictly safer and
+    // shrinks the best-effort allowlist: a coalesce-window rollback of a
+    // restore would silently re-suspend a member the caller was told was
+    // restored — a liveness regression, not a security one — but failing closed
+    // here never re-opens an authorization the caller observed as denied (the
+    // direction §9 protects), so the strengthening introduces no new risk and
+    // removes one. Keep-direction: a restore that did not durably land stays
+    // applied in memory and the persist error surfaces (the member is, if
+    // anything, MORE permissioned in memory than on disk — the safe direction).
+    // The check rejects (`Err` from the closure) run before any persist exactly
+    // as the prior early returns did. The post-persist external work (broadcast
+    // snapshot, event-log append, coalesced `checkpoint_events_since` bump) is
+    // unchanged.
+    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        require_active(&state.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::MemberBan) {
-        return Err(ContextError::PermissionDenied(
-            "member:ban (MemberBan) capability not in ceiling".to_owned(),
-        ));
-    }
-
-    let suspended_set = state.role_state.suspended_capabilities.get(did.as_ref());
-    let nothing_suspended_for_request =
-        suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
-    let read_excluded = state.access.read_exclusion_list.contains(did);
-    let read_requested = capabilities.contains(&Capability::MessagesRead);
-    if nothing_suspended_for_request && !(read_requested && read_excluded) {
-        return Err(ContextError::NothingToRestore(format!(
-            "no suspended capabilities to restore for {did}"
-        )));
-    }
-
-    state
-        .role_state
-        .restore_capabilities(did.as_ref(), capabilities);
-
-    let has_read = capabilities.contains(&Capability::MessagesRead);
-    let bc_snap = if has_read {
-        state.access.read_exclusion_list.remove(did);
-
-        let snap = state.broadcast_context.as_mut().map(|bc| {
-            bc.governance_unban_subscriber(&did.0);
-            bc.to_snapshot()
-        });
-
-        if state.broadcast_context.is_none() {
-            let restored_key =
-                scp_protocol::crypto::access_keys::generate_access_key(context_id, did.as_ref());
-            state
-                .access
-                .access_key_store
-                .set(context_id, did.as_ref(), restored_key);
+        if !state.role_state.ceiling.contains(&Capability::MemberBan) {
+            return Err(ContextError::PermissionDenied(
+                "member:ban (MemberBan) capability not in ceiling".to_owned(),
+            ));
         }
 
-        emit(
-            state,
-            ContextEvent::ReadAccessRestored { did: did.clone() },
-            context_id,
-            deps,
-        );
-        emit(
-            state,
-            ContextEvent::AccessKeyRestored {
-                did: did.clone(),
-                new_epoch: 1,
-            },
-            context_id,
-            deps,
-        );
+        let suspended_set = state.role_state.suspended_capabilities.get(did.as_ref());
+        let nothing_suspended_for_request =
+            suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
+        let read_excluded = state.access.read_exclusion_list.contains(did);
+        let read_requested = capabilities.contains(&Capability::MessagesRead);
+        if nothing_suspended_for_request && !(read_requested && read_excluded) {
+            return Err(ContextError::NothingToRestore(format!(
+                "no suspended capabilities to restore for {did}"
+            )));
+        }
 
-        snap
-    } else {
-        None
-    };
+        state
+            .role_state
+            .restore_capabilities(did.as_ref(), capabilities);
 
-    if capabilities.contains(&Capability::MessagesWrite) {
-        emit(
-            state,
-            ContextEvent::WriteAccessRestored { did: did.clone() },
-            context_id,
-            deps,
-        );
-    }
+        let has_read = capabilities.contains(&Capability::MessagesRead);
+        let bc_snap = if has_read {
+            state.access.read_exclusion_list.remove(did);
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+            let snap = state.broadcast_context.as_mut().map(|bc| {
+                bc.governance_unban_subscriber(&did.0);
+                bc.to_snapshot()
+            });
+
+            if state.broadcast_context.is_none() {
+                let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
+                    context_id,
+                    did.as_ref(),
+                );
+                state
+                    .access
+                    .access_key_store
+                    .set(context_id, did.as_ref(), restored_key);
+            }
+
+            emit(
+                state,
+                ContextEvent::ReadAccessRestored { did: did.clone() },
+                context_id,
+                deps,
+            );
+            emit(
+                state,
+                ContextEvent::AccessKeyRestored {
+                    did: did.clone(),
+                    new_epoch: 1,
+                },
+                context_id,
+                deps,
+            );
+
+            snap
+        } else {
+            None
+        };
+
+        if capabilities.contains(&Capability::MessagesWrite) {
+            emit(
+                state,
+                ContextEvent::WriteAccessRestored { did: did.clone() },
+                context_id,
+                deps,
+            );
+        }
+
+        Ok(bc_snap)
+    })?;
+
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
@@ -1066,7 +1096,8 @@ pub fn execute_restore_access(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    // Coalesced Class-C counter bump (rides the next run-loop persist).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -4225,7 +4256,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::RevokeAccess { did, access } => {
             let r = execute_revoke(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4244,7 +4275,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
             execute_restore_access(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -4705,32 +4736,37 @@ pub async fn execute_governance_action(
     let result = match dispatch_governance_action(cell, deps, context_id, proposal).await {
         Ok(r) => r,
         Err(e) => {
-            // Roll back the executed marker on dispatch failure so the
-            // proposal can be retried (e.g. after a transient crypto
-            // error), THEN persist that removal fail-closed (keep-direction:
-            // the un-mark must be durable so a crash cannot resurrect the
-            // marker and block the retry). The marker removal is the Class-S
-            // mutation the token now covers.
-            cell.state_mut()
-                .governance
-                .class_s
-                .executed_proposals
-                .remove(&proposal.proposal_id);
-            token.commit(&*cell, deps, context_id)?;
+            // Roll back the executed marker on dispatch failure so the proposal
+            // can be retried (e.g. after a transient crypto error). The removal
+            // is itself a Class-S transition that must be durable fail-closed
+            // (keep-direction: a crash must not resurrect the marker and block
+            // the retry). It is staged through the deferred-persist token's own
+            // ClassSMut flow — `discharge_with` runs the removal closure
+            // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
+            // and then performs the SINGLE fail-closed persist the token already
+            // owed, so the removed-marker state is what lands durably (no
+            // `state_mut`, exactly one persist — the one the token deferred).
+            token.discharge_with(cell, deps, context_id, |mut view| {
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .remove(&proposal.proposal_id);
+                Ok(())
+            })?;
             return Err(e);
         }
     };
 
     // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
     // own persist was best-effort; the executed-marker durability now rides the
-    // token's FAIL-CLOSED `commit` here instead. On a finalize error we still
-    // commit the token (keep-direction — the executed marker stays set and must
-    // persist) and surface the finalize error.
-    if let Err(e) = finalize_governance_action(cell.state_mut(), deps, context_id, proposal) {
-        token.commit(&*cell, deps, context_id)?;
-        return Err(e);
-    }
-    token.commit(&*cell, deps, context_id)?;
+    // token's FAIL-CLOSED `commit` instead. `finalize_governance_action` is a
+    // Class-C body reached through the token's `discharge_with` ClassSMut view
+    // (`rest_mut()`), so it runs and is then persisted FAIL-CLOSED by the SINGLE
+    // deferred persist the token owed — no whole-state `state_mut`. On a finalize
+    // error the persist STILL runs (keep-direction — the executed marker stays
+    // set and must persist) and `discharge_with` surfaces the finalize error.
+    token.discharge_with(cell, deps, context_id, |mut view| {
+        finalize_governance_action(view.rest_mut(), deps, context_id, proposal)
+    })?;
 
     Ok(result)
 }

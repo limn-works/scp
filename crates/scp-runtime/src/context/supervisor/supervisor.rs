@@ -13868,10 +13868,14 @@ mod tests {
         persistence.persist_context(&ctx_key, &pre).unwrap();
 
         // Perform the downward-authorization transition. `execute_revoke`
-        // calls `persist_state_best_effort` synchronously before returning, so
-        // the persisted snapshot now reflects the suspension.
+        // routes the suspension through `commit_class_s_keep` (a fail-closed
+        // persist) synchronously before returning, so the persisted snapshot
+        // now reflects the suspension. It takes `&mut ClassSCell`, so wrap the
+        // local `state` in a cell for the call, then unwrap it back out for the
+        // subsequent `spawn_actor_with_state` hand-off.
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::governance_helpers::execute_revoke(
-            &mut state,
+            &mut cell,
             &deps,
             &ctx_key,
             &target,
@@ -13883,6 +13887,7 @@ mod tests {
             },
         )
         .expect("execute_revoke (Both scope) must succeed");
+        let state = cell.into_inner();
 
         // Sanity: the just-persisted snapshot already carries the revocation,
         // proving the sync persist happened inside the helper (no coalesce).
