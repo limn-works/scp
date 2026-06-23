@@ -492,16 +492,13 @@ async function validateOneCapUri(
   } catch (error) {
     // `scp.ucanValidate` routes through `mapBridgeError`, so this is a typed
     // `ScpError` whose message preserves the original `[SCP-PERM-NNNN]` code
-    // prefix verbatim. We classify on that prefix (rather than `instanceof`)
-    // to mirror the Python port's code-based dispatch and stay robust to the
-    // exact subclass. Any non-UCAN error is a genuine fault and propagates.
+    // prefix verbatim. We absorb ONLY `[SCP-PERM-3001]` — the one code all
+    // UcanError variants use — and re-throw everything else. This is a closed
+    // allowlist: PERM-3000 (WASM manager permission failures), PERM-3030
+    // (handle-affinity misuse), and any future codes are genuine faults and
+    // must propagate rather than being silently folded into a false verdict.
     const msg = error instanceof Error ? error.message : String(error);
-    if (!/^\[SCP-PERM-\d+\]/.test(msg)) {
-      throw error;
-    }
-    // Re-raise handle-affinity errors — these are caller misuse, not UCAN
-    // failures.
-    if (/^\[SCP-PERM-3030\]/.test(msg)) {
+    if (!/^\[SCP-PERM-3001\]/.test(msg)) {
       throw error;
     }
     const passed = __PASSED_BEFORE[__classifyUcanError(msg)];
@@ -550,9 +547,12 @@ function hasAnyFalse(cv: CapabilityValidation): boolean {
  * passed before it (`__PASSED_BEFORE`) stay `true`. A malformed / no-capability
  * token is fail-closed (all-false) and never reaches the bridge.
  *
- * Non-UCAN errors (anything without an `[SCP-PERM-NNNN]` prefix) and
- * handle-affinity misuse (`[SCP-PERM-3030]`) propagate to the caller rather
- * than being absorbed into a false verdict.
+ * Only errors with the `[SCP-PERM-3001]` code (the one code used by all
+ * `UcanError` variants) are classified and absorbed into the verdict. All
+ * other errors — `[SCP-PERM-3000]` (manager permission failures),
+ * `[SCP-PERM-3030]` (handle-affinity misuse), and any future codes — are
+ * genuine faults and propagate to the caller rather than being folded into
+ * a false verdict (closed allowlist).
  *
  * **What Layer 1 measures**: token self-consistency — is this token
  * structurally valid, cryptographically signed, within the context ceiling,

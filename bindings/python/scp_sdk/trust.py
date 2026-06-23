@@ -839,8 +839,10 @@ async def evaluate_trust(
                     # PERM-3030 is a caller-misuse error (handle belongs to a
                     # different SCP instance). Re-raise so the programming mistake
                     # is visible rather than being absorbed into a false all-False
-                    # trust verdict. Mirrors the TypeScript `evaluateLayer1` function in trust.ts:
-                    #   if (/^\[SCP-PERM-3030\]/.test(msg)) throw error;
+                    # trust verdict. TypeScript absorbs ONLY [SCP-PERM-3001] (closed
+                    # allowlist for the UCAN error code); PERM-3030 is re-thrown
+                    # implicitly there. Python catches by type (bridge.UcanError),
+                    # so this explicit guard is still required.
                     if error_msg.startswith("[SCP-PERM-3030]"):
                         raise
                     failed_category = _classify_ucan_error(error_msg)
