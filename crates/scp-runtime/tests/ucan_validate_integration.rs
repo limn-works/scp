@@ -2265,3 +2265,142 @@ async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
         "out-of-ceiling attestation must report within_ceiling=false: {result:?}"
     );
 }
+
+/// `evaluate_ucan` reports `not_revoked: false` for a token whose revocation
+/// CID is on the context revocation list. Revocation is step 10; everything
+/// before it (parse, signatures, ceiling, nonce) passes, and step 11 (expiry)
+/// never runs after revocation short-circuits, so `time_bounds_valid` stays
+/// false. This documents the actual short-circuit field mapping in
+/// `evaluate_ucan`.
+#[tokio::test]
+async fn evaluate_ucan_reports_revoked_token() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-revoke",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    // Revoke the token by inserting its content-hash CID into the checker.
+    let revocation_cid = compute_revocation_cid(&token.encoded);
+    let mut revocation_checker = InMemoryRevocationChecker::new();
+    revocation_checker.revoked.insert(revocation_cid);
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-eval-revoke", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "revoked token must report not_revoked=false (and time_bounds_valid \
+         stays false because expiry never runs after revocation): {result:?}"
+    );
+}
+
+/// `evaluate_ucan` reports `time_bounds_valid: false` for an expired token.
+/// Expiry is the last step (11); everything before it passes, including
+/// `not_revoked: true`. This documents the actual field mapping in
+/// `evaluate_ucan`.
+#[tokio::test]
+async fn evaluate_ucan_reports_expired_token() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-expired",
+        capabilities: &caps,
+        lifetime_secs: 1, // Very short lifetime.
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    // Wait for the token to expire.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-eval-expired", "messages", "write");
+
+    let mut ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+    // Use zero tolerance so the 2-second expiry is detected.
+    ctx.clock_skew_tolerance_secs = 0;
+
+    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: true,
+            time_bounds_valid: false,
+        },
+        "expired token must report time_bounds_valid=false with all prior \
+         stages true: {result:?}"
+    );
+}
