@@ -3,13 +3,14 @@
 //! in ADR-049 commit 12.
 
 use scp_identity::DID;
-use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
+use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::context::roles;
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
 
-use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_event_into};
+use super::actor::class_s::ClassCSplit;
+use super::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
@@ -82,41 +83,41 @@ fn append_consequence_event(
 /// Field-disjoint mutable borrows of the per-context state needed by
 /// the consequence-enforcement chain.
 ///
+/// This is an ALIAS for the ADR-049 §9 [`ClassCSplit`] view, so the
+/// consequence path is, by construction, cell-COMPATIBLE: a cell holder
+/// reaches the identical type via `cell.class_c_view().split_class_c()`, and
+/// the non-cell sites build it via [`Self::from_state`] (which bridges through
+/// [`ClassCSplit::from_state`]). It carries the same five disjoint borrows the
+/// enforcement helpers need:
+///
+/// - `governance: GovernanceClassCMut<'a>` — the field-granular Class-C
+///   governance view (NOT a whole `&mut GovernanceState`): it exposes the
+///   Class-C governance fields (e.g. the consequence `cooldown_until` map via
+///   [`cooldown_until_mut`](super::actor::class_s::GovernanceClassCMut::cooldown_until_mut))
+///   and CANNOT reach `governance.class_s`, so a consequence helper cannot
+///   accidentally mutate a Class-S governance field with no fail-closed persist.
+/// - `role_state: &'a mut ContextRoleState` — the ONE whole-substruct `&mut`,
+///   the documented ADR-049 §9 line-194 ACCEPTED Class-C residual: the
+///   consequence anti-spam suspension (`suspend_all` / `suspend_capabilities`)
+///   is best-effort BY DESIGN and deliberately NOT routed through a fail-closed
+///   combinator. Preserved EXACTLY — no behavior change.
+/// - `membership: &'a MembershipState` (read-only), `receive_buffer`,
+///   `checkpoint_events_since` — unchanged.
+///
 /// Both [`super::state::PerContextState`] (legacy) and
-/// [`crate::context::actor::state::PerContextState`] (actor) implement
-/// the same `governance: GovernanceState`, `role_state: ContextRoleState`,
-/// `membership: MembershipState`, `receive_buffer: ReceiveBuffer`, and
-/// `checkpoint_events_since: u64` fields with identical types. Splitting
-/// the borrows here lets the enforcement helpers stay generic over the
-/// parent state struct while preserving Rust's ability to disjointly
-/// borrow each subfield (a single trait method returning `&mut Self`
-/// would block the multiple mutable borrows the body actually needs).
+/// [`crate::context::actor::state::PerContextState`] (actor) expose these same
+/// fields with identical types. Splitting the borrows lets the enforcement
+/// helpers preserve Rust's disjoint subfield borrows (a single method returning
+/// `&mut Self` would block the multiple mutable borrows the body needs).
 ///
 /// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
 /// can drive the same enforcement pipeline as the legacy
 /// `&Supervisor`-shape `messaging_helpers_legacy` without duplicating
-/// the ~300 lines of consequence dispatch + escalation logic.
-pub struct ConsequenceStateSplit<'a> {
-    pub governance: &'a mut GovernanceState,
-    pub role_state: &'a mut ContextRoleState,
-    pub membership: &'a MembershipState,
-    pub receive_buffer: &'a mut ReceiveBuffer,
-    pub checkpoint_events_since: &'a mut u64,
-}
-
-impl<'a> ConsequenceStateSplit<'a> {
-    /// Build a split-borrow from the unified [`PerContextState`]
-    /// (ADR-049 §Decision 1 — single `PerContextState`).
-    pub const fn from_state(ctx: &'a mut PerContextState) -> Self {
-        Self {
-            governance: &mut ctx.governance,
-            role_state: &mut ctx.role_state,
-            membership: &ctx.membership,
-            receive_buffer: &mut ctx.receive_buffer,
-            checkpoint_events_since: &mut ctx.checkpoint_events_since,
-        }
-    }
-}
+/// the ~300 lines of consequence dispatch + escalation logic. Reshaped onto
+/// [`ClassCSplit`] (ADR-049 §9) so the type is cell-compatible; the reshape is
+/// NON-BREAKING — [`Self::from_state`] keeps its `&mut PerContextState`
+/// signature.
+pub type ConsequenceStateSplit<'a> = ClassCSplit<'a>;
 
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
 /// providers, scope identifiers, and pre-evaluated rule data into one
@@ -193,8 +194,14 @@ fn process_one_triggered_consequence(
     let member_did = args.member_did;
     let now = args.now;
 
-    // Cooldown tracking: skip if this rule fired within its window.
-    if let Some(&last_fired) = state.governance.cooldown_until.get(&consequence.rule_index)
+    // Cooldown tracking: skip if this rule fired within its window. The cooldown
+    // map is a Class-C governance field reached through the field-granular
+    // `GovernanceClassCMut` accessor (the view holds no whole `&mut GovernanceState`
+    // and cannot reach `governance.class_s`).
+    if let Some(&last_fired) = state
+        .governance
+        .cooldown_until_mut()
+        .get(&consequence.rule_index)
         && now < last_fired
     {
         return;
@@ -282,9 +289,12 @@ fn process_one_triggered_consequence(
         return; // skip cooldown recording — failed action doesn't count
     }
 
-    // Record cooldown: prevent re-firing within the rule's window.
+    // Record cooldown: prevent re-firing within the rule's window. Written
+    // through the field-granular `GovernanceClassCMut` accessor (Class-C; a
+    // coalesce-window rollback of a cooldown tick is acceptable — it is not a
+    // Class-S replay/authorization witness).
     if let Some(rule) = args.rules.get(consequence.rule_index) {
-        state.governance.cooldown_until.insert(
+        state.governance.cooldown_until_mut().insert(
             consequence.rule_index,
             now.saturating_add(rule.window.as_secs()),
         );

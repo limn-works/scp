@@ -775,13 +775,7 @@ pub fn run_buffered_post_delivery(
             convergent_now,
         );
         let member_did = DID(sender_did.to_owned());
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
-        };
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
         crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2009,13 +2003,7 @@ pub fn finalize_send(
         convergent_now,
     );
     {
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
-        };
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
         crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2833,13 +2821,8 @@ pub fn deliver_message_and_drain_buffered(
                     convergent_now,
                 );
                 let recv_member_did = DID(sender_did.to_owned());
-                let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-                    governance: &mut state.governance,
-                    role_state: &mut state.role_state,
-                    membership: &state.membership,
-                    receive_buffer: &mut state.receive_buffer,
-                    checkpoint_events_since: &mut state.checkpoint_events_since,
-                };
+                let mut split =
+                    crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
                 crate::context::governance_logic::enforce_triggered_consequences(
                     &mut split,
                     &crate::context::governance_logic::EnforceConsequencesCtx {
@@ -2951,13 +2934,7 @@ pub fn deliver_message_and_drain_buffered(
             convergent_now,
         );
         let recv_member_did = DID(sender_did.to_owned());
-        let mut split = crate::context::governance_logic::ConsequenceStateSplit {
-            governance: &mut state.governance,
-            role_state: &mut state.role_state,
-            membership: &state.membership,
-            receive_buffer: &mut state.receive_buffer,
-            checkpoint_events_since: &mut state.checkpoint_events_since,
-        };
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(state);
         crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {

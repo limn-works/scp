@@ -4550,13 +4550,7 @@ pub fn finalize_governance_action(
                 None
             };
 
-            let mut split = ConsequenceStateSplit {
-                governance: &mut state.governance,
-                role_state: &mut state.role_state,
-                membership: &state.membership,
-                receive_buffer: &mut state.receive_buffer,
-                checkpoint_events_since: &mut state.checkpoint_events_since,
-            };
+            let mut split = ConsequenceStateSplit::from_state(state);
             enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
@@ -4571,13 +4565,7 @@ pub fn finalize_governance_action(
                 },
             );
             if let Some((target, triggered)) = triggered_target {
-                let mut split = ConsequenceStateSplit {
-                    governance: &mut state.governance,
-                    role_state: &mut state.role_state,
-                    membership: &state.membership,
-                    receive_buffer: &mut state.receive_buffer,
-                    checkpoint_events_since: &mut state.checkpoint_events_since,
-                };
+                let mut split = ConsequenceStateSplit::from_state(state);
                 enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {

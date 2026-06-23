@@ -1144,6 +1144,80 @@ pub(crate) struct ClassCSplit<'a> {
 
 #[allow(
     dead_code,
+    reason = "ADR-049 §9 scaffolding: `ClassCSplit::from_state` gets its first PRODUCTION caller when `ConsequenceStateSplit` reshapes onto `ClassCSplit` (it is the cell-free bridge used by the non-actor construction sites). Exercised by this module's unit test now."
+)]
+impl<'a> ClassCSplit<'a> {
+    /// Build a [`ClassCSplit`] DIRECTLY from a `&mut PerContextState`, with NO
+    /// owning [`ClassSCell`] / [`ClassCMut`] in scope.
+    ///
+    /// This is the cell-free bridge that lets
+    /// [`crate::context::governance_logic::ConsequenceStateSplit`] reshape onto
+    /// the [`ClassCSplit`] field shape while keeping its
+    /// `from_state(&mut PerContextState)` signature — every existing
+    /// (non-cell) consequence construction site stays compiling unchanged. A
+    /// cell holder reaches the SAME `ClassCSplit` shape via
+    /// `cell.class_c_view().split_class_c()`, so this commit makes the
+    /// consequence type cell-COMPATIBLE without itself dropping any `state_mut`
+    /// call (that is the later cell-threading pass).
+    ///
+    /// # Airtight BY CONSTRUCTION — parity with [`ClassCMut::split_class_c`]
+    ///
+    /// This performs the EXACT SAME safe destructure that
+    /// [`ClassCMut::new`] + [`ClassCMut::split_class_c`] already perform — it
+    /// just exposes it without the [`ClassCMut`] wrapper. It holds NO whole
+    /// `&mut PerContextState`, NO whole `&mut GovernanceState`, and NO `&mut` to
+    /// any Class-S-containing struct:
+    ///
+    /// - `governance` is wrapped in a [`GovernanceClassCMut`], whose `new`
+    ///   destructures the `&mut GovernanceState` and leaves `governance.class_s`
+    ///   ([`GovernanceClassS`]) in its `..` rest — so NO reference (mut or
+    ///   shared) to it is taken, and a `governance.class_s` mutation is a COMPILE
+    ///   error by construction (there is no whole `&mut GovernanceState` to reach
+    ///   it through).
+    /// - `class_s` ([`ClassSState`], the actor's own Class-S sub-struct) is left
+    ///   in the destructure's `..` rest — NO reference to it is taken AT ALL.
+    /// - `membership` is bound a SHARED `&` (read-only on the consequence path),
+    ///   matching [`ClassCMut::split_class_c`]'s `&*self.membership` narrowing.
+    /// - `role_state` is the ONE whole-substruct `&mut` — the documented ADR-049
+    ///   §9 line-194 ACCEPTED Class-C residual for the consequence anti-spam
+    ///   (suspend) path: that suspension is best-effort BY DESIGN and is NOT
+    ///   routed through a fail-closed combinator. This is the only whole-substruct
+    ///   `&mut` here and is pre-existing/intended (it matches the existing
+    ///   `ConsequenceStateSplit.role_state: &mut ContextRoleState`).
+    ///
+    /// Because no whole `&mut PerContextState` / `&mut GovernanceState` /
+    /// `&mut ClassSState` / `&mut GovernanceClassS` is held, there is NOTHING of
+    /// those types for any future accessor to return — the airtightness is
+    /// structural, identical to the cell path.
+    pub(crate) const fn from_state(state: &'a mut PerContextState) -> Self {
+        // SAFETY INVARIANT (ADR-049 §9 — rationale in this method's doc above):
+        // mirror the disjoint destructure of `ClassCMut::new` for exactly the
+        // five fields `ConsequenceStateSplit` needs. The Class-S sub-structs
+        // `class_s` (actor) and `governance.class_s` (via `GovernanceClassCMut`'s
+        // own `..`) are NEVER bound `&mut` — they fall into the `..` rest here
+        // and inside `GovernanceClassCMut::new`. `role_state` is the §9 line-194
+        // accepted best-effort whole-`&mut` residual; `membership` is narrowed to
+        // a shared `&`.
+        let PerContextState {
+            governance,
+            role_state,
+            membership,
+            receive_buffer,
+            checkpoint_events_since,
+            ..
+        } = state;
+        Self {
+            governance: GovernanceClassCMut::new(governance),
+            role_state,
+            membership: &*membership,
+            receive_buffer,
+            checkpoint_events_since,
+        }
+    }
+}
+
+#[allow(
+    dead_code,
     reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
