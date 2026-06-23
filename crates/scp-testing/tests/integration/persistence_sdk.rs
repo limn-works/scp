@@ -390,8 +390,9 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         .await
         .expect("restore_all_contexts must succeed against sqlite-backed repo");
     assert!(
-        restored.iter().any(|id| id == ctx_id),
-        "restore_all_contexts must return the previously-persisted context id, got {restored:?}"
+        restored.ids().iter().any(|id| id == ctx_id),
+        "restore_all_contexts must return the previously-persisted context id, got {:?}",
+        restored.ids()
     );
 
     // ---- Phase 4: Verify state survived. ----

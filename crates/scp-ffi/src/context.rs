@@ -3965,7 +3965,7 @@ impl crate::scp::PyScp {
 
     /// Restores a single persisted context from storage.
     ///
-    /// Delegates to `ContextManager::restore_context`. The context must
+    /// Delegates to `Supervisor::restore_context`. The context must
     /// have been previously persisted and must not already be registered.
     ///
     /// # Arguments
@@ -5319,7 +5319,7 @@ impl crate::scp::PyScp {
     /// Restores a member's access key by generating a new key at the next
     /// epoch.
     ///
-    /// Delegates to `ContextManager::restore_context_access_key`.
+    /// Delegates to `Supervisor::restore_context_access_key`.
     ///
     /// # Errors
     ///

@@ -59,7 +59,7 @@ pub const MAX_SUBSCRIBERS_RANGE: (u32, u32) = (1, 1_000_000);
 /// handshake types (§5.14.13).
 ///
 /// Error codes use the broadcast-hosting sub-block of the `SCP-SAGA-` band
-/// (`13100-13102`, within the `13100-13999` broadcast-hosting reservation;
+/// (`13100-13102`, within the `13100-13199` broadcast-hosting reservation;
 /// ADR-049 §3a; see `.docs/standards/sdk-common.md`). They are kept clear of
 /// the `13000-13009` cross-context tool-saga sub-block. The code is embedded in
 /// each message so the `check-error-codes.sh` gate can enumerate and

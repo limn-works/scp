@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use scp_platform::testing::InMemoryStorage;
 use scp_runtime::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState, Supervisor,
-    SupervisorConfig,
+    JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaJournal, SagaState,
+    Supervisor, SupervisorConfig,
 };
 
 struct NoopPersistence;
@@ -144,9 +144,16 @@ async fn replay_mixed_states_resolves_each_per_classification() {
         "5 synthetic unresolved sagas expected, got {pre:?}"
     );
 
-    // Build a supervisor — replay happens manually (not from new).
+    // Build a supervisor — replay happens manually (not from new). This harness
+    // wires no persistence provider, so it cannot obtain a `RestoredContexts`
+    // witness from a real `restore_all_contexts`; the `testing`-gated `for_test`
+    // mints the empty witness that proves restore-then-replay ordering to the
+    // type system (these tests exercise the replay arms in isolation).
     let supervisor = build_supervisor(&storage);
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     // Post-replay: Initiated, PreparingA, PreparingB resolved to
     // Aborted; Committing transitioned to NeedsRepair;
@@ -182,10 +189,16 @@ async fn replay_is_idempotent_after_first_pass() {
     inject(&probe_journal, &saga_id, SagaState::Initiated, 0).await;
 
     let supervisor = build_supervisor(&storage);
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     // Second replay must succeed without side effects.
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
     let post = probe_journal.load_unresolved().await.unwrap();
     assert!(post.is_empty(), "second replay must leave journal stable");
 }
@@ -195,7 +208,10 @@ async fn replay_is_idempotent_after_first_pass() {
 async fn replay_on_empty_journal_succeeds() {
     let storage = Arc::new(InMemoryStorage::new());
     let supervisor = build_supervisor(&storage);
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 }
 
 /// Process-restart bootstrap wiring (ADR-049 Phase 2D), §17.16.4
@@ -218,7 +234,7 @@ async fn replay_on_empty_journal_succeeds() {
 /// wired supervisor) is reachable. This integration crate can only construct a
 /// `Supervisor::new` harness (no helper persistence), so it carries the
 /// fail-closed half. The structural ordering + bootstrap-routing guards are in
-/// `pipeline_wiring.rs` (`restore_on_startup_runs_replay_before_restore`,
+/// `pipeline_wiring.rs` (`restore_on_startup_runs_restore_before_replay`,
 /// `bridge_resume_path_routes_through_restore_on_startup`).
 #[tokio::test]
 async fn restore_on_startup_fails_closed_when_restore_leg_errors() {

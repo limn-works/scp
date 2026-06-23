@@ -106,8 +106,8 @@ const COMMON_BROADCAST_SRC: &str =
 // Shared bridge-instance core (scp-ffi-common) — owns the production
 // startup/resume path `restore_all_persisted_contexts`, which MUST route
 // through `Supervisor::restore_on_startup` so the §17.16.4 saga-journal
-// replay runs before context restore on every process restart (ADR-049
-// Phase 2D). Pinned by `restore_on_startup_runs_replay_before_restore` and
+// replay runs after context restore on every process restart (ADR-049
+// Phase 2D). Pinned by `restore_on_startup_runs_restore_before_replay` and
 // `bridge_resume_path_routes_through_restore_on_startup`.
 const BRIDGE_INSTANCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
@@ -155,17 +155,34 @@ const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 45;
 ///
 /// Searches for `fn <fn_name>(` or `fn <fn_name><` (generic params), then
 /// finds the opening `{` and does brace-matching to locate the closing `}`.
-/// Returns the CODE between (and including) the braces with `//`-line-comment
-/// text and string-literal contents STRIPPED — so a `find`/`contains` on the
-/// returned body matches only real call sites, never a token that merely
-/// appears in a comment or a string literal (a structural assertion that
-/// matched commented-out or stringized text would silently false-pass). The
-/// parser already tracks `in_line_comment`/`in_string` for brace depth; this
-/// reuses that state to exclude those chars from the emitted slice. Comment and
-/// string DELIMITERS (`/`, `"`) and all other code are preserved, as is
-/// whitespace structure (a stripped char becomes a space), so byte offsets of
-/// surviving code tokens move but their relative ORDER is unchanged — order-
-/// sensitive assertions (e.g. "X before Y") remain valid.
+/// Returns the CODE between (and including) the braces with the contents of
+/// every Rust lexical "non-code" span STRIPPED (replaced by spaces) — so a
+/// `find`/`contains` on the returned body matches only real call sites, never a
+/// token that merely appears inside a comment, a string, or a char literal (a
+/// structural assertion that matched commented-out or stringized text would
+/// silently false-pass — and would be trivially evadable by an attacker who
+/// hides a decoy call in a comment or a string).
+///
+/// The scanner is a SOUND Rust lexer for the comment/string/char grammar — it
+/// recognizes the full set of spans the language defines, not an ad-hoc subset:
+///
+/// - `//` line comments (to end of line),
+/// - `/* … */` block comments, **nesting-aware** (Rust block comments nest),
+/// - `"…"` string literals (with `\"` escapes),
+/// - `r"…"`, `r#"…"#`, `r##"…"##`, … raw strings (closing matched by the exact
+///   opening `#` count — a `"` inside a raw string does NOT end it),
+/// - `'x'` / `'\n'` / `'\''` char literals, DISTINGUISHED from lifetimes /
+///   labels (`'a`, `'static`, `'loop:`): a lifetime has no closing `'`, so a
+///   `'` is only treated as a char-literal opener when a properly-formed
+///   closing `'` follows within the char-literal grammar.
+///
+/// Brace depth is counted only over CODE spans, so a `{`/`}` inside any of the
+/// above non-code spans (e.g. a `/* } */` decoy or a `'}'` char) neither opens
+/// nor closes the body and cannot truncate the extracted slice. Stripped chars
+/// become spaces, so byte offsets of surviving code tokens move but their
+/// relative ORDER is unchanged — order-sensitive assertions ("X before Y")
+/// remain valid. Delimiters (`/`, `*`, `"`, `'`, `#`, `r`) are themselves
+/// emitted as code so the surrounding token structure is preserved.
 ///
 /// If the function appears multiple times (e.g. in test mocks), returns the
 /// FIRST occurrence. For functions that may also appear in `#[cfg(test)]`
@@ -184,77 +201,268 @@ fn extract_fn_body(source: &str, fn_name: &str) -> Option<String> {
     let open_brace_offset = after_sig.find('{')?;
     let body_start = sig_pos + open_brace_offset;
 
-    // Brace-matching: count depth from the opening brace. We also build a
-    // CLEANED copy of the body with line-comment text and string-literal
-    // contents replaced by spaces, so downstream `find`/`contains` never match
-    // a token inside a comment or string.
-    let mut depth = 0u32;
-    let mut in_line_comment = false;
-    let mut in_string = false;
-    let mut prev_char = '\0';
-    let mut cleaned = String::new();
-    let mut balanced = false;
+    clean_and_extract_braced(&source[body_start..])
+}
 
-    for ch in source[body_start..].chars() {
-        // Track line comments. The first `/` of a `//` is emitted before we
-        // know it begins a comment; the SECOND `/` flips the flag, so we
-        // retroactively blank the just-emitted first `/` too.
-        if ch == '/' && prev_char == '/' && !in_string {
-            in_line_comment = true;
-            // Blank the first `/` of the `//` already pushed.
-            if cleaned.ends_with('/') {
-                cleaned.pop();
+/// Brace-match + strip non-code spans over a slice that BEGINS at the body's
+/// opening `{`. Returns the cleaned body (braces included) up to and including
+/// the matching `}`, or `None` if the braces never balance.
+///
+/// Implemented as an index-based scan over the char vector so the raw-string
+/// `#`-count and char-vs-lifetime decisions can look ahead. Every non-code span
+/// is consumed by a dedicated `skip_*` helper that emits the right number of
+/// spaces (preserving length/order) and returns the index just past the span.
+fn clean_and_extract_braced(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut cleaned = String::with_capacity(chars.len());
+    let mut depth = 0u32;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // ---- Comments -----------------------------------------------------
+        if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            i = skip_line_comment(&chars, i, &mut cleaned);
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            i = skip_block_comment(&chars, i, &mut cleaned);
+            continue;
+        }
+
+        // ---- Raw strings: r"...", r#"..."#, r##"..."##, ... ---------------
+        // Recognize `r` (or `br`) followed by zero-or-more `#` then `"`.
+        if (ch == 'r' || ch == 'b') && is_raw_string_start(&chars, i) {
+            i = skip_raw_string(&chars, i, &mut cleaned);
+            continue;
+        }
+
+        // ---- Ordinary / byte strings: "...", b"..." -----------------------
+        if ch == '"' {
+            i = skip_string(&chars, i, &mut cleaned);
+            continue;
+        }
+        if ch == 'b' && chars.get(i + 1) == Some(&'"') {
+            cleaned.push('b');
+            i = skip_string(&chars, i + 1, &mut cleaned);
+            continue;
+        }
+
+        // ---- Char literals (NOT lifetimes/labels) -------------------------
+        if ch == '\'' {
+            if let Some(next) = skip_char_literal(&chars, i, &mut cleaned) {
+                i = next;
+                continue;
+            }
+            // Not a char literal — a lifetime/label `'a` / `'static`. Emit the
+            // `'` as code; the following identifier chars flow through normally.
+            cleaned.push('\'');
+            i += 1;
+            continue;
+        }
+
+        // ---- Code ---------------------------------------------------------
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth -= 1;
+        }
+        cleaned.push(ch);
+        if ch == '}' && depth == 0 {
+            return Some(cleaned);
+        }
+        i += 1;
+    }
+
+    None // Unbalanced braces
+}
+
+/// Consume a `//` line comment starting at `start` (`chars[start] == '/'`,
+/// `chars[start+1] == '/'`), emitting a space per char up to (but NOT
+/// including) the newline. Returns the index of the newline (or EOF).
+fn skip_line_comment(chars: &[char], start: usize, cleaned: &mut String) -> usize {
+    let mut i = start;
+    while i < chars.len() && chars[i] != '\n' {
+        cleaned.push(' ');
+        i += 1;
+    }
+    i
+}
+
+/// Consume a `/* … */` block comment starting at `start`, NESTING-AWARE (Rust
+/// block comments nest, so an inner `/*` must be matched by an inner `*/`).
+/// Emits a space per consumed char (newlines preserved as newlines so line
+/// structure is retained). Returns the index just past the closing `*/`.
+fn skip_block_comment(chars: &[char], start: usize, cleaned: &mut String) -> usize {
+    let mut i = start;
+    let mut nesting = 0u32;
+    while i < chars.len() {
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            nesting += 1;
+            cleaned.push(' ');
+            cleaned.push(' ');
+            i += 2;
+        } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+            nesting -= 1;
+            cleaned.push(' ');
+            cleaned.push(' ');
+            i += 2;
+            if nesting == 0 {
+                break;
+            }
+        } else {
+            // Preserve newlines as newlines so emitted line structure matches
+            // the source; blank everything else.
+            cleaned.push(if chars[i] == '\n' { '\n' } else { ' ' });
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Consume an ordinary string literal starting at the opening `"` (`start`).
+/// Emits the opening and closing `"` as code and blanks the interior; honors
+/// `\"` escapes. Returns the index just past the closing `"`.
+fn skip_string(chars: &[char], start: usize, cleaned: &mut String) -> usize {
+    cleaned.push('"'); // opening delimiter (code)
+    let mut i = start + 1;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            // Escape: blank both the backslash and the escaped char.
+            cleaned.push(' ');
+            if i + 1 < chars.len() {
                 cleaned.push(' ');
             }
+            i += 2;
+            continue;
         }
-        if ch == '\n' {
-            in_line_comment = false;
+        if ch == '"' {
+            cleaned.push('"'); // closing delimiter (code)
+            return i + 1;
         }
+        cleaned.push(if ch == '\n' { '\n' } else { ' ' });
+        i += 1;
+    }
+    i
+}
 
-        // Track string literals (simplified — doesn't handle raw strings,
-        // but sufficient for brace matching in Rust source). Both the opening
-        // `"` and the closing `"` are emitted as delimiters; only the CONTENTS
-        // between them are blanked.
-        if ch == '"' && prev_char != '\\' && !in_line_comment {
-            in_string = !in_string;
-        }
+/// Returns `true` if a raw-string literal opens at `start` — i.e. `chars[start]`
+/// is `r` (or `br`, with the `b` at `start`) followed by zero-or-more `#` and
+/// then a `"`. (`br` shares the raw-string close rule; `b` alone is handled as a
+/// byte string elsewhere.)
+fn is_raw_string_start(chars: &[char], start: usize) -> bool {
+    let mut i = start;
+    if chars.get(i) == Some(&'b') {
+        i += 1;
+    }
+    if chars.get(i) != Some(&'r') {
+        return false;
+    }
+    i += 1;
+    while chars.get(i) == Some(&'#') {
+        i += 1;
+    }
+    chars.get(i) == Some(&'"')
+}
 
-        if !in_line_comment && !in_string {
-            if ch == '{' {
-                depth += 1;
-            } else if ch == '}' {
-                depth -= 1;
+/// Consume a raw string starting at `start` (`r"..."`, `r#"..."#`, `br##"..."##`,
+/// …). The closing is `"` followed by EXACTLY the opening `#` count, so an inner
+/// `"` (even `"#` with too few hashes) does NOT terminate it. Emits the `r`/`b`,
+/// the `#` fences, and the `"` delimiters as code; blanks the interior. Returns
+/// the index just past the close.
+fn skip_raw_string(chars: &[char], start: usize, cleaned: &mut String) -> usize {
+    let mut i = start;
+    if chars.get(i) == Some(&'b') {
+        cleaned.push('b');
+        i += 1;
+    }
+    // `r`
+    cleaned.push('r');
+    i += 1;
+    // opening hashes
+    let mut hashes = 0usize;
+    while chars.get(i) == Some(&'#') {
+        cleaned.push('#');
+        hashes += 1;
+        i += 1;
+    }
+    // opening quote
+    cleaned.push('"');
+    i += 1;
+    // interior until `"` + `hashes` `#`
+    while i < chars.len() {
+        if chars[i] == '"' && raw_close_matches(chars, i + 1, hashes) {
+            cleaned.push('"');
+            for _ in 0..hashes {
+                cleaned.push('#');
+            }
+            return i + 1 + hashes;
+        }
+        cleaned.push(if chars[i] == '\n' { '\n' } else { ' ' });
+        i += 1;
+    }
+    i
+}
+
+/// Returns `true` if `chars[at..]` begins with exactly `hashes` `#` characters
+/// (the raw-string close fence).
+fn raw_close_matches(chars: &[char], at: usize, hashes: usize) -> bool {
+    (0..hashes).all(|k| chars.get(at + k) == Some(&'#'))
+}
+
+/// Attempt to consume a CHAR literal starting at the `'` at `start`. Returns
+/// `Some(index_past_close)` if `start` opens a well-formed char literal
+/// (`'x'`, `'\n'`, `'\''`, `'\u{1F600}'`), or `None` if the `'` is a lifetime /
+/// label introducer (`'a`, `'static`, `'loop:`) — which has NO closing `'`.
+///
+/// Discrimination rule (matches Rust lexing): a `'` opens a char literal iff it
+/// is followed by either
+///   (a) a backslash escape `'\...'` closed by `'`, or
+///   (b) exactly ONE non-`'`, non-`\` char then a closing `'`.
+/// A `'` followed by an identifier-start char and then NOT a closing `'` is a
+/// lifetime (e.g. `'a,` or `'static>`), so we return `None`.
+fn skip_char_literal(chars: &[char], start: usize, cleaned: &mut String) -> Option<usize> {
+    // start == '\''
+    match chars.get(start + 1) {
+        Some('\\') => {
+            // Escaped char literal: '\n', '\'', '\\', '\u{..}', '\x41', ...
+            // Scan to the closing `'` (the next unescaped `'`).
+            let mut i = start + 2;
+            // Consume the escape payload up to the closing quote. A `\u{...}`
+            // contains `{`/`}`/hex; none of it is code, so just scan to `'`.
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    // Emit the whole literal as spaces (length-preserving), with
+                    // the opening + closing `'` kept as code delimiters.
+                    cleaned.push('\'');
+                    for _ in (start + 1)..i {
+                        cleaned.push(' ');
+                    }
+                    cleaned.push('\'');
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            None // unterminated — treat the `'` as non-char (caller emits it)
+        }
+        Some(&c) if c != '\'' => {
+            // Single-char body iff a closing `'` immediately follows.
+            if chars.get(start + 2) == Some(&'\'') {
+                cleaned.push('\''); // opening delimiter
+                cleaned.push(' '); // blanked body char
+                cleaned.push('\''); // closing delimiter
+                Some(start + 3)
+            } else {
+                // No closing quote after one char ⇒ lifetime/label (`'a`, `'static`).
+                None
             }
         }
-
-        // Emit: real code as-is; comment text and string CONTENTS as a space.
-        // The `"` delimiters themselves (opening + closing) are preserved as
-        // code — the `else if ch == '"'` arm fires for both, before the
-        // interior-blanking arm can reach an in-string non-quote char.
-        let emit = if in_line_comment {
-            ' '
-        } else if ch == '"' {
-            '"'
-        } else if in_string {
-            // Interior of a string literal — blank it.
-            ' '
-        } else {
-            ch
-        };
-        cleaned.push(emit);
-
-        if !in_line_comment && !in_string && ch == '}' && depth == 0 {
-            balanced = true;
-            break;
-        }
-        prev_char = ch;
+        // `''` (empty) or EOF ⇒ not a valid single-char literal; let caller
+        // emit the `'` as code.
+        _ => None,
     }
-
-    if !balanced {
-        return None; // Unbalanced braces
-    }
-
-    Some(cleaned)
 }
 
 /// Returns `true` if the body of `fn_name` in `source` contains `callee`.
@@ -275,6 +483,168 @@ fn extract_fn_signature(source: &str, fn_name: &str) -> Option<String> {
     let after_sig = &source[sig_pos..];
     let open_brace_offset = after_sig.find('{')?;
     Some(after_sig[..open_brace_offset].to_string())
+}
+
+// ===========================================================================
+// `extract_fn_body` parser hardening — evasion-defeat unit tests
+// ===========================================================================
+//
+// These pin the lexer's handling of every Rust non-code span so a future
+// refactor of `extract_fn_body` cannot silently reintroduce a hole an attacker
+// could use to smuggle a decoy call (which would make an order/presence gate
+// false-pass). Each test is modeled on a concrete proven evasion: a block-comment
+// decoy call, a block-comment `}` brace-truncation, a char-literal `'}'` desync,
+// and a raw-string decoy call.
+
+/// A real call hidden inside a `//` line comment must NOT appear in the cleaned
+/// body (the original guarantee — kept as a regression pin).
+#[test]
+fn parser_line_comment_decoy_excluded() {
+    let src = "fn f() {\n    // real_call();\n    let x = 1;\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        !body.contains("real_call"),
+        "a `// real_call()` line-comment decoy must be stripped, got: {body:?}"
+    );
+    assert!(body.contains("let x"), "real code must survive: {body:?}");
+}
+
+/// A real call hidden inside a `/* … */` BLOCK comment must NOT appear in the
+/// cleaned body. This is the CRITICAL evasion: a `/* restore_all_contexts() */`
+/// decoy placed before the real `replay()` call previously false-passed an
+/// order gate because the old parser did not strip block comments.
+#[test]
+fn parser_block_comment_decoy_excluded() {
+    let src = "fn f() {\n    /* real_call(); */\n    other();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        !body.contains("real_call"),
+        "a `/* real_call() */` block-comment decoy must be stripped, got: {body:?}"
+    );
+    assert!(body.contains("other"), "real code must survive: {body:?}");
+}
+
+/// A `/* } */` brace inside a block comment must NOT close the body early — the
+/// HIGH evasion: brace-injection in a comment previously TRUNCATED the extracted
+/// body, hiding everything after it from a `contains` gate.
+#[test]
+fn parser_block_comment_brace_does_not_truncate() {
+    let src = "fn f() {\n    /* } */\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts (not truncated)");
+    assert!(
+        body.contains("tail_call"),
+        "a `/* }} */` comment brace must NOT truncate the body — code after it must \
+         survive, got: {body:?}"
+    );
+}
+
+/// NESTED block comments: Rust block comments nest, so an inner `/*` needs an
+/// inner `*/`. A single `*/` must not close a doubly-opened comment early and
+/// expose a decoy.
+#[test]
+fn parser_nested_block_comment_excluded() {
+    let src = "fn f() {\n    /* outer /* inner */ real_call(); */\n    tail();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        !body.contains("real_call"),
+        "a decoy after a NESTED `*/` is still inside the outer comment and must be \
+         stripped, got: {body:?}"
+    );
+    assert!(body.contains("tail"), "real code must survive: {body:?}");
+}
+
+/// A `'}'` CHAR literal must NOT desync brace depth (its `}` is not a real
+/// closing brace) and must not truncate the body.
+#[test]
+fn parser_char_literal_brace_does_not_desync() {
+    let src = "fn f() {\n    let c = '}';\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts (char brace ignored)");
+    assert!(
+        body.contains("tail_call"),
+        "a `'}}'` char literal must NOT close the body — code after it must survive, \
+         got: {body:?}"
+    );
+}
+
+/// A real call hidden inside a `'{'`-style char or a quote char must not break
+/// scanning; an escaped-quote char `'\''` must be consumed whole.
+#[test]
+fn parser_escaped_quote_char_literal_consumed() {
+    let src = "fn f() {\n    let q = '\\'';\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        body.contains("tail_call"),
+        "an escaped-quote char `'\\''` must be consumed as one literal, code after must \
+         survive, got: {body:?}"
+    );
+}
+
+/// A LIFETIME (`'a`) must NOT be mistaken for an unterminated char literal — the
+/// scanner must keep going and still see real code.
+#[test]
+fn parser_lifetime_not_treated_as_char() {
+    let src = "fn f() {\n    let r: &'static str = pick();\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        body.contains("pick") && body.contains("tail_call"),
+        "a `'static` lifetime must not swallow following code, got: {body:?}"
+    );
+}
+
+/// A real call hidden inside a RAW STRING (`r#"call()"#`) must NOT appear in the
+/// cleaned body — a `"` inside the raw string does not end it, and the decoy is
+/// interior.
+#[test]
+fn parser_raw_string_decoy_excluded() {
+    let src = "fn f() {\n    let s = r#\"real_call() and a \\\" quote\"#;\n    other();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        !body.contains("real_call"),
+        "a `r#\"real_call()\"#` raw-string decoy must be stripped, got: {body:?}"
+    );
+    assert!(body.contains("other"), "real code must survive: {body:?}");
+}
+
+/// A raw string carrying a `}` (`r"}"`)  must NOT truncate the body.
+#[test]
+fn parser_raw_string_brace_does_not_truncate() {
+    let src = "fn f() {\n    let s = r\"}\";\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts (raw-string brace ignored)");
+    assert!(
+        body.contains("tail_call"),
+        "a `r\"}}\"` raw-string brace must NOT truncate the body, got: {body:?}"
+    );
+}
+
+/// An ordinary string carrying a decoy call + a `}` must be stripped and must
+/// not truncate (the original string guarantee — kept as a regression pin).
+#[test]
+fn parser_string_decoy_and_brace_handled() {
+    let src = "fn f() {\n    let s = \"real_call() }\";\n    tail_call();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    assert!(
+        !body.contains("real_call"),
+        "a string decoy must be stripped, got: {body:?}"
+    );
+    assert!(
+        body.contains("tail_call"),
+        "a string `}}` must not truncate the body, got: {body:?}"
+    );
+}
+
+/// Order preservation: a real `a()` before a real `b()` must keep `a` before `b`
+/// in the cleaned body even when comments/strings sit between them (blanked to
+/// spaces, not removed, so offsets shift but order holds).
+#[test]
+fn parser_preserves_call_order_through_noncode() {
+    let src = "fn f() {\n    a(); /* x */ \"y\"; r#\"z\"#; b();\n}";
+    let body = extract_fn_body(src, "f").expect("body extracts");
+    let pa = body.find("a()").expect("a present");
+    let pb = body.find("b()").expect("b present");
+    assert!(
+        pa < pb,
+        "call order must be preserved: a@{pa} before b@{pb}"
+    );
 }
 
 // ===========================================================================
@@ -497,18 +867,26 @@ fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
 // `restore_on_startup` MUST restore contexts BEFORE the saga-journal replay —
 // the §17.16.4 restore-then-replay crash-recovery model requires each recovery
 // arm (the cross-context caller reversal; a Commit-in-progress re-send) to drive
-// a NOW-RESIDENT participant, so context restore must run first. This pins both
-// the presence of both calls AND their order, so a future refactor cannot
-// reorder them or drop the replay sweep.
+// a NOW-RESIDENT participant, so context restore must run first.
+//
+// PRIMARY enforcement is the TYPE SYSTEM: `replay_unresolved_sagas` takes a
+// `&RestoredContexts` witness that only `restore_all_contexts` can mint, so a
+// reordered "replay first" body does not compile (see the `compile_fail`
+// doctest on `Supervisor::replay_unresolved_sagas`). This text gate is
+// defense-in-depth — it pins the presence of both calls AND their order in the
+// source so the wiring stays legible and a refactor that somehow preserved
+// compilation (e.g. by fetching a token elsewhere) is still flagged.
 #[test]
-fn restore_on_startup_runs_replay_before_restore() {
+fn restore_on_startup_runs_restore_before_replay() {
     let body = extract_fn_body(SUPERVISOR_SRC, "restore_on_startup")
         .expect("Supervisor::restore_on_startup must exist");
     let restore_pos = body
         .find("restore_all_contexts()")
         .expect("restore_on_startup must call restore_all_contexts() — the context-restore sweep");
-    let replay_pos = body.find("replay_unresolved_sagas()").expect(
-        "restore_on_startup must call replay_unresolved_sagas() — the §17.16.4 replay sweep",
+    // The call now threads the restore witness: `replay_unresolved_sagas(&restored)`.
+    // Match the open paren (not `()`), which the witness argument follows.
+    let replay_pos = body.find("replay_unresolved_sagas(").expect(
+        "restore_on_startup must call replay_unresolved_sagas(&restored) — the §17.16.4 replay sweep",
     );
     assert!(
         restore_pos < replay_pos,
@@ -518,14 +896,20 @@ fn restore_on_startup_runs_replay_before_restore() {
     );
 }
 
-// Bridge level (ADR-049 Phase 2D): the production startup/resume path
-// `restore_all_persisted_contexts` MUST route through the combined
-// `restore_on_startup` entry point — NOT call the bare `restore_all_contexts`
-// — so the saga-journal replay can never be skipped on a real process restart.
-// Guards against the "exported but never called from the bootstrap path"
-// regression.
+// Bridge level (ADR-049 Phase 2D): every production startup/resume path MUST
+// route through the combined `restore_on_startup` entry point — NOT call the
+// bare `restore_all_contexts` — so the saga-journal replay can never be skipped
+// on a real process restart. Guards against the "exported but never called from
+// the bootstrap path" regression.
+//
+// `restore_all_contexts` is kept `pub` (the `scp-testing` persistence E2E drives
+// it directly), so a bridge COULD physically name the bare leg; this gate is the
+// enforcement that none does. It covers the shared bridge-instance core AND each
+// of the three FFI exports (PyO3 / napi / UniFFI), since each exports its own
+// `context_restore_all`-shaped entry point.
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {
+    // 1) Shared bridge-instance core: the production startup/resume path.
     assert!(
         fn_body_contains(
             BRIDGE_INSTANCE_SRC,
@@ -534,7 +918,7 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
         ),
         "BridgeInstanceCore::restore_all_persisted_contexts (the production startup/resume path) \
          must call Supervisor::restore_on_startup() so the §17.16.4 saga-journal replay runs \
-         before context restore on every process restart"
+         after context restore on every process restart"
     );
     assert!(
         !fn_body_contains(
@@ -546,6 +930,28 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
          restore_all_contexts() — that bypasses the saga-journal replay; route through \
          restore_on_startup() instead"
     );
+
+    // 2) The three FFI exports must each route through `restore_on_startup()` and
+    //    NOT call the bare `restore_all_contexts()` on the supervisor.
+    //    (PyO3 method `restore_all_contexts`, UniFFI method `restore_all_contexts`,
+    //    napi free fn `context_restore_all_on`.)
+    for (src, fn_name, bridge) in [
+        (PYO3_CONTEXT_SRC, "restore_all_contexts", "PyO3"),
+        (UNIFFI_BRIDGE_SRC, "restore_all_contexts", "UniFFI"),
+        (NAPI_CONTEXT_SRC, "context_restore_all_on", "napi"),
+    ] {
+        assert!(
+            fn_body_contains(src, fn_name, "restore_on_startup()"),
+            "{bridge} export `{fn_name}` must call Supervisor::restore_on_startup() so the \
+             §17.16.4 saga-journal replay runs after context restore"
+        );
+        assert!(
+            !fn_body_contains(src, fn_name, ".restore_all_contexts()"),
+            "{bridge} export `{fn_name}` must NOT call the bare supervisor \
+             `.restore_all_contexts()` — that bypasses the saga-journal replay; route through \
+             restore_on_startup() instead"
+        );
+    }
 }
 
 // Provider level: seal calls create_outer_envelope (envelope construction)
