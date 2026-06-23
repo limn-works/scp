@@ -1551,8 +1551,30 @@ def main() -> int:
     expected_sdks = frozenset(sdks)
 
     for domain_entry in matrix.get("capabilities", []):
+        if not isinstance(domain_entry, dict):
+            print(
+                f"  ERROR: capabilities entry must be an object, "
+                f"got {type(domain_entry).__name__}."
+            )
+            errors += 1
+            continue
         domain = domain_entry.get("domain", "?")
-        for op in domain_entry.get("operations", []):
+        operations = domain_entry.get("operations", [])
+        if not isinstance(operations, list):
+            print(
+                f"  ERROR: {domain}: 'operations' must be an array, "
+                f"got {type(operations).__name__}."
+            )
+            errors += 1
+            continue
+        for op in operations:
+            if not isinstance(op, dict):
+                print(
+                    f"  ERROR: {domain}: operation entry must be an object, "
+                    f"got {type(op).__name__}."
+                )
+                errors += 1
+                continue
             op_name = op.get("name", "?")
             total_ops += 1
 

@@ -944,3 +944,90 @@ def test_gate_fails_on_non_dict_coverage_exemptions(tmp_path: Path) -> None:
         f"Non-dict coverage_exemptions must not surface a traceback.\n"
         f"stderr:\n{result.stderr}"
     )
+
+
+def test_gate_fails_on_non_dict_capabilities_entry(tmp_path: Path) -> None:
+    """A non-dict element of 'capabilities' must fail closed without a traceback.
+
+    A string (or other non-object) capabilities entry would make the
+    .get("domain")/.get("operations") accesses raise; the gate must instead
+    emit a clean ERROR and exit 1.
+    """
+    synthetic_matrix = {"capabilities": ["this should be an object"]}
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for a non-dict capabilities entry, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "capabilities entry must be an object" in result.stdout, (
+        f"Expected the non-dict capabilities-entry diagnostic in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"A non-dict capabilities entry must not surface a traceback.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_non_list_operations(tmp_path: Path) -> None:
+    """A non-list 'operations' value must fail closed without a traceback.
+
+    A string (or other non-array) operations value would make the iteration
+    below raise (or iterate characters); the gate must instead emit a clean
+    ERROR and exit 1.
+    """
+    synthetic_matrix = {"capabilities": [{"domain": "Fake", "operations": "nope"}]}
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for a non-list 'operations', "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "'operations' must be an array" in result.stdout, (
+        f"Expected the non-list operations diagnostic in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"A non-list 'operations' must not surface a traceback.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_gate_fails_on_non_dict_operation_entry(tmp_path: Path) -> None:
+    """A non-dict element of 'operations' must fail closed without a traceback.
+
+    An integer (or other non-object) operation entry would make the
+    .get("name")/.keys() accesses raise; the gate must instead emit a clean
+    ERROR and exit 1.
+    """
+    synthetic_matrix = {"capabilities": [{"domain": "Fake", "operations": [123]}]}
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for a non-dict operation entry, "
+        f"got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "operation entry must be an object" in result.stdout, (
+        f"Expected the non-dict operation-entry diagnostic in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"A non-dict operation entry must not surface a traceback.\n"
+        f"stderr:\n{result.stderr}"
+    )
