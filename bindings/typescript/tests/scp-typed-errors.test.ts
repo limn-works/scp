@@ -8,12 +8,12 @@
  * rather than a bare `Error`. These tests pin that contract across the async,
  * sync, `getBridge`-routed, and `nativeFreeFn`-routed shapes.
  *
- * Two methods deliberately opt OUT of mapping — `ucanValidate` and
- * `eventLogQuery` — because their sole SDK consumer (`evaluateTrust` in
- * trust.ts) classifies the raw error itself by inspecting the `[SCP-...]` code
- * prefix and re-throws specific errors by object identity. The final block
- * guards that exemption so a future "wrap everything" refactor cannot silently
- * break trust evaluation.
+ * `ucanValidate` and `eventLogQuery` are wrapped like every other method.
+ * Their sole SDK consumer (`evaluateTrust` in trust.ts) classifies errors by
+ * inspecting the `[SCP-...]` code prefix on the error message — and
+ * `mapBridgeError` preserves the original message verbatim, so the typed
+ * {@link ScpError} subclass it produces still carries the prefix and trust
+ * classification is unaffected.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -137,13 +137,11 @@ describe("SCP typed-error mapping", () => {
   });
 });
 
-describe("SCP raw-error pass-through exemptions (trust.ts contract)", () => {
-  it("ucanValidate re-throws the raw Error by identity (no mapping)", async () => {
+describe("SCP typed-error mapping (trust.ts consumers)", () => {
+  it("maps a ucanValidate PERM-3030 error to UcanPermissionError with the prefix preserved", async () => {
     const { scp, native } = mountMockScp();
-    const raw = rawBridgeError(
-      "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance",
-    );
-    native.__stub("ucanValidate", () => Promise.reject(raw));
+    const message = "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance";
+    native.__stub("ucanValidate", () => Promise.reject(rawBridgeError(message)));
 
     let thrown: unknown;
     try {
@@ -151,15 +149,18 @@ describe("SCP raw-error pass-through exemptions (trust.ts contract)", () => {
     } catch (err) {
       thrown = err;
     }
-    // Same object reference — NOT re-typed. trust.ts depends on this to
-    // re-throw PERM-3030 handle-affinity errors by identity.
-    expect(thrown).toBe(raw);
+    // Re-typed to UcanPermissionError, but `mapBridgeError` keeps the message
+    // verbatim — so trust.ts's `[SCP-PERM-3030]` prefix classification still
+    // matches.
+    expect(thrown).toBeInstanceOf(UcanPermissionError);
+    expect((thrown as UcanPermissionError).code).toBe("SCP-PERM-3030");
+    expect((thrown as UcanPermissionError).message).toBe(message);
   });
 
-  it("eventLogQuery re-throws the raw Error by identity (no mapping)", async () => {
+  it("maps an eventLogQuery CTX error to ContextError with the prefix preserved", async () => {
     const { scp, native } = mountMockScp();
-    const raw = rawBridgeError("[SCP-CTX-2001] context error: not a member");
-    native.__stub("eventLogQuery", () => Promise.reject(raw));
+    const message = "[SCP-CTX-2001] context error: not a member";
+    native.__stub("eventLogQuery", () => Promise.reject(rawBridgeError(message)));
 
     let thrown: unknown;
     try {
@@ -167,8 +168,10 @@ describe("SCP raw-error pass-through exemptions (trust.ts contract)", () => {
     } catch (err) {
       thrown = err;
     }
-    // Same object reference — trust.ts Layer 2 classifies the raw `[SCP-CTX-]`
-    // prefix itself and must see the original Error.
-    expect(thrown).toBe(raw);
+    // Re-typed to ContextError, but the verbatim message keeps the
+    // `[SCP-CTX-]` prefix that trust.ts Layer 2 classifies on.
+    expect(thrown).toBeInstanceOf(ContextError);
+    expect((thrown as ContextError).code).toBe("SCP-CTX-2001");
+    expect((thrown as ContextError).message).toBe(message);
   });
 });

@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { Context } from "../src/context";
-import { ValidationError } from "../src/errors";
+import { ScpError, UcanPermissionError, ValidationError } from "../src/errors";
 import type { SCP } from "../src/scp";
 import {
   __classifyUcanError,
@@ -222,13 +222,15 @@ function mountWithContext(): {
  * with `errorMsg`, returning the resulting Layer-1 CapabilityValidation.
  *
  * `errorMsg` must be the full bridge-formatted message string including the
- * `[SCP-PERM-NNNN]` prefix, because the real NAPI bridge throws a plain
- * `Error` (not `UcanPermissionError`) — it bypasses `mapBridgeError`.
+ * `[SCP-PERM-NNNN]` prefix. The native bridge throws a plain `Error`;
+ * `scp.ucanValidate` wraps it via `mapBridgeError` into a typed `ScpError`
+ * whose message preserves that prefix, and trust.ts classifies on the prefix.
  */
 async function runLayer1(errorMsg: string): Promise<CapabilityValidation> {
   const { scp, native, context } = mountWithContext();
   native.__stub("ucanValidate", () =>
-    // Simulate the real NAPI bridge: plain Error with the full formatted message.
+    // Simulate the native bridge: plain Error with the full formatted message.
+    // The SDK wrapper re-types it; the message (and prefix) survive verbatim.
     Promise.reject(new Error(errorMsg)),
   );
   // No event-log history for this subject — Layer 2 is non-fatal.
@@ -381,10 +383,12 @@ describe("evaluateTrust — Layer 1 field independence", () => {
 
   it("non-UCAN error propagates (not silently classified)", async () => {
     const { scp, native, context } = mountWithContext();
+    // Native bridge throws a plain Error whose message carries the
+    // `[SCP-VALID-NNNN]` prefix; `scp.ucanValidate` re-types it to
+    // `ValidationError` via `mapBridgeError`. trust.ts only classifies
+    // `[SCP-PERM-]` errors, so this propagates unchanged.
     native.__stub("ucanValidate", () =>
-      Promise.reject(
-        new ValidationError("context_id contains control characters", "SCP-VALID-7001"),
-      ),
+      Promise.reject(new Error("[SCP-VALID-7001] context_id contains control characters")),
     );
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
@@ -404,10 +408,11 @@ describe("evaluateTrust — Layer 1 field independence", () => {
     // mapped to a failed CapabilityValidation. Mirrors Python's
     // test_evaluate_trust_reraises_perm_3030_handle_affinity_error.
     const { scp, native, context } = mountWithContext();
-    const perm3030 = new Error(
-      "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance",
-    );
-    native.__stub("ucanValidate", () => Promise.reject(perm3030));
+    const message = "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance";
+    // The native bridge throws a plain Error; `scp.ucanValidate` wraps it via
+    // `mapBridgeError` into a typed `UcanPermissionError` (message preserved),
+    // and trust.ts re-throws that typed error by identity.
+    native.__stub("ucanValidate", () => Promise.reject(new Error(message)));
     native.__stub("eventLogQuery", () => Promise.resolve([]));
 
     let threw = false;
@@ -415,7 +420,9 @@ describe("evaluateTrust — Layer 1 field independence", () => {
       await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
     } catch (err) {
       threw = true;
-      expect(err).toBe(perm3030);
+      expect(err).toBeInstanceOf(UcanPermissionError);
+      expect((err as UcanPermissionError).code).toBe("SCP-PERM-3030");
+      expect((err as UcanPermissionError).message).toBe(message);
     }
     expect(threw).toBe(true);
   });
@@ -468,8 +475,9 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
 
   it("leaves behavioral record null when the event-log query raises a context error", async () => {
     const { scp, native, context } = mountWithContext();
-    // Simulate the real NAPI bridge: plain Error with the [SCP-CTX-NNNN] prefix,
-    // because eventLogQuery bypasses mapBridgeError and throws plain Error objects.
+    // Native bridge throws a plain Error with the [SCP-CTX-NNNN] prefix;
+    // `scp.eventLogQuery` re-types it via `mapBridgeError` (message preserved),
+    // and trust.ts Layer 2 classifies the context error on that prefix.
     native.__stub("eventLogQuery", () =>
       Promise.reject(
         new Error("[SCP-CTX-2001] context error: not a member — check membership status"),
@@ -484,9 +492,11 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
     const { scp, native, context } = mountWithContext();
     // ucanValidate resolves (passes Layer 1)
     native.__stub("ucanValidate", () => Promise.resolve(undefined));
-    // eventLogQuery rejects with a non-[SCP-CTX-] error (e.g. a network failure)
-    const networkError = new Error("Network timeout");
-    native.__stub("eventLogQuery", () => Promise.reject(networkError));
+    // eventLogQuery rejects with a non-[SCP-CTX-] error (e.g. a network failure).
+    // `scp.eventLogQuery` wraps it via `mapBridgeError` into a base `ScpError`
+    // (no recognized prefix → SCP-UNKNOWN-0000), with the message preserved.
+    const message = "Network timeout";
+    native.__stub("eventLogQuery", () => Promise.reject(new Error(message)));
 
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
@@ -495,7 +505,8 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
       await evaluateTrust(scp, "did:dht:z6MkBob", context);
     } catch (err) {
       threw = true;
-      expect(err).toBe(networkError);
+      expect(err).toBeInstanceOf(ScpError);
+      expect((err as ScpError).message).toBe(message);
     }
     expect(threw).toBe(true);
   });

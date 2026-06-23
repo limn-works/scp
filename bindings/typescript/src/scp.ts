@@ -2376,22 +2376,19 @@ export class SCP {
     presentingAgentDid?: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
-    // NOTE: this method deliberately does NOT route through `mapBridgeError`.
-    // Its sole SDK consumer, `evaluateTrust` (trust.ts), classifies the raw
-    // bridge error itself — it detects UCAN-permission failures and re-throws
-    // PERM-3030 handle-affinity errors by inspecting the `[SCP-...]` code
-    // prefix on the raw `Error`. Wrapping here would replace that object with a
-    // re-typed `ScpError`, breaking the prefix-based classification and the
-    // by-identity re-throw contract.
-    await (
-      this.#native.ucanValidate as (
-        h: unknown,
-        t: string,
-        c: string,
-        pa: string | undefined,
-        pt: readonly string[] | undefined,
-      ) => Promise<void>
-    )(handle, token, capability, presentingAgentDid, proofTokens);
+    try {
+      await (
+        this.#native.ucanValidate as (
+          h: unknown,
+          t: string,
+          c: string,
+          pa: string | undefined,
+          pt: readonly string[] | undefined,
+        ) => Promise<void>
+      )(handle, token, capability, presentingAgentDid, proofTokens);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async ucanMint(
@@ -2453,19 +2450,16 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async eventLogQuery(handle: unknown, filterJson?: string): Promise<readonly unknown[]> {
-    // NOTE: this method deliberately does NOT route through `mapBridgeError`.
-    // Its sole SDK consumer, `evaluateTrust` (trust.ts) Layer 2, distinguishes
-    // a context error (which it swallows to `behavioralRecord: null`) from any
-    // other fault (which it re-throws) by matching the raw `[SCP-CTX-NNNN]`
-    // code prefix on the thrown `Error`. Wrapping here would replace that
-    // object with a re-typed `ScpError`, breaking the prefix-based
-    // classification and the by-identity re-throw of non-context errors.
-    return await (
-      this.#native.eventLogQuery as (
-        h: unknown,
-        f: string | undefined,
-      ) => Promise<readonly unknown[]>
-    )(handle, filterJson);
+    try {
+      return await (
+        this.#native.eventLogQuery as (
+          h: unknown,
+          f: string | undefined,
+        ) => Promise<readonly unknown[]>
+      )(handle, filterJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async eventLogVerify(handle: unknown, claimJson: string): Promise<unknown> {

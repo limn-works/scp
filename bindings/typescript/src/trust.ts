@@ -449,10 +449,11 @@ export async function evaluateTrust(
         // fault and must propagate to the caller — matching the Python port,
         // which catches only `bridge.UcanError`.
         //
-        // The NAPI bridge throws plain Error objects (not UcanPermissionError)
-        // because ucanValidate bypasses mapBridgeError. We detect UCAN errors
-        // by the [SCP-PERM-NNNN] code prefix in the message instead of
-        // instanceof.
+        // `scp.ucanValidate` routes through `mapBridgeError`, so this is a
+        // typed `ScpError` whose message preserves the original
+        // `[SCP-PERM-NNNN]` code prefix verbatim. We classify on that prefix
+        // (rather than `instanceof`) to mirror the Python port's code-based
+        // dispatch and stay robust to the exact subclass.
         const msg = error instanceof Error ? error.message : String(error);
         if (!/^\[SCP-PERM-\d+\]/.test(msg)) {
           throw error;
@@ -503,9 +504,11 @@ export async function evaluateTrust(
     // no event-log history yet. Mirrors the Python port, which catches only
     // `ContextError` here — any other error is a genuine fault that propagates.
     //
-    // The NAPI bridge throws plain Error objects (not ContextError) because
-    // eventLogQuery bypasses mapBridgeError. We detect context errors by the
-    // [SCP-CTX-NNNN] code prefix in the message instead of instanceof.
+    // `scp.eventLogQuery` routes through `mapBridgeError`, so this is a typed
+    // `ScpError` whose message preserves the original `[SCP-CTX-NNNN]` code
+    // prefix verbatim. We classify on that prefix (rather than `instanceof`) to
+    // mirror the Python port's code-based dispatch and stay robust to the exact
+    // subclass.
     const msg = error instanceof Error ? error.message : String(error);
     if (!/^\[SCP-CTX-\d+\]/.test(msg)) {
       throw error;
