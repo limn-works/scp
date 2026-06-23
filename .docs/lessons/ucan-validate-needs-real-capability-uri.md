@@ -16,7 +16,7 @@ The correct approach is to extract the URI the token was minted for from its own
 
 ```ts
 // trust.ts — correct
-const capUri = __extractAllCapabilityUris(token)?.[0] ?? null; // reads att[0].with from unverified JWT payload
+const capUri = __extractFirstCapabilityUri(token); // reads att[0].with from unverified JWT payload; returns string | null
 if (capUri === null) return ALL_LAYER1_FIELDS_FALSE;
 await scp.ucanValidate(handle, token, capUri);
 ```
@@ -51,7 +51,7 @@ Re-throws:
 - **Never pass `"*"` to `ucanValidate`** — it always fails, silently.
 - **Never pass a bare action string** (`"messages:write"`) — must include the `scp:ctx:` prefix.
 - **Wildcard context** is `scp:ctx:*/resource:action`, not `"*"`.
-- **Extract from `att[0].with`** via `__extractAllCapabilityUris(token)?.[0]` for validation; the bridge re-verifies cryptographically.
+- **Extract from `att[0].with`** via `__extractFirstCapabilityUri(token)` for validation; the bridge re-verifies cryptographically.
 - **Keep TypeScript and Python implementations in lockstep** — this is a cross-SDK trap.
 
 ## Detection
