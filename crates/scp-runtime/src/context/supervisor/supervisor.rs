@@ -5432,11 +5432,19 @@ impl Supervisor {
     /// - `NeedsRepair` — emit a metric; operator intervention is
     ///   required to repair the saga.
     ///
-    /// This method is called by [`Self::new`] through an internal replay-task
-    /// spawn on construction so a crash-restart
-    /// supervisor reconciles state before the first `start_saga` call.
-    /// It is safe to call multiple times; each call loads the current
-    /// unresolved set from the journal.
+    /// On the production bootstrap this method is the SECOND leg of
+    /// [`Self::restore_on_startup`] — it runs AFTER `restore_all_contexts`, in
+    /// the §17.16.4 restore-then-replay order, so each recovery arm drives a
+    /// now-resident participant. It is safe to call multiple times; each call
+    /// loads the current unresolved set from the journal.
+    ///
+    /// **Visibility (`pub`, intentional).** Kept `pub` — not `pub(crate)` —
+    /// because the saga FSM + crash-recovery integration suites
+    /// (`crates/scp-runtime/tests/`, separate crates) drive replay in isolation
+    /// to test each per-state recovery arm. The production FFI bridges never
+    /// call this directly; they route through [`Self::restore_on_startup`], and
+    /// the `bridge_resume_path_routes_through_restore_on_startup` structural
+    /// gate enforces that no bridge bypasses the combined entry point.
     ///
     /// # Errors
     ///
@@ -5565,17 +5573,22 @@ impl Supervisor {
     /// The terminal-`Aborted` marker asserts "fully compensated", so it MUST NOT
     /// be written while the caller's durable LOCAL-economy reversal is still
     /// outstanding — exactly the invariant [`Self::abort_saga`] enforces on the
-    /// LIVE abort path. If the caller context is not yet resident when this
-    /// startup sweep runs (a `lookup` miss — ordering of context restore vs.
-    /// `replay_unresolved_sagas` is not enforced in-tree) OR the `Abort { None }`
-    /// send fails, the record-based reversal was NOT delivered: leave the journal
-    /// NON-terminal at `PreparingB` so a later sweep (after the caller is restored)
-    /// re-drives it. Marking terminal here would strand the caller's durable
-    /// deduction forever (the sweep re-drives ONLY non-terminal journals → a
-    /// permanent over-charge). The ONE exception is a PERMANENTLY-DELETED caller
-    /// context (absent from durable persistence): its reservation record died with
-    /// the context, so there is nothing to reverse and the saga is reaped instead
-    /// of looping forever — see [`Self::caller_context_deleted_from_persistence`].
+    /// LIVE abort path. On the normal startup path
+    /// ([`Self::restore_on_startup`]) the §17.16.4 restore-THEN-replay ordering
+    /// has already made the caller RESIDENT before this runs, so the
+    /// record-keyed `Abort { None }` re-drive is delivered in-pass and the
+    /// journal reaches terminal-`Aborted` with the refund applied. The
+    /// non-terminal-leave below is the genuinely-undeliverable fallback: if the
+    /// caller context still is not resident (a `lookup` miss — e.g. it failed to
+    /// restore) OR the `Abort { None }` send fails, the record-based reversal was
+    /// NOT delivered, so leave the journal NON-terminal at `PreparingB` and carry
+    /// it to the NEXT process start (whose restore-then-replay re-drives it).
+    /// Marking terminal here would strand the caller's durable deduction forever
+    /// (recovery re-drives ONLY non-terminal journals → a permanent over-charge).
+    /// The ONE exception is a PERMANENTLY-DELETED caller context (absent from
+    /// durable persistence): its reservation record died with the context, so
+    /// there is nothing to reverse and the saga is reaped instead of looping
+    /// forever — see [`Self::caller_context_deleted_from_persistence`].
     ///
     /// **Known limitation — external escrow hold on a context deleted
     /// mid-`PreparingB`.** When the caller context is reaped as permanently
@@ -7830,6 +7843,15 @@ impl Supervisor {
     /// `Closing` / `Closed` / `Expired` states are skipped (only
     /// `Active` contexts are resurrected after a restart).
     ///
+    /// **Visibility (`pub`, intentional).** Kept `pub` — not `pub(crate)` —
+    /// because the persistence E2E integration suite (`scp-testing`, a separate
+    /// crate) drives context restore directly against a real SQLite-backed repo.
+    /// The production FFI bridges never call this directly on the bootstrap
+    /// path; they route through [`Self::restore_on_startup`] (so the §17.16.4
+    /// saga-journal replay always runs), and the
+    /// `bridge_resume_path_routes_through_restore_on_startup` structural gate
+    /// enforces that no bridge calls the bare restore and skips replay.
+    ///
     /// # Errors
     ///
     /// - [`ContextError::PersistenceFailed`] if the persistence
@@ -7838,26 +7860,34 @@ impl Supervisor {
         crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
-    /// Single process-startup restore entry point (ADR-049 Phase 2D).
+    /// Single process-startup recovery entry point (ADR-049 Phase 2D).
     ///
-    /// Runs the two startup sweeps in the order the §17.16.4 crash-recovery
-    /// proof requires:
+    /// Runs the two startup sweeps in the order §17.16.4 requires —
+    /// **restore, THEN reconcile**:
     ///
-    /// 1. [`Self::replay_unresolved_sagas`] — sweep the durable saga journal
-    ///    and resolve every non-terminal entry left by a crash mid-saga.
-    /// 2. [`Self::restore_all_contexts`] — rehydrate every persisted `Active`
-    ///    context's actor from the persistence provider.
+    /// 1. [`Self::restore_all_contexts`] — rehydrate every persisted `Active`
+    ///    context's actor from the persistence provider, so every participant a
+    ///    recovery arm must drive is RESIDENT.
+    /// 2. [`Self::replay_unresolved_sagas`] — sweep the durable saga journal and
+    ///    reconcile every unresolved entry left by a crash mid-saga.
     ///
-    /// **Replay MUST precede restore.** The §17.16.4 recovery treats a
-    /// non-resident saga caller as `ReversalOutstanding`: when the caller
-    /// context is not yet resident, the record-keyed reversal `lookup`-misses
-    /// and the journal is left NON-terminal at `PreparingB` for a later sweep
-    /// (see [`Self::recover_preparing_b_entry`] and the recovery comments near
-    /// the cross-context recovery path). If restore ran first, a now-resident
-    /// caller would be re-driven down the live-reversal path instead, changing
-    /// the crash-recovery semantics the proof relies on. Folding both sweeps
-    /// behind this one method makes it impossible for a bridge to invoke one
-    /// without the other, or in the wrong order.
+    /// **Restore MUST precede replay.** Every saga-recovery arm that has to
+    /// reach a live actor — the cross-context caller whose LOCAL-economy
+    /// reversal is re-driven (see [`Self::recover_preparing_b_entry`]), and a
+    /// Commit-in-progress re-send to all participants — needs that actor
+    /// resident; NO arm needs the inverse (observing a participant *before* it
+    /// is restored). Restoring first makes the caller resident, so the
+    /// record-keyed reversal (`Abort { None }`, idempotent: it consumes the
+    /// durable caller reservation record exactly once and is a no-op if that
+    /// record was already drained — the live RAII guard died with the crash)
+    /// is delivered in this same pass and the journal reaches terminal-`Aborted`
+    /// with the caller's refund applied. There is NO separate post-restore
+    /// sweep; reconciliation runs once, here, after restore. A reversal is left
+    /// NON-terminal for the NEXT process start only when it is genuinely
+    /// undeliverable (caller context failed to restore, or its persistence
+    /// existence cannot be confirmed). Folding both sweeps behind this one
+    /// method makes it impossible for a bridge to invoke one without the other,
+    /// or in the wrong order.
     ///
     /// Returns the list of restored context IDs (the `restore_all_contexts`
     /// result). Replay's per-entry outcomes are observable on the saga journal,
@@ -7865,15 +7895,21 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - Any [`ContextError`] surfaced by [`Self::replay_unresolved_sagas`]
-    ///   (e.g. a saga-journal load failure). Replay runs first, so a replay
-    ///   failure short-circuits before any context is restored.
     /// - [`ContextError::PersistenceFailed`] if the persistence provider is
-    ///   unconfigured or `list_persisted_contexts` fails.
+    ///   unconfigured or `list_persisted_contexts` fails. Restore runs first, so
+    ///   a restore failure short-circuits before any saga is reconciled (the
+    ///   unresolved entries stay unresolved for the next process start — fail
+    ///   closed).
+    /// - Any [`ContextError`] surfaced by [`Self::replay_unresolved_sagas`]
+    ///   (e.g. a saga-journal load failure) after a successful restore. Such a
+    ///   replay failure surfaces; the still-unresolved sagas are carried to the
+    ///   next restart.
     pub async fn restore_on_startup(self: &Arc<Self>) -> Result<Vec<String>, ContextError> {
-        // §17.16.4: replay BEFORE restore. Do not reorder.
+        // §17.16.4: restore BEFORE replay. Do not reorder — recovery arms drive
+        // now-resident actors (the caller reversal, the Commit re-send).
+        let restored = self.restore_all_contexts().await?;
         self.replay_unresolved_sagas().await?;
-        self.restore_all_contexts().await
+        Ok(restored)
     }
 
     /// Restore a single previously-persisted context from storage via
@@ -17849,20 +17885,23 @@ mod tests {
     /// §6.2.4 review wave-15 — CRASH-RECOVERY symmetry with the live abort path.
     /// The startup `recover_saga_entry` `PreparingB` arm re-drives the prepared
     /// side(s) and then marks the journal terminal-`Aborted`. But the caller-side
-    /// record-based `Abort { None }` re-drive can FAIL to deliver: if
-    /// `replay_unresolved_sagas` runs BEFORE the caller context is restored
-    /// (ordering is not enforced in-tree), the `lookup` misses. Pre-fix the arm
-    /// marked terminal-`Aborted` UNCONDITIONALLY — so the caller's durable
-    /// LOCAL-economy deduction was NEVER reversed AND the §17.16.4 sweep (which
-    /// re-drives ONLY non-terminal journals) could never re-drive a terminal
-    /// entry: a permanent over-charge. The fix makes the arm honour the SAME
-    /// invariant the live abort path (`abort_saga`) enforces — terminal-`Aborted`
-    /// MUST NOT be written until the caller reversal is CONFIRMED delivered.
+    /// record-based `Abort { None }` re-drive can FAIL to deliver in the
+    /// genuinely-undeliverable case: when the caller context is not resident
+    /// (e.g. it failed to restore on the §17.16.4 restore-then-replay startup
+    /// pass), the `lookup` misses. Pre-fix the arm marked terminal-`Aborted`
+    /// UNCONDITIONALLY — so the caller's durable LOCAL-economy deduction was
+    /// NEVER reversed AND recovery (which re-drives ONLY non-terminal journals)
+    /// could never re-drive a terminal entry: a permanent over-charge. The fix
+    /// makes the arm honour the SAME invariant the live abort path (`abort_saga`)
+    /// enforces — terminal-`Aborted` MUST NOT be written until the caller
+    /// reversal is CONFIRMED delivered.
     ///
     /// NON-RESIDENT caller (this test): the durable record is staged (real
-    /// Prepare-A), then the caller actor is despawned BEFORE recovery so the
-    /// re-drive `lookup` misses ⇒ the journal MUST be LEFT non-terminal (the
-    /// sweep re-drives it after a respawn). PRE-FIX this marked terminal-Aborted.
+    /// Prepare-A), then the caller actor is despawned BEFORE recovery to model a
+    /// caller that did not become resident, so the re-drive `lookup` misses ⇒ the
+    /// journal MUST be LEFT non-terminal (carried to the next process start, whose
+    /// restore-then-replay re-drives it once the caller is resident). PRE-FIX this
+    /// marked terminal-Aborted.
     #[tokio::test]
     async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
         use crate::context::supervisor::saga_journal::{SagaId, SagaState};
@@ -18122,6 +18161,253 @@ mod tests {
             !unresolved.iter().any(|e| e.saga_id == saga_id),
             "a CONFIRMED caller reversal lets recovery mark the journal terminal-Aborted (the \
              saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
+    /// §17.16.4 restore-then-replay START-UP path (ADR-049 Phase 2D) — the
+    /// crash-recovery GATE for the cross-context caller reversal. Drives the
+    /// SINGLE production startup entry point [`Supervisor::restore_on_startup`]
+    /// (NOT `recover_saga_entry` directly) over a REAL persistence provider so
+    /// the restore leg SUCCEEDS and the caller is RESIDENT when the replay leg
+    /// runs, and asserts the xctx-caller-reversal path (the genuine length-3
+    /// `[caller_hex, caller_did, tool_id]` triple → `recover_preparing_b_entry`
+    /// → `redrive_caller_local_reversal`) ends the journal entry TERMINAL-
+    /// `Aborted` with the caller's LOCAL economy refund DELIVERED (the durable
+    /// `CallerReservationRecord` consumed, the hard-rate-limit token refunded to
+    /// full burst).
+    ///
+    /// This is red-hat's strand-the-refund PoC INVERTED: replay-before-restore
+    /// would miss the not-yet-resident caller on the only pass and depend on a
+    /// nonexistent later sweep, stranding the refund. Restore-then-replay makes
+    /// the caller resident first, so the reversal is driven in-pass and the
+    /// entry resolves terminal with the refund applied. The existing wave-15
+    /// resident test drives `recover_saga_entry` directly with a hand-built
+    /// 2-element evidence-reconstruction entry; THIS test drives the whole
+    /// `restore_on_startup` ordering with the genuine FSM triple, so it pins the
+    /// END-TO-END startup behaviour, not just the per-entry arm.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full startup E2E: reserve + journal + restore_on_startup + assert
+    async fn restore_on_startup_xctx_caller_reversal_delivered_entry_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkRestoreReplayResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkRestoreReplayResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("restore-replay-resident-saga".to_owned());
+        // The genuine FSM cross-context participants shape: the caller-provenance
+        // TRIPLE `[caller_hex, caller_did, tool_id]` (`saga_input_participants`),
+        // length 3 with a 64-hex first element — the xctx-caller path the
+        // 2-element wave-15 tests do NOT exercise (they take the evidence-
+        // reconstruction route).
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Journal `Initiated` (seq 0) + `PreparingA` (seq 1, empty evidence) then
+        // Prepare-A durably stages the caller deduction + reservation record on
+        // the live caller actor (the durable state a crash leaves behind), and
+        // journal `PreparingB` (seq 2, empty evidence — the genuine
+        // participant-keyed shape, so the reversal MUST come through the triple).
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        // Balance the must-use carrier (lost-reply shape) so its drop guard does
+        // not fire; the durable record is what recovery reverses.
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
+            .await
+            .expect("journal PreparingB");
+
+        // Pre-condition: the saga is unresolved (the crash left it at PreparingB).
+        let pre = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved pre");
+        assert!(
+            pre.iter().any(|e| e.saga_id == saga_id),
+            "the crashed saga must be unresolved before startup recovery"
+        );
+
+        // DRIVE THE PRODUCTION STARTUP ENTRY POINT. The caller is already
+        // resident (as a restore-before-replay startup would leave it: the real
+        // `CapturingPersistence::list_persisted_contexts` is empty, so the restore
+        // leg succeeds without re-restoring over the live caller), and ONLY THEN
+        // the replay leg runs and drives the record-keyed reversal against the
+        // now-resident caller. This is the restore-then-replay ordering under
+        // test — NOT a direct `recover_saga_entry` call.
+        let restored = supervisor
+            .restore_on_startup()
+            .await
+            .expect("restore_on_startup must succeed (real persistence, empty context list)");
+        assert!(
+            restored.is_empty(),
+            "the capturing persistence lists no contexts to restore; the live caller stays \
+             resident for the replay leg"
+        );
+
+        // GATE 1 — the refund is DELIVERED: the hard-rate-limit token is refunded
+        // to full burst and the durable record consumed. Replay-before-restore
+        // would strand both (the reversal would miss the non-resident caller).
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after restore_on_startup");
+        assert_eq!(
+            token_after, burst_milli,
+            "restore_on_startup MUST reverse the caller's LOCAL economy from the durable record \
+             (refund to full burst) — the refund is DELIVERED, NOT stranded"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable CallerReservationRecord MUST be consumed by the startup reversal"
+        );
+
+        // GATE 2 — the entry ends TERMINAL-Aborted: a CONFIRMED reversal lets the
+        // replay leg mark the journal resolved, so it drops out of load_unresolved.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved post");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "after restore_on_startup the xctx-caller saga MUST be terminal-Aborted (resolved, \
+             no longer in load_unresolved) — the refund-delivered + entry-terminal gate"
+        );
+    }
+
+    /// §17.16.4 restore-then-replay START-UP path — the genuinely-undeliverable
+    /// SIBLING of the gate test above. The caller context is PERMANENTLY DELETED
+    /// (absent from durable persistence), so its `CallerReservationRecord` died
+    /// with the context and there is nothing to reverse. Driving
+    /// [`Supervisor::restore_on_startup`] must REAP the entry to terminal-
+    /// `Aborted` via the `caller_context_deleted_from_persistence` `Ok(None)`
+    /// reap branch — NOT loop forever non-terminal. This pins the
+    /// reap-vs-stay-non-terminal decision through the production startup path.
+    #[tokio::test]
+    async fn restore_on_startup_xctx_deleted_caller_is_reaped_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkRestoreReplayDelCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, _persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+
+        // NOTE: we do NOT spawn the caller context, and `CapturingPersistence`
+        // has no snapshot for it — so it is ABSENT from durable persistence
+        // (the permanently-deleted case). The journal still names the caller in
+        // the genuine length-3 triple.
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let caller_did = "did:dht:z6MkRestoreReplayDelCaller";
+        let saga_id = SagaId("restore-replay-deleted-saga".to_owned());
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 1, &[])
+            .await
+            .expect("journal PreparingB");
+
+        let pre = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved pre");
+        assert!(
+            pre.iter().any(|e| e.saga_id == saga_id),
+            "the saga must be unresolved before startup recovery"
+        );
+
+        // Drive the production startup path. Restore succeeds (empty list); the
+        // replay leg finds the caller ABSENT from persistence and reaps the entry.
+        supervisor
+            .restore_on_startup()
+            .await
+            .expect("restore_on_startup must succeed");
+
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved post");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "a PERMANENTLY-DELETED caller (absent from persistence) MUST be reaped to \
+             terminal-Aborted by restore_on_startup — NOT left to never-reap"
         );
     }
 

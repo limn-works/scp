@@ -4020,11 +4020,11 @@ impl crate::scp::PyScp {
 
     /// Restores all persisted contexts from storage.
     ///
-    /// Delegates to `ContextManager::restore_on_startup` (ADR-049 Phase 2D),
-    /// which first replays any crash-orphaned saga journal entries and then
-    /// restores contexts in the §17.16.4-required replay-before-restore order.
-    /// Only contexts in `Active` state are restored; contexts in
-    /// `Closing`/`Closed`/`Expired` states are skipped.
+    /// Delegates to `Supervisor::restore_on_startup` (ADR-049 Phase 2D), which
+    /// first restores contexts and then replays any crash-orphaned saga journal
+    /// entries in the §17.16.4-required restore-then-replay order. Only contexts
+    /// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
+    /// states are skipped.
     ///
     /// # Returns
     ///

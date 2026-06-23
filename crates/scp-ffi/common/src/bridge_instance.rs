@@ -1672,7 +1672,7 @@ impl CoreFields {
 
     /// Rehydrates every context that was persisted before the most recent
     /// `suspend()`/`shutdown()` cycle — see
-    /// `ContextManager::restore_all_contexts`.
+    /// `Supervisor::restore_all_contexts`.
     ///
     /// Called from per-bridge `BridgeInstanceCore::resume` overrides after
     /// [`Self::reconnect_transport_if_pending`]. No-ops silently when:
@@ -1682,24 +1682,24 @@ impl CoreFields {
     ///   (ephemeral test / in-memory path).
     ///
     /// Routes through `Supervisor::restore_on_startup` (ADR-049 Phase 2D),
-    /// which runs the durable saga-journal replay BEFORE context restore in
-    /// the §17.16.4-required order — so a process restart resolves any
-    /// crash-orphaned saga journal entries on the same startup sweep that
-    /// rehydrates contexts, with replay observing the not-yet-restored
-    /// (non-resident) caller and leaving outstanding reversals non-terminal
-    /// for a later sweep.
+    /// which restores contexts BEFORE the durable saga-journal replay in the
+    /// §17.16.4-required restore-then-replay order — so a process restart
+    /// rehydrates contexts and then reconciles any crash-orphaned saga journal
+    /// entries on the same startup pass, with each recovery arm driving a
+    /// now-resident participant (the cross-context caller reversal is delivered
+    /// and the journal reaches terminal-`Aborted` with the refund applied).
     ///
     /// Errors from the manager itself are logged but not propagated —
     /// restore is a best-effort rehydration. A caller that needs failure
-    /// visibility calls `ContextManager::restore_on_startup` directly.
+    /// visibility calls `Supervisor::restore_on_startup` directly.
     pub async fn restore_all_persisted_contexts(&self) {
-        // Supervisor forwards to `ContextManager::restore_all_contexts` (after
-        // the saga-journal replay) when a manager is attached, and returns
-        // `Err(ContextError::NotInitialized)` otherwise. Both the
-        // no-supervisor path (instance has no supervisor wired yet) and the
-        // "no persistence provider configured" path are expected for ephemeral
-        // bridges and share the same debug-log-and-continue behavior as before
-        // the rewire.
+        // Supervisor restores contexts and then replays the saga journal when a
+        // manager is attached, and returns `Err(ContextError::NotInitialized)`
+        // otherwise. Both the no-supervisor path (instance has no supervisor
+        // wired yet) and the "no persistence provider configured" path are
+        // expected for ephemeral bridges and log at debug; a genuine
+        // saga-journal load failure after a successful restore is a real fault
+        // and logs at warn.
         let Some(supervisor) = self.supervisor.get() else {
             tracing::debug!("restore_all_persisted_contexts: skipped (no Supervisor attached yet)");
             return;
@@ -1711,15 +1711,28 @@ impl CoreFields {
                     "restore_all_persisted_contexts: rehydrated contexts after resume"
                 );
             }
-            Err(e) => {
-                // `no persistence provider configured` is the expected path
-                // for ephemeral bridges; log at debug rather than warn.
-                // `NotInitialized` (no ContextManager attached to the
-                // supervisor) is likewise an expected no-op — the bridge
-                // hasn't seen its first identity_create / context_create.
+            Err(
+                e @ (scp_core::context::ContextError::NotInitialized(_)
+                | scp_core::context::ContextError::PersistenceFailed(_)),
+            ) => {
+                // `no persistence provider configured` (`PersistenceFailed`) is
+                // the expected path for ephemeral bridges; `NotInitialized` (no
+                // ContextManager attached to the supervisor) is likewise an
+                // expected no-op — the bridge hasn't seen its first
+                // identity_create / context_create. Log at debug.
                 tracing::debug!(
                     error = %e,
                     "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no supervisor is attached)"
+                );
+            }
+            Err(e) => {
+                // A genuine recovery failure (e.g. a saga-journal load error
+                // surfaced by the replay leg after a successful restore) is a
+                // real fault, not an expected ephemeral no-op — surface it at
+                // warn so operators see it.
+                tracing::warn!(
+                    error = %e,
+                    "restore_all_persisted_contexts: startup recovery failed (saga-journal replay or context restore error)"
                 );
             }
         }

@@ -58,9 +58,12 @@ pub const MAX_SUBSCRIBERS_RANGE: (u32, u32) = (1, 1_000_000);
 /// Errors produced while signing, verifying, or validating broadcast hosting
 /// handshake types (§5.14.13).
 ///
-/// Error codes use the `SCP-SAGA-` band (`13000-13999`, ADR-049 §3a;
-/// see `.docs/standards/sdk-common.md`). The code is embedded in each message
-/// so the `check-error-codes.sh` gate can enumerate and range-check it.
+/// Error codes use the broadcast-hosting sub-block of the `SCP-SAGA-` band
+/// (`13100-13102`, within the `13100-13999` broadcast-hosting reservation;
+/// ADR-049 §3a; see `.docs/standards/sdk-common.md`). They are kept clear of
+/// the `13000-13009` cross-context tool-saga sub-block. The code is embedded in
+/// each message so the `check-error-codes.sh` gate can enumerate and
+/// range-check it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BroadcastHostingError {
     /// A canonical-hash field exceeded the `u32::MAX` length-prefix ceiling, or
@@ -69,11 +72,11 @@ pub enum BroadcastHostingError {
     /// The length-prefix case is unreachable in practice: protocol messages are
     /// bounded to 256 KB by the envelope layer (§9.10.3). Present to eliminate a
     /// panic path.
-    #[error("SCP-SAGA-13003: canonical preimage construction failed: {0}")]
+    #[error("SCP-SAGA-13100: canonical preimage construction failed: {0}")]
     PreimageConstruction(String),
 
     /// The Ed25519 signature did not verify against the reconstructed preimage.
-    #[error("SCP-SAGA-13004: Ed25519 signature verification failed: {0}")]
+    #[error("SCP-SAGA-13101: Ed25519 signature verification failed: {0}")]
     SignatureInvalid(String),
 
     /// A [`BroadcastHostConfig`] field violated a hard validity invariant that
@@ -81,7 +84,7 @@ pub enum BroadcastHostingError {
     /// "`expires_at_ms` MUST be > 0 — no perpetual grants"). Out-of-range
     /// `max_forward_rate_per_minute` / `max_subscribers` values are *clamped*
     /// (not errors); only a zero `expires_at_ms` is rejected here.
-    #[error("SCP-SAGA-13005: broadcast host config invalid: {0}")]
+    #[error("SCP-SAGA-13102: broadcast host config invalid: {0}")]
     ConfigInvalid(String),
 }
 
@@ -310,7 +313,7 @@ impl BroadcastHostingRequest {
     /// `Fixed32(host_context_id)`, `Fixed32(broadcast_context_id)`,
     /// `VarBytes(subscriber_did)`, `Fixed32(wrapping_pubkey)`,
     /// `VarBytes(jcs(requested_config))`, `OptVarBytes(ucan)`,
-    /// `RawBytes16(nonce)`, `U64(timestamp_ms)`.
+    /// `RawBytes(nonce)` (the 16 raw nonce bytes), `U64(timestamp_ms)`.
     ///
     /// `OptVarBytes(ucan)` follows the §9.5.1 optional-field rule exactly:
     /// **present** ⇒ `VarBytes` (4-byte BE length prefix + raw UCAN bytes);
@@ -395,6 +398,19 @@ impl BroadcastHostingRequest {
     /// not trust the request to name its own authorizing key. By requiring the
     /// resolved key as an input, signature validity here is equivalent to
     /// "signed by the Active Signing Key of `subscriber_did`".
+    ///
+    /// # Verification scope
+    ///
+    /// This checks the Ed25519 signature ONLY. It does NOT validate the embedded
+    /// [`BroadcastHostConfig`] (the caller MUST separately call
+    /// [`BroadcastHostConfig::validate`] for the `expires_at_ms > 0` floor and
+    /// apply [`BroadcastHostConfig::clamp`] for the range fields), and it does
+    /// NOT apply the Prepare-B lifetime ceiling
+    /// (`min(requested, granted_at_ms + max_grant_lifetime_ms)`, §5.14.13) —
+    /// that ceiling depends on B's Prepare-B `granted_at_ms` /
+    /// `max_grant_lifetime_ms` and is applied by B at Prepare-B, not here. A
+    /// caller that treats a successful `verify` as full admission would bypass
+    /// both the config-validity and the lifetime-ceiling checks.
     ///
     /// # Errors
     ///
@@ -489,7 +505,7 @@ impl BroadcastHostingGrant {
     /// `Fixed32(host_context_id)`, `Fixed32(broadcast_context_id)`,
     /// `VarBytes(subscriber_did)`, `Fixed32(wrapping_pubkey)`,
     /// `VarBytes(jcs(granted_config))`, `U64(current_key_epoch)`,
-    /// `RawBytes16(nonce)`, `U64(timestamp_ms)`.
+    /// `RawBytes(nonce)` (the 16 raw nonce bytes), `U64(timestamp_ms)`.
     ///
     /// The grant has no optional `ucan` term (only the request carries one).
     ///
@@ -567,6 +583,19 @@ impl BroadcastHostingGrant {
     /// pass the signing key authorized for the broadcast author of
     /// `broadcast_context_id`; this function does not trust the grant to name its
     /// own authorizing key.
+    ///
+    /// # Verification scope
+    ///
+    /// This checks the Ed25519 signature ONLY. It does NOT validate the embedded
+    /// `granted_config` [`BroadcastHostConfig`] (the consumer MUST still apply
+    /// [`BroadcastHostConfig::validate`] for the `expires_at_ms > 0` floor) and
+    /// it does NOT re-apply or re-check the Prepare-B lifetime ceiling
+    /// (`min(requested, granted_at_ms + max_grant_lifetime_ms)`, §5.14.13) — B
+    /// applied that ceiling when it produced the granted config at Prepare-B; a
+    /// consumer that must enforce the effective grant lifetime reads
+    /// `granted_config.expires_at_ms` and does not re-derive it here. A caller
+    /// that treats a successful `verify` as full admission would skip the
+    /// config-validity check.
     ///
     /// # Errors
     ///
@@ -798,7 +827,7 @@ mod tests {
         h.update(&config_jcs); // VarBytes(jcs(requested_config))
         h.update(u32::try_from(ucan.len()).unwrap().to_be_bytes());
         h.update(ucan); // OptVarBytes present → VarBytes
-        h.update([0x55; 16]); // RawBytes16(nonce)
+        h.update([0x55; 16]); // RawBytes(nonce) — 16 raw bytes
         h.update(1_709_654_400_000u64.to_be_bytes()); // U64(timestamp_ms)
         let expected: [u8; 32] = h.finalize().into();
 

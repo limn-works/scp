@@ -155,7 +155,17 @@ const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 45;
 ///
 /// Searches for `fn <fn_name>(` or `fn <fn_name><` (generic params), then
 /// finds the opening `{` and does brace-matching to locate the closing `}`.
-/// Returns the text between (and including) the braces.
+/// Returns the CODE between (and including) the braces with `//`-line-comment
+/// text and string-literal contents STRIPPED — so a `find`/`contains` on the
+/// returned body matches only real call sites, never a token that merely
+/// appears in a comment or a string literal (a structural assertion that
+/// matched commented-out or stringized text would silently false-pass). The
+/// parser already tracks `in_line_comment`/`in_string` for brace depth; this
+/// reuses that state to exclude those chars from the emitted slice. Comment and
+/// string DELIMITERS (`/`, `"`) and all other code are preserved, as is
+/// whitespace structure (a stripped char becomes a space), so byte offsets of
+/// surviving code tokens move but their relative ORDER is unchanged — order-
+/// sensitive assertions (e.g. "X before Y") remain valid.
 ///
 /// If the function appears multiple times (e.g. in test mocks), returns the
 /// FIRST occurrence. For functions that may also appear in `#[cfg(test)]`
@@ -174,24 +184,37 @@ fn extract_fn_body(source: &str, fn_name: &str) -> Option<String> {
     let open_brace_offset = after_sig.find('{')?;
     let body_start = sig_pos + open_brace_offset;
 
-    // Brace-matching: count depth from the opening brace
+    // Brace-matching: count depth from the opening brace. We also build a
+    // CLEANED copy of the body with line-comment text and string-literal
+    // contents replaced by spaces, so downstream `find`/`contains` never match
+    // a token inside a comment or string.
     let mut depth = 0u32;
-    let mut body_end = body_start;
     let mut in_line_comment = false;
     let mut in_string = false;
     let mut prev_char = '\0';
+    let mut cleaned = String::new();
+    let mut balanced = false;
 
-    for (i, ch) in source[body_start..].char_indices() {
-        // Track line comments
+    for ch in source[body_start..].chars() {
+        // Track line comments. The first `/` of a `//` is emitted before we
+        // know it begins a comment; the SECOND `/` flips the flag, so we
+        // retroactively blank the just-emitted first `/` too.
         if ch == '/' && prev_char == '/' && !in_string {
             in_line_comment = true;
+            // Blank the first `/` of the `//` already pushed.
+            if cleaned.ends_with('/') {
+                cleaned.pop();
+                cleaned.push(' ');
+            }
         }
         if ch == '\n' {
             in_line_comment = false;
         }
 
         // Track string literals (simplified — doesn't handle raw strings,
-        // but sufficient for brace matching in Rust source)
+        // but sufficient for brace matching in Rust source). Both the opening
+        // `"` and the closing `"` are emitted as delimiters; only the CONTENTS
+        // between them are blanked.
         if ch == '"' && prev_char != '\\' && !in_line_comment {
             in_string = !in_string;
         }
@@ -201,20 +224,37 @@ fn extract_fn_body(source: &str, fn_name: &str) -> Option<String> {
                 depth += 1;
             } else if ch == '}' {
                 depth -= 1;
-                if depth == 0 {
-                    body_end = body_start + i;
-                    break;
-                }
             }
+        }
+
+        // Emit: real code as-is; comment text and string CONTENTS as a space.
+        // The `"` delimiters themselves (opening + closing) are preserved as
+        // code — the `else if ch == '"'` arm fires for both, before the
+        // interior-blanking arm can reach an in-string non-quote char.
+        let emit = if in_line_comment {
+            ' '
+        } else if ch == '"' {
+            '"'
+        } else if in_string {
+            // Interior of a string literal — blank it.
+            ' '
+        } else {
+            ch
+        };
+        cleaned.push(emit);
+
+        if !in_line_comment && !in_string && ch == '}' && depth == 0 {
+            balanced = true;
+            break;
         }
         prev_char = ch;
     }
 
-    if depth != 0 {
+    if !balanced {
         return None; // Unbalanced braces
     }
 
-    Some(source[body_start..=body_end].to_string())
+    Some(cleaned)
 }
 
 /// Returns `true` if the body of `fn_name` in `source` contains `callee`.
@@ -454,26 +494,27 @@ fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
 }
 
 // Supervisor level (ADR-049 Phase 2D): the single startup entry point
-// `restore_on_startup` MUST run the saga-journal replay BEFORE context
-// restore — the §17.16.4 crash-recovery proof depends on the non-resident
-// caller being observed by replay before restoration makes it resident.
-// This pins both the presence of both calls AND their order, so a future
-// refactor cannot reorder them or drop the replay sweep.
+// `restore_on_startup` MUST restore contexts BEFORE the saga-journal replay —
+// the §17.16.4 restore-then-replay crash-recovery model requires each recovery
+// arm (the cross-context caller reversal; a Commit-in-progress re-send) to drive
+// a NOW-RESIDENT participant, so context restore must run first. This pins both
+// the presence of both calls AND their order, so a future refactor cannot
+// reorder them or drop the replay sweep.
 #[test]
 fn restore_on_startup_runs_replay_before_restore() {
     let body = extract_fn_body(SUPERVISOR_SRC, "restore_on_startup")
         .expect("Supervisor::restore_on_startup must exist");
-    let replay_pos = body.find("replay_unresolved_sagas()").expect(
-        "restore_on_startup must call replay_unresolved_sagas() — the §17.16.4 replay sweep",
-    );
     let restore_pos = body
         .find("restore_all_contexts()")
         .expect("restore_on_startup must call restore_all_contexts() — the context-restore sweep");
+    let replay_pos = body.find("replay_unresolved_sagas()").expect(
+        "restore_on_startup must call replay_unresolved_sagas() — the §17.16.4 replay sweep",
+    );
     assert!(
-        replay_pos < restore_pos,
-        "restore_on_startup MUST call replay_unresolved_sagas() BEFORE restore_all_contexts() \
-         (§17.16.4 replay-before-restore ordering); found replay at {replay_pos}, restore at \
-         {restore_pos}"
+        restore_pos < replay_pos,
+        "restore_on_startup MUST call restore_all_contexts() BEFORE replay_unresolved_sagas() \
+         (§17.16.4 restore-then-replay ordering — recovery arms drive now-resident participants); \
+         found restore at {restore_pos}, replay at {replay_pos}"
     );
 }
 
@@ -1023,10 +1064,19 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
         "native execute_governance_action must resolve the authoritative proposal \
          from the governance engine via engine.get_proposal(proposal_id)"
     );
+    // The forgery path: `get_proposal(proposal_id)` returns `None` for an id the
+    // engine never tracked, and the `ok_or_else(...)?` rejects it with a
+    // `PermissionDenied`. We match the CODE construct (`ok_or_else` +
+    // `PermissionDenied`) rather than the rejection's error-message STRING, since
+    // `extract_fn_body` strips string-literal contents (so a structural assertion
+    // cannot false-pass on stringized or commented-out text).
     assert!(
-        body.contains("not tracked"),
+        body.contains("get_proposal(proposal_id)")
+            && body.contains("ok_or_else")
+            && body.contains("PermissionDenied"),
         "native execute_governance_action must reject a proposal id the engine \
-         never tracked (the forgery path)"
+         never tracked — the `get_proposal(proposal_id).ok_or_else(|| ... PermissionDenied ...)?` \
+         forgery-rejection path"
     );
 }
 

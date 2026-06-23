@@ -3793,9 +3793,10 @@ pub(crate) async fn context_restore_on(
 ///
 /// Returns a JSON array of restored context ID strings. Routes through the
 /// supervisor-scope direct method `restore_on_startup` (ADR-049 Phase 2D),
-/// which replays any crash-orphaned saga journal entries BEFORE restoring
-/// contexts in the §17.16.4-required order; `restore_on_startup` operates on
-/// the supervisor-wide context registry and has no per-context command target.
+/// which restores contexts BEFORE replaying any crash-orphaned saga journal
+/// entries in the §17.16.4-required restore-then-replay order; `restore_on_startup`
+/// operates on the supervisor-wide context registry and has no per-context
+/// command target.
 pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Result<String> {
     let sup = crate::runtime::supervisor(bi)?;
 
