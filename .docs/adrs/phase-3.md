@@ -745,7 +745,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., `fct.scp_key_scope: "#agent"` delegates authority from the human's `#active` key to their own `#agent` key on the same DID).
    - **Step 6 — Capability match:** Verify the token's `att` includes the `required_capability`. Capability matching supports wildcards (`scp:ctx:*/messages:write` matches any context).
    - **Step 7 — Attenuation:** Verify each delegation in the chain narrows or preserves capabilities (never widens). A child token cannot grant capabilities its parent does not have.
-   - **Step 8 — Ceiling:** Verify the `required_capability` is within the context's immutable capability ceiling.
+   - **Step 8 — Ceiling:** Verify every capability the token grants is within the context's immutable capability ceiling — not only the invoked capability. The token's entire attestation set (`att`) is checked; a token carrying any out-of-ceiling attestation is rejected even if the invoked capability is itself within the ceiling.
    - **Step 9 — Nonce:** Validate nonce format (`{unix_millis}-{hex16}`). Validate nonce freshness (timestamp within ± 5 minutes of now). Verify `nnc` has not been seen before in this context. Record the nonce with the token's `exp` in the context's nonce tracker.
    - **Step 10 — Revocation:** Verify the token's CID is not in the context's revocation list.
    - **Step 11 — Expiry:** Verify `exp > now` and `nbf <= now` (if present).
