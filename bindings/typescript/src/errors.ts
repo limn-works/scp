@@ -85,12 +85,6 @@ export class UcanPermissionError extends ScpError {
   }
 }
 
-/**
- * @deprecated Use `UcanPermissionError` instead. This alias exists for
- * backward compatibility during the rename transition.
- */
-export const PermissionError = UcanPermissionError;
-
 /** Encryption, decryption, signature failures. */
 export class CryptoError extends ScpError {
   constructor(message: string, code: string) {

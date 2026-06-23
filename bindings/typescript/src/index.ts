@@ -259,7 +259,6 @@ export {
   mapBridgeError,
   mapSagaError,
   OutletError,
-  PermissionError,
   ProtocolError,
   SagaAbortedError,
   SagaBusyError,
