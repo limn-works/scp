@@ -28,12 +28,13 @@
         {
           "name": "rotate_key",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "kotlin": "UniFFI bridge does not export rotate_key",
-            "swift": "UniFFI bridge does not export rotate_key"
+            "typescript": "Bridge plumbing exists (internal/native.ts, internal/wasm.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
+            "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
+            "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
         },
         {
@@ -53,23 +54,32 @@
         {
           "name": "add_agent_key",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey, internal/wasm.ts identity_add_agent_key) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "rotate_agent_key",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "Bridge plumbing exists (internal/native.ts rotateAgentKey) but no public SDK wrapper on the Identity class yet; the named public rotateAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "remove_agent_key",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "Bridge plumbing exists (internal/native.ts removeAgentKey) but no public SDK wrapper on the Identity class yet; the named public removeAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "identity_remove",
@@ -90,9 +100,12 @@
         {
           "name": "migrate",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "Bridge plumbing exists (internal/native.ts migrate, internal/wasm.ts identity_migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "resume_migration_publish",
@@ -622,10 +635,11 @@
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": false,
           "swift": true,
           "exemptions": {
+            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"
           }
         },
@@ -1144,10 +1158,13 @@
         },
         {
           "name": "discover",
-          "python": true,
+          "python": false,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "python": "discovery.py exposes parse_address / create_query / normalize_address only; no named discover / discover_contexts / context_discover public function yet. The Python discovery wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "address_resolve",
@@ -1399,11 +1416,14 @@
         },
         {
           "name": "verify_payment_receipts",
-          "python": true,
+          "python": false,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + Python/TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095)."
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095).",
+          "exemptions": {
+            "python": "economy.py exposes estimate_cost / policy helpers / evaluate_formula only; no named verify_payment_receipts public function yet. The Python verify_payment_receipts wrapper lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "enforce_economy_send_path",
@@ -1738,16 +1758,22 @@
         {
           "name": "register",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
+          }
         },
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": true,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "exemptions": {
+            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch."
+          }
         },
         {
           "name": "create_shadow",
@@ -1939,7 +1965,8 @@
          "exemptions": {}},
         {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
-         "exemptions": {}}
+         "exemptions": {},
+         "coverage_exemptions": {"kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` \u2014 the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."}}
       ]
     }
   ],
