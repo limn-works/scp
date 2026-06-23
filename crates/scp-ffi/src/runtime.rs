@@ -1292,6 +1292,28 @@ where
         )));
 }
 
+/// Returns the in-memory DHT client backing this instance's DID resolver, if
+/// initialized.
+///
+/// Used by `identity_create` to publish freshly minted in-memory DID documents
+/// into the same client the resolver reads from, so the DID resolves for
+/// signature verification (UCAN validation, governance vote verification).
+#[must_use]
+pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::InMemoryDhtClient>> {
+    bi.core.dht_client().map(Arc::clone)
+}
+
+/// Stores the in-memory DHT client backing this instance's DID resolver.
+///
+/// Called once during resolver initialization with the SAME `InMemoryDhtClient`
+/// `Arc` the resolver was built over. Subsequent calls are no-ops.
+pub fn set_resolver_dht_client(
+    bi: &PyBridgeInstance,
+    client: Arc<scp_identity::InMemoryDhtClient>,
+) {
+    bi.core.set_dht_client(client);
+}
+
 // ---------------------------------------------------------------------------
 // Key resolver helper — delegates to scp-ffi-common
 // ---------------------------------------------------------------------------
@@ -1608,6 +1630,35 @@ pub fn sync_role_state_from_manager(
     let sup = supervisor(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
     let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
+        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+    })?;
+
+    with_ffi_state(bi, context_id, |st| {
+        st.role_state = new_role_state;
+        Ok(())
+    })
+}
+
+/// Async-native variant of [`sync_role_state_from_manager`].
+///
+/// Callers that are already executing inside `runtime().block_on(...)` (e.g.
+/// the governance proposal/approve/reject/withdraw flows in `context.rs`) MUST
+/// use this instead of the sync wrapper: the sync wrapper performs its own
+/// `block_on`, and a nested `block_on` on the multi-threaded runtime panics
+/// with "Cannot start a runtime from within a runtime". This helper awaits the
+/// supervisor role-state query directly so it composes inside an existing
+/// async context.
+///
+/// # Errors
+///
+/// Returns `ScpPyError` if the supervisor is not initialized, the context is
+/// not registered in the supervisor, or the FFI state is missing.
+pub async fn sync_role_state_from_manager_async(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let sup = supervisor(bi)?;
+    let new_role_state = sup.get_role_state(context_id).await.ok_or_else(|| {
         ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
     })?;
 

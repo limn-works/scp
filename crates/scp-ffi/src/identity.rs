@@ -75,6 +75,13 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
         return;
     }
 
+    // Retain the DHT client on the instance so `identity_create` can publish
+    // freshly minted in-memory DID documents into the SAME client the resolver
+    // reads from. Without a shared client, in-memory identities are never
+    // resolvable and any DID-resolving verification (UCAN validation,
+    // governance vote verification) fails with "unknown voter". This mirrors
+    // the NAPI bridge's shared-DHT publish design, scoped per-instance
+    // to match where the resolver itself is stored.
     let dht_client = Arc::new(InMemoryDhtClient::new());
     let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
@@ -82,12 +89,85 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 
     let resolver = Arc::new(DualLayerResolver::new(
         relay_querier,
-        dht_client,
+        Arc::clone(&dht_client),
         cache,
         bootstrap_relays,
     ));
 
     crate::runtime::init_did_resolver(bi, resolver, handle);
+    crate::runtime::set_resolver_dht_client(bi, dht_client);
+}
+
+/// Publishes a newly created in-memory DID document into the instance's
+/// resolver DHT client.
+///
+/// After `identity_create`, the DID document must be discoverable by the
+/// per-instance `DualLayerResolver` (used by UCAN validation and governance
+/// vote-signature verification). The document is otherwise only held in the
+/// local identity registry, never in the resolver's DHT — so resolving the DID
+/// to fetch its verification key fails.
+///
+/// Constructs a BEP44 signed mutable item (32-byte public key, 64-byte
+/// signature, document JSON, sequence number 1) and calls
+/// [`scp_identity::dht_client::DhtClient::publish`]. Best-effort: errors are
+/// logged but never fail identity creation (the document is still registered
+/// locally; only resolver discoverability is affected).
+///
+/// Mirrors the NAPI bridge's `publish_to_shared_dht_for`.
+async fn publish_to_resolver_dht_for(
+    bi: &PyBridgeInstance,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+    custody: &FfiKeyCustody,
+) {
+    use scp_identity::dht_client::DhtClient as _;
+
+    let Some(dht_client) = crate::runtime::resolver_dht_client(bi) else {
+        // Resolver not initialized on this instance; nothing to seed.
+        return;
+    };
+
+    // Serialize the document to JSON (the BEP44 value).
+    let doc_json = match document.to_json() {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: failed to serialize document: {e}");
+            return;
+        }
+    };
+    let value = doc_json.as_bytes();
+
+    // Extract the 32-byte public key from the DID string.
+    let public_key = match scp_identity::extract_public_key(&identity.did) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: failed to extract public key: {e}");
+            return;
+        }
+    };
+
+    // Build the BEP44 signable payload and sign it with the identity key.
+    let seq: u64 = 1;
+    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
+        Ok(sig) => sig.into_bytes(),
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: signing failed: {e}");
+            return;
+        }
+    };
+    let Ok(signature): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        tracing::warn!("publish_to_resolver_dht: signature is not 64 bytes");
+        return;
+    };
+
+    // Publish into the per-instance in-memory DHT the resolver reads from.
+    if let Err(e) = dht_client
+        .publish(&public_key, &signature, value, seq)
+        .await
+    {
+        tracing::warn!("publish_to_resolver_dht: DHT publish failed: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +924,14 @@ impl crate::scp::PyScp {
                     })?;
                 let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
+                // Publish the DID document into this instance's resolver DHT so
+                // the document is resolvable for signature verification (UCAN
+                // validation, governance vote verification). Best-effort; the
+                // document is still registered locally regardless. Done BEFORE
+                // moving `identity`/`key_custody`/`document` into the registry.
+                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    .await;
+
                 // Register the identity in this instance's registry so that
                 // subsequent bridge methods (UCAN minting, pseudonym
                 // derivation, signing, key rotation) can access the retained
@@ -940,6 +1028,12 @@ impl crate::scp::PyScp {
                         ))
                     })?;
                 let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                // Publish into the resolver DHT (best-effort) so the DID is
+                // resolvable for signature verification, before moving owned
+                // state into the registry. See `identity_create`.
+                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    .await;
 
                 crate::runtime::register_identity(
                     &bi_arc,
@@ -1069,6 +1163,12 @@ impl crate::scp::PyScp {
                         ))
                     })?;
                 let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                // Publish into the resolver DHT (best-effort) so the DID is
+                // resolvable for signature verification, before moving owned
+                // state into the registry. See `identity_create`.
+                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    .await;
 
                 crate::runtime::register_identity(
                     &bi_arc,

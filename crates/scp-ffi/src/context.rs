@@ -3348,7 +3348,9 @@ impl crate::scp::PyScp {
 
             // Re-sync local role state cache from ContextManager after any
             // governance action that may have modified roles/membership (#560).
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     action = action_name,
@@ -3441,7 +3443,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -3523,7 +3527,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -3581,7 +3587,9 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id) {
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,

@@ -199,9 +199,6 @@ pub struct IdentityBackedDidResolver {
     /// `scp_identity::resolver::DidResolver`.
     resolve_fn: Arc<AsyncResolveFn>,
 
-    /// Handle to the tokio runtime for async-sync bridging.
-    handle: tokio::runtime::Handle,
-
     /// Highest sequence number seen per DID. Used for rotation detection
     /// and downgrade prevention. Only increases; never decremented.
     seen_sequences: Arc<RwLock<HashMap<String, u64>>>,
@@ -225,8 +222,11 @@ impl IdentityBackedDidResolver {
     ///
     /// * `resolver` — The identity resolver to delegate to. Typically
     ///   `DualLayerResolver`. Must be `'static + Send + Sync`.
-    /// * `handle` — Handle to the tokio runtime for async-sync bridging.
-    pub fn new<R>(resolver: Arc<R>, handle: tokio::runtime::Handle) -> Self
+    /// * `_handle` — Accepted for call-site stability across the FFI bridges.
+    ///   No longer retained: `resolve_sync` drives async resolution on a
+    ///   dedicated thread with its own runtime (see its docs), so this resolver
+    ///   does not depend on a borrowed runtime handle.
+    pub fn new<R>(resolver: Arc<R>, _handle: tokio::runtime::Handle) -> Self
     where
         R: scp_identity::resolver::DidResolver + 'static,
     {
@@ -237,7 +237,6 @@ impl IdentityBackedDidResolver {
 
         Self {
             resolve_fn,
-            handle,
             seen_sequences: Arc::new(RwLock::new(HashMap::new())),
             rotation_events: Arc::new(RwLock::new(Vec::new())),
         }
@@ -290,23 +289,61 @@ impl IdentityBackedDidResolver {
         }
     }
 
-    /// Calls the async resolve function from a sync context, bridging via
-    /// `block_in_place` (tokio multi-thread) or `block_on` (non-tokio thread).
+    /// Calls the async resolve function from a sync context.
+    ///
+    /// The async resolution is driven to completion on a dedicated OS thread
+    /// that owns a private current-thread runtime, and the result is handed
+    /// back through `join()`. This is the runtime-flavor-agnostic "regime-(c)"
+    /// pattern used elsewhere in the bridge (see `context.rs` export signing):
+    /// it is fully self-contained — it neither nests a `block_on` on the
+    /// bridge's shared runtime nor depends on that runtime having a free worker
+    /// to make progress — so it is correct and deadlock-free from every caller
+    /// posture.
+    ///
+    /// Why not `block_in_place` + `Handle::block_on` on the shared runtime: the
+    /// sync `DidResolver` trait methods are invoked synchronously from deep
+    /// inside async bridge operations that the bridge drives via
+    /// `RUNTIME.block_on(...)` on the *calling* (non-worker) thread — e.g.
+    /// governance proposal verification resolves the proposer's DID while the
+    /// calling Python/JS thread is already executing `block_on`. On such a
+    /// thread `tokio::task::block_in_place` is invalid (not a runtime worker)
+    /// and a nested `Handle::block_on` panics with "Cannot start a runtime from
+    /// within a runtime". And merely `spawn`ing the resolution back onto the
+    /// shared runtime + awaiting the `JoinHandle` is not deadlock-free on the
+    /// current-thread fallback runtime (no worker exists to poll the spawned
+    /// task while the calling thread is parked in `block_on`).
+    ///
+    /// The async resolve future is `Send` (see `AsyncResolveFn`), so moving it
+    /// to another thread is sound. DID resolution is a short, bounded operation
+    /// (in-memory DHT lookup or a single network round-trip), so the blocking
+    /// `join()` on the calling thread is acceptable.
     fn resolve_sync(&self, did: &str) -> Result<ResolvedDidDocument, ResolutionError> {
         let resolve_fn = Arc::clone(&self.resolve_fn);
         let did_owned = did.to_owned();
-        let handle = self.handle.clone();
 
-        // Determine if we're inside a tokio runtime context.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Inside tokio: use block_in_place to avoid blocking a worker thread.
-            tokio::task::block_in_place(|| {
-                handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned))
-            })
-        } else {
-            // Outside tokio (e.g., PyO3 Python thread): use block_on directly.
-            handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned))
-        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let resolve_rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            return Err(ResolutionError::NetworkUnavailable(format!(
+                                "failed to build DID-resolution runtime: {e}"
+                            )));
+                        }
+                    };
+                    resolve_rt.block_on(Self::resolve_document(&*resolve_fn, &did_owned))
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(ResolutionError::NetworkUnavailable(
+                        "DID-resolution thread panicked".to_owned(),
+                    ))
+                })
+        })
     }
 
     /// Checks sequence number for rotation detection and downgrade prevention.

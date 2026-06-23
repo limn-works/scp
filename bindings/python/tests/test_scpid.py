@@ -14,9 +14,10 @@ Requires: ``maturin develop --release --features allow_in_memory_custody``
 
 Note: :meth:`SCP.scpid_verify` requires DID document resolution via a
 real or in-memory DHT. In-memory identities created through the SDK
-bridge are not published to the DHT, so the verify step fails with
-``SCP-IDENT-1033`` (``DidResolutionFailed``). The Rust FFI test suite
-validates the full roundtrip using a shared ``InMemoryDhtClient`` — see
+bridge publish their DID document into the per-instance resolver DHT at
+creation time, so the full challenge → sign → verify roundtrip succeeds
+without any external network. The Rust FFI test suite covers the same
+roundtrip — see
 ``crates/scp-ffi/src/scpid.rs::sign_verify_roundtrip_via_identity_backed_resolver``.
 """
 
@@ -155,19 +156,20 @@ class TestScpIdSign:
 class TestScpIdVerify:
     """Tests for SCPID response verification.
 
-    Note: Full roundtrip verification (challenge → sign → verify) requires
-    the identity's DID document to be published to a DHT that the global
-    resolver can access. In-memory test identities are NOT published, so
-    :meth:`SCP.scpid_verify` raises ``IdentityError`` with
-    ``SCP-IDENT-1033`` (DID resolution failed). This is the expected and
-    correct error — the Rust FFI test suite validates the full roundtrip
-    with a shared ``InMemoryDhtClient``.
+    In-memory identities created through the SDK bridge publish their DID
+    document into the per-instance resolver DHT at creation time, so the
+    full challenge → sign → verify roundtrip resolves the signer's DID and
+    succeeds with no external network. The Rust FFI test suite covers the
+    same roundtrip with a shared ``InMemoryDhtClient``.
     """
 
-    def test_verify_raises_did_resolution_error(self, scp: SCP) -> None:
+    def test_verify_succeeds_for_in_memory_identity(self, scp: SCP) -> None:
         identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
         challenge = _run(scp.scpid_challenge("https://example.com", 120))
         response = _run(scp.scpid_sign(identity.did, "#active", challenge.to_json()))
 
-        with pytest.raises(Exception, match="SCP-IDENT-1033"):
-            _run(scp.scpid_verify(response.to_json(), challenge.to_json()))
+        auth = _run(scp.scpid_verify(response.to_json(), challenge.to_json()))
+
+        assert auth.did == identity.did
+        assert auth.signing_key_id == "#active"
+        assert auth.signed_at == response.signed_at

@@ -336,6 +336,27 @@ pub struct CoreFields {
     /// See #311 for the unification design.
     did_resolver: OnceLock<Arc<IdentityBackedDidResolver>>,
 
+    /// In-memory DHT client backing the production DID resolver.
+    ///
+    /// Retained on the instance so that `identity_create` can publish freshly
+    /// minted in-memory DID documents into the *same* `InMemoryDhtClient` the
+    /// resolver reads from. Without this, an in-memory identity's document is
+    /// only registered in the local identity registry and is never resolvable
+    /// via the resolver — so any code path that resolves the DID to verify a
+    /// signature (UCAN validation, governance vote verification) fails with
+    /// "unknown voter: cannot resolve public key for DID".
+    ///
+    /// Set by the same idempotent resolver-initialization path that calls
+    /// [`set_did_resolver`]; the resolver and this client are the same `Arc`.
+    /// `None` until the identity layer is first set up.
+    ///
+    /// Mirrors the NAPI bridge's `publish_to_shared_dht_for` design,
+    /// but scoped per-instance (matching where the resolver itself is stored)
+    /// rather than process-global. The `InMemoryDhtClient` stores only signed,
+    /// public DID documents — it is a test/demo affordance for the in-memory
+    /// custody path; production uses real `did:dht`/`did:web` resolution.
+    dht_client: OnceLock<Arc<scp_identity::InMemoryDhtClient>>,
+
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
     /// During the Phase 4 transition, each FFI bridge registers hooks that
@@ -514,6 +535,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            dht_client: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
             relay_urls: Mutex::new(HashSet::new()),
@@ -596,6 +618,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            dht_client: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
             relay_urls: Mutex::new(HashSet::new()),
@@ -2080,6 +2103,28 @@ impl CoreFields {
     pub fn set_did_resolver(&self, resolver: Arc<IdentityBackedDidResolver>) {
         if self.did_resolver.set(resolver).is_err() {
             tracing::warn!("set_did_resolver called but resolver already initialized — ignoring");
+        }
+    }
+
+    /// Returns the in-memory DHT client backing the DID resolver, if initialized.
+    ///
+    /// Used by `identity_create` (in-memory custody path) to publish freshly
+    /// minted DID documents into the same `InMemoryDhtClient` the resolver
+    /// reads from, so the DID is resolvable for signature verification.
+    #[must_use]
+    pub fn dht_client(&self) -> Option<&Arc<scp_identity::InMemoryDhtClient>> {
+        self.dht_client.get()
+    }
+
+    /// Stores the in-memory DHT client backing the DID resolver.
+    ///
+    /// Called once during identity system setup, alongside [`set_did_resolver`],
+    /// with the SAME `InMemoryDhtClient` `Arc` the resolver was built over.
+    /// Subsequent calls are no-ops (`OnceLock` guarantees single
+    /// initialization).
+    pub fn set_dht_client(&self, client: Arc<scp_identity::InMemoryDhtClient>) {
+        if self.dht_client.set(client).is_err() {
+            tracing::warn!("set_dht_client called but client already initialized — ignoring");
         }
     }
 
