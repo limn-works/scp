@@ -122,11 +122,21 @@ const RECONNECT_DRIVER_SRC: &str =
 const HANDLERS_MESSAGING_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
 
+// UCAN validation pipeline source — owns `validate_ucan`, the 11-step
+// capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
+// assertion below pins step 8 to checking the FULL parsed attestation set
+// (`&granted_caps`) against the ceiling — not just the invoked capability
+// (spec §7.2.1 step 8) — so a refactor cannot silently regress to
+// `from_ref(required_capability)`, which would let a token smuggle an
+// out-of-ceiling attestation past validation.
+const UCAN_VALIDATE_SRC: &str =
+    include_str!("../../../../crates/scp-protocol/src/crypto/ucan/validate.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 42;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 43;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1722,6 +1732,38 @@ fn b3_webhook_dispatch_wired() {
             && uniffi_runtime_src.contains("Some(event_tx)"),
         "UniFFI production Supervisor construction must enable the event channel \
          (otherwise subscribe_events yields None and no events are dispatched)"
+    );
+}
+
+// ===========================================================================
+// UCAN validation step 8 — all-attestation ceiling enforcement
+// ===========================================================================
+
+/// Step 8 of `validate_ucan` must enforce the ceiling over the token's FULL
+/// parsed attestation set (`&granted_caps`), not only the invoked capability
+/// (spec §7.2.1 step 8). Pins the fix against a silent regression to
+/// `from_ref(required_capability)`, which would allow a token to smuggle an
+/// out-of-ceiling attestation past validation.
+#[test]
+fn ucan_step8_enforces_ceiling_over_all_att() {
+    assert!(
+        fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "validate_ucan",
+            "verify_ceiling_compliance(&granted_caps,"
+        ),
+        "validate_ucan step 8 must call verify_ceiling_compliance over the full \
+         parsed attestation set (&granted_caps), per spec §7.2.1 step 8"
+    );
+    assert!(
+        !fn_body_contains(
+            UCAN_VALIDATE_SRC,
+            "validate_ucan",
+            "verify_ceiling_compliance(std::slice::from_ref(required_capability)"
+        ),
+        "validate_ucan step 8 must NOT scope the ceiling check to only the \
+         invoked capability — that lets a token smuggle an out-of-ceiling \
+         attestation (spec §7.2.1 step 8)"
     );
 }
 

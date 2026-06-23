@@ -12,7 +12,9 @@
 //! - [`CapabilityCeiling`] -- Immutable set of capabilities declared at context
 //!   creation.
 //! - [`RoleDefinition`] -- Named role mapping to a capability subset.
-//! - [`UcanToken`] -- Lightweight UCAN token representation for role-based access control in broadcast contexts.
+//! - [`UcanToken`] -- Lightweight UCAN token representation that populates the
+//!   local `member_capabilities` cache (spec §7.2.2 Tier 2). See the type docs
+//!   for why it carries no per-token signature.
 //! - [`RoleError`] -- Error type for role and capability operations.
 //!
 //! # Built-in Roles
@@ -1196,6 +1198,13 @@ impl ContextRoleState {
             .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
             .clone();
 
+        // 2a. Mint-time ceiling enforcement (spec §7.2.1 step 8 — "the same
+        // all-attestations rule applies at mint time"). EVERY capability in the
+        // role definition must be within the context's immutable ceiling before
+        // any token is minted, even on the system path. Mirrors the gate-local
+        // re-check in `assign_role`.
+        validate_role_definition(&role_def, &self.ceiling)?;
+
         // 3. Mint UCAN tokens for each capability in the role.
         let tokens = mint_role_tokens(
             &self.context_id,
@@ -1377,6 +1386,10 @@ impl ContextRoleClassCParts<'_> {
             .get(role_name)
             .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
             .clone();
+        // Mint-time ceiling enforcement (spec §7.2.1 step 8): every capability in
+        // the role definition must be within the immutable ceiling before any
+        // token is minted, even on this field-granular system path.
+        validate_role_definition(&role_def, self.ceiling)?;
         let tokens = mint_role_tokens(
             self.context_id,
             self.creator_did,
@@ -1446,6 +1459,18 @@ pub fn assign_role(
         .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
         .clone();
 
+    // 3a. Mint-time ceiling enforcement (spec §7.2.1 step 8 — "the same
+    // all-attestations rule applies at mint time"). EVERY capability in the
+    // role definition must be within the context's immutable ceiling before any
+    // token is minted. Role definitions are ceiling-validated when they are
+    // built (RoleDefinition::new / ContextRoleState::new /
+    // validate_role_definition); this is the gate-local layer at mint time —
+    // the producer-side counterpart to UCAN validation step 8 on the consumer
+    // side — closing any path by which a role definition carrying an
+    // out-of-ceiling capability (e.g. one built via new_unchecked) could reach
+    // mint and emit out-of-ceiling attestations.
+    validate_role_definition(&role_def, &state.ceiling)?;
+
     // 4. Mint UCAN tokens for each capability in the role.
     let tokens = mint_role_tokens(
         &state.context_id,
@@ -1500,6 +1525,8 @@ pub fn system_assign_role(
     // `ContextRoleState::system_assign_role` so a field-granular role view can
     // mint a role over its own disjoint fields without a whole `&mut`. Retained
     // `pub` (not removed) because `scp-runtime` and tests still call the free form.
+    // Mint-time ceiling enforcement (spec §7.2.1 step 8) now lives inside that
+    // inherent method, so the forwarder inherits it.
     state.system_assign_role(member_did, role_name, clock)
 }
 
@@ -1624,8 +1651,20 @@ pub fn validate_role_definition(
 /// the ADR-009 token format: `iss` = creator DID, `aud` = member DID,
 /// `att` = capability attestation, `nnc` = unique nonce.
 ///
-/// Phase 2 stub: tokens are structurally correct but not cryptographically
-/// signed. Full signing will be added in SCP-024.
+/// These role tokens intentionally carry no per-token signature — this is a
+/// complete design decision, not a stub. See the [`UcanToken`] type docs for
+/// the full rationale (authority is grounded in the signed governance action,
+/// the tokens never cross a trust boundary, and they cannot enter the Tier-1
+/// JWT validation pipeline). Callers MUST NOT add an Ed25519 signature here.
+///
+/// Every capability in `role` is guaranteed to be within the context ceiling at
+/// every call site: the assignment paths ([`assign_role`],
+/// [`system_assign_role`]) run [`validate_role_definition`] against the ceiling
+/// immediately before minting, and the construction path
+/// ([`ContextRoleState::new`]) mints only the `admin` role, whose definition is
+/// already within the ceiling — a custom `admin` override is ceiling-validated
+/// at construction, and the built-in fallback ([`builtin_admin`]) derives its
+/// capabilities directly from the ceiling.
 fn mint_role_tokens(
     context_id: &str,
     creator_did: &str,
@@ -2283,6 +2322,110 @@ mod tests {
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
         assert!(state.member_has_capability("did:dht:alice", &Capability::ToolInvokeAll));
+    }
+
+    #[test]
+    fn assign_role_rejects_role_definition_outside_ceiling() {
+        // Mint-time ceiling enforcement (spec §7.2.1 step 8): even if a role
+        // definition with an out-of-ceiling capability is introduced into
+        // `role_definitions` by any path, `assign_role` must reject it before
+        // minting and must NOT mutate the member's capabilities.
+        //
+        // Use `test_ceiling` (which includes RoleAssign) so the creator-admin
+        // passes the step-1 authorization check; the smuggled role then carries
+        // a Custom capability that is NOT in the ceiling, isolating the
+        // mint-time ceiling gate.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+
+        // Inject a role whose capability set exceeds the ceiling.
+        let out_of_ceiling = Capability::Custom("not-in-ceiling".to_owned());
+        let smuggled = RoleDefinition::new_unchecked(
+            "smuggled",
+            [Capability::MessagesWrite, out_of_ceiling.clone()]
+                .into_iter()
+                .collect(),
+        );
+        state
+            .role_definitions
+            .insert("smuggled".to_owned(), smuggled);
+
+        let result = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "smuggled",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RoleError::CapabilityOutsideCeiling { ref role, ref capability })
+                    if role == "smuggled" && *capability == out_of_ceiling
+            ),
+            "assign_role must reject an out-of-ceiling role definition at mint time: {result:?}"
+        );
+
+        // No tokens minted, no capabilities granted, no assignment recorded.
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::RoleAssign));
+        assert!(!state.member_capabilities.contains_key("did:dht:alice"));
+        assert!(!state.assignments.contains_key("did:dht:alice"));
+    }
+
+    #[test]
+    fn system_assign_role_rejects_role_definition_outside_ceiling() {
+        // Same mint-time ceiling enforcement on the system (governance) path,
+        // which bypasses the RoleAssign authorization check but must NOT bypass
+        // the ceiling.
+        let ceiling = minimal_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+
+        let smuggled = RoleDefinition::new_unchecked(
+            "smuggled",
+            [Capability::MessagesWrite, Capability::ContextClose]
+                .into_iter()
+                .collect(),
+        );
+        state
+            .role_definitions
+            .insert("smuggled".to_owned(), smuggled);
+
+        let result = system_assign_role(
+            &mut state,
+            "did:dht:alice",
+            "smuggled",
+            &scp_primitives::SystemClock,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RoleError::CapabilityOutsideCeiling { ref role, ref capability })
+                    if role == "smuggled" && *capability == Capability::ContextClose
+            ),
+            "system_assign_role must reject an out-of-ceiling role definition at mint time: {result:?}"
+        );
+
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::ContextClose));
+        assert!(!state.member_capabilities.contains_key("did:dht:alice"));
+        assert!(!state.assignments.contains_key("did:dht:alice"));
     }
 
     #[test]

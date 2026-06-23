@@ -5173,6 +5173,22 @@ impl ClassSCell
         )
     }
 
+    /// Like [`fresh_state`] but seeds the role-state ceiling via the sanctioned
+    /// [`scp_protocol::context::roles::ContextRoleState::set_ceiling`] mutator.
+    /// Mint-time ceiling enforcement (spec §7.2.1 step 8) now runs on the system
+    /// path, so fixtures that seed role definitions must seat a ceiling that
+    /// contains the capabilities those roles grant.
+    fn fresh_state_with_ceiling(
+        ctx_byte: u8,
+        caps: impl IntoIterator<Item = scp_protocol::context::roles::Capability>,
+    ) -> PerContextState {
+        let mut state = fresh_state(ctx_byte);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new(caps));
+        state
+    }
+
     fn ctx_hex(byte: u8) -> String {
         let mut s = String::with_capacity(64);
         for _ in 0..32 {
@@ -5807,7 +5823,9 @@ impl ClassSCell
         };
 
         let deps = build_deps(Box::new(FailPersistence)).await;
-        let mut cell = ClassSCell::new(fresh_state(0x72));
+        // Ceiling holds the HIGH/LOW role caps: mint-time enforcement (§7.2.1 step 8).
+        let caps = [Capability::MessagesRead, Capability::MessagesWrite];
+        let mut cell = ClassSCell::new(fresh_state_with_ceiling(0x72, caps));
         let ctx = ctx_hex(0x72);
         let subject = DID("did:example:demote-subject".to_owned());
 

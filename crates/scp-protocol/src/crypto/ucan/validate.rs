@@ -16,7 +16,7 @@
 //! 6. **Capability match** — Verify `att` includes required capability.
 //!    6b. **Category A enforcement** — If `kid` is `#agent`, reject Category A capabilities (ADR-039).
 //! 7. **Attenuation** — Verify delegations narrow or preserve.
-//! 8. **Ceiling** — Verify capability is within context ceiling.
+//! 8. **Ceiling** — Verify every granted capability is within context ceiling.
 //! 9. **Nonce** — Validate format, freshness, uniqueness.
 //! 10. **Revocation** — Verify token CID not in revocation list.
 //! 11. **Expiry** — Verify `exp > now` and `nbf <= now`.
@@ -435,6 +435,38 @@ pub fn parse_ucan(encoded: &str) -> Result<UcanToken, UcanError> {
     })
 }
 
+/// Parses a token's attestation set (`att`) into capability URIs.
+///
+/// This is the shared step-6 parse used by both [`validate_ucan`] (the
+/// enforcing gate) and [`evaluate_ucan`] (the diagnostic). Keeping it in one
+/// place ensures the two pipelines can never drift on how attestations are
+/// parsed.
+///
+/// SECURITY: fail-closed — any single unparseable attestation URI rejects the
+/// entire token. There is no `filter_map`/`ok()` that could silently drop a
+/// malformed attestation and let it escape a downstream check (e.g. the
+/// all-attestation ceiling check, step 8).
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] if any attestation URI cannot be
+/// parsed into a [`CapabilityUri`].
+fn parse_granted_caps(token: &UcanToken) -> Result<Vec<CapabilityUri>, UcanError> {
+    token
+        .payload
+        .att
+        .iter()
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in attestation: {}",
+                    att.with
+                ))
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Validation context
 // ---------------------------------------------------------------------------
@@ -499,7 +531,8 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
 /// 5. Verify audience matches presenting agent DID.
 /// 6. Verify token's `att` includes required capability.
 /// 7. Attenuation verification (delegation narrows only).
-/// 8. Verify capability is within context ceiling.
+/// 8. Verify every granted capability (the full `att` set) is within the
+///    context ceiling — not only the invoked capability (spec §7.2.1 step 8).
 /// 9. Nonce validation (format, freshness, uniqueness).
 /// 10. Revocation check (token CID not in revocation list).
 /// 11. Expiry verification (`exp > now`, `nbf <= now`, `exp <= now + 24h`).
@@ -540,20 +573,10 @@ where
     )?;
 
     // Step 4: Root issuer — verify root token's iss is context creator.
-    if root_issuer != ctx.context_creator_did {
-        return Err(UcanError::InvalidIssuer {
-            expected: ctx.context_creator_did.to_owned(),
-            actual: root_issuer,
-        });
-    }
+    verify_root_issuer(&root_issuer, ctx.context_creator_did)?;
 
     // Step 5: Audience — verify aud matches presenting agent.
-    if token.payload.aud != ctx.presenting_agent_did {
-        return Err(UcanError::AudienceMismatch {
-            expected: ctx.presenting_agent_did.to_owned(),
-            actual: token.payload.aud.clone(),
-        });
-    }
+    verify_audience(token, ctx.presenting_agent_did)?;
 
     // Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013).
     // Rejects self-delegation without key_scope and key_scope/kid mismatches.
@@ -561,19 +584,7 @@ where
 
     // Step 6: Capability match — verify att includes required capability.
     // SECURITY: fail-closed — any unparseable attestation URI rejects the entire token.
-    let granted_caps: Vec<CapabilityUri> = token
-        .payload
-        .att
-        .iter()
-        .map(|att| {
-            att.with.parse::<CapabilityUri>().map_err(|_| {
-                UcanError::MalformedToken(format!(
-                    "unparseable capability URI in attestation: {}",
-                    att.with
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let granted_caps = parse_granted_caps(token)?;
     check_capability_match(&granted_caps, required_capability)?;
 
     // Step 6b: Category A enforcement (ADR-039 Enforcement Stack layer 3).
@@ -587,8 +598,13 @@ where
         verify_attenuation(token, ctx.proof_resolver)?;
     }
 
-    // Step 8: Ceiling — verify capability is within context ceiling.
-    verify_ceiling_compliance(std::slice::from_ref(required_capability), ctx.ceiling)?;
+    // Step 8: Ceiling — verify EVERY capability the token grants is within the
+    // context's immutable capability ceiling, not only the invoked capability
+    // (spec §7.2.1 step 8). A token carrying any out-of-ceiling attestation is
+    // rejected even if the invoked capability is itself within the ceiling.
+    // `granted_caps` is the full parsed `att` set built in step 6; this makes
+    // step 8 consistent with step 6b (which already iterates all attestations).
+    verify_ceiling_compliance(&granted_caps, ctx.ceiling)?;
 
     // Step 9: Nonce — validate format, freshness, uniqueness.
     ctx.nonce_tracker
@@ -610,8 +626,267 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Structured, side-effect-free evaluation
+// ---------------------------------------------------------------------------
+
+/// A structured, per-stage summary of a UCAN token's validity.
+///
+/// Produced by [`evaluate_ucan`], this is the diagnostic counterpart to the
+/// fail-closed [`validate_ucan`] gate. It collapses the 11-step pipeline into
+/// six boolean fields suitable for surfacing a trust signal to an SDK consumer
+/// without enforcing (or mutating) anything.
+///
+/// # Dependency ordering
+///
+/// The pipeline is strictly ordered: each stage only runs if every prior stage
+/// passed. A field is `true` only if its stage ran *and* passed; every field
+/// for a stage at or after the first failure is `false` (those stages never
+/// ran, so nothing is known to be valid). This mirrors the short-circuit
+/// behavior of [`validate_ucan`].
+///
+/// # Side-effect freedom
+///
+/// Unlike [`validate_ucan`], evaluating a token records NO state — in
+/// particular the nonce is probed read-only (via
+/// [`NonceTracker::check_replay`]), never recorded. [`evaluate_ucan`] is safe
+/// to call repeatedly on the same token without consuming its nonce.
+///
+/// # Diagnostic accuracy caveats
+///
+/// Because this mirrors the enforcing pipeline's stage boundaries exactly, two
+/// consequences are worth surfacing to any consumer that acts on the fields:
+///
+/// - `signatures_valid` covers the WHOLE delegation chain, not just the leaf
+///   signature. Chain verification (step 3) validates every parent's signature,
+///   expiry, and revocation, so an otherwise-valid leaf whose *parent* is
+///   expired or revoked reports `signatures_valid: false` — not
+///   `time_bounds_valid: false` / `not_revoked: false` (those two fields
+///   reflect only the leaf token).
+/// - The result is a point-in-time snapshot and is NOT a promise that a
+///   subsequent [`validate_ucan`] will accept the token. `nonce_valid: true`
+///   and `not_revoked: true` can both flip to a rejection at enforcement time
+///   if, between the two calls, the nonce is recorded by another request or the
+///   token is revoked. Treat the booleans as a diagnostic signal, never as a
+///   pre-flight success guarantee.
+//
+// Six independent per-stage outcome flags is the mandated public shape of this
+// diagnostic result (one boolean per pipeline stage group). These are pure data
+// — not behavior-selecting flags — so a state machine / two-variant enums (what
+// `struct_excessive_bools` suggests) would obscure, not clarify, the API and
+// break the flat named-field shape the SDK trust signal consumes.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityValidation {
+    /// Step 1: the token parsed and its header validated, and the attestation
+    /// set parsed into capability URIs.
+    pub tokens_valid: bool,
+    /// Steps 2-7: signature, delegation chain, root issuer, audience, key
+    /// scope, capability grant-match, Category-A enforcement, and attenuation
+    /// all passed.
+    pub signatures_valid: bool,
+    /// Step 8 (all-attestation ceiling): every capability the token grants (the
+    /// full `att` set) is within the context's immutable capability ceiling
+    /// (spec §7.2.1 step 8). Reaching this stage already implies the step-6
+    /// invoked-capability grant-match passed (it runs inside the
+    /// `signatures_valid` stage), so a `true` here means BOTH the invoked
+    /// capability is granted AND no attestation exceeds the ceiling.
+    pub within_ceiling: bool,
+    /// Step 9: the nonce format, freshness, and uniqueness checks passed
+    /// (probed read-only — the nonce is NOT recorded).
+    pub nonce_valid: bool,
+    /// Step 10: the token's revocation CID is not on the context revocation
+    /// list.
+    pub not_revoked: bool,
+    /// Step 11: `exp`/`nbf` time bounds are valid (within clock-skew
+    /// tolerance).
+    pub time_bounds_valid: bool,
+}
+
+impl CapabilityValidation {
+    /// An all-`false` result — used as the starting point and returned when a
+    /// stage fails (every later stage is left `false` because it never ran).
+    const NONE: Self = Self {
+        tokens_valid: false,
+        signatures_valid: false,
+        within_ceiling: false,
+        nonce_valid: false,
+        not_revoked: false,
+        time_bounds_valid: false,
+    };
+}
+
+/// Evaluates a UCAN token against the 11-step pipeline and returns a structured
+/// [`CapabilityValidation`] summary instead of failing at the first error.
+///
+/// This is the diagnostic, **side-effect-free** counterpart to
+/// [`validate_ucan`]. It is intended for SDK trust signals: a caller can show a
+/// per-stage breakdown of why a token is (or is not) acceptable without
+/// enforcing the result and — critically — without consuming the token's nonce.
+///
+/// # Relationship to [`validate_ucan`]
+///
+/// - It calls the EXACT same sub-checks as [`validate_ucan`] (signature,
+///   delegation chain, issuer/audience, key scope, grant-match, Category-A,
+///   attenuation, all-attestation ceiling, revocation, expiry). No validation
+///   logic is duplicated.
+/// - The nonce step uses [`NonceTracker::check_replay`] (read-only). It NEVER
+///   calls [`NonceTracker::record`] / [`NonceTracker::check_and_record`], so
+///   the tracker is never mutated. Hence `ctx` is taken by shared reference.
+/// - Stages run in pipeline order and short-circuit: the returned struct sets
+///   a field `true` only for stages that ran and passed; the first failing
+///   stage and everything after it are `false`.
+///
+/// # Returns
+///
+/// Always returns a [`CapabilityValidation`] — it never returns an error, even
+/// for a token that fails every check. A token that cannot be parsed into the
+/// required inputs yields `tokens_valid: false` with all later fields `false`.
+#[must_use]
+pub fn evaluate_ucan<D, N, R, P, S>(
+    token: &UcanToken,
+    required_capability: &CapabilityUri,
+    ctx: &ValidationContext<'_, D, N, R, P, S>,
+) -> CapabilityValidation
+where
+    D: DidResolver,
+    N: NonceTracker,
+    R: RevocationChecker,
+    P: ProofResolver,
+    S: BuildHasher,
+{
+    let mut result = CapabilityValidation::NONE;
+
+    // Step 1: Parse — token is pre-parsed; validate the header and parse the
+    // attestation set into capability URIs (fail-closed on any unparseable
+    // URI, exactly as validate_ucan's step 6).
+    if token.header.validate().is_err() {
+        return result;
+    }
+    let Ok(granted_caps) = parse_granted_caps(token) else {
+        return result;
+    };
+    result.tokens_valid = true;
+
+    // Steps 2-7: signature, delegation chain + root issuer, audience, key
+    // scope, grant-match, Category-A, attenuation. Any failure stops here.
+    let sigs_ok = (|| -> Result<(), UcanError> {
+        // Step 2: signature.
+        verify_signature(token, ctx.did_resolver)?;
+
+        // Step 3: delegation chain (returns the root issuer DID).
+        let root_issuer = verify_delegation_chain(
+            token,
+            ctx.did_resolver,
+            ctx.proof_resolver,
+            ctx.revocation_checker,
+            ctx.clock_skew_tolerance_secs,
+            ctx.clock,
+        )?;
+
+        // Step 4: root issuer is the context creator.
+        verify_root_issuer(&root_issuer, ctx.context_creator_did)?;
+
+        // Step 5: audience matches the presenting agent.
+        verify_audience(token, ctx.presenting_agent_did)?;
+
+        // Steps 5a/5b: key scope.
+        validate_key_scope(token)?;
+
+        // Step 6: capability grant-match (the invoked capability).
+        check_capability_match(&granted_caps, required_capability)?;
+
+        // Step 6b: Category-A enforcement.
+        enforce_ucan_category_a(token, &granted_caps)?;
+
+        // Step 7: attenuation (no-op for root tokens).
+        if !token.payload.prf.is_empty() {
+            verify_attenuation(token, ctx.proof_resolver)?;
+        }
+
+        Ok(())
+    })()
+    .is_ok();
+    if !sigs_ok {
+        return result;
+    }
+    result.signatures_valid = true;
+
+    // Steps 6 + 8: within_ceiling reflects BOTH the invoked-capability
+    // grant-match (verified above as part of the signatures stage) AND the
+    // all-attestation ceiling check (spec §7.2.1 step 8). The grant-match
+    // already passed to reach here, so this stage is the all-att ceiling.
+    if verify_ceiling_compliance(&granted_caps, ctx.ceiling).is_err() {
+        return result;
+    }
+    result.within_ceiling = true;
+
+    // Step 9: nonce — READ-ONLY probe. This must never record the nonce, so
+    // evaluate_ucan is safe to call repeatedly on the same token.
+    if ctx
+        .nonce_tracker
+        .check_replay(&token.payload.nnc, token.payload.exp)
+        .is_err()
+    {
+        return result;
+    }
+    result.nonce_valid = true;
+
+    // Step 10: revocation.
+    let revocation_cid = compute_revocation_cid(&token.encoded);
+    if ctx.revocation_checker.is_revoked(&revocation_cid) {
+        return result;
+    }
+    result.not_revoked = true;
+
+    // Step 11: expiry / not-before bounds.
+    if verify_expiry(token, ctx.clock_skew_tolerance_secs, ctx.clock).is_ok() {
+        result.time_bounds_valid = true;
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Individual validation steps
 // ---------------------------------------------------------------------------
+
+/// Step 4: Verify the delegation chain's root issuer is the context creator.
+///
+/// Shared by [`validate_ucan`] and [`evaluate_ucan`] so the root-issuer rule
+/// cannot drift between the enforcing gate and the diagnostic.
+///
+/// # Errors
+///
+/// Returns [`UcanError::InvalidIssuer`] if `root_issuer` is not the context
+/// creator DID.
+fn verify_root_issuer(root_issuer: &str, context_creator_did: &str) -> Result<(), UcanError> {
+    if root_issuer != context_creator_did {
+        return Err(UcanError::InvalidIssuer {
+            expected: context_creator_did.to_owned(),
+            actual: root_issuer.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Step 5: Verify the token's audience matches the presenting agent.
+///
+/// Shared by [`validate_ucan`] and [`evaluate_ucan`] so the audience rule
+/// cannot drift between the enforcing gate and the diagnostic.
+///
+/// # Errors
+///
+/// Returns [`UcanError::AudienceMismatch`] if `token.payload.aud` is not the
+/// presenting agent DID.
+fn verify_audience(token: &UcanToken, presenting_agent_did: &str) -> Result<(), UcanError> {
+    if token.payload.aud != presenting_agent_did {
+        return Err(UcanError::AudienceMismatch {
+            expected: presenting_agent_did.to_owned(),
+            actual: token.payload.aud.clone(),
+        });
+    }
+    Ok(())
+}
 
 /// Extracts the `scp_key_scope` value from a UCAN payload's facts.
 ///
