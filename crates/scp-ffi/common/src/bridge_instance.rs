@@ -357,6 +357,19 @@ pub struct CoreFields {
     /// custody path; production uses real `did:dht`/`did:web` resolution.
     dht_client: OnceLock<Arc<scp_identity::InMemoryDhtClient>>,
 
+    /// The DID-resolution cache shared with the production DID resolver.
+    ///
+    /// Stored alongside [`dht_client`] and the resolver itself (the SAME
+    /// `Arc<DidCache>` the `DualLayerResolver` was built over). The resolver
+    /// caches resolved documents with a multi-day TTL; when a locally held
+    /// identity is mutated (key rotation, agent-key add/rotate/remove,
+    /// migration) and its higher-sequence document is re-published into
+    /// [`dht_client`], the matching cache entry must be invalidated so the
+    /// next resolution re-reads the fresh document instead of serving the
+    /// stale, pre-mutation one. `None` until the identity layer is first set
+    /// up.
+    resolver_cache: OnceLock<Arc<scp_identity::cache::DidCache>>,
+
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
     /// During the Phase 4 transition, each FFI bridge registers hooks that
@@ -536,6 +549,7 @@ impl CoreFields {
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
             dht_client: OnceLock::new(),
+            resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
             relay_urls: Mutex::new(HashSet::new()),
@@ -619,6 +633,7 @@ impl CoreFields {
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
             dht_client: OnceLock::new(),
+            resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
             relay_urls: Mutex::new(HashSet::new()),
@@ -2125,6 +2140,30 @@ impl CoreFields {
     pub fn set_dht_client(&self, client: Arc<scp_identity::InMemoryDhtClient>) {
         if self.dht_client.set(client).is_err() {
             tracing::warn!("set_dht_client called but client already initialized — ignoring");
+        }
+    }
+
+    /// Returns the DID-resolution cache shared with the production resolver, if
+    /// initialized.
+    ///
+    /// Used to invalidate a DID's cached document after a higher-sequence
+    /// re-publish (key rotation / agent-key / migration) so the resolver does
+    /// not keep serving the stale, pre-mutation document for the cache's
+    /// multi-day TTL.
+    #[must_use]
+    pub fn resolver_cache(&self) -> Option<&Arc<scp_identity::cache::DidCache>> {
+        self.resolver_cache.get()
+    }
+
+    /// Stores the DID-resolution cache backing the DID resolver.
+    ///
+    /// Called once during identity system setup, alongside [`set_did_resolver`]
+    /// and [`set_dht_client`], with the SAME `Arc<DidCache>` the resolver was
+    /// built over. Subsequent calls are no-ops (`OnceLock` guarantees single
+    /// initialization).
+    pub fn set_resolver_cache(&self, cache: Arc<scp_identity::cache::DidCache>) {
+        if self.resolver_cache.set(cache).is_err() {
+            tracing::warn!("set_resolver_cache called but cache already initialized — ignoring");
         }
     }
 

@@ -173,3 +173,38 @@ class TestScpIdVerify:
         assert auth.did == identity.did
         assert auth.signing_key_id == "#active"
         assert auth.signed_at == response.signed_at
+
+    def test_verify_uses_rotated_active_key_not_stale(self, scp: SCP) -> None:
+        """After ``identity_rotate_key``, the resolver must serve the NEW
+        ``#active`` key.
+
+        Rotation publishes a higher-sequence DID document into the SAME
+        per-instance resolver DHT client that ``scpid_verify`` resolves
+        against. If rotation published into a throwaway client (or at a
+        non-advancing sequence), the resolver would keep serving the stale
+        pre-rotation document: a fresh challenge signed by the NEW active key
+        would then fail to verify against the OLD key, silently defeating the
+        revocation purpose of rotation. This asserts the post-rotation
+        signature verifies, which is only possible if the rotated document
+        reached the shared resolver.
+        """
+        identity = _run(scp.identity_create(CustodyType.IN_MEMORY))
+
+        # Baseline: pre-rotation active key signs and verifies.
+        challenge = _run(scp.scpid_challenge("https://example.com", 120))
+        response = _run(scp.scpid_sign(identity.did, "#active", challenge.to_json()))
+        _run(scp.scpid_verify(response.to_json(), challenge.to_json()))
+
+        # Rotate the active signing key (DID string is unchanged).
+        rotated = _run(scp.identity_rotate_key(identity._raw_handle))
+        assert rotated.did == identity.did
+
+        # A fresh challenge signed with the NEW active key must verify, which
+        # requires the resolver to serve the rotated document (FIX B).
+        new_challenge = _run(scp.scpid_challenge("https://example.com", 120))
+        new_response = _run(scp.scpid_sign(identity.did, "#active", new_challenge.to_json()))
+        auth = _run(scp.scpid_verify(new_response.to_json(), new_challenge.to_json()))
+
+        assert auth.did == identity.did
+        assert auth.signing_key_id == "#active"
+        assert auth.signed_at == new_response.signed_at

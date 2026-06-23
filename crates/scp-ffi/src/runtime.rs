@@ -1314,6 +1314,37 @@ pub fn set_resolver_dht_client(
     bi.core.set_dht_client(client);
 }
 
+/// Stores the DID-resolution cache backing this instance's DID resolver.
+///
+/// Called once during resolver initialization with the SAME `Arc<DidCache>`
+/// the resolver was built over. Subsequent calls are no-ops.
+pub fn set_resolver_cache(bi: &PyBridgeInstance, cache: Arc<scp_identity::cache::DidCache>) {
+    bi.core.set_resolver_cache(cache);
+}
+
+/// Returns the resolver's DID-resolution cache, if initialized.
+///
+/// Async callers (already inside the shared runtime) can `await
+/// cache.remove(did)` directly; sync callers should use
+/// [`invalidate_resolver_cache`].
+#[must_use]
+pub fn resolver_cache(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::cache::DidCache>> {
+    bi.core.resolver_cache().map(Arc::clone)
+}
+
+/// Invalidates the resolver's cached document for `did` after a higher-sequence
+/// re-publish (key rotation, agent-key add/rotate/remove, migration).
+///
+/// The resolver caches resolved documents with a multi-day TTL. Without this,
+/// a freshly rotated identity would keep resolving to its pre-rotation document
+/// (and pre-rotation `#active` key) until the cache TTL expired — defeating
+/// rotation's revocation purpose. Best-effort: a no-op when no cache is wired.
+pub fn invalidate_resolver_cache(bi: &PyBridgeInstance, did: &str, rt: &tokio::runtime::Runtime) {
+    if let Some(cache) = bi.core.resolver_cache() {
+        rt.block_on(cache.remove(did));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key resolver helper — delegates to scp-ffi-common
 // ---------------------------------------------------------------------------

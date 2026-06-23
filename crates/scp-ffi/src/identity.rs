@@ -90,12 +90,16 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
     let resolver = Arc::new(DualLayerResolver::new(
         relay_querier,
         Arc::clone(&dht_client),
-        cache,
+        Arc::clone(&cache),
         bootstrap_relays,
     ));
 
     crate::runtime::init_did_resolver(bi, resolver, handle);
     crate::runtime::set_resolver_dht_client(bi, dht_client);
+    // Retain the SAME cache `Arc` the resolver was built over so post-rotation
+    // re-publishes can invalidate the stale cached document (see
+    // `invalidate_resolver_cache`).
+    crate::runtime::set_resolver_cache(bi, cache);
 }
 
 /// Publishes a newly created in-memory DID document into the instance's
@@ -112,6 +116,14 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 /// [`scp_identity::dht_client::DhtClient::publish`]. Best-effort: errors are
 /// logged but never fail identity creation (the document is still registered
 /// locally; only resolver discoverability is affected).
+///
+/// This is the FIRST publish of a freshly minted DID, so `seq = 1` is correct
+/// by construction. SUBSEQUENT publishes (key rotation, agent-key add/rotate/
+/// remove, migration) do NOT route through here: they go through a `DidDht`
+/// built against the same resolver client (see `rotation_publish_client`) whose
+/// monotonic BEP44 sequence is bootstrapped via `DidDht::initialize_sequence`,
+/// guaranteeing each re-publish carries a strictly higher `seq` that overwrites
+/// the prior record and advances the resolver's downgrade tracker.
 ///
 /// Mirrors the NAPI bridge's `publish_to_shared_dht_for`.
 async fn publish_to_resolver_dht_for(
@@ -168,6 +180,83 @@ async fn publish_to_resolver_dht_for(
     {
         tracing::warn!("publish_to_resolver_dht: DHT publish failed: {e}");
     }
+}
+
+/// Selects the DHT client that key-rotation / agent-key / migration operations
+/// should publish their UPDATED DID document into.
+///
+/// Rotation, agent-key, and migration operations re-publish a NEW DID document
+/// (a higher BEP44 sequence). That document MUST land in the per-instance
+/// resolver DHT client — the one [`IdentityBackedDidResolver`] reads from
+/// (seeded by [`set_resolver_dht_client`] / read via [`resolver_dht_client`]) —
+/// so that subsequent DID resolution (UCAN validation, governance vote-signature
+/// verification) sees the rotated `#active` key and rejects signatures from the
+/// retired one. Publishing into a throwaway client would leave the resolver
+/// permanently serving the stale, pre-rotation document, silently defeating
+/// rotation's revocation purpose.
+///
+/// Returns the shared resolver client when the resolver is initialized on this
+/// instance. When it is not (e.g. before any `identity_create`, or in a
+/// bridge configuration without DID resolution), there is nothing to keep in
+/// sync, so a fresh in-memory client is returned: the in-place document update
+/// in the registry still happens, and no stale state can be served because no
+/// resolver exists.
+fn rotation_publish_client(bi: &PyBridgeInstance) -> Arc<InMemoryDhtClient> {
+    crate::runtime::resolver_dht_client(bi).unwrap_or_else(|| Arc::new(InMemoryDhtClient::new()))
+}
+
+/// Runs the migration publish chain against the SHARED resolver DHT client.
+///
+/// Migration publishes TWO documents — the new DID's document and the old DID's
+/// `alsoKnownAs` update — both of which must land in the resolver client (see
+/// [`rotation_publish_client`]) so DID resolution follows the migration forward
+/// instead of pinning the pre-migration document. The BEP44 sequence is seeded
+/// from the OLD DID's current value via `DidDht::initialize_sequence`, so the
+/// old-document republish strictly overwrites the pre-migration record (the new
+/// DID is fresh and starts at sequence 1). A failure is logged loudly because
+/// it leaves the resolver potentially serving the pre-migration document.
+#[allow(clippy::too_many_arguments)] // Mirrors `DidDht::migrate_identity`'s arity (FFI seam).
+async fn run_migrate_publish<C>(
+    bi: &PyBridgeInstance,
+    old_did: &str,
+    old_identity: &ScpIdentity,
+    old_doc: &DidDocument,
+    pre_rotation_handle: &scp_platform::PreRotationKeyHandle,
+    pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+    key_custody: &Arc<C>,
+    rotated_at: u64,
+) -> Result<scp_identity::MigrationOutcome, ScpPyError>
+where
+    C: KeyCustody + Send + Sync + 'static,
+{
+    let sign_fn = DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+        Arc::clone(key_custody),
+    );
+    let publish_client = rotation_publish_client(bi);
+    let did_method =
+        DidDht::with_client_and_signer(publish_client, Arc::new(DidCache::new()), sign_fn);
+    did_method
+        .initialize_sequence(old_did)
+        .await
+        .map_err(ScpPyError::from)?;
+    did_method
+        .migrate_identity(
+            old_identity,
+            old_doc,
+            pre_rotation_handle,
+            pre_rotation_custody,
+            key_custody.as_ref(),
+            rotated_at,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                old_did = %old_did,
+                error = %e,
+                "identity_migrate: migration/republish failed — resolver may still serve the pre-migration document"
+            );
+            ScpPyError::from(e)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,25 +1488,40 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
+        let publish_client = rotation_publish_client(&self.inner);
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
                     DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
+                // Publish the rotated document into the SHARED resolver DHT
+                // client so DID resolution serves the new `#active` key and
+                // rejects the retired one. `initialize_sequence` advances this
+                // method's BEP44 sequence past whatever the resolver already
+                // holds, so the rotated document strictly overwrites it (a
+                // lower-or-equal `seq` would be a silent no-op).
                 let did_method = DidDht::with_client_and_signer(
-                    Arc::new(InMemoryDhtClient::new()),
+                    Arc::clone(&publish_client),
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
 
                 let rotation_result = rt.block_on(async {
+                    did_method.initialize_sequence(&did).await?;
                     did_method
                         .rotate_active_key(&entry.identity, &entry.document, entry.custody.as_ref())
                         .await
                 });
 
-                let (new_identity, new_document) = rotation_result.map_err(ScpPyError::from)?;
+                let (new_identity, new_document) = rotation_result.map_err(|e| {
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        "identity_rotate_key: rotation/republish failed — resolver may still serve the pre-rotation key"
+                    );
+                    ScpPyError::from(e)
+                })?;
                 entry.identity = new_identity;
                 entry.document = new_document;
 
@@ -1435,6 +1539,12 @@ impl crate::scp::PyScp {
                 ))
             })
         });
+        if result.is_ok() {
+            // The re-published document carries a higher BEP44 sequence; drop
+            // the resolver's now-stale cached copy so the next resolution reads
+            // the fresh document (with the rotated/updated keys).
+            crate::runtime::invalidate_resolver_cache(&self.inner, &did, rt);
+        }
         result.map_err(PyErr::from)
     }
 
@@ -1473,25 +1583,37 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
+        let publish_client = rotation_publish_client(&self.inner);
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
                     DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
+                // Publish the agent-key-bearing document into the SHARED
+                // resolver DHT client (see `rotation_publish_client`), advancing
+                // the BEP44 sequence past the resolver's current value first.
                 let did_method = DidDht::with_client_and_signer(
-                    Arc::new(InMemoryDhtClient::new()),
+                    Arc::clone(&publish_client),
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
 
                 let add_result = rt.block_on(async {
+                    did_method.initialize_sequence(&did).await?;
                     did_method
                         .add_agent_key(&entry.identity, &entry.document, entry.custody.as_ref())
                         .await
                 });
 
-                let (new_identity, new_document) = add_result.map_err(ScpPyError::from)?;
+                let (new_identity, new_document) = add_result.map_err(|e| {
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        "identity_add_agent_key: add/republish failed — resolver may not serve the new agent key"
+                    );
+                    ScpPyError::from(e)
+                })?;
                 entry.identity = new_identity;
                 entry.document = new_document;
 
@@ -1509,6 +1631,12 @@ impl crate::scp::PyScp {
                 ))
             })
         });
+        if result.is_ok() {
+            // The re-published document carries a higher BEP44 sequence; drop
+            // the resolver's now-stale cached copy so the next resolution reads
+            // the fresh document (with the rotated/updated keys).
+            crate::runtime::invalidate_resolver_cache(&self.inner, &did, rt);
+        }
         result.map_err(PyErr::from)
     }
 
@@ -1547,25 +1675,37 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
+        let publish_client = rotation_publish_client(&self.inner);
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
                     DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
+                // Publish the rotated-agent-key document into the SHARED
+                // resolver DHT client (see `rotation_publish_client`), advancing
+                // the BEP44 sequence past the resolver's current value first.
                 let did_method = DidDht::with_client_and_signer(
-                    Arc::new(InMemoryDhtClient::new()),
+                    Arc::clone(&publish_client),
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
 
                 let rotate_result = rt.block_on(async {
+                    did_method.initialize_sequence(&did).await?;
                     did_method
                         .rotate_agent_key(&entry.identity, &entry.document, entry.custody.as_ref())
                         .await
                 });
 
-                let (new_identity, new_document) = rotate_result.map_err(ScpPyError::from)?;
+                let (new_identity, new_document) = rotate_result.map_err(|e| {
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        "identity_rotate_agent_key: rotation/republish failed — resolver may still serve the retired agent key"
+                    );
+                    ScpPyError::from(e)
+                })?;
                 entry.identity = new_identity;
                 entry.document = new_document;
 
@@ -1583,6 +1723,12 @@ impl crate::scp::PyScp {
                 ))
             })
         });
+        if result.is_ok() {
+            // The re-published document carries a higher BEP44 sequence; drop
+            // the resolver's now-stale cached copy so the next resolution reads
+            // the fresh document (with the rotated/updated keys).
+            crate::runtime::invalidate_resolver_cache(&self.inner, &did, rt);
+        }
         result.map_err(PyErr::from)
     }
 
@@ -1620,25 +1766,38 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
+        let publish_client = rotation_publish_client(&self.inner);
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
                     DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
+                // Publish the agent-key-removed document into the SHARED
+                // resolver DHT client (see `rotation_publish_client`) so the
+                // resolver stops serving the removed agent key. Advance the
+                // BEP44 sequence past the resolver's current value first.
                 let did_method = DidDht::with_client_and_signer(
-                    Arc::new(InMemoryDhtClient::new()),
+                    Arc::clone(&publish_client),
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
 
                 let remove_result = rt.block_on(async {
+                    did_method.initialize_sequence(&did).await?;
                     did_method
                         .remove_agent_key(&entry.identity, &entry.document)
                         .await
                 });
 
-                let (new_identity, new_document) = remove_result.map_err(ScpPyError::from)?;
+                let (new_identity, new_document) = remove_result.map_err(|e| {
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        "identity_remove_agent_key: removal/republish failed — resolver may still serve the removed agent key"
+                    );
+                    ScpPyError::from(e)
+                })?;
                 entry.identity = new_identity;
                 entry.document = new_document;
 
@@ -1656,6 +1815,12 @@ impl crate::scp::PyScp {
                 ))
             })
         });
+        if result.is_ok() {
+            // The re-published document carries a higher BEP44 sequence; drop
+            // the resolver's now-stale cached copy so the next resolution reads
+            // the fresh document (with the rotated/updated keys).
+            crate::runtime::invalidate_resolver_cache(&self.inner, &did, rt);
+        }
         result.map_err(PyErr::from)
     }
 
@@ -1769,26 +1934,17 @@ impl crate::scp::PyScp {
                     did: old_did.clone(),
                 };
 
-                let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
-                        Arc::clone(&custody),
-                    );
-                let did_method = DidDht::with_client_and_signer(
-                    Arc::new(InMemoryDhtClient::new()),
-                    Arc::new(DidCache::new()),
-                    sign_fn,
-                );
-                let outcome = did_method
-                    .migrate_identity(
-                        &old_identity,
-                        &old_doc,
-                        &pre_rotation_handle,
-                        pre_rotation_custody.as_ref(),
-                        custody.as_ref(),
-                        rotated_at,
-                    )
-                    .await
-                    .map_err(ScpPyError::from)?;
+                let outcome = run_migrate_publish(
+                    &bi_arc,
+                    &old_did,
+                    &old_identity,
+                    &old_doc,
+                    &pre_rotation_handle,
+                    pre_rotation_custody.as_ref(),
+                    &custody,
+                    rotated_at,
+                )
+                .await?;
                 let rotation_event_json = serialize_rotation_event(&outcome.rotation_event)?;
                 let scp_identity::MigrationOutcome {
                     new_identity,
@@ -1830,6 +1986,16 @@ impl crate::scp::PyScp {
                         pre_rotation_custody,
                     },
                 );
+
+                // Migration re-published BOTH documents at higher sequences:
+                // the new DID's document and the old DID's `alsoKnownAs`
+                // update. Drop both stale cache entries so resolution follows
+                // the migration forward instead of serving pre-migration docs.
+                if let Some(cache) = crate::runtime::resolver_cache(&bi_arc) {
+                    cache.remove(&old_did).await;
+                    cache.remove(&new_did).await;
+                }
+
                 Ok((
                     PyIdentity::from_document(
                         &bi_arc,
