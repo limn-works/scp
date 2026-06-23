@@ -294,14 +294,6 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handler-no-panic.sh
 
-  class-s-fail-closed:
-    needs: check-draft
-    name: Actor / Class-S consume-site fail-closed (ADR-049 §9)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - run: bash scripts/check-class-s-fail-closed.sh
-
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)

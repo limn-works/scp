@@ -1239,7 +1239,15 @@ pub(crate) struct GovernanceState {
     /// required when revocation lands is populating it (no enforcement
     /// rewrite needed). The set is part of the governance bucket because
     /// revocation actions are governance-driven (§19.5).
-    pub(crate) revoked_spending_ucan_cids: HashSet<String>,
+    ///
+    /// ADR-049 §9 classifies this revocation set as **Class S**: a coalesce-window
+    /// rollback of a revocation would re-admit a spending UCAN the caller observed
+    /// as revoked. Privatized to `pub(in crate::context)` (defense-in-depth, so it
+    /// is unnameable outside `crate::context`) and left to the `..` rest of the
+    /// best-effort [`GovernanceClassCMut`](crate::context::actor::class_s) view's
+    /// destructure, so that best-effort path holds no `&mut` to it — when
+    /// revocation wiring lands it must route through a fail-closed combinator.
+    pub(in crate::context) revoked_spending_ucan_cids: HashSet<String>,
     /// Per-member governance proposal timestamps for earned capacity rate limiting
     /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
     /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
@@ -1251,9 +1259,12 @@ pub(crate) struct GovernanceState {
     /// a security window the caller already observed as closed. Grouped into
     /// [`GovernanceClassS`] so the fail-closed-persist boundary is one named
     /// sub-struct rather than four loose fields scattered through the
-    /// governance bucket. Fields remain `pub(crate)` — privatization behind a
-    /// mutator-combinator boundary is a LATER PR.
-    pub(crate) class_s: GovernanceClassS,
+    /// governance bucket. Privatized to `pub(in crate::context)`: the field is
+    /// unnameable outside `crate::context`, and within it the ONLY mutable reach
+    /// is through the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+    /// persist-on-commit combinators (no `state_mut`, no `DerefMut`). The
+    /// snapshot/serialization paths read it shared. ADR-049 §9.
+    pub(in crate::context) class_s: GovernanceClassS,
 }
 
 /// The Class-S subset of [`GovernanceState`] (ADR-049 §9).

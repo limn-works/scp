@@ -96,11 +96,20 @@ fn append_consequence_event(
 ///   [`cooldown_until_mut`](super::actor::class_s::GovernanceClassCMut::cooldown_until_mut))
 ///   and CANNOT reach `governance.class_s`, so a consequence helper cannot
 ///   accidentally mutate a Class-S governance field with no fail-closed persist.
-/// - `role_state: &'a mut ContextRoleState` — the ONE whole-substruct `&mut`,
-///   the documented ADR-049 §9 line-194 ACCEPTED Class-C residual: the
-///   consequence anti-spam suspension (`suspend_all` / `suspend_capabilities`)
-///   is best-effort BY DESIGN and deliberately NOT routed through a fail-closed
-///   combinator. Preserved EXACTLY — no behavior change.
+/// - `role_state: &'a mut ContextRoleState` — a whole-substruct `&mut`. This is
+///   part of the KNOWN RESIDUAL documented in ADR-049 §9 ("Known residual — the
+///   dual-use `ContextRoleState` downward-auth fields") and in
+///   [`super::actor::class_s`]'s module "Known residual" section: this whole
+///   `&mut` can reach the dual-use downward-auth Class-S fields `ceiling` /
+///   `suspended_capabilities` (the consequence anti-spam suspension
+///   `suspend_all` / `suspend_capabilities` rides it) with no fail-closed persist.
+///   It is NOT an ADR-accepted residual — the only accepted security-adjacent
+///   Class-C residual in §9 (`velocity_tracker` / `earned_capacity`) explicitly
+///   excludes re-granting a removed capability, which a `suspended_capabilities`
+///   rollback does — it is a residual to CLOSE, alongside
+///   [`super::actor::class_s::ClassCMut::role_state_mut`], when the consequence
+///   path moves onto a field-granular role-state view. Preserved EXACTLY for now
+///   — no behavior change.
 /// - `membership: &'a MembershipState` (read-only), `receive_buffer`,
 ///   `checkpoint_events_since` — unchanged.
 ///

@@ -13965,11 +13965,12 @@ mod tests {
     /// — a code path that mutates a Class-S field and then acknowledges the
     /// operation WITHOUT a fail-closed persist (e.g. the message-send / paid-
     /// join nonce-consume sites that earlier rounds missed while the tool-invoke
-    /// site was fixed). That complementary half is enforced by
-    /// `scripts/check-class-s-fail-closed.sh`, which scans every consume site
-    /// and requires a fail-closed persist before acknowledgment. The two
-    /// together — field round-trip HERE, consume-site fail-closed THERE — are
-    /// what the §9 enforcement actually guarantees.
+    /// site was fixed). That complementary half is now enforced at COMPILE TIME
+    /// by the `ClassSCell` boundary (no `DerefMut` / `state_mut`; the only `&mut`
+    /// reach to a Class-S field is through a persist-on-commit combinator), plus
+    /// the `class_s_no_persist_mutator_whitelist_is_bounded` tripwire test in
+    /// `context::actor::class_s`. The two together — field round-trip HERE,
+    /// mutation-must-persist THERE — are what the §9 enforcement guarantees.
     ///
     /// The mechanism that catches a NEW coalesced-only security FIELD:
     ///

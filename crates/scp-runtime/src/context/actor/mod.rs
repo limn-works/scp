@@ -230,10 +230,10 @@ impl ContextActor {
         Self {
             context_id,
             inbox,
-            // Wrap the owned state in the Class-S fail-closed-persist cell.
-            // PR1 scaffolding: handlers still receive `&mut PerContextState`
-            // via `ClassSCell::state_mut()` at the dispatch boundary, so this
-            // is a pure ownership change with no behaviour difference.
+            // Wrap the owned state in the Class-S fail-closed-persist cell. The
+            // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
+            // `state_mut`); every handler mutates through the cell's persist-on-
+            // commit combinators or the airtight `class_c_view()` (ADR-049 §9).
             state: Some(class_s::ClassSCell::new(state)),
             deps: Some(deps),
             ttl_timer: None,
@@ -463,17 +463,15 @@ impl ContextActor {
             )
         };
 
-        // Class-S migration seam: `dispatch_state` receives the
-        // `&mut ClassSCell` directly and threads it into every domain
-        // handler. All dispatch arms pass the `cell` (not a bare
-        // `&mut PerContextState` via `state_mut()`); each domain mutates
-        // through the non-persisting `class_c_view()` / `commit_class_c_*`
-        // combinators (these domains are Class-C / read-only for Class-S),
-        // so dispatch behaviour is byte-for-byte unchanged. The sole
-        // remaining `state_mut()` in a domain body is the FLAGGED
-        // best-effort broadcast member-removal in `unsubscribe_broadcast`
-        // (the restricted Class-C membership view cannot express removal —
-        // see its inline FLAG).
+        // `dispatch_state` receives the `&mut ClassSCell` directly and threads
+        // it into every domain handler. Every domain mutates through the cell's
+        // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
+        // for Class-S transitions, and the airtight `class_c_view()` /
+        // `commit_class_c_best_effort` for Class-C / structural state. There is
+        // no `state_mut()` escape hatch (deleted), and the broadcast member-
+        // removal in `unsubscribe_broadcast` routes through the restricted
+        // `MembershipClassCMut::remove_subscriber` (a public-content subscriber
+        // unsubscribe is best-effort-acceptable; see its doc, ADR-049 §9).
         let outcome = Self::dispatch_state(&mut cell, &deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;

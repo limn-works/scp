@@ -1288,9 +1288,13 @@ pub struct PerContextState {
     /// committed/reservation witnesses whose ≤50 ms coalesce-window rollback
     /// would re-open a replay / re-invoke / double-settle window the caller
     /// already observed as closed. See [`ClassSState`] for the per-field
-    /// security rationale. Fields stay `pub(crate)` — privatization behind a
-    /// mutator-combinator boundary is a LATER PR.
-    pub(crate) class_s: ClassSState,
+    /// security rationale. Privatized to `pub(in crate::context)`: the field is
+    /// unnameable outside `crate::context`, and within it the ONLY mutable reach
+    /// is through the [`ClassSCell`](crate::context::actor::class_s::ClassSCell)
+    /// persist-on-commit combinators (no `state_mut`, no `DerefMut`). The `&mut`
+    /// in the snapshot/serialization paths (`build_snapshot_from_state`) reads it
+    /// shared. ADR-049 §9.
+    pub(in crate::context) class_s: ClassSState,
 
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1

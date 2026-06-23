@@ -867,13 +867,16 @@ pub async fn settle_tool_economy_capture(
         &consequence_rules,
     );
 
-    // Best-effort consequence path (ADR-049 §9 line-194). `split_class_c()`
-    // yields exactly the `ConsequenceStateSplit` shape — the same five disjoint
-    // Class-C / structural borrows `from_state(&mut PerContextState)` produced —
-    // from the field-granular cell view, with NO whole `&mut PerContextState`
-    // and NO `&mut` reach into any Class-S sub-struct. Enforcement stays
-    // best-effort (the run loop coalesce-persists; no per-site fail-closed
-    // persist).
+    // Best-effort consequence path (ADR-049 §9). `split_class_c()` yields exactly
+    // the `ConsequenceStateSplit` shape — the same five disjoint Class-C /
+    // structural borrows `from_state(&mut PerContextState)` produced — from the
+    // field-granular cell view, with NO whole `&mut PerContextState` and NO `&mut`
+    // reach into any of the three PRIVATIZED Class-S sub-structs. (Its
+    // `role_state` borrow is the documented dual-use `ContextRoleState` residual —
+    // see ADR-049 §9 "Known residual" — through which `ceiling` /
+    // `suspended_capabilities` remain reachable; that residual is tracked, not
+    // closed here.) Enforcement stays best-effort (the run loop coalesce-persists;
+    // no per-site fail-closed persist).
     let mut split = view.split_class_c();
     crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,

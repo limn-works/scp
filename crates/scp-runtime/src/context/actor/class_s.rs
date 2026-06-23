@@ -11,14 +11,30 @@
 //! would let an actor crash roll the mutation back and re-open a replay /
 //! re-spend / re-grant window the caller already observed as closed.
 //!
-//! Today that invariant is enforced by a source-text scanner
-//! (`scripts/check-class-s-fail-closed.sh`) which pattern-matches handler bodies
-//! for "mutate then persist_fail_closed." A source-text scanner is structurally
-//! non-convergent: every new way to alias a `&mut PerContextState`
-//! (extern-fn, `&mut`-alias, ref-mut-destructure, autoref-method) is a fresh
-//! evasion, and the gate must grow a new pattern to catch each one. The goal of
-//! the refactor this file is part of is to make the invariant a **compile error**
-//! to violate, retiring the scanner.
+//! This invariant is now enforced **by the type system** for the THREE privatized
+//! Class-S fields (`PerContextState.class_s`, `GovernanceState.class_s`,
+//! `GovernanceState.revoked_spending_ucan_cids`). The original enforcement was a
+//! source-text scanner (`scripts/check-class-s-fail-closed.sh`) which
+//! pattern-matched handler bodies for "mutate then persist_fail_closed." A
+//! source-text scanner is structurally non-convergent: every new way to alias a
+//! `&mut PerContextState` (extern-fn, `&mut`-alias, ref-mut-destructure,
+//! autoref-method) was a fresh evasion, and the gate had to grow a new pattern to
+//! catch each one. That scanner has been **RETIRED**: this file's `ClassSCell`
+//! (no `DerefMut`, no `state_mut` escape hatch) plus the privatized Class-S fields
+//! make a mutation of those three fields outside a fail-closed-persisting
+//! combinator a **compile error**, and a bounded positive-allowlist tripwire test
+//! (`class_s_no_persist_mutator_whitelist_is_bounded`, this module's test
+//! submodule) guards the one sanctioned no-persist Class-S method against a NEW
+//! no-persist mutator being added later. For those three fields the compile-time
+//! guard + the whitelist together cover what the scanner covered, soundly and
+//! convergently. The scanner ALSO had markers for the dual-use
+//! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth pair and
+//! for `MembershipState::remove_member`; member removal IS now behind the boundary
+//! (the best-effort views withhold `remove_member` and removal routes through a
+//! fail-closed combinator), but the `ceiling` / `suspended_capabilities` pair is
+//! the documented residual still reachable from the best-effort surface (see
+//! "Known residual" below) — for it, neither the compile boundary nor the tripwire
+//! yet substitutes for the retired scanner, and that gap is disclosed, not closed.
 //!
 //! # The mechanism
 //!
@@ -27,9 +43,14 @@
 //! - **Reads** via [`Deref`] — `&*cell` / `cell.<field>` yields `&PerContextState`.
 //!   There is deliberately **no [`DerefMut`]**: you cannot obtain a
 //!   `&mut PerContextState` by writing `&mut cell.<field>` or `*cell = …`. That is
-//!   the compile-time hook — a future migration step privatizes the fields so the
-//!   ONLY way to mutate Class-S state is through the combinators below, each of
-//!   which performs the fail-closed persist by construction.
+//!   the compile-time hook, and it is now in force for the THREE privatized
+//!   Class-S fields (`PerContextState.class_s`, `GovernanceState.class_s`, and
+//!   `GovernanceState.revoked_spending_ucan_cids` are `pub(in crate::context)`):
+//!   with no `state_mut` escape hatch, the only way to mutate THOSE THREE FIELDS
+//!   is through the combinators below, each of which performs the fail-closed
+//!   persist by construction. (The dual-use `ContextRoleState.ceiling` /
+//!   `suspended_capabilities` Class-S pair is NOT yet behind this hook — see the
+//!   "Known residual" section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
 //!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
 //!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
@@ -90,9 +111,10 @@
 //! handler modules are co-descendants of `context::actor`, so no `pub(in PATH)`
 //! visibility separates them (a handler could always name `class_s` through a
 //! whole-struct `&mut` if one were ever handed out — but none is). Field
-//! privatization (a later step) concerns only the [`ClassSCell::state_mut`]
-//! escape hatch and [`ClassSMut`]'s `pub(crate)` reach, NOT this view, which is
-//! already airtight.
+//! privatization (`PerContextState.class_s` / `GovernanceState.class_s` are now
+//! `pub(in crate::context)`) closes the LAST whole-`&mut` reach that DID exist —
+//! the deleted [`ClassSCell::state_mut`] escape hatch and [`ClassSMut`]'s
+//! `pub(crate)` reach — NOT this view, which was already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
 //!   log adapter on [`ActorDeps`]); if `after` fails, restore the snapshot and
@@ -103,16 +125,18 @@
 //!
 //! # Combinator coverage & migration scope
 //!
-//! These six combinators are deliberately the set for the **common** Class-S
+//! These combinators are deliberately the set for the **common** Class-S
 //! persist/rollback shapes, not an exhaustive cover of every call site. The
-//! Class-S-capable five span the *keep / restore* × *no-Class-C-undo /
+//! Class-S-capable ones span the *keep / restore* × *no-Class-C-undo /
 //! Class-C-(or-external)-undo* grid — `*_keep` (keep, no undo), `*_restore`
 //! (restore, no undo), `*_keep_compensating` (keep, undo C/external),
 //! `*_compensating` (restore, undo C/external) — plus `*_then_append` for the
 //! one extra shape of a fail-closed persist FOLLOWED BY an external durable
-//! append (event-log) that can itself fail; `commit_class_c_best_effort` covers
-//! the Class-C best-effort path. They are chosen because they are the shapes
-//! that recur; they are NOT proof that every site fits one of them.
+//! append (event-log) that can itself fail, and `*_keep_restore_split` for a
+//! single fail-closed persist that KEEPs one Class-S field while RESTOREing
+//! another (the `prepare_b` decomposition shape). `commit_class_c_best_effort`
+//! covers the Class-C best-effort path. They are chosen because they are the
+//! shapes that recur; they are NOT proof that every site fits one of them.
 //!
 //! A site whose shape falls OUTSIDE this set is handled when **that site
 //! migrates** (during the handler migration, where its exact crash/atomicity
@@ -136,25 +160,77 @@
 //!   `emit_divergence_marker`) is not a Class-S mutation site at all and needs
 //!   no combinator — it routes through the ordinary persist path.
 //!
-//! The [`ClassSCell::state_mut`] escape hatch is what bridges every site that
-//! has not yet migrated: a site still on `state_mut` is EXPECTED during the
-//! migration, not a defect. `state_mut` is deleted in the terminal migration
-//! step, once every Class-S mutation routes through a combinator (or a
-//! site-specific one added along the way); at that point — with the Class-S
-//! fields privatized and no `DerefMut` — the compiler, not this prose,
-//! enforces that every Class-S mutation is fail-closed-persisted.
+//! For the three PRIVATIZED Class-S fields — `PerContextState.class_s`,
+//! `GovernanceState.class_s`, and `GovernanceState.revoked_spending_ucan_cids` —
+//! the boundary is now in force: every mutation of them routes through a
+//! combinator (or the single sanctioned no-persist
+//! [`ClassSCell::clear_committed_reservation_idempotent`]). The temporary
+//! `state_mut` escape hatch has been DELETED, those fields are privatized, and
+//! there is no `DerefMut` — so the compiler, not this prose, enforces that every
+//! mutation of them is fail-closed-persisted. The text scanner
+//! (`scripts/check-class-s-fail-closed.sh`) is retired in favour of this
+//! compile-time guarantee plus the bounded whitelist tripwire described below.
 //!
-//! # Behaviour-neutral scaffolding
+//! # Known residual — the dual-use `ContextRoleState` downward-auth fields
 //!
-//! No handler is migrated to these combinators yet (handlers still mutate through
-//! the temporary [`ClassSCell::state_mut`] escape hatch + nested field paths), so
-//! the combinators are `#[allow(dead_code)]` and exercised only by this module's
-//! unit tests. The source-text gate is UNCHANGED and still passes — the view
-//! `*_mut()` accessors return `&mut` to the sub-structs and carry no Class-S
-//! mutation MARKER tokens, and the combinators take closures (any marker appears
-//! in the caller's closure, where the later migration will route it through the
-//! persist-on-commit boundary). The escape hatch and these allows are removed in
-//! the final migration step.
+//! ADR-049 §9 also classifies the **downward-authorization** fields
+//! `ContextRoleState.ceiling` and `ContextRoleState.suspended_capabilities` as
+//! Class-S (a coalesce-window rollback of a ceiling tightening or a capability
+//! suspension re-widens authority the caller observed as narrowed). These are
+//! NOT yet behind the compile-time boundary: the best-effort surface still hands
+//! out a whole `&mut ContextRoleState` (through which a best-effort path can reach
+//! `ceiling` / `suspended_capabilities` with no fail-closed persist) via THREE
+//! accessors, ALL of which are part of this residual:
+//!
+//! 1. [`ClassCMut::role_state_mut`] — the direct whole-`&mut` accessor.
+//! 2. [`ClassCMut::split_class_c`] → [`ClassCSplit::role_state`] — the disjoint
+//!    consequence-path split carries the same whole `&mut ContextRoleState`.
+//! 3. [`ClassCSplit::from_state`] — the cell-free bridge builds the same split
+//!    (and thus the same `role_state` `&mut`) directly from a
+//!    `&mut PerContextState`.
+//!
+//! The restricted replacement [`ClassCMut::role_state_class_c_mut`] (which hands
+//! out a [`RoleStateClassCMut`] exposing `&mut` only for the Class-C structural
+//! fields and shared `&` reads of the two downward-auth fields) ALREADY EXISTS;
+//! the residual closes when the `role_state_mut` callers AND the consequence-path
+//! `ClassCSplit.role_state` consumers migrate onto that field-granular shape and
+//! all three whole-`&mut` exits are removed. This is NOT an ADR-sanctioned
+//! accepted residual — the only accepted security-adjacent Class-C residual in §9
+//! (`velocity_tracker` / `earned_capacity`) explicitly EXCLUDES re-granting a
+//! removed capability, which a `suspended_capabilities` rollback does; this pair
+//! is a residual to CLOSE, not an accepted carve-out. Until then the compile-time
+//! guarantee above holds for the three privatized fields but NOT for the
+//! `ContextRoleState` dual-use pair — see [`ClassCMut::role_state_mut`]'s own doc
+//! and ADR-049 §9. The whitelist tripwire scans only `impl ClassSCell` and so does
+//! not cover these `ClassCMut` / `ClassCSplit` accessor paths either; the residual
+//! is tracked here honestly rather than claimed closed.
+//!
+//! # Final enforcement model
+//!
+//! Most combinators now have production callers. Only two —
+//! [`ClassSCell::commit_class_s_compensating`] and
+//! [`ClassSCell::commit_class_s_then_append`] — have no production caller yet and
+//! retain `#[allow(dead_code)]`; they are exercised by this module's unit tests
+//! and wired when a site with their exact crash/atomicity shape migrates. The
+//! compile-time guarantee does NOT depend on any handler being migrated — it is a
+//! property of `ClassSCell`'s shape (no `DerefMut`, no `state_mut`, private
+//! Class-S fields): a caller can obtain `&mut` to one of the three PRIVATIZED
+//! Class-S fields only through the view a combinator constructs, and the
+//! best-effort views hold no `&mut` to them, so the only `&mut` to those fields
+//! originates inside a persisting `ClassSCell` method. (The dual-use
+//! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth fields are
+//! the documented residual still reachable via `ClassCMut::role_state_mut` — see
+//! "Known residual" above.)
+//!
+//! The ONE remaining `&mut self` method on `ClassSCell` that mutates Class-S
+//! WITHOUT a fail-closed persist is
+//! [`ClassSCell::clear_committed_reservation_idempotent`] (a single named,
+//! idempotent straggler cleanup whose §9 safety argument is on the method). A
+//! bounded positive-allowlist test —
+//! `class_s_no_persist_mutator_whitelist_is_bounded` — asserts the set of such
+//! methods is EXACTLY the known-safe set, so a NEW no-persist Class-S mutator
+//! added later trips it. This replaces the retired text scanner: it is a closed
+//! whitelist (not an ever-growing denylist), so it is sound and convergent.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
@@ -250,13 +326,16 @@ impl<'a> ClassSMut<'a> {
         &mut self.state.governance.class_s
     }
 
-    /// `&mut` access to the rest of [`PerContextState`] (the NON-Class-S
-    /// portion). The Class-S sub-structs are still reachable through this bare
-    /// `&mut` while their fields stay `pub(crate)` this PR — the field-privatizing
-    /// PR is what makes [`Self::class_s_mut`] / [`Self::governance_class_s_mut`]
-    /// the *only* path. Until then this accessor exists so a migrated handler can
-    /// mutate the structural / Class-C portion of the state from inside a Class-S
-    /// combinator without a second borrow.
+    /// `&mut` access to the rest of [`PerContextState`] (and, in principle, the
+    /// Class-S sub-structs, which this whole-`&mut` can also reach). This accessor
+    /// exists so a handler can mutate the structural / Class-C portion of the
+    /// state from inside a Class-S combinator without a second borrow. It is sound
+    /// even though it can reach Class-S because the combinator that hands out this
+    /// (Class-S-capable) view persists **fail-closed** — see the naming note
+    /// below. The Class-S fields are now privatized to `pub(in crate::context)`, so
+    /// this `ClassSMut` view (and the persisting combinators it belongs to) is the
+    /// sanctioned mutation path; the airtight best-effort [`ClassCMut`] view holds
+    /// no `&mut` to Class-S at all.
     ///
     /// # Naming note — why `rest_mut` exists HERE but NOT on [`ClassCMut`]
     ///
@@ -349,12 +428,6 @@ pub(crate) struct ClassCMut<'a> {
     role_state: &'a mut ContextRoleState,
     /// `&mut` to the checkpoint counter (Class-C / structural).
     checkpoint_events_since: &'a mut u64,
-    /// `&mut` to the deterministic context id (Class-C / structural identity).
-    context_id: &'a mut [u8; 32],
-    /// `&mut` to the local first-instantiation timestamp (Class-C / structural).
-    created_at: &'a mut u64,
-    /// `&mut` to the convergent creator-assigned creation timestamp (Class-C).
-    creation_timestamp_secs: &'a mut u64,
     /// `&mut` to the monotonic generation counter (Class-C / structural).
     generation: &'a mut u64,
     /// `&mut` to the full-fat context handle (Class-C / structural).
@@ -535,15 +608,13 @@ pub(crate) struct GovernanceClassCMut<'a> {
     message_pricing: &'a mut Option<ContextMessagePricingConfig>,
     /// `&mut` to the defense-in-depth Matrix-style hard rate limiter (§19.7).
     hard_rate_limit: &'a mut TokenBucketLimiter,
-    /// `&mut` to the per-context revoked spending-UCAN CID set (§19.5).
-    revoked_spending_ucan_cids: &'a mut HashSet<String>,
     /// `&mut` to the per-member governance proposal timestamps (§9.3).
     proposal_timestamps: &'a mut HashMap<String, Vec<u64>>,
 }
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `revoked_spending_ucan_cids_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -556,11 +627,16 @@ impl<'a> GovernanceClassCMut<'a> {
     const fn new(gov: &'a mut GovernanceState) -> Self {
         // SAFETY INVARIANT (ADR-049 §9 — rationale in this type's doc above). When
         // adding a field here: any field that is, or transitively contains, a
-        // Class-S sub-struct (`GovernanceClassS`) MUST be left to the `..` rest —
-        // NEVER bound `&mut`, and never bound by name (match ergonomics on the
-        // `&mut GovernanceState` would make the binding `&mut`). Today the ONLY
-        // Class-S-containing field is `class_s: GovernanceClassS`, which stays in
-        // `..` so no `&mut` to it is ever produced. Every field named below is a
+        // Class-S sub-struct (`GovernanceClassS`), OR is itself a Class-S
+        // downward-authorization field (ADR-049 §9 lists the **spending-UCAN
+        // revocation set** `revoked_spending_ucan_cids` as Class S — a
+        // coalesce-window rollback of a revocation re-admits a spending UCAN the
+        // caller observed as revoked), MUST be left to the `..` rest — NEVER bound
+        // `&mut`, and never bound by name (match ergonomics on the
+        // `&mut GovernanceState` would make the binding `&mut`). Today the fields
+        // left to `..` for this reason are `class_s: GovernanceClassS` and
+        // `revoked_spending_ucan_cids: HashSet<String>`, so no `&mut` to either is
+        // ever produced from this best-effort view. Every field named below is a
         // Class-C / structural `&mut`.
         let GovernanceState {
             velocity_tracker,
@@ -584,10 +660,12 @@ impl<'a> GovernanceClassCMut<'a> {
             participation_cache,
             message_pricing,
             hard_rate_limit,
-            revoked_spending_ucan_cids,
             proposal_timestamps,
-            // `class_s: GovernanceClassS` is the Class-S sub-struct — left to `..`
-            // so NO reference (mut or shared) to it is taken here.
+            // `class_s: GovernanceClassS` (the Class-S sub-struct) and
+            // `revoked_spending_ucan_cids` (the Class-S spending-UCAN revocation
+            // set, ADR-049 §9) are left to `..` so NO reference (mut or shared) to
+            // either is taken here — a revocation is fail-closed governance, never
+            // a best-effort mutation through this view.
             ..
         } = gov;
         Self {
@@ -612,7 +690,6 @@ impl<'a> GovernanceClassCMut<'a> {
             participation_cache,
             message_pricing,
             hard_rate_limit,
-            revoked_spending_ucan_cids,
             proposal_timestamps,
         }
     }
@@ -765,13 +842,6 @@ impl<'a> GovernanceClassCMut<'a> {
         self.hard_rate_limit
     }
 
-    /// `&mut` access to the per-context revoked spending-UCAN CID set (§19.5).
-    /// Class-C: governance-driven revocation list; not the replay-nonce witness
-    /// (that is Class-S `spending_nonce_tracker`).
-    pub(crate) const fn revoked_spending_ucan_cids_mut(&mut self) -> &mut HashSet<String> {
-        self.revoked_spending_ucan_cids
-    }
-
     /// `&mut` access to the per-member governance proposal timestamps (§9.3
     /// earned-capacity rate limiting). Class-C structural rate-limit state.
     pub(crate) const fn proposal_timestamps_mut(&mut self) -> &mut HashMap<String, Vec<u64>> {
@@ -864,7 +934,6 @@ impl<'a> GovernanceClassCMut<'a> {
             participation_cache: &mut *self.participation_cache,
             message_pricing: &mut *self.message_pricing,
             hard_rate_limit: &mut *self.hard_rate_limit,
-            revoked_spending_ucan_cids: &mut *self.revoked_spending_ucan_cids,
             proposal_timestamps: &mut *self.proposal_timestamps,
         }
     }
@@ -1194,7 +1263,11 @@ pub(crate) struct ClassCSplit<'a> {
     /// [`GovernanceClassCMut::next_proposal_seq`]); it holds no whole
     /// `&mut GovernanceState` — airtight by that field-granular construction.
     pub(crate) governance: GovernanceClassCMut<'a>,
-    /// `&mut` role / ceiling / assignment state.
+    /// `&mut` role / ceiling / assignment state. NOTE: this whole `&mut
+    /// ContextRoleState` can reach the dual-use downward-auth Class-S fields
+    /// `ceiling` / `suspended_capabilities` with no fail-closed persist — the
+    /// KNOWN RESIDUAL documented in the module "Known residual" section, to be
+    /// closed alongside [`ClassCMut::role_state_mut`].
     pub(crate) role_state: &'a mut ContextRoleState,
     /// `&` membership (read-only in the consequence path).
     pub(crate) membership: &'a MembershipState,
@@ -1240,26 +1313,37 @@ impl<'a> ClassCSplit<'a> {
     ///   in the destructure's `..` rest — NO reference to it is taken AT ALL.
     /// - `membership` is bound a SHARED `&` (read-only on the consequence path),
     ///   matching [`ClassCMut::split_class_c`]'s `&*self.membership` narrowing.
-    /// - `role_state` is the ONE whole-substruct `&mut` — the documented ADR-049
-    ///   §9 line-194 ACCEPTED Class-C residual for the consequence anti-spam
-    ///   (suspend) path: that suspension is best-effort BY DESIGN and is NOT
-    ///   routed through a fail-closed combinator. This is the only whole-substruct
-    ///   `&mut` here and is pre-existing/intended (it matches the existing
-    ///   `ConsequenceStateSplit.role_state: &mut ContextRoleState`).
+    /// - `role_state` is bound a whole `&mut ContextRoleState`. This is part of
+    ///   the KNOWN RESIDUAL documented in the module-level "Known residual"
+    ///   section: [`ContextRoleState`] is DUAL-USE — it carries Class-C structural
+    ///   fields AND the downward-authorization Class-S fields `ceiling` /
+    ///   `suspended_capabilities`, and this whole `&mut` can reach those with NO
+    ///   fail-closed persist. It is NOT an ADR-sanctioned accepted residual (the
+    ///   only accepted security-adjacent Class-C residual in §9 — `velocity_tracker`
+    ///   / `earned_capacity` — explicitly EXCLUDES re-granting a removed capability,
+    ///   which a `suspended_capabilities` rollback does). It is a residual still to
+    ///   be CLOSED, by the same migration that retires [`ClassCMut::role_state_mut`]:
+    ///   when the consequence path moves onto a field-granular role-state view (the
+    ///   [`RoleStateClassCMut`] shape, `&mut` for structural fields + shared `&` for
+    ///   `ceiling` / `suspended_capabilities`), this whole `&mut` goes away too.
+    ///   Until then it matches the pre-existing
+    ///   `ConsequenceStateSplit.role_state: &mut ContextRoleState`.
     ///
-    /// Because no whole `&mut PerContextState` / `&mut GovernanceState` /
-    /// `&mut ClassSState` / `&mut GovernanceClassS` is held, there is NOTHING of
-    /// those types for any future accessor to return — the airtightness is
-    /// structural, identical to the cell path.
+    /// Apart from that disclosed `role_state` residual, no whole
+    /// `&mut PerContextState` / `&mut GovernanceState` / `&mut ClassSState` /
+    /// `&mut GovernanceClassS` is held, so a mutation of the THREE PRIVATIZED
+    /// Class-S fields through this view is a compile error by construction.
     pub(crate) const fn from_state(state: &'a mut PerContextState) -> Self {
         // SAFETY INVARIANT (ADR-049 §9 — rationale in this method's doc above):
         // mirror the disjoint destructure of `ClassCMut::new` for exactly the
         // five fields `ConsequenceStateSplit` needs. The Class-S sub-structs
         // `class_s` (actor) and `governance.class_s` (via `GovernanceClassCMut`'s
         // own `..`) are NEVER bound `&mut` — they fall into the `..` rest here
-        // and inside `GovernanceClassCMut::new`. `role_state` is the §9 line-194
-        // accepted best-effort whole-`&mut` residual; `membership` is narrowed to
-        // a shared `&`.
+        // and inside `GovernanceClassCMut::new`. `role_state` is the whole-`&mut`
+        // ContextRoleState dual-use residual (downward-auth `ceiling` /
+        // `suspended_capabilities` reachable, no fail-closed persist) tracked in
+        // the module "Known residual" section — to be closed with `role_state_mut`,
+        // NOT an ADR-accepted carve-out; `membership` is narrowed to a shared `&`.
         let PerContextState {
             governance,
             role_state,
@@ -1280,7 +1364,7 @@ impl<'a> ClassCSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `context_id_mut`, `created_at_mut`, `creation_timestamp_secs_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_mut`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -1312,9 +1396,6 @@ impl<'a> ClassCMut<'a> {
             receive_buffer,
             role_state,
             checkpoint_events_since,
-            context_id,
-            created_at,
-            creation_timestamp_secs,
             generation,
             handle,
             event_log,
@@ -1349,9 +1430,6 @@ impl<'a> ClassCMut<'a> {
             receive_buffer,
             role_state,
             checkpoint_events_since,
-            context_id,
-            created_at,
-            creation_timestamp_secs,
             generation,
             handle,
             event_log,
@@ -1499,24 +1577,6 @@ impl<'a> ClassCMut<'a> {
     /// rollback acceptable.
     pub(crate) const fn checkpoint_events_since_mut(&mut self) -> &mut u64 {
         self.checkpoint_events_since
-    }
-
-    /// `&mut` access to the deterministic context id (Class-C / structural
-    /// identity). Stable for the actor's lifetime; exposed for parity completeness.
-    pub(crate) const fn context_id_mut(&mut self) -> &mut [u8; 32] {
-        self.context_id
-    }
-
-    /// `&mut` access to the local first-instantiation timestamp (Class-C /
-    /// structural). Best-effort rollback acceptable.
-    pub(crate) const fn created_at_mut(&mut self) -> &mut u64 {
-        self.created_at
-    }
-
-    /// `&mut` access to the convergent creator-assigned creation timestamp
-    /// (Class-C / structural, §7.3.1). Best-effort rollback acceptable.
-    pub(crate) const fn creation_timestamp_secs_mut(&mut self) -> &mut u64 {
-        self.creation_timestamp_secs
     }
 
     /// `&mut` access to the monotonic generation counter (Class-C / structural).
@@ -1709,8 +1769,11 @@ impl<'a> ClassCMut<'a> {
 
     /// READ-ONLY access to the Class-S [`ClassSState`] sub-struct. Field-granular
     /// `&`-read, replacing the removed whole-state [`Deref`] read of `class_s`.
-    /// There is NO `&mut` counterpart on this view — a Class-S mutation from the
-    /// best-effort / compensation path is a compile error by construction.
+    /// There is NO `&mut` counterpart on this view — a mutation of the actor's
+    /// `ClassSState` from the best-effort / compensation path is a compile error by
+    /// construction. (This is one of the three privatized Class-S fields; the
+    /// dual-use `ContextRoleState.ceiling` / `suspended_capabilities` Class-S pair
+    /// is NOT covered by this guarantee — see the module "Known residual" section.)
     pub(crate) const fn class_s(&self) -> &ClassSState {
         self.class_s
     }
@@ -1795,7 +1858,9 @@ pub(crate) struct AppendOutcomeError {
 /// [`Self::commit_class_c_best_effort`] for best-effort).
 pub(crate) struct ClassSCell {
     /// The wrapped state. Private — the only mutable access is through the
-    /// combinators (or the PR1-temporary [`Self::state_mut`] escape hatch).
+    /// persist-on-commit combinators (or the single sanctioned no-persist
+    /// [`Self::clear_committed_reservation_idempotent`]). There is no `state_mut`
+    /// escape hatch and no `DerefMut`.
     state: PerContextState,
 }
 
@@ -1820,32 +1885,12 @@ impl ClassSCell {
     /// hand-off boundaries (e.g. draining state out of the actor on shutdown /
     /// replace).
     ///
-    /// `dead_code` allow: pure scaffolding — the first production caller is the
-    /// migration step that routes a state hand-off through the cell. The method
-    /// is exercised by this module's unit tests today.
+    /// `dead_code` allow: the current callers are `#[cfg(test)]` (the supervisor /
+    /// lifecycle hand-off tests); its first non-test caller is the shutdown/replace
+    /// drain migration. Exercised by this module's unit tests today.
     #[allow(dead_code)]
     pub(crate) fn into_inner(self) -> PerContextState {
         self.state
-    }
-
-    /// **TEMPORARY — removed in the final migration step.**
-    ///
-    /// Hands out the bare `&mut PerContextState` so existing handlers keep
-    /// working byte-for-byte unchanged while the combinators are introduced.
-    /// Once every handler routes its mutations through the combinators and the
-    /// [`PerContextState`] Class-S fields are privatized, this method is deleted —
-    /// at which point the only path to a `&mut PerContextState` is through the
-    /// persist-on-commit combinators, making the Class-S fail-closed invariant a
-    /// compile error to violate.
-    ///
-    /// `dead_code` allow: the messaging-domain migration removed the LAST
-    /// production callers (`send_message` + the `DeliverIncoming` handler now
-    /// route through `class_c_view` / the cell). The method is retained only so
-    /// the FINAL migration step can delete it together with the
-    /// `PerContextState` Class-S field privatization in one atomic change.
-    #[allow(dead_code)]
-    pub(in crate::context) const fn state_mut(&mut self) -> &mut PerContextState {
-        &mut self.state
     }
 
     /// Idempotent straggler cleanup of a committed cross-context reservation
@@ -1855,10 +1900,9 @@ impl ClassSCell {
     /// re-ack straggler, idempotent, and rebuilt-irrelevant on respawn. Adding a persist
     /// would turn an idempotent `Ok` re-ack into a fallible write. This is a single named
     /// operation, NOT a general no-persist escape — it can never widen to a closure form.
-    #[allow(
-        dead_code,
-        reason = "ADR-049 §9 foundation: the single no-persist Class-S straggler cleanup gets its production caller when commit_a's replay arm migrates off state_mut(). Exercised by this module's unit tests now."
-    )]
+    /// Production caller: `commit_a`'s committed-terminal replay arm. It is the ONE
+    /// no-persist Class-S mutator on the allowlist enforced by
+    /// `class_s_no_persist_mutator_whitelist_is_bounded`.
     pub(crate) fn clear_committed_reservation_idempotent(
         &mut self,
         saga_id: &crate::context::supervisor::saga_journal::SagaId,
@@ -1907,9 +1951,6 @@ impl ClassSCell {
     ///
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`].
     ///
-    /// `dead_code` allow: scaffolding — no handler is migrated yet. Exercised by
-    /// this module's unit tests.
-    #[allow(dead_code)]
     pub(crate) fn commit_class_s_keep<T>(
         &mut self,
         deps: &ActorDeps,
@@ -1968,8 +2009,6 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after
     /// restoring the snapshot).
     ///
-    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
-    #[allow(dead_code)]
     pub(crate) fn commit_class_s_restore<T>(
         &mut self,
         deps: &ActorDeps,
@@ -2119,8 +2158,6 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
     /// `on_persist_failure`, with the Class-S mutation retained).
     ///
-    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
-    #[allow(dead_code)]
     pub(crate) async fn commit_class_s_keep_compensating<T, X>(
         &mut self,
         deps: &ActorDeps,
@@ -2263,8 +2300,6 @@ impl ClassSCell {
     /// The [`ClassCMut`] view exposes no Class-S mutator, so a best-effort `f`
     /// cannot stage a Class-S transition.
     ///
-    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
-    #[allow(dead_code)]
     pub(crate) fn commit_class_c_best_effort(
         &mut self,
         deps: &ActorDeps,
@@ -2309,10 +2344,6 @@ impl ClassSCell {
     /// mutation is a COMPILE error by construction (the view exposes no Class-S
     /// mutator), so no fail-closed-requiring transition can escape unpersisted.
     ///
-    /// `dead_code` allow: scaffolding — the first production caller is a
-    /// coalesced-persist dispatch arm that migrates off `state_mut`. Exercised
-    /// by this module's unit tests now.
-    #[allow(dead_code)]
     pub(crate) const fn class_c_view(&mut self) -> ClassCMut<'_> {
         ClassCMut::new(&mut self.state)
     }
@@ -2374,10 +2405,6 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
     /// `restore_on_failure`, with the KEPT field retained).
     ///
-    /// `dead_code` allow: scaffolding — the first production caller is the
-    /// `prepare_b` staging site's `state_mut`-deletion migration. Exercised by
-    /// this module's unit tests now.
-    #[allow(dead_code)]
     pub(crate) fn commit_class_s_keep_restore_split<T, S>(
         &mut self,
         deps: &ActorDeps,
@@ -2566,10 +2593,12 @@ impl ClassSCommitToken {
     /// (ADR-049 §9), KEEPING the Class-S mutation even if the persist fails.
     ///
     /// Takes `state: &PerContextState` rather than being a method on
-    /// [`ClassSCell`] DELIBERATELY: the deferred-persist sites hold a bare
-    /// `&mut PerContextState` (re-derived from the cell's `state_mut()` escape
-    /// hatch) across the intervening async work, so the commit point has no cell
-    /// to call through — it persists the state it is handed.
+    /// [`ClassSCell`] DELIBERATELY: a deferred-persist site reads the actor's
+    /// state (through the cell's `Deref`) at the commit point after intervening
+    /// async work, so the commit point persists the `&PerContextState` it is
+    /// handed rather than re-borrowing the cell. (The earlier-mutation half of
+    /// the deferral is performed inside [`ClassSCell::begin_class_s`] through a
+    /// [`ClassSMut`] view; this token only owns the deferred PERSIST.)
     ///
     /// Sequence:
     /// 1. `debug_assert_eq!` the token's `context_id` against the caller's, so a
@@ -2618,11 +2647,11 @@ impl ClassSCommitToken {
     ///   (a Class-C body, reached via [`ClassSMut::rest_mut`]) and then performs
     ///   the token's owed persist over the finalized state.
     ///
-    /// Rather than re-acquire a `state_mut()` escape hatch to mutate, then call
-    /// [`Self::commit`] (two reaches, a whole-state `&mut`), this runs the
-    /// mutation through the same fail-closed-capable [`ClassSMut`] view the
-    /// combinators use and performs the token's single deferred persist over the
-    /// resulting state — EXACTLY ONE persist, KEEP-direction.
+    /// Rather than reach a whole-state `&mut` to mutate, then call
+    /// [`Self::commit`] (two reaches), this runs the mutation through the same
+    /// fail-closed-capable [`ClassSMut`] view the combinators use and performs the
+    /// token's single deferred persist over the resulting state — EXACTLY ONE
+    /// persist, KEEP-direction.
     ///
     /// `f` may itself fail. Keep-direction means the persist runs REGARDLESS of
     /// `f`'s result (the partial mutations `f` made before erroring stay and are
@@ -2726,6 +2755,615 @@ mod tests {
     // `DerefMut` the same way). Only `ClassSCell`'s no-`DerefMut` remains a
     // guarded invariant.
     static_assertions::assert_not_impl_any!(ClassSCell: core::ops::DerefMut);
+
+    /// Return `src` with the CONTENT of comments and string / char literals
+    /// blanked out (delimiters, braces, code tokens, and newlines preserved), so
+    /// downstream `.find` / `.contains` / brace-depth scans see ONLY code. This is
+    /// the single source-aware lexer the tripwire uses; [`brace_bounded_body`]
+    /// runs brace-matching over its output and [`class_s_no_persist_methods`]
+    /// runs the persist-marker scan over it.
+    ///
+    /// It is `char`-based (never `byte as char`, which would corrupt multi-byte
+    /// UTF-8 like `§ … × →` that appear in this file's doc comments) and handles
+    /// the literal forms that actually occur in Rust source: `//` line comments,
+    /// `/* … */` block comments (nesting), regular and **raw** strings
+    /// (`"…"`, `r"…"`, `r#"…"#`, with any `#` count), **byte** strings
+    /// (`b"…"`, `br#"…"#`), `\\`-escapes inside regular strings, and `'…'` char /
+    /// byte-char literals vs lifetimes. A marker inside ANY of these is therefore
+    /// dropped before classification, closing the comment/string spoof vector.
+    ///
+    /// CONSCIOUS CHOICE (not inherited by momentum): this is a small hand-rolled
+    /// lexer rather than a `syn` dev-dependency parse. A `syn` parse would be
+    /// strictly sounder and a few lines shorter, but it pulls a heavy proc-macro
+    /// parsing crate into `scp-runtime`'s `dev-dependencies` for a single
+    /// `#[cfg(test)]` honest-contributor speed-bump — disproportionate to the
+    /// marginal benefit, given the compile-time boundary (not this test) is the
+    /// real guarantee. The lexer's scope is bounded to the constructs this one
+    /// file uses; the fail-LOUD macro / block-comment / count guards cover the
+    /// shapes it deliberately does not parse. If this file ever grows constructs
+    /// the lexer doesn't handle, prefer the `syn` parse over extending the lexer.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let len = chars.len();
+        let at = |idx: usize| chars.get(idx).copied().unwrap_or('\0');
+        let mut out = String::with_capacity(src.len());
+        let mut pos = 0;
+        while pos < len {
+            let cur = chars[pos];
+            // Line comment: drop to end of line (the `\n` is emitted next loop).
+            if cur == '/' && at(pos + 1) == '/' {
+                while pos < len && chars[pos] != '\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+            // Block comment (nesting): drop content, keep newlines.
+            if cur == '/' && at(pos + 1) == '*' {
+                pos = skip_block_comment(&chars, pos + 2, &mut out);
+                continue;
+            }
+            // Raw string: r"…", r#"…"#, br##"…"## (any `#` count, optional `b`).
+            let raw_hash_at = if cur == 'r' {
+                Some(pos + 1)
+            } else if cur == 'b' && at(pos + 1) == 'r' {
+                Some(pos + 2)
+            } else {
+                None
+            };
+            if let Some(next) =
+                raw_hash_at.and_then(|after| skip_raw_string(&chars, after, &mut out))
+            {
+                pos = next;
+                continue;
+            }
+            // Regular / byte string: "…" or b"…" with `\\`-escapes.
+            if cur == '"' || (cur == 'b' && at(pos + 1) == '"') {
+                let quote = if cur == 'b' { pos + 1 } else { pos };
+                pos = skip_quoted_string(&chars, quote, &mut out);
+                continue;
+            }
+            // Char / byte-char literal (`'a'`, `b'{'`, `'\n'`) vs lifetime (`'a`).
+            if cur == '\'' {
+                let esc = at(pos + 1) == '\\';
+                let close_at = if esc { pos + 3 } else { pos + 2 };
+                if close_at < len && chars[close_at] == '\'' {
+                    out.push_str("''"); // placeholder, content dropped
+                    pos = close_at + 1;
+                    continue;
+                }
+                out.push('\''); // a lifetime: let the ident flow as code
+                pos += 1;
+                continue;
+            }
+            out.push(cur);
+            pos += 1;
+        }
+        out
+    }
+
+    /// Skip a `/* … */` block comment (already past the opening `/*`), keeping
+    /// only newlines in `out`; returns the index just past the closing `*/`.
+    fn skip_block_comment(chars: &[char], mut pos: usize, out: &mut String) -> usize {
+        let len = chars.len();
+        let at = |idx: usize| chars.get(idx).copied().unwrap_or('\0');
+        let mut depth = 1usize;
+        while pos < len && depth > 0 {
+            if chars[pos] == '/' && at(pos + 1) == '*' {
+                depth += 1;
+                pos += 2;
+            } else if chars[pos] == '*' && at(pos + 1) == '/' {
+                depth -= 1;
+                pos += 2;
+            } else {
+                if chars[pos] == '\n' {
+                    out.push('\n');
+                }
+                pos += 1;
+            }
+        }
+        pos
+    }
+
+    /// If `hash_at` begins a raw-string opener (`#* "`), drop its content and emit
+    /// placeholder quotes + newlines into `out`, returning the index past the
+    /// closing `"#*`. Returns `None` if it is not actually a raw string.
+    fn skip_raw_string(chars: &[char], hash_at: usize, out: &mut String) -> Option<usize> {
+        let len = chars.len();
+        let mut pos = hash_at;
+        let mut hashes = 0usize;
+        while pos < len && chars[pos] == '#' {
+            hashes += 1;
+            pos += 1;
+        }
+        if pos >= len || chars[pos] != '"' {
+            return None;
+        }
+        out.push('"');
+        pos += 1;
+        while pos < len {
+            if chars[pos] == '"' {
+                let mut end = pos + 1;
+                let mut got = 0;
+                while end < len && got < hashes && chars[end] == '#' {
+                    got += 1;
+                    end += 1;
+                }
+                if got == hashes {
+                    out.push('"');
+                    return Some(end);
+                }
+            }
+            if chars[pos] == '\n' {
+                out.push('\n');
+            }
+            pos += 1;
+        }
+        Some(pos)
+    }
+
+    /// Skip a regular/byte string starting at the opening `"` (`quote`), dropping
+    /// content (honoring `\\`-escapes) and emitting placeholder quotes + newlines
+    /// into `out`; returns the index just past the closing `"`.
+    fn skip_quoted_string(chars: &[char], quote: usize, out: &mut String) -> usize {
+        let len = chars.len();
+        out.push('"');
+        let mut pos = quote + 1;
+        while pos < len {
+            if chars[pos] == '\\' {
+                pos += 2; // skip the escaped char (incl. `\"` and `\\`)
+                continue;
+            }
+            if chars[pos] == '"' {
+                out.push('"');
+                return pos + 1;
+            }
+            if chars[pos] == '\n' {
+                out.push('\n');
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    /// Whether `header_line` (a 4-space-indented line) is a method header —
+    /// STRUCTURALLY, not by a fixed prefix list. Strips an optional `pub` / `pub(…)`
+    /// visibility (any restriction, incl. `pub(in crate::context)` and future
+    /// spellings), then any `const` / `async` / `unsafe` / `extern` fn-qualifier
+    /// keywords in any order, and asks whether what remains starts with `fn `. A
+    /// new method spelling (bare `async fn`, `pub fn`, `pub(super) fn`, …) is
+    /// therefore recognized — closed by construction, so it cannot silently drop a
+    /// method from the whitelist scan.
+    fn is_method_header(header_line: &str) -> bool {
+        let mut t = header_line.trim_start();
+        if let Some(rest) = t.strip_prefix("pub") {
+            t = rest.trim_start();
+            if let Some(after) = t.strip_prefix('(') {
+                let Some(close) = after.find(')') else {
+                    return false;
+                };
+                t = after[close + 1..].trim_start();
+            }
+        }
+        while let Some(rest) = ["const ", "async ", "unsafe ", "extern "]
+            .iter()
+            .find_map(|kw| t.strip_prefix(kw))
+        {
+            t = rest.trim_start();
+            // `extern` may carry an ABI string: `extern "C" fn …`. Drop it.
+            if let Some(close) = t
+                .strip_prefix('"')
+                .and_then(|q| q.find('"').map(|c| (q, c)))
+            {
+                let (after_quote, close_idx) = close;
+                t = after_quote[close_idx + 1..].trim_start();
+            }
+        }
+        t.starts_with("fn ")
+    }
+
+    /// Bound a method's body to its own braces over the COMMENT/STRING-stripped
+    /// ([`code_only`]) text of `slice`, returning the code-only text from the
+    /// method header through its closing `}`. Because braces inside comments and
+    /// string / char literals are already gone, a plain depth counter is exact
+    /// (no `format!`-style `"{…}"` can desync it). The returned `String` is
+    /// code-only, so the caller's name parse, receiver check, AND persist-marker
+    /// scan all run over code — a marker in a comment/string cannot bleed in from
+    /// this method's body OR from the NEXT method's leading doc/attributes.
+    fn brace_bounded_body(slice: &str) -> String {
+        let code = code_only(slice);
+        let Some(body_open) = code.find('{') else {
+            return code;
+        };
+        let mut depth = 0i32;
+        for (idx, ch) in code[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = body_open + idx + ch.len_utf8();
+                        return code[..end].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        code
+    }
+
+    /// Whether a brace-bounded method `body` declares a `self` receiver. Finds the
+    /// param-list `(` — the first `(` AFTER the `fn name` AND after any balanced
+    /// `<…>` generic list (so a `(` inside a `Fn(…)` / `FnOnce(…)` generic bound is
+    /// not mistaken for the param list) — then checks the FIRST parameter is a
+    /// `self` receiver, matched as a TOKEN (`self` / `&self` / `&mut self` /
+    /// `&'a self` / `self:`), not a substring (so a param merely NAMED `self_id`
+    /// is not a false positive). The signature can span several physical lines.
+    fn body_has_self_receiver(body: &str) -> bool {
+        let Some(fn_kw) = body.find("fn ") else {
+            return false;
+        };
+        let after_fn = &body[fn_kw + 3..];
+        let trimmed = after_fn.trim_start();
+        let Some(name_end_rel) = trimmed.find(['(', '<', ' ']) else {
+            return false;
+        };
+        let name_end = (after_fn.len() - trimmed.len()) + name_end_rel;
+        // Skip a balanced `<…>` generic list if one immediately follows the name,
+        // so a `(` inside a `Fn(…)` bound is not taken as the param list.
+        let rest_after_name = &after_fn[name_end..];
+        let search_from = if rest_after_name.trim_start().starts_with('<') {
+            let mut depth = 0i32;
+            let mut end = rest_after_name.len();
+            for (k, ch) in rest_after_name.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = k + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            name_end + end
+        } else {
+            name_end
+        };
+        let Some(param_open_rel) = after_fn[search_from..].find('(').map(|r| search_from + r)
+        else {
+            return false;
+        };
+        let first_param = after_fn[param_open_rel + 1..]
+            .split([',', ')'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        // Normalize a reference receiver: strip a leading `&`, an optional `'a`
+        // lifetime token, and an optional `mut`; the remainder must be exactly
+        // `self` (or `self:` for an explicit-type receiver). Rejects `self_id`,
+        // `myself`, etc. while accepting every real receiver form.
+        let mut r = first_param;
+        if let Some(after_amp) = r.strip_prefix('&') {
+            r = after_amp.trim_start();
+            if r.starts_with('\'') {
+                // Drop the lifetime token up to the next whitespace.
+                r = r
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, rest)| rest);
+                r = r.trim_start();
+            }
+        }
+        let r = r.strip_prefix("mut ").map_or(r, str::trim_start);
+        r == "self" || r.starts_with("self:") || r.starts_with("self ")
+    }
+
+    /// Enumerate the `self`-receiver methods of an `impl ClassSCell` block (given
+    /// as its source text `impl_block`) and return the NAMES of those whose body
+    /// performs NONE of `persist_markers`, plus the total recognized-method count
+    /// (for a parser-drift cross-check). Splits the impl into per-method slices at
+    /// each method-level (4-space-indented) `fn`, and bounds each body to its own
+    /// braces via [`brace_bounded_body`] — whose output is code-only (comment /
+    /// string contents stripped), so the persist-marker scan cannot be spoofed by
+    /// a marker named in a comment or string literal.
+    fn class_s_no_persist_methods(
+        impl_block: &str,
+        persist_markers: &[&str],
+    ) -> (Vec<String>, usize) {
+        let fn_starts: Vec<usize> = impl_block
+            .match_indices("\n    ")
+            .filter(|(i, _)| {
+                let line = impl_block[i + 1..].lines().next().unwrap_or("");
+                // Exactly 4-space indent (method level, not a deeper body line),
+                // and structurally a method header (any valid qualifier soup).
+                line.starts_with("    ") && !line.starts_with("     ") && is_method_header(line)
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+
+        assert!(
+            !fn_starts.is_empty(),
+            "must find method `fn`s in impl ClassSCell — parser drift if empty"
+        );
+
+        let recognized = fn_starts.len();
+        let mut out: Vec<String> = Vec::new();
+        for (idx, &start) in fn_starts.iter().enumerate() {
+            let slice_end = fn_starts.get(idx + 1).copied().unwrap_or(impl_block.len());
+            // `body` is COMMENT/STRING-stripped (code-only): the name parse, the
+            // receiver check, and the persist-marker scan below all run over code,
+            // so a marker named in a comment/string cannot spoof classification.
+            let body = brace_bounded_body(&impl_block[start..slice_end]);
+            let header = body.lines().next().unwrap_or("");
+
+            let name = header
+                .split("fn ")
+                .nth(1)
+                .and_then(|s| s.split(['(', '<', ' ']).next())
+                .unwrap_or("")
+                .to_owned();
+            assert!(
+                !name.is_empty(),
+                "could not parse method name from: {header}"
+            );
+
+            // Only methods with a `self` receiver can mutate the owned state;
+            // `new(state: PerContextState)` has no `self` receiver — skip it.
+            if !body_has_self_receiver(&body) {
+                continue;
+            }
+            if !persist_markers.iter().any(|m| body.contains(m)) {
+                out.push(name);
+            }
+        }
+        (out, recognized)
+    }
+
+    /// ADR-049 §9 — **bounded positive-allowlist tripwire** replacing the retired
+    /// source-text scanner `scripts/check-class-s-fail-closed.sh`.
+    ///
+    /// # What this guards, and why a whitelist (not a denylist)
+    ///
+    /// The compile-time guarantee is layered, and it — NOT this test — is the
+    /// adversarial boundary. `ClassSCell` hands out NO whole `&mut PerContextState`
+    /// (no `DerefMut`, no `state_mut`), so a caller can only obtain `&mut` to one
+    /// of the three PRIVATIZED Class-S fields (`class_s`, `governance.class_s`,
+    /// `revoked_spending_ucan_cids`) through the *view* a combinator constructs —
+    /// and the best-effort views (`ClassCMut` / `GovernanceClassCMut`) hold no
+    /// `&mut` to them at all (field-granular refs + a shared `&` to `class_s`), so
+    /// the only `&mut` to those fields originates inside a `ClassSCell` method (the
+    /// combinators + token paths, which persist). (The dual-use
+    /// `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth fields
+    /// are NOT yet privatized — `ClassCMut::role_state_mut` still reaches them; see
+    /// the module-level "Known residual" section.) Field privatization to
+    /// `pub(in crate::context)` is the OUTER, defense-in-depth ring: it stops code
+    /// *outside* `crate::context` from naming the fields, but does NOT (and cannot)
+    /// stop a sibling module under `crate::context` from naming them — so the
+    /// inner, load-bearing guarantee is the cell's no-whole-`&mut` shape, not the
+    /// visibility. That shape (plus crate-wide `#![forbid(unsafe_code)]`) is what
+    /// resists a *deliberate* adversary.
+    ///
+    /// This test is a narrower thing: a review **speed-bump** that catches the
+    /// NAIVE / ACCIDENTAL case of a method ADDED to `impl ClassSCell` (which can
+    /// reach `self.state.class_s` directly) that mutates Class-S but forgets to
+    /// persist. It is NOT an adversarial gate and deliberately does not try to be
+    /// one: it lives `#[cfg(test)]` in the SAME FILE as `impl ClassSCell`, so
+    /// anyone who can add a no-persist mutator can equally edit `KNOWN_SAFE` or
+    /// delete the test — chasing source-text reachability/macro-expansion to defeat
+    /// a determined evader would be the non-convergent denylist this PR retired.
+    /// What it DOES guarantee, soundly and convergently, is fail-LOUD behaviour for
+    /// the honest contributor: a straightforwardly-added no-persist `&mut self`
+    /// Class-S mutator trips it, and a parser blind-spot (an unrecognized header,
+    /// or a method-producing macro invocation) trips the count / macro
+    /// cross-checks rather than silently passing. The honest author is then steered
+    /// to persist — directly (`persist_state_fail_closed`), via the explicitly-
+    /// Class-C best-effort combinator (`persist_state_best_effort`), or by deferring
+    /// the fail-closed persist to a `ClassSCommitToken` (minted via
+    /// `ClassSCommitToken::new`).
+    ///
+    /// The retired scanner was a DENYLIST: it chased "one more spelling" of a
+    /// mutate-without-persist and had to grow a pattern per evasion. This test is
+    /// the convergent inverse — a CLOSED POSITIVE ALLOWLIST. It enumerates the
+    /// `self`-receiver methods of `impl ClassSCell` from the source text and
+    /// asserts that the set which performs NO persist of any kind is EXACTLY the
+    /// known-safe set. Adding a NEW `&mut self` method that mutates Class-S
+    /// without a persist mechanism (the exact §9 hazard) makes the no-persist set
+    /// grow beyond the allowlist and TRIPS this test — forcing a reviewer to
+    /// either route it through a combinator/token or consciously, reviewably add
+    /// it to `KNOWN_SAFE` with a §9 safety argument. The allowlist is bounded by
+    /// construction: it does not grow to chase spellings, only to admit a new
+    /// deliberately-sanctioned no-persist method.
+    ///
+    /// # The known-safe set (each justified)
+    ///
+    /// - `new` / `into_inner` — ownership in/out; `new` takes `state` by value (no
+    ///   `self` receiver, so it is not even enumerated), `into_inner` unwraps by
+    ///   value. Neither mutates Class-S behind a caller ack.
+    /// - `class_c_view` / `commit_class_c_best_effort` — Class-C: the [`ClassCMut`]
+    ///   view they hand out, by construction, holds NO `&mut` to any Class-S field
+    ///   (shared `&` to `class_s`), so they cannot perform a Class-S mutation at
+    ///   all. (`commit_class_c_best_effort` performs a *best-effort* persist, which
+    ///   is deliberately NOT a Class-S persist marker — a Class-S mutator that only
+    ///   best-effort-persists must TRIP, so it is whitelisted by NAME here on the
+    ///   grounds that it cannot reach Class-S, not on the grounds that it persists.)
+    /// - `clear_committed_reservation_idempotent` — the SINGLE sanctioned
+    ///   no-persist Class-S mutator; its §9 safety argument (the committed
+    ///   terminal is already durably witnessed; the removal is an idempotent
+    ///   straggler cleanup) is on the method.
+    /// - `set_generation_for_test` — `#[cfg(test)]`, seeds the Class-C generation
+    ///   counter only; never compiled into production.
+    /// - `restore_class_s` — the PRIVATE combinator-internal restore arm: reached
+    ///   ONLY from inside `commit_class_s_restore` / `_compensating` (whose own
+    ///   bodies own the fail-closed persist), to roll a Class-S sub-struct back to a
+    ///   pre-`f` snapshot when that persist FAILED — by construction always wrapped
+    ///   by a persisting combinator, never a standalone Class-S mutation entry.
+    ///
+    /// # Known limitations (honest scope)
+    ///
+    /// The persist check is a presence test — does the method body NAME a
+    /// fail-closed persist mechanism — NOT a reachability/dominance analysis. It
+    /// therefore does NOT catch a method that mutates Class-S and then takes an
+    /// early-return path that SKIPS the persist, nor one that names the marker on
+    /// an unreachable branch, nor one that shadows the marker's spelling with an
+    /// unrelated local item. Building source-text control-flow analysis to close
+    /// these would be the non-convergent denylist this PR retired; instead they are
+    /// left to ordinary code review (the compile-time shape still forces the
+    /// mutation through a persisting `ClassSCell` method — it does not force
+    /// *correct persist placement* within that method, which review must verify).
+    #[test]
+    fn class_s_no_persist_mutator_whitelist_is_bounded() {
+        const SRC: &str = include_str!("class_s.rs");
+
+        // "Performs a FAIL-CLOSED persist" = the body names one of the two
+        // mechanisms that satisfy §9 for a Class-S mutation: the synchronous
+        // fail-closed persist, or minting a deferred-persist `ClassSCommitToken`
+        // (whose `commit` / `discharge_with` perform the fail-closed persist).
+        //
+        // `persist_state_best_effort` is DELIBERATELY NOT a marker: best-effort
+        // (coalesced) persistence does NOT satisfy §9 for Class-S — a crash in the
+        // ≤50ms coalesce window rolls the mutation back behind a caller who already
+        // saw success. A method that mutates Class-S and only best-effort-persists
+        // is exactly the §9 hazard and MUST trip. The sole best-effort combinator,
+        // `commit_class_c_best_effort`, is Class-C (its `ClassCMut` view cannot
+        // reach Class-S) and is therefore on `KNOWN_SAFE`, not cleared by a marker.
+        const PERSIST_MARKERS: [&str; 2] = ["persist_state_fail_closed", "ClassSCommitToken::new"];
+
+        // The closed allowlist of self-receiver methods that legitimately perform
+        // NO fail-closed persist of a Class-S mutation. A NEW no-persist mutator
+        // NOT in this set trips the assert.
+        // - `class_c_view` / `commit_class_c_best_effort` — Class-C: the `ClassCMut`
+        //   view they hand out holds NO `&mut` to any Class-S field (it cannot name
+        //   one), so they cannot perform a Class-S mutation at all; no fail-closed
+        //   persist is required of them.
+        // - `restore_class_s` — the PRIVATE combinator-internal restore arm: reached
+        //   ONLY from inside `commit_class_s_restore` / `_compensating` (whose own
+        //   bodies own the fail-closed persist), to roll a Class-S sub-struct back to
+        //   a pre-`f` snapshot when that persist FAILED — by construction always
+        //   wrapped by a persisting combinator, never a standalone mutation entry.
+        const KNOWN_SAFE: [&str; 6] = [
+            "into_inner",
+            "class_c_view",
+            "commit_class_c_best_effort",
+            "clear_committed_reservation_idempotent",
+            "set_generation_for_test",
+            "restore_class_s",
+        ];
+
+        // Isolate the `impl ClassSCell { … }` block: from its header to the next
+        // top-level `impl ClassSCommitToken` so the scan is about THIS impl only,
+        // not the token impl or the views above it.
+        let impl_start = SRC
+            .find("\nimpl ClassSCell {\n")
+            .expect("impl ClassSCell block must exist");
+        let after = &SRC[impl_start + 1..];
+        let impl_end_rel = after
+            .find("\nimpl ClassSCommitToken {\n")
+            .expect("impl ClassSCommitToken follows impl ClassSCell");
+        let impl_block = &after[..impl_end_rel];
+
+        // Enumerate `self`-receiver methods and classify each by whether its body
+        // performs ANY persist mechanism. A method with NO persist mechanism that
+        // mutates Class-S behind a caller ack is the §9 hazard — those must equal
+        // the known-safe allowlist exactly.
+        //
+        // The enumeration + classification is in `class_s_no_persist_methods`.
+        let (mut no_persist_methods, recognized) =
+            class_s_no_persist_methods(impl_block, &PERSIST_MARKERS);
+        no_persist_methods.sort();
+        let mut expected: Vec<String> = KNOWN_SAFE.iter().map(|s| (*s).to_owned()).collect();
+        expected.sort();
+
+        // Parser-drift cross-check: the count of recognized method headers must
+        // equal the count of `fn ` keyword occurrences at method (4-space) indent
+        // in the impl block. If a header spelling slips past `is_method_header`,
+        // these diverge and the test fails LOUDLY (parser drift) rather than
+        // silently dropping a method from the scan. Run over the COMMENT/STRING-
+        // stripped block so a `fn ` inside a comment or string does not skew it.
+        let impl_code = code_only(impl_block);
+        let total_method_fns = impl_code
+            .lines()
+            .filter(|l| {
+                l.starts_with("    ") && !l.starts_with("     ") && l.trim_start().contains("fn ")
+            })
+            .count();
+        assert_eq!(
+            recognized, total_method_fns,
+            "ADR-049 §9 parser drift: `is_method_header` recognized {recognized} method \
+             headers but {total_method_fns} 4-space-indented `fn ` lines exist in \
+             `impl ClassSCell`. A header spelling slipped past the recognizer — a new \
+             method could be silently dropped from the no-persist scan. Fix \
+             `is_method_header` to recognize it."
+        );
+
+        // Macro fail-LOUD guard: a method-producing macro INVOCATION at method
+        // (4-space) indent (`    foo!(…)` / `    foo! {…}`) expands to methods the
+        // source-text scan cannot see — silently bypassing the whitelist. The
+        // source-text approach is fundamentally blind to macro expansion, so we
+        // forbid such invocations inside `impl ClassSCell` outright: there are none
+        // today, and any addition must be a `fn` the scan CAN read (or the author
+        // must replace this guard with expansion-aware enforcement). This converts
+        // a fail-SILENT blind spot into a fail-LOUD assertion.
+        let macro_invocation = impl_code.lines().find(|l| {
+            if !l.starts_with("    ") || l.starts_with("     ") {
+                return false;
+            }
+            let t = l.trim_start();
+            // `ident!(` / `ident !(` / `ident! {` — a leading identifier, then `!`
+            // (tolerating whitespace either side so it does not depend on `cargo
+            // fmt` having run), then a delimiter. (Negative `!expr` and `!=` start
+            // with `!`, not an ident, so they are excluded.)
+            let Some(bang) = t.find('!') else {
+                return false;
+            };
+            let before = t[..bang].trim_end();
+            let ident: String = before
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            !ident.is_empty()
+                && ident == before
+                && t[bang + 1..].trim_start().starts_with(['(', '{', '['])
+        });
+        assert!(
+            macro_invocation.is_none(),
+            "ADR-049 §9: a method-producing macro invocation at method indent in \
+             `impl ClassSCell` ({macro_invocation:?}) is invisible to the source-text \
+             whitelist scan — it could add a no-persist Class-S mutator silently. \
+             Either remove it or replace this tripwire with expansion-aware \
+             enforcement."
+        );
+
+        // Block-comment fail-LOUD guard: a `/* … */` block comment on a method-
+        // indent line shifts the surviving indentation (the comment body is
+        // dropped), which can move a `fn` header off the exact 4-space prefix that
+        // BOTH the enumeration and the count cross-check key on — letting a method
+        // slip BOTH silently. There are no block comments in this impl today (it
+        // uses `//` / `///`), so forbid them at method indent rather than special-
+        // case the indent shift. Scanned on the RAW block (pre-strip) so the `/*`
+        // is still visible.
+        let block_comment = impl_block.lines().find(|l| {
+            l.starts_with("    ") && !l.starts_with("     ") && l.trim_start().contains("/*")
+        });
+        assert!(
+            block_comment.is_none(),
+            "ADR-049 §9: a `/* … */` block comment at method indent in `impl ClassSCell` \
+             ({block_comment:?}) can shift a `fn` header off the 4-space prefix the \
+             whitelist scan keys on, hiding a method from BOTH the enumeration and the \
+             count cross-check. Use `//` line comments instead."
+        );
+
+        assert_eq!(
+            no_persist_methods, expected,
+            "ADR-049 §9: the set of `ClassSCell` self-receiver methods that perform \
+             NO persist must be EXACTLY the known-safe allowlist. A NEW method here \
+             means a Class-S mutation may be acknowledged without a fail-closed \
+             persist (a §9 replay/re-spend/re-grant hole). Route it through a \
+             combinator / `ClassSCommitToken`, or — if it is genuinely safe — add \
+             it to KNOWN_SAFE with a §9 safety argument on the method. \
+             Found: {no_persist_methods:?}, expected: {expected:?}"
+        );
+    }
 
     /// Minimal event log provider — accepts every call (the combinator paths do
     /// not touch the event log).
