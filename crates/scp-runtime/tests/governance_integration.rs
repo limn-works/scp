@@ -2474,3 +2474,173 @@ async fn multi_party_threshold_propose_approve_verify() {
         "expected Dave to be a member after AddMember execution"
     );
 }
+
+// =========================================================================
+// Direct-execute trust boundary (governance quorum-bypass fix)
+//
+// `GovernanceCommand::ExecuteGovernanceAction` carries ONLY a proposal id
+// (plus an optional executor DID on the internal callers). The runtime
+// resolves the authoritative proposal from the context actor's OWN
+// quorum-validated governance engine via `engine.get_proposal(id)`; a caller
+// cannot fabricate an `Approved` proposal or substitute an action. These KATs
+// pin both halves of the boundary on the native runtime:
+//   - FORGERY: an untracked id is rejected and applies no state change.
+//   - GENUINE: a real quorum-approved action takes effect exactly once, and a
+//     subsequent execute-by-id of the same id is replay-rejected.
+// =========================================================================
+
+/// Dispatch a direct execute-by-id through the actor mailbox, returning the
+/// handler `Result`. Mirrors the FFI bridges' `ExecuteGovernanceAction`
+/// dispatch (proposal id only — no caller-supplied proposal/action/status).
+async fn dispatch_execute_by_id(
+    manager: &std::sync::Arc<Supervisor>,
+    ctx_id: &str,
+    proposal_id: scp_protocol::context::governance::ProposalId,
+) -> Result<GovernanceActionResult, ContextError> {
+    use scp_runtime::context::actor::commands::{
+        ExecuteGovernanceActionPayload, GovernanceCommand,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ExecuteGovernanceAction {
+        payload: Box::new(ExecuteGovernanceActionPayload {
+            context_id: ctx_id.to_owned(),
+            proposal_id,
+        }),
+        reply: tx,
+    };
+    manager.dispatch_governance_command(cmd).await.unwrap();
+    rx.await.unwrap()
+}
+
+#[tokio::test]
+async fn direct_execute_rejects_untracked_proposal_id() {
+    let manager = new_manager();
+    let ctx_id = "ctx-direct-forgery";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // A proposal id the engine never tracked.
+    let fabricated = [0xABu8; 32];
+    let err = dispatch_execute_by_id(&manager, ctx_id, fabricated)
+        .await
+        .expect_err("executing an untracked proposal id must be rejected");
+    assert!(
+        matches!(err, ContextError::PermissionDenied(_)),
+        "untracked proposal must be PermissionDenied, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("not tracked"),
+        "rejection should name the untracked proposal: {err}"
+    );
+}
+
+#[tokio::test]
+async fn direct_execute_forgery_applies_no_state_change() {
+    let manager = new_manager();
+    let ctx_id = "ctx-direct-forgery-state";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let victim = DID("did:dht:z6MkForgeryVictimNeverAdded".to_owned());
+    assert!(
+        !manager.is_member(ctx_id, victim.as_ref()).await,
+        "victim must not be a member before the forged execute"
+    );
+
+    // A fabricated id that, if the bridge trusted caller data, would have
+    // carried an AddMember{victim}. The runtime has no caller action to apply.
+    let fabricated = [0x11u8; 32];
+    assert!(
+        dispatch_execute_by_id(&manager, ctx_id, fabricated)
+            .await
+            .is_err(),
+        "forged direct-execute must be rejected"
+    );
+
+    assert!(
+        !manager.is_member(ctx_id, victim.as_ref()).await,
+        "rejected forgery must not have added the victim as a member"
+    );
+}
+
+#[tokio::test]
+async fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected() {
+    // A genuinely quorum-approved action takes effect exactly once. After the
+    // quorum-crossing vote auto-executes it, a direct execute-by-id of the SAME
+    // tracked proposal is replay-rejected — proving the by-id path resolves the
+    // engine's real proposal and honours the `executed_proposals` replay guard.
+    let manager = new_manager();
+    let ctx_id = "ctx-direct-genuine";
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Majority {
+            eligible_voters: vec![alice(), bob(), carol()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let sk_bob = signing_key_for_did(&bob());
+
+    // ChangeRole on the creator (a member) — reaches quorum at 2/3 and
+    // auto-executes inline.
+    let action = GovernanceAction::ChangeRole {
+        did: alice(),
+        new_role: "observer".into(),
+    };
+    let (proposal, _, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .await
+        .unwrap();
+    let (status, _) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        ProposalStatus::Approved,
+        "genuine quorum must approve the proposal"
+    );
+
+    // The engine retains the approved proposal: by-id resolution finds it.
+    let tracked = manager
+        .get_proposal(ctx_id, &proposal.proposal_id)
+        .await
+        .expect("engine must retain the approved proposal");
+    assert_eq!(tracked.status, ProposalStatus::Approved);
+
+    // The action took effect exactly once (executed inline at quorum). A direct
+    // execute-by-id of the same id is replay-rejected.
+    let replay = dispatch_execute_by_id(&manager, ctx_id, proposal.proposal_id).await;
+    let err = replay.expect_err("re-executing an already-executed proposal must be rejected");
+    assert!(
+        matches!(err, ContextError::PermissionDenied(_)),
+        "replay must be PermissionDenied, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("already been executed"),
+        "replay rejection should name the executed proposal: {err}"
+    );
+}

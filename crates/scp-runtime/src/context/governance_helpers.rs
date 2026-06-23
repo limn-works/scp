@@ -3443,8 +3443,8 @@ pub async fn propose_governance_action_inner(
                 cell,
                 deps,
                 context_id,
-                &proposal,
-                proposer_did,
+                &proposal.proposal_id,
+                Some(proposer_did),
             ))
             .await?,
         )
@@ -3759,7 +3759,11 @@ pub async fn vote_on_proposal_inner(
             // native disagree with WASM whenever proposer != quorum-crossing
             // voter.
             Box::pin(execute_governance_action(
-                cell, deps, context_id, &proposal, voter_did,
+                cell,
+                deps,
+                context_id,
+                &proposal.proposal_id,
+                Some(voter_did),
             ))
             .await?;
         }
@@ -4819,21 +4823,66 @@ pub async fn execute_governance_action(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    proposal: &GovernanceProposal,
-    // The committing member — the DID whose approval crossed quorum (quorum
-    // path) or the proposer (auto-execute / SingleAdmin). Threaded through to
-    // both `dispatch_governance_action` (per-action leaves) and
-    // `finalize_governance_action` (the `GovernanceActionExecuted` leaf +
-    // event `executor_did`). Spec: ADR-031 §8 "executor DID" / §7.3.1
-    // "committing member" / ADR-051 §6.
-    executor_did: &DID,
+    // Identifier of the proposal to execute. The authoritative proposal is
+    // resolved from the context actor's OWN governance engine via
+    // `engine.get_proposal(proposal_id)` — never from a caller-supplied
+    // proposal/action/status. This is the trust boundary that closes the
+    // direct-execute quorum bypass: the engine only sets
+    // `ProposalStatus::Approved` after verifying every vote's Ed25519
+    // signature at genuine quorum (see the governance engines in
+    // `scp_protocol::context::governance`), and only the engine-retained
+    // proposal is ever dispatched.
+    proposal_id: &ProposalId,
+    // The committing member whose DID is stamped on the per-action dispatch
+    // leaves and the `GovernanceActionExecuted` leaf/event:
+    // - `Some(voter)` on the quorum-approval path (the quorum-crossing voter)
+    //   and the auto-execute / `SingleAdmin` path (the proposer), supplied by
+    //   the internal callers that already hold that DID.
+    // - `None` on the direct-execute FFI path, where there is no
+    //   quorum-crossing voter: the executor is resolved from the *tracked*
+    //   proposal's `proposer_did` (never a caller-supplied DID), preserving the
+    //   convention and the native↔WASM leaf convergence established for the
+    //   direct path. Spec: ADR-031 §8 "executor DID" / §7.3.1 "committing
+    //   member" / ADR-051 §6.
+    executor_did: Option<&DID>,
 ) -> Result<GovernanceActionResult, ContextError> {
     // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
-    // gate is READ-ONLY (proposal status/context match, commit-fault gate,
-    // replay-marker presence) — read through the cell's `Deref` (`&*cell`), no
-    // mutation. The `executed_proposals` replay-marker WRITE below routes through
-    // the deferred-persist `begin_class_s` combinator; the downstream dispatch
-    // chain takes the cell directly.
+    // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
+    // proposal status/context match, replay-marker presence) — read through the
+    // cell's `Deref` (`&*cell`), no mutation. The `executed_proposals`
+    // replay-marker WRITE below routes through the deferred-persist
+    // `begin_class_s` combinator; the downstream dispatch chain takes the cell
+    // directly.
+
+    // PR #1606 C6 fail-close gate + atomically check replay AND mark as
+    // executed before dispatch. Actor-owned state — single linear sequence.
+    check_commit_fault(cell)?;
+
+    // Resolve the authoritative proposal from the engine. Clone so the engine
+    // borrow (taken via the cell's `Deref`) is dropped before the Class-S
+    // replay-marker WRITE below. A missing proposal means the caller referenced
+    // something the quorum-validated engine never retained — reject rather than
+    // trust caller-supplied data.
+    let proposal = cell
+        .governance
+        .engine
+        .get_proposal(proposal_id)
+        .cloned()
+        .ok_or_else(|| {
+            ContextError::PermissionDenied(format!(
+                "governance proposal not tracked: {}",
+                hex::encode(proposal_id)
+            ))
+        })?;
+    let proposal = &proposal;
+
+    // Resolve the committing member. The direct-execute path (`None`) attributes
+    // to the TRACKED proposal's proposer — never a caller-supplied DID — so the
+    // `GovernanceActionExecuted` leaf actor_did is convergent with WASM and the
+    // quorum path's own attribution.
+    let executor_did: &DID = executor_did.unwrap_or(&proposal.proposer_did);
+
+    // The engine's own status — set to `Approved` only at genuine quorum.
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
             "governance proposal is not approved (status: {:?})",
@@ -4848,10 +4897,9 @@ pub async fn execute_governance_action(
         )));
     }
 
-    // PR #1606 C6 fail-close gate + atomically check replay AND mark as
-    // executed before dispatch. Actor-owned state — single linear sequence.
-    check_commit_fault(cell)?;
-
+    // Atomically check replay AND mark as executed before dispatch (the
+    // commit-fault gate already ran above). Actor-owned state — single linear
+    // sequence.
     if cell
         .governance
         .class_s

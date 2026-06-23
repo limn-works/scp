@@ -863,6 +863,13 @@ impl ContextActor {
                     "messaging::seed_peer_pseudonym (test-only — use Supervisor::dispatch_command)",
                 );
             }
+            #[cfg(feature = "testing")]
+            MessagingCommand::TestInsertMember { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::test_insert_member (test-only — use Supervisor::dispatch_command)",
+                );
+            }
         }
     }
 

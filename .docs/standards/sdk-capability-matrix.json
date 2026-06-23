@@ -800,7 +800,8 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "Direct-execute is BY ID across all four bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction, WASM context_execute_governance. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
         },
         {
           "name": "propose_action",

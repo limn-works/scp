@@ -1576,7 +1576,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // ---------------------------------------------------------------------------
 
   describe("Governance (real NAPI)", () => {
-    test("executes a ChangeRole governance action", async () => {
+    test("rejects an untracked proposal id (direct-execute trust boundary)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1587,23 +1587,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         }),
       );
 
-      // Add the member first.
       await napi.contextJoin(ctx, member.did);
 
-      // Execute a ChangeRole governance action using a role that exists
-      // in single_admin governance. "admin" and "member" are the only
-      // predefined roles — promote member to admin.
-      const actionJson = JSON.stringify({
-        ChangeRole: {
-          did: member.did,
-          new_role: "admin",
-        },
-      });
-      const result = await napi.contextExecuteGovernanceAction(ctx, actionJson, admin.did);
-      expect(typeof result).toBe("string");
+      // Direct execute is BY ID: the runtime resolves the authoritative proposal
+      // from the context actor's own quorum-validated engine. A fabricated id
+      // (a forgery) is rejected — a caller cannot supply an action to run.
+      const fabricated = "ab".repeat(32);
+      await expect(napi.contextExecuteGovernanceAction(ctx, fabricated)).rejects.toThrow(
+        /not tracked/,
+      );
     });
 
-    test("rejects invalid governance action JSON", async () => {
+    test("rejects a malformed proposal id", async () => {
       const admin = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
@@ -1613,9 +1608,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         }),
       );
 
-      await expect(
-        napi.contextExecuteGovernanceAction(ctx, "not-valid-json", admin.did),
-      ).rejects.toThrow();
+      await expect(napi.contextExecuteGovernanceAction(ctx, "not-hex")).rejects.toThrow();
     });
   });
 

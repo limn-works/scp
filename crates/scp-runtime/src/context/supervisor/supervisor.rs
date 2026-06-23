@@ -9678,6 +9678,46 @@ impl Supervisor {
         })?
     }
 
+    /// Inserts a member directly into a context's role state via the actor
+    /// mailbox — test-only.
+    ///
+    /// Records `member_did` in `role_state.members` and assigns `role`,
+    /// bypassing the MLS Welcome / governance round-trip. Single-node tests
+    /// that need a multi-member context (e.g. exporter selection over a 2+
+    /// member membership map) cannot drive a genuine join: the bridge
+    /// governance key resolver only resolves DID-document-published
+    /// identities, and in-memory test identities are never published.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the role is undefined / the
+    ///   context is inactive.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn test_insert_member(
+        &self,
+        context_id: &str,
+        member_did: DID,
+        role: &str,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestInsertMember {
+            context_id: context_id.to_owned(),
+            member_did,
+            role: role.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_insert_member — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Lists every governance proposal currently tracked by the
     /// context's engine via the actor mailbox.
     ///

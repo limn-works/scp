@@ -9500,28 +9500,24 @@ impl Scp {
     pub async fn governance_execute(
         &self,
         handle: Arc<ContextHandle>,
-        proposal_json: String,
+        proposal_id_hex: String,
     ) -> Result<String, ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+        let proposal_id_log = hex::encode(proposal_id);
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
-        let (result, action_name) = runtime()
+        let result = runtime()
             .spawn(async move {
-                let proposal: scp_core::context::governance::GovernanceProposal =
-                    serde_json::from_str(&proposal_json)?;
-                // Defense-in-depth: validate user-controlled string fields at the
-                // FFI boundary before the action reaches the ContextManager (#1601).
-                scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
-                    .map_err(|e| ScpError::Validation {
-                        msg: e.message,
-                        code: codes::VALID_7000.to_owned(),
-                    })?;
-                let action_name = proposal.action.variant_name();
-                // Route through the ADR-049 governance dispatch surface.
+                // Route through the ADR-049 governance dispatch surface. The
+                // runtime resolves the authoritative proposal from its own
+                // quorum-validated engine by id; the bridge never supplies a
+                // proposal, action, or status — closing the direct-execute
+                // quorum bypass.
                 let sup = bi.context_manager_or_error()?;
                 let result = {
                     use scp_core::context::actor::commands::{
@@ -9531,7 +9527,7 @@ impl Scp {
                     let cmd = GovernanceCommand::ExecuteGovernanceAction {
                         payload: Box::new(ExecuteGovernanceActionPayload {
                             context_id: context_id.clone(),
-                            proposal,
+                            proposal_id,
                         }),
                         reply: tx,
                     };
@@ -9578,7 +9574,7 @@ impl Scp {
                     GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
                     GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
                 };
-                Ok::<_, ScpError>((result_str.to_owned(), action_name))
+                Ok::<_, ScpError>(result_str.to_owned())
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -9596,7 +9592,7 @@ impl Scp {
         {
             tracing::warn!(
                 context_id = %handle.context_id,
-                action = action_name,
+                proposal_id = %proposal_id_log,
                 error = %e,
                 "failed to sync role state after governance execution"
             );

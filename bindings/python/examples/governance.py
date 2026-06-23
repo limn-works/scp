@@ -3,8 +3,9 @@
 Starts an in-memory relay, creates an identity, creates a governed context,
 executes a role-change governance action, and verifies the result.
 
-Phase 4 PR 5 (#1549) moved governance helpers onto :class:`scp_sdk.SCP`.
-Use :meth:`SCP.governance_execute` with a JSON proposal.
+Governance helpers live on :class:`scp_sdk.SCP`. Propose an action with
+:meth:`SCP.governance_propose`, then execute the tracked proposal BY ID with
+:meth:`SCP.governance_execute` — which takes only the proposal id.
 
 Requires a built native extension (``maturin develop --release``).
 """
@@ -53,19 +54,35 @@ async def main() -> None:
             await scp.context_join(ctx._raw_handle, member.did)
             print(f"Member {member.did} joined")
 
-            # 5. Admin executes a governance action to change the member's role.
-            proposal = json.dumps(
+            # 5. Admin proposes a governance action to change the member's role.
+            #    Under SingleAdmin the proposal is tracked, approved, and
+            #    executed by the runtime in one step; the response carries the
+            #    `proposal_id` the engine retained.
+            action = json.dumps(
                 {
-                    "action": {
-                        "ChangeRole": {
-                            "target_did": member.did,
-                            "new_role": "moderator",
-                        },
+                    "ChangeRole": {
+                        "did": member.did,
+                        "new_role": "moderator",
                     },
                 }
             )
-            result = await scp.governance_execute(ctx._raw_handle, proposal)
-            print(f"Governance action result: {result}")
+            propose_result = json.loads(
+                await scp.governance_propose(ctx._raw_handle, admin.did, action)
+            )
+            proposal_id = propose_result["proposal_id"]
+            print(f"Proposed + executed governance action: {proposal_id}")
+
+            # `governance_execute` runs an already-approved proposal BY ID. The
+            # runtime resolves the authoritative proposal from its own
+            # quorum-validated engine — the caller passes no action and no
+            # identity, only the id; the executor and consequence subject are
+            # resolved from the tracked proposal's proposer. The SingleAdmin
+            # propose above already executed this proposal, so a direct execute
+            # now demonstrates the runtime's replay guard.
+            try:
+                await scp.governance_execute(ctx._raw_handle, proposal_id)
+            except Exception as replay:  # illustrative
+                print(f"Re-executing an applied proposal is rejected: {replay}")
 
             # 6. Cleanup.
             await scp.context_leave(ctx._raw_handle, member.did)

@@ -53,6 +53,35 @@ use scp_protocol::crypto::ucan::validate::{
 use scp_protocol::economy::policy::policy_requires_payment;
 use scp_protocol::economy::types::EconomicPolicy;
 
+/// Strictly parses a hex-encoded governance proposal id into the canonical
+/// 32-byte array.
+///
+/// This is the manager-level equivalent of the native bridges'
+/// `hex::decode(...)` + `try_into::<[u8; 32]>()` parse: it rejects non-hex
+/// input and any length other than exactly 32 bytes. It replaces the former
+/// `hex::decode(...).unwrap_or_default()` + truncate/zero-pad code, which
+/// silently widened a short id (or an empty decode from non-hex input) into a
+/// well-formed-looking all-zero / right-padded id — a divergence from native
+/// that could mint a `GovernanceActionExecuted` leaf whose `proposal_id`
+/// differs across platforms. The WASM bridge boundary
+/// (`validate_proposal_id_hex`) already rejects malformed ids before reaching
+/// the manager; this parse is the defense-in-depth equal of the native parse
+/// for any in-crate caller, and fails loudly rather than fabricating bytes.
+///
+/// # Errors
+///
+/// Returns [`ScpWasmError::Context`] with code `SCP-CTX-2040` (via
+/// [`ScpWasmError::proposal_id`]) if `proposal_id` is not valid hex or does not
+/// decode to exactly 32 bytes — the same error surface the bridge boundary
+/// emits, so the in-crate defense-in-depth path is byte-for-byte consistent.
+fn parse_proposal_id_bytes(proposal_id: &str) -> Result<[u8; 32], ScpWasmError> {
+    // Single decode + length-check: `validate_proposal_id_hex` returns the
+    // canonical 32-byte array, so there is no second `hex::decode` and no
+    // unreachable error arm to map.
+    scp_ffi_common::validate::validate_proposal_id_hex(proposal_id)
+        .map_err(ScpWasmError::proposal_id)
+}
+
 // ---------------------------------------------------------------------------
 // No-op UCAN validation trait impls for BroadcastContext::subscribe turbofish
 // ---------------------------------------------------------------------------
@@ -3034,22 +3063,24 @@ impl WasmContextManager {
     /// - Propose auto-execute (`SingleAdmin`) path: `initiator_did ==
     ///   executor_did ==` the proposer (proposer == committer there).
     /// - Direct-FFI execute path (`context_execute_governance`):
-    ///   `initiator_did ==` the caller (auth subject), `executor_did ==` the
-    ///   proposal's `proposer_did` — matching the native direct-execute handler
-    ///   which stamps `proposal.proposer_did` as the executor.
+    ///   `initiator_did == executor_did ==` the proposal's `proposer_did`,
+    ///   resolved from tracked state by the bridge — the caller's identity is
+    ///   NOT used as the subject. Matches the native direct-execute handler,
+    ///   which stamps `proposal.proposer_did` as both the executor and the
+    ///   consequence subject.
     ///
     /// # Errors
     ///
     /// Returns an error if the context is not active, the proposal is not
-    /// `Approved`, the initiator lacks the required capability, the proposal
-    /// was already executed, the proposal is not tracked, or the action fails.
+    /// tracked, the proposal is not `Approved`, the proposal was already
+    /// executed, or the action fails. There is no per-member capability check
+    /// at execute time (see above).
     pub fn execute_governance_action(
         &mut self,
         context_id: &str,
         initiator_did: &str,
         executor_did: &str,
         proposal_id: &str,
-        action: &GovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
         // Status precondition (mirrors native): a proposal must be `Approved`
         // before it can be executed.
@@ -3096,11 +3127,15 @@ impl WasmContextManager {
                 });
             }
 
-            let created_at = ctx
+            // Resolve BOTH the convergent leaf timestamp AND the action to
+            // dispatch from the TRACKED proposal — never from a caller-supplied
+            // action. This closes the action-substitution facet of the
+            // direct-execute quorum bypass: the executed action is exactly the
+            // one the engine tracked for this id.
+            let tracked = ctx
                 .pending_proposals
                 .get(proposal_id)
                 .or_else(|| ctx.resolved_proposals.get(proposal_id))
-                .map(|p| p.created_at)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!(
                         "governance proposal '{proposal_id}' is not tracked (pending or resolved); \
@@ -3108,6 +3143,8 @@ impl WasmContextManager {
                     ),
                     code: codes::CTX_2041.to_owned(),
                 })?;
+            let created_at = tracked.created_at;
+            let tracked_action = tracked.action.clone();
 
             // Evict expired proposals when over capacity.
             if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
@@ -3116,8 +3153,10 @@ impl WasmContextManager {
             }
 
             ctx.executed_proposals.insert(proposal_id.to_owned(), now);
-            created_at
+            (created_at, tracked_action)
         };
+        let (proposal_created_at, action) = proposal_created_at;
+        let action = &action;
 
         let result = self.dispatch_governance_action(context_id, action);
 
@@ -3139,13 +3178,11 @@ impl WasmContextManager {
             // proposal-derived value (`finalize_governance_action`); never
             // local `now()` (§7.3.1, §9.9.3).
             let action_summary = action.variant_name().to_owned();
-            let proposal_id_bytes: [u8; 32] = {
-                let bytes = hex::decode(proposal_id).unwrap_or_default();
-                let mut arr = [0u8; 32];
-                let len = bytes.len().min(32);
-                arr[..len].copy_from_slice(&bytes[..len]);
-                arr
-            };
+            // Strict parse: reject non-hex / non-32-byte ids loudly instead of
+            // silently zero-padding (matches the native bridges' parse and the
+            // WASM bridge boundary). A divergent `proposal_id` here would break
+            // cross-platform Merkle equivocation detection.
+            let proposal_id_bytes: [u8; 32] = parse_proposal_id_bytes(proposal_id)?;
             let target_did: Option<DID> = action.target_did().cloned();
 
             // Encode the durable leaf payload FIRST, before any buffer event is
@@ -4212,14 +4249,12 @@ impl WasmContextManager {
         let now_secs = (now / 1000.0) as u64;
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let voting_deadline_secs = ((now + WASM_PROPOSAL_DEADLINE_MS) / 1000.0) as u64;
-        // Compute proposal_id as [u8; 32] from the hex string.
-        let proposal_id_bytes: [u8; 32] = {
-            let bytes = hex::decode(proposal_id).unwrap_or_default();
-            let mut arr = [0u8; 32];
-            let len = bytes.len().min(32);
-            arr[..len].copy_from_slice(&bytes[..len]);
-            arr
-        };
+        // Compute proposal_id as [u8; 32] from the hex string. Strict parse:
+        // reject non-hex / non-32-byte ids loudly instead of silently
+        // zero-padding (matches the native bridges' parse and the WASM bridge
+        // boundary). A divergent `proposal_id` here would break cross-platform
+        // Merkle equivocation detection.
+        let proposal_id_bytes: [u8; 32] = parse_proposal_id_bytes(proposal_id)?;
         let proposal = GovernanceProposal {
             proposal_id: proposal_id_bytes,
             context_id: context_id.to_owned(),
@@ -4246,19 +4281,12 @@ impl WasmContextManager {
         // timestamp and checks the status precondition.
         if required == 0 {
             let pid = proposal_id.to_owned();
-            let action_ref = proposal.action.clone();
             let mut approved = proposal;
             approved.status = ProposalStatus::Approved;
             if let Some(ctx) = self.contexts.get_mut(context_id) {
                 ctx.insert_resolved_proposal(pid.clone(), approved);
             }
-            match self.execute_governance_action(
-                context_id,
-                proposer_did,
-                proposer_did,
-                &pid,
-                &action_ref,
-            ) {
+            match self.execute_governance_action(context_id, proposer_did, proposer_did, &pid) {
                 Ok(result) => {
                     return Ok(serde_json::json!({
                         "proposal_id": proposal_id,
@@ -4326,7 +4354,6 @@ impl WasmContextManager {
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(p) = proposal {
-                let action_ref = p.action.clone();
                 let pending_snapshot = p.clone();
                 let mut approved = p;
                 approved.status = ProposalStatus::Approved;
@@ -4336,13 +4363,7 @@ impl WasmContextManager {
                 // Proposer's own vote crossed quorum: proposer == committing
                 // member, so the executor is the proposer (auth subject and
                 // executor coincide here).
-                match self.execute_governance_action(
-                    context_id,
-                    proposer_did,
-                    proposer_did,
-                    &pid,
-                    &action_ref,
-                ) {
+                match self.execute_governance_action(context_id, proposer_did, proposer_did, &pid) {
                     Ok(result) => {
                         return Ok(serde_json::json!({
                             "proposal_id": pid,
@@ -4478,7 +4499,6 @@ impl WasmContextManager {
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(p) = proposal {
-                let action_ref = p.action.clone();
                 // Retain the PRE-MOVE proposal (status `Pending`) so the
                 // pending → resolved move can be rolled back if dispatch fails.
                 let pending_snapshot = p.clone();
@@ -4495,13 +4515,7 @@ impl WasmContextManager {
                 // the executor here. Passing the proposer would diverge the leaf
                 // from native's quorum path, which stamps the voter (§9.9.3
                 // native↔WASM convergence).
-                match self.execute_governance_action(
-                    context_id,
-                    voter_did,
-                    voter_did,
-                    &pid,
-                    &action_ref,
-                ) {
+                match self.execute_governance_action(context_id, voter_did, voter_did, &pid) {
                     Ok(result) => {
                         return Ok(serde_json::json!({
                             "status": "Approved",
@@ -8921,6 +8935,106 @@ mod tests {
         );
     }
 
+    /// `propose_governance_action` REJECTS a caller-supplied `proposal_id` that
+    /// is not strict 32-byte hex, instead of silently truncating / zero-padding
+    /// it into a well-formed-looking `[u8; 32]`. A short / non-hex id reaching
+    /// the `[u8; 32]` parse would have been widened by the former
+    /// `hex::decode(...).unwrap_or_default()` path, producing a `proposal_id`
+    /// that diverges from the native bridges' strict `hex::decode` +
+    /// `try_into::<[u8; 32]>` parse — breaking cross-platform Merkle
+    /// equivocation detection. The proposer is granted `governance:propose`
+    /// (admin role + ceiling) so the rejection happens at the proposal-id parse,
+    /// NOT at the capability gate, and nothing is tracked.
+    #[test]
+    fn test_wasm_propose_rejects_malformed_proposal_id() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let context_id = "ctx-malformed-pid";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        // Admin capabilities are intersected with the ceiling, so grant
+        // `governance:propose` in the ceiling to reach the proposal-id parse.
+        state
+            .ceiling_strings
+            .insert("governance:propose".to_owned());
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        let action = GovernanceAction::ChangeRole {
+            did: DID("did:dht:ztarget".to_owned()),
+            new_role: "moderator".to_owned(),
+        };
+
+        // 4-byte hex — exactly the value the old unwrap_or_default + zero-pad
+        // path would have silently widened to 32 bytes. The strict parse
+        // (`parse_proposal_id_bytes`) routes the rejection through
+        // `ScpWasmError::proposal_id`, so a malformed id surfaces as the same
+        // `Context` / `SCP-CTX-2040` error the bridge boundary emits — identical
+        // to the native PyO3/UniFFI/NAPI bridges' malformed-proposal-id surface.
+        let err = mgr
+            .propose_governance_action(context_id, creator, "deadbeef", &action)
+            .expect_err("a 4-byte proposal id must be rejected, not zero-padded");
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(
+                    code,
+                    codes::CTX_2040,
+                    "a malformed proposal id must surface SCP-CTX-2040, got: {code}"
+                );
+                assert!(
+                    message.contains("32 bytes"),
+                    "rejection should name the 32-byte requirement, got: {message}"
+                );
+            }
+            other => panic!("expected Context (SCP-CTX-2040) error, got: {other:?}"),
+        }
+
+        // Non-hex input must also be rejected (would decode to 0 bytes and the
+        // old path would have produced an all-zero id).
+        assert!(
+            mgr.propose_governance_action(context_id, creator, "zz", &action)
+                .is_err(),
+            "non-hex proposal id must be rejected"
+        );
+
+        // Defense-in-depth: a rejected proposal id leaves NOTHING tracked.
+        let ctx = &mgr.contexts[context_id];
+        assert!(
+            ctx.pending_proposals.is_empty() && ctx.resolved_proposals.is_empty(),
+            "a rejected proposal id must not insert any tracked proposal"
+        );
+    }
+
+    /// `parse_proposal_id_bytes` is the shared strict parse both
+    /// `propose_governance_action` and `execute_governance_action` use. It
+    /// accepts exactly-32-byte hex and rejects everything else, matching the
+    /// native bridges' `hex::decode` + `try_into::<[u8; 32]>`.
+    #[test]
+    fn test_parse_proposal_id_bytes_strict() {
+        let valid = "a".repeat(64);
+        let parsed = parse_proposal_id_bytes(&valid).expect("64-char hex must parse");
+        assert_eq!(parsed, [0xaa_u8; 32]);
+
+        assert!(
+            parse_proposal_id_bytes("deadbeef").is_err(),
+            "short hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes(&"a".repeat(66)).is_err(),
+            "over-length hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes("zz").is_err(),
+            "non-hex must be rejected"
+        );
+        assert!(
+            parse_proposal_id_bytes("").is_err(),
+            "empty input must be rejected"
+        );
+    }
+
     /// `handle_ttl_expiry` stamps the CONVERGENT deadline
     /// (`creation_timestamp_secs + ttl_seconds`) on the `ContextExpired` leaf,
     /// not the member's local fire-time `now()`. Two members whose timers fire
@@ -9102,6 +9216,159 @@ mod tests {
             wasm_deadline, native_deadline,
             "native and WASM importers of the same future-dated signed snapshot \
              must derive the IDENTICAL TTL deadline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct-execute trust boundary (governance quorum-bypass fix)
+    //
+    // `WasmContextManager::execute_governance_action` takes a proposal id and
+    // resolves the action to dispatch from its OWN tracked
+    // (`resolved_proposals`/`pending_proposals`) governance state — never a
+    // caller-supplied action. The bridge surface `context_execute_governance`
+    // has no `action_json` parameter, so action substitution is structurally
+    // impossible. These KATs pin the boundary:
+    //   - FORGERY: an untracked id is rejected and applies no state change.
+    //   - GENUINE: a tracked `Approved` proposal executes once; a second
+    //     execute of the same id is replay-rejected.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn direct_execute_rejects_untracked_proposal_id_wasm() {
+        let context_id = "ctx-wasm-forgery";
+        let proposer = "did:dht:z6MkWasmForgeryProposer";
+        let caller = "did:dht:z6MkWasmForgeryCaller";
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(caller, "admin");
+        ctx.test_insert_ceiling("role:assign");
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // An id the manager never tracked. WASM checks the status precondition
+        // first, so an untracked id surfaces as "not approved (status: None)"
+        // — the engine has no `Approved` proposal to dispatch. Either way the
+        // forgery is rejected before any action can run. The shipped bridge
+        // resolves the proposer and passes it for both the initiator and the
+        // executor, so this call uses the production (proposer, proposer) shape.
+        let err = mgr
+            .execute_governance_action(context_id, proposer, proposer, "deadbeef")
+            .expect_err("executing an untracked proposal id must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not approved") || msg.contains("not tracked"),
+            "untracked/forged proposal must be rejected as un-approved/un-tracked, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn direct_execute_forgery_applies_no_state_change_wasm() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-forgery-state";
+        let proposer = "did:dht:z6MkWasmForgeryStateProposer";
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_ceiling("role:assign");
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // No caller action exists to substitute; the forged id carries nothing.
+        assert!(
+            mgr.execute_governance_action(context_id, proposer, proposer, "feedbeef")
+                .is_err(),
+            "forged direct-execute must be rejected"
+        );
+
+        // The rejection had no side effect: no GovernanceActionExecuted leaf
+        // was minted (a substituted action would have produced one).
+        let logged = mgr.test_context_event_log_events(context_id);
+        assert!(
+            !logged
+                .iter()
+                .any(|e| e.event_type == EventType::GovernanceActionExecuted),
+            "a rejected forgery must mint no GovernanceActionExecuted leaf"
+        );
+    }
+
+    #[test]
+    fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected_wasm() {
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        };
+
+        let context_id = "ctx-wasm-genuine";
+        let proposer = "did:dht:z6MkWasmGenuineProposer";
+        // A valid 64-char (32-byte) hex id: the strict `parse_proposal_id_bytes`
+        // on the execute path requires exactly 32 bytes. The id is only a map
+        // key and the leaf bytes, so any well-formed 64-char hex works.
+        let proposal_id = "abad1dea000000000000000000000000000000000000000000000000000000ff";
+        let created_at = 1_700_600_600_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member("did:dht:z6MkWasmGenuineTarget", "member");
+        ctx.test_insert_ceiling("role:assign");
+
+        let action = GovernanceAction::ChangeRole {
+            did: DID::from("did:dht:z6MkWasmGenuineTarget".to_owned()),
+            new_role: "observer".to_owned(),
+        };
+        // Seed a genuinely Approved, tracked proposal (the precondition the
+        // quorum path produces; here via the test seam since a single-node WASM
+        // test cannot run a real multi-voter round).
+        let proposal = GovernanceProposal {
+            proposal_id: {
+                let bytes = hex::decode(proposal_id).unwrap();
+                let mut arr = [0u8; 32];
+                arr[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+                arr
+            },
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(proposer.to_owned()),
+            action,
+            status: ProposalStatus::Approved,
+            created_at,
+            voting_deadline: created_at + 3600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(proposer.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: created_at,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        ctx.test_insert_resolved_proposal(proposal_id.to_owned(), proposal);
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // First execute: the manager dispatches the TRACKED action, minting
+        // exactly one GovernanceActionExecuted leaf.
+        let resolved_proposer = mgr
+            .proposal_proposer_did(context_id, proposal_id)
+            .expect("proposer resolvable");
+        mgr.execute_governance_action(context_id, proposer, &resolved_proposer, proposal_id)
+            .expect("genuine approved proposal must execute");
+
+        let executed_count = mgr
+            .test_context_event_log_events(context_id)
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed_count, 1,
+            "the tracked action must take effect exactly once"
+        );
+
+        // Second execute of the same id: replay-rejected.
+        let err = mgr
+            .execute_governance_action(context_id, proposer, &resolved_proposer, proposal_id)
+            .expect_err("re-executing an already-executed proposal must be rejected");
+        assert!(
+            format!("{err:?}").contains("already been executed"),
+            "replay rejection should name the executed proposal, got: {err:?}"
         );
     }
 }

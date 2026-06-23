@@ -124,6 +124,13 @@ pub(crate) async fn dispatch(
             pseudonym,
             reply,
         } => handle_seed_peer_pseudonym(cell, member_did, pseudonym, reply),
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestInsertMember {
+            context_id: _,
+            member_did,
+            role,
+            reply,
+        } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -184,6 +191,49 @@ fn handle_seed_peer_pseudonym(
             Ok(())
         },
     );
+    let _ = reply.send(result);
+    Outcome::ok(())
+}
+
+/// Handle [`MessagingCommand::TestInsertMember`] (actor-shape, test-only).
+///
+/// Records a member directly into role state — `members` plus a role
+/// `assignment` — exactly as an executed `AddMember` governance action would
+/// for those two fields, but without the MLS Welcome / governance round-trip
+/// (which a single-node test cannot drive: the bridge governance key resolver
+/// only resolves DID-document-published identities). Used by tests that need a
+/// multi-member context (e.g. exporter selection over a 2+ member membership
+/// map). Rejects an inactive context so a mis-targeted test fails loudly.
+#[cfg(feature = "testing")]
+fn handle_test_insert_member(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    member_did: &scp_identity::DID,
+    role: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    // Coalesced Class-C structural mutation (the run loop persists on `mutated`):
+    // the member roster insert, the system role assignment, and the membership
+    // add all route through the non-persisting `class_c_view`. A member ADD is a
+    // coalesce-window-rollback-acceptable structural change (ADR-049 §9), not a
+    // downward-auth GROW, so it needs no fail-closed Class-S persist.
+    let result = (|| {
+        crate::context::state::require_active(&cell.handle)?;
+        let tokens = {
+            let mut view = cell.class_c_view();
+            let mut role_state = view.role_state_class_c_mut();
+            role_state.members_mut().insert(member_did.to_string());
+            role_state
+                .system_assign_role(member_did.as_ref(), role, &*deps.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?
+        };
+        cell.class_c_view().membership_class_c_mut().add_member(
+            member_did.clone(),
+            role.to_owned(),
+            tokens,
+        );
+        Ok(())
+    })();
     let _ = reply.send(result);
     Outcome::ok(())
 }

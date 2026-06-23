@@ -666,23 +666,32 @@ async fn handle_execute_governance_action_actor(
     reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
 ) -> Outcome<()> {
     let context_id = payload.context_id.clone();
-    let proposal = payload.proposal;
 
     let execute_fut = async move {
-        // Direct-execute command (no quorum-crossing voter in the payload): the
-        // executor is the proposer, matching the auto-execute convention where
-        // proposer == committer (ADR-031 §8 "executor DID" / spec §7.3.1
-        // "committing member"). The quorum-approval path
-        // that distinguishes voter from proposer lives in
-        // `vote_on_proposal_inner`, not this direct entry point.
-        let executor_did = proposal.proposer_did.clone();
+        // Direct-execute command. The payload carries ONLY the proposal id —
+        // never a proposal, action, status, or caller DID.
+        // `execute_governance_action` resolves the authoritative proposal from
+        // the actor's own quorum-validated engine by id; a caller cannot
+        // fabricate an `Approved` proposal or substitute an action.
+        //
+        // There is NO executor capability check here: the proposal is already
+        // engine-`Approved` (quorum-verified at approve time), so execution is
+        // an unprivileged finalization step. Both the executor (the
+        // `GovernanceActionExecuted` leaf actor_did) and the consequence
+        // subject are resolved INSIDE `execute_governance_action` from the
+        // TRACKED proposal's proposer — never a caller-supplied DID (ADR-031 §8
+        // "executor DID" / spec §7.3.1).
         Box::pin(
             crate::context::governance_helpers::execute_governance_action(
                 cell,
                 deps,
                 &payload.context_id,
-                &proposal,
-                &executor_did,
+                &payload.proposal_id,
+                // Direct-execute: no quorum-crossing voter. The executor (and
+                // the `GovernanceActionExecuted` leaf actor_did) is resolved
+                // inside `execute_governance_action` from the TRACKED proposal's
+                // proposer — never a caller-supplied DID.
+                None,
             ),
         )
         .await

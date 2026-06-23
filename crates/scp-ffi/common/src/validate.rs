@@ -541,6 +541,35 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Validates a caller-supplied governance proposal id, hex-encoded, and
+/// returns the decoded 32-byte value.
+///
+/// A proposal id is a 32-byte value. The hex string must decode cleanly and
+/// yield exactly 32 bytes. This is the bridge-boundary equivalent of the
+/// native parsers (`hex::decode` + `try_into::<[u8; 32]>`): it rejects
+/// non-hex input and any length other than 64 hex characters / 32 bytes, so
+/// no bridge can silently truncate or zero-pad a malformed id into a
+/// well-formed-looking one.
+///
+/// Returns the decoded `[u8; 32]` so callers that need the bytes (e.g. the
+/// WASM bridge's `GovernanceActionExecuted` leaf) decode exactly once. Callers
+/// that only need validation can `?` and discard the value.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if `proposal_id_hex` is not valid hex or does
+/// not decode to exactly 32 bytes.
+pub fn validate_proposal_id_hex(proposal_id_hex: &str) -> Result<[u8; 32], ValidationError> {
+    let bytes = hex::decode(proposal_id_hex)
+        .map_err(|e| ValidationError::new(format!("proposal id is not valid hex: {e}")))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ValidationError::new(format!(
+            "proposal id must be 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // User-controlled string validation (§9.1A, #1601)
 // ---------------------------------------------------------------------------
