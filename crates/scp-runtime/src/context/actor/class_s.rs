@@ -31,10 +31,14 @@
 //! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth pair and
 //! for `MembershipState::remove_member`; member removal IS now behind the boundary
 //! (the best-effort views withhold `remove_member` and removal routes through a
-//! fail-closed combinator), but the `ceiling` / `suspended_capabilities` pair is
-//! the documented residual still reachable from the best-effort surface (see
-//! "Known residual" below) — for it, neither the compile boundary nor the tripwire
-//! yet substitutes for the retired scanner, and that gap is disclosed, not closed.
+//! fail-closed combinator). The `ceiling` / `suspended_capabilities` pair's
+//! BEHAVIORAL §9 hole is now closed too — the consequence-engine auto-suspension
+//! (the live exposed path) is persisted fail-closed by the cell-holding caller
+//! (RED-CS3) — but the pair remains a STRUCTURAL residual: it is not behind the
+//! COMPILE-TIME boundary (the whole `&mut ContextRoleState` can still name it),
+//! so for that structural surface neither the compile boundary nor the tripwire
+//! substitutes for the retired scanner (see "Known residual" below). The
+//! behavioral guarantee is closed; the structural surface is disclosed.
 //!
 //! # The mechanism
 //!
@@ -176,34 +180,62 @@
 //! ADR-049 §9 also classifies the **downward-authorization** fields
 //! `ContextRoleState.ceiling` and `ContextRoleState.suspended_capabilities` as
 //! Class-S (a coalesce-window rollback of a ceiling tightening or a capability
-//! suspension re-widens authority the caller observed as narrowed). These are
-//! NOT yet behind the compile-time boundary: the best-effort surface still hands
-//! out a whole `&mut ContextRoleState` (through which a best-effort path can reach
-//! `ceiling` / `suspended_capabilities` with no fail-closed persist) via THREE
-//! accessors, ALL of which are part of this residual:
+//! suspension re-widens authority the caller observed as narrowed). The
+//! BEHAVIORAL hole on the consequence-engine path — the auto-suspension being
+//! lost on a coalesce-window crash, silently re-granting a denied capability
+//! (RED-CS3) — is now **CLOSED**: when consequence enforcement applies a
+//! suspension, [`crate::context::governance_logic::enforce_triggered_consequences`]
+//! returns a downward-auth flag and the cell-holding caller persists the
+//! already-applied suspension **fail-closed** (keep-direction) before acking, in
+//! every production consequence site (send / receive / tool-settle / periodic
+//! sweep; the governance-execution path was already fail-closed via its
+//! `ClassSCommitToken`). Consequence EVALUATION stays best-effort / coalesced —
+//! only the rare suspension OUTCOME is fail-closed.
 //!
-//! 1. [`ClassCMut::role_state_mut`] — the direct whole-`&mut` accessor.
-//! 2. [`ClassCMut::split_class_c`] → [`ClassCSplit::role_state`] — the disjoint
-//!    consequence-path split carries the same whole `&mut ContextRoleState`.
-//! 3. [`ClassCSplit::from_state`] — the cell-free bridge builds the same split
-//!    (and thus the same `role_state` `&mut`) directly from a
-//!    `&mut PerContextState`.
+//! What REMAINS is STRUCTURAL, not behavioral: these two fields are not behind
+//! the COMPILE-TIME boundary (unlike the three privatized Class-S fields). The
+//! best-effort surface still hands out a whole `&mut ContextRoleState` (through
+//! which `ceiling` / `suspended_capabilities` are *nameable* with no fail-closed
+//! persist) via:
 //!
-//! The restricted replacement [`ClassCMut::role_state_class_c_mut`] (which hands
-//! out a [`RoleStateClassCMut`] exposing `&mut` only for the Class-C structural
-//! fields and shared `&` reads of the two downward-auth fields) ALREADY EXISTS;
-//! the residual closes when the `role_state_mut` callers AND the consequence-path
-//! `ClassCSplit.role_state` consumers migrate onto that field-granular shape and
-//! all three whole-`&mut` exits are removed. This is NOT an ADR-sanctioned
-//! accepted residual — the only accepted security-adjacent Class-C residual in §9
-//! (`velocity_tracker` / `earned_capacity`) explicitly EXCLUDES re-granting a
-//! removed capability, which a `suspended_capabilities` rollback does; this pair
-//! is a residual to CLOSE, not an accepted carve-out. Until then the compile-time
-//! guarantee above holds for the three privatized fields but NOT for the
-//! `ContextRoleState` dual-use pair — see [`ClassCMut::role_state_mut`]'s own doc
-//! and ADR-049 §9. The whitelist tripwire scans only `impl ClassSCell` and so does
-//! not cover these `ClassCMut` / `ClassCSplit` accessor paths either; the residual
-//! is tracked here honestly rather than claimed closed.
+//! 1. [`ClassCMut::role_state_mut`] — the direct whole-`&mut` accessor. Its
+//!    remaining callers pass the whole `&mut` to the
+//!    [`scp_protocol::context::roles`] free functions (`system_assign_role`). Of
+//!    the downward-auth pair, `ceiling` is untouched by them; `suspended_capabilities`
+//!    is touched ONLY by the SHRINK-only `prune_suspensions_to_role_grants`
+//!    `system_assign_role` invokes (it drops a member's suspensions for
+//!    capabilities the reassigned role no longer grants). A best-effort prune is
+//!    §9-safe in the DIRECTIONAL sense that matters: a coalesce-window rollback of
+//!    a prune can only RE-SUSPEND a dropped entry (re-narrow authority) — never
+//!    re-grant a removed capability — and the prune rolls back in lockstep with
+//!    the same-persist `member_capabilities` replacement, so it never leaves a
+//!    member effectively un-denied. (The two best-effort `system_assign_role`
+//!    callers are member ADD/JOIN, where no prior suspension entry exists, so the
+//!    prune is a no-op there anyway.) The dangerous GROW direction
+//!    (`suspend_capabilities` / `suspend_all`, which `extend` / `insert`) is the
+//!    one made fail-closed (RED-CS3). The pure-read / clone callers were migrated
+//!    to [`ClassCMut::role_state`] / [`ClassCMut::role_state_class_c_mut`].
+//! 2. [`ClassCMut::split_class_c`] → [`ClassCSplit::role_state`] — the
+//!    consequence-path split carries the same whole `&mut ContextRoleState`. The
+//!    consequence path DOES mutate `suspended_capabilities` through it (the
+//!    auto-suspension), but that mutation is now persist-covered fail-closed at
+//!    the cell boundary, so it is no longer a §9 bypass.
+//! 3. [`ClassCSplit::from_state`] — the cell-free bridge builds the same split.
+//!
+//! The restricted replacement [`ClassCMut::role_state_class_c_mut`] (a
+//! [`RoleStateClassCMut`] exposing `&mut` only for the Class-C structural fields
+//! and shared `&` reads of the two downward-auth fields) ALREADY EXISTS and is
+//! used by the structural callers. The STRUCTURAL residual closes fully when
+//! `system_assign_role` is reshaped onto the field-granular view and the
+//! consequence path mutates `suspended_capabilities` through a method rather than
+//! the whole `&mut` — a follow-up that does not affect the now-closed behavioral
+//! guarantee. The `ContextRoleState.ceiling` / `suspended_capabilities` fields
+//! remain `pub` (a cross-crate constraint: [`RoleStateClassCMut::new`]
+//! field-destructures `ContextRoleState` in this crate, and there is no
+//! cross-crate `pub(in …)` that admits the destructure while privatizing the
+//! field). The whitelist tripwire scans only `impl ClassSCell` and so does not
+//! cover these `ClassCMut` / `ClassCSplit` accessor paths; the structural residual
+//! is tracked here honestly rather than claimed closed by the compile-time guard.
 //!
 //! # Final enforcement model
 //!
@@ -219,8 +251,10 @@
 //! best-effort views hold no `&mut` to them, so the only `&mut` to those fields
 //! originates inside a persisting `ClassSCell` method. (The dual-use
 //! `ContextRoleState.ceiling` / `suspended_capabilities` downward-auth fields are
-//! the documented residual still reachable via `ClassCMut::role_state_mut` — see
-//! "Known residual" above.)
+//! the documented STRUCTURAL residual still reachable via
+//! `ClassCMut::role_state_mut`; their BEHAVIORAL §9 hole — the lost
+//! consequence-engine suspension — is closed by the caller-side fail-closed
+//! persist, see "Known residual" above.)
 //!
 //! The ONE remaining `&mut self` method on `ClassSCell` that mutates Class-S
 //! WITHOUT a fail-closed persist is
@@ -1264,10 +1298,15 @@ pub(crate) struct ClassCSplit<'a> {
     /// `&mut GovernanceState` — airtight by that field-granular construction.
     pub(crate) governance: GovernanceClassCMut<'a>,
     /// `&mut` role / ceiling / assignment state. NOTE: this whole `&mut
-    /// ContextRoleState` can reach the dual-use downward-auth Class-S fields
-    /// `ceiling` / `suspended_capabilities` with no fail-closed persist — the
-    /// KNOWN RESIDUAL documented in the module "Known residual" section, to be
-    /// closed alongside [`ClassCMut::role_state_mut`].
+    /// ContextRoleState` can NAME the dual-use downward-auth Class-S fields
+    /// `ceiling` / `suspended_capabilities`. The consequence path mutates
+    /// `suspended_capabilities` through it (the auto-suspension), but that is no
+    /// longer a §9 BYPASS: the suspension is persisted FAIL-CLOSED by the
+    /// cell-holding caller (RED-CS3 — `enforce_triggered_consequences` returns a
+    /// downward-auth flag the caller acts on). What remains is the STRUCTURAL
+    /// residual (the whole `&mut` still names the pair), documented in the module
+    /// "Known residual" section, to be closed alongside
+    /// [`ClassCMut::role_state_mut`].
     pub(crate) role_state: &'a mut ContextRoleState,
     /// `&` membership (read-only in the consequence path).
     pub(crate) membership: &'a MembershipState,
@@ -1313,20 +1352,21 @@ impl<'a> ClassCSplit<'a> {
     ///   in the destructure's `..` rest — NO reference to it is taken AT ALL.
     /// - `membership` is bound a SHARED `&` (read-only on the consequence path),
     ///   matching [`ClassCMut::split_class_c`]'s `&*self.membership` narrowing.
-    /// - `role_state` is bound a whole `&mut ContextRoleState`. This is part of
-    ///   the KNOWN RESIDUAL documented in the module-level "Known residual"
+    /// - `role_state` is bound a whole `&mut ContextRoleState`. This is the
+    ///   STRUCTURAL residual documented in the module-level "Known residual"
     ///   section: [`ContextRoleState`] is DUAL-USE — it carries Class-C structural
     ///   fields AND the downward-authorization Class-S fields `ceiling` /
-    ///   `suspended_capabilities`, and this whole `&mut` can reach those with NO
-    ///   fail-closed persist. It is NOT an ADR-sanctioned accepted residual (the
-    ///   only accepted security-adjacent Class-C residual in §9 — `velocity_tracker`
-    ///   / `earned_capacity` — explicitly EXCLUDES re-granting a removed capability,
-    ///   which a `suspended_capabilities` rollback does). It is a residual still to
-    ///   be CLOSED, by the same migration that retires [`ClassCMut::role_state_mut`]:
-    ///   when the consequence path moves onto a field-granular role-state view (the
-    ///   [`RoleStateClassCMut`] shape, `&mut` for structural fields + shared `&` for
-    ///   `ceiling` / `suspended_capabilities`), this whole `&mut` goes away too.
-    ///   Until then it matches the pre-existing
+    ///   `suspended_capabilities`, and this whole `&mut` can NAME those. The
+    ///   consequence path mutates `suspended_capabilities` through it (the
+    ///   auto-suspension); the BEHAVIORAL §9 hole that created (a coalesce-window
+    ///   crash losing the suspension and re-granting a denied capability) is now
+    ///   CLOSED — `enforce_triggered_consequences` returns a downward-auth flag and
+    ///   the cell-holding caller persists the suspension FAIL-CLOSED (RED-CS3). The
+    ///   STRUCTURAL residual (the whole `&mut` still names the pair) closes by the
+    ///   same migration that retires [`ClassCMut::role_state_mut`]: moving the
+    ///   consequence path onto the field-granular [`RoleStateClassCMut`] shape
+    ///   (`&mut` for structural fields + shared `&` for `ceiling` /
+    ///   `suspended_capabilities`). Until then it matches the pre-existing
     ///   `ConsequenceStateSplit.role_state: &mut ContextRoleState`.
     ///
     /// Apart from that disclosed `role_state` residual, no whole
@@ -1535,17 +1575,42 @@ impl<'a> ClassCMut<'a> {
 
     /// `&mut` access to the whole role / ceiling / assignment state.
     ///
-    /// **Slated for deletion.** [`ContextRoleState`] is DUAL-USE: it carries
-    /// Class-C structural fields AND the downward-authorization Class-S fields
-    /// `ceiling` / `suspended_capabilities`, which MUST be mutated only through a
-    /// fail-closed-persisting combinator (§5.3.2 ceiling modification, §9
-    /// suspension). This whole-`&mut` accessor can reach those, so the
-    /// best-effort / compensation path could mutate them with no fail-closed
-    /// persist — a §9 bypass. A later finalize step deletes this accessor once
-    /// all callers move to the restricted [`Self::role_state_class_c_mut`] (which
-    /// exposes `&mut` ONLY for the structural fields and a shared `&` read for
-    /// the downward-auth ones). It is KEPT for now so this phase stays
-    /// compile-green; do NOT add new callers.
+    /// [`ContextRoleState`] is DUAL-USE: it carries Class-C structural fields AND
+    /// the downward-authorization Class-S fields `ceiling` /
+    /// `suspended_capabilities`. This whole-`&mut` accessor can in principle
+    /// reach those, so for STRUCTURAL-ONLY mutations the restricted
+    /// [`Self::role_state_class_c_mut`] (structural `&mut`, downward-auth fields
+    /// `&`-read) is preferred and used by the migrated read/structural callers,
+    /// and read-only needs use [`Self::role_state`].
+    ///
+    /// This whole-`&mut` is RETAINED only for the few sites that hand the entire
+    /// `&mut ContextRoleState` to the [`scp_protocol::context::roles`] free
+    /// functions (`system_assign_role`), which take a `&mut ContextRoleState` and
+    /// mutate the structural fields (`assignments` / `member_capabilities` /
+    /// `members`). Of the downward-auth pair they leave `ceiling` untouched and
+    /// touch `suspended_capabilities` ONLY via the SHRINK-only
+    /// `prune_suspensions_to_role_grants` (dropping a member's suspensions for
+    /// capabilities the reassigned role no longer grants). A best-effort prune is
+    /// §9-safe in the DIRECTIONAL sense that matters: a coalesce-window rollback of
+    /// a prune can only RE-SUSPEND a dropped entry (re-narrow authority) — never
+    /// re-grant a removed capability — and it rolls back in lockstep with the
+    /// same-persist `member_capabilities` replacement, so a member is never left
+    /// effectively un-denied. (The two `system_assign_role` callers here are member
+    /// ADD / JOIN, where no prior suspension entry exists, so the prune is a no-op
+    /// there anyway.) The dangerous GROW direction (`suspend_capabilities` /
+    /// `suspend_all`, which `extend` / `insert`) is the one made fail-closed
+    /// (RED-CS3). Those callers ride the ordinary best-effort persist (member ADD /
+    /// role assignment is coalesce-window-rollback acceptable, ADR-049 §9), so the
+    /// whole-`&mut` is not a downward-auth bypass at those sites.
+    ///
+    /// The remaining §9 concern is the dual-use `ceiling` / `suspended_capabilities`
+    /// pair (the "Known residual" in the module docs). The BEHAVIORAL hole there —
+    /// the consequence-engine auto-suspension being lost on a coalesce-window
+    /// crash — is now CLOSED: the consequence path persists an applied suspension
+    /// fail-closed at the cell boundary (RED-CS3). What remains is structural
+    /// (this whole-`&mut` still *can* name those fields); do NOT add new callers
+    /// that mutate `ceiling` / `suspended_capabilities` through it — route a
+    /// downward-auth transition through a fail-closed combinator instead.
     pub(crate) const fn role_state_mut(&mut self) -> &mut ContextRoleState {
         self.role_state
     }
@@ -1560,6 +1625,16 @@ impl<'a> ClassCMut<'a> {
     /// error by construction.
     pub(crate) fn role_state_class_c_mut(&mut self) -> RoleStateClassCMut<'_> {
         RoleStateClassCMut::new(self.role_state)
+    }
+
+    /// SHARED (read-only) access to the whole [`ContextRoleState`]. Safe to hand
+    /// out a `&ContextRoleState` from the best-effort surface: a read cannot
+    /// mutate the dual-use downward-auth Class-S fields (`ceiling` /
+    /// `suspended_capabilities`), so it raises no §9 fail-closed obligation. Use
+    /// this for read-only needs (capability checks, snapshotting/cloning the role
+    /// state) instead of the whole-`&mut` [`Self::role_state_mut`].
+    pub(crate) const fn role_state(&self) -> &ContextRoleState {
+        self.role_state
     }
 
     /// RESTRICTED Class-C view over the dual-use [`MembershipState`] roster: a

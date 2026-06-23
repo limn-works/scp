@@ -813,28 +813,45 @@ fn handle_evaluate_periodic_consequences_actor(
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
-    // Coalesced: the enforcement mutations ride the run loop's coalesced
-    // persist — the non-persisting Class-C view supplies the same disjoint
-    // `ClassCSplit` borrows `ConsequenceStateSplit` needs (it is a type alias
-    // for `ClassCSplit`), with no per-site persist injected.
-    let mut view = cell.class_c_view();
-    let mut split = view.split_class_c();
-    for (member_did, triggered) in &results {
-        enforce_triggered_consequences(
-            &mut split,
-            &EnforceConsequencesCtx {
-                context_id: &context_id,
-                member_did,
-                now,
-                triggered,
-                rules: &rules,
-                clock: deps.clock.as_ref(),
-                event_log: deps.event_log.as_ref(),
-                event_tx: deps.event_tx.as_ref(),
-            },
-        );
+    // Consequence EVALUATION rides the run loop's coalesced persist — the
+    // non-persisting Class-C view supplies the same disjoint `ClassCSplit`
+    // borrows `ConsequenceStateSplit` needs (it is a type alias for
+    // `ClassCSplit`). The ONE Class-S outcome it can produce — a capability
+    // suspension — is OR-accumulated here and persisted fail-closed below
+    // (ADR-049 §9, RED-CS3): a coalesce-window crash must not silently re-grant
+    // an auto-suspended member's denied capability.
+    let mut suspension_applied = false;
+    {
+        let mut view = cell.class_c_view();
+        let mut split = view.split_class_c();
+        for (member_did, triggered) in &results {
+            suspension_applied |= enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &context_id,
+                    member_did,
+                    now,
+                    triggered,
+                    rules: &rules,
+                    clock: deps.clock.as_ref(),
+                    event_log: deps.event_log.as_ref(),
+                    event_tx: deps.event_tx.as_ref(),
+                },
+            );
+        }
+        // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
-    let _ = reply.send(Ok(()));
+
+    // Fail-closed persist of an applied capability suspension (keep-direction):
+    // the suspension is already in memory; make it durable before acking. On
+    // persist failure the suspension STAYS and the error is surfaced to the
+    // caller; the handler still reports `mutated` so the run loop also persists.
+    let reply_result = if suspension_applied {
+        crate::context::messaging_helpers::persist_state_fail_closed(cell, deps, &context_id)
+    } else {
+        Ok(())
+    };
+    let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
 
@@ -1251,4 +1268,332 @@ async fn handle_start_timeout_task_actor(
     crate::context::governance_helpers::spawn_governance_timeout_task(cell, deps).await;
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod consequence_fail_closed_tests {
+    //! ADR-049 §9 (RED-CS3): when the consequence ENGINE auto-suspends a member,
+    //! the suspension OUTCOME must persist FAIL-CLOSED — a coalesce-window crash
+    //! must not silently re-grant the denied capability. This drives the periodic
+    //! consequence sweep against a member who trips a `MessageVelocity`
+    //! `SuspendAccess` rule, with a persistence provider whose every write FAILS,
+    //! and asserts (a) the handler reply surfaces `PersistenceFailed` rather than
+    //! `Ok`, and (b) the suspension is RETAINED in memory (keep-direction), not
+    //! lost.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use scp_identity::DID;
+    use scp_protocol::context::membership::ContextEvent;
+    use scp_protocol::context::params::Capability;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use tokio::sync::oneshot;
+
+    use crate::context::ContextError;
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::persistence::ContextPersistence;
+    use crate::context::providers::MerkleEventLogProvider;
+
+    const ADMIN: &str = "did:dht:z6MkAdminFailClosed";
+    const SUBJECT: &str = "did:dht:z6MkSubjectFailClosed";
+    const CTX_BYTE: u8 = 0x5c;
+
+    /// Persistence whose `persist_context` ALWAYS fails — the fail-closed path.
+    struct FailPersistence;
+    impl ContextPersistence for FailPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Builds `ActorDeps` wired with the always-failing persistence and a fresh
+    /// in-memory Merkle event log (the sweep reads the receive buffer for the
+    /// non-convergent `MessageVelocity` evidence; the durable log stays empty).
+    async fn build_fail_closed_deps() -> ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_primitives::Clock> =
+            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(FailPersistence)),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Seeds a `PerContextState` where SUBJECT is a member holding
+    /// `MessagesWrite`, has buffered enough `MessageSent` events to trip a
+    /// `MessageVelocity` threshold of 1, and the context carries a
+    /// `MessageVelocity` → `SuspendAccess` consequence rule.
+    fn seed_state() -> PerContextState {
+        let mut state = PerContextState::new_for_test_encrypted(
+            [CTX_BYTE; 32],
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        // SUBJECT must be a present member with at least one derived capability,
+        // so `suspend_all` (SuspendAccess) actually populates the suspended set.
+        state
+            .membership
+            .add_member(DID(SUBJECT.to_owned()), "member".to_owned(), Vec::new());
+        state.role_state.members.insert(SUBJECT.to_owned());
+        state.role_state.member_capabilities.insert(
+            SUBJECT.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+        // Buffer per-author MessageSent events so a MessageVelocity rule with
+        // threshold 1 fires for SUBJECT on the next sweep.
+        for seq in 0..5u64 {
+            state.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: DID(SUBJECT.to_owned()),
+                sequence_number: seq,
+                payload: Vec::new(),
+            });
+        }
+        // The consequence rule: a non-convergent MessageVelocity trigger whose
+        // action is SuspendAccess (suspend every held capability).
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_hours(1),
+        });
+        state
+    }
+
+    /// The consequence-engine auto-suspension persists FAIL-CLOSED: with a
+    /// failing persistence provider, the periodic sweep handler surfaces the
+    /// persist error AND retains the in-memory suspension (keep-direction).
+    #[tokio::test]
+    async fn periodic_sweep_suspension_persists_fail_closed() {
+        let deps = build_fail_closed_deps().await;
+        let mut cell = ClassSCell::new(seed_state());
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let outcome =
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx);
+
+        // The reply surfaces the fail-closed persist error — the suspension
+        // OUTCOME was NOT acknowledged as durable while the write failed.
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(
+            matches!(reply, Err(ContextError::PersistenceFailed(_))),
+            "a consequence suspension whose fail-closed persist fails must surface \
+             PersistenceFailed, not Ok; got {reply:?}"
+        );
+
+        // Keep-direction: the suspension STAYS in memory even though the persist
+        // failed (it must not be silently un-applied — that would re-open the
+        // re-grant window on the next coalesced write).
+        let suspended = cell
+            .role_state
+            .suspended_capabilities
+            .get(SUBJECT)
+            .expect("SUBJECT must have been suspended by the sweep");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "the suspended capability is retained in memory (keep-direction) after \
+             the fail-closed persist failure"
+        );
+
+        // The handler still reports a mutation so the actor's coalesced persist
+        // also re-attempts the write.
+        assert!(
+            outcome.mutated,
+            "the sweep mutated state (the suspension), so the outcome is `mutated`"
+        );
+    }
+
+    /// SEND path: when a `send` trips a consequence that suspends the sender,
+    /// the free (non-paid) send persists the suspension FAIL-CLOSED before
+    /// acking — `finalize_send` surfaces the persist error and retains the
+    /// suspension (keep-direction). Guards the `persist_finalized_send`
+    /// free-path upgrade (ADR-049 §9, RED-CS3).
+    #[tokio::test]
+    async fn send_suspension_persists_fail_closed() {
+        let deps = build_fail_closed_deps().await;
+        // Seed SUBJECT as a member who will trip a MessageVelocity SuspendAccess
+        // rule on the next send (the send itself emits the MessageSent that, with
+        // the pre-seeded buffer, crosses the threshold-1 window).
+        let state = seed_state();
+        // The send path requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        let mut cell = ClassSCell::new(state);
+        let ctx_str = hex::encode([CTX_BYTE; 32]);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+
+        // Free (non-paid) send: no token, no signing key, not broadcast.
+        let result = crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_str,
+            &ctx_bytes,
+            &DID(SUBJECT.to_owned()),
+            0,
+            b"payload",
+            None,
+            None,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a send that applies a consequence suspension must persist fail-closed; \
+             a failing persist must surface PersistenceFailed, not Ok; got {result:?}"
+        );
+        let suspended = cell
+            .role_state
+            .suspended_capabilities
+            .get(SUBJECT)
+            .expect("SUBJECT must have been suspended by the send-path consequence");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "the suspended capability is retained in memory (keep-direction) after \
+             the send-path fail-closed persist failure"
+        );
+    }
+
+    /// RECEIVE path: when a received message trips a consequence that suspends
+    /// the sender, the receive cascade OR-sets the caller-owned suspension sink
+    /// so the cell-holding receive handler persists fail-closed. This drives the
+    /// cascade at `deliver_message_and_drain_buffered` (the lowest boundary that
+    /// runs receive-side consequence enforcement) and asserts the sink is set,
+    /// proving the downward-auth signal reaches the cell boundary (ADR-049 §9,
+    /// RED-CS3). The fail-closed persist mechanism itself is proven by the
+    /// periodic- and send-path tests above.
+    #[tokio::test]
+    async fn receive_suspension_sets_fail_closed_sink() {
+        let deps = build_fail_closed_deps().await;
+        let state = seed_state();
+        // The receive cascade requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        let mut cell = ClassSCell::new(state);
+        let ctx_str = hex::encode([CTX_BYTE; 32]);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+
+        let inner = scp_protocol::envelope::inner::InnerEnvelope {
+            version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: ctx_str.clone(),
+            sender_did: SUBJECT.to_owned(),
+            epoch: 0,
+            generation: 0,
+            sequence: 1,
+            timestamp: 1_700_000_000,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signature: [0u8; 64],
+            extensions: std::collections::HashMap::new(),
+        };
+
+        let mut suspension_sink = false;
+        let mut view = cell.class_c_view();
+        let _ = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut view,
+            &deps,
+            &ctx_str,
+            &ctx_bytes,
+            SUBJECT,
+            &inner,
+            b"hello",
+            false,
+            &mut suspension_sink,
+        )
+        .expect("delivery of an in-order application message succeeds");
+
+        assert!(
+            suspension_sink,
+            "a received message that trips a suspension consequence must OR-set the \
+             caller-owned sink so the cell holder persists the suspension fail-closed"
+        );
+        // The `view` borrow of `cell` ends here (NLL) so the assertions below can
+        // read the cell directly.
+        // The suspension landed in memory through the cascade (the cell holder
+        // would then persist it fail-closed via the now-set sink).
+        let suspended = cell
+            .role_state
+            .suspended_capabilities
+            .get(SUBJECT)
+            .expect("SUBJECT must have been suspended by the receive-path consequence");
+        assert!(suspended.contains(&Capability::MessagesWrite));
+    }
 }

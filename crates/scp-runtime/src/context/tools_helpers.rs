@@ -211,6 +211,32 @@ impl ToolEconomyTicket {
         }
     }
 
+    /// Test-only constructor for an escrow-BEARING ticket carrying a budget
+    /// deduction and a captured policy, so the capture path
+    /// ([`settle_tool_economy_capture`]) actually runs payment capture against a
+    /// supplied adapter. Used by the RED-CS3 tool-settle fail-closed test, which
+    /// pairs this with a failing-capture adapter to exercise the
+    /// payment-capture-failure early-return path.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test_with_escrow(
+        actor_did: DID,
+        escrow: PreparedAction,
+        policy: scp_protocol::economy::types::EconomicPolicy,
+    ) -> Self {
+        let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
+        let velocity_token = tracker.record_message(&actor_did, 0);
+        Self {
+            actor_did,
+            deducted_cost: Some(Amount::new(50)),
+            velocity_token,
+            escrow: Some(escrow),
+            policy_for_capture: Some(policy),
+            metrics_for_capture: ObservableMetrics::default(),
+            needs_hard_rate_limit_refund: true,
+            consumed: false,
+        }
+    }
+
     /// Reverse the EXTERNAL side of a reservation when the owning actor
     /// is unreachable (despawned / replaced) and the per-context settle
     /// can therefore never run.
@@ -504,7 +530,7 @@ pub async fn reserve_tool_economy(
         let mut view = cell.class_c_view();
 
         handle = view.handle_mut().clone();
-        role_state = view.role_state_mut().clone();
+        role_state = view.role_state().clone();
         let member_count = u64::try_from(view.membership_class_c_mut().count()).unwrap_or(u64::MAX);
 
         let gov = view.governance_class_c_mut();
@@ -819,8 +845,19 @@ pub async fn reserve_tool_economy(
 /// escrowed payment, and finally commits the ticket.
 ///
 /// Returns the triggered consequences and the optional payment receipt.
-/// On payment-capture failure the ticket is reversed (budget / velocity /
-/// rate-limit) and the error surfaced.
+///
+/// `suspension_sink` (ADR-049 §9, RED-CS3): a CALLER-OWNED `&mut bool` that this
+/// function OR-sets to `true` if consequence enforcement applied a capability
+/// suspension (a Class-S `suspended_capabilities` mutation). The flag is a
+/// caller-owned sink rather than part of the return value SO IT SURVIVES THE
+/// PAYMENT-CAPTURE ERROR PATH: the suspension is applied in memory BEFORE the
+/// fallible payment capture, and on capture failure this function returns `Err`
+/// early — a return-value flag would be lost to that `?`, leaving the suspension
+/// on best-effort-only persistence (the RED-CS3 hole). With a `&mut` sink the
+/// cell-holding caller ([`settle_tool_economy`]) persists the suspension
+/// fail-closed AFTER the call regardless of Ok/Err. On payment-capture failure
+/// the ticket is reversed (budget / velocity / rate-limit) and the error
+/// surfaced; the in-memory suspension is NOT reversed (keep-direction).
 ///
 /// # Errors
 ///
@@ -832,6 +869,7 @@ pub async fn settle_tool_economy_capture(
     context_id: &str,
     invoker_did: &DID,
     ticket: ToolEconomyTicket,
+    suspension_sink: &mut bool,
 ) -> Result<
     (
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
@@ -867,18 +905,24 @@ pub async fn settle_tool_economy_capture(
         &consequence_rules,
     );
 
-    // Best-effort consequence path (ADR-049 §9). `split_class_c()` yields exactly
-    // the `ConsequenceStateSplit` shape — the same five disjoint Class-C /
-    // structural borrows `from_state(&mut PerContextState)` produced — from the
-    // field-granular cell view, with NO whole `&mut PerContextState` and NO `&mut`
-    // reach into any of the three PRIVATIZED Class-S sub-structs. (Its
-    // `role_state` borrow is the documented dual-use `ContextRoleState` residual —
-    // see ADR-049 §9 "Known residual" — through which `ceiling` /
-    // `suspended_capabilities` remain reachable; that residual is tracked, not
-    // closed here.) Enforcement stays best-effort (the run loop coalesce-persists;
-    // no per-site fail-closed persist).
+    // Consequence path (ADR-049 §9). `split_class_c()` yields exactly the
+    // `ConsequenceStateSplit` shape — the same five disjoint Class-C / structural
+    // borrows `from_state(&mut PerContextState)` produced — from the field-granular
+    // cell view, with NO whole `&mut PerContextState` and NO `&mut` reach into any
+    // of the three PRIVATIZED Class-S sub-structs. (Its `role_state` borrow is the
+    // dual-use `ContextRoleState` STRUCTURAL residual — see ADR-049 §9 "Known
+    // residual" — through which `ceiling` / `suspended_capabilities` remain
+    // nameable. The auto-suspension's BEHAVIORAL §9 hole is closed: when
+    // enforcement applies a suspension the cell-holding caller persists it
+    // FAIL-CLOSED, RED-CS3.) Consequence EVALUATION stays best-effort (the run loop
+    // coalesce-persists); only a suspension OUTCOME owes a fail-closed persist,
+    // which the cell-holding caller performs when `suspension_applied` is set
+    // (ADR-049 §9, RED-CS3).
     let mut split = view.split_class_c();
-    crate::context::governance_logic::enforce_triggered_consequences(
+    // OR-set the caller-owned sink so the suspension's fail-closed-persist
+    // obligation survives the payment-capture error path below (a return-value
+    // flag would be stranded by the early `return Err` — RED-CS3).
+    *suspension_sink |= crate::context::governance_logic::enforce_triggered_consequences(
         &mut split,
         &crate::context::governance_logic::EnforceConsequencesCtx {
             context_id,
@@ -1252,16 +1296,50 @@ pub async fn settle_tool_economy(
             // `ClassCMut` holding all of those as disjoint field references;
             // `split_class_c()` (inside `settle_tool_economy_capture`) yields
             // exactly the `ConsequenceStateSplit` shape with NO whole
-            // `&mut PerContextState` and NO Class-S reach. Capture coalesces
-            // through the run loop (no per-site fail-closed persist).
-            let (consequences, payment_receipt) = settle_tool_economy_capture(
+            // `&mut PerContextState` and NO Class-S reach. Evaluation coalesces
+            // through the run loop; the ONE Class-S outcome — a consequence-engine
+            // capability suspension — is signalled via the caller-owned
+            // `suspension_applied` sink and persisted fail-closed below (ADR-049
+            // §9, RED-CS3). The sink is owned HERE (not returned by the callee)
+            // so the obligation survives the callee's payment-capture error path
+            // — a return-value flag would be stranded by that early `return Err`,
+            // leaving the suspension on best-effort-only persistence.
+            let mut suspension_applied = false;
+            let capture_result = settle_tool_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
                 invoker_did,
                 ticket,
+                &mut suspension_applied,
             )
-            .await?;
+            .await;
+            // Fail-closed persist of an applied capability suspension
+            // (keep-direction), run on BOTH the Ok and Err arms: the suspension
+            // is already in memory; make it durable before acking so a
+            // coalesce-window crash cannot silently re-grant the denied
+            // capability. The view above has been consumed, so the `&mut cell`
+            // borrow is released here. ERROR PRECEDENCE: when the capture itself
+            // failed, the persist still runs; if the persist ALSO fails, the
+            // §9 durability failure (`PersistenceFailed`) is surfaced over the
+            // original capture error (durability is the security obligation), and
+            // the original capture cause is preserved in its message. When the
+            // persist succeeds, the original capture error is surfaced unchanged.
+            if suspension_applied
+                && let Err(persist_err) =
+                    crate::context::messaging_helpers::persist_state_fail_closed(
+                        cell, deps, context_id,
+                    )
+            {
+                return Err(match capture_result {
+                    Ok(_) => persist_err,
+                    Err(capture_err) => ContextError::PersistenceFailed(format!(
+                        "{persist_err} (after a tool-settle payment-capture failure: \
+                         {capture_err})"
+                    )),
+                });
+            }
+            let (consequences, payment_receipt) = capture_result?;
             Ok(ToolSettleOutcome {
                 consequences,
                 payment_receipt,
@@ -1390,5 +1468,348 @@ mod tests {
         let ticket = ticket_with_budget(&did);
         ticket.void_external_and_consume(None).await;
         // No panic on Drop ⇒ the ticket was consumed.
+    }
+
+    /// ADR-049 §9 (RED-CS3): the tool-settle CAPTURE-FAILURE path must NOT
+    /// strand an applied capability suspension on best-effort persistence.
+    /// A consequence suspends the invoker in memory BEFORE the fallible payment
+    /// capture; if capture then fails, `settle_tool_economy_capture` returns
+    /// `Err` early — so the suspension obligation is carried on a CALLER-OWNED
+    /// `&mut bool` sink (not a return value the `?` would strand). This test
+    /// drives the capture path with a FAILING adapter and a suspending state and
+    /// asserts the function returns `Err` while the sink is STILL set to `true`
+    /// (the obligation survived the error) and the suspension is retained in
+    /// memory. Without the fix (a return-value flag) the sink would be lost.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
+    mod tool_settle_fail_closed {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use scp_identity::DID;
+        use scp_protocol::context::params::Capability;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::state::PerContextState;
+        use crate::context::builder::ContextEventLogProvider;
+        use crate::context::providers::MerkleEventLogProvider;
+        use crate::economy::adapter::PaymentMetadata;
+        use crate::economy::adapter::{
+            AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError,
+            PaymentReceipt, RefundConfirmation, VerificationResult,
+        };
+        use crate::economy::integration::{ActionEnvelope, PreparedAction};
+        use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
+
+        const ADMIN: &str = "did:dht:z6MkAdminToolSettle";
+        const INVOKER: &str = "did:dht:z6MkInvokerToolSettle";
+        const PAYEE: &str = "did:dht:z6MkPayeeToolSettle";
+        const CTX_BYTE: u8 = 0x7c;
+
+        /// A payment adapter whose `capture` ALWAYS fails — the path that drives
+        /// `complete_tool_payment` into its error arm. `verify_authorization`
+        /// must succeed first (it runs before capture in `process_paid_action`).
+        struct FailingCaptureAdapter;
+        impl PaymentAdapter for FailingCaptureAdapter {
+            fn adapter_id(&self) -> &'static str {
+                "failing-capture"
+            }
+            fn capabilities(&self) -> AdapterCapabilities {
+                AdapterCapabilities {
+                    supported_currencies: vec![CurrencyCode::from("USD")],
+                    supports_streaming: false,
+                    supports_batch_auth: false,
+                    supports_single_step: false,
+                    min_amount: None,
+                    max_amount: None,
+                    typical_settlement_ms: 0,
+                    requires_facilitator: false,
+                }
+            }
+            async fn authorize(
+                &self,
+                payer: &DID,
+                payee: &DID,
+                amount: Amount,
+                currency: CurrencyCode,
+                _metadata: PaymentMetadata,
+            ) -> Result<PaymentAuthorization, PaymentError> {
+                Ok(auth(payer, payee, amount, currency))
+            }
+            async fn verify_authorization(
+                &self,
+                _auth: &PaymentAuthorization,
+            ) -> Result<(), PaymentError> {
+                Ok(())
+            }
+            async fn capture(
+                &self,
+                _auth: &PaymentAuthorization,
+            ) -> Result<PaymentReceipt, PaymentError> {
+                Err(PaymentError::AdapterError("induced capture failure".into()))
+            }
+            async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+                Ok(())
+            }
+            async fn verify(
+                &self,
+                _receipt: &PaymentReceipt,
+            ) -> Result<VerificationResult, PaymentError> {
+                Ok(VerificationResult {
+                    valid: true,
+                    adapter_id: "failing-capture".to_owned(),
+                    verified_amount: Amount(0),
+                    verified_currency: CurrencyCode::from("USD"),
+                    verification_timestamp: 0,
+                })
+            }
+            async fn refund(
+                &self,
+                _receipt: &PaymentReceipt,
+                _amount: Option<Amount>,
+            ) -> Result<RefundConfirmation, PaymentError> {
+                Ok(RefundConfirmation {
+                    refund_id: [0u8; 32],
+                    original_receipt_id: [0u8; 32],
+                    refunded_amount: Amount(0),
+                    currency: CurrencyCode::from("USD"),
+                    adapter_proof: vec![],
+                })
+            }
+        }
+
+        fn auth(
+            payer: &DID,
+            payee: &DID,
+            amount: Amount,
+            currency: CurrencyCode,
+        ) -> PaymentAuthorization {
+            PaymentAuthorization {
+                auth_id: [9u8; 32],
+                payer: payer.clone(),
+                payee: payee.clone(),
+                amount,
+                currency,
+                adapter_id: "failing-capture".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            }
+        }
+
+        fn paid_policy() -> EconomicPolicy {
+            EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_tool_invoke: Some(Amount(50)),
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec!["failing-capture".to_owned()],
+                pricing_formula: None,
+                payee: DID(PAYEE.to_owned()),
+            }
+        }
+
+        /// An escrow-bearing ticket whose capture will run (escrow + policy set),
+        /// carrying a budget deduction. Consumed by the capture path.
+        fn escrow_ticket() -> super::super::ToolEconomyTicket {
+            let invoker = DID(INVOKER.to_owned());
+            super::super::ToolEconomyTicket::new_for_test_with_escrow(
+                invoker.clone(),
+                PreparedAction {
+                    envelope: ActionEnvelope {
+                        actor: invoker.clone(),
+                        action_type: PaidActionType::ToolInvoke,
+                        context_id: None,
+                        authorization: Some(auth(
+                            &invoker,
+                            &DID(PAYEE.to_owned()),
+                            Amount(50),
+                            CurrencyCode::from("USD"),
+                        )),
+                        payload: Vec::new(),
+                    },
+                    evaluated_cost: Amount(50),
+                },
+                paid_policy(),
+            )
+        }
+
+        async fn build_deps() -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                ADMIN.to_owned(),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn ContextEventLogProvider> =
+                Box::new(MerkleEventLogProvider::new());
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_primitives::Clock> =
+                Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+            let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+                Arc::new(FailingCaptureAdapter);
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(Box::new(super::FailToolPersistence)),
+                Some(payment_adapter),
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(ADMIN.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        fn seed_state() -> PerContextState {
+            let mut state = PerContextState::new_for_test_encrypted(
+                [CTX_BYTE; 32],
+                1_700_000_000,
+                DID(ADMIN.to_owned()),
+            );
+            state
+                .membership
+                .add_member(DID(INVOKER.to_owned()), "member".to_owned(), Vec::new());
+            state.role_state.members.insert(INVOKER.to_owned());
+            state.role_state.member_capabilities.insert(
+                INVOKER.to_owned(),
+                std::iter::once(Capability::MessagesWrite).collect(),
+            );
+            // Buffer per-author MessageSent events so a MessageVelocity rule with
+            // threshold 1 fires for INVOKER when the settle runs its consequence
+            // evaluation (the trigger type is immaterial to the persist path under
+            // test — any rule producing a SuspendAccess outcome exercises it).
+            for seq in 0..5u64 {
+                state.receive_buffer.push(
+                    scp_protocol::context::membership::ContextEvent::MessageSent {
+                        sender_did: DID(INVOKER.to_owned()),
+                        sequence_number: seq,
+                        payload: Vec::new(),
+                    },
+                );
+            }
+            state.governance.consequence_rules.push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: Duration::from_hours(1),
+            });
+            state
+        }
+
+        /// The capture-failure path persists the applied suspension fail-closed:
+        /// the surfaced error reflects the §9 durability failure (over the
+        /// capture error) and the suspension is retained in memory.
+        #[tokio::test]
+        async fn tool_settle_capture_failure_persists_suspension_fail_closed() {
+            let deps = build_deps().await;
+            let mut cell = ClassSCell::new(seed_state());
+            let ctx_str = hex::encode([CTX_BYTE; 32]);
+
+            let request = super::super::ToolSettleRequest::Capture {
+                generation: cell.generation,
+                ticket: escrow_ticket(),
+            };
+            let result = super::super::settle_tool_economy(
+                &mut cell,
+                &deps,
+                &ctx_str,
+                &DID(INVOKER.to_owned()),
+                request,
+            )
+            .await;
+
+            // Capture failed, but the suspension's fail-closed persist still ran
+            // and itself failed → the §9 durability error surfaces (with the
+            // capture cause preserved in its message).
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::context::ContextError::PersistenceFailed(_))
+                ),
+                "a tool-settle whose capture fails AFTER a consequence suspension must \
+                 still persist the suspension fail-closed; a failing persist surfaces \
+                 PersistenceFailed; got {result:?}"
+            );
+            let suspended = cell
+                .role_state
+                .suspended_capabilities
+                .get(INVOKER)
+                .expect("INVOKER must have been suspended by the tool-rate consequence");
+            assert!(
+                suspended.contains(&Capability::MessagesWrite),
+                "the suspended capability is retained in memory (keep-direction) even \
+                 though the payment capture failed"
+            );
+        }
+    }
+
+    /// Persistence whose `persist_context` ALWAYS fails — drives the tool-settle
+    /// fail-closed path. Defined at the `tests` module scope so the nested
+    /// `tool_settle_fail_closed` module can reference it via `super::`.
+    struct FailToolPersistence;
+    impl crate::context::persistence::ContextPersistence for FailToolPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
     }
 }

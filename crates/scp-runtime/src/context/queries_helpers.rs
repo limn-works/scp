@@ -415,7 +415,7 @@ pub fn generate_context_access_key(
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
     if !view
-        .role_state_mut()
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -452,7 +452,7 @@ pub fn revoke_context_access_key(
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
     if !view
-        .role_state_mut()
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
@@ -484,7 +484,7 @@ pub fn restore_context_access_key(
 ) -> Result<(), ContextError> {
     // Authorization: access key management requires admin (ContextClose).
     if !view
-        .role_state_mut()
+        .role_state_class_c_mut()
         .member_has_capability(caller_did, &Capability::ContextClose)
     {
         return Err(ContextError::PermissionDenied(
