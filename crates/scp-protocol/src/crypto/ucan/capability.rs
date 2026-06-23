@@ -759,6 +759,35 @@ mod tests {
         assert!(verify_ceiling_compliance(&[], &ceiling).is_ok());
     }
 
+    #[test]
+    fn multi_colon_custom_uri_action_keeps_remainder_and_fails_closed() {
+        // A custom capability URI with extra colons: from_str splits on the
+        // FIRST ':' between resource and action, so the action retains the
+        // remainder verbatim ("write:extra"). The ceiling membership test uses
+        // capability_name() ("messages:write:extra"), which is the same
+        // representation a ceiling entry would be built from — so the two agree.
+        let uri: CapabilityUri = "scp:ctx:abc/messages:write:extra".parse().unwrap();
+        assert_eq!(uri.resource(), "messages");
+        assert_eq!(uri.action(), "write:extra");
+        assert_eq!(uri.capability_name(), "messages:write:extra");
+
+        // Fail-closed: a ceiling that grants only the plain "messages:write"
+        // does NOT cover the multi-colon variant — the extra segment is treated
+        // as outside the ceiling, not silently truncated to a granted form.
+        let plain_ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+        assert!(!uri.is_within_ceiling(&plain_ceiling));
+        let err =
+            verify_ceiling_compliance(std::slice::from_ref(&uri), &plain_ceiling).unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityOutsideCeiling(ref c) if c == "messages:write:extra")
+        );
+
+        // Only an exact ceiling entry for the full capability_name admits it.
+        let exact_ceiling: HashSet<String> =
+            std::iter::once("messages:write:extra".to_owned()).collect();
+        assert!(uri.is_within_ceiling(&exact_ceiling));
+    }
+
     // -----------------------------------------------------------------------
     // check_capability_match
     // -----------------------------------------------------------------------

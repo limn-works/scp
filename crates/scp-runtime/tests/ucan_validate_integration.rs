@@ -24,9 +24,9 @@ use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::nonce;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-    InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker, ProofResolver,
-    ValidationContext, parse_ucan, validate_ucan,
+    CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver,
+    InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
+    ProofResolver, ValidationContext, evaluate_ucan, parse_ucan, validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
@@ -1823,5 +1823,445 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
     assert!(
         matches!(result, Err(UcanError::SignatureInvalid)),
         "scoped UCAN exercised by wrong key must fail: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Step 8: All-attestation ceiling enforcement (spec §7.2.1 step 8)
+//
+// Step 8 enforces the ceiling over the token's ENTIRE attestation set, not
+// only the invoked capability. A token whose invoked capability is in-ceiling
+// but which smuggles an out-of-ceiling attestation must be rejected, and the
+// rejection must happen BEFORE the nonce is recorded (step 9).
+// ---------------------------------------------------------------------------
+
+/// Mints a multi-attestation token whose invoked cap is in-ceiling but which
+/// also carries an out-of-ceiling attestation, and asserts step 8 rejects it
+/// with `CapabilityOutsideCeiling`.
+#[tokio::test]
+async fn validate_ucan_step8_rejects_smuggled_out_of_ceiling_attestation() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    // Token grants BOTH messages:write (invoked, in-ceiling) and role:assign
+    // (smuggled). Mint-time ceiling includes both so the token is well-formed
+    // and signed; the narrower validation ceiling below is what must reject it.
+    let caps = vec!["messages:write".to_owned(), "role:assign".to_owned()];
+    let mint_ceiling: HashSet<String> = ["messages:write".to_owned(), "role:assign".to_owned()]
+        .into_iter()
+        .collect();
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-step8",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: Some(mint_ceiling),
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+
+    // Validation ceiling allows messages:write but NOT role:assign.
+    let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+    let required_cap = CapabilityUri::new("ctx-step8", "messages", "write");
+
+    let mut ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = validate_ucan(&token, &required_cap, &mut ctx);
+    assert!(
+        matches!(result, Err(UcanError::CapabilityOutsideCeiling(ref c)) if c == "role:assign"),
+        "smuggled out-of-ceiling attestation must be rejected by step 8: {result:?}"
+    );
+}
+
+/// A multi-attestation token where every attestation is in-ceiling must pass.
+#[tokio::test]
+async fn validate_ucan_step8_accepts_multi_attestation_all_in_ceiling() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    let caps = vec![
+        "messages:read".to_owned(),
+        "messages:write".to_owned(),
+        "tool_invoke:assistant".to_owned(),
+    ];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-step8-ok",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling(); // contains all three caps
+    let required_cap = CapabilityUri::new("ctx-step8-ok", "messages", "write");
+
+    let mut ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = validate_ucan(&token, &required_cap, &mut ctx);
+    assert!(
+        result.is_ok(),
+        "multi-attestation token with all caps in-ceiling must pass: {result:?}"
+    );
+}
+
+/// A ceiling-violating token (rejected at step 8) must NOT consume its nonce:
+/// step 8 short-circuits before step 9 (`check_and_record`). Proven by
+/// validating the token (which must fail with `CapabilityOutsideCeiling`), then
+/// asserting the tracker's read-only `check_replay` still accepts that exact
+/// nonce afterward — which it could only do if step 9 never recorded it.
+#[tokio::test]
+async fn validate_ucan_ceiling_violation_does_not_consume_nonce() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    let caps = vec!["messages:write".to_owned(), "role:assign".to_owned()];
+    let mint_ceiling: HashSet<String> = ["messages:write".to_owned(), "role:assign".to_owned()]
+        .into_iter()
+        .collect();
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-step8-nonce",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: Some(mint_ceiling),
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+    let required_cap = CapabilityUri::new("ctx-step8-nonce", "messages", "write");
+
+    // Validate: must fail at step 8 (ceiling), before step 9 records the nonce.
+    {
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::CapabilityOutsideCeiling(_))),
+            "must be rejected by step 8: {result:?}"
+        );
+    }
+
+    // The token's nonce must NOT have been recorded — a read-only replay probe
+    // for that exact nonce still succeeds (would be NonceReused if step 9 had
+    // run and recorded it).
+    assert!(
+        nonce_tracker
+            .check_replay(&token.payload.nnc, token.payload.exp)
+            .is_ok(),
+        "ceiling-violating token must not have consumed its nonce (step 8 short-circuits before step 9)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_ucan: structured, side-effect-free evaluation
+// ---------------------------------------------------------------------------
+
+/// `evaluate_ucan` called twice on the same token must report `nonce_valid:
+/// true` BOTH times — proving it never records the nonce. As the regression
+/// guard's enforcement half, `validate_ucan` on the same token must throw
+/// `NonceReused` on the 2nd call — proving the gate DOES record.
+#[tokio::test]
+async fn evaluate_ucan_does_not_consume_nonce_but_validate_does() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-nonce",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-eval-nonce", "messages", "write");
+
+    // evaluate_ucan twice — read-only, so nonce_valid must be true both times.
+    {
+        let ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let first = evaluate_ucan(&token, &required_cap, &ctx);
+        let second = evaluate_ucan(&token, &required_cap, &ctx);
+        assert!(
+            first.nonce_valid && second.nonce_valid,
+            "evaluate_ucan must not consume the nonce: {first:?} {second:?}"
+        );
+        assert_eq!(
+            first, second,
+            "evaluate_ucan must be deterministic / side-effect-free"
+        );
+        assert!(
+            first
+                == CapabilityValidation {
+                    tokens_valid: true,
+                    signatures_valid: true,
+                    within_ceiling: true,
+                    nonce_valid: true,
+                    not_revoked: true,
+                    time_bounds_valid: true,
+                },
+            "fully valid token must evaluate all-true: {first:?}"
+        );
+    }
+
+    // validate_ucan DOES record: 1st passes, 2nd is NonceReused.
+    {
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let first = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(first.is_ok(), "first validate_ucan must pass: {first:?}");
+    }
+    {
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+        let second = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(second, Err(UcanError::NonceReused(_))),
+            "second validate_ucan must reject the recorded nonce: {second:?}"
+        );
+    }
+}
+
+/// `evaluate_ucan` returns the correct per-field struct for a bad-signature
+/// token: parse succeeds (`tokens_valid`), but signature fails so
+/// `signatures_valid` and everything after are false.
+#[tokio::test]
+async fn evaluate_ucan_reports_bad_signature() {
+    let (custody, key_handle, issuer_did, _pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-sig",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    // Resolver returns the WRONG public key for the issuer, so signature
+    // verification (step 2) fails while parsing (step 1) succeeds.
+    let wrong_pk = [0u8; 32];
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), wrong_pk)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-eval-sig", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: false,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "bad signature must report tokens_valid=true, rest false: {result:?}"
+    );
+}
+
+/// `evaluate_ucan` reports `within_ceiling: false` for a token carrying an
+/// out-of-ceiling attestation (signatures pass, ceiling fails, rest false).
+#[tokio::test]
+async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    let caps = vec!["messages:write".to_owned(), "role:assign".to_owned()];
+    let mint_ceiling: HashSet<String> = ["messages:write".to_owned(), "role:assign".to_owned()]
+        .into_iter()
+        .collect();
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-ceiling",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: Some(mint_ceiling),
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+    let required_cap = CapabilityUri::new("ctx-eval-ceiling", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "out-of-ceiling attestation must report within_ceiling=false: {result:?}"
     );
 }
