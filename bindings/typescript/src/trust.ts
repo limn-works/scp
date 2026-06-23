@@ -310,24 +310,23 @@ export type UcanFailureCategory =
   | "unknown";
 
 /**
- * Extracts all declared capability URIs from a UCAN JWT's (unverified) payload.
+ * Returns the first capability URI from att[0].with, or null if absent or malformed.
  *
  * Reading the unverified payload is safe: `scp.ucanValidate` performs the
- * actual cryptographic verification — this only extracts which URIs to validate.
+ * actual cryptographic verification — this only extracts which URI to validate.
  *
- * {@link evaluateLayer1} validates only the **first** element (`att[0].with`)
- * returned by this function. Full multi-att validation (checking every
- * `att[i]` entry) requires a single `ucanValidate` call that verifies all
- * URIs while consuming the nonce only once; until that bridge op exists,
- * only att[0] is checked.
+ * {@link evaluateLayer1} validates only the **first** element (`att[0].with`).
+ * Full multi-att validation (checking every `att[i]` entry) requires a single
+ * `ucanValidate` call that verifies all URIs while consuming the nonce only
+ * once; until that bridge op exists, only att[0] is checked.
  *
- * @returns An array of all declared capability URIs (non-empty strings from
- *   `att[i].with`), or `null` if the token is malformed or declares no valid
- *   capabilities. Both cases are fail-closed: the caller must treat `null` as
+ * @returns The first declared capability URI (non-empty string from
+ *   `att[0].with`), or `null` if the token is malformed or declares no valid
+ *   capability. Both cases are fail-closed: the caller must treat `null` as
  *   structurally invalid.
  * @internal Exported for unit tests.
  */
-export function __extractAllCapabilityUris(token: string): string[] | null {
+export function __extractFirstCapabilityUri(token: string): string | null {
   try {
     const payloadSegment = token.split(".")[1];
     if (payloadSegment === undefined) return null;
@@ -335,10 +334,9 @@ export function __extractAllCapabilityUris(token: string): string[] | null {
       att?: readonly { with?: string }[];
     };
     const att = Array.isArray(rawPayload?.att) ? rawPayload.att : [];
-    const uris = att
-      .map((entry) => (typeof entry?.with === "string" ? entry.with : ""))
-      .filter((uri) => uri !== "");
-    return uris.length > 0 ? uris : null;
+    const first = att[0];
+    const uri = typeof first?.with === "string" ? first.with : "";
+    return uri !== "" ? uri : null;
   } catch {
     return null;
   }
@@ -500,7 +498,7 @@ async function validateOneCapUri(
  * Runs Layer 1 (protocol enforcement) over the supplied capability tokens.
  *
  * Each token is validated against its **first** declared capability URI
- * (`att[0].with`, extracted via `__extractAllCapabilityUris`). Only att[0]
+ * (`att[0].with`, extracted via `__extractFirstCapabilityUri`). Only att[0]
  * is sent to `scp.ucanValidate`. Full multi-att validation (checking every
  * `att[i]` entry) requires a single bridge call that validates all URIs
  * while consuming the nonce only once; until that bridge op exists, only
@@ -554,7 +552,7 @@ async function evaluateLayer1(
   for (const token of capabilityTokens) {
     // Only validate att[0].with per token. Full multi-att validation requires
     // a single bridge call consuming the nonce once — that op does not exist yet.
-    const capUri = __extractAllCapabilityUris(token)?.[0] ?? null;
+    const capUri = __extractFirstCapabilityUri(token);
     if (capUri === null) {
       // Malformed token or one that declares no capabilities: structurally
       // invalid / grants nothing. Fail-closed; the bridge is not called.
