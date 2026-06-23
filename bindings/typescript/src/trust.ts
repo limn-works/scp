@@ -479,18 +479,27 @@ async function validateOneCapUri(
     // (handle-affinity misuse), and any future codes are genuine faults and
     // must propagate rather than being silently folded into a false verdict.
     const msg = error instanceof Error ? error.message : String(error);
-    if (!/^\[SCP-PERM-3001\]/.test(msg)) {
-      throw error;
+    if (/^\[SCP-PERM-3001\]/.test(msg)) {
+      const passed = __PASSED_BEFORE[__classifyUcanError(msg)];
+      return {
+        tokensValid: passed.has("tokensValid"),
+        signaturesValid: passed.has("signaturesValid"),
+        withinCeiling: passed.has("withinCeiling"),
+        nonceValid: passed.has("nonceValid"),
+        notRevoked: passed.has("notRevoked"),
+        timeBoundsValid: passed.has("timeBoundsValid"),
+      };
     }
-    const passed = __PASSED_BEFORE[__classifyUcanError(msg)];
-    return {
-      tokensValid: passed.has("tokensValid"),
-      signaturesValid: passed.has("signaturesValid"),
-      withinCeiling: passed.has("withinCeiling"),
-      nonceValid: passed.has("nonceValid"),
-      notRevoked: passed.has("notRevoked"),
-      timeBoundsValid: passed.has("timeBoundsValid"),
-    };
+    if (/^\[SCP-VALID-/.test(msg)) {
+      // The bridge rejected the capability URI itself as malformed before it
+      // could reach the UCAN validation pipeline (e.g. control characters, HTML-
+      // special chars). Treat this the same as a null capUri: the token is
+      // structurally invalid and grants nothing → all-false fail-closed.
+      // PERM-3000 (manager permission failures), PERM-3030 (handle-affinity
+      // misuse), and all other codes are genuine faults and propagate.
+      return { ...ALL_LAYER1_FIELDS_FALSE };
+    }
+    throw error;
   }
 }
 
