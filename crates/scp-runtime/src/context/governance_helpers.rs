@@ -343,7 +343,7 @@ pub async fn tombstone_migrated_context(
         tombstone_payload,
         tombstone_ts,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
 }
@@ -360,14 +360,20 @@ pub async fn tombstone_migrated_context(
 /// - [`ContextError::InvalidState`] if no fault marker is set.
 #[instrument(skip_all, fields(context_id))]
 pub fn acknowledge_commit_fault(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
 ) -> Result<CommitFaultMarker, ContextError> {
-    state.commit_fault.take().ok_or_else(|| {
-        ContextError::InvalidState(format!(
-            "context {context_id} has no commit fault to acknowledge"
-        ))
-    })
+    // Clearing the commit-fault marker is a coalesced Class-C mutation (the
+    // handler reports `mutated`; the run loop flushes the persist). Take it
+    // through the non-persisting Class-C view — no per-site persist injected.
+    cell.class_c_view()
+        .commit_fault_mut()
+        .take()
+        .ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "context {context_id} has no commit fault to acknowledge"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +483,7 @@ pub async fn apply_pending_ceiling_modification(
         // never local `now()` (§7.3.1, §9.9.3).
         pending.effective_at,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
 }
@@ -496,22 +502,29 @@ pub async fn apply_pending_ceiling_modification(
 ///   attached.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_economic_policy_change(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    require_active(&state.handle)?;
+    // Applying a matured pending economic-policy change is Class-C governance
+    // config. The active-state gate + effective-window read go through the
+    // cell's `Deref`; the `economic_policy` set + `pending` clear (Class-C) ride
+    // `commit_class_c_best_effort`, preserving the prior best-effort persist
+    // exactly. The not-yet-effective early return runs before any mutation.
+    require_active(&cell.handle)?;
 
-    let pending = match &state.governance.pending_economic_policy_change {
+    let pending = match &cell.governance.pending_economic_policy_change {
         Some(p) if p.is_effective(current_timestamp) => p.clone(),
         _ => return Ok(false),
     };
 
-    state.governance.economic_policy = Some(pending.new_policy);
-    state.governance.pending_economic_policy_change = None;
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    let effective_at = pending.effective_at;
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        let gov = view.governance_class_c_mut();
+        *gov.economic_policy_mut() = Some(pending.new_policy);
+        *gov.pending_economic_policy_change_mut() = None;
+    });
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -521,9 +534,9 @@ pub async fn apply_pending_economic_policy_change(
         // Timer-triggered deferred application: the convergent leaf timestamp is
         // the pre-computed effective deadline (deterministic across members),
         // never local `now()` (§7.3.1, §9.9.3).
-        pending.effective_at,
+        effective_at,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
 }
@@ -789,7 +802,7 @@ pub fn execute_suspend_member(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -896,6 +909,17 @@ pub fn execute_revoke(
     // ADR-049 §9 Class S: revocation (capability / access / write) is a
     // downward-authorization transition — persist fail-closed so a crash cannot
     // re-grant authority the caller was told was revoked.
+    //
+    // RESIDUAL cell-escape-hatch at the production call site (FLAGGED in the
+    // report): this helper still takes a bare `&mut PerContextState` because an
+    // out-of-scope test caller (`supervisor.rs::execute_revoke_persists_synchronously`)
+    // passes one, and the task forbids editing supervisor.rs. Routing the
+    // production path through `commit_class_s_keep` would change this signature
+    // to take `&mut ClassSCell`, breaking that out-of-scope caller and the
+    // "supervisor tests must pass" gate. The inline fail-closed persist below
+    // already provides the keep-direction Class-S durability the combinator
+    // would; the call-site escape hatch is removed in the later finalize step
+    // that also updates the supervisor test caller.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
@@ -1253,7 +1277,7 @@ pub fn execute_remove_member(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1306,7 +1330,7 @@ pub fn execute_change_role(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1315,7 +1339,7 @@ pub fn execute_change_role(
 // ---------------------------------------------------------------------------
 
 pub fn execute_register_tool(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     registration: &ToolRegistration,
@@ -1328,29 +1352,35 @@ pub fn execute_register_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Tool registration is an UPWARD grant (Class-C governance config). The
+    // fallible guards read through the cell's `Deref` (no mutation); the
+    // `registered_tools` push (Class-C) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::ToolRegister) {
+    if !cell.role_state.ceiling.contains(&Capability::ToolRegister) {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool registration capability".into(),
         ));
     }
 
-    if state.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+    if cell.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
         return Err(ContextError::LimitExceeded(format!(
             "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
         )));
     }
-    state.governance.registered_tools.push(registration.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .registered_tools_mut()
+            .push(registration.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRegistered,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1396,7 +1426,7 @@ pub fn execute_remove_tool(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1492,7 +1522,7 @@ pub fn execute_modify_ceiling(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1546,7 +1576,7 @@ pub async fn execute_close_context(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1724,7 +1754,7 @@ pub fn execute_transfer_admin(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1733,7 +1763,7 @@ pub fn execute_transfer_admin(
 // ---------------------------------------------------------------------------
 
 pub fn execute_create_child_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     _params: &ContextParams,
@@ -1746,9 +1776,12 @@ pub fn execute_create_child_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Pure read-gate + event-log append; the only state mutation is the
+    // coalesced checkpoint counter (no site persist today). Guards read through
+    // the cell's `Deref`; the counter bumps via the non-persisting Class-C view.
+    require_active(&cell.handle)?;
 
-    if !state
+    if !cell
         .role_state
         .ceiling
         .contains(&Capability::ChildContextCreate)
@@ -1764,7 +1797,7 @@ pub fn execute_create_child_context(
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1773,7 +1806,7 @@ pub fn execute_create_child_context(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_pruning_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_policy: &PruningPolicy,
@@ -1823,17 +1856,21 @@ pub fn execute_modify_pruning_policy(
         }
     }
 
-    require_active(&state.handle)?;
-    state.governance.pruning_policy = Some(new_policy.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // Validation guards above read only the borrowed `new_policy`. The
+    // active-state gate reads through the cell's `Deref`; the `pruning_policy`
+    // set (Class-C governance config) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly.
+    require_active(&cell.handle)?;
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::PruningPolicyModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1916,7 +1953,7 @@ pub fn execute_add_signer(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -1996,7 +2033,7 @@ pub fn execute_remove_signer(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2042,7 +2079,7 @@ pub fn execute_modify_threshold(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2051,7 +2088,7 @@ pub fn execute_modify_threshold(
 // ---------------------------------------------------------------------------
 
 pub fn execute_establish_tool_interface(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     interface: &ToolInterface,
@@ -2064,33 +2101,35 @@ pub fn execute_establish_tool_interface(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Establishing a tool interface is Class-C governance config. The fallible
+    // guards read through the cell's `Deref`; the `tool_interfaces` push
+    // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
+    // best-effort persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state
-        .role_state
-        .ceiling
-        .contains(&Capability::ToolInterface)
-    {
+    if !cell.role_state.ceiling.contains(&Capability::ToolInterface) {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool interface capability".into(),
         ));
     }
 
-    if state.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+    if cell.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
             "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
         )));
     }
-    state.governance.tool_interfaces.push(interface.clone());
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .tool_interfaces_mut()
+            .push(interface.clone());
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolInterfaceEstablished,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2316,7 +2355,7 @@ pub fn execute_resolve_conflict(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2325,7 +2364,7 @@ pub fn execute_resolve_conflict(
 // ---------------------------------------------------------------------------
 
 pub fn execute_promote_context(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     approvals: &[scp_protocol::context::governance::SignedVote],
@@ -2338,10 +2377,15 @@ pub fn execute_promote_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Promotion clears the TTL timer + promotes the handle's memory scope —
+    // both Class-C structural state. The active-state + promotable-policy +
+    // unanimity guards read through the cell's `Deref`; the `ttl` / `handle`
+    // mutations ride `commit_class_c_best_effort`, preserving the prior
+    // best-effort persist exactly.
+    require_active(&cell.handle)?;
 
     if !matches!(
-        state.handle.params().promotion_policy,
+        cell.handle.params().promotion_policy,
         scp_protocol::context::params::PromotionPolicy::Promotable
     ) {
         return Err(ContextError::PermissionDenied(
@@ -2350,7 +2394,7 @@ pub fn execute_promote_context(
     }
 
     let member_dids: std::collections::HashSet<&str> =
-        state.membership.member_dids().map(|d| &**d).collect();
+        cell.membership.member_dids().map(|d| &**d).collect();
     let approval_dids: std::collections::HashSet<&str> =
         approvals.iter().map(|v| &*v.voter_did).collect();
     let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
@@ -2361,19 +2405,22 @@ pub fn execute_promote_context(
             member_dids.len()
         )));
     }
+    drop(member_dids);
+    drop(approval_dids);
 
-    state.ttl.timer.cancel();
-    state.ttl.timer.deadline_unix_secs = None;
-    state.handle.promote_memory_scope();
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        let ttl = view.ttl_mut();
+        ttl.timer.cancel();
+        ttl.timer.deadline_unix_secs = None;
+        view.handle_mut().promote_memory_scope();
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextPromoted,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2475,7 +2522,7 @@ pub fn execute_rotate_content_keys(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2565,7 +2612,7 @@ pub fn execute_reconfigure_governance(
         actor_did,
         timestamp_secs,
     )?;
-    cell.state_mut().checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2574,7 +2621,7 @@ pub fn execute_reconfigure_governance(
 // ---------------------------------------------------------------------------
 
 pub fn execute_set_economic_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     policy: &EconomicPolicy,
@@ -2590,9 +2637,16 @@ pub fn execute_set_economic_policy(
 
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Staging a pending economic-policy change is Class-C governance config. The
+    // validation + active-state + locked/already-pending guards read through
+    // the cell's `Deref`; the pending-change set + notification emit (Class-C)
+    // ride `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly. The notification `emit` is inlined as `emit_event_into`
+    // over the view's `receive_buffer_mut()` (identical to the free `emit`
+    // helper, which the airtight Class-C view cannot be handed whole-state to).
+    require_active(&cell.handle)?;
 
-    if let Some(existing) = &state.governance.economic_policy
+    if let Some(existing) = &cell.governance.economic_policy
         && existing.locked
     {
         return Err(ContextError::PermissionDenied(
@@ -2600,7 +2654,7 @@ pub fn execute_set_economic_policy(
         ));
     }
 
-    if state.governance.pending_economic_policy_change.is_some() {
+    if cell.governance.pending_economic_policy_change.is_some() {
         return Err(ContextError::PermissionDenied(
             "an economic policy change is already pending notification period".to_owned(),
         ));
@@ -2628,33 +2682,35 @@ pub fn execute_set_economic_policy(
     let notified_at = timestamp_secs;
     let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
     let observed_at = deps.clock.now_secs();
-    state.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
-        new_policy: policy.clone(),
-        notified_at,
-        effective_at,
-        observed_at,
-        proposal_id,
-    });
-
-    emit(
-        state,
-        ContextEvent::EconomicPolicyChangeNotification {
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view
+            .governance_class_c_mut()
+            .pending_economic_policy_change_mut() = Some(PendingEconomicPolicyChange {
+            new_policy: policy.clone(),
             notified_at,
             effective_at,
+            observed_at,
             proposal_id,
-        },
-        context_id,
-        deps,
-    );
+        });
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        emit_event_into(
+            view.receive_buffer_mut(),
+            ContextEvent::EconomicPolicyChangeNotification {
+                notified_at,
+                effective_at,
+                proposal_id,
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyChanged,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2664,7 +2720,7 @@ pub fn execute_set_economic_policy(
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_approve_spend(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     spender: &DID,
@@ -2679,15 +2735,21 @@ pub fn execute_approve_spend(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Granting spend budget is Class-C governance state. The fallible guards
+    // read through the cell's `Deref`; the `budget_tracker.grant` (Class-C)
+    // rides `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly.
+    require_active(&cell.handle)?;
 
-    if !state.membership.contains(spender.as_ref()) {
+    if !cell.membership.contains(spender.as_ref()) {
         return Err(ContextError::MemberNotFound(spender.to_string()));
     }
 
-    state.governance.budget_tracker.grant(spender, amount);
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        view.governance_class_c_mut()
+            .budget_tracker_mut()
+            .grant(spender, amount);
+    });
     let spend_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
             spender: spender.as_ref().to_owned(),
@@ -2710,7 +2772,7 @@ pub fn execute_approve_spend(
 // ---------------------------------------------------------------------------
 
 pub fn execute_lock_economic_policy(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     meta: CommitMeta<'_>,
@@ -2722,9 +2784,15 @@ pub fn execute_lock_economic_policy(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(&state.handle)?;
+    // Locking the economic policy is Class-C governance config. The active-state
+    // gate + presence/already-locked checks read through the cell's `Deref`;
+    // the `locked = true` set (Class-C) rides `commit_class_c_best_effort`,
+    // preserving the prior best-effort persist exactly. The reject checks run
+    // BEFORE the commit closure (the closure is infallible) so a rejected lock
+    // triggers no persist, matching the prior reject-before-persist behaviour.
+    require_active(&cell.handle)?;
 
-    match &mut state.governance.economic_policy {
+    match &cell.governance.economic_policy {
         None => {
             return Err(ContextError::PermissionDenied(
                 "cannot lock economic policy: no policy is set".to_owned(),
@@ -2735,19 +2803,21 @@ pub fn execute_lock_economic_policy(
                 "economic policy is already locked".to_owned(),
             ));
         }
-        Some(policy) => {
-            policy.locked = true;
-        }
+        Some(_) => {}
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        if let Some(policy) = view.governance_class_c_mut().economic_policy_mut() {
+            policy.locked = true;
+        }
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyLocked,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -2756,7 +2826,7 @@ pub fn execute_lock_economic_policy(
 // ---------------------------------------------------------------------------
 
 pub fn execute_modify_hard_rate_limit(
-    state: &mut PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
@@ -2775,9 +2845,16 @@ pub fn execute_modify_hard_rate_limit(
         ))
     })?;
 
-    require_active(&state.handle)?;
+    // The hard rate limiter is Class-C defense-in-depth state. Validation +
+    // the preserved-state snapshot read happen BEFORE the commit (reading the
+    // limiter through the cell's `Deref`); the limiter REPLACEMENT (Class-C)
+    // rides `commit_class_c_best_effort`, preserving the prior best-effort
+    // persist exactly. A validation/sanitization reject returns `Err` before
+    // the commit closure runs, so no persist fires — matching the prior
+    // reject-before-persist behaviour.
+    require_active(&cell.handle)?;
 
-    let mut preserved_state = state.governance.hard_rate_limit.snapshot_entries();
+    let mut preserved_state = cell.governance.hard_rate_limit.snapshot_entries();
     scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
         &mut preserved_state,
         new_config,
@@ -2789,20 +2866,20 @@ pub fn execute_modify_hard_rate_limit(
             "ModifyHardRateLimit: preserved state sanitization failed: {e}"
         ))
     })?;
-    state.governance.hard_rate_limit =
-        scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-            new_config.clone(),
-            preserved_state,
-        );
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
+        *view.governance_class_c_mut().hard_rate_limit_mut() =
+            scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                new_config.clone(),
+                preserved_state,
+            );
+    });
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::HardRateLimitModified,
         actor_did,
         timestamp_secs,
     )?;
-    state.checkpoint_events_since += 1;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
@@ -3233,11 +3310,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(
-        cell.state_mut(),
-        deps,
-        context_id,
-    );
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
 
     Ok((proposal, events, execution_result))
 }
@@ -3544,11 +3617,7 @@ pub async fn vote_on_proposal_inner(
         }
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(
-        cell.state_mut(),
-        deps,
-        context_id,
-    );
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
 
     Ok((status, events))
 }
@@ -3685,7 +3754,7 @@ pub fn dispatch_content_governance_action(
         }
         GovernanceAction::EstablishToolInterface { interface } => {
             execute_establish_tool_interface(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 interface,
@@ -3879,7 +3948,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::RegisterTool { registration } => {
             execute_register_tool(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 registration,
@@ -3950,7 +4019,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::CreateChildContext { params } => {
             execute_create_child_context(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 params,
@@ -3964,7 +4033,7 @@ pub async fn dispatch_context_governance_action(
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
             execute_modify_pruning_policy(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 new_policy,
@@ -4146,7 +4215,7 @@ pub async fn dispatch_governance_action(
                 actor,
                 ts,
             )?;
-            cell.state_mut().checkpoint_events_since += 1;
+            *cell.class_c_view().checkpoint_events_since_mut() += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
@@ -4190,7 +4259,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::PromoteContext => {
             execute_promote_context(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 &proposal.approvals,
@@ -4220,7 +4289,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
             execute_set_economic_policy(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 policy,
@@ -4238,7 +4307,7 @@ pub async fn dispatch_governance_action(
             purpose,
         } => {
             execute_approve_spend(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 spender,
@@ -4254,7 +4323,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::LockEconomicPolicy => {
             execute_lock_economic_policy(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 CommitMeta {
@@ -4267,7 +4336,7 @@ pub async fn dispatch_governance_action(
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
             execute_modify_hard_rate_limit(
-                cell.state_mut(),
+                cell,
                 deps,
                 context_id,
                 new_config,
@@ -4583,12 +4652,12 @@ pub async fn execute_governance_action(
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
-    // ADR-049 §9 Class-S cell seam: this entry holds the cell so the
-    // `executed_proposals` replay-marker writes below — and the downstream
-    // governance leaves — can later route through the fail-closed combinator.
-    // The bare `&mut PerContextState` is re-derived in each block so the borrow
-    // ends before the next `cell`-taking dispatch call; behaviour is unchanged.
-    let state = cell.state_mut();
+    // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
+    // gate is READ-ONLY (proposal status/context match, commit-fault gate,
+    // replay-marker presence) — read through the cell's `Deref` (`&*cell`), no
+    // mutation. The `executed_proposals` replay-marker WRITE below routes through
+    // the deferred-persist `begin_class_s` combinator; the downstream dispatch
+    // chain takes the cell directly.
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
             "governance proposal is not approved (status: {:?})",
@@ -4605,9 +4674,9 @@ pub async fn execute_governance_action(
 
     // PR #1606 C6 fail-close gate + atomically check replay AND mark as
     // executed before dispatch. Actor-owned state — single linear sequence.
-    check_commit_fault(state)?;
+    check_commit_fault(cell)?;
 
-    if state
+    if cell
         .governance
         .class_s
         .executed_proposals

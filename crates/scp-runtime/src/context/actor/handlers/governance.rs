@@ -110,7 +110,7 @@ async fn dispatch_state(
             handle_tombstone_migrated_context_actor(cell, deps, &context_id, reply).await
         }
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
-            handle_acknowledge_commit_fault_actor(cell.state_mut(), &context_id, reply)
+            handle_acknowledge_commit_fault_actor(cell, &context_id, reply)
         }
         GovernanceCommand::WithdrawGovernanceVote {
             context_id,
@@ -148,7 +148,7 @@ async fn dispatch_state(
             reply,
         } => {
             handle_apply_pending_economic_policy_change_actor(
-                cell.state_mut(),
+                cell,
                 deps,
                 &context_id,
                 current_timestamp,
@@ -328,11 +328,11 @@ async fn handle_tombstone_migrated_context_actor(
 
 /// Handle [`GovernanceCommand::AcknowledgeCommitFault`] (actor-shape).
 fn handle_acknowledge_commit_fault_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
-    let result = crate::context::governance_helpers::acknowledge_commit_fault(state, context_id);
+    let result = crate::context::governance_helpers::acknowledge_commit_fault(cell, context_id);
     let outcome = match &result {
         Ok(_) => Outcome::ok_mutated(()),
         Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
@@ -713,14 +713,14 @@ async fn handle_execute_governance_action_actor(
 
 /// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] (actor-shape).
 async fn handle_apply_pending_economic_policy_change_actor(
-    state: &mut crate::context::actor::state::PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
-        state,
+        cell,
         deps,
         context_id,
         current_timestamp,
