@@ -135,7 +135,13 @@ impl WasmCryptoState {
     /// (e.g. never MLS-added) is a NO-OP that returns an empty commit — matching
     /// native `MlsCryptoProvider::remove_member`, because the governance layer
     /// is authoritative for membership and the crypto layer only manages MLS
-    /// state. See
+    /// state.
+    ///
+    /// Self-removal is likewise an empty-commit no-op, matching BOTH of native's
+    /// self-removal mechanisms: the self-DID short-circuit (provider.rs:1041)
+    /// and the own-leaf skip in the scan (provider.rs:1060). This holds even in
+    /// a pathological duplicate-DID tree — a second leaf carrying the local DID
+    /// is NOT evicted, mirroring native. See
     /// [`WasmMlsGroup::remove_member_by_did`](super::group::WasmMlsGroup::remove_member_by_did).
     ///
     /// # Errors
@@ -422,6 +428,41 @@ mod tests {
                 .unwrap(),
             post_plaintext,
             "a remaining member MUST still be able to decrypt after the eviction"
+        );
+    }
+
+    /// Governance-layer parity for native's self-DID short-circuit
+    /// (provider.rs:1041) in a pathological duplicate-DID tree. A second leaf
+    /// carries Alice's OWN DID; `governance_remove_from_group(own_did)` must be
+    /// an empty-commit no-op that does NOT evict the duplicate leaf and does NOT
+    /// advance the epoch — matching native, which evicts neither leaf.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn governance_remove_self_did_no_op_in_dup_did_tree() {
+        let mut alice_state = WasmCryptoState::new_for_context(ALICE_DID).unwrap();
+
+        // Add a second leaf carrying Alice's SAME DID but a fresh signing key.
+        let dup_cred =
+            WasmScpCredential::new(ALICE_DID.to_string(), None, WasmSigningKeyId::Active).unwrap();
+        let (dup_kp_bytes, _dup_holder) = WasmMlsGroup::generate_key_package(&dup_cred).unwrap();
+        let dup_kp_in = KeyPackageIn::tls_deserialize(&mut &*dup_kp_bytes).unwrap();
+        alice_state.mls_group.add_member(dup_kp_in).unwrap();
+
+        let epoch_after_add = alice_state.mls_group.epoch().unwrap();
+
+        // Self-removal via the governance entry point is an empty no-op.
+        let commit = alice_state
+            .governance_remove_from_group(ALICE_DID)
+            .expect("self-DID governance removal in a dup-DID tree must be a no-op");
+        assert!(
+            commit.is_empty(),
+            "self-DID governance removal must produce an empty commit"
+        );
+        assert_eq!(
+            alice_state.mls_group.epoch().unwrap(),
+            epoch_after_add,
+            "self-DID governance removal must NOT advance the epoch (duplicate \
+             leaf NOT evicted, matching native's short-circuit)"
         );
     }
 
