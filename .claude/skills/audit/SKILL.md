@@ -58,7 +58,7 @@ If a section/crate argument was provided, audit only that scope. Otherwise, work
 
 For each stage, dispatch a subagent with the appropriate specialization. Use worktree isolation for agents that may need to test code.
 
-For the completeness/divergence stages below — missing implementations, spec drift, unwired code, inter-layer gaps, and artifact divergence — the `completionist` agent (`.claude/agents/completionist.md`) is the canonical specialization; dispatch it (via `subagent_type`) for spec/ADR/PRD-vs-code tracing and the layer-coverage matrix, and reserve `general-purpose` for the adversarial validation pass in Phase 3.
+For the completeness/divergence stages below — missing implementations, spec drift, unwired code, inter-layer gaps, and artifact divergence — the `completionist` agent (`.claude/agents/completionist.md`) is the canonical specialization; dispatch it (via `subagent_type`) for spec/ADR/PRD-vs-code tracing and the layer-coverage matrix. For the *soundness* of the decisions the code embodies — expired premises, sunk-cost and status-quo reasoning, and cross-slice drift/rot — dispatch the `inquisitor` agent (`.claude/agents/inquisitor.md`); it interrogates whether a thing should exist at all, not merely whether it is fully wired. Reserve `general-purpose` for the adversarial validation pass in Phase 3.
 
 ### 2.1 — Spec Review
 
