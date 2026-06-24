@@ -160,11 +160,19 @@ impl WasmCryptoState {
     /// Mirrors native `MlsCrypto::rotate_sender_key` (spec §9.16.4): after a
     /// member is removed, the remaining members rotate their sender keys so the
     /// evicted member's knowledge of any prior sender key grants no future
-    /// plaintext. The freshly rotated key is lazily redistributed to current
-    /// members on the next send (the `local_sender_key` ships with the next
-    /// `encrypt_message`), so there is no separate sender-key delivery step on
-    /// WASM — the HPKE pending-redistribution queue native maintains is a
-    /// genuine no-op here, not a stub.
+    /// sender-layer plaintext. That is this rotation's entire security purpose —
+    /// denying the evicted member the sender layer.
+    ///
+    /// NOTE: this rotation does NOT, by itself, distribute the new key. WASM
+    /// `encrypt_message` emits only the double-ciphertext and never attaches
+    /// `local_sender_key`, so there is no cross-member sender-key distribution
+    /// path on this bridge for encrypted (non-broadcast) MLS contexts — that is
+    /// a pre-existing gap, separate from eviction. The operative lockout for the
+    /// evicted member is the MLS layer-2 eviction (epoch advance): once the
+    /// removal commit lands, the removed member can no longer derive the group
+    /// keys, so MLS decryption of any later message fails regardless of
+    /// sender-key state. The eviction security property therefore holds
+    /// independently of whether the rotated sender key is ever redistributed.
     pub fn governance_rotate_sender_key(&mut self) {
         // Eagerly zeroize the old key in place before overwriting, rather than
         // relying solely on the drop of the replaced value.
@@ -365,8 +373,11 @@ mod tests {
         // epoch's secrets. We leave Bob's stale state as-is (the realistic
         // adversary: he keeps his pre-eviction keys and tries to decrypt).
 
-        // Carol receives Alice's rotated sender key (lazy redistribution: in
-        // production it ships with the next send; here we hand it over).
+        // Carol receives Alice's rotated sender key. WASM has no cross-member
+        // sender-key distribution path for encrypted MLS contexts (a pre-existing
+        // gap), so the test hands the key over directly to isolate and prove the
+        // MLS-eviction security property: it must hold even when the rotated
+        // sender key IS available to a remaining member.
         carol_state.sender_key_store.insert(
             ALICE_DID.to_string(),
             SenderKey::from_bytes(*alice_state.local_sender_key.as_bytes()),

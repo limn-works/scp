@@ -3455,32 +3455,55 @@ impl WasmContextManager {
         timestamp_secs: u64,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-        let removed = ctx
-            .members
-            .remove(did)
-            .ok_or_else(|| ScpWasmError::Context {
+
+        // Existence check WITHOUT removing — the governance strip is deferred
+        // until AFTER the MLS eviction succeeds (fail-closed-keep ordering;
+        // mirrors native `execute_remove_member`, which checks
+        // `membership.contains(did)` before the MLS boundary and only strips
+        // membership once the crypto cuts have all succeeded). Preserves the
+        // exact `CTX_2015` not-found semantics.
+        if !ctx.members.contains_key(did) {
+            return Err(ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
                 code: codes::CTX_2015.to_owned(),
-            })?;
-        // If the ejected member was an author in a broadcast context,
-        // clean up their broadcast state (destroys broadcast key).
-        if removed.role == "author"
-            && let Some(ref mut bc) = ctx.broadcast_context
-        {
-            let _ = bc.block_author(did);
+            });
         }
 
-        // MLS eviction is the HARD security boundary (mirrors native
-        // `execute_remove_member`, which removes from the MLS group FIRST). On
-        // an encrypted context: evict the member from the MLS group, drop their
-        // stored sender key, then rotate the local sender key so the removed
-        // member's knowledge of any prior sender key grants no future plaintext
-        // (§9.16.4). On a broadcast / unencrypted context (`crypto.is_none()`)
-        // there is no MLS group — the commit is empty, matching native's
-        // non-MLS no-op. The rotated `local_sender_key` is lazily redistributed
-        // on the next send, so there is no separate sender-key delivery step on
-        // WASM (the HPKE pending-redistribution queue native maintains is a
-        // genuine no-op here, not a stub).
+        // MLS eviction is the HARD security boundary and MUST run FIRST, BEFORE
+        // any governance/broadcast state is stripped (mirrors native
+        // `execute_remove_member`, which removes from the MLS group first and
+        // strips membership only inside the fail-closed-keep closure after the
+        // crypto cuts succeed). On an encrypted context: evict the member from
+        // the MLS group, drop their stored sender key, then rotate the local
+        // sender key so the removed member's knowledge of any prior sender key
+        // grants no future plaintext (§9.16.4). On a broadcast / unencrypted
+        // context (`crypto.is_none()`) there is no MLS group — the commit is
+        // empty, matching native's non-MLS no-op.
+        //
+        // Fail-closed: if ANY of these crypto steps errors (a destroyed group,
+        // or a governance member with no MLS leaf), this returns `Err` while the
+        // member is STILL fully present in `ctx.members` and broadcast state.
+        // The removal is therefore atomic at the security boundary — there is no
+        // window where the member is gone from governance yet still able to
+        // derive the group keys. The caller's only rollback
+        // (`execute_governance_action`) does not restore `ctx.members`, so the
+        // strip must not happen until eviction has actually succeeded; a retry
+        // after a transient failure is safe.
+        //
+        // The rotated `local_sender_key` denies the EVICTED member any future
+        // sender-layer plaintext, but the operative lockout for the evicted
+        // member is the MLS layer-2 eviction (epoch advance) itself: once the
+        // commit lands, the removed member can no longer derive the group keys,
+        // so MLS decryption of any later message fails regardless of sender-key
+        // state. WASM has no sender-key cross-member distribution path for
+        // encrypted (non-broadcast) MLS contexts — the rotated key is NOT
+        // attached to subsequent sends (`encrypt_message` emits only the
+        // double-ciphertext). That distribution gap is pre-existing and
+        // orthogonal to eviction; the eviction security property holds without
+        // it because the MLS epoch advance is the lockout.
+        //
+        // Scope the `ctx.crypto.as_mut()` borrow tightly so the later
+        // `ctx.members` / `ctx.broadcast_context` mutations can re-borrow `ctx`.
         let commit = if let Some(crypto) = ctx.crypto.as_mut() {
             let commit =
                 crypto
@@ -3495,6 +3518,18 @@ impl WasmContextManager {
         } else {
             Vec::new()
         };
+
+        // MLS eviction succeeded (or there was no MLS group) — only NOW is it
+        // safe to strip governance and broadcast state. Capture the role before
+        // removing so broadcast-author cleanup can still see it.
+        let removed_role = ctx.members.remove(did).map(|m| m.role);
+        // If the ejected member was an author in a broadcast context, clean up
+        // their broadcast state (destroys broadcast key).
+        if removed_role.as_deref() == Some("author")
+            && let Some(ref mut bc) = ctx.broadcast_context
+        {
+            let _ = bc.block_author(did);
+        }
 
         // Buffer event for local subscribers (mirrors native's `emit`).
         ctx.push_event(ContextEvent::MemberLeft {
@@ -9548,6 +9583,83 @@ mod tests {
             member_left_pos < executed_pos,
             "the MemberLeft leaf must precede the GovernanceActionExecuted leaf, \
              matching native execute_remove_member ordering"
+        );
+    }
+
+    /// Fail-closed-keep proof for `dispatch_remove_member`: when MLS eviction
+    /// FAILS, the member MUST remain fully present in `ctx.members` (and the log
+    /// must NOT gain a `MemberLeft` leaf), so no window opens where the member is
+    /// gone from governance yet can still derive the group keys.
+    ///
+    /// The failure is forced deterministically through the REAL crypto path: the
+    /// context's MLS group has only the creator's leaf, so a governance member
+    /// who carries no MLS leaf triggers `governance_remove_from_group` ->
+    /// `remove_member_by_did` -> `RemoveMemberFailed`. With the fail-closed-keep
+    /// ordering, the early `Err` leaves governance state untouched; with the old
+    /// strip-first ordering the member would already be gone — the exact
+    /// decryption-after-removal hole the MLS eviction fix closes.
+    #[test]
+    fn remove_member_keeps_governance_state_when_mls_eviction_fails() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-failclosed";
+        let creator = "did:dht:z6MkWasmFailClosedCreator";
+        // A governance member with NO MLS leaf: present in `ctx.members` but
+        // never added to the single-creator MLS group below.
+        let removed = "did:dht:z6MkWasmFailClosedTarget";
+        let executor = creator;
+        let timestamp_secs = 1_700_700_700_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        // Real MLS crypto with the creator as the sole leaf. `removed` is in
+        // governance but absent from the MLS group, so eviction must fail.
+        ctx.crypto = Some(
+            crate::crypto::WasmCryptoState::new_for_context(creator)
+                .expect("MLS group creation must succeed for the test fixture"),
+        );
+        ctx.test_insert_member(removed, "member");
+        assert!(
+            ctx.members.contains_key(removed),
+            "precondition: the target must be a governance member before removal"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr.dispatch_remove_member(context_id, removed, executor, timestamp_secs);
+
+        // The MLS eviction failed, so the handler must return Err...
+        let err = result.expect_err(
+            "dispatch_remove_member must fail when MLS eviction of a non-leaf member fails",
+        );
+        assert!(
+            matches!(err, ScpWasmError::Crypto { .. }),
+            "the failure must surface as a crypto eviction error, got {err:?}"
+        );
+
+        // ...and CRITICALLY the member must STILL be in governance state
+        // (fail-closed-keep). A retry is safe; no decryption-after-removal hole.
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context must still be registered after a failed removal");
+        assert!(
+            ctx_after.members.contains_key(removed),
+            "FAIL-CLOSED: a member whose MLS eviction failed MUST remain in \
+             ctx.members — removing them from governance while they stay in the \
+             MLS group reopens the decryption-after-removal hole"
+        );
+        assert_eq!(
+            ctx_after.test_member_role(removed),
+            Some("member"),
+            "the kept member's role must be unchanged after the failed removal"
+        );
+
+        // No durable MemberLeft leaf may be emitted on a failed removal.
+        let events = mgr.test_context_event_log_events(context_id);
+        assert!(
+            !events.iter().any(|e| e.event_type == EventType::MemberLeft),
+            "no MemberLeft leaf may be appended when MLS eviction fails"
         );
     }
 }
