@@ -18,10 +18,11 @@
 //! and `evaluate_consequence_rules` lives there as a pure sync function.
 //!
 //! WASM therefore re-implements `enforce_triggered_consequences` locally
-//! against the WASM-specific `PerContextState` layout (no `ContextRoleState`,
-//! a flat `suspended_capabilities: HashMap<String, HashSet<String>>` map,
-//! a simple hardcoded role-to-capability resolver) while calling the shared
-//! scp-protocol `evaluate_consequence_rules` for the rule-matching logic.
+//! against the WASM bridge's `PerContextState`, which now holds the SAME shared
+//! `scp_protocol::context::roles::ContextRoleState` the native runtime uses
+//! (members, role assignments, ceiling, per-member capabilities, suspensions),
+//! while calling the shared scp-protocol `evaluate_consequence_rules` for the
+//! rule-matching logic.
 //!
 //! # Call sites
 //!
@@ -38,7 +39,7 @@ use scp_protocol::trust::consequence::{
     evaluate_consequence_rules,
 };
 
-use crate::manager::{MemberEntry, PerContextState};
+use crate::manager::PerContextState;
 
 /// Evaluates consequence rules declared on `ctx` against `ctx.event_log`
 /// for `subject_did`, enforces any triggered consequences by mutating
@@ -141,11 +142,9 @@ fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_ev
 // WasmConsequenceDispatcher — bridges PerContextState to the shared trait
 // ---------------------------------------------------------------------------
 
-/// Implements [`ConsequenceDispatcher`] for the WASM bridge's `PerContextState`.
-///
-/// The WASM bridge uses a flat `suspended_capabilities: HashMap<String, HashSet<String>>`
-/// rather than the runtime's `ContextRoleState`, and a simple member role
-/// model (role stored as a string on `MemberEntry`).
+/// Implements [`ConsequenceDispatcher`] for the WASM bridge's `PerContextState`,
+/// which holds the shared `scp_protocol::context::roles::ContextRoleState` —
+/// the same role/ceiling/suspension representation as the native runtime.
 struct WasmConsequenceDispatcher<'a> {
     ctx: &'a mut PerContextState,
 }
@@ -224,12 +223,9 @@ fn apply_suspend(
     if caps.is_empty() {
         return false;
     }
-    for cap in caps {
-        // Store the canonical UCAN form `member_has_capability` looks up — NOT
-        // `Display`, which would never match and would silently no-op the
-        // suspension. See `apply_suspend_enforces_capabilities_with_divergent_display_form`.
-        ctx.suspended_capabilities_insert(subject_did, cap.ucan_capability_name());
-    }
+    // Suspend the typed capabilities directly through the shared
+    // `ContextRoleState::suspend_capabilities` (no string round-trip).
+    ctx.suspend_capabilities_typed(subject_did, caps);
     true
 }
 
@@ -259,31 +255,31 @@ fn apply_suspend_all(ctx: &mut PerContextState, subject_did: &str) -> bool {
     applied
 }
 
-/// Enforces `ConsequenceAction::AssignRole` by mutating the subject's
-/// `MemberEntry.role` in place. Returns `true` if the subject is a
-/// known member and the role was updated.
+/// Enforces `ConsequenceAction::AssignRole` by re-assigning the subject's role
+/// through the shared [`ContextRoleState::system_assign_role`]. Returns `true`
+/// only if the subject is a member AND the target role is defined in the
+/// context's `role_definitions` (and within the ceiling).
 ///
-/// In WASM, roles are stored as free-form strings on `MemberEntry`; there
-/// is no separate "role exists" check (the runtime's role definitions
-/// live in `ContextRoleState`, which WASM does not replicate). Assigning a
-/// role that is not recognized by `member_has_capability` simply results
-/// in the member losing all capabilities — which is an acceptable
-/// degradation for a forcibly-applied consequence.
+/// This is the #1886 fix on the consequence path: `system_assign_role`
+/// validates the role against `role_definitions` before applying it, so an
+/// undefined / out-of-ceiling role now returns `false` (the shared
+/// `enforce_triggered` then escalates to `SuspendAll`) instead of silently
+/// accepting a free-form role string that would strip the member's
+/// capabilities. Matches the native runtime's consequence behavior.
 fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str) -> bool {
-    ctx.members_get_mut(subject_did).is_some_and(|entry| {
-        let MemberEntry { role, .. } = entry;
-        to_role.clone_into(role);
-        true
-    })
+    ctx.role_state_system_assign_role(subject_did, to_role)
+        .is_ok()
 }
 
 // NOTE: `PerContextState` accessors used by this module
 // (`consequence_rules`, `event_log_events`, `members_contains`,
-// `members_get_mut`, `push_event_pub`, `member_has_capability_pub`,
-// `suspended_capabilities_insert`, `cooldown_until_get`,
-// `cooldown_until_insert`) are defined in `manager.rs` in the same
-// `impl PerContextState` block that owns the private fields, because
-// Rust's privacy rules scope field access to the defining module.
+// `role_state_system_assign_role`, `push_event_pub`,
+// `member_has_capability_pub`, `suspend_capabilities_typed`,
+// `suspended_capabilities_insert`, `ceiling_strings_pub`,
+// `cooldown_until_get`, `cooldown_until_insert`) are defined in `manager.rs`
+// in the same `impl PerContextState` block that owns the shared
+// `role_state`, because Rust's privacy rules scope field access to the
+// defining module.
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -46,6 +46,9 @@ use scp_protocol::context::governance::{
 };
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ContextMode;
+use scp_protocol::context::roles::{
+    Capability, CapabilityCeiling, ContextRoleState, builtin_broadcast_roles, builtin_roles,
+};
 use scp_protocol::crypto::ucan::UcanError;
 use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker,
@@ -198,6 +201,42 @@ fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
     policy_requires_payment(&parsed)
 }
 
+/// Parses a WASM-format (UCAN `{resource}:{action}`) capability string into a
+/// typed [`Capability`].
+///
+/// The WASM bridge stores and checks capabilities in the UCAN wire form, where
+/// the built-ins with a compound resource are underscore-joined (`"tool_invoke:*"`,
+/// `"tool_invoke:<id>"`, `"context_child:create"`, `"bridging:*"`) and every other
+/// capability is a 2-segment form identical in both the wire and user-facing
+/// encodings (e.g. `"messages:write"`, `"governance:vote"`, `"role:assign"`).
+///
+/// `Capability::new` recognizes BOTH spellings of every built-in — the
+/// user-facing colon form AND the UCAN wire form (`tool_invoke:*` == `ToolInvokeAll`,
+/// `tool_invoke:<id>` == `ToolInvoke(id)`, `context_child:create` ==
+/// `ChildContextCreate`, `bridging:*` == `Bridging`) — and resolves them to the
+/// proper enumerated variant rather than a `Custom` lookalike (no valid custom
+/// carries a `_` in its resource, so there is no collision). Delegating to it
+/// therefore round-trips a UCAN-form ceiling/suspension string back to the correct
+/// typed variant for ALL built-ins, including `bridging:*` -> `Bridging`.
+fn ucan_string_to_capability(ucan: &str) -> Capability {
+    Capability::new(ucan)
+}
+
+/// Maps a [`scp_protocol::context::roles::RoleError`] (from a
+/// `system_assign_role` / role operation on the shared [`ContextRoleState`])
+/// into the WASM bridge's [`ScpWasmError`].
+///
+/// A `RoleNotFound` (the role name is not in `role_definitions`) or
+/// `CapabilityOutsideCeiling` is a governance/validation failure surfaced as a
+/// `Context` error; this is the path that now rejects an undefined / out-of-
+/// ceiling role on the WASM bridge instead of silently accepting it.
+fn map_role_error(e: scp_protocol::context::roles::RoleError) -> ScpWasmError {
+    ScpWasmError::Context {
+        message: format!("role assignment failed: {e}"),
+        code: codes::CTX_2015.to_owned(),
+    }
+}
+
 /// Type alias for tool handler closures stored per-context.
 type ToolHandlerMap =
     HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>;
@@ -225,20 +264,6 @@ where
     MANAGER.with(|mgr| f(&mut mgr.borrow_mut()))
 }
 
-// ---------------------------------------------------------------------------
-// MemberEntry — per-member state
-// ---------------------------------------------------------------------------
-
-/// Per-member state within a context.
-#[derive(Debug, Clone)]
-pub(crate) struct MemberEntry {
-    /// Stored for diagnostics and serialization; read via `HashMap` key.
-    #[allow(dead_code)]
-    pub(crate) did: String,
-    pub(crate) role: String,
-    pub(crate) sequence_number: u64,
-}
-
 // WasmProposal deleted: replaced by GovernanceProposal from scp-protocol
 // (scp_protocol::context::governance::GovernanceProposal).
 
@@ -252,149 +277,84 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 // (§5.14.2 cohesion invariant — broadcast keys stored alongside context data).
 
 // ---------------------------------------------------------------------------
-// ValidatedCeilingStrings — the single validated WASM ceiling constructor
+// Ceiling-entry grammar enforcement at the WASM boundary (spec §5.3.1.1)
 // ---------------------------------------------------------------------------
 
-/// A capability ceiling stored as canonical UCAN-form `{resource}:{action}`
-/// strings, where EVERY entry is well-formed per the ceiling-entry grammar
-/// (spec §5.3.1.1) — guaranteed BY THE TYPE.
-///
-/// ADR-034: the WASM bridge does not use the native [`CapabilityCeiling`] type
-/// (it stores UCAN strings, not `Capability` enums), so this newtype gives the
-/// WASM path the analogous type-level guarantee the native validating
-/// `Deserialize` gives there. Its inner set is PRIVATE; the ONLY ways to build a
-/// non-empty value are the three validating constructors below, so a WASM
-/// ceiling cannot be set without parsing+validating+formatting each entry through
-/// the SAME canonical scp-protocol grammar both bridges share. Reads go through
-/// [`Deref`] to `&HashSet<String>`, so a `ValidatedCeilingStrings` is a drop-in
-/// for the prior `HashSet<String>` on every read path.
-///
-/// All three constructors converge on the SAME canonical UCAN form:
-/// - [`from_colon_entries`](Self::from_colon_entries) (create): parses the
-///   user's colon-form input via [`Capability::new`], validates the parsed enum
-///   via [`Capability::validate_as_ceiling_entry`], formats via
-///   [`Capability::ucan_capability_name`].
-/// - [`from_capabilities`](Self::from_capabilities) (ModifyCeiling): validates
-///   the already-parsed enum and formats via [`Capability::ucan_capability_name`].
-/// - [`from_ucan_strings`](Self::from_ucan_strings) (import): the entries are
-///   already UCAN form (a signed peer export), validated via
-///   [`validate_ucan_ceiling_string`] and stored verbatim (already canonical).
-///
-/// Because create parses colon-form `custom:payments:approve` → `Custom(
-/// "payments:approve")` → `payments:approve` (NOT the raw-string
-/// `custom_payments:approve` the old `build_ceiling_strings` produced), and
-/// import validates+stores the canonical UCAN form, create / modify / import all
-/// produce the same canonical UCAN-string set the native bridge yields via
-/// [`Capability::ucan_capability_name`] (native stores `Capability` enums per
-/// ADR-034; the convergent property is this string projection, not the in-memory
-/// representation).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ValidatedCeilingStrings(HashSet<String>);
+// The former `ValidatedCeilingStrings` newtype (and its `from_colon_entries` /
+// `from_capabilities` / `from_ucan_strings` validating constructors) is GONE: the
+// WASM bridge now stores the ceiling inside the shared
+// `scp_protocol::context::roles::ContextRoleState`, whose `new` and `set_ceiling`
+// both run `CapabilityCeiling::validate_entries` and whose `Deserialize` rejects a
+// malformed ceiling from bytes (the `#[serde(try_from)]` path). The shared type is
+// the single enforcement point both bridges share.
+//
+// Two boundary validators remain because the WASM bridge parses untyped JS input
+// (colon-form create strings) and untrusted deserialized peer exports (UCAN-form
+// import strings) into typed `Capability`s before they reach `ContextRoleState`,
+// and the parse alone is lossy (an unrecognized colon-form token silently becomes
+// `Custom`): validating the PARSED enum / the UCAN string up front rejects a
+// malformed or non-canonical entry with the canonical bridge `Validation` error
+// (`SCP-VALID-7000`) instead of the shared type's `RoleError`, AND — on import —
+// rejects a non-canonical COLON-form built-in that the lossy parse would otherwise
+// canonicalize and accept (BLACK-002 ModifyCeiling, BLACK-003 create, BLACK-005
+// import).
 
-impl ValidatedCeilingStrings {
-    /// Default WASM ceiling (used when create supplies no explicit ceiling).
-    ///
-    /// Matches `scp_protocol::context::roles::default_ceiling` mapped through
-    /// [`Capability::ucan_capability_name`], so the WASM default and the native
-    /// default are the same canonical UCAN-form set.
-    fn defaults() -> Self {
-        Self(
-            scp_protocol::context::roles::default_ceiling()
-                .iter()
-                .map(scp_protocol::context::roles::Capability::ucan_capability_name)
-                .collect(),
-        )
-    }
-
-    /// Maps a [`CeilingEntryError`] into the canonical bridge validation error
-    /// (`SCP-VALID-7000`). Shared by all three validating constructors so the
-    /// reject surface is identical across the create / modify / import paths.
-    fn validation_error(e: scp_protocol::context::roles::CeilingEntryError) -> ScpWasmError {
-        ScpWasmError::Validation {
-            message: e.to_string(),
-            code: codes::VALID_7000.to_owned(),
-        }
-    }
-
-    /// Builds a validated ceiling from user-supplied COLON-form entries (the
-    /// `create_context` path). An empty list yields [`Self::defaults`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a `Validation` error on the first entry that is not a well-formed
-    /// ceiling entry per spec §5.3.1.1.
-    fn from_colon_entries(entries: &[String]) -> Result<Self, ScpWasmError> {
-        if entries.is_empty() {
-            return Ok(Self::defaults());
-        }
-        let mut set = HashSet::with_capacity(entries.len());
-        for entry in entries {
-            let cap = scp_protocol::context::roles::Capability::new(entry);
-            cap.validate_as_ceiling_entry()
-                .map_err(Self::validation_error)?;
-            set.insert(cap.ucan_capability_name());
-        }
-        Ok(Self(set))
-    }
-
-    /// Builds a validated ceiling from already-parsed [`Capability`] enums (the
-    /// `ModifyCeiling` governance path).
-    ///
-    /// # Errors
-    ///
-    /// Returns a `Validation` error on the first capability that is not a
-    /// well-formed ceiling entry per spec §5.3.1.1.
-    fn from_capabilities(
-        caps: &[scp_protocol::context::roles::Capability],
-    ) -> Result<Self, ScpWasmError> {
-        let mut set = HashSet::with_capacity(caps.len());
-        for cap in caps {
-            cap.validate_as_ceiling_entry()
-                .map_err(Self::validation_error)?;
-            set.insert(cap.ucan_capability_name());
-        }
-        Ok(Self(set))
-    }
-
-    /// Builds a validated ceiling from UCAN-form strings read from an UNTRUSTED,
-    /// deserialized peer export (the `import_context` path). Each entry is
-    /// validated via [`validate_ucan_ceiling_string`] (the UCAN-form counterpart
-    /// to the colon-form grammar) and stored verbatim — a conformant exporter's
-    /// strings are already canonical UCAN form, so this is idempotent; a
-    /// non-conformant peer's malformed or non-canonical (colon-form) entry is
-    /// REJECTED rather than poisoning the importer's ceiling.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `Validation` error on the first entry that is not a well-formed
-    /// UCAN-form ceiling entry per spec §5.3.1.1.
-    fn from_ucan_strings<'a, I>(entries: I) -> Result<Self, ScpWasmError>
-    where
-        I: IntoIterator<Item = &'a String>,
-    {
-        let mut set = HashSet::new();
-        for entry in entries {
-            scp_protocol::context::roles::validate_ucan_ceiling_string(entry)
-                .map_err(Self::validation_error)?;
-            set.insert(entry.clone());
-        }
-        Ok(Self(set))
-    }
-
-    /// Test-only: insert a raw UCAN-form capability string, bypassing validation,
-    /// to simulate a corrupt/non-conformant stored ceiling.
-    #[cfg(test)]
-    fn test_insert(&mut self, capability: &str) {
-        self.0.insert(capability.to_owned());
+/// Maps a ceiling-grammar error into the canonical WASM bridge validation error
+/// (`SCP-VALID-7000`), so the reject surface is identical across the create /
+/// modify / import paths.
+fn ceiling_validation_error(e: scp_protocol::context::roles::CeilingEntryError) -> ScpWasmError {
+    ScpWasmError::Validation {
+        message: e.to_string(),
+        code: codes::VALID_7000.to_owned(),
     }
 }
 
-impl std::ops::Deref for ValidatedCeilingStrings {
-    type Target = HashSet<String>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+/// Validates each already-parsed [`Capability`] against the §5.3.1.1 ceiling-entry
+/// grammar (the create path, after `Capability::new`, and the `ModifyCeiling`
+/// governance path, whose `new_ceiling` is already typed). Validates the PARSED
+/// enum so a malformed `Custom` (no-colon `payments`, stray-`*` `*:*`/`*:read`,
+/// multi-colon `a:b:c`, underscore-resource) is rejected BEFORE any mutation —
+/// the same enforcement the shared `CapabilityCeiling::validate_entries` performs,
+/// surfaced as the canonical bridge `Validation` error at the boundary.
+///
+/// # Errors
+///
+/// Returns a `Validation` error on the first capability that is not a well-formed
+/// ceiling entry per spec §5.3.1.1.
+fn validate_ceiling_capabilities(
+    caps: &[scp_protocol::context::roles::Capability],
+) -> Result<(), ScpWasmError> {
+    for cap in caps {
+        cap.validate_as_ceiling_entry()
+            .map_err(ceiling_validation_error)?;
     }
+    Ok(())
+}
+
+/// Validates each UCAN-form ceiling string from an UNTRUSTED, deserialized peer
+/// export (the `import_context` path) via the shared
+/// [`scp_protocol::context::roles::validate_ucan_ceiling_string`] — the UCAN-form
+/// counterpart to the colon-form grammar. A conformant exporter's strings are
+/// already canonical UCAN form, so this is idempotent; a non-conformant peer's
+/// malformed entry OR a non-canonical COLON-form built-in (e.g. `tool:invoke:*`
+/// instead of `tool_invoke:*`) is REJECTED rather than poisoning the importer's
+/// ceiling. This runs BEFORE parsing the strings into `Capability`s, because the
+/// lossy parse (`ucan_string_to_capability`) would canonicalize a colon-form
+/// built-in and accept it (BLACK-005).
+///
+/// # Errors
+///
+/// Returns a `Validation` error on the first entry that is not a well-formed
+/// UCAN-form ceiling entry per spec §5.3.1.1.
+fn validate_imported_ceiling_strings<'a, I>(entries: I) -> Result<(), ScpWasmError>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    for entry in entries {
+        scp_protocol::context::roles::validate_ucan_ceiling_string(entry)
+            .map_err(ceiling_validation_error)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,17 +371,28 @@ pub(crate) struct PerContextState {
     /// checks and snapshot/restore. `minProtocolVersion` is read from this field
     /// during `join_context` and `subscribe_broadcast`.
     params_json: serde_json::Value,
-    /// Creator DID.
-    creator_did: String,
     /// Context mode: "Encrypted" or "Broadcast".
     mode: String,
-    /// Capability ceiling as canonical UCAN-form `{resource}:{action}` strings.
+    /// Shared role state: members, role assignments, capability ceiling, role
+    /// definitions, per-member granted capabilities, and suspensions.
     ///
-    /// Held as [`ValidatedCeilingStrings`] so it cannot be set without routing
-    /// through a validating constructor (create / modify / import) — a malformed
-    /// entry can never be stored, and all three write paths produce the
-    /// byte-identical canonical form the native bridge stores.
-    ceiling_strings: ValidatedCeilingStrings,
+    /// This is the `scp_protocol` shared, sync, wasm-safe type — the SAME
+    /// representation the native runtime holds. It replaces the WASM bridge's
+    /// former flat reimplementation (`members: HashMap<String, MemberEntry>`,
+    /// `ceiling_strings: HashSet<String>`, `suspended_capabilities`,
+    /// `creator_did`). Role-against-`role_definitions` validation now happens by
+    /// construction (`ContextRoleState::system_assign_role`), closing the
+    /// divergence where the old hardcoded role-name match silently accepted
+    /// undefined / out-of-ceiling roles.
+    role_state: ContextRoleState,
+    /// Per-member MLS message sequence counter, keyed by member DID.
+    ///
+    /// This is ENCRYPTION state (the next outgoing message's sequence number
+    /// for each sender), NOT role state — it has no home in
+    /// [`ContextRoleState`], so it lives here alongside the other crypto-adjacent
+    /// fields. Inserted when a member joins / is added, incremented on each
+    /// `publish_broadcast`, and dropped when the member is removed.
+    member_sequence_numbers: HashMap<String, u64>,
     /// Ceiling policy: "immutable" or "governed".
     ceiling_policy: String,
     /// TTL in seconds, if any.
@@ -443,17 +414,12 @@ pub(crate) struct PerContextState {
     /// UCAN nonce replay tracker. Stores `(nonce, insertion_timestamp_ms)`.
     /// Evicts entries older than [`WASM_NONCE_TTL_MS`] when exceeding [`WASM_NONCE_CAP`].
     seen_nonces: HashMap<String, f64>,
-    /// Members indexed by DID.
-    members: HashMap<String, MemberEntry>,
     /// Receive buffer for events. Capped at [`WASM_EVENT_BUFFER_CAP`] (FIFO overflow).
     /// Uses `VecDeque` for O(1) `pop_front` instead of `Vec::remove(0)` O(n) shift.
     event_buffer: VecDeque<ContextEvent>,
     /// Executed proposal IDs with insertion timestamps (replay protection).
     /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
     executed_proposals: HashMap<String, f64>,
-    /// Suspended capabilities per member DID (replaces legacy per-member revocation tracking).
-    /// Key: member DID, Value: set of suspended capability strings (e.g. "messages:write").
-    suspended_capabilities: HashMap<String, HashSet<String>>,
     /// Members excluded from future CEK wrapping (`AccessScope::Read` revocation).
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
@@ -671,96 +637,20 @@ impl PerContextState {
 
     /// Returns `true` if the member has the given capability string.
     ///
-    /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
-    /// default role system (see `builtin_*` functions in scp-core roles.rs):
-    /// - "admin" — all capabilities in the ceiling.
-    /// - "moderator" — messages:read, messages:write, `tool_invoke:*`,
-    ///   member:remove, governance:propose (§5.9 elected moderators pattern).
-    /// - "member" — messages:read, messages:write, `tool_invoke:*`.
-    /// - "author" — messages:write, messages:read, `tool_invoke:*`.
-    /// - "observer" — messages:read only.
-    /// - "subscriber" — messages:read only (broadcast contexts).
+    /// Delegates to the shared [`ContextRoleState::member_has_capability`] (the
+    /// SAME role/ceiling/suspension logic the native runtime uses), after
+    /// parsing the WASM-format capability string into a typed
+    /// [`Capability`]. Suspension is checked first by the shared type, then the
+    /// member's role-granted `member_capabilities` set.
     ///
     /// Capability strings use the UCAN `{resource}:{action}` format where
     /// compound resources use underscores (e.g. `"tool_invoke:*"`,
-    /// `"context:close"`, `"messages:write"`). This matches scp-core's
-    /// `Capability::ucan_capability_name()` output and the ceiling string
-    /// format, ensuring cross-platform UCAN token exchange works correctly.
+    /// `"context:close"`, `"messages:write"`). [`ucan_string_to_capability`]
+    /// reverses the underscore-resource encoding so `Capability::new` (which
+    /// expects the colon user-facing form) recovers the right variant.
     fn member_has_capability(&self, member_did: &str, capability: &str) -> bool {
-        let Some(member) = self.members.get(member_did) else {
-            return false;
-        };
-
-        // Suspension check FIRST — a suspended capability is denied even if
-        // the member's role + ceiling would grant it. Mirrors
-        // `ContextRoleState::member_has_capability` in scp-protocol, which
-        // checks `suspended_capabilities` before the role-granted set.
-        //
-        // This closes the wiring gap where consequence rules (via
-        // `crate::consequence::apply_suspend` / `apply_suspend_all`) would
-        // insert entries into `suspended_capabilities` but every gate that
-        // calls `member_has_capability` would still grant the capability,
-        // leaving the suspension unenforced.
-        if self
-            .suspended_capabilities
-            .get(member_did)
-            .is_some_and(|s| s.contains(capability))
-        {
-            return false;
-        }
-
-        // Helper: check that the capability is within the context ceiling.
-        let in_ceiling = |cap: &str| -> bool {
-            let (resource, _action) = cap.rsplit_once(':').unwrap_or((cap, "*"));
-            let wildcard = format!("{resource}:*");
-            self.ceiling_strings.contains(cap) || self.ceiling_strings.contains(&wildcard)
-        };
-
-        match member.role.as_str() {
-            "admin" => {
-                // Admins have all capabilities in the ceiling.
-                in_ceiling(capability)
-            }
-            "moderator" => {
-                // Moderators: messages r/w, tool invoke, member remove,
-                // governance propose — intersected with ceiling (§5.9).
-                let role_grants = matches!(
-                    capability,
-                    "messages:read"
-                        | "messages:write"
-                        | "tool_invoke:*"
-                        | "member:remove"
-                        | "governance:propose"
-                );
-                role_grants && in_ceiling(capability)
-            }
-            "author" => {
-                // Authors: messages r/w, tool invoke — intersected with ceiling.
-                let role_grants = matches!(
-                    capability,
-                    "messages:write" | "messages:read" | "tool_invoke:*"
-                );
-                role_grants && in_ceiling(capability)
-            }
-            "member" => {
-                // Default member capabilities: messages:read, messages:write,
-                // tool_invoke:* — intersected with ceiling.
-                let role_grants = matches!(
-                    capability,
-                    "messages:read" | "messages:write" | "tool_invoke:*"
-                );
-                role_grants && in_ceiling(capability)
-            }
-            "subscriber" => {
-                // Subscribers can only read messages (broadcast contexts).
-                capability == "messages:read" && in_ceiling(capability)
-            }
-            "observer" => {
-                // Observers can only read messages.
-                capability == "messages:read" && in_ceiling(capability)
-            }
-            _ => false,
-        }
+        self.role_state
+            .member_has_capability(member_did, &ucan_string_to_capability(capability))
     }
 
     /// Checks that the SDK's protocol version is compatible with this context's
@@ -809,12 +699,25 @@ impl PerContextState {
 
     /// Checks whether the subject is currently a member of the context.
     pub(crate) fn members_contains(&self, subject_did: &str) -> bool {
-        self.members.contains_key(subject_did)
+        self.role_state.members.contains(subject_did)
     }
 
-    /// Returns a mutable reference to the subject's member entry.
-    pub(crate) fn members_get_mut(&mut self, subject_did: &str) -> Option<&mut MemberEntry> {
-        self.members.get_mut(subject_did)
+    /// System-level role assignment over the shared [`ContextRoleState`]
+    /// (consequence-engine path). Validates that the role exists in
+    /// `role_definitions` and that every granted capability is within the
+    /// ceiling before minting tokens — the shared behavior that closes the
+    /// former WASM gap of silently accepting an undefined role.
+    ///
+    /// Returns `Err` if the member is absent or the role is undefined /
+    /// out-of-ceiling; the consequence actuator maps that to `false`.
+    pub(crate) fn role_state_system_assign_role(
+        &mut self,
+        subject_did: &str,
+        role_name: &str,
+    ) -> Result<(), scp_protocol::context::roles::RoleError> {
+        self.role_state
+            .system_assign_role(subject_did, role_name, &crate::time::WasmClock)
+            .map(|_tokens| ())
     }
 
     /// Pushes a context event onto the receive buffer (public wrapper so
@@ -830,13 +733,18 @@ impl PerContextState {
         self.member_has_capability(subject_did, capability)
     }
 
-    /// Inserts `capability` into the subject's suspended capability set.
-    /// Creates a new `HashSet` if the subject has no existing entry.
+    /// Suspends `capability` (a WASM-format UCAN string) for the subject via the
+    /// shared [`ContextRoleState::suspend_capabilities`].
     pub(crate) fn suspended_capabilities_insert(&mut self, subject_did: &str, capability: String) {
-        self.suspended_capabilities
-            .entry(subject_did.to_owned())
-            .or_default()
-            .insert(capability);
+        self.role_state
+            .suspend_capabilities(subject_did, [ucan_string_to_capability(&capability)]);
+    }
+
+    /// Suspends typed capabilities for the subject via the shared
+    /// [`ContextRoleState::suspend_capabilities`] (no string round-trip).
+    pub(crate) fn suspend_capabilities_typed(&mut self, subject_did: &str, caps: &[Capability]) {
+        self.role_state
+            .suspend_capabilities(subject_did, caps.iter().cloned());
     }
 
     /// Reads a cooldown timer for a given rule index.
@@ -849,9 +757,76 @@ impl PerContextState {
         self.cooldown_until.insert(rule_index, until_secs);
     }
 
-    /// Returns a reference to the context's capability ceiling strings.
-    pub(crate) fn ceiling_strings_pub(&self) -> &HashSet<String> {
-        &self.ceiling_strings
+    /// Returns the context's capability ceiling as a UCAN `{resource}:{action}`
+    /// string set (owned), derived from the shared [`ContextRoleState`] ceiling.
+    pub(crate) fn ceiling_strings_pub(&self) -> HashSet<String> {
+        self.role_state.ceiling().to_ucan_string_set()
+    }
+
+    /// Replaces the ceiling and RE-DERIVES the built-in role definitions and
+    /// every member's granted-capability set from the new ceiling.
+    ///
+    /// The shared [`ContextRoleState`] snapshots a member's `member_capabilities`
+    /// at assignment time from the role definition (which is itself derived from
+    /// the ceiling at construction). The WASM bridge's former flat model instead
+    /// resolved an admin's capabilities against the LIVE ceiling on every check,
+    /// so a ceiling change took effect immediately. To preserve that semantics
+    /// over the shared type, this:
+    /// 1. installs the new ceiling (`set_ceiling`),
+    /// 2. rebuilds the built-in role definitions (`admin` = the whole new
+    ///    ceiling; the role-subset roles intersected with it),
+    /// 3. re-runs `system_assign_role` for every current member at their existing
+    ///    role so `member_capabilities` reflects the new ceiling. The
+    ///    SHRINK-only suspension prune that `system_assign_role` performs keeps
+    ///    suspensions that the refreshed role still grants and drops the rest —
+    ///    the same fail-safe direction as native.
+    ///
+    /// Custom (non-built-in) role definitions are preserved as-is; only the
+    /// protocol built-ins are re-derived (WASM only assigns built-in role names).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CeilingEntryError`](scp_protocol::context::roles::CeilingEntryError)
+    /// if any entry of `ceiling` is malformed per the §5.3.1.1 grammar — the shared
+    /// `ContextRoleState::set_ceiling` is fail-closed, so on a rejected write the
+    /// prior ceiling, role definitions, and member capabilities are ALL left
+    /// unchanged (the refresh below runs only after a successful `set_ceiling`).
+    fn set_ceiling_and_refresh(
+        &mut self,
+        ceiling: CapabilityCeiling,
+    ) -> Result<(), scp_protocol::context::roles::CeilingEntryError> {
+        // Fail-closed: validate + install the whole replacement first. If it is
+        // rejected, return BEFORE touching role definitions or member caps.
+        self.role_state.set_ceiling(ceiling.clone())?;
+
+        // Rebuild built-in role definitions against the new ceiling, leaving any
+        // custom role definitions untouched.
+        for role in builtin_roles(&ceiling)
+            .into_iter()
+            .chain(builtin_broadcast_roles(&ceiling))
+        {
+            self.role_state
+                .role_definitions
+                .insert(role.name.clone(), role);
+        }
+
+        // Refresh every member's granted-capability set at their current role.
+        let assignments: Vec<(String, String)> = self
+            .role_state
+            .assignments
+            .iter()
+            .map(|(did, a)| (did.clone(), a.role_name.clone()))
+            .collect();
+        for (did, role_name) in assignments {
+            // The role is a current assignment, so it is defined and (post-
+            // rebuild) within the ceiling; the only error case (absent member)
+            // cannot occur for a DID drawn from `assignments`.
+            let _ = self
+                .role_state
+                .system_assign_role(&did, &role_name, &crate::time::WasmClock);
+        }
+
+        Ok(())
     }
 
     /// Appends a durable consequence-enforcement Merkle leaf (ADR-017, ADR-051
@@ -939,45 +914,52 @@ impl PerContextState {
         scp_event_log::tree::root(&self.event_log)
     }
 
-    /// Test-only: insert a member with the given role.
+    /// Test-only: insert a member with the given (built-in) role.
+    ///
+    /// Adds the DID to `role_state.members`, seeds its MLS sequence counter, and
+    /// assigns the role via `system_assign_role` so `member_capabilities` is
+    /// populated against the current ceiling.
     #[cfg(test)]
     pub(crate) fn test_insert_member(&mut self, did: &str, role: &str) {
-        self.members.insert(
-            did.to_owned(),
-            MemberEntry {
-                did: did.to_owned(),
-                role: role.to_owned(),
-                sequence_number: 0,
-            },
-        );
+        self.role_state.members.insert(did.to_owned());
+        self.member_sequence_numbers
+            .entry(did.to_owned())
+            .or_insert(0);
+        let _ = self
+            .role_state
+            .system_assign_role(did, role, &crate::time::WasmClock);
     }
 
-    /// Test-only: read the current role string for a member.
+    /// Test-only: read the current role name for a member.
     #[cfg(test)]
     pub(crate) fn test_member_role(&self, did: &str) -> Option<&str> {
-        self.members.get(did).map(|m| m.role.as_str())
+        self.role_state
+            .assignments
+            .get(did)
+            .map(|a| a.role_name.as_str())
     }
 
-    /// Test-only: read the suspended capability set for a member.
+    /// Test-only: read the suspended capability set for a member as
+    /// UCAN-format strings (owned), or `None` if the member has no suspensions.
     #[cfg(test)]
     pub(crate) fn test_suspended_capabilities(
         &self,
         did: &str,
-    ) -> Option<&std::collections::HashSet<String>> {
-        self.suspended_capabilities.get(did)
+    ) -> Option<std::collections::HashSet<String>> {
+        self.role_state
+            .suspended_for(did)
+            .map(|caps| caps.iter().map(Capability::ucan_capability_name).collect())
     }
 
     /// Test-only: suspend a single capability (UCAN-format string) for a
     /// member, so sibling-module cross-impl tests can construct a member that
     /// holds `governance:vote` (eligible voter) while lacking a specific action
     /// capability (e.g. `role:assign`). Mirrors the production effect of
-    /// `apply_suspend` populating `suspended_capabilities`.
+    /// `apply_suspend` populating the shared `suspended_capabilities`.
     #[cfg(test)]
     pub(crate) fn test_insert_suspended_capability(&mut self, did: &str, capability: &str) {
-        self.suspended_capabilities
-            .entry(did.to_owned())
-            .or_default()
-            .insert(capability.to_owned());
+        self.role_state
+            .suspend_capabilities(did, [ucan_string_to_capability(capability)]);
     }
 
     /// Test-only: push a consequence rule onto the context's declared rules.
@@ -989,11 +971,18 @@ impl PerContextState {
         self.consequence_rules.push(rule);
     }
 
-    /// Test-only: add a raw capability string to the context ceiling, bypassing
-    /// validation (simulates a corrupt/non-conformant stored ceiling).
+    /// Test-only: add a capability (UCAN-format string) to the context ceiling
+    /// and refresh role definitions / member capabilities against it.
     #[cfg(test)]
+    #[allow(clippy::expect_used)] // test-only helper; the test corpus uses well-formed entries
     pub(crate) fn test_insert_ceiling(&mut self, capability: &str) {
-        self.ceiling_strings.test_insert(capability);
+        let mut caps: HashSet<Capability> = self.role_state.ceiling().iter().cloned().collect();
+        caps.insert(ucan_string_to_capability(capability));
+        // Test helper: the inserted capability is well-formed (the test corpus
+        // uses canonical entries), so the validating `set_ceiling_and_refresh`
+        // never errors here.
+        self.set_ceiling_and_refresh(CapabilityCeiling::new(caps))
+            .expect("test ceiling capability must be well-formed");
     }
 
     /// Test-only: set the governance model string (e.g. `"majority"`), so
@@ -1417,23 +1406,29 @@ fn serialize_broadcast_content_wasm(
 /// Consumers should use the `test_*` helpers on [`PerContextState`] to
 /// append events, insert members, push consequence rules, etc.
 #[cfg(test)]
+#[allow(clippy::expect_used)] // test-only helper; empty-ceiling construction is infallible
 pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -> PerContextState {
-    let mut members = HashMap::new();
-    members.insert(
+    // Empty ceiling, creator auto-assigned `admin` by `ContextRoleState::new`.
+    // `WasmClock` falls back to `SystemTime` on the native test target, so the
+    // token-minting clock call inside `new` does not require the JS runtime.
+    let role_state = ContextRoleState::new(
+        context_id.to_owned(),
         creator_did.to_owned(),
-        MemberEntry {
-            did: creator_did.to_owned(),
-            role: "admin".to_owned(),
-            sequence_number: 0,
-        },
-    );
+        CapabilityCeiling::new(std::iter::empty()),
+        Vec::new(),
+        &crate::time::WasmClock,
+    )
+    .expect("bare ContextRoleState with empty ceiling and no custom roles is always valid");
+
+    let mut member_sequence_numbers = HashMap::new();
+    member_sequence_numbers.insert(creator_did.to_owned(), 0);
 
     PerContextState {
         state: "active".to_owned(),
         params_json: serde_json::Value::Null,
-        creator_did: creator_did.to_owned(),
         mode: "Unencrypted".to_owned(),
-        ceiling_strings: ValidatedCeilingStrings::default(),
+        role_state,
+        member_sequence_numbers,
         ceiling_policy: "immutable".to_owned(),
         ttl_seconds: None,
         promotion_policy: None,
@@ -1444,10 +1439,8 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         event_log: EventLog::new(context_id.to_owned()),
         revoked_tokens: HashSet::new(),
         seen_nonces: HashMap::new(),
-        members,
         event_buffer: VecDeque::new(),
         executed_proposals: HashMap::new(),
-        suspended_capabilities: HashMap::new(),
         read_exclusion_list: HashSet::new(),
         broadcast_context: None,
         sessions: HashMap::new(),
@@ -1597,22 +1590,28 @@ impl WasmContextManager {
             });
         }
 
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1) AND canonical
-        // formatting in ONE step. The WASM bridge does NOT route ceiling
-        // construction through `ContextRoleState::new` (the native enforcement
-        // point), so it builds the ceiling through the single validated
-        // constructor `ValidatedCeilingStrings::from_colon_entries`, which parses
-        // each user-supplied colon-form entry via `Capability::new`, validates the
-        // PARSED enum via `validate_as_ceiling_entry`, and formats via
-        // `ucan_capability_name` — the SAME canonical parse+format the native
-        // bridges and the WASM `ModifyCeiling` handler use. This both rejects a
-        // malformed entry (no-colon `custom:payments` → `Custom("payments")`,
-        // stray-`*` `*:*`/`*:read`, multi-colon) AND stores the canonical form,
-        // closing the prior split where validation parsed the enum but the store
-        // formatted from the RAW string (`custom:payments:approve` stored as
-        // `custom_payments:approve` on WASM but `payments:approve` on native). An
-        // empty ceiling yields the canonical default set.
-        let ceiling_strings = ValidatedCeilingStrings::from_colon_entries(&ceiling)?;
+        // Build the typed capability ceiling, enforcing the §5.3.1.1 ceiling-entry
+        // grammar (BLACK-003). Empty input -> the shared `default_ceiling()` (its
+        // `to_ucan_string_set()` is byte-equal to the former
+        // `build_ceiling_strings(empty)` default — verified format-preserving).
+        // Non-empty input -> parse each user-supplied colon-form string via
+        // `Capability::new` (the same parse the shared enforcement uses), validate
+        // the PARSED enums via `validate_as_ceiling_entry`, then build the ceiling.
+        // Validating the parsed enum (not the raw string) is what closes BLACK-003:
+        // a malformed entry (no-colon `custom:payments` -> `Custom("payments")`,
+        // stray-`*` `*:*`/`*:read`, multi-colon) is rejected with the canonical
+        // `SCP-VALID-7000` error here, BEFORE the ceiling reaches the (also
+        // validating, defense-in-depth) `ContextRoleState::new`. The ceiling is
+        // stored as `Capability` enums in `ContextRoleState`; its canonical
+        // UCAN-string projection (`to_ucan_string_set`) is byte-identical to what
+        // the native bridge stores for the same logical entries.
+        let ceiling: CapabilityCeiling = if ceiling.is_empty() {
+            scp_protocol::context::roles::default_ceiling()
+        } else {
+            let parsed: Vec<Capability> = ceiling.iter().map(Capability::new).collect();
+            validate_ceiling_capabilities(&parsed)?;
+            CapabilityCeiling::new(parsed)
+        };
 
         // Parse and validate minProtocolVersion from params (spec §13.4).
         // This mirrors the NAPI bridge's parsing in context_create. Malformed
@@ -1683,16 +1682,29 @@ impl WasmContextManager {
             None
         };
 
-        // Initialize creator as admin member.
-        let mut members = HashMap::new();
-        members.insert(
+        // Initialize the shared role state: `ContextRoleState::new` auto-derives
+        // built-in role definitions from the ceiling and assigns the creator the
+        // `admin` role. It also re-validates the ceiling grammar
+        // (`validate_entries`) as defense in depth — the boundary
+        // `validate_ceiling_capabilities` above already rejected a malformed entry
+        // with the canonical `SCP-VALID-7000` error, so the only error reachable
+        // here with no custom roles is a custom role outside the ceiling. Map it to
+        // a context error rather than unwrapping, per the no-unwrap policy.
+        let role_state = ContextRoleState::new(
+            context_id.to_owned(),
             creator_did.to_owned(),
-            MemberEntry {
-                did: creator_did.to_owned(),
-                role: "admin".to_owned(),
-                sequence_number: 0,
-            },
-        );
+            ceiling,
+            Vec::new(),
+            &crate::time::WasmClock,
+        )
+        .map_err(|e| ScpWasmError::Context {
+            message: format!("role state initialization failed: {e}"),
+            code: codes::CTX_2001.to_owned(),
+        })?;
+
+        // Seed the creator's MLS message sequence counter.
+        let mut member_sequence_numbers = HashMap::new();
+        member_sequence_numbers.insert(creator_did.to_owned(), 0);
 
         // Creator-assigned creation time (this member is the creator). Bound
         // once so the `ContextCreated` leaf timestamp below and the stored
@@ -1703,9 +1715,9 @@ impl WasmContextManager {
         let per_context = PerContextState {
             state: "active".to_owned(),
             params_json: params.clone(),
-            creator_did: creator_did.to_owned(),
             mode,
-            ceiling_strings,
+            role_state,
+            member_sequence_numbers,
             ceiling_policy,
             ttl_seconds,
             promotion_policy,
@@ -1716,10 +1728,8 @@ impl WasmContextManager {
             event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
-            members,
             event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
-            suspended_capabilities: HashMap::new(),
             read_exclusion_list: HashSet::new(),
             broadcast_context,
             sessions: HashMap::new(),
@@ -1807,21 +1817,21 @@ impl WasmContextManager {
             });
         }
 
-        if ctx.members.contains_key(member_did) {
+        if ctx.role_state.members.contains(member_did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{member_did}' already joined context '{context_id}'"),
                 code: codes::CTX_2013.to_owned(),
             });
         }
 
-        ctx.members.insert(
-            member_did.to_owned(),
-            MemberEntry {
-                did: member_did.to_owned(),
-                role: "member".to_owned(),
-                sequence_number: 0,
-            },
-        );
+        ctx.role_state.members.insert(member_did.to_owned());
+        ctx.member_sequence_numbers.insert(member_did.to_owned(), 0);
+        ctx.role_state
+            .system_assign_role(member_did, "member", &crate::time::WasmClock)
+            .map_err(|e| ScpWasmError::Context {
+                message: format!("failed to assign 'member' role on join: {e}"),
+                code: codes::CTX_2015.to_owned(),
+            })?;
 
         ctx.push_event(ContextEvent::MemberJoined {
             member_did: DID(member_did.to_owned()),
@@ -1852,12 +1862,25 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx.members.remove(member_did).is_none() {
+        if !ctx.role_state.members.remove(member_did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{member_did}' not found in context '{context_id}'"),
                 code: codes::CTX_2015.to_owned(),
             });
         }
+        // Drop all per-member state the leaving member left behind: role
+        // assignment, granted capabilities, suspensions, and the MLS sequence
+        // counter. Clearing suspensions via `restore_capabilities` over the
+        // member's current suspended set keeps the shared map free of dangling
+        // entries (a re-admitted same-DID member must not inherit a phantom
+        // suspension).
+        ctx.role_state.assignments.remove(member_did);
+        ctx.role_state.member_capabilities.remove(member_did);
+        if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
+            let caps: Vec<Capability> = suspended.iter().cloned().collect();
+            ctx.role_state.restore_capabilities(member_did, &caps);
+        }
+        ctx.member_sequence_numbers.remove(member_did);
 
         // Unsubscribe from broadcast if applicable.
         if let Some(ref mut bc) = ctx.broadcast_context {
@@ -1885,7 +1908,7 @@ impl WasmContextManager {
         );
 
         // Auto-close if no members remain.
-        if ctx.members.is_empty() {
+        if ctx.role_state.members.is_empty() {
             "closing".clone_into(&mut ctx.state);
         }
 
@@ -1942,9 +1965,9 @@ impl WasmContextManager {
 
         // Check write suspension.
         if ctx
-            .suspended_capabilities
-            .get(sender_did)
-            .is_some_and(|caps| caps.contains("messages:write"))
+            .role_state
+            .suspended_for(sender_did)
+            .is_some_and(|caps| caps.contains(&Capability::MessagesWrite))
         {
             return Err(ScpWasmError::Permission {
                 message: format!("write access has been suspended for {sender_did}"),
@@ -1952,17 +1975,19 @@ impl WasmContextManager {
             });
         }
 
-        // Check membership and assign sequence number.
-        let member = ctx
-            .members
-            .get_mut(sender_did)
-            .ok_or_else(|| ScpWasmError::Context {
+        // Check membership and assign the MLS message sequence number.
+        if !ctx.role_state.members.contains(sender_did) {
+            return Err(ScpWasmError::Context {
                 message: format!("sender '{sender_did}' is not a member of context '{context_id}'"),
                 code: codes::CTX_2019.to_owned(),
-            })?;
-
-        let seq = member.sequence_number;
-        member.sequence_number += 1;
+            });
+        }
+        let seq_entry = ctx
+            .member_sequence_numbers
+            .entry(sender_did.to_owned())
+            .or_insert(0);
+        let seq = *seq_entry;
+        *seq_entry += 1;
 
         // If crypto state is available, encrypt the payload before recording.
         let recorded_payload = if let Some(ref mut crypto) = ctx.crypto {
@@ -2202,7 +2227,9 @@ impl WasmContextManager {
     /// Returns the member count. Mirrors `ContextManager::member_count`.
     #[must_use]
     pub fn member_count(&self, context_id: &str) -> Option<usize> {
-        self.contexts.get(context_id).map(|ctx| ctx.members.len())
+        self.contexts
+            .get(context_id)
+            .map(|ctx| ctx.role_state.members.len())
     }
 
     /// Returns `true` if the DID is a member. Mirrors `ContextManager::is_member`.
@@ -2210,7 +2237,7 @@ impl WasmContextManager {
     pub fn is_member(&self, context_id: &str, did: &str) -> bool {
         self.contexts
             .get(context_id)
-            .is_some_and(|ctx| ctx.members.contains_key(did))
+            .is_some_and(|ctx| ctx.role_state.members.contains(did))
     }
 
     /// Returns all member DIDs. Mirrors `ContextManager::member_dids`.
@@ -2218,7 +2245,7 @@ impl WasmContextManager {
     pub fn member_dids(&self, context_id: &str) -> Vec<String> {
         self.contexts
             .get(context_id)
-            .map(|ctx| ctx.members.keys().cloned().collect())
+            .map(|ctx| ctx.role_state.members.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -2227,8 +2254,8 @@ impl WasmContextManager {
     pub fn member_role(&self, context_id: &str, did: &str) -> Option<String> {
         self.contexts
             .get(context_id)
-            .and_then(|ctx| ctx.members.get(did))
-            .map(|m| m.role.clone())
+            .and_then(|ctx| ctx.role_state.assignments.get(did))
+            .map(|a| a.role_name.clone())
     }
 
     /// Returns the event log leaf count for a context, or `None` if not found.
@@ -2310,7 +2337,7 @@ impl WasmContextManager {
             },
         )?;
 
-        let actor = ctx.creator_did.clone();
+        let actor = ctx.role_state.creator_did.clone();
         // Native appends ToolRegistered with an EMPTY payload
         // (`append_context_event`, no payload) — match it so the leaf preimage
         // is byte-identical across platforms (§9.9.3). The tool_id is NOT part
@@ -2907,8 +2934,8 @@ impl WasmContextManager {
     ) -> Result<(HashSet<String>, String, HashSet<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         Ok((
-            (*ctx.ceiling_strings).clone(),
-            ctx.creator_did.clone(),
+            ctx.role_state.ceiling().to_ucan_string_set(),
+            ctx.role_state.creator_did.clone(),
             ctx.revoked_tokens.clone(),
         ))
     }
@@ -3437,28 +3464,28 @@ impl WasmContextManager {
 
     /// Handles a `ModifyCeiling` governance action (BLACK-002).
     ///
-    /// Ceiling-entry grammar enforcement (spec §5.3.1.1): the WASM bridge
-    /// re-implements the manager (ADR-034) and does NOT share the runtime
-    /// `ContextRoleState::set_ceiling` construction invariant, so it MUST validate
-    /// each entry here — exactly as the WASM create path does — before rebuilding
-    /// `ceiling_strings`. Validates the PARSED enum form
-    /// (`validate_as_ceiling_entry`) and stores its
-    /// [`Capability::ucan_capability_name`], so the validation and the stored
-    /// form agree (no silent broadening of a malformed `Custom`). Rejects before
-    /// any mutation: a
-    /// malformed `new_ceiling` leaves the prior ceiling unchanged, and native +
-    /// WASM therefore store the SAME effective ceiling for the same `ModifyCeiling`
-    /// action.
+    /// Ceiling-entry grammar enforcement (spec §5.3.1.1): validates the PARSED
+    /// `new_ceiling` enums via `validate_as_ceiling_entry` BEFORE any mutation, so
+    /// a malformed proposed entry (no-colon / stray-`*` / multi-colon `Custom`)
+    /// is rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
+    /// is left UNCHANGED (fail-closed). The validated replacement is then stored
+    /// via `set_ceiling_and_refresh`, which routes through the shared
+    /// `ContextRoleState::set_ceiling` (itself a §5.3.1.1 enforcement point,
+    /// defense in depth) and re-derives every member's granted-capability set
+    /// against the new ceiling so admins immediately reflect the new bound
+    /// (preserving the prior live-ceiling semantics). WASM keeps the single-phase
+    /// immediate write — native's two-phase governed-ceiling deferral is a
+    /// separate slice. Because the validation and the stored form both flow from
+    /// the same shared `Capability` grammar, native and WASM store the SAME
+    /// effective ceiling for the same `ModifyCeiling` action.
     fn dispatch_modify_ceiling(
         &mut self,
         context_id: &str,
         new_ceiling: &[scp_protocol::context::roles::Capability],
     ) -> Result<serde_json::Value, ScpWasmError> {
-        // Validate + canonicalize the WHOLE replacement through the single
-        // validated constructor BEFORE any mutation, so a malformed proposed
-        // entry leaves the prior ceiling unchanged (fail-closed) and the stored
-        // form is byte-identical to native/create.
-        let validated = ValidatedCeilingStrings::from_capabilities(new_ceiling)?;
+        // Validate the WHOLE replacement BEFORE any mutation, so a malformed
+        // proposed entry leaves the prior ceiling unchanged (fail-closed).
+        validate_ceiling_capabilities(new_ceiling)?;
         let ctx = self.require_active_context_mut(context_id)?;
         if ctx.ceiling_policy != "governed" {
             return Err(ScpWasmError::Permission {
@@ -3466,7 +3493,12 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
-        ctx.ceiling_strings = validated;
+        // The entries are pre-validated above, so the shared `set_ceiling`
+        // re-validation inside `set_ceiling_and_refresh` cannot fail here; surface
+        // it as a `Validation` error regardless (no silent swallow), keeping the
+        // store fail-closed.
+        ctx.set_ceiling_and_refresh(CapabilityCeiling::new(new_ceiling.iter().cloned()))
+            .map_err(ceiling_validation_error)?;
         Ok(serde_json::json!({"action": "ModifyCeiling"}))
     }
 
@@ -3497,7 +3529,11 @@ impl WasmContextManager {
         // this check (their authorization lives entirely at propose time).
         if let Some(required) = Self::dispatch_ceiling_capability(action) {
             let ctx = self.require_active_context(context_id)?;
-            if !ctx.ceiling_strings.contains(required) {
+            if !ctx
+                .role_state
+                .ceiling()
+                .contains(&ucan_string_to_capability(required))
+            {
                 return Err(ScpWasmError::Permission {
                     message: format!(
                         "context ceiling does not include '{required}' capability required for this governance action"
@@ -3514,25 +3550,7 @@ impl WasmContextManager {
                 self.dispatch_remove_member(context_id, did, executor_did, timestamp_secs)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                let did_str: &str = did;
-                let member = ctx.members.get_mut(did_str).ok_or_else(|| ScpWasmError::Context {
-                    message: format!("member '{did}' not found"),
-                    code: codes::CTX_2015.to_owned(),
-                })?;
-                let old_role = member.role.clone();
-                new_role.clone_into(&mut member.role);
-                // Sync broadcast state when role transitions to/from "author".
-                if let Some(ref mut bc) = ctx.broadcast_context {
-                    if old_role == "author" && new_role != "author" {
-                        // Revoke author status — destroys their broadcast key.
-                        let _ = bc.block_author(did_str);
-                    } else if new_role == "author" && old_role != "author" {
-                        // Grant author status — generates a fresh broadcast key.
-                        let _ = bc.add_author(did_str);
-                    }
-                }
-                Ok(serde_json::json!({"action": "ChangeRole", "did": did_str, "newRole": new_role}))
+                self.dispatch_change_role(context_id, did, new_role)
             }
             GovernanceAction::RegisterTool { registration } => {
                 self.dispatch_register_tool(
@@ -3596,6 +3614,50 @@ impl WasmContextManager {
         }
     }
 
+    /// Handles the `ChangeRole` governance action.
+    ///
+    /// Routes the role change through the shared
+    /// [`ContextRoleState::system_assign_role`], which validates the role exists
+    /// in `role_definitions` (and that every granted capability is within the
+    /// ceiling) before applying it. This is the #1886 fix: an undefined or
+    /// out-of-ceiling role is now REJECTED, matching native, instead of being
+    /// silently accepted as a free-form role string. Broadcast author state is
+    /// synced when the role transitions to/from `author`.
+    fn dispatch_change_role(
+        &mut self,
+        context_id: &str,
+        did: &str,
+        new_role: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        if !ctx.role_state.members.contains(did) {
+            return Err(ScpWasmError::Context {
+                message: format!("member '{did}' not found"),
+                code: codes::CTX_2015.to_owned(),
+            });
+        }
+        let old_role = ctx
+            .role_state
+            .assignments
+            .get(did)
+            .map(|a| a.role_name.clone())
+            .unwrap_or_default();
+        ctx.role_state
+            .system_assign_role(did, new_role, &crate::time::WasmClock)
+            .map_err(map_role_error)?;
+        // Sync broadcast state when role transitions to/from "author".
+        if let Some(ref mut bc) = ctx.broadcast_context {
+            if old_role == "author" && new_role != "author" {
+                // Revoke author status — destroys their broadcast key.
+                let _ = bc.block_author(did);
+            } else if new_role == "author" && old_role != "author" {
+                // Grant author status — generates a fresh broadcast key.
+                let _ = bc.add_author(did);
+            }
+        }
+        Ok(serde_json::json!({"action": "ChangeRole", "did": did, "newRole": new_role}))
+    }
+
     /// Handles `AddMember` governance action: inserts the member and, for
     /// broadcast contexts, registers author state when the role is "author".
     fn dispatch_add_member(
@@ -3606,7 +3668,7 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx.members.len() >= WASM_MEMBER_CAP {
+        if ctx.role_state.members.len() >= WASM_MEMBER_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "member list has reached capacity ({WASM_MEMBER_CAP}) — \
@@ -3616,14 +3678,25 @@ impl WasmContextManager {
             });
         }
 
-        ctx.members.insert(
-            did.to_owned(),
-            MemberEntry {
-                did: did.to_owned(),
-                role: role.to_owned(),
-                sequence_number: 0,
-            },
-        );
+        // Add the member and assign the requested role via the shared
+        // `system_assign_role` (#1886: validates the role exists in
+        // `role_definitions` / is within the ceiling before applying it).
+        // `system_assign_role` requires the DID to already be in `members`, so
+        // insert first; on assignment failure (undefined / out-of-ceiling role)
+        // roll the insertion back so a rejected `AddMember` leaves NO partial
+        // membership behind (fail-closed atomicity).
+        ctx.role_state.members.insert(did.to_owned());
+        ctx.member_sequence_numbers
+            .entry(did.to_owned())
+            .or_insert(0);
+        if let Err(e) = ctx
+            .role_state
+            .system_assign_role(did, role, &crate::time::WasmClock)
+        {
+            ctx.role_state.members.remove(did);
+            ctx.member_sequence_numbers.remove(did);
+            return Err(map_role_error(e));
+        }
         // If the new member is an author in a broadcast context, register
         // them with a fresh broadcast key at epoch 0 (§5.14.8).
         if role == "author"
@@ -3656,7 +3729,7 @@ impl WasmContextManager {
         // `membership.contains(did)` before the MLS boundary and only strips
         // membership once the crypto cuts have all succeeded). Preserves the
         // exact `CTX_2015` not-found semantics.
-        if !ctx.members.contains_key(did) {
+        if !ctx.role_state.members.contains(did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
                 code: codes::CTX_2015.to_owned(),
@@ -3720,18 +3793,30 @@ impl WasmContextManager {
         // MLS eviction succeeded (or there was no MLS group) — only NOW is it
         // safe to strip governance and broadcast state. Capture the role before
         // removing so broadcast-author cleanup can still see it.
-        let removed_role = ctx.members.remove(did).map(|m| m.role);
+        let removed_role = ctx
+            .role_state
+            .assignments
+            .get(did)
+            .map(|a| a.role_name.clone());
+        ctx.role_state.members.remove(did);
 
         // Drop all per-DID state the removed member left behind, mirroring
         // native `execute_remove_member`'s role_state / access cleanup (which
         // strips `role_state.members`, `assignments`, `member_capabilities`, the
-        // access key store entry, and the pseudonym routing entry). WASM models
-        // the per-member authorization state as `suspended_capabilities` (a
-        // demotion record keyed by DID) and the CEK-exclusion state as
-        // `read_exclusion_list`. Leaving either behind is a stale-desync
-        // foothold: a DID later re-admitted under the same string would inherit
-        // a phantom suspension or read-exclusion. Both are no-ops if absent.
-        ctx.suspended_capabilities.remove(did);
+        // access key store entry, and the pseudonym routing entry). The shared
+        // `ContextRoleState` holds `assignments` / `member_capabilities` /
+        // suspensions; the CEK-exclusion state is `read_exclusion_list` and the
+        // MLS sequence counter is `member_sequence_numbers`. Leaving any behind
+        // is a stale-desync foothold: a DID later re-admitted under the same
+        // string would inherit a phantom assignment, suspension, read-exclusion,
+        // or sequence number. All are no-ops if absent.
+        ctx.role_state.assignments.remove(did);
+        ctx.role_state.member_capabilities.remove(did);
+        if let Some(suspended) = ctx.role_state.suspended_for(did) {
+            let caps: Vec<Capability> = suspended.iter().cloned().collect();
+            ctx.role_state.restore_capabilities(did, &caps);
+        }
+        ctx.member_sequence_numbers.remove(did);
         ctx.read_exclusion_list.remove(did);
 
         // If the ejected member was an author in a broadcast context, clean up
@@ -3778,34 +3863,29 @@ impl WasmContextManager {
             GovernanceAction::TransferAdmin { new_admin } => {
                 let ctx = self.require_active_context_mut(context_id)?;
                 let new_admin_str: &str = new_admin;
-                let old_admin = ctx.creator_did.clone();
-                if let Some(m) = ctx.members.get_mut(&old_admin) {
-                    "member".clone_into(&mut m.role);
+                let old_admin = ctx.role_state.creator_did.clone();
+                // Demote the previous admin and promote the new admin via the
+                // shared `system_assign_role` (which validates the role exists
+                // and refreshes `member_capabilities`). No-op if the DID is not
+                // a member, preserving the prior `if let Some` semantics.
+                if ctx.role_state.members.contains(&old_admin) {
+                    ctx.role_state
+                        .system_assign_role(&old_admin, "member", &crate::time::WasmClock)
+                        .map_err(map_role_error)?;
                 }
-                if let Some(m) = ctx.members.get_mut(new_admin_str) {
-                    "admin".clone_into(&mut m.role);
+                if ctx.role_state.members.contains(new_admin_str) {
+                    ctx.role_state
+                        .system_assign_role(new_admin_str, "admin", &crate::time::WasmClock)
+                        .map_err(map_role_error)?;
                 }
-                new_admin_str.clone_into(&mut ctx.creator_did);
+                new_admin_str.clone_into(&mut ctx.role_state.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
             }
             GovernanceAction::SuspendCapability { did, capabilities } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                let entry = ctx
-                    .suspended_capabilities
-                    .entry(did_str.to_owned())
-                    .or_default();
-                for cap in capabilities {
-                    // Store the canonical UCAN form (`{resource}:{action}`) —
-                    // the exact spelling `member_has_capability` looks up and
-                    // that the consequence path (`apply_suspend`) and the
-                    // ceiling strings use. Format directly off the typed
-                    // `Capability` (NOT via a `name()`→`Capability::new` string
-                    // round-trip, which is lossy for a `Custom` whose name
-                    // collides with a built-in spelling, e.g.
-                    // `Custom("bridging")`).
-                    entry.insert(cap.ucan_capability_name());
-                }
+                ctx.role_state
+                    .suspend_capabilities(did_str, capabilities.iter().cloned());
                 // Emit a capability-precise suspension event that
                 // carries the exact suspended set. Cross-SDK parity
                 // requires both the native manager and the WASM
@@ -3820,16 +3900,11 @@ impl WasmContextManager {
             GovernanceAction::SuspendAccess { did } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                // Suspend every capability in the context's ceiling,
-                // matching runtime's `suspend_all` semantics.
-                let all_capabilities: Vec<String> = ctx.ceiling_strings.iter().cloned().collect();
-                let entry = ctx
-                    .suspended_capabilities
-                    .entry(did_str.to_owned())
-                    .or_default();
-                for cap in &all_capabilities {
-                    entry.insert(cap.clone());
-                }
+                // Suspend every capability in the context's ceiling, matching
+                // the runtime's `suspend_all` semantics (the shared method
+                // copies the member's full effective capability set into the
+                // suspended set).
+                ctx.role_state.suspend_all(did_str);
                 ctx.push_event(ContextEvent::CapabilitiesSuspended {
                     did: did.clone(),
                     capabilities: vec![], // all — indicated by empty
@@ -3842,19 +3917,8 @@ impl WasmContextManager {
             GovernanceAction::RestoreAccess { did, capabilities } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                if let Some(entry) = ctx.suspended_capabilities.get_mut(did_str) {
-                    for cap in capabilities {
-                        // Remove using the same canonical UCAN form
-                        // `SuspendCapability`/`apply_suspend` store, formatted
-                        // directly off the typed `Capability` so a
-                        // consequence-applied suspension of the same logical
-                        // capability is actually cleared.
-                        entry.remove(&cap.ucan_capability_name());
-                    }
-                    if entry.is_empty() {
-                        ctx.suspended_capabilities.remove(did_str);
-                    }
-                }
+                let caps: Vec<Capability> = capabilities.clone();
+                ctx.role_state.restore_capabilities(did_str, &caps);
                 ctx.read_exclusion_list.remove(did_str);
                 if let Some(bc) = ctx.broadcast_context.as_mut() {
                     // Governance unban: remove from ALL authors' block lists (§5.14.8).
@@ -3929,25 +3993,15 @@ impl WasmContextManager {
             }
         }
 
-        // Suspend capabilities based on access scope.
-        {
-            let entry = ctx
-                .suspended_capabilities
-                .entry(did_str.to_owned())
-                .or_default();
-            match access {
-                AccessScope::Read => {
-                    entry.insert("messages:read".to_owned());
-                }
-                AccessScope::Write => {
-                    entry.insert("messages:write".to_owned());
-                }
-                AccessScope::Both => {
-                    entry.insert("messages:read".to_owned());
-                    entry.insert("messages:write".to_owned());
-                }
-            }
-        }
+        // Suspend capabilities based on access scope (typed, via the shared
+        // `ContextRoleState::suspend_capabilities`).
+        let revoked_caps: &[Capability] = match access {
+            AccessScope::Read => &[Capability::MessagesRead],
+            AccessScope::Write => &[Capability::MessagesWrite],
+            AccessScope::Both => &[Capability::MessagesRead, Capability::MessagesWrite],
+        };
+        ctx.role_state
+            .suspend_capabilities(did_str, revoked_caps.iter().cloned());
 
         // For write revocation, destroy broadcast key in Full scope.
         if matches!(access, AccessScope::Write | AccessScope::Both) {
@@ -4021,7 +4075,7 @@ impl WasmContextManager {
             GovernanceAction::AddSigner { did } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                if !ctx.members.contains_key(did_str) {
+                if !ctx.role_state.members.contains(did_str) {
                     return Err(ScpWasmError::Context {
                         message: format!("member '{did}' not found"),
                         code: codes::CTX_2015.to_owned(),
@@ -4240,7 +4294,7 @@ impl WasmContextManager {
             } => {
                 let spender_str: &str = spender;
                 let ctx = self.require_active_context_mut(context_id)?;
-                if !ctx.members.contains_key(spender_str) {
+                if !ctx.role_state.members.contains(spender_str) {
                     return Err(ScpWasmError::Context {
                         message: format!("spender '{spender}' is not a member"),
                         code: codes::CTX_2015.to_owned(),
@@ -4376,26 +4430,26 @@ impl WasmContextManager {
         reason: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-        if !ctx.members.contains_key(did) {
+        if !ctx.role_state.members.contains(did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
                 code: codes::CTX_2015.to_owned(),
             });
         }
-        // Member reset: remove + re-add with same role (ADR-029 §Tier 3).
+        // Member reset: re-assign the SAME role and reset the MLS sequence
+        // counter to 0 (ADR-029 §Tier 3). Re-running `system_assign_role`
+        // re-mints the member's tokens and refreshes their capabilities; the
+        // role is the member's existing assignment, so it is defined.
         let role = ctx
-            .members
+            .role_state
+            .assignments
             .get(did)
-            .map(|m| m.role.clone())
+            .map(|a| a.role_name.clone())
             .unwrap_or_default();
-        ctx.members.insert(
-            did.to_owned(),
-            MemberEntry {
-                did: did.to_owned(),
-                role,
-                sequence_number: 0,
-            },
-        );
+        ctx.role_state
+            .system_assign_role(did, &role, &crate::time::WasmClock)
+            .map_err(map_role_error)?;
+        ctx.member_sequence_numbers.insert(did.to_owned(), 0);
         Ok(serde_json::json!({"action": "ResetMember", "did": did, "reason": reason}))
     }
 
@@ -4444,7 +4498,7 @@ impl WasmContextManager {
             },
             implementation_hash: [0u8; 32],
             test_vectors: Vec::new(),
-            operator_did: DID::from(ctx.creator_did.clone()),
+            operator_did: DID::from(ctx.role_state.creator_did.clone()),
             cost: None,
             registered_at,
             signature: Vec::new(),
@@ -4504,7 +4558,7 @@ impl WasmContextManager {
     ///
     /// Returns `(required_approvals, total_members)`.
     fn governance_quorum(ctx: &PerContextState) -> (usize, usize) {
-        let total = ctx.members.len();
+        let total = ctx.role_state.members.len();
         match ctx.governance.as_str() {
             "threshold" => (ctx.threshold_value as usize, total),
             "majority" => (total / 2 + 1, total),
@@ -5226,14 +5280,16 @@ impl WasmContextManager {
             std::hash::RandomState,
         >(subscriber_did, None, ts, None);
 
-        // Also add as a member if not already present.
-        ctx.members
-            .entry(subscriber_did.to_owned())
-            .or_insert_with(|| MemberEntry {
-                did: subscriber_did.to_owned(),
-                role: "subscriber".to_owned(),
-                sequence_number: 0,
-            });
+        // Also add as a member if not already present, assigning the
+        // `subscriber` built-in role and seeding the MLS sequence counter.
+        if !ctx.role_state.members.contains(subscriber_did) {
+            ctx.role_state.members.insert(subscriber_did.to_owned());
+            ctx.member_sequence_numbers
+                .insert(subscriber_did.to_owned(), 0);
+            ctx.role_state
+                .system_assign_role(subscriber_did, "subscriber", &crate::time::WasmClock)
+                .map_err(map_role_error)?;
+        }
 
         Ok(())
     }
@@ -5253,9 +5309,9 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         if ctx
-            .suspended_capabilities
-            .get(author_did)
-            .is_some_and(|caps| caps.contains("messages:write"))
+            .role_state
+            .suspended_for(author_did)
+            .is_some_and(|caps| caps.contains(&Capability::MessagesWrite))
         {
             return Err(ScpWasmError::Permission {
                 message: format!("write access has been suspended for {author_did}"),
@@ -5278,16 +5334,19 @@ impl WasmContextManager {
             });
         }
 
-        // Assign sequence number.
-        let member = ctx
-            .members
-            .get_mut(author_did)
-            .ok_or_else(|| ScpWasmError::Context {
+        // Assign the MLS message sequence number.
+        if !ctx.role_state.members.contains(author_did) {
+            return Err(ScpWasmError::Context {
                 message: format!("author '{author_did}' not found in members"),
                 code: codes::CTX_2019.to_owned(),
-            })?;
-        let seq = member.sequence_number;
-        member.sequence_number += 1;
+            });
+        }
+        let seq_entry = ctx
+            .member_sequence_numbers
+            .entry(author_did.to_owned())
+            .or_insert(0);
+        let seq = *seq_entry;
+        *seq_entry += 1;
 
         ctx.push_event(ContextEvent::MessageSent {
             sender_did: DID(author_did.to_owned()),
@@ -5907,7 +5966,7 @@ impl WasmContextManager {
     pub fn context_creator(&self, context_id: &str) -> Option<String> {
         self.contexts
             .get(context_id)
-            .map(|ctx| ctx.creator_did.clone())
+            .map(|ctx| ctx.role_state.creator_did.clone())
     }
 
     /// Returns the context mode.
@@ -5941,14 +6000,19 @@ impl WasmContextManager {
             ContextMetadata {
                 context_id: context_id.to_owned(),
                 state: ctx.state.clone(),
-                creator_did: ctx.creator_did.clone(),
+                creator_did: ctx.role_state.creator_did.clone(),
                 mode: ctx.mode.clone(),
-                ceiling: ctx.ceiling_strings.iter().cloned().collect(),
+                ceiling: ctx
+                    .role_state
+                    .ceiling()
+                    .to_ucan_string_set()
+                    .into_iter()
+                    .collect(),
                 ceiling_policy: ctx.ceiling_policy.clone(),
                 ttl_seconds: ctx.ttl_seconds,
                 promotion_policy: ctx.promotion_policy.clone(),
                 governance: ctx.governance.clone(),
-                member_count: ctx.members.len() as u64,
+                member_count: ctx.role_state.members.len() as u64,
                 economic_policy: ctx.economic_policy.clone(),
                 min_protocol_version,
             }
@@ -6034,13 +6098,23 @@ impl WasmContextManager {
     pub fn export_context(&self, context_id: &str) -> Result<Vec<u8>, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
+        // Re-materialize the flat export member list from the shared role state
+        // (role name from `assignments`) and the MLS sequence counter (from
+        // `member_sequence_numbers`). The signed snapshot wire format is
+        // unchanged — only the source of these fields moved.
         let members: Vec<WasmExportMember> = ctx
+            .role_state
             .members
             .iter()
-            .map(|(did, entry)| WasmExportMember {
+            .map(|did| WasmExportMember {
                 did: did.clone(),
-                role: entry.role.clone(),
-                sequence_number: entry.sequence_number,
+                role: ctx
+                    .role_state
+                    .assignments
+                    .get(did)
+                    .map(|a| a.role_name.clone())
+                    .unwrap_or_default(),
+                sequence_number: ctx.member_sequence_numbers.get(did).copied().unwrap_or(0),
             })
             .collect();
 
@@ -6074,19 +6148,35 @@ impl WasmContextManager {
             context_id: context_id.to_owned(),
             state: ctx.state.clone(),
             params_json: ctx.params_json.clone(),
-            creator_did: ctx.creator_did.clone(),
+            creator_did: ctx.role_state.creator_did.clone(),
             mode: ctx.mode.clone(),
-            ceiling_strings: ctx.ceiling_strings.iter().cloned().collect(),
+            ceiling_strings: ctx
+                .role_state
+                .ceiling()
+                .to_ucan_string_set()
+                .into_iter()
+                .collect(),
             ceiling_policy: ctx.ceiling_policy.clone(),
             ttl_seconds: ctx.ttl_seconds,
             promotion_policy: ctx.promotion_policy.clone(),
             governance: ctx.governance.clone(),
             economic_policy: ctx.economic_policy.clone(),
             members,
+            // Re-materialize the flat per-member suspended-capability map from
+            // the shared role state, emitting UCAN-format strings (the wire
+            // form the snapshot has always used).
             suspended_capabilities: ctx
-                .suspended_capabilities
+                .role_state
+                .members
                 .iter()
-                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .filter_map(|did| {
+                    ctx.role_state.suspended_for(did).map(|caps| {
+                        (
+                            did.clone(),
+                            caps.iter().map(Capability::ucan_capability_name).collect(),
+                        )
+                    })
+                })
                 .collect(),
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
@@ -6167,7 +6257,8 @@ impl WasmContextManager {
         // signing key (via HKDF domain separation). The creator DID is in the
         // snapshot — look up their identity in the registry. Retained as
         // defense-in-depth for self-imports.
-        let integrity_mac = crate::identity::compute_export_hmac(&ctx.creator_did, &snapshot_json)?;
+        let integrity_mac =
+            crate::identity::compute_export_hmac(&ctx.role_state.creator_did, &snapshot_json)?;
 
         // Ed25519 signature over SHA-256(domain || scope_tag || snapshot_jcs)
         // by the creator's #active key (§23.16.8, ADR-034). This is the
@@ -6177,8 +6268,11 @@ impl WasmContextManager {
         // test cannot drift; it binds the shared FULL scope tag immediately
         // after the domain separator (WASM only produces Full-scope exports).
         let snapshot_hash = wasm_export_snapshot_digest(&snapshot_json);
-        let signature =
-            crate::identity::sign_with_identity(&ctx.creator_did, "#active", &snapshot_hash)?;
+        let signature = crate::identity::sign_with_identity(
+            &ctx.role_state.creator_did,
+            "#active",
+            &snapshot_hash,
+        )?;
         let snapshot_signature = hex::encode(signature);
 
         let now_ms = crate::time::now_ms();
@@ -6196,7 +6290,7 @@ impl WasmContextManager {
             // asserted on import), so there is no reason to expose it as a
             // parameter. Mirrors the native bridges, which derive the exporter
             // internally from the context's creator DID.
-            exporter_did: ctx.creator_did.clone(),
+            exporter_did: ctx.role_state.creator_did.clone(),
             integrity_mac,
             snapshot_signature,
             snapshot,
@@ -6466,16 +6560,72 @@ impl WasmContextManager {
             });
         }
 
-        let mut members = HashMap::new();
+        // Reconstruct the shared role state from the (signed, already-verified)
+        // flat snapshot fields. The ceiling is parsed from the UCAN-format
+        // `ceiling_strings`; `ContextRoleState::new` seeds built-in role
+        // definitions against it and assigns the creator `admin`. Each snapshot
+        // member is then re-inserted and assigned its snapshot role via
+        // `system_assign_role` (which also re-derives `member_capabilities`
+        // against the imported ceiling); the creator's row in `snap.members`
+        // overwrites the auto-admin assignment if the snapshot demoted them
+        // (e.g. after a `TransferAdmin`). The MLS sequence counters are
+        // restored verbatim into `member_sequence_numbers`.
+        //
+        // Ceiling-entry grammar enforcement on the IMPORTED, deserialized ceiling
+        // (spec §5.3.1.1, BLACK-005). The snapshot is fully attacker-controlled: a
+        // valid signature authenticates the export's ORIGIN, not the WELL-FORMEDNESS
+        // of its payload, so a non-conformant peer could sign an export carrying a
+        // malformed (or non-canonical COLON-form) ceiling string. Validate every
+        // entry against the UCAN-form grammar BEFORE parsing — the lossy
+        // `ucan_string_to_capability` parse would otherwise canonicalize a colon-form
+        // built-in (e.g. `tool:invoke:*`) and accept it, diverging from the strictly
+        // UCAN-form vocabulary every gate check matches against. `ContextRoleState`
+        // re-validates the parsed ceiling (defense in depth), but the parse cannot
+        // recover the rejected-colon-form distinction, so this string-level check is
+        // required for the import path.
+        validate_imported_ceiling_strings(&snap.ceiling_strings)?;
+        let imported_ceiling = CapabilityCeiling::new(
+            snap.ceiling_strings
+                .iter()
+                .map(|s| ucan_string_to_capability(s)),
+        );
+        let mut role_state = ContextRoleState::new(
+            snap.creator_did.clone(),
+            snap.creator_did.clone(),
+            imported_ceiling,
+            Vec::new(),
+            &crate::time::WasmClock,
+        )
+        .map_err(|e| ScpWasmError::Context {
+            message: format!("imported role state initialization failed: {e}"),
+            code: codes::CTX_2032.to_owned(),
+        })?;
+        // `ContextRoleState::new` sets `context_id` to the creator DID above
+        // (the bridge has no separate constructor); correct it to the real
+        // context id so minted-token resource URIs and the stored id match.
+        context_id.clone_into(&mut role_state.context_id);
+        // The membership set is exactly the snapshot's. `new` auto-added the
+        // creator as admin; clear the derived membership/assignment maps and
+        // rebuild them purely from the snapshot so a snapshot that does NOT list
+        // the creator (e.g. after the creator left) does not leave them as a
+        // phantom member.
+        role_state.members.clear();
+        role_state.assignments.clear();
+        role_state.member_capabilities.clear();
+        let mut member_sequence_numbers = HashMap::new();
         for m in &snap.members {
-            members.insert(
-                m.did.clone(),
-                MemberEntry {
-                    did: m.did.clone(),
-                    role: m.role.clone(),
-                    sequence_number: m.sequence_number,
-                },
-            );
+            role_state.members.insert(m.did.clone());
+            member_sequence_numbers.insert(m.did.clone(), m.sequence_number);
+            role_state
+                .system_assign_role(&m.did, &m.role, &crate::time::WasmClock)
+                .map_err(|e| ScpWasmError::Context {
+                    message: format!("imported member role assignment failed: {e}"),
+                    code: codes::CTX_2032.to_owned(),
+                })?;
+        }
+        // Restore per-member suspensions (UCAN-format strings -> typed caps).
+        for (did, caps) in &snap.suspended_capabilities {
+            role_state.suspend_capabilities(did, caps.iter().map(|c| ucan_string_to_capability(c)));
         }
 
         let broadcast_context = snap.broadcast.as_ref().map(|bc| {
@@ -6546,26 +6696,13 @@ impl WasmContextManager {
         // defense-in-depth HMAC. Forging `creation_timestamp_secs` therefore requires
         // the creator's signing key. §9.9.3 additionally requires the value verbatim
         // for cross-member/bridge convergence, so clamping is forbidden regardless.
-        // Ceiling-entry grammar enforcement on the IMPORTED, deserialized ceiling
-        // (spec §5.3.1.1). The snapshot is fully attacker-controlled: a valid
-        // signature authenticates the export's ORIGIN, not the WELL-FORMEDNESS of
-        // its payload, so a non-conformant peer could sign an export carrying a
-        // malformed (or non-canonical) ceiling string. Route every imported entry
-        // through the single validated constructor — `from_ucan_strings` validates
-        // each against the UCAN-form grammar and stores it canonically — so a
-        // malformed entry is REJECTED here rather than poisoning the importer's
-        // ceiling (closes BLACK-005, where the import previously copied the raw
-        // `ceiling_strings` with no validation). After this, WASM create / modify /
-        // import all produce the SAME canonical ceiling form.
-        let imported_ceiling = ValidatedCeilingStrings::from_ucan_strings(&snap.ceiling_strings)?;
-
         let now_ms_for_clamp = crate::time::now_ms();
         let ctx = PerContextState {
             state: snap.state.clone(),
             params_json: snap.params_json.clone(),
-            creator_did: snap.creator_did.clone(),
             mode: snap.mode.clone(),
-            ceiling_strings: imported_ceiling,
+            role_state,
+            member_sequence_numbers,
             ceiling_policy: snap.ceiling_policy.clone(),
             ttl_seconds: snap.ttl_seconds,
             promotion_policy: snap.promotion_policy.clone(),
@@ -6591,7 +6728,6 @@ impl WasmContextManager {
                     .map(|e| (e.nonce.clone(), e.inserted_at_ms.min(now_ms_for_clamp)))
                     .collect()
             },
-            members,
             event_buffer: VecDeque::new(),
             // v3 import: preserve executed_proposals timestamps so replay
             // protection survives export/import.
@@ -6604,11 +6740,6 @@ impl WasmContextManager {
                         e.executed_at_ms.min(now_ms_for_clamp),
                     )
                 })
-                .collect(),
-            suspended_capabilities: snap
-                .suspended_capabilities
-                .iter()
-                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
                 .collect(),
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
             broadcast_context,
@@ -8048,53 +8179,12 @@ mod tests {
             let _ = bc.add_author(creator_did);
         }
 
-        let mut members = HashMap::new();
-        members.insert(
-            creator_did.to_owned(),
-            MemberEntry {
-                did: creator_did.to_owned(),
-                role: "admin".to_owned(),
-                sequence_number: 0,
-            },
-        );
-
-        let ctx = PerContextState {
-            state: "active".to_owned(),
-            params_json: serde_json::json!({"mode": "Broadcast"}),
-            creator_did: creator_did.to_owned(),
-            mode: "Broadcast".to_owned(),
-            ceiling_strings: ValidatedCeilingStrings::default(),
-            ceiling_policy: "immutable".to_owned(),
-            ttl_seconds: None,
-            promotion_policy: None,
-            governance: "single_admin".to_owned(),
-            economic_policy: None,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
-            event_log: EventLog::new(context_id.to_owned()),
-            revoked_tokens: HashSet::new(),
-            seen_nonces: HashMap::new(),
-            members,
-            event_buffer: VecDeque::new(),
-            executed_proposals: HashMap::new(),
-            suspended_capabilities: HashMap::new(),
-            read_exclusion_list: HashSet::new(),
-            broadcast_context: Some(bc),
-            sessions: HashMap::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
-            tool_interfaces: Vec::new(),
-            governance_freeze: false,
-            pending_proposals: HashMap::new(),
-            resolved_proposals: HashMap::new(),
-            pruning_policy: None,
-            economic_policy_locked: false,
-            hard_rate_limit_config: None,
-            consequence_rules: Vec::new(),
-            cooldown_until: HashMap::new(),
-            crypto: None,
-            creation_timestamp_secs: 0,
-        };
+        // Start from a bare state (creator auto-assigned admin in `role_state`),
+        // then overlay the Broadcast-mode fields.
+        let mut ctx = make_bare_per_context_state(context_id, creator_did);
+        ctx.params_json = serde_json::json!({"mode": "Broadcast"});
+        ctx.mode = "Broadcast".to_owned();
+        ctx.broadcast_context = Some(bc);
 
         let mut mgr = WasmContextManager::new();
         mgr.contexts.insert(context_id.to_owned(), ctx);
@@ -8161,52 +8251,12 @@ mod tests {
         creator_did: &str,
         revoked: HashSet<String>,
     ) -> WasmContextManager {
-        let mut members = HashMap::new();
-        members.insert(
-            creator_did.to_owned(),
-            MemberEntry {
-                did: creator_did.to_owned(),
-                role: "admin".to_owned(),
-                sequence_number: 0,
-            },
-        );
-        let ctx = PerContextState {
-            state: "active".to_owned(),
-            params_json: serde_json::json!({}),
-            creator_did: creator_did.to_owned(),
-            mode: "Encrypted".to_owned(),
-            ceiling_strings: ValidatedCeilingStrings::default(),
-            ceiling_policy: "immutable".to_owned(),
-            ttl_seconds: None,
-            promotion_policy: None,
-            governance: "single_admin".to_owned(),
-            economic_policy: None,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
-            event_log: EventLog::new(context_id.to_owned()),
-            revoked_tokens: revoked,
-            seen_nonces: HashMap::new(),
-            members,
-            event_buffer: VecDeque::new(),
-            executed_proposals: HashMap::new(),
-            suspended_capabilities: HashMap::new(),
-            read_exclusion_list: HashSet::new(),
-            broadcast_context: None,
-            sessions: HashMap::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
-            tool_interfaces: Vec::new(),
-            governance_freeze: false,
-            pending_proposals: HashMap::new(),
-            resolved_proposals: HashMap::new(),
-            pruning_policy: None,
-            economic_policy_locked: false,
-            hard_rate_limit_config: None,
-            consequence_rules: Vec::new(),
-            cooldown_until: HashMap::new(),
-            crypto: None,
-            creation_timestamp_secs: 0,
-        };
+        // Bare state (creator auto-admin), with the pre-filled revocation set
+        // and Encrypted mode overlaid.
+        let mut ctx = make_bare_per_context_state(context_id, creator_did);
+        ctx.params_json = serde_json::json!({});
+        ctx.mode = "Encrypted".to_owned();
+        ctx.revoked_tokens = revoked;
         let mut mgr = WasmContextManager::new();
         mgr.contexts.insert(context_id.to_owned(), ctx);
         mgr
@@ -9017,31 +9067,42 @@ mod tests {
         }
     }
 
-    /// CREATE-PATH canonical-form parity: the single validated constructor the
-    /// WASM create path routes through (`ValidatedCeilingStrings::from_colon_entries`)
-    /// stores a `custom:`-prefixed multi-token entry as the IDENTICAL canonical
-    /// UCAN form the native bridge stores — closing the prior WASM create-store
-    /// split (the old `build_ceiling_strings` formatted from the RAW string and
-    /// stored `custom_payments:approve`, while native stores `payments:approve`).
-    /// Asserted at the constructor (create's only ceiling construction point)
-    /// because a full `create_context` trips the native time stub; the accept path
-    /// is covered end-to-end by the WASM conformance suite under a real JS host.
+    /// CREATE-PATH canonical-form parity: the WASM create path parses each
+    /// user-supplied colon-form entry via `Capability::new`, validates it
+    /// (`validate_ceiling_capabilities`), and stores the typed ceiling inside
+    /// `ContextRoleState`; its canonical UCAN-string projection
+    /// (`ceiling().to_ucan_string_set()`) is byte-identical to the native bridge's
+    /// `Capability::ucan_capability_name` set for the SAME logical entries — closing
+    /// the prior WASM create-store split (the old `build_ceiling_strings` formatted
+    /// from the RAW string and stored `custom_payments:approve`, while native stores
+    /// `payments:approve`). Asserted at the ceiling projection (the canonical form
+    /// every gate check matches against) rather than a full `create_context`, which
+    /// trips the native time stub; the accept path is covered end-to-end by the WASM
+    /// conformance suite under a real JS host.
     #[test]
     fn test_wasm_create_path_canonical_form_matches_native() {
-        use scp_protocol::context::roles::Capability;
+        use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
 
-        let entries = vec![
+        let entries = [
             "messages:read".to_owned(),
             "custom:payments:approve".to_owned(),
             "tool:invoke:*".to_owned(),
             "context:child:create".to_owned(),
             "billing:*".to_owned(),
         ];
-        let wasm_stored: HashSet<String> = ValidatedCeilingStrings::from_colon_entries(&entries)
-            .expect("well-formed colon entries must build")
-            .iter()
-            .cloned()
-            .collect();
+        // Mirror the create path: parse each entry, validate the parsed enums,
+        // build the typed ceiling, and store it in `ContextRoleState`.
+        let parsed: Vec<Capability> = entries.iter().map(Capability::new).collect();
+        validate_ceiling_capabilities(&parsed).expect("well-formed colon entries must validate");
+        let role_state = ContextRoleState::new(
+            "ctx-create-parity",
+            "did:dht:zcreator",
+            CapabilityCeiling::new(parsed),
+            Vec::new(),
+            &crate::time::WasmClock,
+        )
+        .expect("well-formed ceiling must build a role state");
+        let wasm_stored: HashSet<String> = role_state.ceiling().to_ucan_string_set();
 
         // Native canonical form for the SAME logical entries: parse each via
         // `Capability::new` (the native parse) and format via
@@ -9067,15 +9128,17 @@ mod tests {
         );
     }
 
-    /// IMPORT PATH: `ValidatedCeilingStrings::from_ucan_strings` (the single
-    /// construction point `import_context` routes the untrusted, deserialized peer
-    /// `ceiling_strings` through, closing BLACK-005) ACCEPTS canonical UCAN-form
-    /// entries (idempotent — a conformant exporter's strings are already
-    /// canonical) and REJECTS malformed or non-canonical (colon-form) entries.
+    /// IMPORT PATH: `validate_imported_ceiling_strings` (the validation
+    /// `import_context` runs over the untrusted, deserialized peer `ceiling_strings`
+    /// BEFORE parsing them, closing BLACK-005) ACCEPTS canonical UCAN-form entries
+    /// (a conformant exporter's strings are already canonical) and REJECTS malformed
+    /// or non-canonical (colon-form) entries — the latter because the lossy
+    /// `ucan_string_to_capability` parse would otherwise canonicalize a colon-form
+    /// built-in and accept it, diverging from the strictly UCAN-form stored
+    /// vocabulary every gate check matches against.
     #[test]
-    fn test_wasm_import_ceiling_constructor_accepts_canonical_rejects_malformed() {
-        // Accept: canonical UCAN-form strings (incl. underscore built-in forms),
-        // stored idempotently.
+    fn test_wasm_import_ceiling_validation_accepts_canonical_rejects_malformed() {
+        // Accept: canonical UCAN-form strings (incl. underscore built-in forms).
         let canonical = vec![
             "messages:read".to_owned(),
             "tool_invoke:*".to_owned(),
@@ -9084,16 +9147,8 @@ mod tests {
             "billing:*".to_owned(),
             "tool_invoke:calc".to_owned(),
         ];
-        let stored: HashSet<String> = ValidatedCeilingStrings::from_ucan_strings(&canonical)
-            .expect("canonical UCAN-form ceiling must import")
-            .iter()
-            .cloned()
-            .collect();
-        let expected: HashSet<String> = canonical.iter().cloned().collect();
-        assert_eq!(
-            stored, expected,
-            "import must store canonical form verbatim"
-        );
+        validate_imported_ceiling_strings(&canonical)
+            .expect("canonical UCAN-form ceiling must validate on import");
 
         // Reject: malformed, AND a non-canonical COLON-form built-in (which would
         // otherwise diverge from the canonical UCAN form gate checks match).
@@ -9106,7 +9161,7 @@ mod tests {
             "context:child:create",    // non-canonical COLON-form built-in
         ] {
             let entries = vec!["messages:read".to_owned(), bad.to_owned()];
-            let err = ValidatedCeilingStrings::from_ucan_strings(&entries)
+            let err = validate_imported_ceiling_strings(&entries)
                 .expect_err("import must reject malformed/non-canonical entry");
             match err {
                 ScpWasmError::Validation { ref code, .. } => assert_eq!(code, codes::VALID_7000),
@@ -9115,14 +9170,15 @@ mod tests {
         }
     }
 
-    /// All three WASM ceiling write constructors converge on the SAME canonical
-    /// form for the SAME logical ceiling — create (colon input) == modify
-    /// (Capability enums) == import (UCAN strings).
+    /// All three WASM ceiling write paths converge on the SAME canonical UCAN-form
+    /// set for the SAME logical ceiling — create (colon input, parsed +
+    /// projected), modify (Capability enums, projected via `ucan_capability_name`),
+    /// and import (already-canonical UCAN strings, validated + stored verbatim).
     #[test]
-    fn test_wasm_ceiling_constructors_converge_on_canonical_form() {
-        use scp_protocol::context::roles::Capability;
+    fn test_wasm_ceiling_paths_converge_on_canonical_form() {
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 
-        let colon_input = vec![
+        let colon_input = [
             "messages:read".to_owned(),
             "custom:payments:approve".to_owned(),
             "tool:invoke:*".to_owned(),
@@ -9138,75 +9194,99 @@ mod tests {
             "tool_invoke:*".to_owned(),
         ];
 
-        let from_create: HashSet<String> =
-            ValidatedCeilingStrings::from_colon_entries(&colon_input)
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect();
-        let from_modify: HashSet<String> = ValidatedCeilingStrings::from_capabilities(&caps)
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
-        let from_import: HashSet<String> = ValidatedCeilingStrings::from_ucan_strings(&ucan_input)
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect();
+        // CREATE: parse colon input, validate, build ceiling, project to UCAN form.
+        let parsed: Vec<Capability> = colon_input.iter().map(Capability::new).collect();
+        validate_ceiling_capabilities(&parsed).unwrap();
+        let from_create: HashSet<String> = CapabilityCeiling::new(parsed).to_ucan_string_set();
+
+        // MODIFY: validate the typed enums, project the SAME way the stored
+        // `ContextRoleState` ceiling does (`set_ceiling_and_refresh` stores these
+        // enums; `to_ucan_string_set` is their canonical projection).
+        validate_ceiling_capabilities(&caps).unwrap();
+        let from_modify: HashSet<String> =
+            CapabilityCeiling::new(caps.iter().cloned()).to_ucan_string_set();
+
+        // IMPORT: validate the already-canonical UCAN strings; the stored set is
+        // them verbatim.
+        validate_imported_ceiling_strings(&ucan_input).unwrap();
+        let from_import: HashSet<String> = ucan_input.iter().cloned().collect();
 
         assert_eq!(from_create, from_modify, "create and modify must converge");
         assert_eq!(from_modify, from_import, "modify and import must converge");
     }
 
+    /// UCAN-form -> typed `Capability` round-trip for the compound-resource
+    /// built-ins whose wire spelling differs from their colon form. The export
+    /// path stores the ceiling as `Capability::ucan_capability_name` strings; the
+    /// import path reverses them via `ucan_string_to_capability`. This must recover
+    /// the SAME typed variant — in particular `bridging:*` must round-trip to the
+    /// enumerated `Bridging` (not a `Custom("bridging:*")` lookalike), so an
+    /// exported context's `Bridging` authority survives import as the same typed
+    /// capability every gate check matches against.
+    #[test]
+    fn test_wasm_ucan_string_to_capability_roundtrips_compound_builtins() {
+        use scp_protocol::context::roles::Capability;
+
+        for cap in [
+            Capability::Bridging,
+            Capability::ToolInvokeAll,
+            Capability::ToolInvoke("calc".to_owned()),
+            Capability::ChildContextCreate,
+            // A 2-segment built-in (identical in both encodings) and a custom, to
+            // prove the delegation does not regress the simple cases.
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::Custom("payments:approve".to_owned()),
+        ] {
+            // Export form (what the signed snapshot stores).
+            let exported = cap.ucan_capability_name();
+            // Import reversal.
+            let reimported = ucan_string_to_capability(&exported);
+            assert_eq!(
+                reimported, cap,
+                "UCAN-form {exported:?} must round-trip back to {cap:?}"
+            );
+        }
+
+        // Explicit guard on the #1884-relevant case: the literal wire string.
+        assert_eq!(
+            ucan_string_to_capability("bridging:*"),
+            Capability::Bridging,
+            "bridging:* must resolve to the typed Bridging built-in"
+        );
+        assert_eq!(
+            ucan_string_to_capability("context_child:create"),
+            Capability::ChildContextCreate,
+            "context_child:create must resolve to the typed ChildContextCreate built-in"
+        );
+        assert_eq!(
+            ucan_string_to_capability("tool_invoke:*"),
+            Capability::ToolInvokeAll,
+            "tool_invoke:* must resolve to the typed ToolInvokeAll built-in"
+        );
+    }
+
     /// Build an ACTIVE, encrypted, `governed`-ceiling-policy context registered
-    /// in a fresh manager, seeded with the given ceiling strings. Used to drive
-    /// `dispatch_governance_action(ModifyCeiling)` directly in tests.
+    /// in a fresh manager, seeded with the given (UCAN-form) ceiling strings. Used
+    /// to drive `dispatch_governance_action(ModifyCeiling)` directly in tests.
     fn manager_with_governed_context(
         context_id: &str,
         creator_did: &str,
         ceiling: &[&str],
     ) -> WasmContextManager {
-        let ctx = PerContextState {
-            state: "active".to_owned(),
-            params_json: serde_json::json!({"mode": "Encrypted"}),
-            creator_did: creator_did.to_owned(),
-            mode: "Encrypted".to_owned(),
-            ceiling_strings: ValidatedCeilingStrings::from_ucan_strings(
-                &ceiling.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
-            )
-            .expect("test seed ceiling strings must be well-formed UCAN form"),
-            ceiling_policy: "governed".to_owned(),
-            ttl_seconds: None,
-            promotion_policy: None,
-            governance: "single_admin".to_owned(),
-            economic_policy: None,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
-            event_log: EventLog::new(context_id.to_owned()),
-            revoked_tokens: HashSet::new(),
-            seen_nonces: HashMap::new(),
-            members: HashMap::new(),
-            event_buffer: VecDeque::new(),
-            executed_proposals: HashMap::new(),
-            suspended_capabilities: HashMap::new(),
-            read_exclusion_list: HashSet::new(),
-            broadcast_context: None,
-            sessions: HashMap::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
-            tool_interfaces: Vec::new(),
-            governance_freeze: false,
-            pending_proposals: HashMap::new(),
-            resolved_proposals: HashMap::new(),
-            pruning_policy: None,
-            economic_policy_locked: false,
-            hard_rate_limit_config: None,
-            consequence_rules: Vec::new(),
-            cooldown_until: HashMap::new(),
-            crypto: None,
-            creation_timestamp_secs: 0,
-        };
+        // Bare state (creator auto-admin), then overlay the seed ceiling and the
+        // `governed` policy. The seed strings are UCAN form, so parse them into the
+        // typed ceiling and install via the validating `set_ceiling_and_refresh`.
+        let mut ctx = make_bare_per_context_state(context_id, creator_did);
+        ctx.params_json = serde_json::json!({"mode": "Encrypted"});
+        ctx.mode = "Encrypted".to_owned();
+        ctx.ceiling_policy = "governed".to_owned();
+        let seed_caps: Vec<Capability> = ceiling
+            .iter()
+            .map(|s| ucan_string_to_capability(s))
+            .collect();
+        ctx.set_ceiling_and_refresh(CapabilityCeiling::new(seed_caps))
+            .expect("test seed ceiling strings must be well-formed");
         let mut mgr = WasmContextManager::new();
         mgr.contexts.insert(context_id.to_owned(), ctx);
         mgr
@@ -9214,7 +9294,7 @@ mod tests {
 
     /// WASM `ModifyCeiling` (BLACK-002) rejects a malformed proposed ceiling
     /// entry (spec §5.3.1.1) and leaves the prior ceiling UNCHANGED — closing the
-    /// divergence where the handler rebuilt `ceiling_strings` with no validation.
+    /// divergence where the handler rebuilt the ceiling with no validation.
     #[test]
     fn test_wasm_modify_ceiling_rejects_malformed_entry() {
         for malformed in [
@@ -9224,7 +9304,13 @@ mod tests {
         ] {
             let mut mgr =
                 manager_with_governed_context("ctx-mc", "did:dht:zcreator", &["messages:read"]);
-            let before = mgr.contexts.get("ctx-mc").unwrap().ceiling_strings.clone();
+            let before = mgr
+                .contexts
+                .get("ctx-mc")
+                .unwrap()
+                .role_state
+                .ceiling()
+                .to_ucan_string_set();
             let action = GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead, malformed.clone()],
             };
@@ -9239,7 +9325,12 @@ mod tests {
             }
             // Fail-closed: the prior ceiling is unchanged.
             assert_eq!(
-                mgr.contexts.get("ctx-mc").unwrap().ceiling_strings,
+                mgr.contexts
+                    .get("ctx-mc")
+                    .unwrap()
+                    .role_state
+                    .ceiling()
+                    .to_ucan_string_set(),
                 before,
                 "a rejected malformed ModifyCeiling must leave the ceiling unchanged ({malformed:?})"
             );
@@ -9248,8 +9339,10 @@ mod tests {
 
     /// WASM `ModifyCeiling` accepts a well-formed proposed ceiling and stores the
     /// SAME effective ceiling that the native bridge would for the same action —
-    /// closing the native/WASM divergence (BLACK-002). Both native and WASM store
-    /// `Capability::ucan_capability_name`, so the enforced forms are identical.
+    /// closing the native/WASM divergence (BLACK-002). The native enforced form is
+    /// `Capability::ucan_capability_name`; the WASM stored form is the
+    /// `ContextRoleState` ceiling's `to_ucan_string_set()` projection. For these
+    /// entries the two agree.
     #[test]
     fn test_wasm_modify_ceiling_accepts_wellformed_and_matches_native() {
         let mut mgr =
@@ -9280,10 +9373,9 @@ mod tests {
             .contexts
             .get("ctx-mc-ok")
             .unwrap()
-            .ceiling_strings
-            .iter()
-            .cloned()
-            .collect();
+            .role_state
+            .ceiling()
+            .to_ucan_string_set();
         assert_eq!(
             wasm_stored, native_expected,
             "native and WASM must store the SAME effective ceiling for the same \
@@ -9465,7 +9557,7 @@ mod tests {
         // Defense-in-depth: the joiner was never inserted into members.
         let ctx = &mgr.contexts[context_id];
         assert!(
-            !ctx.members.contains_key("did:dht:zjoiner"),
+            !ctx.role_state.members.contains("did:dht:zjoiner"),
             "rejected join must not insert the joiner into members"
         );
     }
@@ -9523,7 +9615,11 @@ mod tests {
         // scp-runtime/manager/messaging.rs.
         let ctx = &mgr.contexts[context_id];
         assert_eq!(
-            ctx.members[creator].sequence_number, 0,
+            ctx.member_sequence_numbers
+                .get(creator)
+                .copied()
+                .unwrap_or(0),
+            0,
             "rejected send must not advance the sender's sequence number"
         );
     }
@@ -9715,6 +9811,121 @@ mod tests {
         assert!(
             ctx.pending_proposals.is_empty() && ctx.resolved_proposals.is_empty(),
             "a rejected proposal id must not insert any tracked proposal"
+        );
+    }
+
+    /// #1886 convergence: a `ChangeRole` to a role that is NOT defined in the
+    /// context's `role_definitions` MUST be REJECTED on the WASM bridge, instead
+    /// of being silently accepted as a free-form role string (the former flat-
+    /// model behavior). The shared `ContextRoleState::system_assign_role`
+    /// validates the role against `role_definitions` before applying it, so the
+    /// single-admin auto-execute surfaces the rejection on `propose`. The target
+    /// member's role is unchanged after the rejection.
+    #[test]
+    fn change_role_to_undefined_role_is_rejected_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let target = "did:dht:ztarget";
+        let context_id = "ctx-1886-changerole";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        state.test_insert_member(target, "member");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        // `not-a-real-role` is a syntactically valid custom role NAME but is NOT
+        // in `role_definitions` (only the built-ins are). Native rejects it; the
+        // WASM bridge now rejects it too.
+        let action = GovernanceAction::ChangeRole {
+            did: DID(target.to_owned()),
+            new_role: "not-a-real-role".to_owned(),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
+        let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
+        assert!(
+            result.is_err(),
+            "ChangeRole to an undefined role MUST be rejected (#1886), not silently accepted"
+        );
+
+        // The target keeps its original role — the rejected assignment did not apply.
+        assert_eq!(
+            mgr.member_role(context_id, target).as_deref(),
+            Some("member"),
+            "a rejected ChangeRole must leave the member's existing role intact"
+        );
+    }
+
+    /// #1886 convergence: a `ChangeRole` to a DEFINED built-in role still
+    /// succeeds and the target's capability check reflects the new role — the
+    /// rejection above is specific to undefined roles, not a blanket failure.
+    #[test]
+    fn change_role_to_defined_role_succeeds_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let target = "did:dht:ztarget";
+        let context_id = "ctx-1886-changerole-ok";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        state.test_insert_member(target, "member");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        let action = GovernanceAction::ChangeRole {
+            did: DID(target.to_owned()),
+            new_role: "observer".to_owned(),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
+        mgr.propose_governance_action(context_id, creator, proposal_id, &action)
+            .expect("ChangeRole to the built-in `observer` role must succeed");
+
+        assert_eq!(
+            mgr.member_role(context_id, target).as_deref(),
+            Some("observer"),
+            "a valid ChangeRole must update the member's role"
+        );
+        // observer grants messages:read only — capability check still works.
+        let ctx = &mgr.contexts[context_id];
+        assert!(
+            ctx.member_has_capability(target, "messages:read"),
+            "observer must retain messages:read"
+        );
+        assert!(
+            !ctx.member_has_capability(target, "messages:write"),
+            "observer must NOT have messages:write"
+        );
+    }
+
+    /// #1886 convergence: an `AddMember` with an undefined role MUST be rejected
+    /// on the WASM bridge (mirrors `ChangeRole`). The DID must not end up as a
+    /// member.
+    #[test]
+    fn add_member_with_undefined_role_is_rejected_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let newcomer = "did:dht:znewcomer";
+        let context_id = "ctx-1886-addmember";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        let action = GovernanceAction::AddMember {
+            did: DID(newcomer.to_owned()),
+            role: "not-a-real-role".to_owned(),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
+        let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
+        assert!(
+            result.is_err(),
+            "AddMember with an undefined role MUST be rejected (#1886)"
         );
     }
 
@@ -10248,7 +10459,7 @@ mod tests {
         ctx.suspended_capabilities_insert(removed, "messages:write".to_owned());
         ctx.read_exclusion_list.insert(removed.to_owned());
         assert!(
-            ctx.members.contains_key(removed),
+            ctx.role_state.members.contains(removed),
             "precondition: the target must be a governance member before removal"
         );
 
@@ -10271,7 +10482,7 @@ mod tests {
             .get(context_id)
             .expect("context must still be registered after removal");
         assert!(
-            !ctx_after.members.contains_key(removed),
+            !ctx_after.role_state.members.contains(removed),
             "the governance member must be removed from ctx.members (native parity)"
         );
         // F5: per-DID state must be cleaned up.
@@ -10336,7 +10547,7 @@ mod tests {
         ctx.crypto = Some(crypto);
         ctx.test_insert_member(removed, "member");
         assert!(
-            ctx.members.contains_key(removed),
+            ctx.role_state.members.contains(removed),
             "precondition: the target must be a governance member before removal"
         );
 
@@ -10361,7 +10572,7 @@ mod tests {
             .get(context_id)
             .expect("context must still be registered after a failed removal");
         assert!(
-            ctx_after.members.contains_key(removed),
+            ctx_after.role_state.members.contains(removed),
             "FAIL-CLOSED: a member whose MLS eviction failed MUST remain in \
              ctx.members — removing them from governance while they stay in the \
              MLS group reopens the decryption-after-removal hole"
@@ -10445,7 +10656,7 @@ mod tests {
             .get(context_id)
             .expect("context still registered");
         assert!(
-            !ctx_after.members.contains_key(bob_did),
+            !ctx_after.role_state.members.contains(bob_did),
             "the evicted member must be removed from ctx.members"
         );
         assert!(
@@ -10517,7 +10728,7 @@ mod tests {
 
         // Member removed from ctx.members despite the empty commit.
         assert!(
-            !ctx_after.members.contains_key(creator),
+            !ctx_after.role_state.members.contains(creator),
             "self-removal must strip the member from ctx.members even though the commit is empty"
         );
 
@@ -10592,7 +10803,7 @@ mod tests {
             .get(context_id)
             .expect("context still registered");
         assert!(
-            !ctx_after.members.contains_key(author),
+            !ctx_after.role_state.members.contains(author),
             "the author must be removed from ctx.members"
         );
         // (a) block_author cleanup ran — the author's broadcast key is destroyed.
