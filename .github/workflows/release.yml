@@ -22,11 +22,14 @@
 #   APPLE_ID_PASSWORD      — App-specific password for Apple ID
 #   WINDOWS_SIGN_CERT      — Base64-encoded Authenticode certificate (.pfx)
 #   WINDOWS_SIGN_PWD       — Password for the Authenticode certificate
-#   GPG_KEY_ID             — GPG key ID (short or long form) for Gradle signing
-#   GPG_PRIVATE_KEY        — GPG private key for Maven artifact signing
-#   GPG_PASSPHRASE         — Passphrase for GPG private key
-#   MAVEN_USERNAME         — Sonatype OSSRH username (Maven Central)
-#   MAVEN_PASSWORD         — Sonatype OSSRH password
+#   GPG_KEY_ID             — GPG key ID (short or long form) for Maven signing
+#   GPG_PRIVATE_KEY        — ASCII-armored GPG private key for Maven signing
+#   GPG_PASSPHRASE         — Passphrase for the GPG private key
+#   MAVEN_USERNAME         — Maven Central Portal user token name (central.sonatype.com,
+#                            Account → Generate User Token). NOT the legacy OSSRH login.
+#   MAVEN_PASSWORD         — Maven Central Portal user token password
+#   SWIFT_MIRROR_TOKEN     — PAT/fine-grained token with contents:write on
+#                            limn-works/scp-swift (github.token cannot push cross-repo)
 #
 # Required repository variables:
 #   (none — all configuration is derived from the version input)
@@ -68,10 +71,37 @@ concurrency:
 
 jobs:
   # ===========================================================================
+  # Step 0: Validate the version input (fail-closed gate)
+  #
+  # `inputs.version` is free-form and flows into many shell/JS/Gradle sinks. Every
+  # other job depends on this one, so a non-SemVer (or injection-bearing) version
+  # is rejected before it can reach any of those sinks. The value is read from the
+  # environment, never interpolated with ${{ }} into the script body.
+  # ===========================================================================
+  validate-version:
+    name: "Step 0: Validate version input"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate SemVer 2.0
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # bash [[ =~ ]] matches the whole string — unlike `grep`, whose ^/$ are
+          # per-line anchors, so a newline-bearing input could smuggle a valid
+          # first line past the gate. An embedded newline fails this match.
+          if [[ ! "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$VERSION' is not valid SemVer 2.0 (e.g. 0.1.0 or 0.1.0-beta.2)."
+            exit 1
+          fi
+          echo "Version validated: $VERSION"
+
+  # ===========================================================================
   # Step 1: Conformance gate (100% pass required)
   # ===========================================================================
   conformance:
     name: "Step 1: Conformance tests"
+    needs: [validate-version]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -114,6 +144,7 @@ jobs:
   # ===========================================================================
   changelog:
     name: "Step 2: Verify changelog"
+    needs: [validate-version]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -215,6 +246,9 @@ jobs:
   sign-apple:
     name: "Step 5a: Apple codesigning"
     needs: [build]
+    # Signing requires Apple secrets and is publish-adjacent; a dry run validates
+    # the build/version/changelog path with zero secrets configured.
+    if: ${{ !inputs.dry-run }}
     runs-on: macos-latest
     steps:
       - name: Download XCFramework
@@ -259,6 +293,8 @@ jobs:
   sign-windows:
     name: "Step 5b: Authenticode signing"
     needs: [build]
+    # See sign-apple: skipped in dry-run so no signing secrets are required.
+    if: ${{ !inputs.dry-run }}
     runs-on: windows-latest
     steps:
       - name: Download Windows artifacts
@@ -304,50 +340,16 @@ jobs:
             windows-cbindgen/
           retention-days: 14
 
-  sign-maven:
-    name: "Step 5c: GPG sign Maven artifacts"
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Kotlin AAR artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: kotlin-aar
-          path: maven-artifacts/
-
-      - name: Import GPG key
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          echo -n "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
-          gpgconf --reload gpg-agent
-
-      - name: Sign artifacts
-        env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          find maven-artifacts/ -type f \( -name "*.aar" -o -name "*.jar" -o -name "*.pom" \) | while read -r file; do
-            gpg --batch --yes --passphrase "$GPG_PASSPHRASE" \
-              --pinentry-mode loopback \
-              --armor --detach-sign "$file"
-            echo "Signed: $file"
-          done
-
-      - name: Upload signed Maven artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: maven-signed
-          path: maven-artifacts/
-          retention-days: 14
+  # Maven artifacts are GPG-signed inline by the vanniktech plugin during
+  # publish (signAllPublications), so there is no separate signing job — see the
+  # publish-maven job below.
 
   # ===========================================================================
   # Step 6: Publish to registries
   # ===========================================================================
   publish-crates:
     name: "Step 6a: Publish to crates.io"
-    needs: [sign-apple, sign-windows, sign-maven]
+    needs: [sign-apple, sign-windows]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
@@ -504,7 +506,7 @@ jobs:
 
   publish-pypi:
     name: "Step 6b: Publish to PyPI"
-    needs: [sign-apple, sign-windows, sign-maven]
+    needs: [sign-apple, sign-windows]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     # Uses Trusted Publishers (OIDC) — no token required
@@ -532,7 +534,7 @@ jobs:
 
   publish-npm:
     name: "Step 6c: Publish to npm"
-    needs: [sign-apple, sign-windows, sign-maven]
+    needs: [sign-apple, sign-windows]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
@@ -564,17 +566,23 @@ jobs:
           bun run build
 
       - name: Set release version in package.json
+        env:
+          VERSION: ${{ env.VERSION }}
         run: |
           cd bindings/typescript
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '${{ env.VERSION }}';
+          # Read VERSION from process.env rather than interpolating the workflow
+          # expression into the JS body: the version input is validated as SemVer
+          # in Step 0, and reading from the environment removes the injection sink.
+          node -e '
+            const fs = require("fs");
+            const version = process.env.VERSION;
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = version;
             for (const k of Object.keys(pkg.optionalDependencies || {})) {
-              pkg.optionalDependencies[k] = '${{ env.VERSION }}';
+              pkg.optionalDependencies[k] = version;
             }
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
 
       - name: Publish @limn-works/scp-ts
         env:
@@ -629,7 +637,7 @@ jobs:
             "main": "index.node",
             "files": ["index.node"],
             "license": "MIT OR Apache-2.0",
-            "repository": { "type": "git", "url": "https://github.com/limn/scp" },
+            "repository": { "type": "git", "url": "https://github.com/limn-works/scp" },
             "publishConfig": { "access": "public" }
           }
           JSON
@@ -638,9 +646,20 @@ jobs:
             npm publish "$pkg_dir" --access public
           done
 
+  # Publishes works.limn:scp-kt (JVM) and works.limn:scp-kt-android (AAR) to
+  # Maven Central via the Central Portal (vanniktech `publishAndReleaseToMavenCentral`,
+  # which uploads + auto-releases — no OSSRH staging close/release).
+  #
+  # This job runs NO cargo build. Both native inputs are precomputed in the
+  # credential-free build matrix and downloaded here: the Android jniLibs
+  # (kotlin-jnilibs) re-staged so Gradle assembles the AAR with native libraries,
+  # and the UniFFI Kotlin bindings (kotlin-bindings) placed into the scp-kt module
+  # so the publish runs with `-x generateUniffiBindings`. Keeping cargo out of the
+  # credential-bearing step means no dependency build script ever executes with the
+  # Maven signing key or Portal token in its environment.
   publish-maven:
     name: "Step 6d: Publish to Maven Central"
-    needs: [sign-apple, sign-windows, sign-maven]
+    needs: [sign-apple, sign-windows]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
@@ -656,56 +675,63 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Download Kotlin AAR artifacts
+      - name: Download Android jniLibs
         uses: actions/download-artifact@v4
         with:
-          name: kotlin-aar
-          path: kotlin-artifacts/
+          name: kotlin-jnilibs
+          path: bindings/kotlin/scp-kt-android/src/main/jniLibs/
 
-      # Kotlin JVM JAR: works.limn:scp-kt
-      - name: Publish Kotlin JVM JAR to Maven Central
+      - name: Download UniFFI Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: kotlin-bindings
+          path: bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
+
+      # publishAndReleaseToMavenCentral uploads a Portal deployment and triggers
+      # its release. `-x generateUniffiBindings` uses the downloaded bindings
+      # instead of regenerating them (which would run cargo). --no-configuration-cache:
+      # the publish tasks are not configuration-cache compatible.
+      #
+      # MAVEN_USERNAME/MAVEN_PASSWORD must be a Central Portal user token
+      # (central.sonatype.com → Account → Generate User Token), NOT the old OSSRH
+      # password.
+      - name: Publish to Maven Central (JVM + Android)
         working-directory: bindings/kotlin
         env:
-          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_PASSWORD }}
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.GPG_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository \
-            -PscpVersion=${{ env.VERSION }}
+          # Assemble both modules first so a build failure in either aborts before
+          # any (irreversible) Central Portal release. Full cross-coordinate
+          # atomicity is not achievable on the Portal (each module is a separate
+          # deployment); on a partial failure, bump the version rather than
+          # re-publishing an immutable coordinate.
+          ./gradlew \
+            :scp-kt:assemble :scp-kt-android:assembleRelease \
+            -x generateUniffiBindings \
+            -PscpVersion=${{ env.VERSION }} \
+            --no-configuration-cache
+          ./gradlew publishAndReleaseToMavenCentral \
+            -x generateUniffiBindings \
+            -PscpVersion=${{ env.VERSION }} \
+            --no-configuration-cache
 
-      # Kotlin Android AAR: works.limn:scp-kt-android
-      - name: Publish Kotlin Android AAR to Maven Central
-        working-directory: bindings/kotlin
-        env:
-          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_PASSWORD }}
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          ./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository \
-            -PscpVersion=${{ env.VERSION }}
-
-  publish-spm:
-    name: "Step 6f: Publish Swift Package (SPM)"
+  # Zips the signed XCFramework and computes its SHA-256 (== SwiftPM binary-target
+  # checksum). The exact zip is both attached to the GitHub Release (Step 7) and
+  # checksummed here, so the URL/checksum the mirror commits always match the
+  # asset consumers download. No git operations — the mirror is pushed only after
+  # the release asset exists (job `publish-spm`, after `github-release`).
+  package-swift:
+    name: "Step 6f: Package Swift XCFramework"
     needs: [sign-apple]
     if: ${{ !inputs.dry-run }}
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     outputs:
-      xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
+      checksum: ${{ steps.xcf.outputs.checksum }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
       - name: Download signed XCFramework
         uses: actions/download-artifact@v4
         with:
@@ -715,50 +741,18 @@ jobs:
       - name: Zip XCFramework and compute checksum
         id: xcf
         run: |
+          set -euo pipefail
           ZIP="ScpFFI-${{ env.VERSION }}.xcframework.zip"
-          cd xcframework-signed
-          zip -r "../$ZIP" .
-          cd ..
-          CHECKSUM=$(shasum -a 256 "$ZIP" | awk '{print $1}')
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          # upload/download-artifact strips the named directory, so the signed
+          # artifact's root is the bundle's *contents* (Info.plist + slices).
+          # SwiftPM's binaryTarget requires the archive to contain the
+          # `*.xcframework` bundle directory at its root, so reconstruct it.
+          mkdir ScpFFI.xcframework
+          cp -R xcframework-signed/. ScpFFI.xcframework/
+          zip -r "$ZIP" ScpFFI.xcframework
+          CHECKSUM=$(sha256sum "$ZIP" | awk '{print $1}')
           echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
           echo "XCFramework zip: $ZIP ($CHECKSUM)"
-
-      # The GitHub Release URL is deterministic — the zip will be uploaded
-      # to the scp-core@{version} release in Step 7.
-      - name: Update Package.swift with URL binary target
-        env:
-          CHECKSUM: ${{ steps.xcf.outputs.checksum }}
-        run: |
-          RELEASE_URL="https://github.com/limn-works/scp/releases/download/scp-core@${{ env.VERSION }}/ScpFFI-${{ env.VERSION }}.xcframework.zip"
-          python3 - <<PYEOF
-          import re, os, pathlib
-          path = pathlib.Path("bindings/swift/Package.swift")
-          src = path.read_text()
-          # Matches .binaryTarget(name: "ScpFFI", ...) regardless of whether
-          # it currently uses path: or url:/checksum: (handles repeated releases).
-          old = r'\.binaryTarget\(\s*name:\s*"ScpFFI"[^)]*\)'
-          new = (
-              '.binaryTarget(\n'
-              '            name: "ScpFFI",\n'
-              f'            url: "{os.environ["RELEASE_URL"]}",\n'
-              f'            checksum: "{os.environ["CHECKSUM"]}"\n'
-              '        )'
-          )
-          updated = re.sub(old, new, src, flags=re.DOTALL)
-          assert updated != src, "Pattern not found in Package.swift — update the regex"
-          path.write_text(updated)
-          PYEOF
-
-      - name: Commit and tag updated Package.swift
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          git add bindings/swift/Package.swift
-          git commit -m "chore(swift): update Package.swift binary target for ${{ env.VERSION }}"
-          git push origin HEAD:main
-          git tag -a "scp-swift@${{ env.VERSION }}" -m "Swift SDK ${{ env.VERSION }}"
-          git push origin "scp-swift@${{ env.VERSION }}"
 
       - name: Upload XCFramework zip for GitHub Release
         uses: actions/upload-artifact@v4
@@ -777,7 +771,7 @@ jobs:
       - publish-pypi
       - publish-npm
       - publish-maven
-      - publish-spm
+      - package-swift
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     steps:
@@ -790,7 +784,7 @@ jobs:
           name: scp-release-bundle
           path: release-artifacts/
 
-      - name: Download XCFramework zip (produced by publish-spm)
+      - name: Download XCFramework zip (produced by package-swift)
         uses: actions/download-artifact@v4
         with:
           name: xcframework-zip
@@ -852,6 +846,112 @@ jobs:
             release-artifacts/python-sdist/*.tar.gz
 
   # ===========================================================================
+  # Step 6g: Publish the Swift Package mirror (limn-works/scp-swift)
+  #
+  # SwiftPM cannot consume this monorepo directly: it requires a root
+  # Package.swift and SemVer git tags, but the Swift sources live under
+  # bindings/swift/ and the repo is tagged per-component (scp-<crate>@<version>).
+  # The mirror repo carries only the thin generated manifest + Swift sources; the
+  # binary stays a release artifact of this repo, referenced by url:/checksum:.
+  #
+  # Runs AFTER github-release so the binaryTarget URL resolves before the mirror
+  # tag is published (no broken-window where `swift package resolve` 404s). The
+  # mirror is CI-owned and unprotected, so per-release manifest commits never
+  # fight this repo's branch protection.
+  # ===========================================================================
+  publish-spm:
+    name: "Step 6g: Publish Swift Package (SPM mirror)"
+    needs: [github-release, package-swift]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout monorepo
+        # Provides bindings/swift/Package.dist.swift (manifest template) + LICENSE.
+        uses: actions/checkout@v5
+
+      - name: Checkout scp-swift mirror
+        # actions/checkout configures the token as a scrubbed http.extraHeader and
+        # removes it in its post step — the token never appears in a clone URL or
+        # persists in .git/config, unlike `git clone https://x-access-token:...`.
+        # SWIFT_MIRROR_TOKEN needs contents:write on limn-works/scp-swift only
+        # (github.token cannot push cross-repo).
+        uses: actions/checkout@v5
+        with:
+          repository: limn-works/scp-swift
+          token: ${{ secrets.SWIFT_MIRROR_TOKEN }}
+          path: mirror
+          fetch-depth: 0
+
+      - name: Download Swift sources
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-sources
+          path: swift-sources/
+
+      - name: Assemble and publish scp-swift mirror
+        working-directory: mirror
+        env:
+          CHECKSUM: ${{ needs.package-swift.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ env.VERSION }}"
+          RELEASE_URL="https://github.com/limn-works/scp/releases/download/scp-core@${VERSION}/ScpFFI-${VERSION}.xcframework.zip"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # A released version is an immutable contract: SwiftPM resolves `from:`
+          # to this tag, so re-pointing it would silently change what consumers
+          # get. Refuse to republish an existing version — bump it instead.
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists on limn-works/scp-swift. Released versions are immutable — bump the version to publish a fix."
+            exit 1
+          fi
+
+          # Reset tracked content (preserve .git history).
+          git rm -rqf . >/dev/null 2>&1 || true
+          rm -rf Sources
+          mkdir -p Sources/SCP
+
+          # Swift sources (hand-written wrapper + UniFFI-generated bindings) come
+          # from the build artifact, post-generation. Keep only regular .swift
+          # files — drop symlinks and the generated FFI header/modulemap, which
+          # belong to the binary XCFramework, not the Swift target.
+          cp -R ../swift-sources/SCP/. Sources/SCP/
+          find Sources/SCP -type l -delete
+          find Sources/SCP -type f ! -name '*.swift' -delete
+
+          # Materialize the root manifest from the committed template.
+          sed -e "s|__SCP_XCFRAMEWORK_URL__|${RELEASE_URL}|" \
+              -e "s|__SCP_XCFRAMEWORK_CHECKSUM__|${CHECKSUM}|" \
+              ../bindings/swift/Package.dist.swift > Package.swift
+
+          # License (fail closed — a published package must carry one) + a
+          # generated do-not-edit README.
+          cp ../LICENSE LICENSE
+          printf '%s\n' \
+            "# SCP — Swift SDK" \
+            "" \
+            "Auto-generated SwiftPM distribution of the Shared Context Protocol Swift SDK." \
+            "Source of truth: https://github.com/limn-works/scp (bindings/swift)." \
+            "Do not edit; every release regenerates and publishes this repository." \
+            "" \
+            "## Installation" \
+            "" \
+            '```swift' \
+            ".package(url: \"https://github.com/limn-works/scp-swift.git\", from: \"${VERSION}\")" \
+            '```' > README.md
+
+          git add -A
+          git commit -m "Release ${VERSION}" --quiet
+          git push origin HEAD:main
+
+          # SwiftPM resolves versions from SemVer tags. Non-force: the existence
+          # check above already guarantees this version is new.
+          git tag "${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+
+  # ===========================================================================
   # Dry-run summary (when dry-run is true, skip publishing but report status)
   # ===========================================================================
   dry-run-summary:
@@ -881,7 +981,6 @@ jobs:
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
           echo "- npm: @limn-works/scp-ts + @limn-works/scp-ts-napi-{linux-x64-gnu,linux-arm64-gnu,darwin-x64,darwin-arm64,win32-x64-msvc}" >> $GITHUB_STEP_SUMMARY
           echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY
-          echo "- SPM: SCP (via GitHub Release)" >> $GITHUB_STEP_SUMMARY
-          echo "- Go: github.com/limn-works/scp-go (via tag)" >> $GITHUB_STEP_SUMMARY
+          echo "- SPM: limn-works/scp-swift mirror (binary target -> GitHub Release zip)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Re-run without dry-run to publish." >> $GITHUB_STEP_SUMMARY

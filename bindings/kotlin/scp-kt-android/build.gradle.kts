@@ -1,11 +1,14 @@
+import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
+import com.vanniktech.maven.publish.SonatypeHost
+
 plugins {
     id("com.android.library")
     kotlin("android")
     kotlin("plugin.compose")
     kotlin("plugin.serialization")
     id("io.gitlab.arturbosch.detekt") version "1.23.8"
-    id("maven-publish")
-    id("signing")
+    // Version declared in the root build.gradle.kts (apply false) — see there.
+    id("com.vanniktech.maven.publish")
 }
 
 group = "works.limn"
@@ -44,13 +47,10 @@ android {
             isIncludeAndroidResources = true
         }
     }
-
-    publishing {
-        singleVariant("release") {
-            withSourcesJar()
-            withJavadocJar()
-        }
-    }
+    // The publication variant is configured by the vanniktech plugin via
+    // AndroidSingleVariantLibrary("release") below — do not also declare
+    // android { publishing { singleVariant } } here or AGP errors on a
+    // double-configured variant.
 }
 
 dependencies {
@@ -120,70 +120,46 @@ detekt {
     buildUponDefaultConfig = true
 }
 
-afterEvaluate {
-    publishing {
-        publications {
-            create<MavenPublication>("release") {
-                from(components["release"])
+// Publishing to Maven Central via the Central Portal (central.sonatype.com).
+// See scp-kt/build.gradle.kts for the rationale and the ORG_GRADLE_PROJECT_*
+// credential properties. AndroidSingleVariantLibrary publishes the assembled
+// `release` AAR (which carries the UniFFI jniLibs staged by the release
+// pipeline's native build) plus sources and an empty Javadoc jar.
+mavenPublishing {
+    configure(
+        AndroidSingleVariantLibrary(
+            variant = "release",
+            sourcesJar = true,
+            publishJavadocJar = true,
+        ),
+    )
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    signAllPublications()
+    coordinates("works.limn", "scp-kt-android", project.version.toString())
 
-                groupId = "works.limn"
-                artifactId = "scp-kt-android"
-                version = project.version.toString()
-
-                pom {
-                    name.set("SCP SDK for Kotlin — Android Extensions")
-                    description.set("Android lifecycle and platform extensions for the SCP Kotlin SDK")
-                    url.set("https://github.com/limn/scp")
-                    licenses {
-                        license {
-                            name.set("Apache-2.0")
-                            url.set("https://www.apache.org/licenses/LICENSE-2.0")
-                        }
-                    }
-                    developers {
-                        developer {
-                            id.set("limn")
-                            name.set("Limn")
-                            email.set("dev@limn.dev")
-                        }
-                    }
-                    scm {
-                        connection.set("scm:git:git://github.com/limn/scp.git")
-                        developerConnection.set("scm:git:ssh://github.com/limn/scp.git")
-                        url.set("https://github.com/limn/scp")
-                    }
-                }
+    pom {
+        name.set("SCP SDK for Kotlin — Android Extensions")
+        description.set("Android lifecycle and platform extensions for the SCP Kotlin SDK")
+        inceptionYear.set("2026")
+        url.set("https://github.com/limn-works/scp")
+        licenses {
+            license {
+                name.set("Apache-2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                distribution.set("https://www.apache.org/licenses/LICENSE-2.0")
             }
         }
-        repositories {
-            maven {
-                name = "sonatypeStaging"
-                url = uri("https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/")
-                credentials {
-                    username = System.getenv("MAVEN_CENTRAL_USERNAME")
-                    password = System.getenv("MAVEN_CENTRAL_TOKEN")
-                }
-            }
-            maven {
-                name = "sonatypeSnapshots"
-                url = uri("https://s01.oss.sonatype.org/content/repositories/snapshots/")
-                credentials {
-                    username = System.getenv("MAVEN_CENTRAL_USERNAME")
-                    password = System.getenv("MAVEN_CENTRAL_TOKEN")
-                }
+        developers {
+            developer {
+                id.set("limn")
+                name.set("Limn")
+                url.set("https://github.com/limn-works")
             }
         }
-    }
-
-    signing {
-        val signingKeyId = System.getenv("GPG_KEY_ID")
-        val signingKey = System.getenv("GPG_PRIVATE_KEY")
-        val signingPassword = System.getenv("GPG_PASSPHRASE")
-        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
-        sign(publishing.publications["release"])
-    }
-
-    tasks.withType<Sign>().configureEach {
-        onlyIf { System.getenv("GPG_PRIVATE_KEY") != null }
+        scm {
+            url.set("https://github.com/limn-works/scp")
+            connection.set("scm:git:git://github.com/limn-works/scp.git")
+            developerConnection.set("scm:git:ssh://git@github.com/limn-works/scp.git")
+        }
     }
 }

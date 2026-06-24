@@ -1,11 +1,16 @@
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.KotlinJvm
+import com.vanniktech.maven.publish.SonatypeHost
+
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization")
     id("org.jlleitschuh.gradle.ktlint") version "12.2.0"
     id("io.gitlab.arturbosch.detekt") version "1.23.8"
     id("org.jetbrains.dokka")
-    id("maven-publish")
-    id("signing")
+    // Version + rationale live in the root build.gradle.kts (apply false), so the
+    // plugin shares the Kotlin plugin's classpath.
+    id("com.vanniktech.maven.publish")
 }
 
 group = "works.limn"
@@ -17,11 +22,6 @@ repositories {
 
 kotlin {
     jvmToolchain(17)
-}
-
-java {
-    withJavadocJar()
-    withSourcesJar()
 }
 
 dependencies {
@@ -172,14 +172,25 @@ tasks.withType<org.jetbrains.dokka.gradle.AbstractDokkaLeafTask>().configureEach
 // generated bindings included, so it takes the `dependsOn` edge rather than an
 // ordering-only one: the sources jar that ships to Maven Central must carry the
 // sources for every class in the binary jar beside it, whatever else the build
-// happened to ask for. `java.withSourcesJar()` above registers the task, and
-// `.github/workflows/release.yml` reaches it through
-// `:scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository`.
-// `kotlinSourcesJar`, which the Kotlin JVM plugin registers, packages the same
-// tree and takes the same edge for the same reason.
-listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
-    tasks.named(sourcesJarTask) {
-        dependsOn("generateUniffiBindings")
+// happened to ask for. `mavenPublishing { configure(KotlinJvm(sourcesJar = true)) }`
+// at the bottom of this file registers the task — that argument calls Gradle's
+// `java.withSourcesJar()` — and `.github/workflows/release.yml` reaches it through
+// `:scp-kt:publishAndReleaseToMavenCentral`. `kotlinSourcesJar`, which the Kotlin
+// JVM plugin registers, packages the same tree and takes the same edge for the
+// same reason.
+//
+// The lookup runs in `afterEvaluate` because `tasks.named` resolves eagerly and
+// the statement that registers `sourcesJar` sits below this one: run against the
+// script body, `named` throws `UnknownTaskException` and Gradle aborts
+// configuration of this project before any task runs. `afterEvaluate` runs after
+// the whole script body, so both names resolve wherever their registering
+// statement sits, and a name that no statement registers still fails loudly
+// rather than dropping the edge.
+afterEvaluate {
+    listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
+        tasks.named(sourcesJarTask) {
+            dependsOn("generateUniffiBindings")
+        }
     }
 }
 
@@ -296,68 +307,51 @@ tasks.register("checkUniffiBindingsOrdering") {
     }
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            groupId = "works.limn"
-            artifactId = "scp-kt"
-            version = project.version.toString()
+// Publishing to Maven Central via the Central Portal (central.sonatype.com).
+// OSSRH (s01.oss.sonatype.org) reached end-of-life 2025-06-30; the vanniktech
+// plugin targets the Portal by default, GPG-signs every publication, and
+// auto-releases without the Nexus staging close/release dance.
+//
+// Credentials are supplied as Gradle properties (CI sets the matching
+// ORG_GRADLE_PROJECT_* env vars):
+//   mavenCentralUsername / mavenCentralPassword  — Central Portal user token
+//   signingInMemoryKey / signingInMemoryKeyId / signingInMemoryKeyPassword
+// Signing only runs on remote-publish tasks, so local builds and
+// publishToMavenLocal work without any GPG key configured.
+mavenPublishing {
+    configure(
+        KotlinJvm(
+            javadocJar = JavadocJar.Empty(),
+            sourcesJar = true,
+        ),
+    )
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    signAllPublications()
+    coordinates("works.limn", "scp-kt", project.version.toString())
 
-            from(components["java"])
-
-            pom {
-                name.set("SCP SDK for Kotlin")
-                description.set("Kotlin SDK for the Shared Context Protocol")
-                url.set("https://github.com/limn/scp")
-                licenses {
-                    license {
-                        name.set("Apache-2.0")
-                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
-                    }
-                }
-                developers {
-                    developer {
-                        id.set("limn")
-                        name.set("Limn")
-                        email.set("dev@limn.dev")
-                    }
-                }
-                scm {
-                    connection.set("scm:git:git://github.com/limn/scp.git")
-                    developerConnection.set("scm:git:ssh://github.com/limn/scp.git")
-                    url.set("https://github.com/limn/scp")
-                }
+    pom {
+        name.set("SCP SDK for Kotlin")
+        description.set("Kotlin SDK for the Shared Context Protocol")
+        inceptionYear.set("2026")
+        url.set("https://github.com/limn-works/scp")
+        licenses {
+            license {
+                name.set("Apache-2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                distribution.set("https://www.apache.org/licenses/LICENSE-2.0")
             }
+        }
+        developers {
+            developer {
+                id.set("limn")
+                name.set("Limn")
+                url.set("https://github.com/limn-works")
+            }
+        }
+        scm {
+            url.set("https://github.com/limn-works/scp")
+            connection.set("scm:git:git://github.com/limn-works/scp.git")
+            developerConnection.set("scm:git:ssh://git@github.com/limn-works/scp.git")
         }
     }
-    repositories {
-        maven {
-            name = "sonatypeStaging"
-            url = uri("https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/")
-            credentials {
-                username = System.getenv("MAVEN_CENTRAL_USERNAME")
-                password = System.getenv("MAVEN_CENTRAL_TOKEN")
-            }
-        }
-        maven {
-            name = "sonatypeSnapshots"
-            url = uri("https://s01.oss.sonatype.org/content/repositories/snapshots/")
-            credentials {
-                username = System.getenv("MAVEN_CENTRAL_USERNAME")
-                password = System.getenv("MAVEN_CENTRAL_TOKEN")
-            }
-        }
-    }
-}
-
-signing {
-    val signingKeyId = System.getenv("GPG_KEY_ID")
-    val signingKey = System.getenv("GPG_PRIVATE_KEY")
-    val signingPassword = System.getenv("GPG_PASSPHRASE")
-    useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
-    sign(publishing.publications["mavenJava"])
-}
-
-tasks.withType<Sign>().configureEach {
-    onlyIf { System.getenv("GPG_PRIVATE_KEY") != null }
 }

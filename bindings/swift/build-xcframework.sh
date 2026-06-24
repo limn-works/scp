@@ -197,6 +197,11 @@ log "Generating module.modulemap"
 # FFI module name (scpFFI — derived from scp_ffi_uniffi by UniFFI).
 if [ -n "$GENERATED_MODULEMAP" ] && [ -f "$GENERATED_MODULEMAP" ]; then
     cp "$GENERATED_MODULEMAP" "$MODULE_MAP"
+    # The header was renamed scpFFI.h -> ScpFFI.h above; keep the generated
+    # modulemap's header reference in sync so it resolves on case-sensitive
+    # filesystems too (macOS CI is case-insensitive and would mask this).
+    sed -i.bak -E 's/(header[[:space:]]+")scpFFI\.h"/\1ScpFFI.h"/' "$MODULE_MAP"
+    rm -f "$MODULE_MAP.bak"
 else
     cat > "$MODULE_MAP" <<'MODULEMAP'
 module scpFFI {
