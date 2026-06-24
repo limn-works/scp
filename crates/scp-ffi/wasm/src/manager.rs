@@ -961,6 +961,15 @@ impl PerContextState {
             .map(|a| a.role_name.as_str())
     }
 
+    /// Test-only: read a member's MLS message sequence counter, or `None` if
+    /// the DID has no entry in `member_sequence_numbers`. Lets rollback and
+    /// export/import round-trip tests assert the counter directly (the field
+    /// is private).
+    #[cfg(test)]
+    pub(crate) fn test_member_sequence_number(&self, did: &str) -> Option<u64> {
+        self.member_sequence_numbers.get(did).copied()
+    }
+
     /// Test-only: read the suspended capability set for a member as
     /// UCAN-format strings (owned), or `None` if the member has no suspensions.
     #[cfg(test)]
@@ -5324,13 +5333,23 @@ impl WasmContextManager {
 
         // Also add as a member if not already present, assigning the
         // `subscriber` built-in role and seeding the MLS sequence counter.
+        // `system_assign_role` requires the DID to already be in `members`, so
+        // insert first; on assignment failure roll the insertion and sequence
+        // seed back so a rejected subscribe leaves NO partial membership behind
+        // (fail-closed atomicity — mirrors `dispatch_add_member`).
         if !ctx.role_state.members.contains(subscriber_did) {
             ctx.role_state.members.insert(subscriber_did.to_owned());
             ctx.member_sequence_numbers
                 .insert(subscriber_did.to_owned(), 0);
-            ctx.role_state
-                .system_assign_role(subscriber_did, "subscriber", &crate::time::WasmClock)
-                .map_err(map_role_error)?;
+            if let Err(e) = ctx.role_state.system_assign_role(
+                subscriber_did,
+                "subscriber",
+                &crate::time::WasmClock,
+            ) {
+                ctx.role_state.members.remove(subscriber_did);
+                ctx.member_sequence_numbers.remove(subscriber_did);
+                return Err(map_role_error(e));
+            }
         }
 
         Ok(())
@@ -10099,10 +10118,23 @@ mod tests {
         };
         let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
-        assert!(
-            result.is_err(),
-            "ChangeRole to an undefined role MUST be rejected (#1886), not silently accepted"
-        );
+
+        // The rejection MUST be the role-not-found path: `map_role_error`
+        // surfaces `RoleError::RoleNotFound` as `ScpWasmError::Context` with
+        // `SCP-CTX-2015`. Asserting the exact error identity prevents the test
+        // from passing on an unrelated setup failure (wrong governance model,
+        // missing ceiling, etc.).
+        match result {
+            Err(ScpWasmError::Context { ref code, .. }) => assert_eq!(
+                code,
+                codes::CTX_2015,
+                "undefined-role ChangeRole must reject with the RoleNotFound code"
+            ),
+            other => panic!(
+                "ChangeRole to an undefined role MUST be rejected with a \
+                 RoleNotFound Context error (#1886), got: {other:?}"
+            ),
+        }
 
         // The target keeps its original role — the rejected assignment did not apply.
         assert_eq!(
@@ -10178,10 +10210,127 @@ mod tests {
         };
         let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
-        assert!(
-            result.is_err(),
-            "AddMember with an undefined role MUST be rejected (#1886)"
+
+        // Same RoleNotFound identity as the ChangeRole case.
+        match result {
+            Err(ScpWasmError::Context { ref code, .. }) => assert_eq!(
+                code,
+                codes::CTX_2015,
+                "undefined-role AddMember must reject with the RoleNotFound code"
+            ),
+            other => panic!(
+                "AddMember with an undefined role MUST be rejected with a \
+                 RoleNotFound Context error (#1886), got: {other:?}"
+            ),
+        }
+
+        // `dispatch_add_member` rolls back BOTH the `members` insert and the
+        // `member_sequence_numbers` seed on a rejected role assignment
+        // (fail-closed atomicity). Assert the newcomer left no partial
+        // membership behind — this is the only coverage of that rollback path.
+        assert_eq!(
+            mgr.member_role(context_id, newcomer),
+            None,
+            "a rejected AddMember must NOT leave the newcomer as a member"
         );
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(newcomer),
+            None,
+            "a rejected AddMember must roll back the newcomer's sequence-number seed"
+        );
+    }
+
+    /// #1877 slice 1: a full signed `export_context` -> `import_context`
+    /// round-trip must reconstruct the NEW shared `ContextRoleState` verbatim.
+    /// Specifically: a member's non-default role, a per-member capability
+    /// suspension, and a non-zero MLS sequence counter must all survive the
+    /// JCS-canonical, Ed25519-signed envelope onto a freshly reconstructed
+    /// `ContextRoleState` in a different manager.
+    ///
+    /// The signed export resolves the creator's `#active` verification key from
+    /// the thread-local identity registry, so the creator identity is
+    /// registered first (the registry is shared across managers on the test
+    /// thread, which is what lets the "fresh" importing manager verify the
+    /// signature).
+    #[test]
+    fn export_import_roundtrip_preserves_role_state_model_wasm() {
+        // Non-zero MLS sequence counter to advance and assert survives.
+        const EXPECTED_SEQ: u64 = 7;
+
+        // Isolate from any thread-local registry residue left by sibling tests.
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _identity_key, _active_key, _agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let member = "did:dht:zmoderator";
+        let context_id = "ctx-1877-export-roundtrip";
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        // Widen the ceiling so the non-default `moderator` role actually carries
+        // read+write capabilities (built-in roles intersect with the ceiling).
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        // (a) assign a NON-default, non-creator role.
+        state.test_insert_member(member, "moderator");
+        // (b) suspend a capability the role otherwise grants.
+        state.test_insert_suspended_capability(member, "messages:write");
+        // (c) advance the member's MLS sequence counter to a non-zero value.
+        state
+            .member_sequence_numbers
+            .insert(member.to_owned(), EXPECTED_SEQ);
+        src.contexts.insert(context_id.to_owned(), state);
+
+        // Sanity: the source state holds what we set BEFORE the round-trip, so a
+        // failure localizes to export/import rather than setup.
+        assert_eq!(
+            src.member_role(context_id, member).as_deref(),
+            Some("moderator")
+        );
+        assert!(src.contexts[context_id].member_has_capability(member, "messages:read"));
+        assert!(!src.contexts[context_id].member_has_capability(member, "messages:write"));
+        assert_eq!(
+            src.contexts[context_id].test_member_sequence_number(member),
+            Some(EXPECTED_SEQ)
+        );
+
+        let bytes = src
+            .export_context(context_id)
+            .expect("signed export of the role-state context must succeed");
+
+        // Reconstruct into a DIFFERENT manager (shares the thread-local identity
+        // registry, so the creator's #active key resolves for verification).
+        let mut dst = WasmContextManager::new();
+        let imported_id = dst
+            .import_context(&bytes)
+            .expect("signed import must verify and reconstruct the context");
+        assert_eq!(imported_id, context_id);
+
+        // Role survives verbatim on the reconstructed ContextRoleState.
+        assert_eq!(
+            dst.member_role(context_id, member).as_deref(),
+            Some("moderator"),
+            "imported member role must match the exported non-default role"
+        );
+        // Suspension survives: the suspended cap is denied, the unsuspended one allowed.
+        let imported_ctx = &dst.contexts[context_id];
+        assert!(
+            imported_ctx.member_has_capability(member, "messages:read"),
+            "an unsuspended capability must remain granted after import"
+        );
+        assert!(
+            !imported_ctx.member_has_capability(member, "messages:write"),
+            "a suspended capability must remain denied after import"
+        );
+        // Sequence counter survives verbatim.
+        assert_eq!(
+            imported_ctx.test_member_sequence_number(member),
+            Some(EXPECTED_SEQ),
+            "imported member sequence number must match the exported value"
+        );
+
+        // Leave the shared thread-local registry clean for sibling tests.
+        crate::identity::test_helpers::cleanup_identity_registry();
     }
 
     /// `parse_proposal_id_bytes` is the shared strict parse both
