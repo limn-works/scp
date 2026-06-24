@@ -569,6 +569,101 @@ mod tests {
         assert_eq!(ctx.test_member_role("did:test:bob"), Some("observer"));
     }
 
+    /// **E2-6b:** consequence-path escalation — a convergent rule triggered with
+    /// `AssignRole { to_role: <undefined role> }` on a PRESENT member must fail
+    /// (the shared `apply_assign_role` returns false because
+    /// `role_state_system_assign_role` rejects the undefined role) and the
+    /// shared `enforce_triggered` escalates to `SuspendAll`, minting a durable
+    /// `ConsequenceEscalatedToSuspendAll` leaf. This is the consequence-side
+    /// twin of the governance-path `dispatch_add_member` role validation: an
+    /// undefined role can no longer silently strip a member's capabilities; it
+    /// fails closed into a full suspension. A convergent (`WarningCount`)
+    /// trigger is used so the audit leaves are durable Merkle leaves (only
+    /// convergent-trigger consequences reach a durable leaf).
+    #[test]
+    fn enforce_triggered_assign_role_undefined_role_escalates_to_suspend_all() {
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Widen the ceiling so the member's built-in role actually grants a
+        // capability we can prove gets suspended on escalation.
+        ctx.test_insert_ceiling("messages:read");
+        ctx.test_insert_member("did:test:bob", "member");
+
+        // Sanity: bob holds messages:read via the `member` role BEFORE the
+        // failed assignment, and his role is "member".
+        assert!(
+            ctx.member_has_capability_pub("did:test:bob", "messages:read"),
+            "bob's member role must grant messages:read before the failed assign"
+        );
+        assert_eq!(ctx.test_member_role("did:test:bob"), Some("member"));
+
+        let leaves_before = ctx
+            .event_log_events()
+            .iter()
+            .filter(|e| e.event_type == EventType::ConsequenceEscalatedToSuspendAll)
+            .count();
+
+        // Convergent trigger (WarningCount) so the escalation leaf is durable.
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "not-a-real-role".to_owned(),
+            },
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: ConsequenceAction::AssignRole {
+                to_role: "not-a-real-role".to_owned(),
+            },
+            evidence: vec![make_evidence(0, "did:test:bob")],
+        }];
+
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:bob",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
+        assert_eq!(
+            dispatched, 1,
+            "the failed-assign consequence is still counted"
+        );
+
+        // (a) The member's role is UNCHANGED — the undefined role was rejected
+        // before any assignment write.
+        assert_eq!(
+            ctx.test_member_role("did:test:bob"),
+            Some("member"),
+            "a rejected AssignRole must leave the member's role unchanged"
+        );
+
+        // (b) The member's effective capabilities are FULLY suspended — the
+        // escalation called SuspendAll, so a previously-granted cap is denied.
+        assert!(
+            !ctx.member_has_capability_pub("did:test:bob", "messages:read"),
+            "escalation to SuspendAll must suspend the member's previously-granted capability"
+        );
+
+        // (c) Exactly one new `ConsequenceEscalatedToSuspendAll` durable leaf.
+        let leaves_after = ctx
+            .event_log_events()
+            .iter()
+            .filter(|e| e.event_type == EventType::ConsequenceEscalatedToSuspendAll)
+            .count();
+        assert_eq!(
+            leaves_after - leaves_before,
+            1,
+            "the failed convergent AssignRole must mint exactly one \
+             ConsequenceEscalatedToSuspendAll durable leaf"
+        );
+    }
+
     /// **E2-7:** cooldown suppression — a second dispatch within the rule's
     /// cooldown window is skipped without mutation.
     #[test]
@@ -1770,8 +1865,8 @@ mod cross_impl_leaf_parity {
     /// for this action — executing it where native rejected — a §9.9.3
     /// divergence AND a security gap (running an action outside the ceiling).
     /// WASM now mirrors native: `dispatch_ceiling_capability` returns
-    /// `Some("context_child:create")` (the `ucan_capability_name()` form that
-    /// `ceiling_strings` stores).
+    /// `Some("context_child:create")` (the `ucan_capability_name()` form the
+    /// typed ceiling holds).
     #[test]
     fn cross_impl_out_of_ceiling_create_child_context_rejected_wasm() {
         use crate::manager::{WasmContextManager, make_bare_per_context_state};
@@ -1845,7 +1940,7 @@ mod cross_impl_leaf_parity {
         ctx.test_insert_member(admin, "admin");
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
-        // In-ceiling: the UCAN-format string `ceiling_strings` stores for
+        // In-ceiling: the UCAN-format string the typed ceiling holds for
         // `ChildContextCreate` (`Capability::ucan_capability_name()`).
         ctx.test_insert_ceiling("context_child:create");
 

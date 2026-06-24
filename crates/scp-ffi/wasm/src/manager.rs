@@ -3261,10 +3261,10 @@ impl WasmContextManager {
     ///
     /// Maps each `GovernanceAction` variant to the capability that
     /// the initiator must hold. Uses the UCAN `{resource}:{action}` format,
-    /// matching `member_has_capability` and the ceiling strings.
+    /// matching `member_has_capability` and the typed ceiling.
     /// Returns the context-ceiling capability a governance action requires at
-    /// DISPATCH time, in WASM `ceiling_strings` (UCAN) format — or `None` if the
-    /// action is NOT ceiling-gated at dispatch.
+    /// DISPATCH time, as a canonical `Capability::ucan_capability_name()` (UCAN)
+    /// string — or `None` if the action is NOT ceiling-gated at dispatch.
     ///
     /// This mirrors EXACTLY the native runtime's per-action ceiling gates in
     /// `dispatch_governance_action` / its per-action `execute_*` helpers
@@ -3285,7 +3285,8 @@ impl WasmContextManager {
     /// keeps WASM's accept/reject decision byte-identical to native (§9.9.3).
     ///
     /// The strings are exact `Capability::ucan_capability_name()` outputs
-    /// (`member:ban`, `tool:register`) and are matched against `ceiling_strings`
+    /// (`member:ban`, `tool:register`) and are matched through the typed
+    /// `CapabilityCeiling::contains` on `ContextRoleState` (`ceiling().contains`)
     /// with EXACT membership — no wildcard expansion — because native's
     /// `CapabilityCeiling::contains` uses exact set membership for these
     /// capabilities (only `ToolInvoke` has wildcard special-casing).
@@ -3300,10 +3301,12 @@ impl WasmContextManager {
         // `CreateChildContext` and `EstablishToolInterface` were previously
         // ungated in WASM while native rejected them — a §9.9.3 divergence and a
         // security gap). Strings are exact `Capability::ucan_capability_name()`
-        // outputs (the form `ceiling_strings` stores) and are matched with EXACT
-        // membership against `ceiling_strings`, because native's
-        // `CapabilityCeiling::contains` uses exact set membership for all these
-        // capabilities (only `ToolInvoke` has wildcard special-casing).
+        // outputs (the canonical UCAN form the typed ceiling holds) and are
+        // matched with EXACT membership through the typed
+        // `CapabilityCeiling::contains` on `ContextRoleState` (`ceiling().contains`),
+        // because native's `CapabilityCeiling::contains` uses exact set
+        // membership for all these capabilities (only `ToolInvoke` has wildcard
+        // special-casing).
         match action {
             // member:ban — native: execute_suspend_member, execute_revoke,
             // execute_restore_access, and the inline SuspendAccess arm in
@@ -3316,7 +3319,7 @@ impl WasmContextManager {
             GovernanceAction::RegisterTool { .. } => Some("tool:register"),
             // context_child:create — native: execute_create_child_context.
             // `ChildContextCreate.name()` is the 3-segment "context:child:create",
-            // but `ceiling_strings` stores the UCAN form "context_child:create"
+            // but the typed ceiling holds the UCAN form "context_child:create"
             // (`Capability::ucan_capability_name()`), so we match on that.
             GovernanceAction::CreateChildContext { .. } => Some("context_child:create"),
             // tool:interface — native: execute_establish_tool_interface.
@@ -3697,6 +3700,15 @@ impl WasmContextManager {
         ctx.role_state
             .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;
+        // per-action-EventType-leaf deferral: native ALSO appends a per-action
+        // durable event-log leaf for ModifyCeiling (`CeilingModificationPending`
+        // when the change defers, `CeilingModified` when it applies, in
+        // governance_helpers.rs) IN ADDITION to the generic
+        // `GovernanceActionExecuted`. WASM does not yet emit those per-action
+        // leaves — a known §9.9.3 leaf-count divergence deferred to the
+        // per-action-EventType-leaf-parity workstream (tracked by the ignored
+        // `wasm_native_full_governance_eventtype_parity_pending` conformance
+        // test).
         Ok(serde_json::json!({"action": "ModifyCeiling"}))
     }
 
@@ -3708,9 +3720,16 @@ impl WasmContextManager {
         context_id: &str,
         action: &GovernanceAction,
         // The committing member (executor) — stamped as the convergence-critical
-        // `actor_did` on any per-action durable leaf this dispatch appends (e.g.
-        // the `MemberLeft` leaf for `RemoveMember`), byte-identical to native
-        // (§9.9.3; ADR-031 §8 "executor DID").
+        // `actor_did` on any per-action durable leaf this dispatch appends,
+        // byte-identical to native (§9.9.3; ADR-031 §8 "executor DID"). NOTE:
+        // WASM currently emits only RemoveMember's `MemberLeft` per-action leaf;
+        // it does NOT yet emit per-action leaves everywhere native does
+        // (TransferAdmin's `AdminTransferred`, ModifyCeiling's
+        // `CeilingModificationPending`/`CeilingModified`, etc. are deferred to
+        // the per-action-EventType-leaf-parity workstream — the ignored
+        // `wasm_native_full_governance_eventtype_parity_pending` conformance
+        // test). So this `actor_did` stamps the MemberLeft leaf today; the
+        // others are pending.
         executor_did: &str,
         // The convergent committer-assigned leaf timestamp (the executed
         // proposal's signed `created_at`), used for any per-action durable leaf
@@ -3877,12 +3896,25 @@ impl WasmContextManager {
         }
 
         // Add the member and assign the requested role via the shared
-        // `system_assign_role` (#1886: validates the role exists in
-        // `role_definitions` / is within the ceiling before applying it).
-        // `system_assign_role` requires the DID to already be in `members`, so
-        // insert first; on assignment failure (undefined / out-of-ceiling role)
-        // roll the insertion back so a rejected `AddMember` leaves NO partial
-        // membership behind (fail-closed atomicity).
+        // `system_assign_role` (validates the role exists in `role_definitions`
+        // / is within the ceiling before applying it). `system_assign_role`
+        // requires the DID to already be in `members`, so insert first.
+        //
+        // Rollback is CONDITIONAL on novelty: on assignment failure we undo
+        // only what THIS call inserted. A genuinely-new member is fully
+        // removed (fail-closed atomicity — a rejected first-time `AddMember`
+        // leaves NO partial membership behind), but a re-add of an EXISTING
+        // member with a bad / out-of-ceiling role leaves that member fully
+        // intact (members + sequence counter preserved). This matches native
+        // `execute_add_member`, which does not roll back at all (member-add is
+        // coalesce-window-rollback acceptable per ADR-049 §9) and therefore
+        // never corrupts an existing member. Unconditional rollback would
+        // split-brain an existing member: drop them from `members` / their
+        // sequence counter while leaving `assignments` + `member_capabilities`
+        // intact, so membership queries report them gone yet they retain caps
+        // and can still propose / vote / decrypt.
+        let member_was_present = ctx.role_state.members.contains(did);
+        let seq_was_present = ctx.member_sequence_numbers.contains_key(did);
         ctx.role_state.members.insert(did.to_owned());
         ctx.member_sequence_numbers
             .entry(did.to_owned())
@@ -3891,8 +3923,18 @@ impl WasmContextManager {
             .role_state
             .system_assign_role(did, role, &crate::time::WasmClock)
         {
-            ctx.role_state.members.remove(did);
-            ctx.member_sequence_numbers.remove(did);
+            // Only undo what THIS call inserted — never evict a pre-existing
+            // member. (`system_assign_role` validates the role BEFORE touching
+            // `assignments` / `member_capabilities`, so a failure leaves an
+            // existing member fully intact; native `execute_add_member`
+            // likewise does not roll back — member-add is
+            // coalesce-window-rollback acceptable per ADR-049 §9.)
+            if !member_was_present {
+                ctx.role_state.members.remove(did);
+            }
+            if !seq_was_present {
+                ctx.member_sequence_numbers.remove(did);
+            }
             return Err(map_role_error(e));
         }
         // If the new member is an author in a broadcast context, register
@@ -4105,6 +4147,15 @@ impl WasmContextManager {
                 ctx.role_state
                     .system_assign_role(new_admin_str, "admin", &crate::time::WasmClock)
                     .map_err(map_role_error)?;
+                // per-action-EventType-leaf deferral: native ALSO appends a
+                // per-action `AdminTransferred` durable event-log leaf for
+                // TransferAdmin (governance_helpers.rs) IN ADDITION to the
+                // generic `GovernanceActionExecuted`. WASM does not yet emit
+                // that per-action leaf — a known §9.9.3 leaf-count divergence
+                // deferred to the per-action-EventType-leaf-parity workstream
+                // (tracked by the ignored
+                // `wasm_native_full_governance_eventtype_parity_pending`
+                // conformance test).
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
             }
             GovernanceAction::SuspendCapability { did, capabilities } => {
@@ -10642,6 +10693,163 @@ mod tests {
             "a rejected AddMember must roll back the newcomer's sequence-number seed \
              (the load-bearing rollback proof: seeded before the fallible assign, so \
              this would be Some(0) without the rollback)"
+        );
+    }
+
+    /// Conditional-rollback convergence: re-adding an ALREADY-PRESENT member via
+    /// `AddMember` with a bad / out-of-ceiling role must REJECT the action yet
+    /// leave the existing member fully intact. Unconditional rollback would
+    /// split-brain them: drop them from `members` and delete their sequence
+    /// counter while leaving `assignments` + `member_capabilities` behind, so
+    /// membership queries report them gone while they keep every capability and
+    /// can still propose / vote / decrypt. This is the regression guard for the
+    /// eviction bug; it matches native `execute_add_member`, which never
+    /// corrupts an existing member (member-add is coalesce-window-rollback
+    /// acceptable per ADR-049 §9).
+    #[test]
+    fn add_member_existing_member_bad_role_does_not_evict_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmoderator";
+        let context_id = "ctx-addmember-no-evict";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        // Widen the ceiling so the `moderator` role actually carries a
+        // capability we can later prove survives a rejected re-add.
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        // M is a real, established member with a VALID role, capabilities, and a
+        // seeded sequence counter — exactly the state the eviction bug corrupts.
+        state.test_insert_member(member, "moderator");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        // Sanity: M is established BEFORE the bad re-add, so any post-add change
+        // localizes to `dispatch_add_member` rather than setup.
+        assert!(
+            mgr.is_member(context_id, member),
+            "M must be an established member before the bad re-add"
+        );
+        assert!(
+            mgr.contexts[context_id].member_has_capability(member, "messages:read"),
+            "M's moderator role must grant messages:read before the bad re-add"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(member),
+            Some(0),
+            "M must have a seeded sequence counter before the bad re-add"
+        );
+
+        // Re-add the SAME member with an undefined role through the production
+        // dispatch path (single_admin auto-executes on propose).
+        let action = GovernanceAction::AddMember {
+            did: DID(member.to_owned()),
+            role: "not-a-real-role".to_owned(),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ee";
+        let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
+
+        // (a) The action is rejected.
+        assert!(
+            result.is_err(),
+            "re-adding an existing member with an undefined role must be rejected, got: {result:?}"
+        );
+
+        // (b) M is STILL a member (not evicted).
+        assert!(
+            mgr.is_member(context_id, member),
+            "a rejected re-add must NOT evict the pre-existing member from `members`"
+        );
+        assert!(
+            mgr.contexts[context_id].role_state.members.contains(member),
+            "the pre-existing member must remain in `role_state.members` after a rejected re-add"
+        );
+
+        // (c) M STILL holds the capabilities their original role granted.
+        assert!(
+            mgr.contexts[context_id].member_has_capability(member, "messages:read"),
+            "a rejected re-add must NOT strip the pre-existing member's capabilities"
+        );
+
+        // (d) M's sequence counter is preserved (not deleted by the rollback).
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(member),
+            Some(0),
+            "a rejected re-add must NOT delete the pre-existing member's sequence counter"
+        );
+
+        // The original role is untouched (`system_assign_role` rejects the bad
+        // role BEFORE writing any assignment, so the prior assignment stands).
+        assert_eq!(
+            mgr.member_role(context_id, member).as_deref(),
+            Some("moderator"),
+            "a rejected re-add must leave the pre-existing member's role unchanged"
+        );
+    }
+
+    /// `AddMember` with a VALID defined role, through the production dispatch
+    /// path, must succeed: the newcomer becomes a member with that role and a
+    /// `MemberJoined` buffer event is emitted. Exercises the real
+    /// `dispatch_add_member` success path (previously only the
+    /// `test_insert_member` shortcut covered member addition).
+    #[test]
+    fn add_member_with_defined_role_succeeds_and_pushes_member_joined_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let newcomer = "did:dht:znewcomer";
+        let context_id = "ctx-addmember-success";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        // Newcomer is not a member before the add.
+        assert!(!mgr.is_member(context_id, newcomer));
+
+        let action = GovernanceAction::AddMember {
+            did: DID(newcomer.to_owned()),
+            role: "moderator".to_owned(),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000aa";
+        let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
+        assert!(
+            result.is_ok(),
+            "AddMember with a valid defined role must succeed, got: {result:?}"
+        );
+
+        // The newcomer is now a member with the requested role.
+        assert!(
+            mgr.is_member(context_id, newcomer),
+            "a successful AddMember must add the newcomer to `members`"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, newcomer).as_deref(),
+            Some("moderator"),
+            "a successful AddMember must assign the requested defined role"
+        );
+
+        // The member's sequence counter is seeded.
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(newcomer),
+            Some(0),
+            "a successful AddMember must seed the new member's sequence counter"
+        );
+
+        // Exactly one MemberJoined buffer event was emitted for the newcomer.
+        let joined = mgr
+            .drain_events(context_id)
+            .into_iter()
+            .filter(|e| matches!(e, ContextEvent::MemberJoined { member_did, .. } if member_did.0 == newcomer))
+            .count();
+        assert_eq!(
+            joined, 1,
+            "a successful AddMember must push exactly one MemberJoined buffer event for the newcomer"
         );
     }
 
