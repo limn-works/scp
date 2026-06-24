@@ -64,10 +64,12 @@ use crate::validate;
 ///
 /// Contains the token metadata accessible to Python code: a unique token ID
 /// (derived from the nonce), the issuer DID, the audience DID, the list of
-/// granted capabilities, and an optional expiry timestamp.
+/// granted capabilities, an optional expiry timestamp, and the encoded JWT.
 ///
-/// The raw signature and encoded JWT are not exposed -- they are internal
-/// to the Rust crypto layer and not needed by Python callers.
+/// The encoded JWT is exposed so callers can feed a freshly minted token back
+/// into `ucan_validate` / `ucan_evaluate` / `ucan_delegate` (which all take the
+/// JWT string), matching the `encoded` accessor the NAPI and `UniFFI` bridges
+/// already expose. The raw signature remains internal to the Rust crypto layer.
 ///
 /// See ADR-016 (UCAN validation) and ADR-013 §6 (bridge layer).
 #[pyclass(name = "UcanToken")]
@@ -101,6 +103,14 @@ pub struct PyUcanToken {
     /// chain. Empty for root tokens issued by the context creator.
     #[pyo3(get)]
     pub proofs: Vec<String>,
+
+    /// Encoded JWT string (`header.payload.signature`).
+    ///
+    /// The full wire form of the token, suitable for passing back into
+    /// `ucan_validate` / `ucan_evaluate` / `ucan_delegate`. Mirrors the
+    /// `encoded` accessor on the NAPI `NapiUcanToken` and `UniFFI` `UcanToken`.
+    #[pyo3(get)]
+    pub encoded: String,
 
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
     ///
@@ -519,6 +529,7 @@ impl crate::scp::PyScp {
             // Unix timestamp seconds fit in f64 mantissa for centuries.
             #[allow(clippy::cast_precision_loss)]
             expires_at: Some(token.payload.exp as f64),
+            encoded: token.encoded,
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
@@ -643,6 +654,7 @@ impl crate::scp::PyScp {
             capabilities: capability_uris,
             #[allow(clippy::cast_precision_loss)]
             expires_at: Some(token.payload.exp as f64),
+            encoded: token.encoded,
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }

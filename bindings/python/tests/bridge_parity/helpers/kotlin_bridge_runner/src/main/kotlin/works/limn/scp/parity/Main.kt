@@ -466,6 +466,35 @@ private suspend fun opUcanEvaluateMalformed(args: JsonObject): JsonObject =
         }
     }
 
+private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        // Mint a VALID root token granting `messages:read`, then evaluate it
+        // requiring `messages:write` (a capability the token does NOT grant).
+        // Core evaluate_ucan short-circuits at grant-match and returns the
+        // partial-false struct WITHOUT throwing — the no-throw counterpart to
+        // opUcanEvaluateMalformed. All six booleans are compared across bridges.
+        val memberDid = args["member_did"]?.jsonPrimitive?.content
+            ?: "did:dht:zparitymemberparitymemberparitymemberparitymember"
+        val capabilities = (args["capabilities"] as? kotlinx.serialization.json.JsonArray)
+            ?.map { it.jsonPrimitive.content }
+            ?: listOf("messages:read")
+        val requiredCap = args["required_capability"]?.jsonPrimitive?.content ?: "messages:write"
+        val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams(ceiling))
+        val token = scp.ucanMint(handle, memberDid, capabilities, null)
+        val required = "scp:ctx:${handle.contextId()}/$requiredCap"
+        val result = scp.ucanEvaluate(handle, token.encoded(), required, null, null)
+        buildJsonObject {
+            put("tokens_valid", JsonPrimitive(result.tokensValid))
+            put("signatures_valid", JsonPrimitive(result.signaturesValid))
+            put("within_ceiling", JsonPrimitive(result.withinCeiling))
+            put("nonce_valid", JsonPrimitive(result.nonceValid))
+            put("not_revoked", JsonPrimitive(result.notRevoked))
+            put("time_bounds_valid", JsonPrimitive(result.timeBoundsValid))
+        }
+    }
+
 @Suppress("UnusedParameter")
 private suspend fun opTransportStatus(args: JsonObject): JsonObject =
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
@@ -625,6 +654,7 @@ private suspend fun dispatch(req: RawRequest): String {
             "ucan_mint" -> opUcanMint(req.args)
             "ucan_validate_malformed" -> opUcanValidateMalformed(req.args)
             "ucan_evaluate_malformed" -> opUcanEvaluateMalformed(req.args)
+            "ucan_evaluate_structured" -> opUcanEvaluateStructured(req.args)
             "transport_status" -> opTransportStatus(req.args)
             "event_log_query_filtered" -> opEventLogQueryFiltered(req.args)
             "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)

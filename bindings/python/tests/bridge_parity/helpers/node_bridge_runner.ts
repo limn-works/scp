@@ -394,6 +394,12 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opUcanEvaluateMalformed(req),
         };
+      case "ucan_evaluate_structured":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opUcanEvaluateStructured(req),
+        };
       case "transport_status":
         return {
           id: req.id,
@@ -813,6 +819,65 @@ async function opUcanEvaluateMalformed(
     return { error: { type: "unknown", code: "UNKNOWN" } };
   }
   return { error: { type: "none", code: "NONE" } };
+}
+
+async function opUcanEvaluateStructured(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  // Mint a VALID root token granting `messages:read`, then evaluate it
+  // requiring `messages:write` (a capability the token does NOT grant). Core
+  // `evaluate_ucan` short-circuits at grant-match, returning the partial-false
+  // struct {tokensValid:true, signaturesValid:false, ...rest false} WITHOUT
+  // throwing. This is the no-throw counterpart to opUcanEvaluateMalformed.
+  const memberDid = String(req.args.member_did);
+  const capabilities = (req.args.capabilities as string[]) ?? ["messages:read"];
+  const requiredCap = String(req.args.required_capability ?? "messages:write");
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan-es", mode: "encrypted", ceiling };
+  if (req.bridgeMode === "napi") {
+    const scp = await newNapiScp();
+    const identity = await scp.identityCreate("in_memory");
+    const handle = await scp.contextCreate(identity, JSON.stringify(params));
+    const token = await scp.ucanMint(handle, memberDid, capabilities);
+    const required = `scp:ctx:${handle.contextId}/${requiredCap}`;
+    const result = await scp.ucanEvaluate(handle, token.encoded, required);
+    return {
+      tokens_valid: result.tokensValid,
+      signatures_valid: result.signaturesValid,
+      within_ceiling: result.withinCeiling,
+      nonce_valid: result.nonceValid,
+      not_revoked: result.notRevoked,
+      time_bounds_valid: result.timeBoundsValid,
+    };
+  }
+  // WASM: no in-bridge key custody (ADR-034) — minting throws, so this op is
+  // xfail'd for WASM. We still attempt it so the strict xfail observes the
+  // expected failure rather than silently passing.
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const contextId = handle.contextId ?? handle.context_id;
+  const token = await raw.ucan_mint(
+    handle,
+    memberDid,
+    JSON.stringify(capabilities),
+  );
+  const required = `scp:ctx:${contextId}/${requiredCap}`;
+  const result = await raw.ucan_evaluate(
+    handle,
+    token.encoded,
+    required,
+    identity.did,
+    undefined,
+  );
+  return {
+    tokens_valid: result.tokensValid,
+    signatures_valid: result.signaturesValid,
+    within_ceiling: result.withinCeiling,
+    nonce_valid: result.nonceValid,
+    not_revoked: result.notRevoked,
+    time_bounds_valid: result.timeBoundsValid,
+  };
 }
 
 async function opTransportStatus(

@@ -39,6 +39,10 @@ class UcanToken:
             ``None`` if the token does not expire.
         proofs: Proof chain — CIDs/IDs of parent UCAN tokens forming the
             delegation chain. Empty for root tokens.
+        encoded: The encoded JWT string (``header.payload.signature``).
+            Pass this back into :meth:`scp_sdk.SCP.ucan_validate`,
+            :meth:`scp_sdk.SCP.ucan_evaluate`, or
+            :meth:`scp_sdk.SCP.ucan_delegate`.
     """
 
     #: Unique token identifier (derived from the UCAN nonce).
@@ -60,6 +64,11 @@ class UcanToken:
     #: chain. Empty for root tokens.
     proofs: list[str] = field(default_factory=list)
 
+    #: Encoded JWT string (``header.payload.signature``) — the wire form of
+    #: the token, suitable for passing back into ``ucan_validate`` /
+    #: ``ucan_evaluate`` / ``ucan_delegate``.
+    encoded: str = ""
+
     @classmethod
     def _from_bridge(cls, bridge_token: object) -> UcanToken:
         """Construct a :class:`UcanToken` from a ``_scp_core.UcanToken``.
@@ -79,6 +88,7 @@ class UcanToken:
             capabilities=list(bridge_token.capabilities),  # type: ignore[attr-defined]
             expires_at=bridge_token.expires_at,  # type: ignore[attr-defined]
             proofs=list(bridge_token.proofs),  # type: ignore[attr-defined]
+            encoded=bridge_token.encoded,  # type: ignore[attr-defined]
         )
 
 

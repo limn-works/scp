@@ -2404,3 +2404,98 @@ async fn evaluate_ucan_reports_expired_token() {
          stages true: {result:?}"
     );
 }
+
+/// Regression guard for the structured `ucan_evaluate` contract that the
+/// cross-bridge parity op (`OP_UCAN_EVALUATE_STRUCTURED` in
+/// `seed_operations.py`) drives end-to-end: a parseable, validly-signed root
+/// token evaluated against a capability it does NOT grant returns a
+/// PARTIAL-FALSE struct WITHOUT throwing, the field mapping short-circuits at
+/// the failing stage, and repeated evaluation is byte-identical (read-only).
+///
+/// Concretely: mint a valid token granting `messages:read`, then evaluate it
+/// requiring `messages:write`. The step-6 invoked-capability grant-match fails
+/// (the token's `att` set has no `messages:write`), so the failure lands in the
+/// `signatures_valid` stage: `tokens_valid: true` (parse ran and passed),
+/// `signatures_valid: false` (grant-match failed), and every later field false
+/// (those stages never ran). Evaluating twice yields the EXACT same struct,
+/// proving the call records nothing.
+///
+/// This is the no-throw partial-struct counterpart to the malformed-token path
+/// (which throws before the pipeline runs). The all-true read-only-nonce
+/// invariant is pinned separately by
+/// `evaluate_ucan_does_not_consume_nonce_but_validate_does`; this test pins the
+/// determinism of a MID-PIPELINE failure.
+#[tokio::test]
+async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    // Token grants ONLY messages:read.
+    let caps = vec!["messages:read".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-ungranted",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    // Ceiling permits both caps so the divergence is purely the ungranted
+    // INVOKED capability (grant-match), not the ceiling check — matching the
+    // parity op's construction exactly.
+    let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
+        .into_iter()
+        .collect();
+    // Evaluate requiring messages:write — a capability the token does NOT grant.
+    let required_cap = CapabilityUri::new("ctx-eval-ungranted", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let expected = CapabilityValidation {
+        tokens_valid: true,
+        signatures_valid: false,
+        within_ceiling: false,
+        nonce_valid: false,
+        not_revoked: false,
+        time_bounds_valid: false,
+    };
+
+    let first = evaluate_ucan(&token, &required_cap, &ctx);
+    let second = evaluate_ucan(&token, &required_cap, &ctx);
+
+    assert_eq!(
+        first, expected,
+        "ungranted invoked capability must report tokens_valid=true, \
+         signatures_valid=false, rest false (no throw): {first:?}"
+    );
+    assert_eq!(
+        first, second,
+        "evaluate_ucan must be deterministic / side-effect-free across repeated \
+         calls on a mid-pipeline failure: {first:?} {second:?}"
+    );
+}
