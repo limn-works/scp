@@ -176,6 +176,61 @@ impl WasmMlsGroup {
             .map_err(|e| WasmCryptoError::RemoveMemberFailed(format!("serializing commit: {e}")))
     }
 
+    /// Resolves the [`LeafNodeIndex`] of the group member whose SCP credential
+    /// carries `member_did`.
+    ///
+    /// Scans every current group member, decodes each member's
+    /// [`BasicCredential`] into a [`WasmScpCredential`], and returns the leaf
+    /// index of the first member whose `did` matches. Returns `Ok(None)` when
+    /// no current member carries that DID.
+    ///
+    /// Mirrors native `find_leaf_index_by_did`
+    /// (`scp_runtime::crypto::mls::wrapping_extension`): MLS does not key its
+    /// tree by DID, so removal-by-DID must map the SCP identity to its leaf
+    /// before calling [`remove_member`](Self::remove_member).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
+    /// destroyed.
+    pub fn leaf_index_for_did(
+        &self,
+        member_did: &str,
+    ) -> Result<Option<LeafNodeIndex>, WasmCryptoError> {
+        let g = self.group.as_ref().ok_or(WasmCryptoError::GroupDestroyed)?;
+        for member in g.members() {
+            if let Ok(basic) = BasicCredential::try_from(member.credential.clone())
+                && let Ok(scp_cred) = WasmScpCredential::from_bytes(basic.identity())
+                && scp_cred.did == member_did
+            {
+                return Ok(Some(member.index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Removes the group member identified by `member_did`, returning the
+    /// TLS-serialized commit that evicts them from the MLS group.
+    ///
+    /// Resolves the DID to its leaf via [`leaf_index_for_did`](Self::leaf_index_for_did)
+    /// and delegates to [`remove_member`](Self::remove_member). The governance
+    /// layer has ALREADY verified the member is in the context before calling
+    /// this, so a missing MLS leaf is a real native↔WASM state divergence — it
+    /// fails loudly rather than silently skipping the cryptographic eviction
+    /// (the removed member would otherwise keep the group key schedule).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
+    /// destroyed, or [`WasmCryptoError::RemoveMemberFailed`] if no MLS leaf
+    /// carries `member_did` or the underlying remove fails.
+    pub fn remove_member_by_did(&mut self, member_did: &str) -> Result<Vec<u8>, WasmCryptoError> {
+        let leaf_index = self.leaf_index_for_did(member_did)?.ok_or_else(|| {
+            WasmCryptoError::RemoveMemberFailed(format!("no MLS leaf for DID '{member_did}'"))
+        })?;
+        self.remove_member(&leaf_index)
+    }
+
     /// Joins a group from a Welcome message.
     ///
     /// The `welcome_bytes` must be TLS-serialized `MlsMessageOut` bytes
@@ -449,6 +504,79 @@ mod tests {
 
         assert_eq!(alice_group.epoch().unwrap(), 1);
         assert_eq!(bob_group.epoch().unwrap(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn leaf_index_for_did_resolves_added_member_and_remove_by_did_evicts() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bytes, _bob_holder) = WasmMlsGroup::generate_key_package(&bob_cred).unwrap();
+        let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).unwrap();
+        alice_group.add_member(bob_kp_in).unwrap();
+
+        // Bob's DID resolves to a real leaf index (the second leaf — Alice is
+        // the creator at leaf 0).
+        let bob_index = alice_group
+            .leaf_index_for_did(&bob_cred.did)
+            .unwrap()
+            .expect("Bob's DID must resolve to an MLS leaf after add");
+        let alice_index = alice_group
+            .leaf_index_for_did(&alice_cred.did)
+            .unwrap()
+            .expect("Alice's DID must resolve to her own leaf");
+        assert_ne!(
+            bob_index, alice_index,
+            "Alice and Bob must occupy distinct leaves"
+        );
+
+        // A DID that is not a member resolves to None (not an error).
+        assert!(
+            alice_group
+                .leaf_index_for_did("did:dht:z6MkNotAMember")
+                .unwrap()
+                .is_none(),
+            "a non-member DID must resolve to None"
+        );
+
+        // remove_member_by_did evicts Bob and advances the epoch.
+        let epoch_before = alice_group.epoch().unwrap();
+        let commit = alice_group.remove_member_by_did(&bob_cred.did).unwrap();
+        assert!(!commit.is_empty(), "eviction must produce a commit");
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before + 1,
+            "removing a member must advance the MLS epoch"
+        );
+
+        // Bob is no longer resolvable after eviction.
+        assert!(
+            alice_group
+                .leaf_index_for_did(&bob_cred.did)
+                .unwrap()
+                .is_none(),
+            "the evicted member's DID must no longer resolve to a leaf"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_errors_for_non_member() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        // No member with this DID exists — governance would never reach here in
+        // production (it verifies membership first), so an MLS miss is a real
+        // divergence and must surface as an error, not a silent no-op.
+        let err = alice_group
+            .remove_member_by_did("did:dht:z6MkGhostMember")
+            .expect_err("removing a non-member by DID must error");
+        assert!(
+            matches!(err, WasmCryptoError::RemoveMemberFailed(_)),
+            "missing-leaf removal must be a RemoveMemberFailed error, got {err:?}"
+        );
     }
 
     // NOTE: OpenMLS cannot decrypt your own messages. A two-party setup is

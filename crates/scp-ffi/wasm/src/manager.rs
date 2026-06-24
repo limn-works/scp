@@ -3158,7 +3158,17 @@ impl WasmContextManager {
         let (proposal_created_at, action) = proposal_created_at;
         let action = &action;
 
-        let result = self.dispatch_governance_action(context_id, action);
+        // `proposal_created_at` is the convergent committer-assigned leaf
+        // timestamp (the executed proposal's signed `created_at`). It is threaded
+        // into dispatch so the `RemoveMember` arm can append its OWN durable
+        // `MemberLeft` leaf with the SAME convergent timestamp the
+        // `GovernanceActionExecuted` leaf below uses — mirroring native's
+        // per-action `execute_remove_member`, which appends `MemberLeft` BEFORE
+        // `finalize_governance_action` appends `GovernanceActionExecuted`. Using
+        // `crate::time::now_secs()` here would diverge across members and break
+        // the §9.9.3 equal-count/equal-root equivocation invariant.
+        let result =
+            self.dispatch_governance_action(context_id, action, executor_did, proposal_created_at);
 
         // Roll back on failure.
         if result.is_err()
@@ -3265,6 +3275,15 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         action: &GovernanceAction,
+        // The committing member (executor) — stamped as the convergence-critical
+        // `actor_did` on any per-action durable leaf this dispatch appends (e.g.
+        // the `MemberLeft` leaf for `RemoveMember`), byte-identical to native
+        // (§9.9.3; ADR-031 §8 "executor DID").
+        executor_did: &str,
+        // The convergent committer-assigned leaf timestamp (the executed
+        // proposal's signed `created_at`), used for any per-action durable leaf
+        // this dispatch appends — NEVER local `now()`.
+        timestamp_secs: u64,
     ) -> Result<serde_json::Value, ScpWasmError> {
         // Per-action CONTEXT-CEILING gate, identical to native's per-action
         // `ceiling.contains(&Capability::X)` gates in `dispatch_governance_action`
@@ -3290,7 +3309,7 @@ impl WasmContextManager {
                 self.dispatch_add_member(context_id, did, role)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.dispatch_remove_member(context_id, did)
+                self.dispatch_remove_member(context_id, did, executor_did, timestamp_secs)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -3432,6 +3451,8 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         did: &str,
+        executor_did: &str,
+        timestamp_secs: u64,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
         let removed = ctx
@@ -3448,10 +3469,56 @@ impl WasmContextManager {
         {
             let _ = bc.block_author(did);
         }
+
+        // MLS eviction is the HARD security boundary (mirrors native
+        // `execute_remove_member`, which removes from the MLS group FIRST). On
+        // an encrypted context: evict the member from the MLS group, drop their
+        // stored sender key, then rotate the local sender key so the removed
+        // member's knowledge of any prior sender key grants no future plaintext
+        // (§9.16.4). On a broadcast / unencrypted context (`crypto.is_none()`)
+        // there is no MLS group — the commit is empty, matching native's
+        // non-MLS no-op. The rotated `local_sender_key` is lazily redistributed
+        // on the next send, so there is no separate sender-key delivery step on
+        // WASM (the HPKE pending-redistribution queue native maintains is a
+        // genuine no-op here, not a stub).
+        let commit = if let Some(crypto) = ctx.crypto.as_mut() {
+            let commit =
+                crypto
+                    .governance_remove_from_group(did)
+                    .map_err(|e| ScpWasmError::Crypto {
+                        message: e.to_string(),
+                        code: codes::CRYPTO_4011.to_owned(),
+                    })?;
+            crypto.governance_remove_sender_key(did);
+            crypto.governance_rotate_sender_key();
+            commit
+        } else {
+            Vec::new()
+        };
+
+        // Buffer event for local subscribers (mirrors native's `emit`).
         ctx.push_event(ContextEvent::MemberLeft {
             member_did: DID(did.to_owned()),
         });
-        Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
+
+        // Durable `MemberLeft` leaf — appended BEFORE the wrapper's
+        // `GovernanceActionExecuted` leaf, matching native's ordering
+        // (`execute_remove_member` appends `MemberLeft` inside the commit closure;
+        // `finalize_governance_action` appends `GovernanceActionExecuted` after).
+        // The leaf carries the convergent committer-assigned `executor_did` +
+        // `timestamp_secs` and an EMPTY payload, byte-identical to native's
+        // `append_context_event(EventType::MemberLeft, actor_did, timestamp_secs)`
+        // (which uses `EventPayload::default()`). The target DID lives in the
+        // buffer event only, never in the durable leaf (§9.9.3).
+        ctx.append_log_event(EventType::MemberLeft, executor_did, b"", timestamp_secs);
+
+        // Return the eviction commit (hex) so the relay can distribute it to the
+        // remaining members; empty for non-MLS contexts.
+        Ok(serde_json::json!({
+            "action": "RemoveMember",
+            "did": did,
+            "commit": crate::runtime::encode_hex(&commit),
+        }))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.
@@ -9369,6 +9436,118 @@ mod tests {
         assert!(
             format!("{err:?}").contains("already been executed"),
             "replay rejection should name the executed proposal, got: {err:?}"
+        );
+    }
+
+    /// WASM half of the split cross-impl KAT for governance `RemoveMember`
+    /// (the native half is `cross_impl_remove_member_leaf_is_empty_and_precedes_executed`
+    /// in `crates/scp-runtime/tests/wasm_conformance.rs`). Drives the REAL
+    /// `execute_governance_action` path for a `RemoveMember` proposal and pins,
+    /// from the durable log:
+    /// - the `MemberLeft` leaf payload is EMPTY (the removed DID is buffer-only),
+    /// - its `actor_did` is the EXECUTOR (not the removed member),
+    /// - its `timestamp` is the convergent `proposal.created_at` (not local
+    ///   `now()`),
+    /// - it is appended BEFORE the `GovernanceActionExecuted` leaf.
+    ///
+    /// These are byte-for-byte the invariants native's `execute_remove_member` /
+    /// `finalize_governance_action` produce; a regression in any of them would
+    /// diverge the cross-platform `tree::root` and false-positive §9.9.3
+    /// equivocation.
+    #[test]
+    fn remove_member_appends_empty_member_left_leaf_before_executed_wasm() {
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        };
+
+        let context_id = "ctx-wasm-remove";
+        let proposer = "did:dht:z6MkWasmRemoveProposer";
+        let removed = "did:dht:z6MkWasmRemoveTarget";
+        let proposal_id = "beadfeed000000000000000000000000000000000000000000000000000000ff";
+        let created_at = 1_700_600_700_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(removed, "member");
+        // RemoveMember is NOT ceiling-gated at dispatch (authorization is at
+        // propose time) — see `dispatch_ceiling_capability`, so no ceiling seed
+        // is required here.
+
+        let action = GovernanceAction::RemoveMember {
+            did: DID::from(removed.to_owned()),
+            reason: None,
+        };
+        let proposal = GovernanceProposal {
+            proposal_id: {
+                let bytes = hex::decode(proposal_id).unwrap();
+                let mut arr = [0u8; 32];
+                arr[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+                arr
+            },
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(proposer.to_owned()),
+            action,
+            status: ProposalStatus::Approved,
+            created_at,
+            voting_deadline: created_at + 3600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(proposer.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: created_at,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        ctx.test_insert_resolved_proposal(proposal_id.to_owned(), proposal);
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let resolved_proposer = mgr
+            .proposal_proposer_did(context_id, proposal_id)
+            .expect("proposer resolvable");
+        mgr.execute_governance_action(context_id, proposer, &resolved_proposer, proposal_id)
+            .expect("approved RemoveMember proposal must execute");
+
+        let events = mgr.test_context_event_log_events(context_id);
+
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a durable MemberLeft leaf must be appended on RemoveMember");
+        assert!(
+            member_left.payload.data.is_empty(),
+            "the MemberLeft leaf payload must be empty (the removed DID is buffer-only)"
+        );
+        assert_eq!(
+            member_left.actor_did.as_ref(),
+            resolved_proposer,
+            "the MemberLeft leaf actor_did must be the executor, not the removed member"
+        );
+        assert_ne!(
+            member_left.actor_did.as_ref(),
+            removed,
+            "the MemberLeft leaf must NOT be stamped with the removed member's DID"
+        );
+        assert_eq!(
+            member_left.timestamp, created_at,
+            "the MemberLeft leaf timestamp must be the convergent proposal.created_at, \
+             never local now()"
+        );
+
+        let member_left_pos = events
+            .iter()
+            .position(|e| e.event_type == EventType::MemberLeft)
+            .expect("MemberLeft present");
+        let executed_pos = events
+            .iter()
+            .position(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted present");
+        assert!(
+            member_left_pos < executed_pos,
+            "the MemberLeft leaf must precede the GovernanceActionExecuted leaf, \
+             matching native execute_remove_member ordering"
         );
     }
 }
