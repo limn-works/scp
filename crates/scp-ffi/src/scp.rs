@@ -247,11 +247,13 @@ impl PyScp {
         Ok(())
     }
 
-    /// Resumes a suspended instance.
+    /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag so bridge operations can proceed. The
-    /// caller must re-establish the relay connection explicitly — resume
-    /// does not reconnect automatically.
+    /// Clears the suspended flag, then runs the async work in the
+    /// `BridgeInstanceCore::resume` default body (transport reconnect
+    /// from pending relay URLs, persisted-context restoration). The
+    /// caller does not need to re-establish the relay connection
+    /// explicitly — resume replays the pending relay URLs automatically.
     ///
     /// # Errors
     ///
