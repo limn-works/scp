@@ -1362,14 +1362,20 @@ export class SCP {
    * actions (`RemoveMember`) the JSON includes a `commit` field: a hex-encoded
    * MLS Commit that evicts the removed member from the group key schedule.
    *
-   * **Browser (WASM) callers MUST relay this `commit` to the other context
-   * members.** The WASM bridge has no internal transport (ADR-034) and performs
-   * no automatic broadcast or retry — unlike the native bridge, which
-   * auto-broadcasts the eviction commit. If a WASM caller does not distribute
-   * it, the MLS group silently forks: the remaining members never advance their
-   * epoch and never learn of the eviction. An empty `commit` string means no MLS
-   * commit was produced (broadcast/unencrypted context, or the removed member
-   * held no MLS leaf) and there is nothing to distribute.
+   * Commit distribution differs by backend:
+   * - **Native (NAPI) backend — this method.** This call routes through the
+   *   native addon, which has an internal transport and **auto-broadcasts** the
+   *   eviction `commit` to the other context members. The caller does not need
+   *   to relay it.
+   * - **Browser (WASM) backend.** The WASM bridge has no internal transport
+   *   (ADR-034) and performs no automatic broadcast or retry, so a WASM caller
+   *   **MUST relay the `commit`** it receives to the other context members. If
+   *   it does not, the MLS group silently forks: the remaining members never
+   *   advance their epoch and never learn of the eviction.
+   *
+   * Either way, an empty `commit` string means no MLS commit was produced
+   * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
+   * there is nothing to distribute.
    */
   async contextExecuteGovernanceAction(handle: unknown, proposalIdHex: string): Promise<string> {
     return await (

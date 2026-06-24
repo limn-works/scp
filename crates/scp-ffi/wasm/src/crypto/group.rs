@@ -840,10 +840,20 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn remove_member_by_did_short_circuits_on_self_did_before_scan() {
-        // The self-DID short-circuit (native provider.rs:1041) returns an
-        // empty-commit no-op BEFORE the leaf scan. On a single-member group
-        // there is no other leaf, so a removal of the OWN DID exercises the
-        // short-circuit path: empty commit, no epoch advance, no error.
+        // Self-removal on a SINGLE-member group: an own-DID removal is an
+        // empty-commit no-op (empty commit, no epoch advance, no error).
+        //
+        // NOTE — this test does NOT discriminate the self-DID short-circuit
+        // (native provider.rs:1041) from the own-leaf skip in
+        // `leaf_index_for_did` (native provider.rs:1060). On a single-member
+        // group both mechanisms independently yield the same empty no-op: even
+        // with the short-circuit removed, the own-leaf skip alone makes
+        // `leaf_index_for_did(own_did)` return `None`, so the result is
+        // identical. The test that actually isolates the short-circuit is
+        // `remove_member_by_did_self_did_does_not_evict_duplicate_leaf`, where a
+        // duplicate non-own leaf carries the local DID: only the short-circuit
+        // (returning BEFORE the scan) prevents that duplicate from being
+        // resolved and evicted. This test covers the common-case no-op shape.
         let alice_cred = test_credential("alice");
         let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
 

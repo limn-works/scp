@@ -3498,17 +3498,13 @@ impl WasmContextManager {
         // strip must not happen until eviction has actually succeeded; a retry
         // after a transient failure is safe.
         //
-        // The rotated `local_sender_key` denies the EVICTED member any future
-        // sender-layer plaintext, but the operative lockout for the evicted
-        // member is the MLS layer-2 eviction (epoch advance) itself: once the
-        // commit lands, the removed member can no longer derive the group keys,
-        // so MLS decryption of any later message fails regardless of sender-key
-        // state. WASM has no sender-key cross-member distribution path for
-        // encrypted (non-broadcast) MLS contexts — the rotated key is NOT
-        // attached to subsequent sends (`encrypt_message` emits only the
-        // double-ciphertext). That distribution gap is pre-existing and
-        // orthogonal to eviction; the eviction security property holds without
-        // it because the MLS epoch advance is the lockout.
+        // The operative lockout for the evicted member is the MLS layer-2
+        // eviction (epoch advance) itself: once the commit lands, the removed
+        // member can no longer derive the group keys, so MLS decryption of any
+        // later message fails. The sender-key rotation's role, and why WASM's
+        // missing cross-member sender-key distribution path is orthogonal to the
+        // eviction security property, are explained in full at
+        // `WasmCryptoState::governance_rotate_sender_key` (crypto/state.rs).
         //
         // Scope the `ctx.crypto.as_mut()` borrow tightly so the later
         // `ctx.members` / `ctx.broadcast_context` mutations can re-borrow `ctx`.
