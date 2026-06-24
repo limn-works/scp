@@ -291,20 +291,24 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 // malformed ceiling from bytes (the `#[serde(try_from)]` path). The shared type is
 // the single enforcement point both bridges share.
 //
-// `ceiling_validation_error` maps the shared `CeilingEntryError` to the canonical
-// `SCP-VALID-7000` bridge `Validation` error so the reject surface is identical
-// across the create / modify / import paths. The §5.3.1.1 grammar itself is
-// enforced exactly once by the shared type: `ContextRoleState::new` and
-// `set_ceiling` both run `CapabilityCeiling::validate_entries`, and import
-// validates the deserialized typed ceiling directly via `validate_entries`. No
-// separate WASM-side per-capability validator remains — the create path maps the
-// shared `RoleError::InvalidCeilingCategory` to `SCP-VALID-7000`, and the modify
-// path surfaces `set_ceiling`'s `CeilingEntryError` through
-// `ceiling_validation_error`.
+// The §5.3.1.1 grammar is enforced by the single shared
+// `CapabilityCeiling::validate_entries` on all three paths: create (via
+// `ContextRoleState::new`), modify (via `set_ceiling`), and import (the
+// deserialize belt — the `#[serde(try_from)]` path plus the explicit
+// post-deserialize `validate_entries` check). No separate WASM-side
+// per-capability validator remains.
+//
+// The error CLASS differs by path, however. Create and modify surface the
+// canonical `SCP-VALID-7000` `Validation` error (the create path maps the
+// shared `RoleError::InvalidCeilingCategory`, and the modify path maps
+// `set_ceiling`'s `CeilingEntryError` through `ceiling_validation_error`).
+// Import surfaces the `SCP-CTX-2032` deserialize error class instead, because a
+// malformed ceiling is rejected while decoding an untrusted snapshot envelope.
 
 /// Maps a ceiling-grammar error into the canonical WASM bridge validation error
-/// (`SCP-VALID-7000`), so the reject surface is identical across the create /
-/// modify / import paths.
+/// (`SCP-VALID-7000`). Used on the create and modify paths; the import path
+/// rejects a malformed ceiling at deserialize time and surfaces the
+/// `SCP-CTX-2032` deserialize error class instead.
 fn ceiling_validation_error(e: scp_protocol::context::roles::CeilingEntryError) -> ScpWasmError {
     ScpWasmError::Validation {
         message: e.to_string(),

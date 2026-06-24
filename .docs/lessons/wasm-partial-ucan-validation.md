@@ -1,5 +1,7 @@
 # WASM UCAN Validation Is Structurally Partial — Document It Accurately
 
+> **Resolved (since #1877 slice 1).** The structural partial-validation divergence this lesson warned about has been closed. The WASM bridge `ucan_validate` now delegates to the single shared pipeline `scp_protocol::crypto::ucan::validate::validate_ucan` via an extract-validate-writeback pattern — the same validation logic the native bridges run — rather than a WASM-local reimplementation. Relatedly, the flat `ceiling_strings: HashSet<String>` representation referenced below is **gone**: the ceiling now lives inside the shared `scp_protocol::context::roles::ContextRoleState` (`role_state.ceiling()`), enforced by the shared `CapabilityCeiling::validate_entries`. The rule below remains evergreen; the "current state" descriptions in the lower sections are historical (they describe the pre-convergence implementation).
+
 **Rule**: When a validation pipeline is partially implemented due to platform constraints, the docstring must accurately describe what IS checked, not claim full validation. False documentation of security properties is worse than no documentation.
 
 **Context (SCP-218)**: The WASM bridge `ucan_validate` docstring claimed "Performs full UCAN validation: signature verification, time bounds checking, delegation chain traversal, attenuation enforcement, nonce replay detection, and capability matching." In reality, the implementation performs: JWT format check, base64/JSON decode, expiry check, capability string match, and revocation check. Missing: Ed25519 signature verification, delegation chain traversal, root issuer check, audience DID validation, attenuation enforcement, ceiling check, nonce replay detection.
@@ -8,9 +10,9 @@
 
 **What full WASM validation requires**:
 - Ed25519 signature verification: requires `JsKeyCustody` wiring (SCP-214 analog for WASM) — WebCrypto API via injected JS callback
-- Nonce replay detection: `WasmContextRuntime` already has `revoked_tokens: HashSet<String>`; a nonce set can be added
+- Nonce replay detection: each `PerContextState` already has `revoked_tokens: HashSet<String>`; a nonce set can be added
 - Audience validation: check `payload["aud"]` against the presenting identity DID (parameter already available)
-- Ceiling check: `WasmContextRuntime` already has `ceiling_strings: HashSet<String>` — use it
+- Ceiling check: read the ceiling from the per-context role state (`role_state.ceiling()`). (Historically this described a flat `ceiling_strings: HashSet<String>` field on the per-context state; that field has since been removed — the ceiling now lives inside the shared `ContextRoleState`.)
 - Delegation chain: requires proof token resolution — possible with in-memory HashMap, matching PyO3 bridge pattern
 
 **Wildcard capability matching bug**: `can_str == "*"` must only match within the correct resource scope. Check `with_str` first, then allow wildcard on `can`. A token granting `scp:ctx:A/*` must not pass validation for `scp:ctx:B/messages:write`.
