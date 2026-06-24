@@ -146,7 +146,7 @@ async fn replay_mixed_states_resolves_each_per_classification() {
 
     // Build a supervisor — replay happens manually (not from new). This harness
     // wires no persistence provider, so it cannot obtain a `RestoredContexts`
-    // witness from a real `restore_all_contexts`; the `testing`-gated `for_test`
+    // witness from a real `restore_all_contexts`; the `saga-witness-test-mint`-gated `for_test`
     // mints the empty witness that proves restore-then-replay ordering to the
     // type system (these tests exercise the replay arms in isolation).
     let supervisor = build_supervisor(&storage);
