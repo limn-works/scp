@@ -335,7 +335,7 @@ impl MerkleEventLogProvider {
     ///
     /// Loads the events from the persistence backend, replays them through the
     /// Merkle tree (verifying chain integrity), and populates the in-memory
-    /// log. Called during `ContextManager::restore_context`.
+    /// log. Called during `Supervisor::restore_context`.
     ///
     /// If no persistence backend is configured or no events are found, the log
     /// is initialized empty.

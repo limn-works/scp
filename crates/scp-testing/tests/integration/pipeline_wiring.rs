@@ -896,16 +896,32 @@ fn restore_on_startup_runs_restore_before_replay() {
     );
 }
 
-// Bridge level (ADR-049 Phase 2D): every production startup/resume path MUST
+// Bridge level (ADR-049 Phase 2D): every production startup/resume path SHOULD
 // route through the combined `restore_on_startup` entry point — NOT call the
 // bare `restore_all_contexts` — so the saga-journal replay can never be skipped
 // on a real process restart. Guards against the "exported but never called from
 // the bootstrap path" regression.
 //
+// **This is a BEST-EFFORT source-order check, NOT the real enforcement.** A
+// substring scan cannot soundly distinguish "calls the combined entry" from
+// "merely names the token": a bridge could call `Supervisor::restore_all_contexts(&sup)`
+// via UFCS (no `.restore_all_contexts()` substring) plus a no-op
+// `restore_on_startup` shadow and still pass this gate. Hardening the locator
+// with more spellings is a non-convergent denylist (CLAUDE.md). The REAL
+// enforcement that the bridge path runs BOTH the restore and the replay legs is
+// the behavioral bootstrap integration test
+// `bridge_restore_entry_runs_restore_and_replay_legs`
+// (`crates/scp-testing/tests/integration/saga_bridge_bootstrap.rs`), which drives
+// the shared bridge entry `restore_all_persisted_contexts` over a real
+// persistence backend + durable saga journal and asserts a persisted context was
+// restored AND a crash-orphaned saga was reconciled to terminal. This gate is
+// kept as cheap defense-in-depth against the obvious "names the bare leg"
+// regression; its assertions are not weakened.
+//
 // `restore_all_contexts` is kept `pub` (the `scp-testing` persistence E2E drives
 // it directly), so a bridge COULD physically name the bare leg; this gate is the
-// enforcement that none does. It covers the shared bridge-instance core AND each
-// of the three FFI exports (PyO3 / napi / UniFFI), since each exports its own
+// best-effort check that none does. It covers the shared bridge-instance core AND
+// each of the three FFI exports (PyO3 / napi / UniFFI), since each exports its own
 // `context_restore_all`-shaped entry point.
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {

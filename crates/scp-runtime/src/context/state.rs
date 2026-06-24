@@ -782,7 +782,7 @@ pub struct ContextSnapshot {
     /// `ContextCryptoProvider::export_crypto_state`. Contains MLS group
     /// tree, epoch secrets, sender keys, and wrapping keys. Restored via
     /// `ContextCryptoProvider::restore_crypto_state` during
-    /// `ContextManager::restore_context`.
+    /// `Supervisor::restore_context`.
     ///
     /// Empty if no crypto state was exported (e.g., broadcast-only contexts
     /// or mock providers). See issue #645.

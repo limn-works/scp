@@ -111,18 +111,28 @@ impl CrossContextSagaSeal {
 /// evade); see the `compile_fail` doctest on [`Supervisor::replay_unresolved_sagas`].
 ///
 /// The construction discipline mirrors [`CrossContextSagaSeal`] and ADR-049 §5's
-/// `OwnedIdentityDid`: the `ids` field is PRIVATE and the only production
-/// constructor ([`Self::new`]) is module-private, so no external crate can forge
-/// a token to call replay without a real restore. (A clearly-named,
-/// `testing`-feature-gated [`Self::for_test`] exists ONLY for the saga-FSM
-/// integration suites in `crates/scp-runtime/tests/`, which drive replay in
-/// isolation over a harness that has no persistence provider to restore from;
-/// it is compiled out of every production build.)
-#[derive(Debug, Clone, Default)]
+/// `OwnedIdentityDid`. Construction is SEALED: the `ids` field is PRIVATE (no
+/// `RestoredContexts { ids: .. }` literal outside this module) and the only
+/// production constructor ([`Self::new`]) is module-private. There is NO
+/// `Default` impl (a derived `Default::default()` would be a public, zero-arg
+/// constructor reachable from any crate — a forge that mints an empty witness
+/// and voids the ordering guarantee), and no `Clone`. So no external crate can
+/// forge a token to call replay without a real restore. A dedicated-feature-
+/// gated `Self::for_test` (behind the `saga-witness-test-mint` cargo feature,
+/// which NO crate's non-dev `[dependencies]` enables — not even `testing`, so it
+/// cannot reach any production / `allow_in_memory_custody` build) exists ONLY for
+/// the saga-FSM integration suites in `crates/scp-runtime/tests/`, which drive
+/// replay in isolation over a harness with no persistence provider to restore
+/// from. The `ids` payload doubles as the public restored-id result returned by
+/// [`Self::restore_on_startup`]; it is not part of the ordering enforcement (the
+/// mere EXISTENCE of the witness is). The type stays `pub` so the `compile_fail`
+/// doctests (external-crate compiles) can reference it.
+#[derive(Debug)]
 pub struct RestoredContexts {
     /// The context IDs rehydrated by `restore_all_contexts` (hex id-form).
-    /// PRIVATE — only `restore_all_contexts` (or the `testing`-gated `for_test`)
-    /// can populate it, so the token cannot be forged outside this module.
+    /// PRIVATE — only `restore_all_contexts` (or the `saga-witness-test-mint`-
+    /// gated `for_test`) can populate it, so the token cannot be forged outside
+    /// this module.
     ids: Vec<String>,
 }
 
@@ -137,12 +147,19 @@ impl RestoredContexts {
     /// integration suites in `crates/scp-runtime/tests/`, which drive
     /// [`Supervisor::replay_unresolved_sagas`] in isolation over a harness that
     /// has NO persistence provider to restore from (so they cannot obtain a
-    /// token via the real `restore_all_contexts`).
+    /// token via the real `restore_all_contexts` — a `Supervisor::new` harness
+    /// leaves `helper_persistence` empty, so that restore returns
+    /// `PersistenceFailed`, not an empty token).
     ///
-    /// Gated behind the `testing` feature so it is compiled out of every
-    /// production build — a production caller physically cannot forge the
-    /// restore-ran witness, preserving the compile-time ordering guarantee.
-    #[cfg(feature = "testing")]
+    /// Gated behind the dedicated `saga-witness-test-mint` cargo feature, which
+    /// NO crate's non-dev `[dependencies]` enables — in particular it is NOT
+    /// implied by `testing`, so it cannot leak into an `allow_in_memory_custody`
+    /// build via the `scp-ffi → dep:scp-testing → scp-core{testing} →
+    /// scp-runtime/testing` chain. It is enabled only by the `required-features`
+    /// of the two `actor_saga_*` integration test targets. A production caller
+    /// therefore physically cannot forge the restore-ran witness, preserving the
+    /// compile-time ordering guarantee.
+    #[cfg(feature = "saga-witness-test-mint")]
     #[must_use]
     pub const fn for_test(ids: Vec<String>) -> Self {
         Self { ids }
@@ -1368,8 +1385,19 @@ impl Supervisor {
     /// journal write-ordering over co-resident actors. Production bootstrap goes
     /// through [`Self::with_providers`] (no-op journal); a durable journal is
     /// attached at the bridge layer.
+    ///
+    /// **Visibility (`pub`, intentional).** Kept `pub` so the bridge-path
+    /// bootstrap test (`scp-testing`, a separate crate) can construct a
+    /// supervisor that has BOTH a durable saga journal AND a populated
+    /// helper-persistence slot — the two ingredients a real
+    /// [`Self::restore_on_startup`] needs to exercise restore-then-replay
+    /// end-to-end through the FFI bridge entry. This does NOT widen the
+    /// journal-injection surface: the already-`pub` [`Self::new`] accepts an
+    /// arbitrary `Arc<dyn SagaJournal>` too, so any crate could already inject a
+    /// journal; this constructor merely adds the provider wiring that
+    /// [`Self::with_providers`] already exposes.
     #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
-    pub(in crate::context) fn with_providers_and_journal(
+    pub fn with_providers_and_journal(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
@@ -5515,16 +5543,20 @@ impl Supervisor {
     /// because the saga FSM + crash-recovery integration suites
     /// (`crates/scp-runtime/tests/`, separate crates) drive replay in isolation
     /// to test each per-state recovery arm. They obtain the required witness via
-    /// the `testing`-gated [`RestoredContexts::for_test`] (their harness has no
-    /// persistence provider to restore from). The production FFI bridges never
+    /// the `saga-witness-test-mint`-gated `RestoredContexts::for_test` (their
+    /// `Supervisor::new` harness wires no helper persistence, so the real
+    /// `restore_all_contexts` returns `PersistenceFailed` rather than an empty
+    /// token). The production FFI bridges never
     /// call this directly; they route through [`Self::restore_on_startup`], and
     /// the `bridge_resume_path_routes_through_restore_on_startup` structural
     /// gate enforces that no bridge bypasses the combined entry point.
     ///
-    /// # Compile-time ordering proof
+    /// # Compile-time ordering + forge-closure proofs
     ///
     /// Replay cannot be invoked without a `RestoredContexts` witness, so a
-    /// "replay first, restore second" bootstrap does not compile:
+    /// "replay first, restore second" bootstrap does not compile (this only
+    /// proves the witness is REQUIRED — the forge-closing doctests below prove
+    /// the witness cannot be MANUFACTURED without a real restore):
     ///
     /// ```compile_fail
     /// # use scp_runtime::context::supervisor::Supervisor;
@@ -5533,6 +5565,33 @@ impl Supervisor {
     /// // only way to get one is to call `restore_all_contexts` FIRST. Calling
     /// // replay with no witness (replay-before-restore) fails to compile.
     /// sup.replay_unresolved_sagas().await.unwrap();
+    /// # }
+    /// ```
+    ///
+    /// The witness cannot be forged via `Default` — there is no `Default` impl,
+    /// so `RestoredContexts::default()` is not a public zero-arg constructor (a
+    /// `Default` would let any crate mint an empty witness and bypass restore):
+    ///
+    /// ```compile_fail
+    /// # use scp_runtime::context::supervisor::{RestoredContexts, Supervisor};
+    /// # async fn demo(sup: &Supervisor) {
+    /// // ERROR[E0599]: no function or associated item named `default` found —
+    /// // `RestoredContexts` derives no `Default`, so it cannot be forged this way.
+    /// let forged = RestoredContexts::default();
+    /// sup.replay_unresolved_sagas(&forged).await.unwrap();
+    /// # }
+    /// ```
+    ///
+    /// The witness cannot be forged via a struct literal — the `ids` field is
+    /// private, so no external crate can name it:
+    ///
+    /// ```compile_fail
+    /// # use scp_runtime::context::supervisor::{RestoredContexts, Supervisor};
+    /// # async fn demo(sup: &Supervisor) {
+    /// // ERROR[E0451]: field `ids` of `RestoredContexts` is private — an external
+    /// // crate cannot construct the witness by naming its private payload.
+    /// let forged = RestoredContexts { ids: Vec::new() };
+    /// sup.replay_unresolved_sagas(&forged).await.unwrap();
     /// # }
     /// ```
     ///
@@ -18085,6 +18144,131 @@ mod tests {
         (supervisor, persistence)
     }
 
+    /// Stage a cross-context caller saga crashed at `PreparingB`: build a
+    /// real-journal supervisor over `persistence`, spawn the caller/target pair,
+    /// run the genuine FSM triple through `dispatch_xctx_prepare_a` (durably
+    /// staging the caller deduction + `CallerReservationRecord` on the live caller
+    /// actor + flushing it to persistence), void the must-use carrier, and journal
+    /// `Initiated`/`PreparingA`/`PreparingB`. This is the ~95%-shared setup of the
+    /// two `restore_on_startup` crash-recovery gates (the resident-caller in-pass
+    /// reversal and the order-discriminating restore-from-persistence reversal),
+    /// which differ only in the `CapturingPersistence` variant + whether the
+    /// caller is despawned before `restore_on_startup`.
+    ///
+    /// Returns `(supervisor, persistence, caller_hex, burst_milli)` — the full
+    /// burst the caller's hard-rate-limit token must be refunded to once the
+    /// crash-orphaned reversal lands. Leaves the `PreparingB` entry unresolved.
+    async fn stage_xctx_preparing_b_crash(
+        creator_did: &str,
+        creator_key_seed: u8,
+        caller_did: &str,
+        saga_id: &SagaId,
+        persistence: CapturingPersistence,
+    ) -> (Arc<Supervisor>, CapturingPersistence, String, u64) {
+        let creator_key =
+            ed25519_dalek::SigningKey::from_bytes(&[creator_key_seed; 32]).verifying_key();
+        let (supervisor, persistence) = xctx_supervisor_with_real_journal_persistence(
+            creator_did.to_owned(),
+            creator_key,
+            persistence,
+        );
+        let caller_state = xctx_caller_state(caller_did, creator_did).await;
+        let target_state = xctx_target_state(caller_did, creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        // The genuine FSM cross-context participants shape: the caller-provenance
+        // TRIPLE `[caller_hex, caller_did, tool_id]` (`saga_input_participants`),
+        // length 3 with a 64-hex first element — the xctx-caller path the
+        // 2-element wave-15 tests do NOT exercise (they take the evidence-
+        // reconstruction route).
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Journal `Initiated` (seq 0) + `PreparingA` (seq 1, empty evidence) then
+        // Prepare-A durably stages the caller deduction + reservation record on
+        // the live caller actor (the durable state a crash leaves behind), and
+        // journal `PreparingB` (seq 2, empty evidence — the genuine
+        // participant-keyed shape, so the reversal MUST come through the triple).
+        supervisor
+            .append_journal(saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+        supervisor
+            .dispatch_xctx_prepare_a(saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            // The flushed caller snapshot is Active, so a restore-enabled double
+            // can resurrect it after a despawn (the order-discriminating gate
+            // relies on this; the resident gate shares the same invariant).
+            assert_eq!(
+                snap.state,
+                scp_protocol::context::ContextState::Active,
+                "the flushed caller snapshot must be Active so restore_all_contexts resurrects it"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        // Balance the must-use carrier (lost-reply shape) so its drop guard does
+        // not fire; the durable record is what recovery reverses.
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        supervisor
+            .append_journal(saga_id, SagaState::PreparingB, &participants, 2, &[])
+            .await
+            .expect("journal PreparingB");
+
+        (supervisor, persistence, caller_hex, burst_milli)
+    }
+
     /// §6.2.4 review wave-15 — CRASH-RECOVERY symmetry with the live abort path.
     /// The startup `recover_saga_entry` `PreparingB` arm re-drives the prepared
     /// side(s) and then marks the journal terminal-`Aborted`. But the caller-side
@@ -18395,101 +18579,22 @@ mod tests {
     /// This test complements that one by exercising the genuine FSM triple over a
     /// resident caller end-to-end through `restore_on_startup`.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // full startup E2E: reserve + journal + restore_on_startup + assert
     async fn restore_on_startup_xctx_caller_reversal_delivered_entry_terminal() {
-        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
-
-        let creator_did = "did:dht:z6MkRestoreReplayResCreator".to_owned();
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
-        let (supervisor, persistence) =
-            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let creator_did = "did:dht:z6MkRestoreReplayResCreator";
         let caller_did = "did:dht:z6MkRestoreReplayResCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
-        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
-
-        let caller_hex = hex::encode(XCTX_CALLER);
-        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let saga_id = SagaId("restore-replay-resident-saga".to_owned());
-        // The genuine FSM cross-context participants shape: the caller-provenance
-        // TRIPLE `[caller_hex, caller_did, tool_id]` (`saga_input_participants`),
-        // length 3 with a 64-hex first element — the xctx-caller path the
-        // 2-element wave-15 tests do NOT exercise (they take the evidence-
-        // reconstruction route).
-        let participants = vec![
-            caller_hex.clone(),
-            caller_did.to_owned(),
-            XCTX_TOOL.to_owned(),
-        ];
-
-        let mut ctx = CrossContextSagaCtx {
-            caller_context_id: XCTX_CALLER,
-            target_context_id: XCTX_TARGET,
-            caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
-            ucan_proof_id: None,
-            input: serde_json::json!({ "a": 1, "b": 2 }),
-            asserted_chain_depth: 2,
-            asserted_nonce: [0x42u8; 16],
-            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
-            caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
-            executor: Some(Box::new(|_v: serde_json::Value| {
-                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
-            })),
-            executor_output: None,
-            prepared_a: None,
-            prepared_b: None,
-            committed: None,
-            committed_b_tool_invoked_event_id: None,
-            reached_needs_repair: false,
-        };
-
-        // Journal `Initiated` (seq 0) + `PreparingA` (seq 1, empty evidence) then
-        // Prepare-A durably stages the caller deduction + reservation record on
-        // the live caller actor (the durable state a crash leaves behind), and
-        // journal `PreparingB` (seq 2, empty evidence — the genuine
-        // participant-keyed shape, so the reversal MUST come through the triple).
-        supervisor
-            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
-            .await
-            .expect("journal Initiated");
-        supervisor
-            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
-            .await
-            .expect("journal PreparingA");
-        supervisor
-            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
-            .await
-            .expect("Prepare-A stages a real reservation");
-        let burst_milli = {
-            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
-            let token_after_reserve = snap
-                .hard_rate_limit_state
-                .get(caller_did)
-                .map(|(tokens, _)| *tokens)
-                .expect("reserve created a hard-rate-limit entry");
-            assert!(
-                snap.xctx_caller_reservations.contains_key(&saga_id),
-                "Prepare-A staged the durable caller reservation record"
-            );
-            token_after_reserve + 1000 // one token = 1000 milli-tokens
-        };
-        // Balance the must-use carrier (lost-reply shape) so its drop guard does
-        // not fire; the durable record is what recovery reverses.
-        if let Some(prepared) = ctx.prepared_a.take() {
-            prepared
-                .reservation
-                .ticket
-                .void_external_and_consume(supervisor.payment_adapter_ref())
-                .await;
-        }
-        supervisor
-            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
-            .await
-            .expect("journal PreparingB");
+        // Resident-caller gate: the caller is pre-spawned and the (default,
+        // restore-DISABLED) capturing persistence lists no contexts, so the
+        // restore leg is a no-op and the replay leg drives the reversal against
+        // the already-resident caller.
+        let (supervisor, persistence, _caller_hex, burst_milli) = stage_xctx_preparing_b_crash(
+            creator_did,
+            5,
+            caller_did,
+            &saga_id,
+            CapturingPersistence::default(),
+        )
+        .await;
 
         // Pre-condition: the saga is unresolved (the crash left it at PreparingB).
         let pre = supervisor
@@ -18572,109 +18677,22 @@ mod tests {
     /// witness and threaded by `restore_on_startup` — is what makes the reversal
     /// land in this single pass.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // full restore-from-persistence E2E: reserve + flush + despawn + restore_on_startup + assert
     async fn restore_on_startup_restores_caller_from_persistence_then_delivers_reversal() {
-        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
-
-        let creator_did = "did:dht:z6MkRestoreReplayFromPersistCreator".to_owned();
-        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let creator_did = "did:dht:z6MkRestoreReplayFromPersistCreator";
+        let caller_did = "did:dht:z6MkRestoreReplayFromPersistCaller";
+        let saga_id = SagaId("restore-from-persistence-saga".to_owned());
         // RESTORE-ENABLED capturing persistence: `list_persisted_contexts` lists
         // the flushed snapshots, so `restore_all_contexts` resurrects the caller.
-        let (supervisor, persistence) = xctx_supervisor_with_real_journal_persistence(
-            creator_did.clone(),
-            creator_key,
+        // The shared staging flushes the caller's Active snapshot (asserting it is
+        // Active) + the durable reservation record before journaling PreparingB.
+        let (supervisor, persistence, caller_hex, burst_milli) = stage_xctx_preparing_b_crash(
+            creator_did,
+            5,
+            caller_did,
+            &saga_id,
             CapturingPersistence::with_restore(),
-        );
-        let caller_did = "did:dht:z6MkRestoreReplayFromPersistCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
-        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
-
-        let caller_hex = hex::encode(XCTX_CALLER);
-        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
-        let saga_id = SagaId("restore-from-persistence-saga".to_owned());
-        // Genuine FSM cross-context provenance triple `[caller_hex, caller_did, tool_id]`.
-        let participants = vec![
-            caller_hex.clone(),
-            caller_did.to_owned(),
-            XCTX_TOOL.to_owned(),
-        ];
-
-        let mut ctx = CrossContextSagaCtx {
-            caller_context_id: XCTX_CALLER,
-            target_context_id: XCTX_TARGET,
-            caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
-            ucan_proof_id: None,
-            input: serde_json::json!({ "a": 1, "b": 2 }),
-            asserted_chain_depth: 2,
-            asserted_nonce: [0x42u8; 16],
-            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
-            caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
-            executor: Some(Box::new(|_v: serde_json::Value| {
-                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
-            })),
-            executor_output: None,
-            prepared_a: None,
-            prepared_b: None,
-            committed: None,
-            committed_b_tool_invoked_event_id: None,
-            reached_needs_repair: false,
-        };
-
-        // Journal Initiated + PreparingA, then real Prepare-A stages the durable
-        // caller deduction + reservation record on the LIVE caller actor.
-        supervisor
-            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
-            .await
-            .expect("journal Initiated");
-        supervisor
-            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
-            .await
-            .expect("journal PreparingA");
-        supervisor
-            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
-            .await
-            .expect("Prepare-A stages a real reservation");
-
-        // FLUSH the caller's snapshot to persistence — this is the durable state a
-        // crash leaves behind (deducted economy + the live reservation record).
-        // The restore-enabled double now LISTS + LOADS it, so `restore_all_contexts`
-        // can resurrect the caller after we despawn it.
-        let burst_milli = {
-            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
-            let token_after_reserve = snap
-                .hard_rate_limit_state
-                .get(caller_did)
-                .map(|(tokens, _)| *tokens)
-                .expect("reserve created a hard-rate-limit entry");
-            assert!(
-                snap.xctx_caller_reservations.contains_key(&saga_id),
-                "Prepare-A staged the durable caller reservation record (flushed to persistence)"
-            );
-            assert_eq!(
-                snap.state,
-                scp_protocol::context::ContextState::Active,
-                "the flushed caller snapshot must be Active so restore_all_contexts resurrects it"
-            );
-            token_after_reserve + 1000 // one token = 1000 milli-tokens
-        };
-        // Balance the must-use carrier (lost-reply shape) so its drop guard does
-        // not fire; the durable record is what recovery reverses.
-        if let Some(prepared) = ctx.prepared_a.take() {
-            prepared
-                .reservation
-                .ticket
-                .void_external_and_consume(supervisor.payment_adapter_ref())
-                .await;
-        }
-        supervisor
-            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
-            .await
-            .expect("journal PreparingB");
+        )
+        .await;
 
         // DESPAWN the caller actor: model a crash where the caller is NOT yet
         // resident at process start. The reversal can only be delivered once

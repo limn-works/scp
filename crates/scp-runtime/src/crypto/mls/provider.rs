@@ -2009,7 +2009,7 @@ impl MlsCryptoProvider {
     /// Restores per-context cryptographic state from a previously exported
     /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
     ///
-    /// Called during `ContextManager::restore_context` to reinstate MLS
+    /// Called during `Supervisor::restore_context` to reinstate MLS
     /// groups and sender keys after a process restart. If `data` is empty,
     /// this is a no-op (the provider was never persisted or is a mock).
     ///

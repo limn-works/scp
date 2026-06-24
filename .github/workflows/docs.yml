@@ -84,7 +84,7 @@ jobs:
         # runtime surface used by CI/tests.
         run: |
           cargo doc --workspace --no-deps --document-private-items \
-            --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing
+            --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
       - uses: actions/upload-artifact@v4
         with:
           name: docs-rust
