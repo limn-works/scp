@@ -1855,14 +1855,27 @@ impl WasmContextManager {
             });
         }
 
+        // `system_assign_role` requires the DID to already be in `members`, so
+        // insert first and seed the MLS sequence counter; on assignment failure
+        // roll BOTH the `members` insert and the sequence seed back so a
+        // rejected join leaves NO partial membership behind (fail-closed
+        // atomicity — mirrors `dispatch_add_member` / `subscribe_broadcast`).
+        // The error is unreachable today for the built-in "member" role, but
+        // uniform atomicity at this security-relevant invariant is the correct
+        // posture across all three membership-add paths.
         ctx.role_state.members.insert(member_did.to_owned());
         ctx.member_sequence_numbers.insert(member_did.to_owned(), 0);
-        ctx.role_state
-            .system_assign_role(member_did, "member", &crate::time::WasmClock)
-            .map_err(|e| ScpWasmError::Context {
+        if let Err(e) =
+            ctx.role_state
+                .system_assign_role(member_did, "member", &crate::time::WasmClock)
+        {
+            ctx.role_state.members.remove(member_did);
+            ctx.member_sequence_numbers.remove(member_did);
+            return Err(ScpWasmError::Context {
                 message: format!("failed to assign 'member' role on join: {e}"),
                 code: codes::CTX_2015.to_owned(),
-            })?;
+            });
+        }
 
         ctx.push_event(ContextEvent::MemberJoined {
             member_did: DID(member_did.to_owned()),
@@ -10119,16 +10132,20 @@ mod tests {
         let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
 
-        // The rejection MUST be the role-not-found path: `map_role_error`
-        // surfaces `RoleError::RoleNotFound` as `ScpWasmError::Context` with
-        // `SCP-CTX-2015`. Asserting the exact error identity prevents the test
-        // from passing on an unrelated setup failure (wrong governance model,
-        // missing ceiling, etc.).
+        // `map_role_error` maps EVERY `RoleError` variant to
+        // `ScpWasmError::Context` with `SCP-CTX-2015` — there is no
+        // RoleNotFound-specific code; CTX_2015 is the generic mapped
+        // role-error code. The assertion is still meaningful because
+        // `RoleNotFound` is the ONLY role error reachable in this test's setup
+        // (a syntactically valid but undefined role name), so a CTX_2015 here
+        // can only be the role-not-found rejection. Asserting the exact code
+        // prevents the test from passing on an unrelated setup failure (wrong
+        // governance model, missing ceiling, etc.).
         match result {
             Err(ScpWasmError::Context { ref code, .. }) => assert_eq!(
                 code,
                 codes::CTX_2015,
-                "undefined-role ChangeRole must reject with the RoleNotFound code"
+                "undefined-role ChangeRole must reject with the generic CTX_2015 role-error code"
             ),
             other => panic!(
                 "ChangeRole to an undefined role MUST be rejected with a \
@@ -10211,12 +10228,14 @@ mod tests {
         let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000ff";
         let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
 
-        // Same RoleNotFound identity as the ChangeRole case.
+        // Same generic CTX_2015 role-error code as the ChangeRole case:
+        // `map_role_error` maps every `RoleError` to CTX_2015, and
+        // `RoleNotFound` is the only role error reachable in this setup.
         match result {
             Err(ScpWasmError::Context { ref code, .. }) => assert_eq!(
                 code,
                 codes::CTX_2015,
-                "undefined-role AddMember must reject with the RoleNotFound code"
+                "undefined-role AddMember must reject with the generic CTX_2015 role-error code"
             ),
             other => panic!(
                 "AddMember with an undefined role MUST be rejected with a \
@@ -10226,8 +10245,16 @@ mod tests {
 
         // `dispatch_add_member` rolls back BOTH the `members` insert and the
         // `member_sequence_numbers` seed on a rejected role assignment
-        // (fail-closed atomicity). Assert the newcomer left no partial
-        // membership behind — this is the only coverage of that rollback path.
+        // (fail-closed atomicity).
+        //
+        // The sequence-number assertion below is the LOAD-BEARING rollback
+        // proof: the seq is seeded BEFORE the fallible `system_assign_role`, so
+        // without the rollback it would be `Some(0)`; observing `None` proves
+        // the seed was rolled back. The `member_role == None` check is a
+        // supplementary "not a member" assertion — it does NOT by itself prove
+        // the rollback, because `system_assign_role` rejects an undefined role
+        // BEFORE writing any assignment, so `member_role` would read `None`
+        // even if the `members`-set insert had leaked.
         assert_eq!(
             mgr.member_role(context_id, newcomer),
             None,
@@ -10236,7 +10263,9 @@ mod tests {
         assert_eq!(
             mgr.contexts[context_id].test_member_sequence_number(newcomer),
             None,
-            "a rejected AddMember must roll back the newcomer's sequence-number seed"
+            "a rejected AddMember must roll back the newcomer's sequence-number seed \
+             (the load-bearing rollback proof: seeded before the fallible assign, so \
+             this would be Some(0) without the rollback)"
         );
     }
 
