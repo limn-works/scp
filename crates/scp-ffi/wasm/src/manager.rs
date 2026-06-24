@@ -1798,28 +1798,35 @@ impl WasmContextManager {
         Ok(())
     }
 
-    /// Joins a member to a context. Mirrors `ContextManager::join_context`.
+    /// Commits ONLY the in-memory membership state for a join — the
+    /// active-check, version/economy gates, the `role_state.members` insert,
+    /// the built-in "member" role assignment, and the `member_sequence_numbers`
+    /// seed — WITHOUT emitting the `MemberJoined` buffer event or appending the
+    /// durable `MemberJoined` Merkle leaf.
     ///
-    /// # Fail-closed economy gate (C2)
+    /// This split exists so the encrypted-join path can match the native
+    /// runtime's ordering (`crates/scp-runtime/src/context/lifecycle_helpers.rs`
+    /// join): MLS Welcome processing happens BEFORE the durable
+    /// `MemberJoined` leaf is appended (native Phase 5), so a failed Welcome
+    /// leaves NO durable trace in the event log. The public unencrypted
+    /// [`Self::join_context`] re-adds the buffer event + leaf immediately after
+    /// this helper (matching native's non-MLS join, which appends the leaf at
+    /// once); [`Self::join_context_encrypted`] defers them until after
+    /// `join_from_welcome` succeeds.
     ///
-    /// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline
-    /// because `scp-runtime` does not compile to `wasm32` (ADR-034). If the
-    /// stored `economic_policy` requires payment for any action, this method
-    /// rejects the join with `SCP-ECON-12096` regardless of whether
-    /// `spending_ucan_jwt` is `Some` or `None`. Accepting the join would be a
-    /// security lie: the SDK would tell the caller their spend was authorized
-    /// when it was never validated against a payment adapter, budget tracker,
-    /// velocity tracker, or hard rate limit token bucket.
-    ///
-    /// Free contexts are unaffected — the parameter is inspected only to
-    /// drive the rejection branch.
+    /// The fail-closed rollback on role-assign failure is preserved here: on a
+    /// rejected assignment BOTH the `members` insert and the sequence seed are
+    /// rolled back so a failed membership commit leaves nothing behind. Because
+    /// this helper appends NO leaf, an early return cannot orphan one.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active, the protocol version
-    /// is incompatible, the member is already joined, or the context's
-    /// economic policy requires payment (fail-closed).
-    pub fn join_context(
+    /// Returns [`ScpWasmError`] if the context is not active, the SDK protocol
+    /// version is incompatible (§13.4), the context's economic policy requires
+    /// a payment the WASM bridge cannot validate (ADR-034), the member has
+    /// already joined, or the built-in "member" role assignment fails (rolled
+    /// back, infallible by construction today).
+    fn join_context_membership_only(
         &mut self,
         context_id: &str,
         member_did: &str,
@@ -1884,11 +1891,55 @@ impl WasmContextManager {
             });
         }
 
+        Ok(())
+    }
+
+    /// Joins a member to a context. Mirrors `ContextManager::join_context`.
+    ///
+    /// Delegates the membership commit to [`Self::join_context_membership_only`],
+    /// then — since the unencrypted path has no MLS Welcome to process — emits
+    /// the `MemberJoined` buffer event and durable Merkle leaf immediately,
+    /// matching the native runtime's non-MLS join.
+    ///
+    /// # Fail-closed economy gate (C2)
+    ///
+    /// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline
+    /// because `scp-runtime` does not compile to `wasm32` (ADR-034). If the
+    /// stored `economic_policy` requires payment for any action, this method
+    /// rejects the join with `SCP-ECON-12096` regardless of whether
+    /// `spending_ucan_jwt` is `Some` or `None`. Accepting the join would be a
+    /// security lie: the SDK would tell the caller their spend was authorized
+    /// when it was never validated against a payment adapter, budget tracker,
+    /// velocity tracker, or hard rate limit token bucket.
+    ///
+    /// Free contexts are unaffected — the parameter is inspected only to
+    /// drive the rejection branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, the protocol version
+    /// is incompatible, the member is already joined, or the context's
+    /// economic policy requires payment (fail-closed).
+    pub fn join_context(
+        &mut self,
+        context_id: &str,
+        member_did: &str,
+        spending_ucan_jwt: Option<&str>,
+    ) -> Result<(), ScpWasmError> {
+        // Commit membership first. On any failure (inactive context, version
+        // mismatch, economy gate, already-joined, or the infallible-by-
+        // construction role assign) this returns Err having left no partial
+        // state — and crucially no durable leaf, since the helper appends none.
+        self.join_context_membership_only(context_id, member_did, spending_ucan_jwt)?;
+
+        // Unencrypted join has no MLS Welcome to process, so — matching the
+        // native runtime's non-MLS join — the `MemberJoined` buffer event and
+        // durable Merkle leaf are emitted immediately once membership commits.
+        let ctx = self.require_active_context_mut(context_id)?;
         ctx.push_event(ContextEvent::MemberJoined {
             member_did: DID(member_did.to_owned()),
             role_name: "member".to_owned(),
         });
-
         ctx.append_log_event(
             EventType::MemberJoined,
             member_did,
@@ -2265,29 +2316,41 @@ impl WasmContextManager {
                 code: codes::CRYPTO_4023.to_owned(),
             })?;
 
-        // First join the context normally (membership, events, etc.).
-        // Encrypted join doesn't carry a separate spending UCAN — the Welcome
-        // flow implies the adder already validated the join cost.
-        self.join_context(context_id, member_did, None)?;
+        // Commit ONLY the in-memory membership (no buffer event, no durable
+        // leaf yet). Encrypted join doesn't carry a separate spending UCAN —
+        // the Welcome flow implies the adder already validated the join cost.
+        //
+        // ORDERING MIRRORS NATIVE (`crates/scp-runtime/src/context/
+        // lifecycle_helpers.rs` join): MLS Welcome processing (native Phase
+        // 1-3) precedes the durable `MemberJoined` leaf append (native Phase
+        // 5). We therefore defer BOTH the `MemberJoined` buffer event AND the
+        // durable Merkle leaf until AFTER `join_from_welcome` succeeds. A
+        // failed Welcome thus leaves no durable trace — byte/ordering-parity
+        // with native, where a failed encrypted join produces NO leaf. (The
+        // unencrypted `join_context` still appends its leaf immediately,
+        // matching native's non-MLS join.)
+        self.join_context_membership_only(context_id, member_did, None)?;
 
-        // Then set up MLS crypto state from the Welcome.
+        // Process the MLS Welcome.
         //
         // REACHABLE-ROLLBACK: unlike the role-assign rollbacks elsewhere in
         // this file (which guard a built-in-role assignment that is infallible
         // by construction), `join_from_welcome` failure is genuinely reachable
         // — a malformed, stale, or otherwise un-processable Welcome (or any
-        // subsequent crypto-setup error) returns `Err`. The inner
-        // `join_context` above already committed full membership state
-        // (`role_state.members` + `assignments` + `member_capabilities` +
-        // `member_sequence_numbers`) and the pending key package was already
-        // consumed. If we returned the crypto error here without rolling that
-        // membership back, the joiner would be left as a PHANTOM member: full
-        // role/sequence/membership state, counted by `member_count` /
-        // `is_member` / `member_dids`, charged against `WASM_MEMBER_CAP`, and
-        // role-assignable — yet with no MLS leaf, so unable to decrypt or send.
-        // Strip the membership the inner `join_context` added before
-        // propagating the error so the failed join leaves NO partial
-        // membership behind (fail-closed atomicity).
+        // subsequent crypto-setup error) returns `Err`. The membership commit
+        // above already populated `role_state.members` + `assignments` +
+        // `member_capabilities` + `member_sequence_numbers`, and the pending
+        // key package was already consumed. If we returned the crypto error
+        // here without rolling that membership back, the joiner would be left
+        // as a PHANTOM member: full role/sequence/membership state, counted by
+        // `member_count` / `is_member` / `member_dids`, charged against
+        // `WASM_MEMBER_CAP`, and role-assignable — yet with no MLS leaf, so
+        // unable to decrypt or send. Strip the membership the helper added
+        // before propagating the error so the failed join leaves NO partial
+        // membership behind (fail-closed atomicity). No durable
+        // `MemberJoined` leaf was appended (it is deferred to post-success
+        // below), so the failed encrypted join also leaves no orphan leaf and
+        // no phantom buffered join event — matching native.
         let mls_group =
             match crate::crypto::group::WasmMlsGroup::join_from_welcome(welcome_bytes, holder) {
                 Ok(group) => group,
@@ -2301,7 +2364,7 @@ impl WasmContextManager {
                     // suspensions, MLS sequence counter) without those side
                     // effects. No crypto state was installed yet, so there is none
                     // to destroy. `require_active_context_mut` is reused because
-                    // the inner `join_context` may have re-borrowed `self`.
+                    // the membership helper may have re-borrowed `self`.
                     let ctx = self.require_active_context_mut(context_id)?;
                     ctx.role_state.members.remove(member_did);
                     ctx.role_state.assignments.remove(member_did);
@@ -2318,12 +2381,30 @@ impl WasmContextManager {
                 }
             };
 
+        // MLS succeeded. Install crypto state, THEN emit the `MemberJoined`
+        // buffer event + durable Merkle leaf LAST — native Phase 5 ordering,
+        // so the leaf appears only on a fully-successful encrypted join. The
+        // leaf content (actor_did = `member_did`, empty payload, committer-
+        // assigned `now_secs()` timestamp) is IDENTICAL to the unencrypted
+        // `join_context` leaf; only WHEN it is appended differs.
         let ctx = self.require_active_context_mut(context_id)?;
         ctx.crypto = Some(crate::crypto::WasmCryptoState {
             mls_group,
             local_sender_key: crate::crypto::sender_key::generate_sender_key(),
             sender_key_store: std::collections::HashMap::new(),
         });
+        ctx.push_event(ContextEvent::MemberJoined {
+            member_did: DID(member_did.to_owned()),
+            role_name: "member".to_owned(),
+        });
+        ctx.append_log_event(
+            EventType::MemberJoined,
+            member_did,
+            b"",
+            // Committer-assigned: this member's clock, the source of the
+            // join commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -11116,18 +11197,26 @@ mod tests {
         );
     }
 
-    /// `join_context_encrypted` must leave NO phantom member behind when the
-    /// MLS Welcome cannot be processed. The inner `join_context` commits full
-    /// membership state (the `members` set, role `assignments`,
-    /// `member_capabilities`, and the `member_sequence_numbers` seed) and
-    /// consumes the pending key package BEFORE `join_from_welcome` runs; a
-    /// malformed Welcome (here, empty bytes that fail TLS deserialization) is a
-    /// genuinely-reachable crypto error. Without the rollback the joiner would
-    /// be a phantom member, observable via `is_member`, `member_count`, and
-    /// `member_dids`, charged against `WASM_MEMBER_CAP`, and role-assignable,
-    /// yet with no MLS leaf. This test drives that failure and asserts the
-    /// failed join is fully atomic: the member is absent and the
-    /// sequence-number seed is gone.
+    /// `join_context_encrypted` must leave NO phantom member AND NO durable
+    /// trace behind when the MLS Welcome cannot be processed. The membership
+    /// commit (`members` set, role `assignments`, `member_capabilities`, and
+    /// the `member_sequence_numbers` seed) and the pending-key-package
+    /// consumption both happen BEFORE `join_from_welcome` runs; a malformed
+    /// Welcome (here, empty bytes that fail TLS deserialization) is a
+    /// genuinely-reachable crypto error.
+    ///
+    /// Without the membership rollback the joiner would be a phantom member,
+    /// observable via `is_member` / `member_count` / `member_dids`, charged
+    /// against `WASM_MEMBER_CAP`, and role-assignable, yet with no MLS leaf.
+    ///
+    /// CRITICALLY, the `MemberJoined` durable Merkle leaf and the receive-buffer
+    /// join event are deferred until AFTER the Welcome succeeds (native Phase 5
+    /// ordering). A failed Welcome must therefore leave the event-log leaf count
+    /// UNCHANGED (no orphan `MemberJoined` leaf) and drain NO `MemberJoined`
+    /// event — otherwise WASM's log would diverge from native, which produces
+    /// neither on a failed encrypted join (latent cross-impl equivocation). This
+    /// test drives the failure and asserts full atomicity across membership,
+    /// the durable log, and the receive buffer.
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn join_context_encrypted_rolls_back_membership_on_welcome_failure() {
@@ -11135,7 +11224,7 @@ mod tests {
         let creator = "did:dht:z6MkWasmJoinRollbackCreator";
         let joiner = "did:dht:z6MkWasmJoinRollbackJoiner";
 
-        // Active, unencrypted, no-payment context: the inner `join_context`
+        // Active, unencrypted, no-payment context: the membership-only commit
         // succeeds (joiner is not yet a member; the built-in "member" role
         // assign is infallible by construction), so control reaches the
         // reachable `join_from_welcome` failure path under test.
@@ -11145,7 +11234,7 @@ mod tests {
 
         // Populate the pending key package so `join_context_encrypted` does NOT
         // fail early at the CRYPTO_4023 "no pending key package" guard — we
-        // want it to proceed through the inner join and into `join_from_welcome`.
+        // want it to proceed through membership and into `join_from_welcome`.
         let kp_bytes = mgr
             .generate_key_package_for_join(context_id, joiner)
             .expect("key package generation must succeed for an active context");
@@ -11162,10 +11251,18 @@ mod tests {
         let count_before = mgr
             .member_count(context_id)
             .expect("active context has a member count");
+        // Baseline durable leaf count BEFORE the attempt. The fix appends the
+        // `MemberJoined` leaf only on Welcome success, so this must be
+        // unchanged after the failure below — the assertion that would have
+        // caught the orphan-leaf bug.
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
 
         // Empty welcome bytes fail TLS deserialization inside
-        // `join_from_welcome` (a reachable crypto error), so the inner
-        // `join_context`'s membership commit must be rolled back.
+        // `join_from_welcome` (a reachable crypto error), so the membership
+        // commit must be rolled back AND no durable leaf / buffer event may
+        // have been emitted.
         let result = mgr.join_context_encrypted(context_id, joiner, &[]);
         match result {
             Err(ScpWasmError::Crypto { ref code, .. }) => assert_eq!(
@@ -11202,8 +11299,114 @@ mod tests {
             mgr.contexts[context_id].test_member_sequence_number(joiner),
             None,
             "a failed encrypted join must roll back the joiner's sequence-number seed \
-             (it is seeded by the inner join_context before the reachable join_from_welcome \
-             failure, so this would be Some(0) without the rollback)"
+             (it is seeded by join_context_membership_only before the reachable \
+             join_from_welcome failure, so this would be Some(0) without the rollback)"
+        );
+
+        // Durable-log atomicity: no orphan `MemberJoined` leaf. The leaf is
+        // appended only AFTER `join_from_welcome` succeeds (native Phase 5),
+        // so a failed Welcome must leave the leaf count exactly as it was —
+        // this is the assertion that would have caught the original bug, where
+        // the leaf was appended by the inner join BEFORE the reachable Welcome
+        // failure and could not be un-appended from the append-only log.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before),
+            "a failed encrypted join must NOT append a durable MemberJoined leaf \
+             (append-only log cannot un-append it — WASM would diverge from native, \
+             which produces no leaf on a failed encrypted join)"
+        );
+        let drained = mgr.drain_events(context_id);
+        assert!(
+            !drained.iter().any(|e| matches!(
+                e,
+                ContextEvent::MemberJoined { member_did, .. } if member_did.0 == joiner
+            )),
+            "a failed encrypted join must NOT leave a phantom MemberJoined event \
+             in the receive buffer — it is pushed only after Welcome success"
+        );
+    }
+
+    /// Positive counterpart: a SUCCESSFUL encrypted join must append EXACTLY
+    /// ONE `MemberJoined` durable leaf and surface EXACTLY ONE buffered
+    /// `MemberJoined` event for the joiner. This guards against the reorder
+    /// regressing the happy path (dropping the deferred leaf/event entirely)
+    /// and confirms the leaf is emitted on success — native Phase 5 ordering.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn join_context_encrypted_appends_one_member_joined_leaf_on_success() {
+        use openmls::prelude::KeyPackageIn;
+        use tls_codec::Deserialize as _;
+
+        let context_id = "ctx-wasm-join-encrypted-success";
+        let creator = "did:dht:z6MkWasmJoinSuccessCreator";
+        let joiner = "did:dht:z6MkWasmJoinSuccessJoiner";
+
+        // The joining manager owns the context AND the joiner's key-package
+        // holder (stored by `generate_key_package_for_join` in
+        // `mgr.pending_key_packages`). `join_context_encrypted` consumes THAT
+        // holder, so the Welcome must be minted against the SAME key-package
+        // bytes this manager produced.
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        let joiner_kp_bytes = mgr
+            .generate_key_package_for_join(context_id, joiner)
+            .expect("key package generation must succeed for the joining manager");
+        assert!(!joiner_kp_bytes.is_empty());
+
+        // A separate creator MLS group adds the joiner's key package and mints
+        // the Welcome. `add_member` returns already-TLS-serialized
+        // `(commit_bytes, welcome_bytes)`.
+        let mut creator_crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+            .expect("MLS group creation must succeed for the creator");
+        let joiner_kp_in = KeyPackageIn::tls_deserialize(&mut &*joiner_kp_bytes)
+            .expect("key package deserializes");
+        let (_commit_bytes, welcome_bytes) = creator_crypto
+            .mls_group
+            .add_member(joiner_kp_in)
+            .expect("adding the joiner's key package must succeed");
+        assert!(!welcome_bytes.is_empty(), "the Welcome must carry bytes");
+
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
+
+        mgr.join_context_encrypted(context_id, joiner, &welcome_bytes)
+            .expect("a well-formed Welcome must let the encrypted join succeed");
+
+        // Membership committed.
+        assert!(
+            mgr.is_member(context_id, joiner),
+            "a successful encrypted join must leave the joiner as a member"
+        );
+        // EXACTLY ONE new durable MemberJoined leaf, appended last.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before + 1),
+            "a successful encrypted join must append exactly one MemberJoined leaf"
+        );
+        let leaves = mgr.test_context_event_log_events(context_id);
+        assert_eq!(
+            leaves
+                .iter()
+                .filter(|e| e.event_type == EventType::MemberJoined && e.actor_did.0 == joiner)
+                .count(),
+            1,
+            "exactly one MemberJoined leaf for the joiner must exist after success"
+        );
+        // EXACTLY ONE buffered MemberJoined event for the joiner.
+        let drained = mgr.drain_events(context_id);
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    ContextEvent::MemberJoined { member_did, .. } if member_did.0 == joiner
+                ))
+                .count(),
+            1,
+            "exactly one MemberJoined buffer event for the joiner must exist after success"
         );
     }
 
