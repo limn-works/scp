@@ -252,6 +252,149 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 // (§5.14.2 cohesion invariant — broadcast keys stored alongside context data).
 
 // ---------------------------------------------------------------------------
+// ValidatedCeilingStrings — the single validated WASM ceiling constructor
+// ---------------------------------------------------------------------------
+
+/// A capability ceiling stored as canonical UCAN-form `{resource}:{action}`
+/// strings, where EVERY entry is well-formed per the ceiling-entry grammar
+/// (spec §5.3.1.1) — guaranteed BY THE TYPE.
+///
+/// ADR-034: the WASM bridge does not use the native [`CapabilityCeiling`] type
+/// (it stores UCAN strings, not `Capability` enums), so this newtype gives the
+/// WASM path the analogous type-level guarantee the native validating
+/// `Deserialize` gives there. Its inner set is PRIVATE; the ONLY ways to build a
+/// non-empty value are the three validating constructors below, so a WASM
+/// ceiling cannot be set without parsing+validating+formatting each entry through
+/// the SAME canonical scp-protocol grammar both bridges share. Reads go through
+/// [`Deref`] to `&HashSet<String>`, so a `ValidatedCeilingStrings` is a drop-in
+/// for the prior `HashSet<String>` on every read path.
+///
+/// All three constructors converge on the SAME canonical UCAN form:
+/// - [`from_colon_entries`](Self::from_colon_entries) (create): parses the
+///   user's colon-form input via [`Capability::new`], validates the parsed enum
+///   via [`Capability::validate_as_ceiling_entry`], formats via
+///   [`Capability::ucan_capability_name`].
+/// - [`from_capabilities`](Self::from_capabilities) (ModifyCeiling): validates
+///   the already-parsed enum and formats via [`Capability::ucan_capability_name`].
+/// - [`from_ucan_strings`](Self::from_ucan_strings) (import): the entries are
+///   already UCAN form (a signed peer export), validated via
+///   [`validate_ucan_ceiling_string`] and stored verbatim (already canonical).
+///
+/// Because create parses colon-form `custom:payments:approve` → `Custom(
+/// "payments:approve")` → `payments:approve` (NOT the raw-string
+/// `custom_payments:approve` the old `build_ceiling_strings` produced), and
+/// import validates+stores the canonical UCAN form, create / modify / import all
+/// produce the byte-identical ceiling the native bridge stores.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ValidatedCeilingStrings(HashSet<String>);
+
+impl ValidatedCeilingStrings {
+    /// Default WASM ceiling (used when create supplies no explicit ceiling).
+    ///
+    /// Matches `scp_protocol::context::roles::default_ceiling` mapped through
+    /// [`Capability::ucan_capability_name`], so the WASM default and the native
+    /// default are the same canonical UCAN-form set.
+    fn defaults() -> Self {
+        Self(
+            scp_protocol::context::roles::default_ceiling()
+                .iter()
+                .map(scp_protocol::context::roles::Capability::ucan_capability_name)
+                .collect(),
+        )
+    }
+
+    /// Builds a validated ceiling from user-supplied COLON-form entries (the
+    /// `create_context` path). An empty list yields [`Self::defaults`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Validation` error on the first entry that is not a well-formed
+    /// ceiling entry per spec §5.3.1.1.
+    fn from_colon_entries(entries: &[String]) -> Result<Self, ScpWasmError> {
+        if entries.is_empty() {
+            return Ok(Self::defaults());
+        }
+        let mut set = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            let cap = scp_protocol::context::roles::Capability::new(entry);
+            cap.validate_as_ceiling_entry()
+                .map_err(|e| ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                })?;
+            set.insert(cap.ucan_capability_name());
+        }
+        Ok(Self(set))
+    }
+
+    /// Builds a validated ceiling from already-parsed [`Capability`] enums (the
+    /// `ModifyCeiling` governance path).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Validation` error on the first capability that is not a
+    /// well-formed ceiling entry per spec §5.3.1.1.
+    fn from_capabilities(
+        caps: &[scp_protocol::context::roles::Capability],
+    ) -> Result<Self, ScpWasmError> {
+        let mut set = HashSet::with_capacity(caps.len());
+        for cap in caps {
+            cap.validate_as_ceiling_entry()
+                .map_err(|e| ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                })?;
+            set.insert(cap.ucan_capability_name());
+        }
+        Ok(Self(set))
+    }
+
+    /// Builds a validated ceiling from UCAN-form strings read from an UNTRUSTED,
+    /// deserialized peer export (the `import_context` path). Each entry is
+    /// validated via [`validate_ucan_ceiling_string`] (the UCAN-form counterpart
+    /// to the colon-form grammar) and stored verbatim — a conformant exporter's
+    /// strings are already canonical UCAN form, so this is idempotent; a
+    /// non-conformant peer's malformed or non-canonical (colon-form) entry is
+    /// REJECTED rather than poisoning the importer's ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Validation` error on the first entry that is not a well-formed
+    /// UCAN-form ceiling entry per spec §5.3.1.1.
+    fn from_ucan_strings<'a, I>(entries: I) -> Result<Self, ScpWasmError>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let mut set = HashSet::new();
+        for entry in entries {
+            scp_protocol::context::roles::validate_ucan_ceiling_string(entry).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                }
+            })?;
+            set.insert(entry.clone());
+        }
+        Ok(Self(set))
+    }
+
+    /// Test-only: insert a raw UCAN-form capability string, bypassing validation,
+    /// to simulate a corrupt/non-conformant stored ceiling.
+    #[cfg(test)]
+    fn test_insert(&mut self, capability: &str) {
+        self.0.insert(capability.to_owned());
+    }
+}
+
+impl std::ops::Deref for ValidatedCeilingStrings {
+    type Target = HashSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PerContextState — per-context state
 // ---------------------------------------------------------------------------
 
@@ -269,8 +412,13 @@ pub(crate) struct PerContextState {
     creator_did: String,
     /// Context mode: "Encrypted" or "Broadcast".
     mode: String,
-    /// Capability ceiling as `{resource}:{action}` strings.
-    ceiling_strings: HashSet<String>,
+    /// Capability ceiling as canonical UCAN-form `{resource}:{action}` strings.
+    ///
+    /// Held as [`ValidatedCeilingStrings`] so it cannot be set without routing
+    /// through a validating constructor (create / modify / import) — a malformed
+    /// entry can never be stored, and all three write paths produce the
+    /// byte-identical canonical form the native bridge stores.
+    ceiling_strings: ValidatedCeilingStrings,
     /// Ceiling policy: "immutable" or "governed".
     ceiling_policy: String,
     /// TTL in seconds, if any.
@@ -838,10 +986,11 @@ impl PerContextState {
         self.consequence_rules.push(rule);
     }
 
-    /// Test-only: add a capability string to the context ceiling.
+    /// Test-only: add a raw capability string to the context ceiling, bypassing
+    /// validation (simulates a corrupt/non-conformant stored ceiling).
     #[cfg(test)]
     pub(crate) fn test_insert_ceiling(&mut self, capability: &str) {
-        self.ceiling_strings.insert(capability.to_owned());
+        self.ceiling_strings.test_insert(capability);
     }
 
     /// Test-only: set the governance model string (e.g. `"majority"`), so
@@ -1281,7 +1430,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         params_json: serde_json::Value::Null,
         creator_did: creator_did.to_owned(),
         mode: "Unencrypted".to_owned(),
-        ceiling_strings: HashSet::new(),
+        ceiling_strings: ValidatedCeilingStrings::default(),
         ceiling_policy: "immutable".to_owned(),
         ttl_seconds: None,
         promotion_policy: None,
@@ -1445,31 +1594,22 @@ impl WasmContextManager {
             });
         }
 
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1). The WASM bridge does
-        // NOT route ceiling construction through `ContextRoleState::new` (the
-        // native enforcement point), so it validates each user-supplied ceiling
-        // entry here against the SAME canonical grammar validator. Validate the
-        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
-        // the raw string — so the WASM create path agrees with the native bridges
-        // and the WASM `ModifyCeiling` handler on one canonical parse (BLACK-003):
-        // `Capability::new` strips a `custom:` prefix, so the raw `"custom:payments"`
-        // (one colon, would pass a raw-string check) parses to `Custom("payments")`,
-        // a no-colon custom the parsed-enum check correctly REJECTS. This forecloses
-        // a malformed entry being normalized into the ceiling string set — in
-        // particular any silent broadening, since a no-colon custom (e.g. `payments`)
-        // and stray-`*` entries (`*:*`, `*:read`) are rejected rather than
-        // normalized. Built-in defaults (empty ceiling) are well-formed by
-        // construction and skip per-entry validation.
-        for entry in &ceiling {
-            scp_protocol::context::roles::Capability::new(entry)
-                .validate_as_ceiling_entry()
-                .map_err(|e| ScpWasmError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
-
-        let ceiling_strings = Self::build_ceiling_strings(&ceiling);
+        // Ceiling-entry grammar enforcement (spec §5.3.1.1) AND canonical
+        // formatting in ONE step. The WASM bridge does NOT route ceiling
+        // construction through `ContextRoleState::new` (the native enforcement
+        // point), so it builds the ceiling through the single validated
+        // constructor `ValidatedCeilingStrings::from_colon_entries`, which parses
+        // each user-supplied colon-form entry via `Capability::new`, validates the
+        // PARSED enum via `validate_as_ceiling_entry`, and formats via
+        // `ucan_capability_name` — the SAME canonical parse+format the native
+        // bridges and the WASM `ModifyCeiling` handler use. This both rejects a
+        // malformed entry (no-colon `custom:payments` → `Custom("payments")`,
+        // stray-`*` `*:*`/`*:read`, multi-colon) AND stores the canonical form,
+        // closing the prior split where validation parsed the enum but the store
+        // formatted from the RAW string (`custom:payments:approve` stored as
+        // `custom_payments:approve` on WASM but `payments:approve` on native). An
+        // empty ceiling yields the canonical default set.
+        let ceiling_strings = ValidatedCeilingStrings::from_colon_entries(&ceiling)?;
 
         // Parse and validate minProtocolVersion from params (spec §13.4).
         // This mirrors the NAPI bridge's parsing in context_create. Malformed
@@ -2764,7 +2904,7 @@ impl WasmContextManager {
     ) -> Result<(HashSet<String>, String, HashSet<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         Ok((
-            ctx.ceiling_strings.clone(),
+            (*ctx.ceiling_strings).clone(),
             ctx.creator_did.clone(),
             ctx.revoked_tokens.clone(),
         ))
@@ -3310,13 +3450,11 @@ impl WasmContextManager {
         context_id: &str,
         new_ceiling: &[scp_protocol::context::roles::Capability],
     ) -> Result<serde_json::Value, ScpWasmError> {
-        for cap in new_ceiling {
-            cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpWasmError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
+        // Validate + canonicalize the WHOLE replacement through the single
+        // validated constructor BEFORE any mutation, so a malformed proposed
+        // entry leaves the prior ceiling unchanged (fail-closed) and the stored
+        // form is byte-identical to native/create.
+        let validated = ValidatedCeilingStrings::from_capabilities(new_ceiling)?;
         let ctx = self.require_active_context_mut(context_id)?;
         if ctx.ceiling_policy != "governed" {
             return Err(ScpWasmError::Permission {
@@ -3324,10 +3462,7 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
-        ctx.ceiling_strings = new_ceiling
-            .iter()
-            .map(|c| Self::capability_to_ucan_format(&c.name()))
-            .collect();
+        ctx.ceiling_strings = validated;
         Ok(serde_json::json!({"action": "ModifyCeiling"}))
     }
 
@@ -5833,42 +5968,6 @@ impl WasmContextManager {
         }
     }
 
-    /// Builds the capability ceiling string set from explicit ceiling entries
-    /// or defaults matching scp-core's UCAN `{resource}:{action}` format.
-    ///
-    /// Default capabilities use underscore-format for compound resources
-    /// (e.g. `"tool_invoke:*"`, `"tool:register"`) to match scp-core's
-    /// `Capability::ucan_capability_name()` output. This ensures UCAN ceiling
-    /// checks (step 8 of validation) pass when tokens minted by scp-core are
-    /// validated in the WASM bridge.
-    ///
-    /// User-provided ceiling strings are converted from colon-format to
-    /// UCAN format via [`capability_to_ucan_format`].
-    fn build_ceiling_strings(ceiling: &[String]) -> HashSet<String> {
-        if ceiling.is_empty() {
-            [
-                "messages:read",
-                "messages:write",
-                "tool:register",
-                "tool_invoke:*",
-                "role:assign",
-                "member:invite",
-                "member:remove",
-                "governance:propose",
-                "governance:vote",
-                "context:close",
-            ]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect()
-        } else {
-            ceiling
-                .iter()
-                .map(|s| Self::capability_to_ucan_format(s))
-                .collect()
-        }
-    }
-
     /// Returns a reference to context state, or an error if not found.
     fn require_context(&self, context_id: &str) -> Result<&PerContextState, ScpWasmError> {
         self.contexts
@@ -6456,13 +6555,26 @@ impl WasmContextManager {
         // defense-in-depth HMAC. Forging `creation_timestamp_secs` therefore requires
         // the creator's signing key. §9.9.3 additionally requires the value verbatim
         // for cross-member/bridge convergence, so clamping is forbidden regardless.
+        // Ceiling-entry grammar enforcement on the IMPORTED, deserialized ceiling
+        // (spec §5.3.1.1). The snapshot is fully attacker-controlled: a valid
+        // signature authenticates the export's ORIGIN, not the WELL-FORMEDNESS of
+        // its payload, so a non-conformant peer could sign an export carrying a
+        // malformed (or non-canonical) ceiling string. Route every imported entry
+        // through the single validated constructor — `from_ucan_strings` validates
+        // each against the UCAN-form grammar and stores it canonically — so a
+        // malformed entry is REJECTED here rather than poisoning the importer's
+        // ceiling (closes BLACK-005, where the import previously copied the raw
+        // `ceiling_strings` with no validation). After this, WASM create / modify /
+        // import all produce the SAME canonical ceiling form.
+        let imported_ceiling = ValidatedCeilingStrings::from_ucan_strings(&snap.ceiling_strings)?;
+
         let now_ms_for_clamp = crate::time::now_ms();
         let ctx = PerContextState {
             state: snap.state.clone(),
             params_json: snap.params_json.clone(),
             creator_did: snap.creator_did.clone(),
             mode: snap.mode.clone(),
-            ceiling_strings: snap.ceiling_strings.iter().cloned().collect(),
+            ceiling_strings: imported_ceiling,
             ceiling_policy: snap.ceiling_policy.clone(),
             ttl_seconds: snap.ttl_seconds,
             promotion_policy: snap.promotion_policy.clone(),
@@ -7960,7 +8072,7 @@ mod tests {
             params_json: serde_json::json!({"mode": "Broadcast"}),
             creator_did: creator_did.to_owned(),
             mode: "Broadcast".to_owned(),
-            ceiling_strings: HashSet::new(),
+            ceiling_strings: ValidatedCeilingStrings::default(),
             ceiling_policy: "immutable".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
@@ -8072,7 +8184,7 @@ mod tests {
             params_json: serde_json::json!({}),
             creator_did: creator_did.to_owned(),
             mode: "Encrypted".to_owned(),
-            ceiling_strings: HashSet::new(),
+            ceiling_strings: ValidatedCeilingStrings::default(),
             ceiling_policy: "immutable".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
@@ -8914,6 +9026,148 @@ mod tests {
         }
     }
 
+    /// CREATE-PATH canonical-form parity: the single validated constructor the
+    /// WASM create path routes through (`ValidatedCeilingStrings::from_colon_entries`)
+    /// stores a `custom:`-prefixed multi-token entry as the IDENTICAL canonical
+    /// UCAN form the native bridge stores — closing the prior WASM create-store
+    /// split (the old `build_ceiling_strings` formatted from the RAW string and
+    /// stored `custom_payments:approve`, while native stores `payments:approve`).
+    /// Asserted at the constructor (create's only ceiling construction point)
+    /// because a full `create_context` trips the native time stub; the accept path
+    /// is covered end-to-end by the WASM conformance suite under a real JS host.
+    #[test]
+    fn test_wasm_create_path_canonical_form_matches_native() {
+        use scp_protocol::context::roles::Capability;
+
+        let entries = vec![
+            "messages:read".to_owned(),
+            "custom:payments:approve".to_owned(),
+            "tool:invoke:*".to_owned(),
+            "context:child:create".to_owned(),
+            "billing:*".to_owned(),
+        ];
+        let wasm_stored: HashSet<String> = ValidatedCeilingStrings::from_colon_entries(&entries)
+            .expect("well-formed colon entries must build")
+            .iter()
+            .cloned()
+            .collect();
+
+        // Native canonical form for the SAME logical entries: parse each via
+        // `Capability::new` (the native parse) and format via
+        // `ucan_capability_name` (the native ceiling string form).
+        let native_expected: HashSet<String> = entries
+            .iter()
+            .map(|e| Capability::new(e).ucan_capability_name())
+            .collect();
+
+        assert_eq!(
+            wasm_stored, native_expected,
+            "WASM create-path canonical ceiling form must equal native"
+        );
+        // The specific divergence the fix closes: `custom:payments:approve`
+        // stores as `payments:approve` (NOT the old `custom_payments:approve`).
+        assert!(
+            wasm_stored.contains("payments:approve"),
+            "custom:payments:approve must store as the canonical payments:approve"
+        );
+        assert!(
+            !wasm_stored.contains("custom_payments:approve"),
+            "the old raw-string formatting (custom_payments:approve) must be gone"
+        );
+    }
+
+    /// IMPORT PATH: `ValidatedCeilingStrings::from_ucan_strings` (the single
+    /// construction point `import_context` routes the untrusted, deserialized peer
+    /// `ceiling_strings` through, closing BLACK-005) ACCEPTS canonical UCAN-form
+    /// entries (idempotent — a conformant exporter's strings are already
+    /// canonical) and REJECTS malformed or non-canonical (colon-form) entries.
+    #[test]
+    fn test_wasm_import_ceiling_constructor_accepts_canonical_rejects_malformed() {
+        // Accept: canonical UCAN-form strings (incl. underscore built-in forms),
+        // stored idempotently.
+        let canonical = vec![
+            "messages:read".to_owned(),
+            "tool_invoke:*".to_owned(),
+            "context_child:create".to_owned(),
+            "payments:approve".to_owned(),
+            "billing:*".to_owned(),
+            "tool_invoke:calc".to_owned(),
+        ];
+        let stored: HashSet<String> = ValidatedCeilingStrings::from_ucan_strings(&canonical)
+            .expect("canonical UCAN-form ceiling must import")
+            .iter()
+            .cloned()
+            .collect();
+        let expected: HashSet<String> = canonical.iter().cloned().collect();
+        assert_eq!(
+            stored, expected,
+            "import must store canonical form verbatim"
+        );
+
+        // Reject: malformed, AND a non-canonical COLON-form built-in (which would
+        // otherwise diverge from the canonical UCAN form gate checks match).
+        for bad in [
+            "payments",                // no colon
+            "*:*",                     // stray wildcard resource
+            "a:b:c",                   // multi-colon custom
+            "custom_payments:approve", // underscore-resource custom (the create-bug spelling)
+            "tool:invoke:*",           // non-canonical COLON-form built-in
+            "context:child:create",    // non-canonical COLON-form built-in
+        ] {
+            let entries = vec!["messages:read".to_owned(), bad.to_owned()];
+            let err = ValidatedCeilingStrings::from_ucan_strings(&entries)
+                .expect_err("import must reject malformed/non-canonical entry");
+            match err {
+                ScpWasmError::Validation { ref code, .. } => assert_eq!(code, codes::VALID_7000),
+                other => panic!("expected Validation for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// All three WASM ceiling write constructors converge on the SAME canonical
+    /// form for the SAME logical ceiling — create (colon input) == modify
+    /// (Capability enums) == import (UCAN strings).
+    #[test]
+    fn test_wasm_ceiling_constructors_converge_on_canonical_form() {
+        use scp_protocol::context::roles::Capability;
+
+        let colon_input = vec![
+            "messages:read".to_owned(),
+            "custom:payments:approve".to_owned(),
+            "tool:invoke:*".to_owned(),
+        ];
+        let caps = vec![
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::ToolInvokeAll,
+        ];
+        let ucan_input = vec![
+            "messages:read".to_owned(),
+            "payments:approve".to_owned(),
+            "tool_invoke:*".to_owned(),
+        ];
+
+        let from_create: HashSet<String> =
+            ValidatedCeilingStrings::from_colon_entries(&colon_input)
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+        let from_modify: HashSet<String> = ValidatedCeilingStrings::from_capabilities(&caps)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let from_import: HashSet<String> = ValidatedCeilingStrings::from_ucan_strings(&ucan_input)
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+
+        assert_eq!(from_create, from_modify, "create and modify must converge");
+        assert_eq!(from_modify, from_import, "modify and import must converge");
+    }
+
     /// Build an ACTIVE, encrypted, `governed`-ceiling-policy context registered
     /// in a fresh manager, seeded with the given ceiling strings. Used to drive
     /// `dispatch_governance_action(ModifyCeiling)` directly in tests.
@@ -8927,7 +9181,10 @@ mod tests {
             params_json: serde_json::json!({"mode": "Encrypted"}),
             creator_did: creator_did.to_owned(),
             mode: "Encrypted".to_owned(),
-            ceiling_strings: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+            ceiling_strings: ValidatedCeilingStrings::from_ucan_strings(
+                &ceiling.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            )
+            .expect("test seed ceiling strings must be well-formed UCAN form"),
             ceiling_policy: "governed".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
@@ -9027,12 +9284,14 @@ mod tests {
             .iter()
             .map(scp_protocol::context::roles::Capability::ucan_capability_name)
             .collect();
-        let wasm_stored = mgr
+        let wasm_stored: HashSet<String> = mgr
             .contexts
             .get("ctx-mc-ok")
             .unwrap()
             .ceiling_strings
-            .clone();
+            .iter()
+            .cloned()
+            .collect();
         assert_eq!(
             wasm_stored, native_expected,
             "native and WASM must store the SAME effective ceiling for the same \
@@ -9340,9 +9599,7 @@ mod tests {
         let mut state = make_bare_per_context_state(context_id, creator);
         // Admin capabilities are intersected with the ceiling, so grant
         // `governance:propose` in the ceiling to reach the proposal-id parse.
-        state
-            .ceiling_strings
-            .insert("governance:propose".to_owned());
+        state.test_insert_ceiling("governance:propose");
         mgr.contexts.insert(context_id.to_owned(), state);
 
         let action = GovernanceAction::ChangeRole {

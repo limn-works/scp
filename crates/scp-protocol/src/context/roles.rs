@@ -410,7 +410,37 @@ impl std::fmt::Display for Capability {
 /// opt-in contract (spec section 5.7).
 ///
 /// See ADR-009 acceptance criterion 1.
+///
+/// # Well-formedness is a construction *and* deserialization invariant
+///
+/// Every entry in a `CapabilityCeiling` is well-formed per the ceiling-entry
+/// grammar (spec §5.3.1.1) — this is guaranteed BY THE TYPE, not by callers
+/// remembering to validate. There are exactly two ways a value of this type can
+/// come into existence in production, and both route through
+/// [`validate_entries`](Self::validate_entries):
+///
+/// 1. **In-process construction.** The whole-ceiling writers
+///    ([`ContextRoleState::new`], [`ContextRoleState::set_ceiling`]) call
+///    [`validate_entries`](Self::validate_entries) before storing, so a malformed
+///    ceiling built with [`new`](Self::new) is rejected at the write.
+/// 2. **Deserialization (the FROM-BYTES path).** `Deserialize` is implemented via
+///    `#[serde(try_from = "CapabilityCeilingRaw")]`: the raw set is parsed first,
+///    then [`TryFrom`] runs [`validate_entries`](Self::validate_entries) and
+///    REJECTS the whole deserialization on the first malformed entry. This closes
+///    every untrusted byte loader by construction —
+///    `serde_json::from_str::<CapabilityCeiling>(malformed)` returns `Err`, and so
+///    does any struct that embeds one (e.g. [`ContextRoleState`], the signed
+///    context-export snapshot decoded by `rmp_serde::from_slice`). No per-loader
+///    re-validation is required: a signature authenticates an export's ORIGIN, not
+///    the WELL-FORMEDNESS of its payload, but the type now refuses to even
+///    materialize a malformed ceiling from bytes.
+///
+/// Serialization is unchanged — the field still emits a content-sorted array via
+/// [`serde_sorted_set`](crate::serde_util::serde_sorted_set), so the signed
+/// export digest is byte-stable and a valid ceiling round-trips to an identical
+/// value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CapabilityCeilingRaw")]
 pub struct CapabilityCeiling {
     /// The set of capabilities permitted in this context.
     ///
@@ -429,6 +459,36 @@ pub struct CapabilityCeiling {
     /// it.
     #[serde(with = "crate::serde_util::serde_sorted_set")]
     pub(crate) capabilities: HashSet<Capability>,
+}
+
+/// Raw, UNVALIDATED deserialization mirror of [`CapabilityCeiling`].
+///
+/// This is the `#[serde(try_from)]` source type: serde deserializes the wire
+/// bytes into this struct (which carries NO well-formedness guarantee), then
+/// [`TryFrom<CapabilityCeilingRaw> for CapabilityCeiling`] runs
+/// [`CapabilityCeiling::validate_entries`] and rejects a malformed ceiling. It is
+/// PRIVATE and exists ONLY as the deserialization waypoint — no code constructs
+/// or stores a `CapabilityCeilingRaw`, so the validated [`CapabilityCeiling`]
+/// remains the single materializable form from bytes.
+#[derive(Deserialize)]
+struct CapabilityCeilingRaw {
+    #[serde(with = "crate::serde_util::serde_sorted_set")]
+    capabilities: HashSet<Capability>,
+}
+
+impl TryFrom<CapabilityCeilingRaw> for CapabilityCeiling {
+    type Error = CeilingEntryError;
+
+    /// Validates every deserialized entry against the ceiling-entry grammar
+    /// (spec §5.3.1.1) before producing a [`CapabilityCeiling`]. A malformed
+    /// entry fails the whole deserialization with [`CeilingEntryError`].
+    fn try_from(raw: CapabilityCeilingRaw) -> Result<Self, Self::Error> {
+        let ceiling = Self {
+            capabilities: raw.capabilities,
+        };
+        ceiling.validate_entries()?;
+        Ok(ceiling)
+    }
 }
 
 impl CapabilityCeiling {
@@ -633,6 +693,140 @@ impl CeilingEntryError {
     }
 }
 
+/// The exhaustive list of non-parameterized built-in [`Capability`] variants.
+///
+/// Single source of truth for "which capabilities are built-ins" — the
+/// parameterized [`Capability::ToolInvoke`] and [`Capability::Custom`] carry
+/// caller text and are validated through the grammar, so they are deliberately
+/// excluded here. Used by [`validate_ucan_ceiling_string`] to recognize the
+/// canonical UCAN-form spelling of every built-in (its
+/// [`Capability::ucan_capability_name`]). Adding a built-in variant is a compile
+/// error here only if this list is matched exhaustively; it is kept aligned with
+/// the enum by the `builtin_capabilities_list_is_exhaustive` test.
+const BUILTIN_CAPABILITIES: &[Capability] = &[
+    Capability::MessagesRead,
+    Capability::MessagesWrite,
+    Capability::ToolInvokeAll,
+    Capability::ToolRegister,
+    Capability::MemberInvite,
+    Capability::MemberRemove,
+    Capability::RoleAssign,
+    Capability::GovernancePropose,
+    Capability::GovernanceVote,
+    Capability::ContextClose,
+    Capability::ChildContextCreate,
+    Capability::ToolInterface,
+    Capability::Bridging,
+    Capability::MediaVoice,
+    Capability::MediaVideo,
+    Capability::MediaScreenShare,
+    Capability::MemberBan,
+    Capability::MetadataEdit,
+];
+
+/// Validates a ceiling entry supplied in **UCAN wire form**
+/// (`{resource}:{action}`, the output of [`Capability::ucan_capability_name`])
+/// against the ceiling-entry grammar (spec §5.3.1.1).
+///
+/// This is the import-path counterpart to [`validate_ceiling_entry`]. The two
+/// validators recognize the SAME set of capabilities but accept DIFFERENT
+/// spellings, because the two paths carry different vocabularies:
+///
+/// - [`validate_ceiling_entry`] validates **user-facing colon form** (e.g.
+///   `tool:invoke:*`, `context:child:create`) — what `create_context` /
+///   `ModifyCeiling` receive, where built-ins resolve to enum variants via
+///   [`Capability::new`] and skip the string grammar entirely.
+/// - This function validates **UCAN form** (e.g. `tool_invoke:*`,
+///   `context_child:create`) — what a context's stored ceiling string set and a
+///   signed export snapshot carry. A built-in's UCAN spelling can contain `_`
+///   (from a multi-segment resource), which the kebab grammar in
+///   [`validate_ceiling_entry`] deliberately forbids for *custom* entries, so a
+///   UCAN-form built-in must be recognized as a built-in rather than parsed as a
+///   custom.
+///
+/// A UCAN-form entry is well-formed iff it is **exactly one** of:
+/// 1. the [`Capability::ucan_capability_name`] of a non-parameterized built-in
+///    ([`BUILTIN_CAPABILITIES`]);
+/// 2. a parameterized `tool_invoke:{tool_id}` whose `tool_id` is a non-empty
+///    `[a-z0-9_-]` token (spec §5.4.1) — `tool_invoke:*` is already covered by
+///    rule 1 via [`Capability::ToolInvokeAll`];
+/// 3. a well-formed custom `{resource}:{action}` accepted by
+///    [`validate_ceiling_entry`] (a valid custom never contains a
+///    conversion-introduced `_`, since the grammar forbids multi-colon customs).
+///
+/// # Errors
+///
+/// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not a
+/// well-formed UCAN-form ceiling entry.
+pub fn validate_ucan_ceiling_string(entry: &str) -> Result<(), CeilingEntryError> {
+    // Length cap + sanitization first, identical to `validate_ceiling_entry`, so
+    // the two validators reject oversize/control/HTML/whitespace identically.
+    if entry.len() > MAX_CEILING_ENTRY_LENGTH {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            format!(
+                "exceeds maximum length of {MAX_CEILING_ENTRY_LENGTH} bytes (got {} bytes)",
+                entry.len()
+            ),
+        ));
+    }
+    for ch in entry.chars() {
+        if ch.is_control() {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains a control character (U+0000–U+001F / U+007F–U+009F)",
+            ));
+        }
+        if ch.is_whitespace() {
+            return Err(CeilingEntryError::invalid(entry, "contains whitespace"));
+        }
+        if matches!(ch, '<' | '>' | '&' | '"' | '\'') {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains an HTML-special character (< > & \" ')",
+            ));
+        }
+    }
+
+    // 1. Built-in UCAN spelling — exact match against every built-in's
+    //    `ucan_capability_name()`.
+    if BUILTIN_CAPABILITIES
+        .iter()
+        .any(|c| c.ucan_capability_name() == entry)
+    {
+        return Ok(());
+    }
+
+    // 2. Parameterized `tool_invoke:{tool_id}` (UCAN form). `tool_invoke:*` is a
+    //    built-in handled above; here `tool_id` is a concrete id and MUST NOT
+    //    contain `*`.
+    if let Some(tool_id) = entry.strip_prefix("tool_invoke:") {
+        if tool_id.len() > MAX_TOOL_ID_LENGTH {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                format!("tool_id exceeds maximum length of {MAX_TOOL_ID_LENGTH} bytes"),
+            ));
+        }
+        if is_tool_id_token(tool_id) {
+            return Ok(());
+        }
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "tool_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
+        ));
+    }
+
+    // 3. Custom capability: a valid custom's UCAN form equals its colon form
+    //    (single colon, kebab resource — no conversion-introduced `_`), so the
+    //    shared custom grammar accepts it verbatim. We call the custom core
+    //    directly (NOT `validate_ceiling_entry`) so a non-canonical COLON-form
+    //    built-in (e.g. `tool:invoke:*`, `context:child:create`) is rejected on
+    //    the UCAN/import path — the stored vocabulary is strictly UCAN form, and
+    //    accepting a colon-form built-in here would let an import store a spelling
+    //    that diverges from the canonical form every gate check matches against.
+    validate_custom_ceiling_entry(entry)
+}
+
 /// Returns `true` if every byte of `token` is in the kebab-case charset
 /// `[a-z0-9-]` and `token` is non-empty (spec §5.3.1.1). No `:`, no `*`, no
 /// whitespace, no uppercase — the charset is exact and closed.
@@ -741,7 +935,31 @@ pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
         ));
     }
 
-    // 2 & 3. Custom capability: EXACTLY ONE colon separating resource and action.
+    // 2 & 3. Custom capability — delegated to the shared custom-grammar core so
+    // the colon-form (this function) and the UCAN-form
+    // ([`validate_ucan_ceiling_string`]) validators apply ONE definition of a
+    // well-formed custom entry.
+    validate_custom_ceiling_entry(entry)
+}
+
+/// Validates the CUSTOM `{resource}:{action}` portion of the ceiling-entry
+/// grammar (spec §5.3.1.1) — the rules shared by [`validate_ceiling_entry`]
+/// (colon form) and [`validate_ucan_ceiling_string`] (UCAN form) once the
+/// built-in and parameterized `tool*invoke` spellings have been excluded by the
+/// caller. A well-formed custom entry has EXACTLY ONE colon, a non-empty
+/// kebab-case `[a-z0-9-]+` resource, and an action that is either a kebab-case
+/// token or the single literal `*` (explicit wildcard). There is no silent
+/// widening — a no-colon token is rejected, not widened to a wildcard.
+///
+/// Note: a well-formed custom's UCAN spelling is byte-identical to its colon
+/// spelling (the resource is single-segment, so no `:`→`_` conversion occurs),
+/// which is why both validators can share this core.
+///
+/// # Errors
+///
+/// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not a
+/// well-formed custom ceiling entry.
+fn validate_custom_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
     let Some((resource, action)) = entry.split_once(':') else {
         return Err(CeilingEntryError::invalid(
             entry,
@@ -3672,6 +3890,87 @@ mod tests {
         );
     }
 
+    /// `BUILTIN_CAPABILITIES` must list every non-parameterized built-in variant
+    /// (everything except `ToolInvoke(_)` and `Custom(_)`). An exhaustive match
+    /// makes a newly-added built-in a compile error here, forcing it into the
+    /// list so `validate_ucan_ceiling_string` recognizes its UCAN spelling.
+    #[test]
+    fn builtin_capabilities_list_is_exhaustive() {
+        fn assert_listed(cap: &Capability) {
+            // Exhaustive match: a new variant breaks compilation here.
+            match cap {
+                Capability::ToolInvoke(_) | Capability::Custom(_) => {
+                    // Parameterized / custom — deliberately NOT in the built-in list.
+                }
+                Capability::MessagesRead
+                | Capability::MessagesWrite
+                | Capability::ToolInvokeAll
+                | Capability::ToolRegister
+                | Capability::MemberInvite
+                | Capability::MemberRemove
+                | Capability::RoleAssign
+                | Capability::GovernancePropose
+                | Capability::GovernanceVote
+                | Capability::ContextClose
+                | Capability::ChildContextCreate
+                | Capability::ToolInterface
+                | Capability::Bridging
+                | Capability::MediaVoice
+                | Capability::MediaVideo
+                | Capability::MediaScreenShare
+                | Capability::MemberBan
+                | Capability::MetadataEdit => {
+                    assert!(
+                        BUILTIN_CAPABILITIES.contains(cap),
+                        "built-in {cap:?} missing from BUILTIN_CAPABILITIES"
+                    );
+                }
+            }
+        }
+        for cap in BUILTIN_CAPABILITIES {
+            assert_listed(cap);
+        }
+        assert_eq!(
+            BUILTIN_CAPABILITIES.len(),
+            18,
+            "BUILTIN_CAPABILITIES should hold all 18 non-parameterized built-ins"
+        );
+    }
+
+    /// `validate_ucan_ceiling_string` accepts the canonical UCAN spelling of
+    /// every built-in (including the underscore forms `tool_invoke:*`,
+    /// `context_child:create`, `bridging:*`) plus parameterized tool invokes and
+    /// well-formed customs — and rejects malformed entries and non-canonical
+    /// COLON-form built-ins.
+    #[test]
+    fn validate_ucan_ceiling_string_accepts_canonical_and_rejects_malformed() {
+        // Every built-in's UCAN form round-trips through the UCAN validator.
+        for cap in BUILTIN_CAPABILITIES {
+            let ucan = cap.ucan_capability_name();
+            validate_ucan_ceiling_string(&ucan)
+                .unwrap_or_else(|e| panic!("built-in UCAN form {ucan:?} must validate: {e}"));
+        }
+        // Parameterized tool invoke + well-formed customs.
+        validate_ucan_ceiling_string("tool_invoke:calc").unwrap();
+        validate_ucan_ceiling_string("payments:approve").unwrap();
+        validate_ucan_ceiling_string("billing:*").unwrap();
+
+        // Malformed entries are rejected.
+        for bad in [
+            "payments",                // no colon
+            "*:*",                     // stray wildcard resource
+            "a:b:c",                   // multi-colon custom
+            "custom_payments:approve", // underscore-resource custom (the WASM-create bug spelling)
+            "tool:invoke:*",           // non-canonical COLON-form built-in
+            "context:child:create",    // non-canonical COLON-form built-in
+        ] {
+            assert!(
+                validate_ucan_ceiling_string(bad).is_err(),
+                "UCAN-form validator must reject {bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn ceiling_validate_entries_rejects_first_malformed() {
         let ceiling = CapabilityCeiling::new([
@@ -3796,6 +4095,97 @@ mod tests {
         let json = serde_json::to_string(&ceiling).unwrap();
         let deserialized: CapabilityCeiling = serde_json::from_str(&json).unwrap();
         assert_eq!(ceiling, deserialized);
+    }
+
+    /// A well-formed custom ceiling round-trips through serialize → deserialize
+    /// to the identical value — the validating `Deserialize` (via
+    /// `#[serde(try_from)]`) is transparent to valid ceilings.
+    #[test]
+    fn ceiling_deserialize_accepts_and_roundtrips_wellformed_custom() {
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::Custom("billing:*".to_owned()),
+            Capability::ToolInvoke("calc".to_owned()),
+        ]);
+        let json = serde_json::to_string(&ceiling).unwrap();
+        let deserialized: CapabilityCeiling = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            ceiling, deserialized,
+            "a well-formed ceiling must deserialize to an identical value"
+        );
+    }
+
+    /// TYPE-LEVEL invariant: `serde_json::from_str::<CapabilityCeiling>` REJECTS a
+    /// ceiling carrying a malformed entry at DESERIALIZE time — so no untrusted
+    /// byte loader (import, restore, any future loader) can ever materialize a
+    /// malformed ceiling. The malformed value is built via the unchecked
+    /// constructor + test mutator (simulating a non-conformant peer's serialized
+    /// bytes), serialized, then deserialized.
+    #[test]
+    fn ceiling_deserialize_rejects_malformed_entry() {
+        for malformed in [
+            Capability::Custom("payments".to_owned()),      // no colon
+            Capability::Custom("*:*".to_owned()),           // stray wildcard resource
+            Capability::Custom("a:b:c".to_owned()),         // multi-colon (3 segments)
+            Capability::Custom("bad\u{7f}:cap".to_owned()), // control character
+        ] {
+            // `CapabilityCeiling::new` does NOT validate (validation happens at the
+            // write/deserialize boundary), so this constructs the malformed value a
+            // non-conformant peer could serialize.
+            let bad = CapabilityCeiling::new([Capability::MessagesRead, malformed.clone()]);
+            let json = serde_json::to_string(&bad).unwrap();
+            let result: Result<CapabilityCeiling, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_err(),
+                "deserializing a ceiling with malformed entry {malformed:?} must fail; got {result:?}"
+            );
+        }
+    }
+
+    /// The validating `Deserialize` propagates through any struct that EMBEDS a
+    /// `CapabilityCeiling`: a `ContextRoleState` carrying a malformed ceiling is
+    /// rejected at deserialize (covering the signed context-export snapshot, which
+    /// embeds a `ContextRoleState`). No per-field re-validation is needed.
+    #[test]
+    fn context_role_state_deserialize_rejects_malformed_ceiling() {
+        let clock = scp_primitives::SystemClock;
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:scp:creator",
+            CapabilityCeiling::new([Capability::MessagesRead]),
+            vec![],
+            &clock,
+        )
+        .unwrap();
+        // Inject a malformed entry into the backing set via the test mutator,
+        // simulating a corrupt/non-conformant serialized snapshot.
+        state
+            .ceiling_mut()
+            .capabilities_mut()
+            .insert(Capability::Custom("payments".to_owned()));
+        let json = serde_json::to_string(&state).unwrap();
+        let result: Result<ContextRoleState, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "deserializing a ContextRoleState with a malformed ceiling must fail; got a value"
+        );
+
+        // And a well-formed ContextRoleState still deserializes.
+        let good = ContextRoleState::new(
+            "ctx-1",
+            "did:scp:creator",
+            CapabilityCeiling::new([
+                Capability::MessagesRead,
+                Capability::Custom("payments:approve".to_owned()),
+            ]),
+            vec![],
+            &clock,
+        )
+        .unwrap();
+        let good_json = serde_json::to_string(&good).unwrap();
+        let _: ContextRoleState = serde_json::from_str(&good_json)
+            .expect("a well-formed ContextRoleState must deserialize");
     }
 
     #[test]

@@ -1767,17 +1767,22 @@ pub async fn import_context(
     )?;
 
     // Ceiling-entry grammar enforcement on the IMPORTED ceiling (spec §5.3.1.1).
-    // The imported `role_state` is taken from a DESERIALIZED, signed snapshot
-    // produced by an UNTRUSTED, possibly non-conformant peer. A conformant
-    // creator can never sign an export with a malformed ceiling (the local
-    // construction invariant in `ContextRoleState::new` / `set_ceiling` forbids
-    // storing one), but a NON-CONFORMANT peer's signed export could carry one. A
-    // valid signature authenticates the ORIGIN, not the WELL-FORMEDNESS of the
-    // payload — so we re-validate the ceiling after deserialization and reject a
-    // malformed one rather than letting a non-conformant peer poison a conformant
-    // importer's stored ceiling. This re-establishes the construction invariant on
-    // the import path (the snapshot bypasses `ContextRoleState::new`, building
-    // `PerContextState` directly below).
+    // The imported `role_state` is taken from a signed snapshot produced by an
+    // UNTRUSTED, possibly non-conformant peer. A valid signature authenticates the
+    // ORIGIN, not the WELL-FORMEDNESS of the payload, so a non-conformant peer's
+    // signed export could carry a malformed ceiling.
+    //
+    // Defense layering: well-formedness is primarily a TYPE-LEVEL invariant —
+    // `CapabilityCeiling` has a validating `Deserialize` (`#[serde(try_from)]`),
+    // so a malformed ceiling fails to even materialize when an export is decoded
+    // FROM BYTES (`deserialize_export` / `rmp_serde::from_slice`). This explicit
+    // re-validation is the belt-and-suspenders guard for the IN-MEMORY entry
+    // point: `Supervisor::import_context` accepts an already-deserialized
+    // `ContextExport` value (no serde at that boundary), so a programmatically
+    // constructed export reaches here without crossing the validating
+    // `Deserialize`. We re-validate and reject a malformed ceiling rather than
+    // letting it poison a conformant importer's stored ceiling. (The snapshot
+    // bypasses `ContextRoleState::new`, building `PerContextState` directly below.)
     export
         .snapshot
         .role_state
@@ -2392,8 +2397,14 @@ pub async fn restore_context(
     // This is the self-respawn / process-restart path reading a LOCAL snapshot.
     // The construction invariant (`ContextRoleState::new` / `set_ceiling`) means a
     // malformed ceiling can never have been written to that snapshot in the first
-    // place, so this is defense-in-depth against on-disk corruption rather than an
-    // untrusted-peer threat. Reject a malformed restored ceiling rather than
+    // place, and `CapabilityCeiling`'s validating `Deserialize`
+    // (`#[serde(try_from)]`) rejects a malformed ceiling when a real on-disk
+    // provider decodes the snapshot FROM BYTES. This explicit check is the
+    // belt-and-suspenders guard for the IN-MEMORY path: a `ContextPersistence`
+    // provider's `load_context` hands back an already-typed `ContextSnapshot`
+    // value, which may not have crossed serde (e.g. an in-memory provider), so we
+    // re-validate here as defense-in-depth against on-disk corruption rather than
+    // an untrusted-peer threat. Reject a malformed restored ceiling rather than
     // silently rehydrating an actor with a poisoned authorization envelope.
     ctx_snapshot
         .role_state
