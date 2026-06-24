@@ -141,11 +141,18 @@ const HANDLERS_MESSAGING_SRC: &str =
 const UCAN_VALIDATE_SRC: &str =
     include_str!("../../../../crates/scp-protocol/src/crypto/ucan/validate.rs");
 
+// PyO3 bridge UCAN source — owns `ucan_evaluate`, the structured read-only
+// diagnostic op. The `ucan_evaluate_routes_to_core_evaluate_ucan` assertion
+// below pins the bridge to consuming the shared core `evaluate_ucan` pipeline
+// rather than re-implementing capability evaluation locally (which would let
+// the diagnostic and the enforcing `validate_ucan` gate silently diverge).
+const PYO3_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 45;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 46;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2310,6 +2317,24 @@ fn ucan_step8_enforces_ceiling_over_all_att() {
         "validate_ucan step 8 must NOT scope the ceiling check to only the \
          invoked capability — that lets a token smuggle an out-of-ceiling \
          attestation (spec §7.2.1 step 8)"
+    );
+}
+
+/// The structured `ucan_evaluate` bridge op must route to the shared core
+/// `evaluate_ucan` pipeline, not re-implement capability evaluation locally.
+///
+/// `ucan_evaluate` is the read-only diagnostic counterpart to the throwing
+/// `ucan_validate` gate. If the bridge fork-implemented its own evaluation
+/// instead of calling core `evaluate_ucan`, the diagnostic could report a
+/// token as acceptable that the enforcing pipeline would reject (or vice
+/// versa). Pinning the call site keeps both surfaces on one pipeline.
+#[test]
+fn ucan_evaluate_routes_to_core_evaluate_ucan() {
+    assert!(
+        fn_body_contains(PYO3_UCAN_SRC, "ucan_evaluate", "evaluate_ucan("),
+        "PyO3 ucan_evaluate must call the shared core evaluate_ucan pipeline \
+         (it is the read-only diagnostic counterpart to validate_ucan and must \
+         not re-implement capability evaluation locally)"
     );
 }
 

@@ -560,6 +560,23 @@
       ]
     },
     {
+      "canonical": "ucan_evaluate",
+      "category": "ucan",
+      "wasm_required": true,
+      "pyo3": [
+        "ucan_evaluate"
+      ],
+      "uniffi": [
+        "ucan_evaluate"
+      ],
+      "napi": [
+        "ucan_evaluate"
+      ],
+      "wasm": [
+        "ucan_evaluate"
+      ]
+    },
+    {
       "canonical": "ucan_mint",
       "category": "ucan",
       "wasm_required": true,

@@ -38,7 +38,8 @@ use scp_core::crypto::ucan::UcanError as CoreUcanError;
 
 use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+    CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, evaluate_ucan,
+    parse_ucan, validate_ucan,
 };
 
 use scp_ffi_common::{
@@ -183,6 +184,62 @@ impl Drop for NapiUcanToken {
 }
 
 // ---------------------------------------------------------------------------
+// NapiCapabilityValidation
+// ---------------------------------------------------------------------------
+
+/// Structured, side-effect-free result of evaluating a UCAN token.
+///
+/// Mirrors scp-core's [`CapabilityValidation`] — the diagnostic counterpart to
+/// the fail-closed `ucan_validate` gate. Each boolean reflects whether the
+/// corresponding pipeline stage ran and passed; the pipeline short-circuits, so
+/// a field is `true` only if its stage AND every prior stage passed.
+///
+/// napi-rs auto-camelCases the field names for JavaScript: `tokens_valid` →
+/// `tokensValid`, etc.
+///
+/// Unlike `ucan_validate`, evaluation records NO state (the nonce is probed
+/// read-only, never recorded). See ADR-016.
+//
+// Six per-stage outcome flags are the mandated public shape of this diagnostic,
+// mirroring scp-core's `CapabilityValidation`. They are pure data — not
+// behavior-selecting flags — so the `struct_excessive_bools` suggestion (a
+// state machine / two-variant enums) would obscure the API and break the flat
+// named-field shape the SDK trust signal consumes.
+#[allow(clippy::struct_excessive_bools)]
+#[napi(object)]
+#[derive(Debug, Clone, Copy)]
+pub struct NapiCapabilityValidation {
+    /// Step 1: the token parsed and its header/attestation set validated.
+    pub tokens_valid: bool,
+    /// Steps 2-7: signature, delegation chain, root issuer, audience, key
+    /// scope, capability grant-match, Category-A enforcement, and attenuation
+    /// all passed (whole-chain).
+    pub signatures_valid: bool,
+    /// Step 8: every granted capability is within the context's ceiling.
+    pub within_ceiling: bool,
+    /// Step 9: nonce format, freshness, and uniqueness passed (probed
+    /// read-only — the nonce is NOT recorded).
+    pub nonce_valid: bool,
+    /// Step 10: the token's revocation CID is not on the revocation list.
+    pub not_revoked: bool,
+    /// Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance).
+    pub time_bounds_valid: bool,
+}
+
+impl From<CapabilityValidation> for NapiCapabilityValidation {
+    fn from(v: CapabilityValidation) -> Self {
+        Self {
+            tokens_valid: v.tokens_valid,
+            signatures_valid: v.signatures_valid,
+            within_ceiling: v.within_ceiling,
+            nonce_valid: v.nonce_valid,
+            not_revoked: v.not_revoked,
+            time_bounds_valid: v.time_bounds_valid,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -267,6 +324,85 @@ pub(crate) async fn ucan_validate_on(
     .map_err(napi::Error::from)?;
 
     Ok(())
+}
+
+/// Per-bridge-instance implementation of [`ucan_evaluate`].
+///
+/// Diagnostic, **side-effect-free** counterpart to [`ucan_validate_on`]: runs
+/// the same 11-step ADR-016 pipeline via `evaluate_ucan` but returns a
+/// structured [`NapiCapabilityValidation`] instead of throwing, and never
+/// records the token's nonce (read-only probe).
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
+pub(crate) async fn ucan_evaluate_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    token: String,
+    capability: String,
+    presenting_agent_did: Option<String>,
+    proof_tokens: Option<Vec<String>>,
+) -> napi::Result<NapiCapabilityValidation> {
+    crate::napi_check_handle!(&bi.core, handle);
+    validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
+    // is registered. Uses the same registry as event_log and ucan_revoke.
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
+
+    // Step 1: Parse the UCAN token using scp-core's parser.
+    let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
+
+    // Parse the required capability URI.
+    let required_cap: CapabilityUri =
+        capability
+            .parse()
+            .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                message: format!("invalid capability URI '{capability}': {e}"),
+                code: codes::PERM_3001.to_owned(),
+            })?;
+
+    // Determine the presenting agent DID: explicit parameter or token audience.
+    let agent_did = presenting_agent_did
+        .as_deref()
+        .unwrap_or(&parsed_token.payload.aud);
+
+    // Build proof resolver from optional proof tokens.
+    let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
+
+    let context_id = handle.context_id();
+
+    // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
+    // nonce tracker via check_replay but never records, so the persistent
+    // NonceTracker is not mutated.
+    let result = crate::runtime::with_context(bi, &context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver(bi);
+        let did_resolver =
+            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let revocation_checker = BridgeRevocationChecker {
+            revocation_list: &rt.core.revocation_list,
+        };
+        let mut nonce_adapter = BridgeNonceTracker {
+            inner: &mut rt.core.nonce_tracker,
+        };
+
+        let ctx = ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.core.ceiling_strings,
+            context_creator_did: &rt.core.creator_did,
+            presenting_agent_did: agent_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
+        };
+
+        Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+    })
+    .map_err(napi::Error::from)?;
+
+    Ok(NapiCapabilityValidation::from(result))
 }
 
 /// Per-bridge-instance implementation of [`ucan_mint`].

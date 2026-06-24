@@ -488,6 +488,44 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
     }
 }
 
+func opUcanEvaluateMalformed(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    // ucan_evaluate is the structured read-only counterpart to ucan_validate.
+    // A malformed JWT fails the FFI token validator before reaching the
+    // pipeline, surfacing as a thrown error whose code aligns across bridges
+    // (canonical SCP-PERM-3001 via the shared From<UcanError> mapping).
+    let scp = try Scp.withStorage(config: .inMemory)
+    let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams(ceiling: ceiling)
+    )
+    do {
+        _ = try await scp.ucanEvaluate(
+            handle: handle,
+            token: "not.a.jwt",
+            capability: "scp:ctx:any/messages:read",
+            presentingAgentDid: nil,
+            proofTokens: nil
+        )
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code)
+            ])
+        ]
+    }
+}
+
 func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
@@ -652,6 +690,8 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opToolRegister(req)
         case "ucan_mint":
             result = try await opUcanMint(req)
+        case "ucan_evaluate_malformed":
+            result = try await opUcanEvaluateMalformed(req)
         case "ucan_validate_malformed":
             result = try await opUcanValidateMalformed(req)
         case "transport_status":

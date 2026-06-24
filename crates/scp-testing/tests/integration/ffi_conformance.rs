@@ -1571,7 +1571,13 @@ fn discovery_and_provenance_coverage() {
 // `transport_adapter_count` / `transport_reliability` (ADR-013 transport
 // adapter set, wasm-exempt — WASM has no scp-platform per ADR-034). This is a
 // pure coverage expansion, not a swap for the removed `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 104;
+//
+// Subsequently RAISED 104 -> 105 by the structured `ucan_evaluate` op: the new
+// read-only diagnostic counterpart to `ucan_validate` (consumes core
+// `evaluate_ucan`, returns a structured CapabilityValidation; never records the
+// nonce) is exposed across all four bridges (wasm_required). Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 105;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -1614,6 +1620,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "tool_interface_revoke",
     // UCAN
     "ucan_validate",
+    "ucan_evaluate",
     "ucan_mint",
     "ucan_revoke",
     "ucan_delegate",

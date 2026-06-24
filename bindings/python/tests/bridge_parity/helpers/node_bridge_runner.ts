@@ -388,6 +388,12 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opUcanValidateMalformed(req),
         };
+      case "ucan_evaluate_malformed":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opUcanEvaluateMalformed(req),
+        };
       case "transport_status":
         return {
           id: req.id,
@@ -753,6 +759,46 @@ async function opUcanValidateMalformed(
         JSON.stringify(params),
       );
       await raw.ucan_validate(handle, badToken, capability, identity.did, undefined);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+        },
+      };
+    }
+    return { error: { type: "unknown", code: "UNKNOWN" } };
+  }
+  return { error: { type: "none", code: "NONE" } };
+}
+
+async function opUcanEvaluateMalformed(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan-e", mode: "encrypted", ceiling };
+  const badToken = "not.a.jwt";
+  const capability = "scp:ctx:any/messages:read";
+  try {
+    if (req.bridgeMode === "napi") {
+      const scp = await newNapiScp();
+      const identity = await scp.identityCreate("in_memory");
+      const handle = await scp.contextCreate(
+        identity,
+        JSON.stringify(params),
+      );
+      await scp.ucanEvaluate(handle, badToken, capability);
+    } else {
+      const { raw } = await loadWasm();
+      const identity = await raw.identity_create("in_memory");
+      const handle = await raw.context_create(
+        identity.did,
+        JSON.stringify(params),
+      );
+      await raw.ucan_evaluate(handle, badToken, capability, identity.did, undefined);
     }
   } catch (err: unknown) {
     if (err instanceof Error) {

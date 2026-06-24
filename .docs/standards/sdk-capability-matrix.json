@@ -1306,6 +1306,19 @@
           "swift": true
         },
         {
+          "name": "evaluate",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "exemptions": {
+            "python": "Bridge plumbing exists (scp-ffi PyScp.ucan_evaluate returning CapabilityValidation, the read-only structured diagnostic counterpart to ucan_validate) but no public SDK wrapper yet; the named public evaluate()/evaluateTrust() wrapper lands in the C3c SDK-parity follow-up that rebuilds the trust-signal consumer on top of this bridge op.",
+            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate + WASM ucan_evaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
+            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
+            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
+          }
+        },
+        {
           "name": "mint",
           "python": true,
           "typescript": true,

@@ -426,6 +426,46 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
         }
     }
 
+private suspend fun opUcanEvaluateMalformed(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        // ucan_evaluate is the structured read-only counterpart to ucan_validate.
+        // A malformed JWT fails the FFI token validator before reaching the
+        // pipeline, surfacing as a thrown error whose code aligns across bridges
+        // (canonical SCP-PERM-3001 via the shared From<UcanError> mapping).
+        val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams(ceiling))
+        try {
+            scp.ucanEvaluate(
+                handle,
+                "not.a.jwt",
+                "scp:ctx:any/messages:read",
+                null,
+                null
+            )
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                    }
+                )
+            }
+        }
+    }
+
 @Suppress("UnusedParameter")
 private suspend fun opTransportStatus(args: JsonObject): JsonObject =
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
@@ -584,6 +624,7 @@ private suspend fun dispatch(req: RawRequest): String {
             "tool_register" -> opToolRegister(req.args)
             "ucan_mint" -> opUcanMint(req.args)
             "ucan_validate_malformed" -> opUcanValidateMalformed(req.args)
+            "ucan_evaluate_malformed" -> opUcanEvaluateMalformed(req.args)
             "transport_status" -> opTransportStatus(req.args)
             "event_log_query_filtered" -> opEventLogQueryFiltered(req.args)
             "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)

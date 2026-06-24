@@ -781,6 +781,58 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op: ucan_evaluate_malformed
+#
+# Companion to OP_UCAN_VALIDATE_MALFORMED. Where `ucan_validate` THROWS on a
+# malformed token, the structured `ucan_evaluate` op returns a per-stage
+# CapabilityValidation summary. A malformed JWT fails at stage 1 (parse), so
+# every bridge must return tokens_valid=false with all later fields false —
+# WITHOUT throwing. This pins the new structured op's cross-bridge shape and
+# the all-false short-circuit behavior. (A "not.a.jwt" string fails the FFI
+# UCAN-token validator before reaching evaluate; the bridges all surface that
+# as a thrown ValidationError. The parity contract here is the THROWN-code
+# alignment, identical to the validate companion — the structured all-false
+# return is exercised by per-bridge inline tests where a parseable-but-invalid
+# token reaches evaluate_ucan.)
+# ---------------------------------------------------------------------------
+
+
+def _py_ucan_evaluate_malformed(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(
+        identity.did, {"name": "parity-ucan-e", "mode": "encrypted", "ceiling": _UCAN_CEILING}
+    )
+    try:
+        scp.ucan_evaluate(
+            handle.context_id,
+            _MALFORMED_UCAN,
+            "scp:ctx:any/messages:read",
+        )
+    except Exception as err:
+        err_type = type(err).__name__
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {"error": {"type": err_type, "code": code or "UNKNOWN"}}
+    return {"error": {"type": "none", "code": "NONE"}}
+
+
+OP_UCAN_EVALUATE_MALFORMED = OpSpec(
+    name="ucan_evaluate_malformed",
+    py_call=_py_ucan_evaluate_malformed,
+    node_call={
+        "op": "ucan_evaluate_malformed",
+        "args": {"ceiling": _UCAN_CEILING},
+    },
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            FieldSpec("error.code", "exact"),
+        )
+    ),
+    expected_values=(("error.code", _EXPECTED_MALFORMED_UCAN_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
 # op 9: transport_status_disconnected
 #
 # Query the transport status with no relay connected.
@@ -981,6 +1033,7 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_TOOL_REGISTER,
     OP_UCAN_MINT,
     OP_UCAN_VALIDATE_MALFORMED,
+    OP_UCAN_EVALUATE_MALFORMED,
     OP_TRANSPORT_STATUS,
     OP_EVENT_LOG_FILTERED,
     OP_UNREGISTERED_DID_REJECTED,
