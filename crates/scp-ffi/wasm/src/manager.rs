@@ -334,32 +334,6 @@ fn validate_ceiling_capabilities(
     Ok(())
 }
 
-/// Validates each UCAN-form ceiling string from an UNTRUSTED, deserialized peer
-/// export (the `import_context` path) via the shared
-/// [`scp_protocol::context::roles::validate_ucan_ceiling_string`] — the UCAN-form
-/// counterpart to the colon-form grammar. A conformant exporter's strings are
-/// already canonical UCAN form, so this is idempotent; a non-conformant peer's
-/// malformed entry OR a non-canonical COLON-form built-in (e.g. `tool:invoke:*`
-/// instead of `tool_invoke:*`) is REJECTED rather than poisoning the importer's
-/// ceiling. This runs BEFORE parsing the strings into `Capability`s, because the
-/// lossy parse (`ucan_string_to_capability`) would canonicalize a colon-form
-/// built-in and accept it (BLACK-005).
-///
-/// # Errors
-///
-/// Returns a `Validation` error on the first entry that is not a well-formed
-/// UCAN-form ceiling entry per spec §5.3.1.1.
-fn validate_imported_ceiling_strings<'a, I>(entries: I) -> Result<(), ScpWasmError>
-where
-    I: IntoIterator<Item = &'a String>,
-{
-    for entry in entries {
-        scp_protocol::context::roles::validate_ucan_ceiling_string(entry)
-            .map_err(ceiling_validation_error)?;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // PerContextState — per-context state
 // ---------------------------------------------------------------------------
@@ -6390,26 +6364,6 @@ impl WasmContextManager {
     pub fn export_context(&self, context_id: &str) -> Result<Vec<u8>, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
-        // Re-materialize the flat export member list from the shared role state
-        // (role name from `assignments`) and the MLS sequence counter (from
-        // `member_sequence_numbers`). The signed snapshot wire format is
-        // unchanged — only the source of these fields moved.
-        let members: Vec<WasmExportMember> = ctx
-            .role_state
-            .members
-            .iter()
-            .map(|did| WasmExportMember {
-                did: did.clone(),
-                role: ctx
-                    .role_state
-                    .assignments
-                    .get(did)
-                    .map(|a| a.role_name.clone())
-                    .unwrap_or_default(),
-                sequence_number: ctx.member_sequence_numbers.get(did).copied().unwrap_or(0),
-            })
-            .collect();
-
         let broadcast = ctx.broadcast_context.as_ref().map(|bc| {
             let mut author_block_lists: HashMap<String, Vec<String>> = HashMap::new();
             let mut key_epochs: HashMap<String, u64> = HashMap::new();
@@ -6440,36 +6394,20 @@ impl WasmContextManager {
             context_id: context_id.to_owned(),
             state: ctx.state.clone(),
             params_json: ctx.params_json.clone(),
-            creator_did: ctx.role_state.creator_did.clone(),
             mode: ctx.mode.clone(),
-            ceiling_strings: ctx
-                .role_state
-                .ceiling()
-                .to_ucan_string_set()
-                .into_iter()
-                .collect(),
             ceiling_policy: ctx.ceiling_policy.clone(),
             ttl_seconds: ctx.ttl_seconds,
             promotion_policy: ctx.promotion_policy.clone(),
             governance: ctx.governance.clone(),
             economic_policy: ctx.economic_policy.clone(),
-            members,
-            // Re-materialize the flat per-member suspended-capability map from
-            // the shared role state, emitting UCAN-format strings (the wire
-            // form the snapshot has always used).
-            suspended_capabilities: ctx
-                .role_state
-                .members
-                .iter()
-                .filter_map(|did| {
-                    ctx.role_state.suspended_for(did).map(|caps| {
-                        (
-                            did.clone(),
-                            caps.iter().map(Capability::ucan_capability_name).collect(),
-                        )
-                    })
-                })
-                .collect(),
+            // Carry the typed role state VERBATIM (members, assignments +
+            // tokens, ceiling, role definitions, member_capabilities, and
+            // per-member suspensions). `ContextRoleState: Clone`. This is the
+            // crux of the BLACK-CEIL-01 convergence: the importer restores this
+            // structure as-is rather than recomputing `member_capabilities`.
+            role_state: ctx.role_state.clone(),
+            // WASM-local MLS sequence counters, carried as a sidecar map.
+            member_sequence_numbers: ctx.member_sequence_numbers.clone(),
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
             revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
@@ -6686,12 +6624,12 @@ impl WasmContextManager {
         // identity — reject it. Treated as a snapshot signature failure: the
         // signing authority does not match the verifying key (SCP-CTX-2093),
         // matching the runtime and the other three bridges.
-        if envelope.exporter_did != envelope.snapshot.creator_did {
+        if envelope.exporter_did != envelope.snapshot.role_state.creator_did {
             return Err(ScpWasmError::Context {
                 message: format!(
                     "export exporter_did '{}' does not match snapshot creator_did '{}' — \
                      only the context creator may sign an export (§23.16.8)",
-                    envelope.exporter_did, envelope.snapshot.creator_did
+                    envelope.exporter_did, envelope.snapshot.role_state.creator_did
                 ),
                 code: codes::CTX_2093.to_owned(),
             });
@@ -6711,7 +6649,7 @@ impl WasmContextManager {
             });
         }
         Self::verify_snapshot_signature(
-            &envelope.snapshot.creator_did,
+            &envelope.snapshot.role_state.creator_did,
             &snapshot_json,
             &envelope.snapshot_signature,
         )?;
@@ -6721,10 +6659,10 @@ impl WasmContextManager {
         // is not in the local registry (cross-party import), since the Ed25519
         // signature already provides cross-party integrity.
         if !envelope.integrity_mac.is_empty()
-            && crate::identity::creator_key_available(&envelope.snapshot.creator_did)
+            && crate::identity::creator_key_available(&envelope.snapshot.role_state.creator_did)
         {
             crate::identity::verify_export_hmac(
-                &envelope.snapshot.creator_did,
+                &envelope.snapshot.role_state.creator_did,
                 &snapshot_json,
                 &envelope.integrity_mac,
             )?;
@@ -6809,14 +6747,21 @@ impl WasmContextManager {
         let snap = &envelope.snapshot;
         let context_id = snap.context_id.clone();
 
-        // Validate imported fields from untrusted data (defense-in-depth)
+        // Validate imported fields from untrusted data (defense-in-depth).
+        // The role-state DIDs and assigned role names now live inside the typed
+        // `ContextRoleState` carried verbatim in the snapshot, so the string
+        // validations iterate `role_state.members` (member + creator DIDs) and
+        // `role_state.assignments` (assigned role names).
         validate_imported_string(&context_id, "context_id", 256)?;
-        validate_imported_did(&snap.creator_did, "creator_did")?;
-        for m in &snap.members {
-            validate_imported_did(&m.did, "member DID")?;
-            if m.role.is_empty() || m.role.len() > 64 {
+        validate_imported_did(&snap.role_state.creator_did, "creator_did")?;
+        for did in &snap.role_state.members {
+            validate_imported_did(did, "member DID")?;
+        }
+        for assignment in snap.role_state.assignments.values() {
+            let role = &assignment.role_name;
+            if role.is_empty() || role.len() > 64 {
                 return Err(ScpWasmError::Context {
-                    message: format!("invalid member role '{}': must be 1-64 chars", m.role),
+                    message: format!("invalid member role '{role}': must be 1-64 chars"),
                     code: codes::CTX_2032.to_owned(),
                 });
             }
@@ -6852,69 +6797,50 @@ impl WasmContextManager {
             });
         }
 
-        // Reconstruct the shared role state from the (signed, already-verified)
-        // flat snapshot fields. The ceiling is parsed from the UCAN-format
-        // `ceiling_strings`; `ContextRoleState::new` seeds built-in role
-        // definitions against it and assigns the creator `admin`. Each snapshot
-        // member is then re-inserted and assigned its snapshot role via
-        // `system_assign_role` (which also re-derives `member_capabilities`
-        // against the imported ceiling); the creator's row in `snap.members`
-        // overwrites the auto-admin assignment if the snapshot demoted them
-        // (e.g. after a `TransferAdmin`). The MLS sequence counters are
-        // restored verbatim into `member_sequence_numbers`.
+        // Restore the shared role state VERBATIM from the signed, already-verified
+        // snapshot — the exact native behavior (`lifecycle_helpers::import_context`
+        // assigns `role_state: export.snapshot.role_state`). Carrying the typed
+        // `ContextRoleState` and restoring it as-is is what makes the WASM import
+        // path converge with native and closes BLACK-CEIL-01: the former code
+        // rebuilt `member_capabilities` by re-running `system_assign_role` per
+        // member against the imported ceiling, which RE-GRANTED a member who had
+        // been `SuspendAccess`'d BEFORE a ceiling widen the widened capability
+        // (`member_has_capability` flipped false→true across export/import). We no
+        // longer recompute anything: members, role assignments + minted tokens,
+        // `member_capabilities`, and per-member `suspended_capabilities` are taken
+        // straight from the signed snapshot, so a suspended-then-widened member
+        // stays suspended exactly as they were at export time.
         //
-        // Ceiling-entry grammar enforcement on the IMPORTED, deserialized ceiling
-        // (spec §5.3.1.1, BLACK-005). The snapshot is fully attacker-controlled: a
-        // valid signature authenticates the export's ORIGIN, not the WELL-FORMEDNESS
-        // of its payload, so a non-conformant peer could sign an export carrying a
-        // malformed (or non-canonical COLON-form) ceiling string. Validate every
-        // entry against the UCAN-form grammar BEFORE parsing — the lossy
-        // `ucan_string_to_capability` parse would otherwise canonicalize a colon-form
-        // built-in (e.g. `tool:invoke:*`) and accept it, diverging from the strictly
-        // UCAN-form vocabulary every gate check matches against. `ContextRoleState`
-        // re-validates the parsed ceiling (defense in depth), but the parse cannot
-        // recover the rejected-colon-form distinction, so this string-level check is
-        // required for the import path.
-        validate_imported_ceiling_strings(&snap.ceiling_strings)?;
-        let imported_ceiling = CapabilityCeiling::new(
-            snap.ceiling_strings
-                .iter()
-                .map(|s| ucan_string_to_capability(s)),
-        );
-        let mut role_state = ContextRoleState::new(
-            context_id.clone(),
-            snap.creator_did.clone(),
-            imported_ceiling,
-            Vec::new(),
-            &crate::time::WasmClock,
-        )
-        .map_err(|e| ScpWasmError::Context {
-            message: format!("imported role state initialization failed: {e}"),
-            code: codes::CTX_2032.to_owned(),
-        })?;
-        // The membership set is exactly the snapshot's. `new` auto-added the
-        // creator as admin; clear the derived membership/assignment maps and
-        // rebuild them purely from the snapshot so a snapshot that does NOT list
-        // the creator (e.g. after the creator left) does not leave them as a
-        // phantom member.
-        role_state.members.clear();
-        role_state.assignments.clear();
-        role_state.member_capabilities.clear();
-        let mut member_sequence_numbers = HashMap::new();
-        for m in &snap.members {
-            role_state.members.insert(m.did.clone());
-            member_sequence_numbers.insert(m.did.clone(), m.sequence_number);
-            role_state
-                .system_assign_role(&m.did, &m.role, &crate::time::WasmClock)
-                .map_err(|e| ScpWasmError::Context {
-                    message: format!("imported member role assignment failed: {e}"),
-                    code: codes::CTX_2032.to_owned(),
-                })?;
-        }
-        // Restore per-member suspensions (UCAN-format strings -> typed caps).
-        for (did, caps) in &snap.suspended_capabilities {
-            role_state.suspend_capabilities(did, caps.iter().map(|c| ucan_string_to_capability(c)));
-        }
+        // We deliberately do NOT intersect `member_capabilities` with the ceiling
+        // or otherwise downward-shrink on import — native does neither, and doing
+        // so here would be a NEW native/WASM divergence. The snapshot is trusted
+        // for CONTENT because the envelope already binds it to the creator:
+        // `deserialize_and_verify_envelope` enforces `exporter_did == creator_did`
+        // and `verify_strict`s the creator's Ed25519 signature over the
+        // JCS-canonical snapshot (fail-closed on a missing/invalid signature). The
+        // signature authenticates ORIGIN, not WELL-FORMEDNESS, so we still validate
+        // the ceiling GRAMMAR below.
+        let role_state = snap.role_state.clone();
+
+        // §5.3.1.1 defense-in-depth belt, mirroring native: validate every ceiling
+        // entry against the canonical ceiling-entry grammar. A conformant export's
+        // ceiling is already well-formed (and the `#[serde(try_from = "CapabilityCeilingRaw")]`
+        // deserialize path already rejects a malformed ceiling before we reach
+        // here), so this is the explicit, greppable belt that fails loud rather than
+        // relying solely on the deserialize-time check.
+        role_state
+            .ceiling()
+            .validate_entries()
+            .map_err(|e| ScpWasmError::Context {
+                message: format!(
+                    "imported context ceiling has a malformed entry (spec §5.3.1.1): {e}"
+                ),
+                code: codes::CTX_2032.to_owned(),
+            })?;
+
+        // MLS sequence counters are genuinely WASM-local orchestration state with
+        // no home in `ContextRoleState`; restore them verbatim from the sidecar.
+        let member_sequence_numbers = snap.member_sequence_numbers.clone();
 
         let broadcast_context = snap.broadcast.as_ref().map(|bc| {
             use scp_protocol::context::broadcast::{
@@ -7471,18 +7397,34 @@ struct WasmContextExportSnapshot {
     context_id: String,
     state: String,
     params_json: serde_json::Value,
-    creator_did: String,
     mode: String,
-    ceiling_strings: Vec<String>,
     ceiling_policy: String,
     ttl_seconds: Option<u64>,
     promotion_policy: Option<String>,
     governance: String,
     economic_policy: Option<String>,
-    members: Vec<WasmExportMember>,
-    /// Suspended capabilities per member DID.
+    /// Shared role state restored VERBATIM on import (members, role
+    /// assignments + minted tokens, capability ceiling, role definitions,
+    /// per-member granted capabilities, and per-member suspensions). Carrying
+    /// the typed `ContextRoleState` instead of a lossy flat projection is what
+    /// makes the WASM import path converge with native
+    /// (`lifecycle_helpers::import_context`, which assigns
+    /// `role_state: export.snapshot.role_state`): import no longer recomputes
+    /// `member_capabilities` via `system_assign_role`, so a member who was
+    /// suspended BEFORE a ceiling widen cannot regain the widened capability on
+    /// round-trip (BLACK-CEIL-01). The ceiling and per-member suspension sets
+    /// self-canonicalize for the signed digest via the
+    /// `serde_sorted_set` / `serde_sorted_set_map` field codecs on
+    /// `ContextRoleState`, and the `#[serde(try_from = "CapabilityCeilingRaw")]`
+    /// path rejects a malformed ceiling at deserialize time (§5.3.1.1).
+    role_state: ContextRoleState,
+    /// Per-member MLS message sequence counters. This is genuinely WASM-local
+    /// MLS orchestration state with no home in the shared `ContextRoleState`,
+    /// so it survives as its own sidecar field (keyed by member DID). The
+    /// DID-keyed map is canonicalized for the signed digest by RFC 8785 JCS
+    /// object-key sorting; the scalar values need no element sort.
     #[serde(default)]
-    suspended_capabilities: HashMap<String, Vec<String>>,
+    member_sequence_numbers: HashMap<String, u64>,
     read_exclusion_list: Vec<String>,
     broadcast: Option<WasmExportBroadcast>,
     /// UCAN revocation CIDs. Preserves revocation state across export/import
@@ -7558,14 +7500,6 @@ struct WasmContextExportSnapshot {
     creation_timestamp_secs: u64,
 }
 
-/// Serializable member entry for export.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WasmExportMember {
-    did: String,
-    role: String,
-    sequence_number: u64,
-}
-
 /// Canonicalizes every set/map-derived array in an export snapshot to a
 /// deterministic sorted order (§23.16.8 "Set/Map canonicalization").
 ///
@@ -7573,7 +7507,7 @@ struct WasmExportMember {
 /// in incidental iteration order, which is non-deterministic across runs and
 /// implementations. RFC 8785 JCS canonicalizes JSON *object* member ordering
 /// (so the `HashMap`-backed fields serialized as JSON objects —
-/// `suspended_capabilities`, `resolved_proposals_json`, `cooldown_until`, and
+/// `resolved_proposals_json`, `cooldown_until`, `member_sequence_numbers`, and
 /// the broadcast `author_block_lists`/`key_epochs` maps — are already
 /// deterministic by key), but JCS does NOT reorder JSON *array* elements.
 /// Every array whose elements derive from a set MUST therefore be sorted here
@@ -7581,30 +7515,32 @@ struct WasmExportMember {
 /// for verification, so the signed digest is byte-identical across runs and the
 /// producer and verifier always agree.
 ///
+/// The embedded `role_state` (`ContextRoleState`) is NOT handled here: it
+/// self-canonicalizes for the digest. Its set-derived fields use the
+/// `serde_sorted_set` / `serde_sorted_set_map` field codecs (the `members`
+/// set, the per-member `member_capabilities` and `suspended_capabilities`
+/// inner sets, and the ceiling's capability set), and its remaining maps
+/// (`assignments`, `role_definitions`) are JCS-canonicalized by object key. So
+/// the whole `role_state` subtree serializes byte-identically regardless of the
+/// incidental iteration order present in the source — no array sort is needed
+/// or possible at this layer (the inner sets are private to scp-protocol).
+///
 /// Fields that originate from an ordered `Vec` in `PerContextState`
 /// (`threshold_signers`, `tool_interfaces`, `consequence_rules`) carry a
 /// producer-defined order and are intentionally left untouched.
 fn canonicalize_snapshot_sets(snapshot: &mut WasmContextExportSnapshot) {
     // Plain `Vec<String>` fields derived directly from a `HashSet`.
-    snapshot.ceiling_strings.sort_unstable();
     snapshot.read_exclusion_list.sort_unstable();
     snapshot.revoked_tokens.sort_unstable();
 
     // Arrays of struct entries derived from `HashMap` iteration: sort by the
     // logical map key so the array order matches the canonical key order.
-    snapshot.members.sort_unstable_by(|a, b| a.did.cmp(&b.did));
     snapshot
         .seen_nonces_v3
         .sort_unstable_by(|a, b| a.nonce.cmp(&b.nonce));
     snapshot
         .executed_proposals
         .sort_unstable_by(|a, b| a.proposal_id.cmp(&b.proposal_id));
-
-    // Map-of-set field: keys are canonicalized by JCS, but each value array is
-    // collected from an inner `HashSet` and must be sorted element-wise.
-    for caps in snapshot.suspended_capabilities.values_mut() {
-        caps.sort_unstable();
-    }
 
     // Broadcast sub-structure: the subscriber list comes from a `HashMap` and
     // each author block list comes from an inner `HashSet`.
@@ -8323,7 +8259,7 @@ mod tests {
         let envelope = WasmContextExportEnvelope {
             version: WASM_EXPORT_VERSION + 1,
             exported_at: 0,
-            exporter_did: snapshot.creator_did.clone(),
+            exporter_did: snapshot.role_state.creator_did.clone(),
             integrity_mac: String::new(),
             snapshot_signature: String::new(),
             snapshot,
@@ -8348,7 +8284,7 @@ mod tests {
         let envelope = WasmContextExportEnvelope {
             version: WASM_EXPORT_VERSION - 1,
             exported_at: 0,
-            exporter_did: snapshot.creator_did.clone(),
+            exporter_did: snapshot.role_state.creator_did.clone(),
             integrity_mac: String::new(),
             snapshot_signature: String::new(),
             snapshot,
@@ -8774,16 +8710,24 @@ mod tests {
             context_id: "ctx-test".to_owned(),
             state: "active".to_owned(),
             params_json: serde_json::Value::Null,
-            creator_did: "did:test:creator".to_owned(),
             mode: "Unencrypted".to_owned(),
-            ceiling_strings: Vec::new(),
             ceiling_policy: "immutable".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            members: Vec::new(),
-            suspended_capabilities: HashMap::new(),
+            // `creator_did` now lives inside the typed role state. A bare
+            // `ContextRoleState` (empty ceiling, creator auto-admin) is the
+            // minimal valid role state.
+            role_state: ContextRoleState::new(
+                "ctx-test",
+                "did:test:creator",
+                scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
+                Vec::new(),
+                &crate::time::WasmClock,
+            )
+            .expect("bare role state with empty ceiling is always valid"),
+            member_sequence_numbers: HashMap::new(),
             read_exclusion_list: Vec::new(),
             broadcast: None,
             revoked_tokens: Vec::new(),
@@ -8840,17 +8784,31 @@ mod tests {
         block_list: &[&str],
     ) -> WasmContextExportSnapshot {
         let mut snap = make_minimal_valid_snapshot();
-        snap.ceiling_strings = ceiling.iter().map(|s| (*s).to_owned()).collect();
+        // The ceiling, members, and per-member suspensions now live inside the
+        // embedded typed `ContextRoleState` (carried + restored verbatim). They
+        // self-canonicalize for the signed digest via the `serde_sorted_set` /
+        // `serde_sorted_set_map` field codecs, so this helper populates them
+        // through the shared validating APIs. The digest-invariance assertion
+        // this helper backs is satisfied by the still-flat order-sensitive
+        // fields below (read_exclusion_list / revoked_tokens / seen_nonces_v3 /
+        // executed_proposals / broadcast subscribers + block lists).
+        let seed_ceiling =
+            CapabilityCeiling::new(ceiling.iter().map(|c| ucan_string_to_capability(c)));
+        snap.role_state
+            .set_ceiling(seed_ceiling)
+            .expect("snapshot_with_sets test ceiling entries must be well-formed");
+        for did in members {
+            snap.role_state.members.insert((*did).to_owned());
+            let _ = snap
+                .role_state
+                .system_assign_role(did, "member", &crate::time::WasmClock);
+        }
+        for (member, caps) in suspended {
+            snap.role_state
+                .suspend_capabilities(member, caps.iter().map(|c| ucan_string_to_capability(c)));
+        }
         snap.read_exclusion_list = read_excl.iter().map(|s| (*s).to_owned()).collect();
         snap.revoked_tokens = revoked.iter().map(|s| (*s).to_owned()).collect();
-        snap.members = members
-            .iter()
-            .map(|d| WasmExportMember {
-                did: (*d).to_owned(),
-                role: "member".to_owned(),
-                sequence_number: 1,
-            })
-            .collect();
         snap.seen_nonces_v3 = nonces
             .iter()
             .map(|n| WasmExportNonceEntry {
@@ -8863,15 +8821,6 @@ mod tests {
             .map(|p| WasmExportExecutedProposalEntry {
                 proposal_id: (*p).to_owned(),
                 executed_at_ms: 1.0,
-            })
-            .collect();
-        snap.suspended_capabilities = suspended
-            .iter()
-            .map(|(member, caps)| {
-                (
-                    (*member).to_owned(),
-                    caps.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
-                )
             })
             .collect();
         snap.broadcast = Some(WasmExportBroadcast {
@@ -8897,24 +8846,30 @@ mod tests {
     #[test]
     fn snapshot_digest_invariant_under_set_insertion_order() {
         let forward = snapshot_with_sets(
-            &["messages:read", "messages:write", "tools:invoke"],
+            &["messages:read", "messages:write", "tool_invoke:*"],
             &["did:test:x", "did:test:y", "did:test:z"],
             &["cid-a", "cid-b", "cid-c"],
             &["did:test:m1", "did:test:m2", "did:test:m3"],
             &["nonce-1", "nonce-2", "nonce-3"],
             &["prop-1", "prop-2", "prop-3"],
-            &[("did:test:m1", &["a:1", "b:2", "c:3"])],
+            &[(
+                "did:test:m1",
+                &["messages:read", "messages:write", "role:assign"],
+            )],
             &["sub-1", "sub-2", "sub-3"],
             &["blk-1", "blk-2", "blk-3"],
         );
         let reversed = snapshot_with_sets(
-            &["tools:invoke", "messages:write", "messages:read"],
+            &["tool_invoke:*", "messages:write", "messages:read"],
             &["did:test:z", "did:test:y", "did:test:x"],
             &["cid-c", "cid-b", "cid-a"],
             &["did:test:m3", "did:test:m2", "did:test:m1"],
             &["nonce-3", "nonce-2", "nonce-1"],
             &["prop-3", "prop-2", "prop-1"],
-            &[("did:test:m1", &["c:3", "b:2", "a:1"])],
+            &[(
+                "did:test:m1",
+                &["role:assign", "messages:write", "messages:read"],
+            )],
             &["sub-3", "sub-2", "sub-1"],
             &["blk-3", "blk-2", "blk-1"],
         );
@@ -8939,7 +8894,7 @@ mod tests {
     #[test]
     fn snapshot_digest_changes_when_suspended_capabilities_tampered() {
         let base = snapshot_with_sets(
-            &["messages:read"],
+            &["messages:read", "messages:write"],
             &[],
             &[],
             &["did:test:m1"],
@@ -8949,13 +8904,18 @@ mod tests {
             &[],
             &[],
         );
+        // The suspension now lives inside the embedded `ContextRoleState` and is
+        // covered by the full-snapshot signature. Clearing it (restoring the
+        // member's effective capability) MUST change the signed digest.
         let mut tampered = base.clone();
-        tampered.suspended_capabilities.clear();
+        tampered
+            .role_state
+            .restore_capabilities("did:test:m1", &[Capability::MessagesWrite]);
 
         assert_ne!(
             signed_digest(&base),
             signed_digest(&tampered),
-            "tampering with a signed-but-previously-unenumerated field must change the digest"
+            "tampering with a signed role-state suspension must change the digest"
         );
     }
 
@@ -9416,45 +9376,55 @@ mod tests {
         );
     }
 
-    /// IMPORT PATH: `validate_imported_ceiling_strings` (the validation
-    /// `import_context` runs over the untrusted, deserialized peer `ceiling_strings`
-    /// BEFORE parsing them, closing BLACK-005) ACCEPTS canonical UCAN-form entries
-    /// (a conformant exporter's strings are already canonical) and REJECTS malformed
-    /// or non-canonical (colon-form) entries — the latter because the lossy
-    /// `ucan_string_to_capability` parse would otherwise canonicalize a colon-form
-    /// built-in and accept it, diverging from the strictly UCAN-form stored
-    /// vocabulary every gate check matches against.
+    /// IMPORT PATH (BLACK-005): the import no longer pre-validates a flat
+    /// `ceiling_strings` array — the ceiling now lives inside the typed
+    /// `ContextRoleState` carried in the snapshot, whose `CapabilityCeiling`
+    /// deserializes through `#[serde(try_from = "CapabilityCeilingRaw")]`. That
+    /// `try_from` runs `validate_entries` (spec §5.3.1.1), so a malformed ceiling
+    /// entry fails the envelope `serde_json::from_slice` BEFORE any signature
+    /// check or state reconstruction. This proves a non-conformant peer cannot
+    /// smuggle a malformed (multi-colon `Custom`) ceiling through the import path.
     #[test]
-    fn test_wasm_import_ceiling_validation_accepts_canonical_rejects_malformed() {
-        // Accept: canonical UCAN-form strings (incl. underscore built-in forms).
-        let canonical = vec![
-            "messages:read".to_owned(),
-            "tool_invoke:*".to_owned(),
-            "context_child:create".to_owned(),
-            "payments:approve".to_owned(),
-            "billing:*".to_owned(),
-            "tool_invoke:calc".to_owned(),
-        ];
-        validate_imported_ceiling_strings(&canonical)
-            .expect("canonical UCAN-form ceiling must validate on import");
+    fn test_wasm_import_rejects_malformed_ceiling_on_deserialize() {
+        // Start from a well-formed, serialized envelope (a minimal valid snapshot
+        // wrapped in a current-version envelope). The signature fields are empty;
+        // that does not matter because deserialization fails first.
+        let snapshot = make_minimal_valid_snapshot();
+        let envelope = WasmContextExportEnvelope {
+            version: WASM_EXPORT_VERSION,
+            exported_at: 0,
+            exporter_did: snapshot.role_state.creator_did.clone(),
+            integrity_mac: String::new(),
+            snapshot_signature: String::new(),
+            snapshot,
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
 
-        // Reject: malformed, AND a non-canonical COLON-form built-in (which would
-        // otherwise diverge from the canonical UCAN form gate checks match).
-        for bad in [
-            "payments",                // no colon
-            "*:*",                     // stray wildcard resource
-            "a:b:c",                   // multi-colon custom
-            "custom_payments:approve", // underscore-resource custom (the create-bug spelling)
-            "tool:invoke:*",           // non-canonical COLON-form built-in
-            "context:child:create",    // non-canonical COLON-form built-in
-        ] {
-            let entries = vec!["messages:read".to_owned(), bad.to_owned()];
-            let err = validate_imported_ceiling_strings(&entries)
-                .expect_err("import must reject malformed/non-canonical entry");
-            match err {
-                ScpWasmError::Validation { ref code, .. } => assert_eq!(code, codes::VALID_7000),
-                other => panic!("expected Validation for {bad:?}, got {other:?}"),
-            }
+        // Inject a malformed multi-colon `Custom` capability into the role-state
+        // ceiling array. The empty ceiling serializes as `"capabilities":[]`;
+        // splice the malformed entry in. Default serde enum repr serializes
+        // `Capability::Custom(s)` as `{"Custom":s}`.
+        assert!(
+            json.contains("\"capabilities\":[]"),
+            "minimal snapshot ceiling must serialize as an empty capabilities array"
+        );
+        let tampered = json.replace(
+            "\"capabilities\":[]",
+            "\"capabilities\":[{\"Custom\":\"a:b:c\"}]",
+        );
+        assert_ne!(
+            tampered, json,
+            "the malformed entry must have been spliced in"
+        );
+
+        let err = WasmContextManager::deserialize_and_verify_envelope(tampered.as_bytes())
+            .expect_err("a malformed ceiling entry must fail envelope deserialization");
+        match err {
+            // The malformed ceiling is rejected by `CapabilityCeilingRaw::try_from`
+            // during `serde_json::from_slice`, surfaced as the bridge's deserialize
+            // error class (CTX-2032), not a signature failure (CTX-2093).
+            ScpWasmError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2032),
+            other => panic!("expected a Context deserialize error, got {other:?}"),
         }
     }
 
@@ -9476,7 +9446,7 @@ mod tests {
             Capability::Custom("payments:approve".to_owned()),
             Capability::ToolInvokeAll,
         ];
-        let ucan_input = vec![
+        let ucan_input = [
             "messages:read".to_owned(),
             "payments:approve".to_owned(),
             "tool_invoke:*".to_owned(),
@@ -9494,10 +9464,19 @@ mod tests {
         let from_modify: HashSet<String> =
             CapabilityCeiling::new(caps.iter().cloned()).to_ucan_string_set();
 
-        // IMPORT: validate the already-canonical UCAN strings; the stored set is
-        // them verbatim.
-        validate_imported_ceiling_strings(&ucan_input).unwrap();
-        let from_import: HashSet<String> = ucan_input.iter().cloned().collect();
+        // IMPORT: the ceiling now arrives inside the typed `ContextRoleState`
+        // (carried + restored VERBATIM). Reconstruct the ceiling from the
+        // already-canonical UCAN strings exactly as a deserialized snapshot would
+        // hold it, then project it the SAME way the stored state does
+        // (`to_ucan_string_set`). The deserialize-time `CapabilityCeilingRaw`
+        // try_from validates grammar; here the entries are canonical so it is a
+        // no-op, and the projection must converge with create/modify.
+        let imported_ceiling =
+            CapabilityCeiling::new(ucan_input.iter().map(|s| ucan_string_to_capability(s)));
+        imported_ceiling
+            .validate_entries()
+            .expect("canonical UCAN-form import ceiling must validate");
+        let from_import: HashSet<String> = imported_ceiling.to_ucan_string_set();
 
         assert_eq!(from_create, from_modify, "create and modify must converge");
         assert_eq!(from_modify, from_import, "modify and import must converge");
@@ -10593,6 +10572,208 @@ mod tests {
         );
 
         // Leave the shared thread-local registry clean for sibling tests.
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// BLACK-CEIL-01 load-bearing regression: a member who is `SuspendAccess`'d
+    /// BEFORE a governed ceiling WIDEN must NOT regain the widened capability
+    /// across an export -> import round-trip into a FRESH manager.
+    ///
+    /// The former WASM import recomputed `member_capabilities` by re-running
+    /// `system_assign_role` per member against the imported ceiling. On a widen,
+    /// that recompute re-granted the suspended member the newly-added capability
+    /// (`member_has_capability` flipped false -> true post-import). The fix
+    /// restores `role_state` VERBATIM (native parity), so the suspension survives.
+    #[test]
+    fn import_does_not_un_suspend_capability_widened_after_suspension() {
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let context_id = "ctx-ceil01-roundtrip";
+
+        // The signed export resolves the creator's #active key from the shared
+        // thread-local identity registry; register the creator identity first
+        // under a clean registry.
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (registered_creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        // Governed context whose ceiling does NOT include messages:write but DOES
+        // include member:ban (so the SuspendAccess governance action is permitted).
+        let mut src = manager_with_governed_context(
+            context_id,
+            &registered_creator,
+            &["messages:read", "member:ban"],
+        );
+        let _ = creator; // documented intent; the registered DID is authoritative.
+
+        // Add the member as admin so their effective capability set is the whole
+        // current ceiling ({messages:read, member:ban}).
+        src.contexts
+            .get_mut(context_id)
+            .unwrap()
+            .test_insert_member(member, "admin");
+
+        // SuspendAccess: suspend_all copies the member\'s effective capabilities
+        // into their suspended set.
+        src.dispatch_governance_action(
+            context_id,
+            &GovernanceAction::SuspendAccess {
+                did: DID(member.to_owned()),
+            },
+            &registered_creator,
+            0,
+        )
+        .expect("SuspendAccess must succeed");
+
+        // Governed ModifyCeiling WIDENS the ceiling to add messages:write. This is
+        // the convergence path: it calls set_ceiling ONLY (no per-member refresh),
+        // so the suspended member\'s member_capabilities goes STALE relative to the
+        // new ceiling — exactly the precondition that exposed the import recompute.
+        src.dispatch_governance_action(
+            context_id,
+            &GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![
+                    Capability::MessagesRead,
+                    Capability::MessagesWrite,
+                    Capability::MemberBan,
+                ],
+            },
+            &registered_creator,
+            0,
+        )
+        .expect("governed ceiling widen must succeed");
+
+        // Pre-export invariant: the suspended member does NOT hold messages:write.
+        assert!(
+            !src.contexts[context_id].member_has_capability(member, "messages:write"),
+            "pre-export: a SuspendAccess-suspended member must not hold a \
+             capability the widen added"
+        );
+
+        let bytes = src
+            .export_context(context_id)
+            .expect("signed export must succeed");
+
+        // Import into a FRESH manager (shares the thread-local identity registry).
+        let mut dst = WasmContextManager::new();
+        let imported_id = dst
+            .import_context(&bytes)
+            .expect("signed import must verify and reconstruct the context");
+        assert_eq!(imported_id, context_id);
+
+        // The crux: post-import the suspended member STILL does not hold
+        // messages:write. With the old recompute-on-import this assertion was RED
+        // (the member silently regained the widened capability).
+        assert!(
+            !dst.contexts[context_id].member_has_capability(member, "messages:write"),
+            "post-import: a member suspended before a ceiling widen must NOT regain \
+             the widened capability (BLACK-CEIL-01; native restores role_state verbatim)"
+        );
+
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// Import preserves each member\'s minted assignment tokens VERBATIM — the
+    /// fix carries the typed `RoleAssignment` (tokens included) instead of
+    /// re-minting fresh tokens via `system_assign_role` on import.
+    #[test]
+    fn import_preserves_assignment_tokens_verbatim() {
+        let member = "did:dht:zmoderator";
+        let context_id = "ctx-ceil01-tokens";
+
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        state.test_insert_member(member, "moderator");
+        src.contexts.insert(context_id.to_owned(), state);
+
+        // Capture the pre-export tokens for both the creator and the member.
+        let pre_member_tokens = src.contexts[context_id]
+            .role_state
+            .assignments
+            .get(member)
+            .expect("member must have an assignment")
+            .tokens
+            .clone();
+        let pre_creator_tokens = src.contexts[context_id]
+            .role_state
+            .assignments
+            .get(creator.as_str())
+            .expect("creator must have an assignment")
+            .tokens
+            .clone();
+
+        let bytes = src.export_context(context_id).expect("export must succeed");
+        let mut dst = WasmContextManager::new();
+        dst.import_context(&bytes).expect("import must succeed");
+
+        let post_member_tokens = dst.contexts[context_id]
+            .role_state
+            .assignments
+            .get(member)
+            .expect("imported member must have an assignment")
+            .tokens
+            .clone();
+        let post_creator_tokens = dst.contexts[context_id]
+            .role_state
+            .assignments
+            .get(creator.as_str())
+            .expect("imported creator must have an assignment")
+            .tokens
+            .clone();
+
+        assert_eq!(
+            post_member_tokens, pre_member_tokens,
+            "imported member assignment tokens must equal the exported tokens verbatim \
+             (no fresh re-mint on import)"
+        );
+        assert_eq!(
+            post_creator_tokens, pre_creator_tokens,
+            "imported creator assignment tokens must equal the exported tokens verbatim"
+        );
+
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// The whole `ContextRoleState` round-trips VERBATIM (derived `PartialEq`):
+    /// members, assignments + tokens, ceiling, `role_definitions`,
+    /// `member_capabilities`, and per-member suspensions all match pre-export.
+    #[test]
+    fn import_round_trips_role_state_verbatim() {
+        let member = "did:dht:zmoderator";
+        let context_id = "ctx-ceil01-verbatim";
+
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        state.test_insert_member(member, "moderator");
+        // Suspend one capability the role otherwise grants.
+        state.test_insert_suspended_capability(member, "messages:write");
+        src.contexts.insert(context_id.to_owned(), state);
+
+        let pre_role_state = src.contexts[context_id].role_state.clone();
+
+        let bytes = src.export_context(context_id).expect("export must succeed");
+        let mut dst = WasmContextManager::new();
+        dst.import_context(&bytes).expect("import must succeed");
+
+        let post_role_state = &dst.contexts[context_id].role_state;
+        assert_eq!(
+            *post_role_state, pre_role_state,
+            "the whole ContextRoleState must round-trip verbatim (members, assignments + \
+             tokens, ceiling, role_definitions, member_capabilities, suspensions)"
+        );
+
         crate::identity::test_helpers::cleanup_identity_registry();
     }
 
