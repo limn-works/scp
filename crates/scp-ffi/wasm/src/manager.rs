@@ -1445,6 +1445,24 @@ impl WasmContextManager {
             });
         }
 
+        // Ceiling-entry grammar enforcement (spec §5.3.1.1). The WASM bridge does
+        // NOT route ceiling construction through `ContextRoleState::new` (the
+        // native enforcement point), so it validates each user-supplied ceiling
+        // entry here against the SAME canonical grammar validator. This forecloses
+        // a malformed entry being normalized into the ceiling string set — in
+        // particular it prevents any silent broadening, since a no-colon custom
+        // (e.g. `payments`) and stray-`*` entries (`*:*`, `*:read`) are rejected
+        // rather than normalized. Built-in defaults (empty ceiling) are
+        // well-formed by construction and skip per-entry validation.
+        for entry in &ceiling {
+            scp_protocol::context::roles::validate_ceiling_entry(entry).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                }
+            })?;
+        }
+
         let ceiling_strings = Self::build_ceiling_strings(&ceiling);
 
         // Parse and validate minProtocolVersion from params (spec §13.4).
@@ -8771,6 +8789,87 @@ mod tests {
             !mgr.contexts.contains_key("ctx-paid"),
             "rejected paid context must not appear in the registry"
         );
+    }
+
+    /// `create_context` rejects a malformed ceiling entry (spec §5.3.1.1)
+    /// BEFORE any state mutation (the ceiling-grammar gate runs ahead of the
+    /// time-dependent creation path), and nothing is inserted into the registry.
+    /// A single-token custom (`payments`) and a stray-wildcard (`*:*`) are both
+    /// rejected — proving the WASM bridge does NOT silently normalize/broaden
+    /// them into the ceiling.
+    #[test]
+    fn test_wasm_context_create_rejects_malformed_ceiling_entry() {
+        for bad_entry in [
+            "payments",
+            "*:*",
+            "*:read",
+            "payments:read:write",
+            "payments:wr*",
+        ] {
+            let mut mgr = WasmContextManager::new();
+            let creator = "did:dht:zcreator";
+            let params = serde_json::json!({
+                "mode": "Encrypted",
+                "ceiling": ["messages:read", bad_entry],
+                "ceilingPolicy": "immutable",
+                "governance": "single_admin",
+                "economicPolicy": free_policy_json(),
+            });
+
+            let err = mgr
+                .create_context("ctx-bad-ceiling", creator, &params)
+                .expect_err("create_context must reject malformed ceiling entry");
+
+            match err {
+                ScpWasmError::Validation {
+                    ref code,
+                    ref message,
+                } => {
+                    assert_eq!(code, codes::VALID_7000);
+                    assert!(
+                        message.contains("InvalidCeilingCategory"),
+                        "expected InvalidCeilingCategory for {bad_entry:?}, got: {message}"
+                    );
+                }
+                other => panic!("expected Validation error for {bad_entry:?}, got: {other:?}"),
+            }
+
+            assert!(
+                !mgr.contexts.contains_key("ctx-bad-ceiling"),
+                "rejected context must not appear in the registry for {bad_entry:?}"
+            );
+        }
+    }
+
+    /// `create_context` accepts a well-formed custom ceiling entry and an
+    /// explicit `{resource}:*` wildcard at the grammar gate (the gate passes;
+    /// downstream creation is covered by the conformance suite under a real JS
+    /// host). We assert the gate does not reject these well-formed entries by
+    /// confirming the error, if any, is NOT an `InvalidCeilingCategory`.
+    #[test]
+    fn test_wasm_context_create_accepts_wellformed_custom_ceiling() {
+        for good_entry in ["payments:approve", "payments:*", "tool:invoke:calc"] {
+            let mut mgr = WasmContextManager::new();
+            let creator = "did:dht:zcreator";
+            let params = serde_json::json!({
+                "mode": "Encrypted",
+                "ceiling": ["messages:read", good_entry],
+                "ceilingPolicy": "immutable",
+                "governance": "single_admin",
+                "economicPolicy": free_policy_json(),
+            });
+            // The grammar gate must NOT reject well-formed entries. (The accept
+            // path may still error later on the native time stub — that is not a
+            // ceiling-grammar rejection.)
+            if let Err(ScpWasmError::Validation { code, message }) =
+                mgr.create_context("ctx-good-ceiling", creator, &params)
+            {
+                assert!(
+                    !(code == codes::VALID_7000 && message.contains("InvalidCeilingCategory")),
+                    "well-formed entry {good_entry:?} must not be rejected by the grammar gate: {message}"
+                );
+            }
+        }
     }
 
     /// **C2-B:** `create_context` accepts a free economic policy. The

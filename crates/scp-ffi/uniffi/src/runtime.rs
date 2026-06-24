@@ -978,8 +978,17 @@ impl UniffiBridgeInstance {
                 .map(scp_core::context::roles::Capability::ucan_capability_name)
                 .collect::<HashSet<String>>()
         } else {
+            // Ceiling-entry grammar enforcement (spec §5.3.1.1). This per-instance
+            // UCAN-state cache is populated AFTER `context_create` already routed
+            // through the runtime creation gate (`lifecycle_helpers::create_context`
+            // → `ContextRoleState::new`), which rejects any malformed ceiling — so
+            // every surviving entry is well-formed. As infallible defense-in-depth,
+            // a malformed entry is SKIPPED rather than normalized: this forecloses
+            // the silent broadening where a no-colon `payments` would become
+            // `payments:*` via `Capability::new` + `ucan_capability_name`.
             ceiling
                 .iter()
+                .filter(|s| scp_core::context::roles::validate_ceiling_entry(s).is_ok())
                 .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
                 .collect::<HashSet<String>>()
         };

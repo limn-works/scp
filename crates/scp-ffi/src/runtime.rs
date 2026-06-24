@@ -1520,6 +1520,16 @@ pub fn register_ffi_state(
                     .map(scp_core::context::roles::Capability::ucan_capability_name)
                     .collect::<HashSet<String>>()
             } else {
+                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on the raw
+                // user strings BEFORE they are normalized into the UCAN ceiling
+                // string set. Rejects malformed entries at the bridge boundary
+                // (e.g. a no-colon `payments`, which `Capability::new` +
+                // `ucan_capability_name` would otherwise silently widen to
+                // `payments:*`) rather than storing a broadened entry.
+                for entry in user_ceiling {
+                    scp_core::context::roles::validate_ceiling_entry(entry)
+                        .map_err(|e| ScpPyError::context(e.to_string()))?;
+                }
                 user_ceiling
                     .iter()
                     .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
@@ -3018,6 +3028,56 @@ mod tests {
             !Arc::ptr_eq(&first_manager, second_manager),
             "second bi must hold a distinct ContextManager — not the first's"
         );
+    }
+
+    /// `register_context` rejects a malformed ceiling entry (spec §5.3.1.1) at
+    /// the bridge boundary: a single-token custom (`payments`) and stray-wildcard
+    /// entries (`*:*`, `*:read`) and a multi-colon entry are all rejected, and NO
+    /// FFI state is stored. Proves the `PyO3` reference bridge does not silently
+    /// widen a no-colon custom into `payments:*`.
+    #[test]
+    fn register_context_rejects_malformed_ceiling_entry() {
+        for bad in [
+            "payments",
+            "*:*",
+            "*:read",
+            "payments:read:write",
+            "payments:wr*",
+        ] {
+            let bi = PyBridgeInstance::new_py();
+            let ctx_id = unique_ctx_id("bad-ceiling");
+            let creator = "did:dht:z6MkBadCeiling";
+            let user_ceiling = vec!["messages:read".to_owned(), (*bad).to_owned()];
+            let err = register_context(&bi, &ctx_id, creator, &user_ceiling)
+                .expect_err("malformed ceiling entry must be rejected");
+            assert!(
+                err.to_string().contains("InvalidCeilingCategory"),
+                "expected InvalidCeilingCategory for {bad:?}, got: {err}"
+            );
+            // Defense-in-depth: no FFI state was stored for the rejected context.
+            assert!(
+                with_ffi_state(&bi, &ctx_id, |_| Ok::<(), ScpPyError>(())).is_err(),
+                "rejected context must not have stored FFI state for {bad:?}"
+            );
+        }
+    }
+
+    /// `register_context` accepts a well-formed custom ceiling entry, an explicit
+    /// `{resource}:*` wildcard, and the parameterized `tool:invoke:{tool_id}`
+    /// built-in.
+    #[test]
+    fn register_context_accepts_wellformed_custom_ceiling() {
+        for good in ["payments:approve", "payments:*", "tool:invoke:calc"] {
+            let bi = PyBridgeInstance::new_py();
+            let ctx_id = unique_ctx_id("good-ceiling");
+            let creator = "did:dht:z6MkGoodCeiling";
+            let user_ceiling = vec!["messages:read".to_owned(), (*good).to_owned()];
+            let result = register_context(&bi, &ctx_id, creator, &user_ceiling);
+            assert!(
+                result.is_ok(),
+                "well-formed ceiling {good:?} must be accepted: {result:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -291,18 +291,29 @@ impl Capability {
                 std::borrow::Cow::Borrowed("edit"),
             ),
             Self::Custom(name) => {
-                // Custom capabilities may use either colon or underscore format.
-                // Split on the last colon to separate resource from action.
+                // Custom capabilities use the `{resource}:{action}` form. Split on
+                // the last colon to separate resource from action.
                 if let Some((resource, action)) = name.rsplit_once(':') {
                     (
                         std::borrow::Cow::Owned(resource.replace(':', "_")),
                         std::borrow::Cow::Borrowed(action),
                     )
                 } else {
-                    // No colon — treat entire name as resource with wildcard action.
+                    // No colon. Well-formed ceiling entries are validated at
+                    // context creation (`validate_ceiling_entry`, spec §5.3.1.1),
+                    // so a no-colon custom can NEVER reach this point as a stored
+                    // ceiling entry — it is rejected up front with
+                    // `InvalidCeilingCategory`. This branch therefore never
+                    // synthesizes the silent `name → name:*` wildcard that
+                    // previously widened a no-colon custom: a defensive fallback
+                    // maps the whole token to BOTH resource and action (a
+                    // concrete, non-wildcard `name:name`), so even if a no-colon
+                    // custom is constructed directly (e.g. in a test or via the
+                    // raw enum), it can match only that one exact capability and
+                    // can never grant `name:*`.
                     (
                         std::borrow::Cow::Borrowed(name.as_str()),
-                        std::borrow::Cow::Borrowed("*"),
+                        std::borrow::Cow::Borrowed(name.as_str()),
                     )
                 }
             }
@@ -330,6 +341,32 @@ impl Capability {
     pub fn ucan_capability_name(&self) -> String {
         let (resource, action) = self.ucan_resource_action();
         format!("{resource}:{action}")
+    }
+
+    /// Validates this capability as a ceiling entry against the ceiling-entry
+    /// grammar (spec §5.3.1.1).
+    ///
+    /// Built-in variants are well-formed by construction (they correspond to
+    /// rows of the §5.3.1 table). [`ToolInvoke`](Self::ToolInvoke) and
+    /// [`Custom`](Self::Custom) variants are reconstructed to their user-facing
+    /// entry string ([`name`](Self::name)) and validated via
+    /// [`validate_ceiling_entry`]. This is the enum-form entry point onto the
+    /// single canonical string validator, so a malformed custom (e.g. a no-colon
+    /// `Custom("payments")` or `Custom("*:*")`) is rejected at ceiling
+    /// construction rather than silently widened or stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if this capability
+    /// would be a malformed ceiling entry.
+    pub fn validate_as_ceiling_entry(&self) -> Result<(), CeilingEntryError> {
+        match self {
+            // Built-in variants are well-formed by construction. `ToolInvoke(id)`
+            // and `Custom(_)` carry caller-supplied text, so route them through
+            // the canonical string grammar using their user-facing entry form.
+            Self::ToolInvoke(_) | Self::Custom(_) => validate_ceiling_entry(self.name().as_ref()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -487,6 +524,22 @@ impl CapabilityCeiling {
             .map(Capability::ucan_capability_name)
             .collect()
     }
+
+    /// Validates every entry in this ceiling against the ceiling-entry grammar
+    /// (spec §5.3.1.1). Called at context creation so a malformed entry cannot be
+    /// stored; the first malformed entry short-circuits with its error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CeilingEntryError::InvalidCeilingCategory`] for the first entry
+    /// that is not a recognized built-in category nor a well-formed custom
+    /// capability.
+    pub fn validate_entries(&self) -> Result<(), CeilingEntryError> {
+        for cap in &self.capabilities {
+            cap.validate_as_ceiling_entry()?;
+        }
+        Ok(())
+    }
 }
 
 /// Returns the default capability ceiling for new contexts.
@@ -508,6 +561,219 @@ pub fn default_ceiling() -> CapabilityCeiling {
         Capability::GovernanceVote,
         Capability::ContextClose,
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Ceiling-entry grammar (spec §5.3.1.1)
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length of a single ceiling entry string (spec §5.3.1.1 / §9.1A
+/// "String field validation"). Entries exceeding this cap are rejected.
+pub const MAX_CEILING_ENTRY_LENGTH: usize = 256;
+
+/// Maximum byte length of a `tool_id` in a parameterized `tool:invoke:{tool_id}`
+/// built-in entry (spec §5.4.1 `ToolRegistration.tool_id`, `max 128 chars`).
+const MAX_TOOL_ID_LENGTH: usize = 128;
+
+/// The exhaustive set of non-parameterized built-in capability category strings
+/// (spec §5.3.1 table). These are matched exactly and case-sensitively. The
+/// parameterized `tool:invoke:{tool_id}` and the resource wildcard
+/// `tool:invoke:*` are validated separately (see [`validate_ceiling_entry`]).
+const BUILTIN_CEILING_CATEGORIES: &[&str] = &[
+    "messages:read",
+    "messages:write",
+    "tool:register",
+    "tool:invoke:*",
+    "member:invite",
+    "member:remove",
+    "member:ban",
+    "role:assign",
+    "media:voice",
+    "media:video",
+    "media:screen_share",
+    "bridging",
+    "tool:interface",
+    "context:child:create",
+    "governance:propose",
+    "governance:vote",
+    "context:close",
+    "metadata:edit",
+];
+
+/// Error produced when a ceiling entry is not well-formed per the
+/// ceiling-entry grammar (spec §5.3.1.1).
+///
+/// Surfaced at context creation: a malformed entry causes creation to fail and
+/// can never be stored in a [`CapabilityCeiling`]. The single variant carries
+/// the spec-named `InvalidCeilingCategory` semantics plus the offending entry
+/// and a human-readable reason for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CeilingEntryError {
+    /// A ceiling entry is neither a recognized built-in category (spec §5.3.1)
+    /// nor a well-formed custom capability (spec §5.3.1.1). This is the
+    /// protocol's `InvalidCeilingCategory` error.
+    #[error("InvalidCeilingCategory: ceiling entry {entry:?} is malformed ({reason})")]
+    InvalidCeilingCategory {
+        /// The offending ceiling entry, exactly as supplied.
+        entry: String,
+        /// Why the entry is malformed (which grammar rule it violated).
+        reason: String,
+    },
+}
+
+impl CeilingEntryError {
+    /// Constructs an [`Self::InvalidCeilingCategory`] for `entry` with `reason`.
+    fn invalid(entry: &str, reason: impl Into<String>) -> Self {
+        Self::InvalidCeilingCategory {
+            entry: entry.to_owned(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Returns `true` if every byte of `token` is in the kebab-case charset
+/// `[a-z0-9-]` and `token` is non-empty (spec §5.3.1.1). No `:`, no `*`, no
+/// whitespace, no uppercase — the charset is exact and closed.
+fn is_kebab_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Returns `true` if every byte of `tool_id` is in the §5.4.1 `tool_id` charset
+/// `[a-z0-9_-]` and `tool_id` is non-empty. Differs from [`is_kebab_token`] by
+/// also permitting `_` (underscore), per §5.4.1.
+fn is_tool_id_token(tool_id: &str) -> bool {
+    !tool_id.is_empty()
+        && tool_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Validates a single ceiling entry string against the ceiling-entry grammar.
+///
+/// This (spec §5.3.1.1) is the SINGLE canonical definition of "well-formed
+/// ceiling entry"; every construction and bridge path routes through it (via
+/// [`Capability::validate_as_ceiling_entry`] for enum-form entries) so a
+/// malformed entry can never be stored.
+///
+/// A well-formed entry is **exactly one** of:
+/// 1. a built-in category — exact, case-sensitive match against the §5.3.1
+///    table (including parameterized `tool:invoke:{tool_id}` and the resource
+///    wildcard `tool:invoke:*`);
+/// 2. a custom `{resource}:{action}` — exactly one colon; both tokens non-empty
+///    kebab-case `[a-z0-9-]+`;
+/// 3. an explicit resource wildcard `{resource}:*` — `{resource}` kebab-case;
+///    the action segment is the single literal `*`.
+///
+/// Everything else is rejected with [`CeilingEntryError::InvalidCeilingCategory`]:
+/// single-token customs (no colon, e.g. `payments`), a stray `*` anywhere except
+/// as a whole action segment (`*:*`, `*:read`, `pay*ments`, `payments:wr*`),
+/// more than one colon (`payments:read:write`), empty resource/action, characters
+/// outside the kebab charset, whitespace, control characters
+/// (U+0000–U+001F / U+007F–U+009F), HTML-special characters (`< > & " '`), and
+/// strings exceeding [`MAX_CEILING_ENTRY_LENGTH`] bytes. There is **no implicit
+/// or silent wildcard** — a wildcard must be written explicitly as `:*`.
+///
+/// # Errors
+///
+/// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not
+/// well-formed.
+pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
+    // Length cap (bytes), per §9.1A string-field validation.
+    if entry.len() > MAX_CEILING_ENTRY_LENGTH {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            format!(
+                "exceeds maximum length of {MAX_CEILING_ENTRY_LENGTH} bytes (got {} bytes)",
+                entry.len()
+            ),
+        ));
+    }
+
+    // String sanitization (§9.1A): reject control chars, HTML-special chars, and
+    // any whitespace anywhere in the entry. This applies uniformly before any
+    // structural parse — a control char inside an otherwise built-in-looking
+    // string is still malformed.
+    for ch in entry.chars() {
+        if ch.is_control() {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains a control character (U+0000–U+001F / U+007F–U+009F)",
+            ));
+        }
+        if ch.is_whitespace() {
+            return Err(CeilingEntryError::invalid(entry, "contains whitespace"));
+        }
+        if matches!(ch, '<' | '>' | '&' | '"' | '\'') {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains an HTML-special character (< > & \" ')",
+            ));
+        }
+    }
+
+    // 1. Built-in categories: exact, case-sensitive match.
+    if BUILTIN_CEILING_CATEGORIES.contains(&entry) {
+        return Ok(());
+    }
+
+    // 1b. Parameterized built-in: `tool:invoke:{tool_id}` (the `*` form is in the
+    // table above). The tool_id follows §5.4.1's charset/length (allows `_`).
+    if let Some(tool_id) = entry.strip_prefix("tool:invoke:") {
+        // `tool:invoke:*` already matched as a built-in above; here tool_id is a
+        // concrete id and MUST NOT contain a `*`.
+        if tool_id.len() > MAX_TOOL_ID_LENGTH {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                format!("tool_id exceeds maximum length of {MAX_TOOL_ID_LENGTH} bytes"),
+            ));
+        }
+        if is_tool_id_token(tool_id) {
+            return Ok(());
+        }
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "tool_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
+        ));
+    }
+
+    // 2 & 3. Custom capability: EXACTLY ONE colon separating resource and action.
+    let Some((resource, action)) = entry.split_once(':') else {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "single-token custom (no colon); a custom capability must be \
+             resource:action and is never silently widened to a wildcard",
+        ));
+    };
+
+    // More than one colon is malformed (e.g. `payments:read:write`).
+    if action.contains(':') {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "more than one colon; a custom ceiling entry has exactly one colon",
+        ));
+    }
+
+    // The resource token is always a kebab-case token (never `*`).
+    if !is_kebab_token(resource) {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "resource must be a non-empty kebab-case [a-z0-9-] token (no '*', no whitespace)",
+        ));
+    }
+
+    // The action is either the single literal `*` (explicit wildcard) or a
+    // kebab-case token. A `*` as a substring (e.g. `wr*`) is never accepted.
+    if action == "*" || is_kebab_token(action) {
+        Ok(())
+    } else {
+        Err(CeilingEntryError::invalid(
+            entry,
+            "action must be a non-empty kebab-case [a-z0-9-] token or the single literal '*'",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -821,6 +1087,13 @@ pub enum RoleError {
     /// A context lifecycle error occurred during role assignment.
     #[error("context error: {0}")]
     Context(#[from] ContextError),
+
+    /// A ceiling entry supplied at context creation is not a recognized built-in
+    /// category nor a well-formed custom capability (spec §5.3.1.1). Surfaces the
+    /// protocol's `InvalidCeilingCategory` error so a malformed entry can never be
+    /// stored in the ceiling.
+    #[error(transparent)]
+    InvalidCeilingCategory(#[from] CeilingEntryError),
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +1201,15 @@ impl ContextRoleState {
     ) -> Result<Self, RoleError> {
         let context_id = context_id.into();
         let creator_did = creator_did.into();
+
+        // Ceiling-entry grammar enforcement (spec §5.3.1.1). Every ceiling entry
+        // must be a recognized built-in category or a well-formed custom
+        // capability; a malformed entry (single-token custom, stray `*`,
+        // multi-colon, bad charset, control/HTML char, oversize, …) fails
+        // creation with `InvalidCeilingCategory` and is never stored. This is the
+        // single canonical enforcement point — every context-creation path routes
+        // through `ContextRoleState::new`.
+        ceiling.validate_entries()?;
 
         // Validate custom roles: name format + capabilities against ceiling.
         for role in &custom_roles {
@@ -3148,12 +3430,294 @@ mod tests {
 
     #[test]
     fn ceiling_with_custom_capability() {
+        // Custom ceiling entries are well-formed `{resource}:{action}` per
+        // §5.3.1.1 (no bare single-token customs).
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
-            Capability::Custom("special-action".to_owned()),
+            Capability::Custom("special:action".to_owned()),
         ]);
-        assert!(ceiling.contains(&Capability::Custom("special-action".to_owned())));
-        assert!(!ceiling.contains(&Capability::Custom("other-action".to_owned())));
+        assert!(ceiling.contains(&Capability::Custom("special:action".to_owned())));
+        assert!(!ceiling.contains(&Capability::Custom("other:action".to_owned())));
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling-entry grammar (spec §5.3.1.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ceiling_entry_accepts_wellformed_custom_and_wildcard() {
+        // Custom `{resource}:{action}` and explicit `{resource}:*` wildcard.
+        validate_ceiling_entry("payments:approve").unwrap();
+        validate_ceiling_entry("payments:*").unwrap();
+        validate_ceiling_entry("a-b-c:d-e-f").unwrap();
+        validate_ceiling_entry("r0:a0").unwrap();
+    }
+
+    #[test]
+    fn ceiling_entry_accepts_builtin_categories() {
+        for entry in [
+            "messages:read",
+            "messages:write",
+            "tool:register",
+            "tool:invoke:*",
+            "tool:invoke:calc",
+            "member:invite",
+            "member:remove",
+            "member:ban",
+            "role:assign",
+            "media:voice",
+            "media:video",
+            "media:screen_share",
+            "bridging",
+            "tool:interface",
+            "context:child:create",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "metadata:edit",
+        ] {
+            validate_ceiling_entry(entry)
+                .unwrap_or_else(|e| panic!("built-in {entry:?} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_single_token_custom() {
+        // No colon, no action → malformed; never widened to `payments:*`.
+        assert!(matches!(
+            validate_ceiling_entry("payments"),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_stray_wildcards() {
+        for entry in [
+            "*:*",
+            "*:read",
+            "pay*ments",
+            "payments:wr*",
+            "*",
+            "*:approve",
+        ] {
+            assert!(
+                matches!(
+                    validate_ceiling_entry(entry),
+                    Err(CeilingEntryError::InvalidCeilingCategory { .. })
+                ),
+                "entry {entry:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_multi_colon() {
+        assert!(matches!(
+            validate_ceiling_entry("payments:read:write"),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_empty_segments() {
+        for entry in ["payments:", ":read", ":", ""] {
+            assert!(
+                matches!(
+                    validate_ceiling_entry(entry),
+                    Err(CeilingEntryError::InvalidCeilingCategory { .. })
+                ),
+                "entry {entry:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_bad_charset_and_whitespace() {
+        for entry in [
+            "Payments:approve",  // uppercase
+            "payments:Approve",  // uppercase action
+            "pay ments:approve", // internal whitespace
+            "payments:appr ove",
+            "payments :approve",
+            "pay_ments:approve", // underscore not in custom kebab charset
+            "payments:appr_ove",
+            "payménts:approve", // non-ASCII
+        ] {
+            assert!(
+                matches!(
+                    validate_ceiling_entry(entry),
+                    Err(CeilingEntryError::InvalidCeilingCategory { .. })
+                ),
+                "entry {entry:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_control_and_html_chars() {
+        for entry in [
+            "payments:appr\u{0000}ove",
+            "payments:appr\u{001f}ove",
+            "payments:appr\u{007f}ove",
+            "payments:appr\u{009f}ove",
+            "payments:<approve>",
+            "payments:appr&ove",
+            "payments:appr\"ove",
+            "payments:appr'ove",
+        ] {
+            assert!(
+                matches!(
+                    validate_ceiling_entry(entry),
+                    Err(CeilingEntryError::InvalidCeilingCategory { .. })
+                ),
+                "entry {entry:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_oversize() {
+        // 256 bytes is the cap; build a 257-byte well-charset entry.
+        let resource = "r";
+        let action = "a".repeat(MAX_CEILING_ENTRY_LENGTH); // r:aaa... → 1+1+256 = 258 bytes
+        let entry = format!("{resource}:{action}");
+        assert!(entry.len() > MAX_CEILING_ENTRY_LENGTH);
+        assert!(matches!(
+            validate_ceiling_entry(&entry),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+        // A 256-byte entry at the boundary is accepted (well-formed kebab).
+        let at_cap = format!("r:{}", "a".repeat(MAX_CEILING_ENTRY_LENGTH - 2));
+        assert_eq!(at_cap.len(), MAX_CEILING_ENTRY_LENGTH);
+        validate_ceiling_entry(&at_cap).unwrap();
+    }
+
+    #[test]
+    fn ceiling_entry_rejects_tool_invoke_with_stray_wildcard() {
+        // `tool:invoke:*` is the only wildcard built-in; an embedded `*` in the
+        // tool_id is malformed.
+        assert!(matches!(
+            validate_ceiling_entry("tool:invoke:ca*lc"),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+        assert!(matches!(
+            validate_ceiling_entry("tool:invoke:"),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn capability_validate_as_ceiling_entry_rejects_malformed_custom() {
+        // Enum-form entry point onto the canonical validator.
+        assert!(
+            Capability::Custom("payments".to_owned())
+                .validate_as_ceiling_entry()
+                .is_err()
+        );
+        assert!(
+            Capability::Custom("*:*".to_owned())
+                .validate_as_ceiling_entry()
+                .is_err()
+        );
+        assert!(
+            Capability::Custom("payments:approve".to_owned())
+                .validate_as_ceiling_entry()
+                .is_ok()
+        );
+        assert!(
+            Capability::Custom("payments:*".to_owned())
+                .validate_as_ceiling_entry()
+                .is_ok()
+        );
+        // Built-ins are always well-formed.
+        assert!(Capability::MessagesRead.validate_as_ceiling_entry().is_ok());
+        assert!(
+            Capability::ToolInvokeAll
+                .validate_as_ceiling_entry()
+                .is_ok()
+        );
+        assert!(
+            Capability::ToolInvoke("calc".to_owned())
+                .validate_as_ceiling_entry()
+                .is_ok()
+        );
+        assert!(
+            Capability::ToolInvoke("ca*lc".to_owned())
+                .validate_as_ceiling_entry()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ceiling_validate_entries_rejects_first_malformed() {
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments".to_owned()),
+        ]);
+        assert!(matches!(
+            ceiling.validate_entries(),
+            Err(CeilingEntryError::InvalidCeilingCategory { .. })
+        ));
+    }
+
+    #[test]
+    fn context_role_state_new_rejects_malformed_ceiling_entry() {
+        // End-to-end: context creation fails (does not store) a malformed entry.
+        let clock = scp_primitives::SystemClock;
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments".to_owned()),
+        ]);
+        let result = ContextRoleState::new("ctx-1", "did:scp:creator", ceiling, vec![], &clock);
+        assert!(matches!(
+            result,
+            Err(RoleError::InvalidCeilingCategory(
+                CeilingEntryError::InvalidCeilingCategory { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn context_role_state_new_accepts_wellformed_custom_ceiling() {
+        let clock = scp_primitives::SystemClock;
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::Custom("billing:*".to_owned()),
+            Capability::ToolInvoke("calc".to_owned()),
+        ]);
+        ContextRoleState::new("ctx-1", "did:scp:creator", ceiling, vec![], &clock).unwrap();
+    }
+
+    #[test]
+    fn ceiling_mint_and_validate_agree_on_custom_action() {
+        // Mint-side: ucan string set for a well-formed custom `{resource}:{action}`.
+        let cap = Capability::Custom("payments:approve".to_owned());
+        let ceiling = CapabilityCeiling::new([cap.clone()]);
+        let ucan_set = ceiling.to_ucan_string_set();
+        // Validate-side: a UCAN capability URI for the same {resource}:{action}
+        // is within the ceiling.
+        let uri =
+            crate::crypto::ucan::capability::CapabilityUri::new("ctx-1", "payments", "approve");
+        assert!(uri.is_within_ceiling(&ucan_set));
+        // Mint-side enum check agrees: the exact capability is in the ceiling.
+        assert!(ceiling.contains(&cap));
+    }
+
+    #[test]
+    fn ceiling_mint_and_validate_agree_on_wildcard() {
+        // Explicit `{resource}:*` wildcard.
+        let cap = Capability::Custom("payments:*".to_owned());
+        let ceiling = CapabilityCeiling::new([cap]);
+        let ucan_set = ceiling.to_ucan_string_set();
+        // Validate-side: a concrete action under the wildcard resource is covered.
+        let uri =
+            crate::crypto::ucan::capability::CapabilityUri::new("ctx-1", "payments", "refund");
+        assert!(uri.is_within_ceiling(&ucan_set));
+        // A different resource is NOT covered (no resource wildcard).
+        let other =
+            crate::crypto::ucan::capability::CapabilityUri::new("ctx-1", "billing", "refund");
+        assert!(!other.is_within_ceiling(&ucan_set));
     }
 
     #[test]
@@ -3463,11 +4027,23 @@ mod tests {
     }
 
     #[test]
-    fn ucan_resource_action_custom_no_colons() {
+    fn ucan_resource_action_custom_no_colons_does_not_widen_to_wildcard() {
+        // Regression: a no-colon custom MUST NOT be silently widened to
+        // `{name}:*` (spec §5.3.1.1 — "no implicit or silent wildcard"). Such an
+        // entry is rejected at context creation (see
+        // `ceiling_entry_rejects_single_token_custom`); the residual
+        // `ucan_resource_action` fallback maps it to the concrete, non-wildcard
+        // `name:name` so even a directly-constructed no-colon custom can never
+        // grant `name:*`.
         let cap = Capability::Custom("single".to_owned());
         let (resource, action) = cap.ucan_resource_action();
         assert_eq!(resource.as_ref(), "single");
-        assert_eq!(action.as_ref(), "*");
+        assert_ne!(
+            action.as_ref(),
+            "*",
+            "no-colon custom must not widen to '*'"
+        );
+        assert_eq!(action.as_ref(), "single");
     }
 
     #[test]

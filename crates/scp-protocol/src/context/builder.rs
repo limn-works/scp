@@ -233,6 +233,12 @@ pub enum ContextCreationError {
     )]
     BilateralPeerNotSupported,
 
+    /// A ceiling entry is not a recognized built-in category nor a well-formed
+    /// custom capability (spec §5.3.1.1). Surfaces the protocol's
+    /// `InvalidCeilingCategory` error so a malformed entry can never be stored.
+    #[error(transparent)]
+    InvalidCeilingCategory(#[from] crate::context::roles::CeilingEntryError),
+
     /// Generic creation failure with a descriptive message.
     #[error("context creation failed: {0}")]
     CreationFailed(String),

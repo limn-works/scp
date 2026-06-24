@@ -1379,9 +1379,19 @@ pub async fn create_context(
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
+    // `ContextRoleState::new` enforces the ceiling-entry grammar (spec §5.3.1.1):
+    // a malformed entry fails here with `InvalidCeilingCategory`, preserved as a
+    // typed error so the bridges surface the protocol error verbatim rather than
+    // a flattened string.
     let role_state =
-        ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock)
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock).map_err(
+            |e| match e {
+                scp_protocol::context::roles::RoleError::InvalidCeilingCategory(inner) => {
+                    ContextCreationError::InvalidCeilingCategory(inner)
+                }
+                other => ContextCreationError::CreationFailed(other.to_string()),
+            },
+        )?;
     let mut membership = MembershipState::new();
     let creator_tokens = role_state
         .assignments

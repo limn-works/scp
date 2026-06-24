@@ -1515,6 +1515,20 @@ pub fn ensure_registered(
             .map(scp_core::context::roles::Capability::ucan_capability_name)
             .collect::<HashSet<String>>()
     } else {
+        // Ceiling-entry grammar enforcement (spec §5.3.1.1) on the raw user
+        // strings BEFORE they are normalized into the UCAN ceiling string set.
+        // Rejects malformed entries at the bridge boundary (e.g. a no-colon
+        // `payments`, which `Capability::new` + `ucan_capability_name` would
+        // otherwise silently widen to `payments:*`) rather than storing a
+        // broadened entry.
+        for entry in &handle_ceiling {
+            scp_core::context::roles::validate_ceiling_entry(entry).map_err(|e| {
+                ScpNapiError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                }
+            })?;
+        }
         handle_ceiling
             .into_iter()
             .map(|s| scp_core::context::roles::Capability::new(&s).ucan_capability_name())
