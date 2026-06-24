@@ -50,6 +50,8 @@ also not a saga.)*
 
 ## Gap 1 — Standing-pair 2-phase decomposition
 
+> **Superseded — see Resolution Gap-1 (2026-06-18).** Standing-pair creation is **not** a two-phase-commit saga: a 2-member MLS group is **one** context (single-context async creation), so there is no Prepare-A / Prepare-B / Commit / Abort decomposition to specify. Replica synchronization is MLS (epoch-ordered Commits + the bootstrapping Welcome) plus the event-log consistency layer; the consent gate is applied by the joining peer on Welcome receipt. The `CreationReceipt` / `StandingPairCreate` / `InitiateStandingPairCreate` apparatus described below is removed. See spec §5.15.8 and ADR-049 §3 / §3a. The present-tense two-phase body below is the original problem statement, retained for historical provenance only.
+
 **What's missing.** The spec (§5.12.6 plus the
 `standing_helpers::generate_standing_context_id` derivation) defines
 the `standing_context` get-or-create flow but, prior to §5.15.8, does
