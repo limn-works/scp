@@ -2717,7 +2717,7 @@
         "Exception hierarchy rooted at `ScpError(Exception)`.",
         "`IdentityError(ScpError)` — Identity creation, resolution, or key management failure.",
         "`ContextError(ScpError)` — Context lifecycle errors (create, join, leave, close).",
-        "`PermissionError(ScpError)` — UCAN capability validation failure.",
+        "`UcanPermissionError(ScpError)` — UCAN capability validation failure.",
         "`CryptoError(ScpError)` — Encryption, decryption, or signature failure.",
         "`TransportError(ScpError)` — Network or relay communication failure.",
         "`ToolError(ScpError)` — Tool registration, invocation, or verification failure.",
@@ -2726,7 +2726,7 @@
         "Exceptions wrap the corresponding bridge-level `ScpPyError` variants."
       ],
       "actionItems": [
-        "Create `bindings/python/scp_sdk/errors.py` with `ScpError`, `IdentityError`, `ContextError`, `PermissionError`, `CryptoError`, `TransportError`, `ToolError`, `ValidationError` exception classes.",
+        "Create `bindings/python/scp_sdk/errors.py` with `ScpError`, `IdentityError`, `ContextError`, `UcanPermissionError`, `CryptoError`, `TransportError`, `ToolError`, `ValidationError` exception classes.",
         "Add machine-readable error code attribute to each exception.",
         "Create `bindings/python/scp_sdk/tools.py` with `ToolDefinition` and `TestVector` dataclasses.",
         "Create `bindings/python/scp_sdk/types.py` with `Message`, `Provenance`, `Capability` dataclasses and shared enums.",
@@ -2807,7 +2807,7 @@
       "acceptanceCriteria": [
         "Top-level imports: `import scp_sdk` or `from scp_sdk import Identity, Context` work.",
         "The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 3.1.",
-        "Re-exports: Identity, Context, ToolDefinition, TestVector, evaluate_trust, ScpError, IdentityError, ContextError, PermissionError, CryptoError, TransportError, ToolError, ValidationError.",
+        "Re-exports: Identity, Context, ToolDefinition, TestVector, evaluate_trust, ScpError, IdentityError, ContextError, UcanPermissionError, CryptoError, TransportError, ToolError, ValidationError.",
         "`__version__ = \"0.1.0\"` declared.",
         "`py.typed` PEP 561 marker file exists.",
         "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
@@ -3320,13 +3320,13 @@
       ],
       "description": "Implement the Python wrapper for UCAN operations: `validate()`, `mint()`, `revoke()`, `delegate()`. Exposes UCAN as both an explicit API (for advanced use) and an implicit enforcement layer (every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally).",
       "acceptanceCriteria": [
-        "`validate(context, token, capability)` validates a UCAN token (raises PermissionError on failure).",
+        "`validate(context, token, capability)` validates a UCAN token (raises UcanPermissionError on failure).",
         "`mint(issuer, audience, capabilities, context, expiry)` mints a new UCAN token.",
         "`revoke(context, token)` revokes a UCAN token.",
         "`delegate(parent_token, delegator, delegatee, capabilities)` creates a delegated UCAN.",
         "All functions delegate to `_scp_core` bridge functions.",
         "Implicit validation: every `Context.send()`, `Context.invoke()`, etc. validates capabilities internally before executing.",
-        "Validation failures surface as `scp_sdk.PermissionError` with descriptive messages."
+        "Validation failures surface as `scp_sdk.UcanPermissionError` with descriptive messages."
       ],
       "actionItems": [
         "Create `bindings/python/scp_sdk/ucan.py` with `validate()`, `mint()`, `revoke()`, `delegate()` async functions.",
@@ -3334,7 +3334,7 @@
         "Implement `mint(issuer, audience, capabilities, context, expiry)` delegating to `_scp_core.py_ucan_mint`.",
         "Implement `revoke(context, token)` delegating to `_scp_core.py_ucan_revoke`.",
         "Implement `delegate(parent_token, delegator, delegatee, capabilities)` delegating to bridge.",
-        "Ensure PermissionError is raised with descriptive messages on validation failure."
+        "Ensure UcanPermissionError is raised with descriptive messages on validation failure."
       ],
       "blockedBy": [
         "SCP-040",
@@ -3370,11 +3370,11 @@
         "Alice sends a message — UCAN validated: `await ctx.send(\"Hello from Python\", identity=alice)`. Internally: validate_ucan(ctx, alice_token, \"messages:write\") passes (ADR-016). Message flows through scp-core: sender key encrypt -> MLS encrypt -> envelope -> multi-relay publish. All via PyO3 bridge (ADR-013).",
         "Bob receives the message via async iterator: `async for msg in ctx.receive(): print(msg.content)`. Async iterator bridges tokio stream -> Python asyncio via PyO3 native async (ADR-013).",
         "Bob invokes the calculator tool: `result = await ctx.invoke(\"calculator\", {\"operation\": \"add\", \"a\": 1, \"b\": 2})`, `assert result == {\"result\": 3}`. UCAN validates Bob has tool_invoke capability (ADR-016). Tool invocation is logged in the Merkle event log.",
-        "Bob attempts an admin action — UCAN rejects: `await ctx.close(identity=bob)` raises `scp.PermissionError`. Bob lacks context:close capability. UCAN validation failed (ADR-016).",
+        "Bob attempts an admin action — UCAN rejects: `await ctx.close(identity=bob)` raises `scp.UcanPermissionError`. Bob lacks context:close capability. UCAN validation failed (ADR-016).",
         "Start an MCP server exposing Alice's SCP contexts (ADR-015): `server = await scp.mcp.serve_mcp(identity=alice, contexts=[ctx], transport=\"stdio\")`. tools/list returns namespaced tools. Admin tools visible because Alice is admin. Member tools only visible for member-role agent.",
         "MCP client invokes a tool: `tools/call(\"ctx_123/calculator\", {\"operation\": \"multiply\", \"a\": 3, \"b\": 7})` returns `{\"result\": 21}`. MCP adapter parses context namespace, validates UCAN, routes through scp-core tool invocation, returns result via JSON-RPC. The model never saw a DID, UCAN token, MLS group, or relay.",
         "Verify event log from Python: `events = await ctx.event_log.query(event_type=\"tool_invoked\")`, `proof = await ctx.event_log.verify({\"event_exists\": events[0].id})`, `assert proof.valid`. Merkle proof verification runs in Rust, result returned to Python (ADR-013).",
-        "Alice revokes Bob's tool invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"tool_invoke_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next tool invocation attempt fails with PermissionError.",
+        "Alice revokes Bob's tool invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"tool_invoke_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next tool invocation attempt fails with UcanPermissionError.",
         "Throughout: Every Python async call crosses the PyO3 bridge (ADR-013), runs on the shared tokio runtime, and returns results as native Python objects. No Rust concepts leak. Errors are Python exceptions. Types have full PEP 484 hints. IDE autocompletion works."
       ],
       "actionItems": [
@@ -3386,7 +3386,7 @@
         "Test message send with UCAN validation, encryption, and transport.",
         "Test async message receive via Python async iterator bridging tokio stream.",
         "Test tool invocation with UCAN capability validation and event log recording.",
-        "Test UCAN rejection: member attempting admin action gets PermissionError.",
+        "Test UCAN rejection: member attempting admin action gets UcanPermissionError.",
         "Test MCP server tool listing with capability filtering.",
         "Test MCP tool invocation routing through SCP context.",
         "Test event log query and Merkle proof verification from Python.",

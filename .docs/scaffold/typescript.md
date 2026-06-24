@@ -174,7 +174,7 @@ export class ScpError extends Error {
 
 export class IdentityError extends ScpError { name = "IdentityError" as const; }
 export class ContextError extends ScpError { name = "ContextError" as const; }
-export class PermissionError extends ScpError { name = "PermissionError" as const; }
+export class UcanPermissionError extends ScpError { name = "UcanPermissionError" as const; }
 export class CryptoError extends ScpError { name = "CryptoError" as const; }
 export class TransportError extends ScpError { name = "TransportError" as const; }
 export class ToolError extends ScpError { name = "ToolError" as const; }
