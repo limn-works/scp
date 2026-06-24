@@ -370,30 +370,36 @@ let channel = sdk.standing_context(&bob_did).await?;
 // Returns existing bilateral-persistent context if one exists,
 // creates one if not. Idempotent.
 
-// NOTE: if this side obtained its replica via Welcome-join (the common
-// non-initiating peer, or a collision-losing did_hi), send fails-closed
-// until the Phase-2E spawn-from-Welcome entrypoint lands (spec §5.15.8).
+// NOTE: this caller is the INITIATOR, so this send succeeds. It is the
+// *peer's* send that fails-closed: a side that obtained its replica via
+// Welcome-join (the common non-initiating peer, or a collision-losing
+// did_hi) cannot send until the Phase-2E spawn-from-Welcome entrypoint
+// lands (spec §5.15.8). The initiator side here is unaffected.
 channel.send("Are you available for the 3pm sync?").await?;
 
 // Python
 channel = await sdk.standing_context(bob_did)
-# send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+# initiator-side send (succeeds); the *peer's* Welcome-joined send
+# fails-closed until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?")
 
 // Swift
 let channel = try await sdk.standingContext(with: bobDID)
-// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
 try await channel.send("Are you available for the 3pm sync?")
 
 // TypeScript — NOTE: the return shape MUST NOT add a `created: bool` /
 // `peer_joined` discriminant; it is identical to every other binding.
 const channel = await sdk.standingContext(bobDid);
-// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?");
 
 // Kotlin
 val channel = sdk.standingContext(bobDid)
-// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
 channel.send("Are you available for the 3pm sync?")
 ```
 
@@ -408,7 +414,7 @@ channel.send("Are you available for the 3pm sync?")
 
 **Welcome-joiner caveat (decrypt-but-not-send until Phase 2E).** A caller whose replica was obtained via **Welcome-join** — the common non-initiating peer, and a collision-losing `did_hi` — can join and **decrypt** but **cannot send** in the standing context until the Phase-2E spawn-from-Welcome entrypoint lands (ADR-049 §Follow-ups #1, spec §5.15.8). Do **not** assume `standing_context(peer)` immediately yields a send-capable channel on the joiner side; the initiator side is unaffected.
 
-**No create-vs-found discriminant (MUST).** FFI/SDK bindings **MUST NOT** enrich the `standing_context` return with a create-vs-found or `peer_joined` discriminant (e.g. a `created: bool`) — such a field re-opens the existence oracle the uniform `Ok` forecloses. The return shape MUST be identical across all four bindings.
+**No create-vs-found discriminant (MUST).** FFI/SDK bindings **MUST NOT** enrich the `standing_context` return with a create-vs-found or `peer_joined` discriminant (e.g. a `created: bool`) — such a field re-opens the existence oracle the uniform `Ok` forecloses. The return shape MUST be identical across all bindings (every SDK language).
 
 **Startup reconnection.** On SDK initialization, reconnect transport for all standing contexts. This is background work — the SDK reconnects to relays for all active persistent contexts and begins receiving queued messages. Standing contexts are available immediately after `sdk.init()` returns.
 
