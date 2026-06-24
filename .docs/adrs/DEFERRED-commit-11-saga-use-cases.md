@@ -213,10 +213,18 @@ withdrawn with Gap 4 per ADR-049 §3a.)
    `create` + `add_member` + Welcome path for standing-pair. (No
    migration handler — Gap 4 withdrawn.)
 3. Per-use-case integration tests (covering all **3** variants) under
-   `crates/scp-runtime/tests/actor_saga_*.rs`.
+   `crates/scp-runtime/tests/actor_saga_*.rs`. (The `actor_saga_*` glob is
+   a filename convention, not a saga claim: the standing-pair entry is
+   single-context async, not a saga — its test lives under that glob but
+   the op it exercises is single-context async creation, not a saga.)
 4. FFI bridge exports for `start_saga` **only** — block-until-terminal,
    with **no** `saga_state` status query (the async/poll wait model was
    the withdrawn Gap 4's; see ADR-049 §3a and the Gap 5 Resolution).
+   (This covers the **two `start_*_saga` exports** for the two live
+   sagas only: the standing-pair entry is single-context async and has
+   **no** `start_*_saga` FFI export — it is reached via the
+   `standing_context` get-or-create path, §5.15.8 — so two is the
+   correct export count.)
 5. SDK wrappers for each supported language target.
 
 ## References
