@@ -3158,7 +3158,17 @@ impl WasmContextManager {
         let (proposal_created_at, action) = proposal_created_at;
         let action = &action;
 
-        let result = self.dispatch_governance_action(context_id, action);
+        // `proposal_created_at` is the convergent committer-assigned leaf
+        // timestamp (the executed proposal's signed `created_at`). It is threaded
+        // into dispatch so the `RemoveMember` arm can append its OWN durable
+        // `MemberLeft` leaf with the SAME convergent timestamp the
+        // `GovernanceActionExecuted` leaf below uses — mirroring native's
+        // per-action `execute_remove_member`, which appends `MemberLeft` BEFORE
+        // `finalize_governance_action` appends `GovernanceActionExecuted`. Using
+        // `crate::time::now_secs()` here would diverge across members and break
+        // the §9.9.3 equal-count/equal-root equivocation invariant.
+        let result =
+            self.dispatch_governance_action(context_id, action, executor_did, proposal_created_at);
 
         // Roll back on failure.
         if result.is_err()
@@ -3265,6 +3275,15 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         action: &GovernanceAction,
+        // The committing member (executor) — stamped as the convergence-critical
+        // `actor_did` on any per-action durable leaf this dispatch appends (e.g.
+        // the `MemberLeft` leaf for `RemoveMember`), byte-identical to native
+        // (§9.9.3; ADR-031 §8 "executor DID").
+        executor_did: &str,
+        // The convergent committer-assigned leaf timestamp (the executed
+        // proposal's signed `created_at`), used for any per-action durable leaf
+        // this dispatch appends — NEVER local `now()`.
+        timestamp_secs: u64,
     ) -> Result<serde_json::Value, ScpWasmError> {
         // Per-action CONTEXT-CEILING gate, identical to native's per-action
         // `ceiling.contains(&Capability::X)` gates in `dispatch_governance_action`
@@ -3290,7 +3309,7 @@ impl WasmContextManager {
                 self.dispatch_add_member(context_id, did, role)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.dispatch_remove_member(context_id, did)
+                self.dispatch_remove_member(context_id, did, executor_did, timestamp_secs)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -3432,26 +3451,126 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         did: &str,
+        executor_did: &str,
+        timestamp_secs: u64,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
-        let removed = ctx
-            .members
-            .remove(did)
-            .ok_or_else(|| ScpWasmError::Context {
+
+        // Existence check WITHOUT removing — the governance strip is deferred
+        // until AFTER the MLS eviction succeeds (fail-closed-keep ordering;
+        // mirrors native `execute_remove_member`, which checks
+        // `membership.contains(did)` before the MLS boundary and only strips
+        // membership once the crypto cuts have all succeeded). Preserves the
+        // exact `CTX_2015` not-found semantics.
+        if !ctx.members.contains_key(did) {
+            return Err(ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
                 code: codes::CTX_2015.to_owned(),
-            })?;
-        // If the ejected member was an author in a broadcast context,
-        // clean up their broadcast state (destroys broadcast key).
-        if removed.role == "author"
+            });
+        }
+
+        // MLS eviction is the HARD security boundary and MUST run FIRST, BEFORE
+        // any governance/broadcast state is stripped (mirrors native
+        // `execute_remove_member`, which removes from the MLS group first and
+        // strips membership only inside the fail-closed-keep closure after the
+        // crypto cuts succeed). On an encrypted context: evict the member from
+        // the MLS group, drop their stored sender key, then rotate the local
+        // sender key so the removed member's knowledge of any prior sender key
+        // grants no future plaintext (§9.16.4). When there is no MLS
+        // state (`crypto.is_none()` — a broadcast / unencrypted context, or one
+        // whose crypto was destroyed by a prior self-leave) there is no MLS
+        // group, so the commit is empty, matching native's non-MLS no-op.
+        //
+        // A governance member with NO MLS leaf is NOT a failure: it is a no-op
+        // returning an empty commit (matching native `MlsCryptoProvider::
+        // remove_member`), so dispatch PROCEEDS to strip membership + append the
+        // `MemberLeft` leaf. The governance layer is authoritative for
+        // membership; the crypto layer only manages MLS state.
+        //
+        // Fail-closed: if ANY of these crypto steps errors with a GENUINE MLS
+        // failure (a destroyed group, or a commit-serialization failure on a
+        // leaf that WAS found), this returns `Err` while the member is STILL
+        // fully present in `ctx.members` and broadcast state.
+        // The removal is therefore atomic at the security boundary — there is no
+        // window where the member is gone from governance yet still able to
+        // derive the group keys. The caller's only rollback
+        // (`execute_governance_action`) does not restore `ctx.members`, so the
+        // strip must not happen until eviction has actually succeeded; a retry
+        // after a transient failure is safe.
+        //
+        // The operative lockout for the evicted member is the MLS layer-2
+        // eviction (epoch advance) itself: once the commit lands, the removed
+        // member can no longer derive the group keys, so MLS decryption of any
+        // later message fails. The sender-key rotation's role, and why WASM's
+        // missing cross-member sender-key distribution path is orthogonal to the
+        // eviction security property, are explained in full at
+        // `WasmCryptoState::governance_rotate_sender_key` (crypto/state.rs).
+        //
+        // Scope the `ctx.crypto.as_mut()` borrow tightly so the later
+        // `ctx.members` / `ctx.broadcast_context` mutations can re-borrow `ctx`.
+        let commit = if let Some(crypto) = ctx.crypto.as_mut() {
+            let commit =
+                crypto
+                    .governance_remove_from_group(did)
+                    .map_err(|e| ScpWasmError::Crypto {
+                        message: e.to_string(),
+                        code: codes::CRYPTO_4011.to_owned(),
+                    })?;
+            crypto.governance_remove_sender_key(did);
+            crypto.governance_rotate_sender_key();
+            commit
+        } else {
+            Vec::new()
+        };
+
+        // MLS eviction succeeded (or there was no MLS group) — only NOW is it
+        // safe to strip governance and broadcast state. Capture the role before
+        // removing so broadcast-author cleanup can still see it.
+        let removed_role = ctx.members.remove(did).map(|m| m.role);
+
+        // Drop all per-DID state the removed member left behind, mirroring
+        // native `execute_remove_member`'s role_state / access cleanup (which
+        // strips `role_state.members`, `assignments`, `member_capabilities`, the
+        // access key store entry, and the pseudonym routing entry). WASM models
+        // the per-member authorization state as `suspended_capabilities` (a
+        // demotion record keyed by DID) and the CEK-exclusion state as
+        // `read_exclusion_list`. Leaving either behind is a stale-desync
+        // foothold: a DID later re-admitted under the same string would inherit
+        // a phantom suspension or read-exclusion. Both are no-ops if absent.
+        ctx.suspended_capabilities.remove(did);
+        ctx.read_exclusion_list.remove(did);
+
+        // If the ejected member was an author in a broadcast context, clean up
+        // their broadcast state (destroys broadcast key).
+        if removed_role.as_deref() == Some("author")
             && let Some(ref mut bc) = ctx.broadcast_context
         {
             let _ = bc.block_author(did);
         }
+
+        // Buffer event for local subscribers (mirrors native's `emit`).
         ctx.push_event(ContextEvent::MemberLeft {
             member_did: DID(did.to_owned()),
         });
-        Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
+
+        // Durable `MemberLeft` leaf — appended BEFORE the wrapper's
+        // `GovernanceActionExecuted` leaf, matching native's ordering
+        // (`execute_remove_member` appends `MemberLeft` inside the commit closure;
+        // `finalize_governance_action` appends `GovernanceActionExecuted` after).
+        // The leaf carries the convergent committer-assigned `executor_did` +
+        // `timestamp_secs` and an EMPTY payload, byte-identical to native's
+        // `append_context_event(EventType::MemberLeft, actor_did, timestamp_secs)`
+        // (which uses `EventPayload::default()`). The target DID lives in the
+        // buffer event only, never in the durable leaf (§9.9.3).
+        ctx.append_log_event(EventType::MemberLeft, executor_did, b"", timestamp_secs);
+
+        // Return the eviction commit (hex) so the relay can distribute it to the
+        // remaining members; empty for non-MLS contexts.
+        Ok(serde_json::json!({
+            "action": "RemoveMember",
+            "did": did,
+            "commit": crate::runtime::encode_hex(&commit),
+        }))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.
@@ -9369,6 +9488,536 @@ mod tests {
         assert!(
             format!("{err:?}").contains("already been executed"),
             "replay rejection should name the executed proposal, got: {err:?}"
+        );
+    }
+
+    /// WASM half of the split cross-impl KAT for governance `RemoveMember`
+    /// (the native half is `cross_impl_remove_member_leaf_is_empty_and_precedes_executed`
+    /// in `crates/scp-runtime/tests/wasm_conformance.rs`). Drives the REAL
+    /// `execute_governance_action` path for a `RemoveMember` proposal and pins,
+    /// from the durable log:
+    /// - the `MemberLeft` leaf payload is EMPTY (the removed DID is buffer-only),
+    /// - its `actor_did` is the EXECUTOR (not the removed member),
+    /// - its `timestamp` is the convergent `proposal.created_at` (not local
+    ///   `now()`),
+    /// - it is appended BEFORE the `GovernanceActionExecuted` leaf.
+    ///
+    /// These are byte-for-byte the invariants native's `execute_remove_member` /
+    /// `finalize_governance_action` produce; a regression in any of them would
+    /// diverge the cross-platform `tree::root` and false-positive §9.9.3
+    /// equivocation.
+    #[test]
+    fn remove_member_appends_empty_member_left_leaf_before_executed_wasm() {
+        use scp_event_log::EventType;
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+        };
+
+        let context_id = "ctx-wasm-remove";
+        let proposer = "did:dht:z6MkWasmRemoveProposer";
+        let removed = "did:dht:z6MkWasmRemoveTarget";
+        let proposal_id = "beadfeed000000000000000000000000000000000000000000000000000000ff";
+        let created_at = 1_700_600_700_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(removed, "member");
+        // RemoveMember is NOT ceiling-gated at dispatch (authorization is at
+        // propose time) — see `dispatch_ceiling_capability`, so no ceiling seed
+        // is required here.
+
+        let action = GovernanceAction::RemoveMember {
+            did: DID::from(removed.to_owned()),
+            reason: None,
+        };
+        let proposal = GovernanceProposal {
+            proposal_id: {
+                let bytes = hex::decode(proposal_id).unwrap();
+                let mut arr = [0u8; 32];
+                arr[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+                arr
+            },
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(proposer.to_owned()),
+            action,
+            status: ProposalStatus::Approved,
+            created_at,
+            voting_deadline: created_at + 3600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(proposer.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: created_at,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        ctx.test_insert_resolved_proposal(proposal_id.to_owned(), proposal);
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let resolved_proposer = mgr
+            .proposal_proposer_did(context_id, proposal_id)
+            .expect("proposer resolvable");
+        mgr.execute_governance_action(context_id, proposer, &resolved_proposer, proposal_id)
+            .expect("approved RemoveMember proposal must execute");
+
+        let events = mgr.test_context_event_log_events(context_id);
+
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a durable MemberLeft leaf must be appended on RemoveMember");
+        assert!(
+            member_left.payload.data.is_empty(),
+            "the MemberLeft leaf payload must be empty (the removed DID is buffer-only)"
+        );
+        assert_eq!(
+            member_left.actor_did.as_ref(),
+            resolved_proposer,
+            "the MemberLeft leaf actor_did must be the executor, not the removed member"
+        );
+        assert_ne!(
+            member_left.actor_did.as_ref(),
+            removed,
+            "the MemberLeft leaf must NOT be stamped with the removed member's DID"
+        );
+        assert_eq!(
+            member_left.timestamp, created_at,
+            "the MemberLeft leaf timestamp must be the convergent proposal.created_at, \
+             never local now()"
+        );
+
+        // Exactly ONE MemberLeft and exactly ONE GovernanceActionExecuted leaf.
+        // Locking the equal-count invariant guards against a duplicate append
+        // (which `find`/`position` below would silently tolerate) diverging the
+        // cross-platform `tree::root`.
+        let member_left_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::MemberLeft)
+            .count();
+        assert_eq!(
+            member_left_count, 1,
+            "RemoveMember must append EXACTLY one MemberLeft leaf, got {member_left_count}"
+        );
+        let executed_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count();
+        assert_eq!(
+            executed_count, 1,
+            "RemoveMember must append EXACTLY one GovernanceActionExecuted leaf, got {executed_count}"
+        );
+
+        let member_left_pos = events
+            .iter()
+            .position(|e| e.event_type == EventType::MemberLeft)
+            .expect("MemberLeft present");
+        let executed_pos = events
+            .iter()
+            .position(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .expect("GovernanceActionExecuted present");
+        assert!(
+            member_left_pos < executed_pos,
+            "the MemberLeft leaf must precede the GovernanceActionExecuted leaf, \
+             matching native execute_remove_member ordering"
+        );
+    }
+
+    /// Native parity: a governance member who carries NO MLS leaf is removed
+    /// CLEANLY (not kept). This matches native `MlsCryptoProvider::remove_member`,
+    /// which treats a missing leaf as a no-op (empty commit), so
+    /// `execute_remove_member` PROCEEDS to strip membership and append the
+    /// `MemberLeft` leaf — the governance layer is authoritative for membership.
+    ///
+    /// The context's MLS group has only the creator's leaf, so the governance
+    /// member `removed` has no MLS leaf. `dispatch_remove_member` must return Ok
+    /// with an EMPTY commit, the member must be gone from `ctx.members`, and a
+    /// durable `MemberLeft` leaf must be appended.
+    #[test]
+    fn remove_member_with_no_mls_leaf_is_removed_cleanly() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-noleaf";
+        let creator = "did:dht:z6MkWasmNoLeafCreator";
+        // A governance member with NO MLS leaf: present in `ctx.members` but
+        // never added to the single-creator MLS group below.
+        let removed = "did:dht:z6MkWasmNoLeafTarget";
+        let executor = creator;
+        let timestamp_secs = 1_700_700_700_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        ctx.crypto = Some(
+            crate::crypto::WasmCryptoState::new_for_context(creator)
+                .expect("MLS group creation must succeed for the test fixture"),
+        );
+        ctx.test_insert_member(removed, "member");
+        // Seed per-DID state to prove the F5 cleanup runs on this path too.
+        ctx.suspended_capabilities_insert(removed, "messages:write".to_owned());
+        ctx.read_exclusion_list.insert(removed.to_owned());
+        assert!(
+            ctx.members.contains_key(removed),
+            "precondition: the target must be a governance member before removal"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr
+            .dispatch_remove_member(context_id, removed, executor, timestamp_secs)
+            .expect("a governance member with no MLS leaf must be removed cleanly (native parity)");
+
+        // The MLS layer produced no commit (no leaf to evict) — empty hex.
+        assert_eq!(
+            result["commit"].as_str(),
+            Some(""),
+            "a member with no MLS leaf yields an empty commit (no-op eviction)"
+        );
+
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context must still be registered after removal");
+        assert!(
+            !ctx_after.members.contains_key(removed),
+            "the governance member must be removed from ctx.members (native parity)"
+        );
+        // F5: per-DID state must be cleaned up.
+        assert!(
+            ctx_after.test_suspended_capabilities(removed).is_none(),
+            "the removed member's suspended_capabilities entry must be cleaned up"
+        );
+        assert!(
+            !ctx_after.read_exclusion_list.contains(removed),
+            "the removed member's read_exclusion_list entry must be cleaned up"
+        );
+
+        // A durable MemberLeft leaf must be appended.
+        let events = mgr.test_context_event_log_events(context_id);
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a MemberLeft leaf must be appended when a no-leaf member is removed");
+        assert!(
+            member_left.payload.data.is_empty(),
+            "the MemberLeft leaf payload must be empty (the removed DID is buffer-only)"
+        );
+        assert_eq!(
+            member_left.actor_did.as_ref(),
+            executor,
+            "the MemberLeft leaf actor_did must be the executor"
+        );
+        assert_eq!(
+            member_left.timestamp, timestamp_secs,
+            "the MemberLeft leaf timestamp must be the committer-assigned timestamp"
+        );
+    }
+
+    /// Fail-closed-keep proof for `dispatch_remove_member`: when MLS eviction
+    /// fails with a GENUINE MLS error, the member MUST remain fully present in
+    /// `ctx.members` (and the log must NOT gain a `MemberLeft` leaf), so no
+    /// window opens where the member is gone from governance yet can still
+    /// derive the group keys.
+    ///
+    /// The genuine error is forced by DESTROYING the MLS group (group is None):
+    /// `governance_remove_from_group` -> `remove_member_by_did` ->
+    /// `leaf_index_for_did` -> `GroupDestroyed`. (A missing leaf is NOT a
+    /// genuine error after the native-parity fix — it is a no-op — so a real
+    /// fail-closed case requires a real MLS failure.) With the fail-closed-keep
+    /// ordering, the early `Err` leaves governance state untouched.
+    #[test]
+    fn remove_member_keeps_governance_state_when_mls_eviction_fails() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-failclosed";
+        let creator = "did:dht:z6MkWasmFailClosedCreator";
+        let removed = "did:dht:z6MkWasmFailClosedTarget";
+        let executor = creator;
+        let timestamp_secs = 1_700_700_700_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+            .expect("MLS group creation must succeed for the test fixture");
+        // Destroy the MLS group so any eviction attempt hits GroupDestroyed — a
+        // genuine MLS failure (not a missing-leaf no-op).
+        crypto.mls_group.destroy();
+        ctx.crypto = Some(crypto);
+        ctx.test_insert_member(removed, "member");
+        assert!(
+            ctx.members.contains_key(removed),
+            "precondition: the target must be a governance member before removal"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr.dispatch_remove_member(context_id, removed, executor, timestamp_secs);
+
+        // The MLS eviction failed with a genuine error, so the handler must Err...
+        let err = result.expect_err(
+            "dispatch_remove_member must fail when MLS eviction hits a genuine MLS error",
+        );
+        assert!(
+            matches!(err, ScpWasmError::Crypto { .. }),
+            "the failure must surface as a crypto eviction error, got {err:?}"
+        );
+
+        // ...and CRITICALLY the member must STILL be in governance state
+        // (fail-closed-keep). A retry is safe; no decryption-after-removal hole.
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context must still be registered after a failed removal");
+        assert!(
+            ctx_after.members.contains_key(removed),
+            "FAIL-CLOSED: a member whose MLS eviction failed MUST remain in \
+             ctx.members — removing them from governance while they stay in the \
+             MLS group reopens the decryption-after-removal hole"
+        );
+        assert_eq!(
+            ctx_after.test_member_role(removed),
+            Some("member"),
+            "the kept member's role must be unchanged after the failed removal"
+        );
+
+        // No durable MemberLeft leaf may be emitted on a failed removal.
+        let events = mgr.test_context_event_log_events(context_id);
+        assert!(
+            !events.iter().any(|e| e.event_type == EventType::MemberLeft),
+            "no MemberLeft leaf may be appended when MLS eviction fails"
+        );
+    }
+
+    /// F6: encrypted-path commit hex round-trips. With a REAL second MLS member,
+    /// `dispatch_remove_member` must return a non-empty hex `commit` that
+    /// `hex::decode`s to the eviction commit bytes — the relay-distribution
+    /// surface the JS caller is obligated to broadcast.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_encrypted_path_returns_decodable_commit_hex() {
+        use openmls::prelude::KeyPackageIn;
+        use tls_codec::Deserialize as _;
+
+        let context_id = "ctx-wasm-remove-commit";
+        let creator = "did:dht:z6MkWasmCommitCreator";
+        // The second member's DID — must match the credential embedded in the
+        // MLS leaf so `leaf_index_for_did` resolves it.
+        let bob_did = "did:dht:z6MkWasmCommitBob";
+        let executor = creator;
+        let timestamp_secs = 1_700_800_800_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+            .expect("MLS group creation must succeed");
+
+        // Add Bob as a REAL MLS leaf via the standard key-package + add flow.
+        let bob_cred = crate::crypto::WasmScpCredential::new(
+            bob_did.to_owned(),
+            None,
+            crate::crypto::WasmSigningKeyId::Active,
+        )
+        .unwrap();
+        let (bob_kp_bytes, _bob_holder) =
+            crate::crypto::WasmMlsGroup::generate_key_package(&bob_cred).unwrap();
+        let bob_kp_in =
+            KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).expect("key package deserializes");
+        crypto.mls_group.add_member(bob_kp_in).unwrap();
+
+        ctx.crypto = Some(crypto);
+        ctx.test_insert_member(bob_did, "member");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr
+            .dispatch_remove_member(context_id, bob_did, executor, timestamp_secs)
+            .expect("removing a real MLS member must succeed");
+
+        let commit_hex = result["commit"]
+            .as_str()
+            .expect("the result JSON must carry a string commit field");
+        assert!(
+            !commit_hex.is_empty(),
+            "evicting a real MLS member must produce a non-empty commit"
+        );
+        let commit_bytes = hex::decode(commit_hex)
+            .expect("the commit field must be valid hex of the commit bytes");
+        assert!(
+            !commit_bytes.is_empty(),
+            "the decoded commit must be non-empty MLS commit bytes"
+        );
+
+        // The member is gone and Bob no longer resolves to a leaf.
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context still registered");
+        assert!(
+            !ctx_after.members.contains_key(bob_did),
+            "the evicted member must be removed from ctx.members"
+        );
+        assert!(
+            ctx_after
+                .crypto
+                .as_ref()
+                .unwrap()
+                .mls_group
+                .leaf_index_for_did(bob_did)
+                .unwrap()
+                .is_none(),
+            "the evicted member's DID must no longer resolve to an MLS leaf"
+        );
+    }
+
+    /// Self-removal parity: a governance `RemoveMember` that targets the
+    /// local/creator DID on a REAL encrypted context must behave like native's
+    /// self-removal — an EMPTY commit (the own MLS leaf is skipped, so eviction
+    /// is a no-op) while dispatch STILL PROCEEDS to strip the member from
+    /// `ctx.members`, clean F5 per-DID state, and append a `MemberLeft` leaf.
+    ///
+    /// This is the divergence regression guard: before the own-leaf skip,
+    /// `leaf_index_for_did` resolved the creator's own leaf, `OpenMLS` rejected
+    /// `remove_member(own_index)` with `CannotRemoveSelf`, dispatch failed
+    /// closed, and the member was KEPT with NO `MemberLeft` leaf — diverging
+    /// from native (which removes the member + appends the leaf), breaking the
+    /// §9.9.3 cross-platform `tree::root` + membership convergence invariant.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_self_did_encrypted_empty_commit_strips_and_appends_leaf() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-self";
+        // The creator IS the local MLS member (leaf 0) and the removal target.
+        let creator = "did:dht:z6MkWasmSelfRemovalCreator";
+        let executor = creator;
+        let timestamp_secs = 1_701_000_000_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        let crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+            .expect("MLS group creation must succeed");
+        ctx.crypto = Some(crypto);
+        // Seed F5 per-DID state for the creator so we can prove it is cleaned up.
+        ctx.test_insert_suspended_capability(creator, "tool:invoke:calculator");
+        assert!(
+            ctx.test_suspended_capabilities(creator).is_some(),
+            "precondition: the creator must hold a suspended-capabilities entry"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr
+            .dispatch_remove_member(context_id, creator, executor, timestamp_secs)
+            .expect("self-removal on an encrypted context must succeed (empty-commit no-op)");
+
+        // EMPTY commit — the own MLS leaf is skipped, so eviction is a no-op
+        // (matching native's self-removal short-circuit).
+        assert_eq!(
+            result["commit"].as_str(),
+            Some(""),
+            "self-removal must produce an EMPTY commit (own leaf skipped — no eviction)"
+        );
+
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context still registered");
+
+        // Member removed from ctx.members despite the empty commit.
+        assert!(
+            !ctx_after.members.contains_key(creator),
+            "self-removal must strip the member from ctx.members even though the commit is empty"
+        );
+
+        // F5 per-DID state cleaned.
+        assert!(
+            ctx_after.test_suspended_capabilities(creator).is_none(),
+            "self-removal must clean the removed member's suspended_capabilities entry"
+        );
+
+        // A durable MemberLeft leaf must be appended (native parity).
+        let events = mgr.test_context_event_log_events(context_id);
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a MemberLeft leaf must be appended on self-removal (native parity)");
+        assert!(
+            member_left.payload.data.is_empty(),
+            "the MemberLeft leaf payload must be empty (the removed DID is buffer-only)"
+        );
+        assert_eq!(
+            member_left.actor_did.as_ref(),
+            executor,
+            "the MemberLeft leaf actor_did must be the executor (the self-removing member)"
+        );
+        assert_eq!(
+            member_left.timestamp, timestamp_secs,
+            "the MemberLeft leaf timestamp must be the committer-assigned timestamp"
+        );
+    }
+
+    /// F7: broadcast / `crypto.is_none()` path. A broadcast-author context with
+    /// an "author" member and no MLS crypto: `dispatch_remove_member` must run
+    /// the `block_author` cleanup, return an EMPTY commit, and still append a
+    /// `MemberLeft` leaf.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_broadcast_path_empty_commit_still_appends_leaf() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-broadcast";
+        let creator = "did:dht:z6MkWasmBroadcastCreator";
+        let author = "did:dht:z6MkWasmBroadcastAuthor";
+        let executor = creator;
+        let timestamp_secs = 1_700_900_900_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        // Broadcast context: a BroadcastContext is present, crypto is None.
+        ctx.broadcast_context = Some(make_broadcast(&[author], &[]));
+        ctx.crypto = None;
+        ctx.test_insert_member(author, "author");
+        assert!(
+            ctx.broadcast_context.as_ref().unwrap().is_author(author),
+            "precondition: the author must hold a broadcast key before removal"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr
+            .dispatch_remove_member(context_id, author, executor, timestamp_secs)
+            .expect("removing an author from a broadcast context must succeed");
+
+        // (b) empty commit — no MLS group on a broadcast context.
+        assert_eq!(
+            result["commit"].as_str(),
+            Some(""),
+            "a broadcast (crypto.is_none) context produces an empty commit"
+        );
+
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context still registered");
+        assert!(
+            !ctx_after.members.contains_key(author),
+            "the author must be removed from ctx.members"
+        );
+        // (a) block_author cleanup ran — the author's broadcast key is destroyed.
+        assert!(
+            !ctx_after
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .is_author(author),
+            "block_author cleanup must run: the removed author must no longer hold a broadcast key"
+        );
+
+        // (c) a MemberLeft leaf is still appended.
+        let events = mgr.test_context_event_log_events(context_id);
+        assert!(
+            events.iter().any(|e| e.event_type == EventType::MemberLeft),
+            "a MemberLeft leaf must be appended even on the broadcast/empty-commit path"
         );
     }
 }

@@ -1357,6 +1357,25 @@ export class SCP {
    * action, or status. An untracked / unapproved id is rejected. The executor
    * and consequence subject are resolved from the tracked proposal's proposer,
    * never from a caller-supplied DID.
+   *
+   * @returns A JSON string describing the action result. For membership-changing
+   * actions (`RemoveMember`) the JSON includes a `commit` field: a hex-encoded
+   * MLS Commit that evicts the removed member from the group key schedule.
+   *
+   * Commit distribution differs by backend:
+   * - **Native (NAPI) backend — this method.** This call routes through the
+   *   native addon, which has an internal transport and **auto-broadcasts** the
+   *   eviction `commit` to the other context members. The caller does not need
+   *   to relay it.
+   * - **Browser (WASM) backend.** The WASM bridge has no internal transport
+   *   (ADR-034) and performs no automatic broadcast or retry, so a WASM caller
+   *   **MUST relay the `commit`** it receives to the other context members. If
+   *   it does not, the MLS group silently forks: the remaining members never
+   *   advance their epoch and never learn of the eviction.
+   *
+   * Either way, an empty `commit` string means no MLS commit was produced
+   * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
+   * there is nothing to distribute.
    */
   async contextExecuteGovernanceAction(handle: unknown, proposalIdHex: string): Promise<string> {
     return await (

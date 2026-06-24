@@ -176,6 +176,196 @@ impl WasmMlsGroup {
             .map_err(|e| WasmCryptoError::RemoveMemberFailed(format!("serializing commit: {e}")))
     }
 
+    /// Returns the local member's own DID, decoded from the SCP credential in
+    /// the committer's own MLS leaf.
+    ///
+    /// Reads the leaf at [`MlsGroup::own_leaf_index`] — which is leaf 0 for the
+    /// group creator and a non-zero leaf for a member who joined via Welcome —
+    /// finds that member among [`MlsGroup::members`], decodes its
+    /// [`BasicCredential`] into a [`WasmScpCredential`], and returns the `did`.
+    /// No persistent state is required: the local DID is recovered from the
+    /// group itself at call time, so it is correct for the creator and any
+    /// Welcome-joined member alike.
+    ///
+    /// This is the WASM analogue of native's `self.local_did`
+    /// (`scp_runtime::crypto::mls::provider`), which the native
+    /// `MlsCryptoProvider::remove_member` short-circuits on at provider.rs:1041.
+    /// Deriving from the own leaf (rather than storing a field) keeps the two
+    /// construction paths — `create_group` and `join_from_welcome` — free of a
+    /// hand-maintained DID field that the join path could set wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
+    /// destroyed, or [`WasmCryptoError::RemoveMemberFailed`] if the own leaf's
+    /// credential cannot be located or decoded (it always should be — the
+    /// committer is a member of its own group).
+    pub fn own_did(&self) -> Result<String, WasmCryptoError> {
+        let g = self.group.as_ref().ok_or(WasmCryptoError::GroupDestroyed)?;
+        let own_index = g.own_leaf_index();
+        for member in g.members() {
+            if member.index != own_index {
+                continue;
+            }
+            let basic = BasicCredential::try_from(member.credential).map_err(|e| {
+                WasmCryptoError::RemoveMemberFailed(format!("decoding own leaf credential: {e}"))
+            })?;
+            let scp_cred = WasmScpCredential::from_bytes(basic.identity()).map_err(|e| {
+                WasmCryptoError::RemoveMemberFailed(format!("parsing own SCP credential: {e}"))
+            })?;
+            return Ok(scp_cred.did);
+        }
+        Err(WasmCryptoError::RemoveMemberFailed(
+            "own leaf not found among group members".to_string(),
+        ))
+    }
+
+    /// Resolves the [`LeafNodeIndex`] of the group member whose SCP credential
+    /// carries `member_did`, SKIPPING the local member's own leaf.
+    ///
+    /// Scans every current group member EXCEPT the committer's own leaf
+    /// (`MlsGroup::own_leaf_index`), decodes each member's
+    /// [`BasicCredential`] into a [`WasmScpCredential`], and returns the leaf
+    /// index of the first OTHER member whose `did` matches. Returns `Ok(None)`
+    /// when no other current member carries that DID — including the case where
+    /// `member_did` is the local member's OWN DID (self-removal).
+    ///
+    /// Mirrors native `MlsCryptoProvider::remove_member`
+    /// (`scp_runtime::crypto::mls::provider`, provider.rs:1041/1060), which
+    /// combines a self-DID short-circuit (`member_did == self.local_did` ->
+    /// empty-commit no-op) and an own-leaf skip in the scan
+    /// (`if member.index == own_index { continue; }`). Both funnel self-removal
+    /// to the same outcome: an empty-commit NO-OP. Skipping the own leaf here
+    /// makes an own-DID lookup return `Ok(None)`, which
+    /// [`remove_member_by_did`](Self::remove_member_by_did) turns into the
+    /// empty-commit no-op — the local member abandons its own group state and
+    /// the remaining members process the removal via the relayed commit from
+    /// another member. If the own leaf were NOT skipped, `OpenMLS` would reject
+    /// `remove_member(own_index)` with `CannotRemoveSelf`, the dispatch layer
+    /// would fail closed, and the member would be KEPT with no `MemberLeft` /
+    /// `GovernanceActionExecuted` leaf — divergent from native's self-removal
+    /// (which proceeds to strip governance + append both leaves), breaking the
+    /// §9.9.3 cross-platform `tree::root` convergence invariant.
+    ///
+    /// MLS does not key its tree by DID, so removal-by-DID must map the SCP
+    /// identity to its leaf before calling [`remove_member`](Self::remove_member).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
+    /// destroyed.
+    pub fn leaf_index_for_did(
+        &self,
+        member_did: &str,
+    ) -> Result<Option<LeafNodeIndex>, WasmCryptoError> {
+        let g = self.group.as_ref().ok_or(WasmCryptoError::GroupDestroyed)?;
+        // The committer's own leaf — `MlsGroup::own_leaf_index` is infallible on
+        // the raw OpenMLS group. Skip it so a self-DID removal resolves to
+        // `None` (empty-commit no-op), mirroring native's own-index skip +
+        // self no-op (provider.rs:1041/1060). Do NOT hardcode index 0: the
+        // creator is leaf 0 but a member who JOINED via Welcome occupies a
+        // different leaf.
+        let own_index = g.own_leaf_index();
+        for member in g.members() {
+            if member.index == own_index {
+                continue;
+            }
+            if let Ok(basic) = BasicCredential::try_from(member.credential.clone())
+                && let Ok(scp_cred) = WasmScpCredential::from_bytes(basic.identity())
+                && scp_cred.did == member_did
+            {
+                return Ok(Some(member.index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Removes the group member identified by `member_did`, returning the
+    /// TLS-serialized commit that evicts them from the MLS group.
+    ///
+    /// Resolves the DID to its leaf via [`leaf_index_for_did`](Self::leaf_index_for_did)
+    /// and delegates to [`remove_member`](Self::remove_member).
+    ///
+    /// A missing MLS leaf is a NO-OP, not an error: it returns an empty commit
+    /// (`Ok(Vec::new())`) and logs a warning to the browser console. This matches native
+    /// `MlsCryptoProvider::remove_member`, which returns
+    /// `RemoveMemberOutput::default()` (empty commit) for a member with no MLS
+    /// leaf. The governance/`WasmContextManager` layer is authoritative for
+    /// membership; the crypto layer only manages MLS group state. A member who
+    /// is in the context's membership set but was never MLS-added (or is the
+    /// local member under a different DID in a multi-identity environment) is
+    /// removed from membership by the dispatch layer regardless, and there is
+    /// no MLS key schedule to advance. The eviction security property — a
+    /// removed member can no longer derive the group key — rests on the MLS
+    /// epoch advance, which only exists when the member actually held a leaf.
+    ///
+    /// # Self-removal parity with native (two mechanisms)
+    ///
+    /// Native `MlsCryptoProvider::remove_member` funnels a self-removal to an
+    /// empty-commit no-op via TWO independent mechanisms, and this method now
+    /// mirrors BOTH:
+    /// 1. **Self-DID short-circuit** (native provider.rs:1041,
+    ///    `if member_did == self.local_did { return default }`): BEFORE any
+    ///    scan, an own-DID removal returns `Ok(Vec::new())`. WASM derives the
+    ///    local DID from the committer's own leaf via [`own_did`](Self::own_did)
+    ///    (no stored state). This additionally covers a pathological
+    ///    duplicate-DID tree (a SECOND leaf carrying the local DID): native
+    ///    evicts NEITHER leaf, so WASM must not either — the short-circuit
+    ///    returns before [`leaf_index_for_did`](Self::leaf_index_for_did) could
+    ///    resolve the non-own duplicate leaf and wrongly advance the epoch,
+    ///    diverging from native and breaking the §9.9.3 cross-platform
+    ///    `tree::root` convergence invariant.
+    /// 2. **Own-leaf skip in the scan** (native provider.rs:1060,
+    ///    `if member.index == own_index { continue; }`): retained in
+    ///    [`leaf_index_for_did`](Self::leaf_index_for_did). It handles the
+    ///    normal single-own-leaf self-removal even were the short-circuit
+    ///    absent, and keeps `OpenMLS` from rejecting `remove_member(own_index)`
+    ///    with `CannotRemoveSelf`.
+    ///
+    /// Either way, self-removal is an empty-commit no-op: the local member
+    /// abandons its own group state and the remaining members process the
+    /// removal via a relayed commit from another member, while the dispatch
+    /// layer strips governance + appends the `MemberLeft` leaf — matching
+    /// native's self-removal exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
+    /// destroyed, or [`WasmCryptoError::RemoveMemberFailed`] if a leaf IS found
+    /// but the underlying remove/commit serialization fails. Those are genuine
+    /// MLS failures and must propagate so the dispatch layer can fail closed
+    /// (keep the member rather than report a removal that did not cut the key).
+    pub fn remove_member_by_did(&mut self, member_did: &str) -> Result<Vec<u8>, WasmCryptoError> {
+        // Self-DID short-circuit, mirroring native provider.rs:1041
+        // (`member_did == self.local_did`). The local DID is derived from the
+        // committer's own leaf, so this is correct for the creator and any
+        // Welcome-joined member. Returning BEFORE the scan also covers the
+        // pathological duplicate-DID tree: native evicts neither leaf, so this
+        // empty-commit no-op must not resolve a non-own duplicate leaf either.
+        // `own_did` propagates `GroupDestroyed` (group is None) as a genuine
+        // error.
+        if self.own_did()? == member_did {
+            return Ok(Vec::new());
+        }
+        // `leaf_index_for_did` propagates `GroupDestroyed` (group is None) as a
+        // genuine error; `Ok(None)` means the DID has no MLS leaf.
+        let Some(leaf_index) = self.leaf_index_for_did(member_did)? else {
+            // Diagnostic only — the no-op behaviour (empty commit) is the
+            // contract. `web_sys::console` is unavailable on non-wasm32 test
+            // targets, so gate the log to the browser build.
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::warn_1(
+                &format!(
+                    "[SCP] remove_member_by_did: member DID '{member_did}' not found in MLS \
+                     group leaf nodes — member may not have been MLS-added"
+                )
+                .into(),
+            );
+            return Ok(Vec::new());
+        };
+        self.remove_member(&leaf_index)
+    }
+
     /// Joins a group from a Welcome message.
     ///
     /// The `welcome_bytes` must be TLS-serialized `MlsMessageOut` bytes
@@ -449,6 +639,318 @@ mod tests {
 
         assert_eq!(alice_group.epoch().unwrap(), 1);
         assert_eq!(bob_group.epoch().unwrap(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn leaf_index_for_did_resolves_added_member_and_remove_by_did_evicts() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bytes, _bob_holder) = WasmMlsGroup::generate_key_package(&bob_cred).unwrap();
+        let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).unwrap();
+        alice_group.add_member(bob_kp_in).unwrap();
+
+        // Bob's DID (a NON-self member) resolves to a real leaf index (the
+        // second leaf — Alice is the creator at leaf 0). The own-leaf skip must
+        // NOT affect resolution of OTHER members.
+        let _bob_index = alice_group
+            .leaf_index_for_did(&bob_cred.did)
+            .unwrap()
+            .expect("Bob's DID must resolve to an MLS leaf after add");
+
+        // Alice's OWN DID resolves to None — `leaf_index_for_did` skips the
+        // committer's own leaf, mirroring native `MlsCryptoProvider::
+        // remove_member` (own-index skip + self no-op, provider.rs:1041/1060).
+        // This is what funnels a self-removal to the empty-commit no-op.
+        assert!(
+            alice_group
+                .leaf_index_for_did(&alice_cred.did)
+                .unwrap()
+                .is_none(),
+            "the local member's OWN DID must resolve to None (own leaf skipped)"
+        );
+
+        // A DID that is not a member resolves to None (not an error).
+        assert!(
+            alice_group
+                .leaf_index_for_did("did:dht:z6MkNotAMember")
+                .unwrap()
+                .is_none(),
+            "a non-member DID must resolve to None"
+        );
+
+        // remove_member_by_did evicts Bob and advances the epoch.
+        let epoch_before = alice_group.epoch().unwrap();
+        let commit = alice_group.remove_member_by_did(&bob_cred.did).unwrap();
+        assert!(!commit.is_empty(), "eviction must produce a commit");
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before + 1,
+            "removing a member must advance the MLS epoch"
+        );
+
+        // Bob is no longer resolvable after eviction.
+        assert!(
+            alice_group
+                .leaf_index_for_did(&bob_cred.did)
+                .unwrap()
+                .is_none(),
+            "the evicted member's DID must no longer resolve to a leaf"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_is_noop_for_non_member() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        let epoch_before = alice_group.epoch().unwrap();
+
+        // No member with this DID has an MLS leaf. This matches native
+        // `MlsCryptoProvider::remove_member`: a missing leaf is a NO-OP that
+        // returns an empty commit (the governance layer is authoritative for
+        // membership; the crypto layer only manages MLS state). It must NOT
+        // error and must NOT advance the epoch.
+        let commit = alice_group
+            .remove_member_by_did("did:dht:z6MkGhostMember")
+            .expect("missing-leaf removal must be a no-op, not an error");
+        assert!(
+            commit.is_empty(),
+            "a missing-leaf removal must produce an empty commit (no-op)"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before,
+            "a missing-leaf removal must NOT advance the MLS epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_is_noop_for_self_did() {
+        // Self-removal parity with native `MlsCryptoProvider::remove_member`:
+        // when the removed DID is the local member's OWN DID, the own leaf is
+        // skipped, so `leaf_index_for_did` returns `None` and
+        // `remove_member_by_did` is an empty-commit NO-OP (epoch unchanged).
+        // OpenMLS would otherwise reject `remove_member(own_index)` with
+        // `CannotRemoveSelf`; mirroring native, dispatch instead proceeds to
+        // strip governance + append the `MemberLeft` leaf.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        // Add Bob so the group has more than one leaf — proves the no-op is
+        // specifically the own-leaf skip, not "single-member group" behaviour.
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bytes, _bob_holder) = WasmMlsGroup::generate_key_package(&bob_cred).unwrap();
+        let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).unwrap();
+        alice_group.add_member(bob_kp_in).unwrap();
+
+        // Alice's own DID resolves to None (own leaf skipped).
+        assert!(
+            alice_group
+                .leaf_index_for_did(&alice_cred.did)
+                .unwrap()
+                .is_none(),
+            "the local member's own DID must resolve to None (own leaf skipped)"
+        );
+
+        let epoch_before = alice_group.epoch().unwrap();
+        let commit = alice_group
+            .remove_member_by_did(&alice_cred.did)
+            .expect("self-removal must be an empty-commit no-op, not an error");
+        assert!(
+            commit.is_empty(),
+            "self-removal must produce an empty commit (no-op)"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before,
+            "self-removal must NOT advance the MLS epoch"
+        );
+
+        // Bob (a NON-self member) still resolves + evicts normally — the
+        // own-leaf skip must not affect other members.
+        let bob_epoch_before = alice_group.epoch().unwrap();
+        let bob_commit = alice_group.remove_member_by_did(&bob_cred.did).unwrap();
+        assert!(
+            !bob_commit.is_empty(),
+            "evicting a non-self member must still produce a commit"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            bob_epoch_before + 1,
+            "evicting a non-self member must advance the MLS epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn own_did_returns_local_member_did_for_creator() {
+        // The creator occupies leaf 0; `own_did` must recover Alice's DID from
+        // her own leaf credential without any stored state.
+        let alice_cred = test_credential("alice");
+        let alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+        assert_eq!(
+            alice_group.own_did().unwrap(),
+            alice_cred.did,
+            "own_did must recover the creator's DID from her own leaf"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn own_did_returns_joiner_did_for_welcome_joined_member() {
+        // A Welcome-joined member occupies a non-zero leaf; `own_did` must
+        // recover the JOINER's DID (Bob), not the creator's (Alice). This proves
+        // the self-DID short-circuit is correct on both construction paths.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bytes, bob_holder) = WasmMlsGroup::generate_key_package(&bob_cred).unwrap();
+        let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).unwrap();
+        let (_commit, welcome_bytes) = alice_group.add_member(bob_kp_in).unwrap();
+
+        let bob_group = WasmMlsGroup::join_from_welcome(&welcome_bytes, bob_holder).unwrap();
+        assert_eq!(
+            bob_group.own_did().unwrap(),
+            bob_cred.did,
+            "own_did must recover the joiner's DID, not the creator's"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn own_did_errors_on_destroyed_group() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+        alice_group.destroy();
+        let err = alice_group
+            .own_did()
+            .expect_err("own_did against a destroyed group must error");
+        assert!(
+            matches!(err, WasmCryptoError::GroupDestroyed),
+            "destroyed-group own_did must be GroupDestroyed, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_short_circuits_on_self_did_before_scan() {
+        // Self-removal on a SINGLE-member group: an own-DID removal is an
+        // empty-commit no-op (empty commit, no epoch advance, no error).
+        //
+        // NOTE — this test does NOT discriminate the self-DID short-circuit
+        // (native provider.rs:1041) from the own-leaf skip in
+        // `leaf_index_for_did` (native provider.rs:1060). On a single-member
+        // group both mechanisms independently yield the same empty no-op: even
+        // with the short-circuit removed, the own-leaf skip alone makes
+        // `leaf_index_for_did(own_did)` return `None`, so the result is
+        // identical. The test that actually isolates the short-circuit is
+        // `remove_member_by_did_self_did_does_not_evict_duplicate_leaf`, where a
+        // duplicate non-own leaf carries the local DID: only the short-circuit
+        // (returning BEFORE the scan) prevents that duplicate from being
+        // resolved and evicted. This test covers the common-case no-op shape.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        let epoch_before = alice_group.epoch().unwrap();
+        let commit = alice_group
+            .remove_member_by_did(&alice_cred.did)
+            .expect("self-DID removal must be an empty-commit no-op");
+        assert!(
+            commit.is_empty(),
+            "self-DID removal must produce an empty commit (no-op)"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before,
+            "self-DID removal must NOT advance the MLS epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_self_did_does_not_evict_duplicate_leaf() {
+        // Pathological duplicate-DID tree: a SECOND leaf carries the local
+        // member's OWN DID. Native `MlsCryptoProvider::remove_member`
+        // short-circuits on `member_did == self.local_did` (provider.rs:1041)
+        // and evicts NEITHER leaf (empty no-op). WASM must match: the self-DID
+        // short-circuit returns before the scan, so the duplicate non-own leaf
+        // is NOT resolved or evicted and the epoch does NOT advance.
+        //
+        // The duplicate leaf is constructed via the normal add path with a
+        // credential carrying Alice's DID but a fresh signing key (a distinct
+        // KeyPackage). OpenMLS keys leaves by leaf-node/signature-key, not by
+        // SCP credential DID, so two leaves can legitimately carry the same DID.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        // A second credential with Alice's SAME DID but its own signing key.
+        let dup_cred = test_credential("alice");
+        assert_eq!(
+            dup_cred.did, alice_cred.did,
+            "the duplicate leaf must carry the local member's own DID"
+        );
+        let (dup_kp_bytes, _dup_holder) = WasmMlsGroup::generate_key_package(&dup_cred).unwrap();
+        let dup_kp_in = KeyPackageIn::tls_deserialize(&mut &*dup_kp_bytes).unwrap();
+        alice_group.add_member(dup_kp_in).unwrap();
+
+        // The group now has two leaves carrying Alice's DID (her own leaf 0 plus
+        // the added duplicate). The epoch advanced once for the add.
+        let epoch_after_add = alice_group.epoch().unwrap();
+
+        // Self-removal of Alice's own DID must be an empty-commit no-op: the
+        // short-circuit fires before the scan, so the duplicate leaf is left in
+        // place and the epoch does not advance — exactly as native would.
+        let commit = alice_group
+            .remove_member_by_did(&alice_cred.did)
+            .expect("self-DID removal in a dup-DID tree must be an empty no-op");
+        assert!(
+            commit.is_empty(),
+            "self-DID removal in a dup-DID tree must produce an empty commit"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_after_add,
+            "self-DID removal must NOT advance the epoch — the duplicate leaf is \
+             NOT evicted, matching native's short-circuit"
+        );
+
+        // The duplicate leaf is still present: a NON-self scan (own-leaf skipped)
+        // still resolves Alice's DID to the duplicate's leaf index, proving the
+        // short-circuit — not an eviction — is what produced the no-op.
+        assert!(
+            alice_group
+                .leaf_index_for_did(&alice_cred.did)
+                .unwrap()
+                .is_some(),
+            "the duplicate leaf carrying the local DID must still be present \
+             (own-leaf skip resolves it; the short-circuit did not evict it)"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_errors_on_destroyed_group() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        // A destroyed group (group is None) is a genuine MLS failure:
+        // `leaf_index_for_did` returns `GroupDestroyed`, which must propagate as
+        // an error so the dispatch layer fails closed (keeps the member) rather
+        // than reporting a removal that never cut the key.
+        alice_group.destroy();
+        let err = alice_group
+            .remove_member_by_did("did:dht:z6MkAnyone")
+            .expect_err("removal against a destroyed group must error");
+        assert!(
+            matches!(err, WasmCryptoError::GroupDestroyed),
+            "destroyed-group removal must be GroupDestroyed, got {err:?}"
+        );
     }
 
     // NOTE: OpenMLS cannot decrypt your own messages. A two-party setup is

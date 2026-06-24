@@ -1098,6 +1098,13 @@ export function createWasmBridge(): Bridge {
       // Execute BY ID: the WASM runtime resolves the authoritative, tracked
       // proposal and dispatches its action. No caller-supplied action; the
       // executor and consequence subject are the tracked proposal's proposer.
+      //
+      // For RemoveMember the returned JSON carries a hex `commit` field. WASM has
+      // no internal transport (ADR-034) and never auto-broadcasts it, so the
+      // caller MUST relay this commit to the other context members or the MLS
+      // group silently forks (remaining members never learn of the eviction). An
+      // empty `commit` means no MLS commit was produced (broadcast/unencrypted
+      // context, or the removed member held no MLS leaf).
       return await wasm.context_execute_governance(handle, proposalIdHex);
     },
 
