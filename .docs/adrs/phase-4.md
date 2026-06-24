@@ -1177,7 +1177,7 @@ export class ScpError extends Error {
 
 export class IdentityError extends ScpError { override name = "IdentityError" as const; }
 export class ContextError extends ScpError { override name = "ContextError" as const; }
-export class PermissionError extends ScpError { override name = "PermissionError" as const; }
+export class UcanPermissionError extends ScpError { override name = "UcanPermissionError" as const; } // named to avoid shadowing the JS global `PermissionError`
 export class CryptoError extends ScpError { override name = "CryptoError" as const; }
 export class TransportError extends ScpError { override name = "TransportError" as const; }
 export class ToolError extends ScpError { override name = "ToolError" as const; }
@@ -1297,12 +1297,12 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    ```typescript
    const token = await mintUcan(ctx, memberDid, ["messages:read"]);
    await validateUcan(ctx, token.encoded, "messages:read"); // does not throw
-   await expect(validateUcan(ctx, token.encoded, "messages:write")).rejects.toThrow(PermissionError);
+   await expect(validateUcan(ctx, token.encoded, "messages:write")).rejects.toThrow(UcanPermissionError);
    await revokeUcan(ctx, token.id);
    ```
    - `mintUcan(ctx, did, capabilities)` returns a `UcanToken` with `.encoded: string` and `.id: string`.
-   - `validateUcan(ctx, token, capability)` resolves on valid token, rejects with `PermissionError` on invalid.
-   - `revokeUcan(ctx, tokenId)` revokes the token; subsequent validation throws `PermissionError`.
+   - `validateUcan(ctx, token, capability)` resolves on valid token, rejects with `UcanPermissionError` on invalid.
+   - `revokeUcan(ctx, tokenId)` revokes the token; subsequent validation throws `UcanPermissionError`. The class is named `UcanPermissionError` (not `PermissionError`) to avoid shadowing the JS global `PermissionError`.
 
 6. **EventLog API:**
    - `eventLog.query(filter)` returns `Event[]` matching the filter.
