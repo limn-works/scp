@@ -5185,7 +5185,8 @@ impl ClassSCell
         let mut state = fresh_state(ctx_byte);
         state
             .role_state
-            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new(caps));
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new(caps))
+            .expect("well-formed test ceiling");
         state
     }
 
@@ -7364,6 +7365,111 @@ impl ClassSCell
         assert_eq!(
             cell.generation, 7,
             "generation seeded through set_generation_for_test"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // execute_modify_ceiling — propose-time ceiling-entry grammar gate
+    // (spec §5.3.1.1 / §5.3.2). A malformed proposed ceiling is rejected
+    // at PROPOSE/STAGE time (before the 72h notification window), and no
+    // pending modification is staged. A well-formed proposal stages.
+    // ------------------------------------------------------------------
+
+    /// Build an ACTIVE, `Governed`-ceiling-policy cell so `execute_modify_ceiling`
+    /// reaches its staging logic. The default `ContextParams` ceiling policy is
+    /// `Immutable`; ceiling modification requires `Governed`.
+    async fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
+        let mut state = fresh_state(ctx_byte);
+        let params = scp_protocol::context::params::ContextParams {
+            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
+            ..scp_protocol::context::params::ContextParams::default()
+        };
+        // Replace the handle with one carrying the Governed policy, then activate.
+        state.handle = crate::context::ContextHandle::new(ctx_hex(ctx_byte), params);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        ClassSCell::new(state)
+    }
+
+    fn ceiling_commit_meta() -> crate::context::governance_helpers::CommitMeta<'static> {
+        crate::context::governance_helpers::CommitMeta {
+            pid: [7u8; 32],
+            actor_did: "did:example:admin",
+            timestamp_secs: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_modify_ceiling_rejects_malformed_proposal_at_propose_time() {
+        use scp_protocol::context::roles::Capability;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let ctx_id = ctx_hex(0xC1);
+
+        // Each malformed entry must be rejected BEFORE staging.
+        for malformed in [
+            Capability::Custom("payments".to_owned()), // no colon
+            Capability::Custom("*:*".to_owned()),      // stray wildcard resource
+            Capability::Custom("a:b:c".to_owned()),    // multi-colon (3 segments)
+        ] {
+            let mut cell = active_governed_cell(0xC1).await;
+            let new_ceiling = vec![Capability::MessagesRead, malformed.clone()];
+            let res = crate::context::governance_helpers::execute_modify_ceiling(
+                &mut cell,
+                &deps,
+                &ctx_id,
+                &new_ceiling,
+                ceiling_commit_meta(),
+            );
+            assert!(
+                matches!(res, Err(ContextError::InvalidState(_))),
+                "malformed proposed ceiling entry {malformed:?} must be rejected at \
+                 propose time: {res:?}"
+            );
+            // Fail-closed: nothing was staged.
+            assert!(
+                cell.governance.pending_ceiling_modification.is_none(),
+                "a rejected malformed ceiling proposal must NOT stage a pending \
+                 modification (entry {malformed:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_modify_ceiling_stages_wellformed_proposal() {
+        use scp_protocol::context::roles::Capability;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let ctx_id = ctx_hex(0xC2);
+        let mut cell = active_governed_cell(0xC2).await;
+
+        let new_ceiling = vec![
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::Custom("billing:*".to_owned()),
+        ];
+        let res = crate::context::governance_helpers::execute_modify_ceiling(
+            &mut cell,
+            &deps,
+            &ctx_id,
+            &new_ceiling,
+            ceiling_commit_meta(),
+        );
+        assert!(
+            res.is_ok(),
+            "well-formed ceiling proposal must stage: {res:?}"
+        );
+        let pending = cell
+            .governance
+            .pending_ceiling_modification
+            .as_ref()
+            .expect("well-formed proposal stages a pending modification");
+        assert_eq!(
+            pending.new_capabilities, new_ceiling,
+            "staged pending modification carries the proposed capabilities verbatim"
         );
     }
 }

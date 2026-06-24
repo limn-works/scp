@@ -1448,19 +1448,25 @@ impl WasmContextManager {
         // Ceiling-entry grammar enforcement (spec §5.3.1.1). The WASM bridge does
         // NOT route ceiling construction through `ContextRoleState::new` (the
         // native enforcement point), so it validates each user-supplied ceiling
-        // entry here against the SAME canonical grammar validator. This forecloses
+        // entry here against the SAME canonical grammar validator. Validate the
+        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
+        // the raw string — so the WASM create path agrees with the native bridges
+        // and the WASM `ModifyCeiling` handler on one canonical parse (BLACK-003):
+        // `Capability::new` strips a `custom:` prefix, so the raw `"custom:payments"`
+        // (one colon, would pass a raw-string check) parses to `Custom("payments")`,
+        // a no-colon custom the parsed-enum check correctly REJECTS. This forecloses
         // a malformed entry being normalized into the ceiling string set — in
-        // particular it prevents any silent broadening, since a no-colon custom
-        // (e.g. `payments`) and stray-`*` entries (`*:*`, `*:read`) are rejected
-        // rather than normalized. Built-in defaults (empty ceiling) are
-        // well-formed by construction and skip per-entry validation.
+        // particular any silent broadening, since a no-colon custom (e.g. `payments`)
+        // and stray-`*` entries (`*:*`, `*:read`) are rejected rather than
+        // normalized. Built-in defaults (empty ceiling) are well-formed by
+        // construction and skip per-entry validation.
         for entry in &ceiling {
-            scp_protocol::context::roles::validate_ceiling_entry(entry).map_err(|e| {
-                ScpWasmError::Validation {
+            scp_protocol::context::roles::Capability::new(entry)
+                .validate_as_ceiling_entry()
+                .map_err(|e| ScpWasmError::Validation {
                     message: e.to_string(),
                     code: codes::VALID_7000.to_owned(),
-                }
-            })?;
+                })?;
         }
 
         let ceiling_strings = Self::build_ceiling_strings(&ceiling);
@@ -3286,6 +3292,45 @@ impl WasmContextManager {
         result
     }
 
+    /// Handles a `ModifyCeiling` governance action (BLACK-002).
+    ///
+    /// Ceiling-entry grammar enforcement (spec §5.3.1.1): the WASM bridge
+    /// re-implements the manager (ADR-034) and does NOT share the runtime
+    /// `ContextRoleState::set_ceiling` construction invariant, so it MUST validate
+    /// each entry here — exactly as the WASM create path does — before rebuilding
+    /// `ceiling_strings`. Validates the PARSED enum form
+    /// (`validate_as_ceiling_entry`), which is what `capability_to_ucan_format(&c
+    /// .name())` enforces, so the validation and the stored form agree (no silent
+    /// broadening of a malformed `Custom`). Rejects before any mutation: a
+    /// malformed `new_ceiling` leaves the prior ceiling unchanged, and native +
+    /// WASM therefore store the SAME effective ceiling for the same `ModifyCeiling`
+    /// action.
+    fn dispatch_modify_ceiling(
+        &mut self,
+        context_id: &str,
+        new_ceiling: &[scp_protocol::context::roles::Capability],
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        for cap in new_ceiling {
+            cap.validate_as_ceiling_entry()
+                .map_err(|e| ScpWasmError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                })?;
+        }
+        let ctx = self.require_active_context_mut(context_id)?;
+        if ctx.ceiling_policy != "governed" {
+            return Err(ScpWasmError::Permission {
+                message: "ceiling is immutable — cannot modify".to_owned(),
+                code: codes::PERM_3000.to_owned(),
+            });
+        }
+        ctx.ceiling_strings = new_ceiling
+            .iter()
+            .map(|c| Self::capability_to_ucan_format(&c.name()))
+            .collect();
+        Ok(serde_json::json!({"action": "ModifyCeiling"}))
+    }
+
     /// Dispatches a governance action to its handler.
     ///
     /// Split into multiple methods to satisfy the 100-line function limit.
@@ -3369,15 +3414,7 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "RemoveTool", "toolId": tool_id}))
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
-                let ctx = self.require_active_context_mut(context_id)?;
-                if ctx.ceiling_policy != "governed" {
-                    return Err(ScpWasmError::Permission {
-                        message: "ceiling is immutable — cannot modify".to_owned(),
-                        code: codes::PERM_3000.to_owned(),
-                    });
-                }
-                ctx.ceiling_strings = new_ceiling.iter().map(|c| Self::capability_to_ucan_format(&c.name())).collect();
-                Ok(serde_json::json!({"action": "ModifyCeiling"}))
+                self.dispatch_modify_ceiling(context_id, new_ceiling)
             }
             GovernanceAction::CloseContext { .. } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -8805,6 +8842,11 @@ mod tests {
             "*:read",
             "payments:read:write",
             "payments:wr*",
+            // BLACK-003: `Capability::new("custom:payments")` strips the `custom:`
+            // prefix → `Custom("payments")`, a no-colon custom whose enforced form
+            // is rejected. Validating the parsed enum (this fix) rejects it here so
+            // the validation and the enforced parse agree.
+            "custom:payments",
         ] {
             let mut mgr = WasmContextManager::new();
             let creator = "did:dht:zcreator";
@@ -8870,6 +8912,132 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build an ACTIVE, encrypted, `governed`-ceiling-policy context registered
+    /// in a fresh manager, seeded with the given ceiling strings. Used to drive
+    /// `dispatch_governance_action(ModifyCeiling)` directly in tests.
+    fn manager_with_governed_context(
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[&str],
+    ) -> WasmContextManager {
+        let ctx = PerContextState {
+            state: "active".to_owned(),
+            params_json: serde_json::json!({"mode": "Encrypted"}),
+            creator_did: creator_did.to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling_strings: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+            ceiling_policy: "governed".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: EventLog::new(context_id.to_owned()),
+            revoked_tokens: HashSet::new(),
+            seen_nonces: HashMap::new(),
+            members: HashMap::new(),
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
+            suspended_capabilities: HashMap::new(),
+            read_exclusion_list: HashSet::new(),
+            broadcast_context: None,
+            sessions: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
+            pruning_policy: None,
+            economic_policy_locked: false,
+            hard_rate_limit_config: None,
+            consequence_rules: Vec::new(),
+            cooldown_until: HashMap::new(),
+            crypto: None,
+            creation_timestamp_secs: 0,
+        };
+        let mut mgr = WasmContextManager::new();
+        mgr.contexts.insert(context_id.to_owned(), ctx);
+        mgr
+    }
+
+    /// WASM `ModifyCeiling` (BLACK-002) rejects a malformed proposed ceiling
+    /// entry (spec §5.3.1.1) and leaves the prior ceiling UNCHANGED — closing the
+    /// divergence where the handler rebuilt `ceiling_strings` with no validation.
+    #[test]
+    fn test_wasm_modify_ceiling_rejects_malformed_entry() {
+        for malformed in [
+            Capability::Custom("payments".to_owned()), // no colon
+            Capability::Custom("*:*".to_owned()),      // stray wildcard resource
+            Capability::Custom("a:b:c".to_owned()),    // multi-colon (3 segments)
+        ] {
+            let mut mgr =
+                manager_with_governed_context("ctx-mc", "did:dht:zcreator", &["messages:read"]);
+            let before = mgr.contexts.get("ctx-mc").unwrap().ceiling_strings.clone();
+            let action = GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![Capability::MessagesRead, malformed.clone()],
+            };
+            let err = mgr
+                .dispatch_governance_action("ctx-mc", &action)
+                .expect_err("malformed ModifyCeiling must be rejected");
+            match err {
+                ScpWasmError::Validation { ref code, .. } => {
+                    assert_eq!(code, codes::VALID_7000);
+                }
+                other => panic!("expected Validation error for {malformed:?}, got: {other:?}"),
+            }
+            // Fail-closed: the prior ceiling is unchanged.
+            assert_eq!(
+                mgr.contexts.get("ctx-mc").unwrap().ceiling_strings,
+                before,
+                "a rejected malformed ModifyCeiling must leave the ceiling unchanged ({malformed:?})"
+            );
+        }
+    }
+
+    /// WASM `ModifyCeiling` accepts a well-formed proposed ceiling and stores the
+    /// SAME effective ceiling that the native bridge would for the same action —
+    /// closing the native/WASM divergence (BLACK-002). The native enforced form is
+    /// `Capability::ucan_capability_name`; the WASM stored form is
+    /// `capability_to_ucan_format(cap.name())`. For these entries the two agree.
+    #[test]
+    fn test_wasm_modify_ceiling_accepts_wellformed_and_matches_native() {
+        let mut mgr =
+            manager_with_governed_context("ctx-mc-ok", "did:dht:zcreator", &["messages:read"]);
+        let new_ceiling = vec![
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::Custom("billing:*".to_owned()),
+            Capability::ToolInvokeAll,
+        ];
+        mgr.dispatch_governance_action(
+            "ctx-mc-ok",
+            &GovernanceAction::ModifyCeiling {
+                new_ceiling: new_ceiling.clone(),
+            },
+        )
+        .expect("well-formed ModifyCeiling must succeed");
+
+        // Native enforced ceiling string set for the SAME action: each capability
+        // mapped via `ucan_capability_name` (the native bridge ceiling form).
+        let native_expected: HashSet<String> = new_ceiling
+            .iter()
+            .map(scp_protocol::context::roles::Capability::ucan_capability_name)
+            .collect();
+        let wasm_stored = mgr
+            .contexts
+            .get("ctx-mc-ok")
+            .unwrap()
+            .ceiling_strings
+            .clone();
+        assert_eq!(
+            wasm_stored, native_expected,
+            "native and WASM must store the SAME effective ceiling for the same \
+             well-formed ModifyCeiling action"
+        );
     }
 
     /// **C2-B:** `create_context` accepts a free economic policy. The

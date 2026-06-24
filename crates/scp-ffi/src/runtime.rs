@@ -1520,14 +1520,23 @@ pub fn register_ffi_state(
                     .map(scp_core::context::roles::Capability::ucan_capability_name)
                     .collect::<HashSet<String>>()
             } else {
-                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on the raw
-                // user strings BEFORE they are normalized into the UCAN ceiling
-                // string set. Rejects malformed entries at the bridge boundary
-                // (e.g. a no-colon `payments`, which `Capability::new` +
-                // `ucan_capability_name` would otherwise silently widen to
-                // `payments:*`) rather than storing a broadened entry.
+                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user
+                // entry BEFORE it is normalized into the UCAN ceiling string set.
+                // Validate the PARSED enum (`Capability::new(entry)
+                // .validate_as_ceiling_entry()`) — NOT the raw string — so the
+                // validation checks EXACTLY the capability that gets enforced.
+                // `Capability::new` strips a `custom:` prefix: the raw string
+                // `"custom:payments"` has one colon (would pass a raw-string check)
+                // but parses to `Custom("payments")`, whose enforced form
+                // (`ucan_capability_name` → `payments:payments`) corresponds to a
+                // no-colon custom that `validate_as_ceiling_entry` REJECTS. Routing
+                // through the parsed enum keeps the raw-string validation and the
+                // enforced parse in agreement on one canonical form (BLACK-003), and
+                // still rejects a no-colon `payments` that would otherwise be widened
+                // to `payments:*`.
                 for entry in user_ceiling {
-                    scp_core::context::roles::validate_ceiling_entry(entry)
+                    scp_core::context::roles::Capability::new(entry)
+                        .validate_as_ceiling_entry()
                         .map_err(|e| ScpPyError::context(e.to_string()))?;
                 }
                 user_ceiling

@@ -603,10 +603,12 @@ const BUILTIN_CEILING_CATEGORIES: &[&str] = &[
 /// Error produced when a ceiling entry is not well-formed per the
 /// ceiling-entry grammar (spec §5.3.1.1).
 ///
-/// Surfaced at context creation: a malformed entry causes creation to fail and
-/// can never be stored in a [`CapabilityCeiling`]. The single variant carries
-/// the spec-named `InvalidCeilingCategory` semantics plus the offending entry
-/// and a human-readable reason for diagnostics.
+/// Surfaced at EVERY ceiling write — context creation
+/// ([`ContextRoleState::new`]) and the whole-ceiling mutator
+/// ([`ContextRoleState::set_ceiling`]) — so a malformed entry causes the write to
+/// fail and can never be stored in a [`CapabilityCeiling`] by construction. The
+/// single variant carries the spec-named `InvalidCeilingCategory` semantics plus
+/// the offending entry and a human-readable reason for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CeilingEntryError {
     /// A ceiling entry is neither a recognized built-in category (spec §5.3.1)
@@ -1422,8 +1424,30 @@ impl ContextRoleState {
     /// coalesce-window rollback of a ceiling tightening would silently re-widen the
     /// authorization envelope, which is why the WRITE is centralized here rather
     /// than via a public field.
-    pub fn set_ceiling(&mut self, ceiling: CapabilityCeiling) {
+    ///
+    /// WELL-FORMEDNESS CONSTRUCTION INVARIANT (spec §5.3.1.1): every ceiling entry
+    /// is validated against the canonical ceiling-entry grammar BEFORE the
+    /// replacement is stored. This is the SINGLE whole-ceiling write chokepoint for
+    /// the runtime, so routing the grammar check here makes "a malformed
+    /// `CapabilityCeiling` can never be stored" true by construction on EVERY
+    /// mutation path — not just at context creation
+    /// ([`ContextRoleState::new`](Self::new)). A malformed entry (single-token
+    /// custom, stray `*`, multi-colon, bad charset, control/HTML char, oversize, …)
+    /// is rejected with [`CeilingEntryError::InvalidCeilingCategory`] and the prior
+    /// ceiling is left UNCHANGED (fail-closed: a rejected write never widens or
+    /// poisons the authorization envelope).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if any entry of
+    /// `ceiling` is not a recognized built-in category nor a well-formed custom
+    /// capability. The receiver is not mutated on error.
+    pub fn set_ceiling(&mut self, ceiling: CapabilityCeiling) -> Result<(), CeilingEntryError> {
+        // Validate the WHOLE replacement before storing any of it, so a partially
+        // malformed ceiling cannot leave the state half-written.
+        ceiling.validate_entries()?;
         self.ceiling = ceiling;
+        Ok(())
     }
 
     /// TEST-ONLY mutable access to the ceiling (ADR-049 §9). Gated
@@ -3687,6 +3711,52 @@ mod tests {
             Capability::ToolInvoke("calc".to_owned()),
         ]);
         ContextRoleState::new("ctx-1", "did:scp:creator", ceiling, vec![], &clock).unwrap();
+    }
+
+    #[test]
+    fn set_ceiling_rejects_malformed_entry_and_leaves_prior_unchanged() {
+        // Construction invariant: `set_ceiling` validates the WHOLE replacement
+        // against the ceiling-entry grammar before storing, so a malformed
+        // `CapabilityCeiling` can never be stored via the mutation path either.
+        let clock = scp_primitives::SystemClock;
+        let initial = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+        ]);
+        let mut state =
+            ContextRoleState::new("ctx-1", "did:scp:creator", initial.clone(), vec![], &clock)
+                .unwrap();
+
+        for malformed in [
+            Capability::Custom("payments".to_owned()), // no colon
+            Capability::Custom("*:*".to_owned()),      // stray wildcard resource
+            Capability::Custom("a:b:c".to_owned()),    // multi-colon (3 segments)
+        ] {
+            let bad = CapabilityCeiling::new([Capability::MessagesRead, malformed]);
+            assert!(matches!(
+                state.set_ceiling(bad),
+                Err(CeilingEntryError::InvalidCeilingCategory { .. })
+            ));
+            // Fail-closed: the prior ceiling is left UNCHANGED on a rejected write.
+            assert_eq!(state.ceiling(), &initial);
+        }
+    }
+
+    #[test]
+    fn set_ceiling_accepts_wellformed_replacement() {
+        let clock = scp_primitives::SystemClock;
+        let initial = CapabilityCeiling::new([Capability::MessagesRead]);
+        let mut state =
+            ContextRoleState::new("ctx-1", "did:scp:creator", initial, vec![], &clock).unwrap();
+
+        let replacement = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+            Capability::Custom("billing:*".to_owned()),
+            Capability::ToolInvoke("calc".to_owned()),
+        ]);
+        state.set_ceiling(replacement.clone()).unwrap();
+        assert_eq!(state.ceiling(), &replacement);
     }
 
     #[test]

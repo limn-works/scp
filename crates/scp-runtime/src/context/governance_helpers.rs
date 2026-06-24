@@ -477,9 +477,23 @@ pub async fn apply_pending_ceiling_modification(
         let state = view.rest_mut();
         // ADR-049 §9: downward-auth ceiling WRITE via the named `set_ceiling`
         // mutator, inside this fail-closed-persisting `commit_class_s_keep`.
-        state.role_state.set_ceiling(CapabilityCeiling::new(
-            pending.new_capabilities.iter().cloned(),
-        ));
+        // `set_ceiling` re-validates the whole replacement against the
+        // ceiling-entry grammar (spec §5.3.1.1) before storing: the
+        // construction invariant holds even if a malformed pending modification
+        // somehow reached this apply step (it cannot — `execute_modify_ceiling`
+        // rejects malformed entries at propose/stage time — but the invariant is
+        // enforced by construction at the write, not assumed). On a rejected
+        // write the prior ceiling stays and the pending record is NOT cleared.
+        state
+            .role_state
+            .set_ceiling(CapabilityCeiling::new(
+                pending.new_capabilities.iter().cloned(),
+            ))
+            .map_err(|e| {
+                ContextError::InvalidState(format!(
+                    "pending ceiling modification has a malformed entry: {e}"
+                ))
+            })?;
         state.governance.pending_ceiling_modification = None;
         Ok(())
     })?;
@@ -1537,6 +1551,24 @@ pub fn execute_modify_ceiling(
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
+
+        // Ceiling-entry grammar enforcement at PROPOSE/STAGE time (spec §5.3.1.1).
+        // Validate every proposed ceiling entry BEFORE staging it into
+        // `pending_ceiling_modification`, so a malformed proposal fails fast —
+        // rather than only at apply time, after the §5.3.2 notification window has
+        // elapsed. This is a reject-before-mutate guard: it returns `Err` from
+        // inside the `commit_class_s_keep` closure before any state is written, so
+        // no persist runs and the prior ceiling/pending state is untouched
+        // (fail-closed). The `set_ceiling` invariant at apply time
+        // (`apply_pending_ceiling_modification`) is the construction backstop; this
+        // is the fast-fail front door.
+        for cap in new_ceiling {
+            cap.validate_as_ceiling_entry().map_err(|e| {
+                ContextError::InvalidState(format!(
+                    "proposed ceiling entry is malformed (spec §5.3.1.1): {e}"
+                ))
+            })?;
+        }
 
         if !matches!(
             state.handle.params().ceiling_policy,

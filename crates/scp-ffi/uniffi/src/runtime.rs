@@ -986,9 +986,24 @@ impl UniffiBridgeInstance {
             // a malformed entry is SKIPPED rather than normalized: this forecloses
             // the silent broadening where a no-colon `payments` would become
             // `payments:*` via `Capability::new` + `ucan_capability_name`.
+            //
+            // Filter on the PARSED enum (`Capability::new(s)
+            // .validate_as_ceiling_entry()`) — NOT the raw string — so the
+            // accept/skip decision uses EXACTLY the capability that gets enforced
+            // (and mapped via `ucan_capability_name` on the next line). The runtime
+            // gate validates the same parsed-enum form, so this filter never skips
+            // an entry the runtime accepted nor keeps one it rejected. Validating
+            // the raw string instead would diverge on a prefix-stripped custom: the
+            // raw `"custom:payments"` passes a raw-string check but parses to
+            // `Custom("payments")` (enforced `payments:payments`), a no-colon custom
+            // the parsed-enum check correctly rejects (BLACK-003).
             ceiling
                 .iter()
-                .filter(|s| scp_core::context::roles::validate_ceiling_entry(s).is_ok())
+                .filter(|s| {
+                    scp_core::context::roles::Capability::new(s)
+                        .validate_as_ceiling_entry()
+                        .is_ok()
+                })
                 .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
                 .collect::<HashSet<String>>()
         };
