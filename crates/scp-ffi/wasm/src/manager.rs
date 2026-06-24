@@ -9873,6 +9873,93 @@ mod tests {
         );
     }
 
+    /// Self-removal parity: a governance `RemoveMember` that targets the
+    /// local/creator DID on a REAL encrypted context must behave like native's
+    /// self-removal — an EMPTY commit (the own MLS leaf is skipped, so eviction
+    /// is a no-op) while dispatch STILL PROCEEDS to strip the member from
+    /// `ctx.members`, clean F5 per-DID state, and append a `MemberLeft` leaf.
+    ///
+    /// This is the divergence regression guard: before the own-leaf skip,
+    /// `leaf_index_for_did` resolved the creator's own leaf, `OpenMLS` rejected
+    /// `remove_member(own_index)` with `CannotRemoveSelf`, dispatch failed
+    /// closed, and the member was KEPT with NO `MemberLeft` leaf — diverging
+    /// from native (which removes the member + appends the leaf), breaking the
+    /// §9.9.3 cross-platform `tree::root` + membership convergence invariant.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_self_did_encrypted_empty_commit_strips_and_appends_leaf() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-remove-self";
+        // The creator IS the local MLS member (leaf 0) and the removal target.
+        let creator = "did:dht:z6MkWasmSelfRemovalCreator";
+        let executor = creator;
+        let timestamp_secs = 1_701_000_000_u64;
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        let crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+            .expect("MLS group creation must succeed");
+        ctx.crypto = Some(crypto);
+        // Seed F5 per-DID state for the creator so we can prove it is cleaned up.
+        ctx.test_insert_suspended_capability(creator, "tool:invoke:calculator");
+        assert!(
+            ctx.test_suspended_capabilities(creator).is_some(),
+            "precondition: the creator must hold a suspended-capabilities entry"
+        );
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let result = mgr
+            .dispatch_remove_member(context_id, creator, executor, timestamp_secs)
+            .expect("self-removal on an encrypted context must succeed (empty-commit no-op)");
+
+        // EMPTY commit — the own MLS leaf is skipped, so eviction is a no-op
+        // (matching native's self-removal short-circuit).
+        assert_eq!(
+            result["commit"].as_str(),
+            Some(""),
+            "self-removal must produce an EMPTY commit (own leaf skipped — no eviction)"
+        );
+
+        let ctx_after = mgr
+            .contexts
+            .get(context_id)
+            .expect("context still registered");
+
+        // Member removed from ctx.members despite the empty commit.
+        assert!(
+            !ctx_after.members.contains_key(creator),
+            "self-removal must strip the member from ctx.members even though the commit is empty"
+        );
+
+        // F5 per-DID state cleaned.
+        assert!(
+            ctx_after.test_suspended_capabilities(creator).is_none(),
+            "self-removal must clean the removed member's suspended_capabilities entry"
+        );
+
+        // A durable MemberLeft leaf must be appended (native parity).
+        let events = mgr.test_context_event_log_events(context_id);
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a MemberLeft leaf must be appended on self-removal (native parity)");
+        assert!(
+            member_left.payload.data.is_empty(),
+            "the MemberLeft leaf payload must be empty (the removed DID is buffer-only)"
+        );
+        assert_eq!(
+            member_left.actor_did.as_ref(),
+            executor,
+            "the MemberLeft leaf actor_did must be the executor (the self-removing member)"
+        );
+        assert_eq!(
+            member_left.timestamp, timestamp_secs,
+            "the MemberLeft leaf timestamp must be the committer-assigned timestamp"
+        );
+    }
+
     /// F7: broadcast / `crypto.is_none()` path. A broadcast-author context with
     /// an "author" member and no MLS crypto: `dispatch_remove_member` must run
     /// the `block_author` cleanup, return an EMPTY commit, and still append a

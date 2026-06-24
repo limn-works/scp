@@ -2490,6 +2490,126 @@ fn cross_impl_remove_member_leaf_is_empty_and_precedes_executed() {
     );
 }
 
+/// SELF-REMOVAL parity: a governance `RemoveMember` that targets the local /
+/// committing member's OWN DID mints the SAME durable leaf shape as removing
+/// any other member — an empty `MemberLeft` leaf (stamped with the executor, who
+/// here equals the removed member) appended BEFORE `GovernanceActionExecuted`,
+/// exactly one of each.
+///
+/// Native self-removal (`MlsCryptoProvider::remove_member`, provider.rs:1041/1060)
+/// short-circuits the MLS eviction to an empty-commit no-op (own-index skip +
+/// self no-op) but still PROCEEDS through `execute_remove_member` to strip
+/// governance + append `MemberLeft`, then `finalize_governance_action` appends
+/// `GovernanceActionExecuted`. The WASM bridge mirrors this: with the own-leaf
+/// skip in `leaf_index_for_did`, an own-DID removal resolves to `None` →
+/// empty-commit no-op → `dispatch_remove_member` strips membership + appends the
+/// same two leaves (covered by the WASM crate's
+/// `remove_member_self_did_encrypted_empty_commit_strips_and_appends_leaf`
+/// dispatch test). A WASM regression that failed closed on self-removal would
+/// append ZERO leaves where native appends TWO, diverging the cross-platform
+/// `tree::root` and membership set. This test REPLAYS the native append sequence
+/// for the self-targeting case (`removed_did == executor_did`) and pins the
+/// empty-payload `MemberLeft`, the executor `actor_did`, the exactly-one-each
+/// leaf counts, and the `MemberLeft`-before-`GovernanceActionExecuted` ordering.
+#[test]
+fn cross_impl_self_removal_leaf_is_empty_and_precedes_executed() {
+    use scp_event_log::EventPayload;
+    use scp_protocol::context::governance::GovernanceAction;
+    use scp_runtime::context::builder::ContextEventLogProvider;
+    use scp_runtime::context::providers::MerkleEventLogProvider;
+
+    let ctx: [u8; 32] = [0x5e; 32];
+    // Self-removal: the executor IS the removed member (the creator removing
+    // themselves, or any self-targeting approved proposal).
+    let self_did = "did:dht:z6MkSelfRemovingMember";
+    let ts = 1_700_000_500_u64;
+
+    let log = MerkleEventLogProvider::new();
+    log.init_event_log(&ctx).unwrap();
+
+    // Replay the two appends native's self-removal performs, in order:
+    // 1) the empty-payload `MemberLeft` leaf, stamped with the EXECUTOR — which
+    //    for self-removal equals the removed member.
+    log.append_context_event(&ctx, EventType::MemberLeft, self_did, ts)
+        .unwrap();
+    // 2) then `GovernanceActionExecuted` via the shared payload producer.
+    let action = GovernanceAction::RemoveMember {
+        did: scp_identity::DID::from(self_did.to_owned()),
+        reason: None,
+    };
+    let target_did = action
+        .target_did()
+        .map(|d| d.as_ref().to_owned())
+        .unwrap_or_default();
+    let action_type = action.variant_name().to_owned();
+    let executed_payload = gov_action_executed_payload_bytes(&target_did, &action_type);
+    log.append_context_event_with_payload(
+        &ctx,
+        EventType::GovernanceActionExecuted,
+        self_did,
+        EventPayload {
+            data: executed_payload,
+        },
+        ts,
+    )
+    .unwrap();
+
+    let entries = log.event_log_entries(&ctx).unwrap().unwrap();
+
+    // The `MemberLeft` leaf carries an EMPTY payload and is stamped with the
+    // executor (== the self-removing member).
+    let member_left = entries
+        .iter()
+        .find(|e| e.event_type == EventType::MemberLeft)
+        .expect("MemberLeft leaf must be present on self-removal");
+    assert!(
+        member_left.payload.data.is_empty(),
+        "the self-removal MemberLeft canonical leaf payload MUST be empty (§9.9.3)"
+    );
+    assert_eq!(
+        member_left.actor_did.as_ref(),
+        self_did,
+        "the self-removal MemberLeft leaf actor_did MUST be the executor (the \
+         self-removing member)"
+    );
+
+    // Exactly ONE MemberLeft and exactly ONE GovernanceActionExecuted leaf —
+    // self-removal mints the SAME count as any other removal (not zero, which a
+    // fail-closed WASM regression would produce).
+    let member_left_count = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::MemberLeft)
+        .count();
+    assert_eq!(
+        member_left_count, 1,
+        "self-removal must append EXACTLY one MemberLeft leaf, got {member_left_count}"
+    );
+    let executed_count = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+        .count();
+    assert_eq!(
+        executed_count, 1,
+        "self-removal must append EXACTLY one GovernanceActionExecuted leaf, got {executed_count}"
+    );
+
+    // Ordering: `MemberLeft` precedes `GovernanceActionExecuted`.
+    let member_left_pos = entries
+        .iter()
+        .position(|e| e.event_type == EventType::MemberLeft)
+        .expect("MemberLeft present");
+    let executed_pos = entries
+        .iter()
+        .position(|e| e.event_type == EventType::GovernanceActionExecuted)
+        .expect("GovernanceActionExecuted present");
+    assert!(
+        member_left_pos < executed_pos,
+        "the self-removal MemberLeft leaf MUST precede the GovernanceActionExecuted \
+         leaf, matching native ordering — WASM must append in the same order for \
+         cross-platform root parity"
+    );
+}
+
 /// Canonical `TokenRevoked` leaf payload — JSON `{token_cid, revoker_did,
 /// context_id}`. Produced by the SHARED
 /// `scp_protocol::crypto::ucan::revoke::token_revoked_payload` that BOTH the
