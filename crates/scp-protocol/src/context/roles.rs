@@ -115,21 +115,53 @@ pub enum Capability {
 impl Capability {
     /// Creates a capability from a string name.
     ///
-    /// Recognized names: `"messages:read"`, `"messages:write"`,
-    /// `"tool:invoke:*"`, `"tool:register"`, `"member:invite"`,
-    /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
-    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
-    /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
-    /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
-    /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
+    /// A built-in capability is recognized in **either** of its two equivalent
+    /// spellings of the SAME enumerated category, so a built-in always parses to
+    /// its proper variant (never a [`Custom`](Self::Custom) lookalike):
+    ///
+    /// - **User-facing colon form** (spec §5.3.1 table): `"messages:read"`,
+    ///   `"messages:write"`, `"tool:invoke:*"`, `"tool:register"`,
+    ///   `"member:invite"`, `"member:remove"`, `"role:assign"`,
+    ///   `"governance:propose"`, `"governance:vote"`, `"context:close"`,
+    ///   `"context:child:create"`, `"tool:interface"`, `"bridging"`,
+    ///   `"media:voice"`, `"media:video"`, `"media:screen_share"`,
+    ///   `"member:ban"`, `"metadata:edit"`. Names starting with `"tool:invoke:"`
+    ///   parse as `ToolInvoke(id)`.
+    /// - **UCAN wire form** (the `{resource}:{action}` output of
+    ///   [`ucan_capability_name`](Self::ucan_capability_name), §7.3.4) — the
+    ///   spellings that differ from colon form because the resource is a
+    ///   multi-segment, underscore-joined token: `"tool_invoke:*"`
+    ///   (== `ToolInvokeAll`), `"tool_invoke:{id}"` (== `ToolInvoke(id)`),
+    ///   `"context_child:create"` (== `ChildContextCreate`), and `"bridging:*"`
+    ///   (== `Bridging`). Recognizing these is what lets a context's STORED
+    ///   ceiling (kept in canonical UCAN form) round-trip back to the proper
+    ///   built-in enum, and lets a UCAN-form ceiling entry resolve to the
+    ///   enumerated category it names rather than a `Custom` lookalike. There is
+    ///   no ambiguity: no well-formed custom ceiling entry contains a `_` in its
+    ///   resource (the custom grammar is kebab-only, §5.3.1.1), so a built-in's
+    ///   UCAN spelling can never collide with a valid custom.
+    ///
     /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
     /// Anything else maps to `Custom(name)`.
+    ///
+    /// [`name`](Self::name) and [`Display`](std::fmt::Display) always emit the
+    /// canonical colon form, so `new(name())` and `new(to_string())` round-trip.
     #[must_use]
     pub fn new(name: impl AsRef<str>) -> Self {
         match name.as_ref() {
+            // Built-in categories. Each arm lists the user-facing colon spelling
+            // (spec §5.3.1 table) AND, for the multi-segment built-ins, the
+            // equivalent UCAN wire spelling (the underscore-joined-resource output
+            // of `ucan_capability_name`, §7.3.4) — the two spellings of the SAME
+            // enumerated category. Recognizing the UCAN spelling is what lets a
+            // context's STORED ceiling (kept in canonical UCAN form) round-trip
+            // back to the proper built-in enum, and resolves a UCAN-form ceiling
+            // entry to its category instead of a `Custom` lookalike. No valid
+            // custom collides: the custom grammar is kebab-only (no `_` in the
+            // resource, §5.3.1.1).
             "messages:read" => Self::MessagesRead,
             "messages:write" => Self::MessagesWrite,
-            "tool:invoke:*" => Self::ToolInvokeAll,
+            "tool:invoke:*" | "tool_invoke:*" => Self::ToolInvokeAll,
             "tool:register" => Self::ToolRegister,
             "member:invite" => Self::MemberInvite,
             "member:remove" => Self::MemberRemove,
@@ -137,23 +169,26 @@ impl Capability {
             "governance:propose" => Self::GovernancePropose,
             "governance:vote" => Self::GovernanceVote,
             "context:close" => Self::ContextClose,
-            "context:child:create" => Self::ChildContextCreate,
+            "context:child:create" | "context_child:create" => Self::ChildContextCreate,
             "tool:interface" => Self::ToolInterface,
-            "bridging" => Self::Bridging,
+            "bridging" | "bridging:*" => Self::Bridging,
             "media:voice" => Self::MediaVoice,
             "media:video" => Self::MediaVideo,
             "media:screen_share" => Self::MediaScreenShare,
             "member:ban" => Self::MemberBan,
             "metadata:edit" => Self::MetadataEdit,
-            other => other.strip_prefix("tool:invoke:").map_or_else(
-                || {
-                    other.strip_prefix("custom:").map_or_else(
-                        || Self::Custom(other.to_owned()),
-                        |custom_name| Self::Custom(custom_name.to_owned()),
-                    )
-                },
-                |tool_id| Self::ToolInvoke(tool_id.to_owned()),
-            ),
+            other => other
+                .strip_prefix("tool:invoke:")
+                .or_else(|| other.strip_prefix("tool_invoke:"))
+                .map_or_else(
+                    || {
+                        other.strip_prefix("custom:").map_or_else(
+                            || Self::Custom(other.to_owned()),
+                            |custom_name| Self::Custom(custom_name.to_owned()),
+                        )
+                    },
+                    |tool_id| Self::ToolInvoke(tool_id.to_owned()),
+                ),
         }
     }
 
@@ -3877,6 +3912,107 @@ mod tests {
                 .validate_as_ceiling_entry()
                 .is_err()
         );
+    }
+
+    /// `Capability::new` recognizes a built-in in EITHER its colon spelling or
+    /// its UCAN wire spelling, always yielding the proper built-in variant (never
+    /// a `Custom` lookalike) — the multi-segment built-ins whose UCAN form differs
+    /// from colon form (`tool_invoke:*`, `tool_invoke:{id}`,
+    /// `context_child:create`, `bridging:*`) plus a representative sample of the
+    /// identical-spelling built-ins. Without this, a context's STORED (canonical
+    /// UCAN-form) ceiling re-parses to a `Custom` and fails re-validation
+    /// (`InvalidCeilingCategory: tool_invoke:* is malformed`), breaking context
+    /// creation / tool flow / cross-bridge parity.
+    #[test]
+    fn capability_new_parses_builtin_colon_and_ucan_spellings() {
+        // Colon spelling → built-in variant.
+        assert_eq!(Capability::new("tool:invoke:*"), Capability::ToolInvokeAll);
+        assert_eq!(
+            Capability::new("context:child:create"),
+            Capability::ChildContextCreate
+        );
+        assert_eq!(Capability::new("bridging"), Capability::Bridging);
+        assert_eq!(
+            Capability::new("tool:invoke:calc"),
+            Capability::ToolInvoke("calc".to_owned())
+        );
+
+        // UCAN wire spelling → the SAME built-in variant (not a Custom).
+        assert_eq!(Capability::new("tool_invoke:*"), Capability::ToolInvokeAll);
+        assert_eq!(
+            Capability::new("context_child:create"),
+            Capability::ChildContextCreate
+        );
+        assert_eq!(Capability::new("bridging:*"), Capability::Bridging);
+        assert_eq!(
+            Capability::new("tool_invoke:calc"),
+            Capability::ToolInvoke("calc".to_owned())
+        );
+
+        // Identical-spelling built-ins parse the same either way.
+        assert_eq!(Capability::new("messages:read"), Capability::MessagesRead);
+        assert_eq!(
+            Capability::new("media:screen_share"),
+            Capability::MediaScreenShare
+        );
+
+        // Every built-in's UCAN form round-trips back to its variant, so the
+        // canonical STORED ceiling form re-parses to the proper enum.
+        for cap in BUILTIN_CAPABILITIES {
+            let ucan = cap.ucan_capability_name();
+            assert_eq!(
+                &Capability::new(&ucan),
+                cap,
+                "UCAN form {ucan:?} must parse back to {cap:?}"
+            );
+        }
+    }
+
+    /// A built-in supplied in EITHER spelling is a valid ceiling entry; a
+    /// malformed custom is rejected in either parse. Mirrors the create-path
+    /// `Capability::new(entry).validate_as_ceiling_entry()` the bridges run, and
+    /// pins the regression: the canonical UCAN spellings (`tool_invoke:*`,
+    /// `context_child:create`, `bridging:*`, `tool_invoke:{id}`) and the
+    /// user-facing colon spellings must BOTH pass; underscore-resource customs and
+    /// stray-wildcard / multi-colon customs must still fail.
+    #[test]
+    fn ceiling_entry_accepts_builtin_either_spelling_rejects_malformed_custom() {
+        for good in [
+            // Colon spellings (spec §5.3.1 table / SDK input).
+            "messages:read",
+            "tool:invoke:*",
+            "tool:invoke:calc",
+            "context:child:create",
+            "bridging",
+            "media:screen_share",
+            // UCAN wire spellings (canonical stored form).
+            "tool_invoke:*",
+            "tool_invoke:calc",
+            "context_child:create",
+            "bridging:*",
+            // Well-formed customs.
+            "payments:approve",
+            "payments:*",
+        ] {
+            Capability::new(good)
+                .validate_as_ceiling_entry()
+                .unwrap_or_else(|e| panic!("ceiling entry {good:?} must be accepted: {e}"));
+        }
+
+        for bad in [
+            "payments",            // no-colon custom
+            "*:*",                 // stray wildcard resource
+            "*:read",              // stray wildcard resource
+            "payments:read:write", // multi-colon custom
+            "pay_ments:approve",   // underscore resource is NOT a valid custom
+            "tool_invoke:ca*lc",   // stray `*` in tool_id (UCAN form)
+            "tool:invoke:ca*lc",   // stray `*` in tool_id (colon form)
+        ] {
+            assert!(
+                Capability::new(bad).validate_as_ceiling_entry().is_err(),
+                "ceiling entry {bad:?} must be rejected"
+            );
+        }
     }
 
     /// `BUILTIN_CAPABILITIES` must list every non-parameterized built-in variant

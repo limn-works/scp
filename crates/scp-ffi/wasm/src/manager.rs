@@ -9241,7 +9241,7 @@ mod tests {
                 new_ceiling: vec![Capability::MessagesRead, malformed.clone()],
             };
             let err = mgr
-                .dispatch_governance_action("ctx-mc", &action)
+                .dispatch_governance_action("ctx-mc", &action, "did:dht:zcreator", 0)
                 .expect_err("malformed ModifyCeiling must be rejected");
             match err {
                 ScpWasmError::Validation { ref code, .. } => {
@@ -9278,6 +9278,8 @@ mod tests {
             &GovernanceAction::ModifyCeiling {
                 new_ceiling: new_ceiling.clone(),
             },
+            "did:dht:zcreator",
+            0,
         )
         .expect("well-formed ModifyCeiling must succeed");
 

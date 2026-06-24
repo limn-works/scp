@@ -3072,11 +3072,25 @@ mod tests {
     }
 
     /// `register_context` accepts a well-formed custom ceiling entry, an explicit
-    /// `{resource}:*` wildcard, and the parameterized `tool:invoke:{tool_id}`
-    /// built-in.
+    /// `{resource}:*` wildcard, the parameterized `tool:invoke:{tool_id}`
+    /// built-in, and a built-in supplied in its canonical UCAN wire spelling
+    /// (`tool_invoke:*`, `context_child:create`, `bridging:*`,
+    /// `tool_invoke:{id}`). Pins the regression where a UCAN-form built-in entry
+    /// — the canonical stored ceiling spelling — was misparsed to a `Custom`
+    /// lookalike and rejected with `InvalidCeilingCategory`.
     #[test]
     fn register_context_accepts_wellformed_custom_ceiling() {
-        for good in ["payments:approve", "payments:*", "tool:invoke:calc"] {
+        for good in [
+            "payments:approve",
+            "payments:*",
+            "tool:invoke:calc",
+            "tool:invoke:*",
+            "context:child:create",
+            "tool_invoke:*",
+            "tool_invoke:calc",
+            "context_child:create",
+            "bridging:*",
+        ] {
             let bi = PyBridgeInstance::new_py();
             let ctx_id = unique_ctx_id("good-ceiling");
             let creator = "did:dht:z6MkGoodCeiling";
