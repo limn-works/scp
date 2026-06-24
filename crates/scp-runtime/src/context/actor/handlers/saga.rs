@@ -3023,7 +3023,8 @@ mod tests {
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
                 Capability::ToolInterface,
                 Capability::ToolInvokeAll,
-            ]));
+            ]))
+            .expect("well-formed built-in ceiling");
         st.governance.registered_tools.push(ToolRegistration {
             tool_id: TOOL.to_owned(),
             name: "Calculator".to_owned(),

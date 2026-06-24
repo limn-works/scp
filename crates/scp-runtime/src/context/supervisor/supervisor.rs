@@ -12110,6 +12110,56 @@ mod tests {
         );
     }
 
+    /// A validly-signed export whose ceiling carries a MALFORMED entry (spec
+    /// §5.3.1.1) must be rejected with `ImportRejected`. A valid signature
+    /// authenticates the ORIGIN, not the WELL-FORMEDNESS of the payload — so a
+    /// non-conformant peer's signed export (which could carry a malformed ceiling
+    /// the local construction invariant would never produce) must not poison a
+    /// conformant importer. The export is signed by the creator key and presented
+    /// with the matching verifying key, so it passes signature verification;
+    /// rejection comes from the ceiling-grammar check inside `import_context`.
+    #[tokio::test]
+    async fn import_rejects_malformed_ceiling_entry() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let supervisor = supervisor_with_providers();
+        let creator = "did:key:malformed-ceiling-import-creator";
+        let context_id = "malformed-ceiling-import-ctx";
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        // Inject a malformed (no-colon) custom directly into the ceiling's backing
+        // set via the test-only accessor, simulating a non-conformant peer's
+        // export — the construction invariant forbids producing this legitimately.
+        snapshot.role_state.ceiling_mut().capabilities_mut().insert(
+            scp_protocol::context::roles::Capability::Custom("payments".to_owned()),
+        );
+        let event_log_data =
+            create_event_log_data(&[0x33u8; 32], &[scp_event_log::EventType::ContextCreated]);
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed export with a malformed ceiling");
+        let verifying_key = signing_key.verifying_key();
+
+        let result = supervisor
+            .import_context(export, &verifying_key, Some([0x42u8; 32]))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ContextError::ImportRejected { ref reason }) if reason.contains("malformed")
+            ),
+            "an export with a malformed ceiling entry must be rejected with \
+             ImportRejected; got {result:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Eviction-path coverage for the `ImportContext` dispatch arm.
     //
@@ -14151,7 +14201,8 @@ mod tests {
             .role_state
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
                 Capability::MemberBan,
-            ]));
+            ]))
+            .expect("well-formed built-in ceiling");
         state
             .role_state
             .member_capabilities
@@ -15643,7 +15694,8 @@ mod tests {
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
                 Capability::ToolInterface,
                 Capability::ToolInvokeAll,
-            ]));
+            ]))
+            .expect("well-formed built-in ceiling");
         // Established (both-approved) outbound interface caller→target for
         // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
         // passes. Source/target ids are the hex id-form §6.2.4 stores.
@@ -15696,7 +15748,8 @@ mod tests {
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
                 Capability::ToolInterface,
                 Capability::ToolInvokeAll,
-            ]));
+            ]))
+            .expect("well-formed built-in ceiling");
         st.governance.registered_tools.push(ToolRegistration {
             tool_id: XCTX_TOOL.to_owned(),
             name: "Calculator".to_owned(),

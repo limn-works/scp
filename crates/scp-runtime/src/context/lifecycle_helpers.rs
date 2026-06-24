@@ -1379,9 +1379,19 @@ pub async fn create_context(
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
+    // `ContextRoleState::new` enforces the ceiling-entry grammar (spec §5.3.1.1):
+    // a malformed entry fails here with `InvalidCeilingCategory`, preserved as a
+    // typed error so the bridges surface the protocol error verbatim rather than
+    // a flattened string.
     let role_state =
-        ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock)
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock).map_err(
+            |e| match e {
+                scp_protocol::context::roles::RoleError::InvalidCeilingCategory(inner) => {
+                    ContextCreationError::InvalidCeilingCategory(inner)
+                }
+                other => ContextCreationError::CreationFailed(other.to_string()),
+            },
+        )?;
     let mut membership = MembershipState::new();
     let creator_tokens = role_state
         .assignments
@@ -1755,6 +1765,32 @@ pub async fn import_context(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
+
+    // Ceiling-entry grammar enforcement on the IMPORTED ceiling (spec §5.3.1.1).
+    // The imported `role_state` is taken from a signed snapshot produced by an
+    // UNTRUSTED, possibly non-conformant peer. A valid signature authenticates the
+    // ORIGIN, not the WELL-FORMEDNESS of the payload, so a non-conformant peer's
+    // signed export could carry a malformed ceiling.
+    //
+    // Defense layering: well-formedness is primarily a TYPE-LEVEL invariant —
+    // `CapabilityCeiling` has a validating `Deserialize` (`#[serde(try_from)]`),
+    // so a malformed ceiling fails to even materialize when an export is decoded
+    // FROM BYTES (`deserialize_export` / `rmp_serde::from_slice`). This explicit
+    // re-validation is the belt-and-suspenders guard for the IN-MEMORY entry
+    // point: `Supervisor::import_context` accepts an already-deserialized
+    // `ContextExport` value (no serde at that boundary), so a programmatically
+    // constructed export reaches here without crossing the validating
+    // `Deserialize`. We re-validate and reject a malformed ceiling rather than
+    // letting it poison a conformant importer's stored ceiling. (The snapshot
+    // bypasses `ContextRoleState::new`, building `PerContextState` directly below.)
+    export
+        .snapshot
+        .role_state
+        .ceiling()
+        .validate_entries()
+        .map_err(|e| ContextError::ImportRejected {
+            reason: format!("imported context ceiling has a malformed entry (spec §5.3.1.1): {e}"),
+        })?;
 
     // §9.10.4: the import path is encrypted-only. Every imported context is
     // re-homed with `broadcast_context: None`, `mode = Encrypted`, and a
@@ -2356,6 +2392,29 @@ pub async fn restore_context(
         &ctx_snapshot.consequence_rules,
         &ctx_snapshot.context_params.consequence_config,
     )?;
+
+    // Ceiling-entry grammar enforcement on the RESTORED ceiling (spec §5.3.1.1).
+    // This is the self-respawn / process-restart path reading a LOCAL snapshot.
+    // The construction invariant (`ContextRoleState::new` / `set_ceiling`) means a
+    // malformed ceiling can never have been written to that snapshot in the first
+    // place, and `CapabilityCeiling`'s validating `Deserialize`
+    // (`#[serde(try_from)]`) rejects a malformed ceiling when a real on-disk
+    // provider decodes the snapshot FROM BYTES. This explicit check is the
+    // belt-and-suspenders guard for the IN-MEMORY path: a `ContextPersistence`
+    // provider's `load_context` hands back an already-typed `ContextSnapshot`
+    // value, which may not have crossed serde (e.g. an in-memory provider), so we
+    // re-validate here as defense-in-depth against on-disk corruption rather than
+    // an untrusted-peer threat. Reject a malformed restored ceiling rather than
+    // silently rehydrating an actor with a poisoned authorization envelope.
+    ctx_snapshot
+        .role_state
+        .ceiling()
+        .validate_entries()
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "restore: persisted context ceiling has a malformed entry (spec §5.3.1.1): {e}"
+            ))
+        })?;
 
     let now_for_cooldown = deps.clock.now_secs();
     sanitize_cooldown_until(
@@ -3347,6 +3406,39 @@ mod restore_reconcile_tests {
         .expect("routing agreeing with mode must restore Ok");
     }
 
+    /// Restore must reject a persisted snapshot whose ceiling carries a malformed
+    /// entry (spec §5.3.1.1). The construction invariant means a malformed ceiling
+    /// can never have been written legitimately, so this is defense-in-depth
+    /// against on-disk corruption — a poisoned authorization envelope must not be
+    /// silently rehydrated.
+    #[tokio::test]
+    async fn restore_rejects_malformed_ceiling_entry() {
+        let (mut enc_snapshot, _) = harvest_snapshot(false).await;
+        let routing = enc_snapshot.routing.clone();
+        // Inject a malformed (no-colon) custom directly into the backing set via
+        // the test-only ceiling accessor, bypassing the construction invariant the
+        // way a corrupt on-disk snapshot would.
+        enc_snapshot
+            .role_state
+            .ceiling_mut()
+            .capabilities_mut()
+            .insert(scp_protocol::context::roles::Capability::Custom(
+                "payments".to_owned(),
+            ));
+        let err = restore_with(
+            enc_snapshot,
+            routing,
+            None,
+            "restore-case-malformed-ceiling",
+        )
+        .await
+        .expect_err("a malformed restored ceiling must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
+            "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ADR-049 §9 (round-7): paid-join money-ordering parity with the send path.
     // capture_join_payment (external escrow settlement) runs AFTER the
@@ -3669,7 +3761,8 @@ mod restore_reconcile_tests {
                 Capability::MemberInvite,
                 Capability::MessagesWrite,
                 Capability::MessagesRead,
-            ]));
+            ]))
+            .expect("well-formed built-in ceiling");
         state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
             locked: false,
             cost_schedule: scp_protocol::economy::types::CostSchedule {

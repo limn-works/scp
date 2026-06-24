@@ -737,12 +737,28 @@ pub fn validate_governance_action_strings(
         GovernanceAction::CreateChildContext { params } => {
             validate_context_params_strings(params)?;
         }
+        GovernanceAction::ModifyCeiling { new_ceiling } => {
+            // Ceiling-entry grammar enforcement at the FFI boundary (spec
+            // §5.3.1.1), defense-in-depth on top of the runtime construction
+            // invariant (`ContextRoleState::set_ceiling`) and the propose-time
+            // check in `execute_modify_ceiling`. A malformed ceiling proposal is
+            // rejected before it ever reaches the `ContextManager`. Validate the
+            // PARSED enum (`validate_as_ceiling_entry`), the canonical form the
+            // runtime enforces, so the boundary check and the enforced parse agree
+            // (BLACK-003).
+            for cap in new_ceiling {
+                cap.validate_as_ceiling_entry().map_err(|e| {
+                    ValidationError::new(format!(
+                        "ModifyCeiling: malformed ceiling entry (spec §5.3.1.1): {e}"
+                    ))
+                })?;
+            }
+        }
         // Variants without user-controlled string fields.
         GovernanceAction::RemoveMember { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
         | GovernanceAction::RotateContentKeys { reason: None, .. }
         | GovernanceAction::RemoveTool { .. }
-        | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::RevokeAccess { .. }
@@ -1692,6 +1708,43 @@ mod tests {
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn governance_action_modify_ceiling_rejects_malformed_entry() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::roles::Capability;
+
+        // A no-colon custom is a malformed ceiling entry (spec §5.3.1.1).
+        let action = GovernanceAction::ModifyCeiling {
+            new_ceiling: vec![
+                Capability::MessagesRead,
+                Capability::Custom("payments".to_owned()),
+            ],
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(
+            err.message.contains("malformed ceiling entry"),
+            "expected a malformed-ceiling-entry rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn governance_action_modify_ceiling_accepts_wellformed_entries() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::roles::Capability;
+
+        let action = GovernanceAction::ModifyCeiling {
+            new_ceiling: vec![
+                Capability::MessagesRead,
+                Capability::Custom("payments:approve".to_owned()),
+                Capability::Custom("billing:*".to_owned()),
+                Capability::ToolInvokeAll,
+            ],
+        };
+        validate_governance_action_strings(&action)
+            .expect("well-formed ceiling entries must pass the boundary validator");
     }
 
     // -- Fixed-length byte narrowing --
