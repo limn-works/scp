@@ -466,7 +466,7 @@ Templates are protocol constants, not extensible. A template ID in context metad
 
 #### Auto-accept policies
 
-Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. Example: "auto-accept `bilateral-ephemeral` from any DID I share a context with, if TTL is under 10 minutes, at most 5 per hour."
+Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is a DID on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from DIDs on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
 
 Two hard rules that cannot be overridden by any policy:
 - **No auto-accept for tool-bearing contexts.** Tool access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.

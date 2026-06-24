@@ -60,7 +60,7 @@ condition, even across files.
 | `13000-13009` | `scp-protocol` `cross_context_saga.rs` | Saga-type signing / verification (pure, sync) |
 | `13010-13099` | `scp-runtime` saga handler + supervisor FSM | Prepare / Commit / Abort phase coordination |
 | `13100-13199` | `scp-protocol` `broadcast/hosting_handshake.rs` | Broadcast-hosting handshake signing / verification / config validation (§5.14.13, pure, sync) |
-| `13200-13999` | *(reserved)* | Future saga families (e.g. standing-pair handshake) |
+| `13200-13999` | *(reserved)* | Future cross-context saga families |
 
 Within `13010-13099`, the handler (`actor/handlers/saga.rs`, the per-context
 authorization + freshness + Commit-B execute/settle path) holds `13010-13049`,
@@ -332,7 +332,7 @@ SDKs implement local auto-accept policy evaluation for incoming context invitati
 // Rust
 sdk.set_auto_accept_policy(AutoAcceptPolicy {
     template: Template::BilateralEphemeral,
-    from: TrustRequirement::SharedContext,   // Must share ≥1 active context
+    from: TrustRequirement::KnownDid(vec![alice_did]), // explicit allowlist — the only trigger
     max_ttl: Some(Duration::from_secs(600)), // ≤10 minutes
     rate_limit: Some(Rate::per_hour(5)),     // Max 5 auto-accepts/hour
 });
@@ -340,11 +340,13 @@ sdk.set_auto_accept_policy(AutoAcceptPolicy {
 // Python
 sdk.set_auto_accept_policy(
     template="bilateral-ephemeral",
-    trust=TrustRequirement.SHARED_CONTEXT,
+    trust=TrustRequirement.known_did([alice_did]),  # explicit allowlist — the only trigger
     max_ttl=timedelta(minutes=10),
     rate_limit=Rate.per_hour(5),
 )
 ```
+
+**No default:** absent an explicit, human-configured policy, every invitation prompts the agent/human (default-deny). `known_did` is the only auto-accept trigger; co-membership and discoverability are not trust signals.
 
 **Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any tool-related capability (`ToolInvokeAll`, `ToolInvokeSpecific`, `ToolRegister`). Tool-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
 
@@ -370,23 +372,51 @@ let channel = sdk.standing_context(&bob_did).await?;
 // Returns existing bilateral-persistent context if one exists,
 // creates one if not. Idempotent.
 
+// NOTE: this caller is the INITIATOR, so this send succeeds. It is the
+// *peer's* send that fails-closed: a side that obtained its replica via
+// Welcome-join (the common non-initiating peer, or a collision-losing
+// did_hi) cannot send until the Phase-2E spawn-from-Welcome entrypoint
+// lands (spec §5.15.8). The initiator side here is unaffected.
 channel.send("Are you available for the 3pm sync?").await?;
 
 // Python
 channel = await sdk.standing_context(bob_did)
+# initiator-side send (succeeds); the *peer's* Welcome-joined send
+# fails-closed until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?")
 
 // Swift
 let channel = try await sdk.standingContext(with: bobDID)
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
 try await channel.send("Are you available for the 3pm sync?")
+
+// TypeScript — NOTE: the return shape MUST NOT add a `created: bool` /
+// `peer_joined` discriminant; it is identical to every other binding.
+const channel = await sdk.standingContext(bobDid);
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
+await channel.send("Are you available for the 3pm sync?");
+
+// Kotlin
+val channel = sdk.standingContext(bobDid)
+// initiator-side send (succeeds); the *peer's* Welcome-joined send
+// fails-closed until Phase-2E (spec §5.15.8)
+channel.send("Are you available for the 3pm sync?")
 ```
 
-**Semantics of `standing_context`:**
+**Semantics of `standing_context`** (see spec §5.15.8 for the normative contract):
 
 1. Check local state for an existing `bilateral-persistent` context with this peer DID.
 2. If found and `Active`, return it. Zero network cost — instant.
-3. If not found, create one (`bilateral-persistent` template), send invitation, return the handle. First message queues until the peer joins.
-4. If found but peer has left, create a new one (re-invitation).
+3. If not found, create one (`bilateral-persistent` template), dispatch the Welcome, return the handle. First message queues until the peer joins.
+4. If a prior handle was reaped or never joined, it is transparently **auto-revived** under the deterministic `derived_context_id` (spec §5.15.8, ADR-049 §10) — *not* a fresh create. A dangling/reaped handle never surfaces an error.
+
+**`Ok` does not mean "peer joined."** A successful `standing_context` return means the **initiator's replica is created and the Welcome dispatched** — it does *not* block on the peer joining and does *not* confirm a bidirectional channel. An offline, slow, blocking, or consent-declining peer **all yield the identical `Ok`** (no synchronous join confirmation; the peer's join is observed only out-of-band). This uniformity is intentional: it is what forecloses a synchronous block/pair-existence oracle.
+
+**Welcome-joiner caveat (decrypt-but-not-send until Phase 2E).** A caller whose replica was obtained via **Welcome-join** — the common non-initiating peer, and a collision-losing `did_hi` — can join and **decrypt** but **cannot send** in the standing context until the Phase-2E spawn-from-Welcome entrypoint lands (ADR-049 §Follow-ups #1, spec §5.15.8). Do **not** assume `standing_context(peer)` immediately yields a send-capable channel on the joiner side; the initiator side is unaffected.
+
+**No create-vs-found discriminant (MUST).** FFI/SDK bindings **MUST NOT** enrich the `standing_context` return with a create-vs-found or `peer_joined` discriminant (e.g. a `created: bool`) — such a field re-opens the existence oracle the uniform `Ok` forecloses. The return shape MUST be identical across all bindings (every SDK language).
 
 **Startup reconnection.** On SDK initialization, reconnect transport for all standing contexts. This is background work — the SDK reconnects to relays for all active persistent contexts and begins receiving queued messages. Standing contexts are available immediately after `sdk.init()` returns.
 
