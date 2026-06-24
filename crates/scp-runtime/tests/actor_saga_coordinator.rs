@@ -35,8 +35,8 @@ use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::ContextError;
 use scp_runtime::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaInput, SagaJournal, SagaState,
-    SagaTerminalState, Supervisor, SupervisorConfig,
+    JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaInput, SagaJournal,
+    SagaState, SagaTerminalState, Supervisor, SupervisorConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -299,7 +299,13 @@ async fn crash_recovery_initiated_state_is_discarded() {
     let j_dyn: Arc<dyn SagaJournal> = replayed_journal;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     // After replay, `load_unresolved` must return empty (the Initiated
     // saga was resolved as Aborted).
@@ -325,7 +331,13 @@ async fn crash_recovery_preparing_a_state_is_discarded() {
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     let remaining = journal.load_unresolved().await.unwrap();
     assert!(
@@ -349,7 +361,13 @@ async fn crash_recovery_preparing_b_state_is_rolled_back() {
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     let remaining = journal.load_unresolved().await.unwrap();
     assert!(
@@ -372,7 +390,13 @@ async fn crash_recovery_committing_state_triggers_needs_repair() {
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     // The saga is still unresolved (NeedsRepair is non-terminal), but
     // the latest state is now NeedsRepair.
@@ -403,7 +427,13 @@ async fn crash_recovery_needs_repair_is_carryover() {
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     // NeedsRepair is non-terminal — it stays in the unresolved set for
     // operator review.
@@ -440,7 +470,13 @@ async fn crash_recovery_terminal_states_are_noop() {
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
 
     // Replay must succeed without adding any new state.
-    supervisor.replay_unresolved_sagas().await.unwrap();
+    // `for_test` witness: this coordinator harness drives replay in isolation
+    // (restore-then-replay ordering is type-enforced; the empty witness stands in
+    // for a real `restore_all_contexts` the lightweight harness does not run).
+    supervisor
+        .replay_unresolved_sagas(&RestoredContexts::for_test(Vec::new()))
+        .await
+        .unwrap();
 
     let remaining = journal.load_unresolved().await.unwrap();
     assert!(

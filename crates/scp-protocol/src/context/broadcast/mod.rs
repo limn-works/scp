@@ -6,6 +6,16 @@
 //! valid `messages:read` UCAN. Blocking is per-author and cryptographic: the
 //! author rotates their broadcast key, and the blocked subscriber receives no
 //! response to future key requests.
+//!
+//! # Submodules
+//!
+//! - [`hosting_handshake`] — the signed protocol types for the broadcast
+//!   hosting handshake saga (spec §5.14.13): [`hosting_handshake::BroadcastHostConfig`],
+//!   [`hosting_handshake::BroadcastHostingRequest`],
+//!   [`hosting_handshake::BroadcastHostingGrant`], and
+//!   [`hosting_handshake::AcceptedHostSnapshotEntry`].
+
+pub mod hosting_handshake;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;

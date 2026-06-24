@@ -111,8 +111,8 @@ impl Scp {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag, then runs any per-bridge async work chained
-    /// by the `BridgeInstanceCore::resume` override (transport reconnect
+    /// Clears the suspended flag, then runs the async work in the
+    /// `BridgeInstanceCore::resume` default body (transport reconnect
     /// from pending relay URLs, persisted-context restoration).
     ///
     /// `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.

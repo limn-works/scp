@@ -35,7 +35,7 @@ use pyo3::Python;
 #[test]
 fn scp_suspend_resume_roundtrip() {
     // `PyScp::resume` releases the GIL while driving the async
-    // `BridgeInstanceCore::resume` override on the tokio runtime. The test
+    // `BridgeInstanceCore::resume` default body on the tokio runtime. The test
     // therefore acquires the GIL once and drives every call through
     // `Python::with_gil`.
     Python::with_gil(|py| {

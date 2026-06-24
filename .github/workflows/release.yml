@@ -91,7 +91,7 @@ jobs:
           restore-keys: conformance-
 
       - name: Run all workspace tests
-        run: cargo test --workspace --release --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing
+        run: cargo test --workspace --release --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/saga-witness-test-mint
 
       # Conformance test suite runs against JSON fixtures.
       # When tests/conformance/ exists, run the dedicated conformance runner.

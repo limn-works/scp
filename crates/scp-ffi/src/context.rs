@@ -3965,7 +3965,7 @@ impl crate::scp::PyScp {
 
     /// Restores a single persisted context from storage.
     ///
-    /// Delegates to `ContextManager::restore_context`. The context must
+    /// Delegates to `Supervisor::restore_context`. The context must
     /// have been previously persisted and must not already be registered.
     ///
     /// # Arguments
@@ -4020,7 +4020,9 @@ impl crate::scp::PyScp {
 
     /// Restores all persisted contexts from storage.
     ///
-    /// Delegates to `ContextManager::restore_all_contexts`. Only contexts
+    /// Delegates to `Supervisor::restore_on_startup` (ADR-049), which
+    /// first restores contexts and then replays any crash-orphaned saga journal
+    /// entries in the §17.16.4-required restore-then-replay order. Only contexts
     /// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
     /// states are skipped.
     ///
@@ -4041,7 +4043,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
 
         rt.block_on(async move {
-            let restored = sup.restore_all_contexts().await.map_err(|e| {
+            let restored = sup.restore_on_startup().await.map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
             })?;
 
@@ -5317,7 +5319,7 @@ impl crate::scp::PyScp {
     /// Restores a member's access key by generating a new key at the next
     /// epoch.
     ///
-    /// Delegates to `ContextManager::restore_context_access_key`.
+    /// Delegates to `Supervisor::restore_context_access_key`.
     ///
     /// # Errors
     ///

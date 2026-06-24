@@ -106,6 +106,10 @@ name = "multi_relay"
 path = "tests/integration/multi_relay.rs"
 
 [[test]]
+name = "saga_bridge_bootstrap"
+path = "tests/integration/saga_bridge_bootstrap.rs"
+
+[[test]]
 name = "protocol_repository"
 path = "tests/integration/protocol_repository.rs"
 

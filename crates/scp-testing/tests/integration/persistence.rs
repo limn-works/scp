@@ -871,7 +871,7 @@ persistence_tests!(filesystem, {
 // ---------------------------------------------------------------------------
 
 /// A simple `ContextPersistence` implementation using synchronous
-/// `Mutex<HashMap>` for testing the `ContextManager::restore_context`
+/// `Mutex<HashMap>` for testing the `Supervisor::restore_context`
 /// path. Avoids the "`block_on` inside runtime" problem by not using async
 /// storage under the hood.
 struct InMemoryContextPersistence {

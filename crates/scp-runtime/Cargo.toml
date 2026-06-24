@@ -20,6 +20,16 @@ testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/te
 # requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
 # in scp-ffi. See issue #695.
 allow_unencrypted_storage = []
+# Gates `RestoredContexts::for_test` — the test-only minter for the
+# restore-then-replay ordering witness, used by the saga-FSM / crash-recovery
+# integration suites that drive replay in isolation. Deliberately NOT implied by
+# `testing`: a `testing`-gated minter would leak into every
+# `allow_in_memory_custody` build via `scp-ffi → dep:scp-testing →
+# scp-core{testing} → scp-runtime/testing`, re-opening the forge. This feature is
+# enabled ONLY by the `required-features` of the `actor_saga_coordinator` /
+# `actor_saga_crash_recovery` test targets, so no production or FFI build can
+# reach the witness back-door.
+saga-witness-test-mint = []
 
 [dependencies]
 openmls = { workspace = true }
@@ -117,11 +127,11 @@ required-features = ["testing"]
 
 [[test]]
 name = "actor_saga_coordinator"
-required-features = ["testing"]
+required-features = ["testing", "saga-witness-test-mint"]
 
 [[test]]
 name = "actor_saga_crash_recovery"
-required-features = ["testing"]
+required-features = ["testing", "saga-witness-test-mint"]
 
 [[test]]
 name = "content_access_governance_integration"

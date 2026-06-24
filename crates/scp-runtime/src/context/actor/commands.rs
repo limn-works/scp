@@ -812,7 +812,7 @@ pub enum LifecycleCommand {
 
     /// Restore a single previously-persisted context from storage.
     /// Mirrors
-    /// [`ContextManager::restore_context`](crate::context::supervisor::Supervisor::restore_context).
+    /// [`Supervisor::restore_context`](crate::context::supervisor::Supervisor::restore_context).
     ///
     /// The legacy method loads a snapshot from the configured
     /// [`ContextPersistence`](crate::context::persistence::ContextPersistence)
@@ -863,7 +863,7 @@ pub enum LifecycleCommand {
     /// Restore a member's access key by generating a fresh key at
     /// epoch 0 (§9.17.2 step 5, ADR-038 forward-only restoration).
     /// Mirrors
-    /// [`ContextManager::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key).
+    /// [`restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller. Historical
     /// content from the revocation period remains permanently
