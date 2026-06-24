@@ -131,7 +131,7 @@ After ALL stories across ALL waves are implemented, verified, reviewed, and merg
 Read `.claude/agents/README.md` (or list `.claude/agents/*.md`) to identify the project's review agent roster. Default roster from CLAUDE.md:
 
 - black-hat, red-hat, white-hat, security-reviewer, cryptographer
-- bug-catcher, chronicler, alignment-reviewer, api-design-reviewer, simplifier
+- bug-catcher, chronicler, alignment-reviewer, completionist, api-design-reviewer, simplifier
 
 Use discretion to add or remove agents based on the PRD's content domain.
 

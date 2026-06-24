@@ -183,7 +183,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 
 Use eagerly for focus, expertise, and parallelization. See `.claude/agents/README.md` for the full roster.
 
-Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (agent)", @"security-reviewer (agent)", @"cryptographer (agent)", @"bug-catcher (agent)", @"chronicler (agent)", @"alignment-reviewer (agent)", @"api-design-reviewer (agent)", @"simplifier (agent)". Use discretion to add or remove based on review contents.
+Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (agent)", @"security-reviewer (agent)", @"cryptographer (agent)", @"bug-catcher (agent)", @"chronicler (agent)", @"alignment-reviewer (agent)", @"completionist (agent)", @"api-design-reviewer (agent)", @"simplifier (agent)". Use discretion to add or remove based on review contents.
 
 **Reviews are not rubber stamps.** Read every finding. If a reviewer flags something, understand the concern fully before dismissing it. Assume reviewers are right until you can prove otherwise with evidence from specs or code. Act on review feedback — don't acknowledge and move on. When a review surfaces a real issue, fix it and update the relevant artifacts.
 

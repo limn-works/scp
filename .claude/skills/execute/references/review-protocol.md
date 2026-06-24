@@ -73,6 +73,7 @@ Read `.claude/agents/README.md` to identify available review agents. The default
 | **bug-catcher** | Concurrency, crashes, logic errors | Always |
 | **chronicler** | Documentation completeness, knowledge capture | Always |
 | **alignment-reviewer** | Spec/roadmap alignment, intent verification | Always |
+| **completionist** | Missing/mismatched implementations, unwired code, inter-layer gaps, artifact divergence | Always |
 | **api-design-reviewer** | API quality, misuse resistance | When public APIs change |
 | **simplifier** | Complexity, premature abstractions | Always |
 
