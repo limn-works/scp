@@ -60,7 +60,7 @@ condition, even across files.
 | `13000-13009` | `scp-protocol` `cross_context_saga.rs` | Saga-type signing / verification (pure, sync) |
 | `13010-13099` | `scp-runtime` saga handler + supervisor FSM | Prepare / Commit / Abort phase coordination |
 | `13100-13199` | `scp-protocol` `broadcast/hosting_handshake.rs` | Broadcast-hosting handshake signing / verification / config validation (§5.14.13, pure, sync) |
-| `13200-13999` | *(reserved)* | Future saga families (e.g. standing-pair handshake) |
+| `13200-13999` | *(reserved)* | Future cross-context saga families |
 
 Within `13010-13099`, the handler (`actor/handlers/saga.rs`, the per-context
 authorization + freshness + Commit-B execute/settle path) holds `13010-13049`,
