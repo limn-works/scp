@@ -6514,7 +6514,7 @@ impl WasmContextManager {
             exported_at,
             // The exporter is always the context creator — the snapshot is
             // signed with the creator's #active key and the verifying key is
-            // resolved from `snapshot.creator_did` on import. Derive it here
+            // resolved from `snapshot.role_state.creator_did` on import. Derive it here
             // rather than accepting a caller-supplied value: a wrong caller
             // value would only self-reject (exporter_did == creator_did is
             // asserted on import), so there is no reason to expose it as a
@@ -6983,6 +6983,18 @@ impl WasmContextManager {
             cooldown_until: snap.cooldown_until.clone(),
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
+            //
+            // SECURITY: an imported context intentionally holds NO live MLS
+            // crypto state (`crypto: None`). The verbatim-restored `role_state`
+            // is advisory metadata only — it confers no message-decryption
+            // ability — and the `member_sequence_numbers` sidecar above is
+            // therefore decoupled from any live AEAD key. Because no GCM key is
+            // bound to these counters at import, a reset or forged sequence
+            // value CANNOT cause GCM nonce reuse: there is no nonce to reuse
+            // until a fresh Welcome establishes `crypto`, which starts its own
+            // counters from zero. If a future change ever populates `crypto`
+            // from imported MLS state, this sidecar becomes a nonce-reuse vector
+            // and MUST be re-evaluated.
             crypto: None,
             // Convergent creator-assigned creation time, restored from the
             // signed snapshot so the imported TTL deadline base
@@ -7005,6 +7017,13 @@ impl WasmContextManager {
             // diverging the Merkle root at equal event count.
             creation_timestamp_secs: snap.creation_timestamp_secs,
         };
+
+        // See the SECURITY note on `crypto: None` above: imported contexts must
+        // start without live MLS crypto; a fresh Welcome establishes it.
+        debug_assert!(
+            ctx.crypto.is_none(),
+            "imported contexts must start without live MLS crypto (see SECURITY note); a fresh Welcome establishes crypto"
+        );
 
         self.contexts.insert(context_id.clone(), ctx);
         Ok(context_id)
@@ -7418,10 +7437,18 @@ struct WasmContextExportSnapshot {
     /// `ContextRoleState`, and the `#[serde(try_from = "CapabilityCeilingRaw")]`
     /// path rejects a malformed ceiling at deserialize time (§5.3.1.1).
     role_state: ContextRoleState,
-    /// Per-member MLS message sequence counters. This is genuinely WASM-local
-    /// MLS orchestration state with no home in the shared `ContextRoleState`,
-    /// so it survives as its own sidecar field (keyed by member DID). The
-    /// DID-keyed map is canonicalized for the signed digest by RFC 8785 JCS
+    /// Per-member MLS message sequence counters, keyed by member DID.
+    ///
+    /// The shared home for this per-member counter is
+    /// `scp_protocol::context::membership::MembershipState`
+    /// (`MemberInfo.sequence_number`), which native carries inside its context
+    /// snapshot and restores verbatim. WASM does not yet adopt `MembershipState`,
+    /// so this flat `HashMap<String, u64>` is the INTERIM WASM representation of
+    /// the same state. Converging WASM onto the shared `MembershipState` (and
+    /// retiring this sidecar) is a deferred follow-up slice of the native↔WASM
+    /// convergence program.
+    ///
+    /// The DID-keyed map is canonicalized for the signed digest by RFC 8785 JCS
     /// object-key sorting; the scalar values need no element sort.
     #[serde(default)]
     member_sequence_numbers: HashMap<String, u64>,
@@ -7515,15 +7542,38 @@ struct WasmContextExportSnapshot {
 /// for verification, so the signed digest is byte-identical across runs and the
 /// producer and verifier always agree.
 ///
-/// The embedded `role_state` (`ContextRoleState`) is NOT handled here: it
-/// self-canonicalizes for the digest. Its set-derived fields use the
-/// `serde_sorted_set` / `serde_sorted_set_map` field codecs (the `members`
+/// The embedded `role_state` (`ContextRoleState`) is NOT handled here. Its
+/// SET-shaped fields self-canonicalize for the digest via the
+/// `serde_sorted_set` / `serde_sorted_set_map` field codecs: the `members`
 /// set, the per-member `member_capabilities` and `suspended_capabilities`
-/// inner sets, and the ceiling's capability set), and its remaining maps
-/// (`assignments`, `role_definitions`) are JCS-canonicalized by object key. So
-/// the whole `role_state` subtree serializes byte-identically regardless of the
-/// incidental iteration order present in the source — no array sort is needed
-/// or possible at this layer (the inner sets are private to scp-protocol).
+/// inner sets, the ceiling's `capabilities` set, and each
+/// `role_definitions[*].capabilities` set. Its outer MAPS (`assignments`,
+/// `role_definitions`, and `member_sequence_numbers`) are JCS-canonicalized by
+/// object key. So those portions of the subtree serialize deterministically
+/// regardless of the incidental iteration order present in the source, and no
+/// array sort is needed or possible for them here (the inner sets are private
+/// to scp-protocol).
+///
+/// IMPORTANT — this does NOT make the whole `role_state` subtree byte-identical
+/// across two INDEPENDENT exports of the same logical state. The exception is
+/// `assignments[*].tokens`: a `Vec<UcanToken>` (the role-token type, whose `att`
+/// is an unsorted `Vec<UcanAttestation>`). The minter (`mint_role_tokens`)
+/// produces one token per capability by iterating the role's
+/// `capabilities` SET in unspecified `HashSet` order, so the `tokens` Vec
+/// carries that incidental mint/iteration order; and each token's `nnc` is a
+/// fresh random nonce. Re-minting the same logical grant therefore yields
+/// different `assignments` bytes, and we intentionally do NOT sort `tokens`
+/// here.
+///
+/// This is sound for THIS construction because the signed digest is a
+/// single-signer VERBATIM model: the exporter signs the exact JCS bytes it
+/// produced, and the importer re-canonicalizes and `verify_strict`s THOSE SAME
+/// received bytes — tokens are carried verbatim and never re-minted on either
+/// side. A faithful export therefore always verifies (identical bytes in,
+/// identical bytes out), and any tamper changes the bytes and fails
+/// `verify_strict`. Byte-parity across independent exports — or with native /
+/// any other implementation — is explicitly NOT claimed here; the WASM digest
+/// is already documented as not byte-identical to native's.
 ///
 /// Fields that originate from an ordered `Vec` in `PerContextState`
 /// (`threshold_signers`, `tool_interfaces`, `consequence_rules`) carry a
