@@ -22,6 +22,8 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Lint Diagnostics** | Compiler errors/warnings, build verification | `lint-diagnostics.md` |
 | **Architecture Reviewer** | Completeness, scalability, maintainability, ADR compliance | `architecture-reviewer.md` |
 | **Alignment Reviewer** | Intent verification, product/spec/roadmap alignment | `alignment-reviewer.md` |
+| **Completionist** | Missing/mismatched implementations, unwired code, inter-layer gaps, artifact divergence | `completionist.md` |
+| **Inquisitor** | Premise/decision soundness, sunk-cost & status-quo challenges, cross-slice coherence, drift/rot | `inquisitor.md` |
 | **Frontend Reviewer** | Interactions, a11y, brand, design system, i18n | `frontend-reviewer.md` |
 | **API Design Reviewer** | API quality, discoverability, misuse resistance, devx | `api-design-reviewer.md` |
 | **Security Reviewer** | Auth, secrets, injection, info leakage | `security-reviewer.md` |
@@ -50,6 +52,8 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Lint Diagnostics** | After writing/modifying code, verifying builds compile |
 | **Architecture Reviewer** | Structural changes, new modules, protocol mods, any pattern-setting change |
 | **Alignment Reviewer** | Non-trivial feature work, any change that could diverge from spec/roadmap |
+| **Completionist** | Protocol logic spanning core/bridges/SDKs, story-closing changes, spec/ADR/PRD edits, any "done" claim |
+| **Inquisitor** | Changes that establish/perpetuate a decision, patterns copied from existing code, "already built" arguments, periodic coherence audits |
 | **Review — when relevant:** | |
 | **Frontend Reviewer** | Views, components, navigation, any user-facing surface |
 | **API Design Reviewer** | New protocols, public interface changes, service APIs, module boundaries |
