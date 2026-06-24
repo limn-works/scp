@@ -2320,15 +2320,19 @@ impl WasmContextManager {
         // leaf yet). Encrypted join doesn't carry a separate spending UCAN —
         // the Welcome flow implies the adder already validated the join cost.
         //
-        // ORDERING MIRRORS NATIVE (`crates/scp-runtime/src/context/
-        // lifecycle_helpers.rs` join): MLS Welcome processing (native Phase
-        // 1-3) precedes the durable `MemberJoined` leaf append (native Phase
-        // 5). We therefore defer BOTH the `MemberJoined` buffer event AND the
-        // durable Merkle leaf until AFTER `join_from_welcome` succeeds. A
-        // failed Welcome thus leaves no durable trace — byte/ordering-parity
-        // with native, where a failed encrypted join produces NO leaf. (The
-        // unencrypted `join_context` still appends its leaf immediately,
-        // matching native's non-MLS join.)
+        // We borrow native's ORDERING INVARIANT (crypto succeeds BEFORE the
+        // durable `MemberJoined` leaf is appended, leaf last & only on
+        // success) from `crates/scp-runtime/src/context/lifecycle_helpers.rs`
+        // `join_context` — but note that is native's ADDER path (it calls
+        // `crypto.add_member`, Phase 3, then appends the leaf at Phase 5).
+        // Native has NO joiner-side lifecycle method to mirror: the
+        // receive-side `join_from_welcome` append path is dormant there
+        // (cross-member leaf replication is a forward ADR-051 step). So we
+        // apply the adder-path invariant to this joiner path: defer BOTH the
+        // `MemberJoined` buffer event AND the durable Merkle leaf until AFTER
+        // `join_from_welcome` succeeds, so a failed Welcome leaves no leaf —
+        // the same fail-closed ordering native's adder path guarantees. (The
+        // unencrypted `join_context` still appends its leaf immediately.)
         self.join_context_membership_only(context_id, member_did, None)?;
 
         // Process the MLS Welcome.
@@ -2382,8 +2386,9 @@ impl WasmContextManager {
             };
 
         // MLS succeeded. Install crypto state, THEN emit the `MemberJoined`
-        // buffer event + durable Merkle leaf LAST — native Phase 5 ordering,
-        // so the leaf appears only on a fully-successful encrypted join. The
+        // buffer event + durable Merkle leaf LAST — the leaf-last ordering
+        // borrowed from native's adder path (see above), so the leaf appears
+        // only on a fully-successful encrypted join. The
         // leaf content (actor_did = `member_did`, empty payload, committer-
         // assigned `now_secs()` timestamp) is IDENTICAL to the unencrypted
         // `join_context` leaf; only WHEN it is appended differs.
