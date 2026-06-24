@@ -3442,9 +3442,10 @@ impl WasmContextManager {
     /// `ContextRoleState::set_ceiling` construction invariant, so it MUST validate
     /// each entry here — exactly as the WASM create path does — before rebuilding
     /// `ceiling_strings`. Validates the PARSED enum form
-    /// (`validate_as_ceiling_entry`), which is what `capability_to_ucan_format(&c
-    /// .name())` enforces, so the validation and the stored form agree (no silent
-    /// broadening of a malformed `Custom`). Rejects before any mutation: a
+    /// (`validate_as_ceiling_entry`) and stores its
+    /// [`Capability::ucan_capability_name`], so the validation and the stored
+    /// form agree (no silent broadening of a malformed `Custom`). Rejects before
+    /// any mutation: a
     /// malformed `new_ceiling` leaves the prior ceiling unchanged, and native +
     /// WASM therefore store the SAME effective ceiling for the same `ModifyCeiling`
     /// action.
@@ -3795,7 +3796,15 @@ impl WasmContextManager {
                     .entry(did_str.to_owned())
                     .or_default();
                 for cap in capabilities {
-                    entry.insert(Self::capability_to_ucan_format(&cap.name()));
+                    // Store the canonical UCAN form (`{resource}:{action}`) —
+                    // the exact spelling `member_has_capability` looks up and
+                    // that the consequence path (`apply_suspend`) and the
+                    // ceiling strings use. Format directly off the typed
+                    // `Capability` (NOT via a `name()`→`Capability::new` string
+                    // round-trip, which is lossy for a `Custom` whose name
+                    // collides with a built-in spelling, e.g.
+                    // `Custom("bridging")`).
+                    entry.insert(cap.ucan_capability_name());
                 }
                 // Emit a capability-precise suspension event that
                 // carries the exact suspended set. Cross-SDK parity
@@ -3835,7 +3844,12 @@ impl WasmContextManager {
                 let ctx = self.require_active_context_mut(context_id)?;
                 if let Some(entry) = ctx.suspended_capabilities.get_mut(did_str) {
                     for cap in capabilities {
-                        entry.remove(&Self::capability_to_ucan_format(&cap.name()));
+                        // Remove using the same canonical UCAN form
+                        // `SuspendCapability`/`apply_suspend` store, formatted
+                        // directly off the typed `Capability` so a
+                        // consequence-applied suspension of the same logical
+                        // capability is actually cleared.
+                        entry.remove(&cap.ucan_capability_name());
                     }
                     if entry.is_empty() {
                         ctx.suspended_capabilities.remove(did_str);
@@ -5944,32 +5958,6 @@ impl WasmContextManager {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
-
-    /// Converts a capability string from the canonical user-facing colon
-    /// format (e.g. `"tool:invoke:*"`) to the UCAN `{resource}:{action}`
-    /// format (e.g. `"tool_invoke:*"`).
-    ///
-    /// The rule: if a capability has more than one colon (compound resource),
-    /// join all segments except the last with underscores to form the resource,
-    /// and the last segment becomes the action. Simple capabilities with
-    /// exactly one colon (e.g. `"messages:write"`) pass through unchanged.
-    ///
-    /// This mirrors `Capability::ucan_resource_action` in scp-core (see #1293).
-    fn capability_to_ucan_format(cap: &str) -> String {
-        if let Some((resource_part, action)) = cap.rsplit_once(':') {
-            if resource_part.contains(':') {
-                // 3+ segments: join all-but-last with underscores.
-                // "a:b:c:d" → "a_b_c:d" (matches scp-core rsplit_once behavior)
-                format!("{}:{}", resource_part.replace(':', "_"), action)
-            } else {
-                // 2 parts: "messages:write" — already in UCAN format
-                cap.to_owned()
-            }
-        } else {
-            // 1 part: "bridging" — no colon at all → pass through unchanged
-            cap.to_owned()
-        }
-    }
 
     /// Returns a reference to context state, or an error if not found.
     fn require_context(&self, context_id: &str) -> Result<&PerContextState, ScpWasmError> {
@@ -9260,9 +9248,8 @@ mod tests {
 
     /// WASM `ModifyCeiling` accepts a well-formed proposed ceiling and stores the
     /// SAME effective ceiling that the native bridge would for the same action —
-    /// closing the native/WASM divergence (BLACK-002). The native enforced form is
-    /// `Capability::ucan_capability_name`; the WASM stored form is
-    /// `capability_to_ucan_format(cap.name())`. For these entries the two agree.
+    /// closing the native/WASM divergence (BLACK-002). Both native and WASM store
+    /// `Capability::ucan_capability_name`, so the enforced forms are identical.
     #[test]
     fn test_wasm_modify_ceiling_accepts_wellformed_and_matches_native() {
         let mut mgr =
@@ -9301,6 +9288,82 @@ mod tests {
             wasm_stored, native_expected,
             "native and WASM must store the SAME effective ceiling for the same \
              well-formed ModifyCeiling action"
+        );
+    }
+
+    /// Governance `SuspendCapability` / `RestoreAccess` store and remove the
+    /// suspended-capability key in the SAME canonical UCAN form
+    /// (`Capability::ucan_capability_name`) the consequence path
+    /// (`apply_suspend`) and `member_has_capability` use — formatting directly
+    /// off the typed `Capability`, so the spelling is identical across every
+    /// store path and a `RestoreAccess` actually clears a prior suspension.
+    ///
+    /// Includes capabilities whose `Display` form differs from their UCAN form
+    /// (`Bridging`, `ToolInvokeAll`) and a `Custom` whose inner string collides
+    /// with a built-in spelling (`Custom("bridging")`) or carries the `custom:`
+    /// disambiguator (`Custom("custom:foo")`) — the shapes where a lossy
+    /// `name()` → `Capability::new` string round-trip would have diverged.
+    #[test]
+    fn governance_suspend_restore_uses_canonical_form_for_all_shapes() {
+        let mut mgr = manager_with_governed_context(
+            "ctx-susp",
+            "did:dht:zcreator",
+            &["messages:read", "bridging:*", "tool_invoke:*", "member:ban"],
+        );
+
+        let subject = DID("did:dht:zsubject".to_owned());
+        let caps = vec![
+            Capability::Bridging,
+            Capability::ToolInvokeAll,
+            Capability::Custom("custom:foo".to_owned()),
+            Capability::Custom("bridging".to_owned()),
+        ];
+
+        mgr.dispatch_governance_action(
+            "ctx-susp",
+            &GovernanceAction::SuspendCapability {
+                did: subject.clone(),
+                capabilities: caps.clone(),
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("SuspendCapability must succeed");
+
+        // Each stored key is exactly `cap.ucan_capability_name()` — the same
+        // value `apply_suspend` and `member_has_capability` produce/consume.
+        let stored: HashSet<String> = mgr
+            .contexts
+            .get("ctx-susp")
+            .unwrap()
+            .suspended_capabilities
+            .get(subject.as_ref())
+            .expect("subject must have a suspended set")
+            .clone();
+        let expected: HashSet<String> = caps.iter().map(Capability::ucan_capability_name).collect();
+        assert_eq!(
+            stored, expected,
+            "governance SuspendCapability must store canonical UCAN-form keys"
+        );
+
+        // RestoreAccess removes the SAME canonical keys, fully clearing the set.
+        mgr.dispatch_governance_action(
+            "ctx-susp",
+            &GovernanceAction::RestoreAccess {
+                did: subject.clone(),
+                capabilities: caps,
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("RestoreAccess must succeed");
+        assert!(
+            !mgr.contexts
+                .get("ctx-susp")
+                .unwrap()
+                .suspended_capabilities
+                .contains_key(subject.as_ref()),
+            "RestoreAccess must clear every key SuspendCapability stored"
         );
     }
 
@@ -10548,5 +10611,85 @@ mod tests {
             events.iter().any(|e| e.event_type == EventType::MemberLeft),
             "a MemberLeft leaf must be appended even on the broadcast/empty-commit path"
         );
+    }
+
+    /// Cross-impl parity: the WASM ceiling string-conversion path
+    /// (`ValidatedCeilingStrings::from_colon_entries`, the production converter
+    /// for both context-create and `ModifyCeiling` validation) must produce the
+    /// SAME canonical UCAN form as native `Capability::ucan_capability_name` for
+    /// EVERY built-in capability variant.
+    ///
+    /// This is the equivocation class the ceiling work eliminated for custom
+    /// entries, now pinned for the full built-in set: the WASM converter and the
+    /// native canonical source agree by construction (both route through
+    /// `Capability::new(s).ucan_capability_name()`). The old hand-rolled `rsplit`
+    /// heuristic diverged — e.g. the no-colon `Bridging` token (`"bridging"`)
+    /// passed through unchanged instead of becoming the canonical `"bridging:*"`.
+    /// The input is each capability's COLON form (`Capability::name`), exactly
+    /// what the create/modify paths receive from the SDK.
+    #[test]
+    fn ceiling_string_conversion_matches_native_for_all_builtin_variants() {
+        // Every non-parameterized built-in (mirrors `BUILTIN_CAPABILITIES` in
+        // scp-protocol — keep in sync; see `roles.rs`
+        // `builtin_capabilities_list_is_exhaustive`), plus a parameterized
+        // ToolInvoke and a custom `{resource}:{action}` — the full shape space
+        // the create/modify ceiling converter must round-trip.
+        let cases = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+            // Parameterized + custom shapes.
+            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::Custom("payments:approve".to_owned()),
+        ];
+
+        for cap in &cases {
+            let native = cap.ucan_capability_name();
+            // The create/modify path receives the colon form (`cap.name()`) and
+            // stores `Capability::new(entry).ucan_capability_name()`.
+            let wasm: Vec<String> =
+                ValidatedCeilingStrings::from_colon_entries(&[cap.name().into_owned()])
+                    .expect("well-formed colon entry must build")
+                    .iter()
+                    .cloned()
+                    .collect();
+            assert_eq!(
+                wasm,
+                vec![native.clone()],
+                "WASM ceiling conversion diverged from native ucan_capability_name \
+                 for {cap:?}: wasm={wasm:?} native={native:?}"
+            );
+        }
+
+        // Pin that the old hand-rolled converter's buggy pass-through spellings
+        // are GONE (the positive canonical forms are already covered by the loop
+        // above when it hits `Bridging` / `ToolInvokeAll`): a no-colon built-in
+        // token must NOT pass through, and a built-in colon form must NOT remain
+        // un-underscored.
+        let pinned_set: HashSet<String> = ValidatedCeilingStrings::from_colon_entries(&[
+            "bridging".to_owned(),
+            "tool:invoke:*".to_owned(),
+        ])
+        .expect("well-formed colon entries must build")
+        .iter()
+        .cloned()
+        .collect();
+        assert!(!pinned_set.contains("bridging"));
+        assert!(!pinned_set.contains("tool:invoke:*"));
     }
 }

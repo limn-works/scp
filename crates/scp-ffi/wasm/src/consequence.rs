@@ -225,9 +225,10 @@ fn apply_suspend(
         return false;
     }
     for cap in caps {
-        // WASM's `suspended_capabilities` uses the `Display` format, which
-        // matches `member_has_capability` lookup in `PerContextState`.
-        ctx.suspended_capabilities_insert(subject_did, cap.to_string());
+        // Store the canonical UCAN form `member_has_capability` looks up — NOT
+        // `Display`, which would never match and would silently no-op the
+        // suspension. See `apply_suspend_enforces_capabilities_with_divergent_display_form`.
+        ctx.suspended_capabilities_insert(subject_did, cap.ucan_capability_name());
     }
     true
 }
@@ -738,11 +739,12 @@ mod tests {
         assert_eq!(ctx.test_member_role("did:test:alice"), None);
     }
 
-    /// **E2-11:** `apply_suspend` ignores unknown capability names (matching
-    /// `parse_suspension_capability` — unknown names return `None`) and still
-    /// returns `true` if at least one valid capability was applied.
+    /// **E2-11:** `apply_suspend` stores each capability in canonical UCAN form
+    /// (`Capability::ucan_capability_name`) and returns `true` when at least one
+    /// capability is applied — including a `Custom` capability, which is
+    /// canonicalized (not stored as its bare `Display` string).
     #[test]
-    fn apply_suspend_ignores_unknown_capability_names() {
+    fn apply_suspend_canonicalizes_custom_capability_names() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
         ctx.test_insert_ceiling("messages:write");
 
@@ -756,9 +758,56 @@ mod tests {
         );
         assert!(applied);
         let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
-        // Custom capabilities use Display format; MessagesWrite is "messages:write"
+        // Stored in canonical UCAN form: a no-colon `Custom` → concrete
+        // `name:name` (see roles.rs `ucan_resource_action`), NOT the bare
+        // Display string.
         assert!(suspended.contains("messages:write"));
+        assert!(suspended.contains("not-a-real-capability:not-a-real-capability"));
         assert!(!suspended.contains("not-a-real-capability"));
+    }
+
+    /// Regression: `apply_suspend` must store the canonical UCAN form so the
+    /// suspension is actually ENFORCED by `member_has_capability`.
+    ///
+    /// Capabilities whose `Display` spelling differs from their UCAN form
+    /// (`Bridging` → `"bridging"` vs `"bridging:*"`; `ToolInvokeAll` →
+    /// `"tool:invoke:*"` vs `"tool_invoke:*"`) exposed the bug: `apply_suspend`
+    /// stored the `Display` string, but `member_has_capability` (and
+    /// `apply_suspend_all`) key off the UCAN form, so the suspended entry never
+    /// matched the lookup key and the capability stayed GRANTED. This pins that
+    /// an admin (who would otherwise hold every in-ceiling capability) is
+    /// actually denied the suspended caps. Before the fix this test fails
+    /// because the suspension is silently ignored.
+    #[test]
+    fn apply_suspend_enforces_capabilities_with_divergent_display_form() {
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Admin grants any in-ceiling capability, so seed the ceiling with the
+        // UCAN-form spellings the role check looks up.
+        ctx.test_insert_ceiling("bridging:*");
+        ctx.test_insert_ceiling("tool_invoke:*");
+
+        // Sanity: before suspension the admin holds both caps.
+        assert!(ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
+        assert!(ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
+
+        let applied = apply_suspend(
+            &mut ctx,
+            "did:test:admin",
+            &[Capability::Bridging, Capability::ToolInvokeAll],
+        );
+        assert!(applied);
+
+        // The suspended set must hold the canonical UCAN form, NOT the Display
+        // form — otherwise the lookup below would never match.
+        let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
+        assert!(suspended.contains("bridging:*"));
+        assert!(suspended.contains("tool_invoke:*"));
+        assert!(!suspended.contains("bridging"));
+        assert!(!suspended.contains("tool:invoke:*"));
+
+        // The actual enforcement check: both caps are now DENIED.
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
     }
 
     /// **E2-12:** `apply_suspend_all` is a no-op (returns false) for a member
