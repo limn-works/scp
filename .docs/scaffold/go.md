@@ -228,14 +228,14 @@ func (e *ScpError) Error() string {
 
 type IdentityError struct{ ScpError }
 type ContextError struct{ ScpError }
-type PermissionError struct{ ScpError }
+type UcanPermissionError struct{ ScpError }
 type CryptoError struct{ ScpError }
 type TransportError struct{ ScpError }
 type ToolError struct{ ScpError }
 type ValidationError struct{ ScpError }
 
 // Usage: type assertion
-var target *PermissionError
+var target *UcanPermissionError
 if errors.As(err, &target) {
     log.Printf("Permission denied: %s", target.Code)
 }
