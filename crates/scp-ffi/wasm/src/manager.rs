@@ -728,13 +728,20 @@ impl PerContextState {
     }
 
     /// Role-based capability check (public wrapper around the module-private
-    /// `member_has_capability`).
+    /// `member_has_capability`). Test-only: the production consequence path
+    /// (`apply_suspend_all`) now delegates to the shared
+    /// [`ContextRoleState::suspend_all`] and no longer needs this per-cap probe;
+    /// it survives solely as a cross-module assertion helper for the
+    /// `consequence` tests.
+    #[cfg(test)]
     pub(crate) fn member_has_capability_pub(&self, subject_did: &str, capability: &str) -> bool {
         self.member_has_capability(subject_did, capability)
     }
 
     /// Suspends `capability` (a WASM-format UCAN string) for the subject via the
-    /// shared [`ContextRoleState::suspend_capabilities`].
+    /// shared [`ContextRoleState::suspend_capabilities`]. Test-only — used by
+    /// sibling-module tests to construct partially-suspended members.
+    #[cfg(test)]
     pub(crate) fn suspended_capabilities_insert(&mut self, subject_did: &str, capability: String) {
         self.role_state
             .suspend_capabilities(subject_did, [ucan_string_to_capability(&capability)]);
@@ -747,6 +754,19 @@ impl PerContextState {
             .suspend_capabilities(subject_did, caps.iter().cloned());
     }
 
+    /// Suspends ALL of the subject's effective capabilities via the shared
+    /// [`ContextRoleState::suspend_all`], which REPLACES (not extends) the
+    /// subject's suspended set with their full current `member_capabilities`.
+    /// Returns `true` if the subject had any capabilities to suspend (i.e. a
+    /// suspended-set entry now exists), `false` otherwise — so the consequence
+    /// actuator can report whether the action applied.
+    pub(crate) fn suspend_all_pub(&mut self, subject_did: &str) -> bool {
+        self.role_state.suspend_all(subject_did);
+        self.role_state
+            .suspended_for(subject_did)
+            .is_some_and(|caps| !caps.is_empty())
+    }
+
     /// Reads a cooldown timer for a given rule index.
     pub(crate) fn cooldown_until_get(&self, rule_index: usize) -> Option<&u64> {
         self.cooldown_until.get(&rule_index)
@@ -755,12 +775,6 @@ impl PerContextState {
     /// Records a cooldown timer for a given rule index.
     pub(crate) fn cooldown_until_insert(&mut self, rule_index: usize, until_secs: u64) {
         self.cooldown_until.insert(rule_index, until_secs);
-    }
-
-    /// Returns the context's capability ceiling as a UCAN `{resource}:{action}`
-    /// string set (owned), derived from the shared [`ContextRoleState`] ceiling.
-    pub(crate) fn ceiling_strings_pub(&self) -> HashSet<String> {
-        self.role_state.ceiling().to_ucan_string_set()
     }
 
     /// Replaces the ceiling and RE-DERIVES the built-in role definitions and
@@ -818,9 +832,17 @@ impl PerContextState {
             .map(|(did, a)| (did.clone(), a.role_name.clone()))
             .collect();
         for (did, role_name) in assignments {
-            // The role is a current assignment, so it is defined and (post-
-            // rebuild) within the ceiling; the only error case (absent member)
-            // cannot occur for a DID drawn from `assignments`.
+            // `system_assign_role` can error three ways: `MemberNotInContext`
+            // (member absent), `RoleNotFound` (role undefined), or
+            // `CapabilityOutsideCeiling` (a role-def cap not in the live
+            // ceiling). None can occur here: `did` is drawn from a live
+            // `assignments` entry (so it is present); `role_name` is that
+            // entry's role, which — for the built-in role names WASM assigns —
+            // was just re-inserted into `role_definitions` by the rebuild above
+            // (so it is defined); and that rebuild derives each built-in role's
+            // caps by INTERSECTING with the new ceiling, so every assigned
+            // role's caps are within-ceiling by construction. The discarded
+            // result is therefore always `Ok`.
             let _ = self
                 .role_state
                 .system_assign_role(&did, &role_name, &crate::time::WasmClock);
@@ -1963,23 +1985,41 @@ impl WasmContextManager {
             });
         }
 
-        // Check write suspension.
-        if ctx
-            .role_state
-            .suspended_for(sender_did)
-            .is_some_and(|caps| caps.contains(&Capability::MessagesWrite))
-        {
-            return Err(ScpWasmError::Permission {
-                message: format!("write access has been suspended for {sender_did}"),
-                code: codes::PERM_3000.to_owned(),
-            });
-        }
-
         // Check membership and assign the MLS message sequence number.
         if !ctx.role_state.members.contains(sender_did) {
             return Err(ScpWasmError::Context {
                 message: format!("sender '{sender_did}' is not a member of context '{context_id}'"),
                 code: codes::CTX_2019.to_owned(),
+            });
+        }
+
+        // Positive role-grant authorization gate. Mirrors native
+        // `messaging_helpers::send_message` (the H7 capability check before any
+        // economy/velocity mutation): a sender may write ONLY if their assigned
+        // role grants `messages:write`. `member_has_capability` is
+        // suspension-aware — it returns `false` when the capability is in the
+        // member's suspended set — so this SINGLE positive check closes both
+        // facets: a read-only role (e.g. `observer` / `subscriber`, which grant
+        // only `messages:read`) is rejected, AND a write-granting member whose
+        // `messages:write` was suspended via `SuspendAccess` /
+        // `SuspendCapability` is rejected. The distinct error message mirrors
+        // native's suspended-vs-not-granted split.
+        if !ctx
+            .role_state
+            .member_has_capability(sender_did, &Capability::MessagesWrite)
+        {
+            let is_suspended = ctx
+                .role_state
+                .suspended_for(sender_did)
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite));
+            let message = if is_suspended {
+                format!("write access has been suspended for {sender_did}")
+            } else {
+                format!("member {sender_did} role does not grant messages:write")
+            };
+            return Err(ScpWasmError::Permission {
+                message,
+                code: codes::PERM_3000.to_owned(),
             });
         }
         let seq_entry = ctx
@@ -3800,16 +3840,18 @@ impl WasmContextManager {
             .map(|a| a.role_name.clone());
         ctx.role_state.members.remove(did);
 
-        // Drop all per-DID state the removed member left behind, mirroring
-        // native `execute_remove_member`'s role_state / access cleanup (which
-        // strips `role_state.members`, `assignments`, `member_capabilities`, the
-        // access key store entry, and the pseudonym routing entry). The shared
-        // `ContextRoleState` holds `assignments` / `member_capabilities` /
-        // suspensions; the CEK-exclusion state is `read_exclusion_list` and the
-        // MLS sequence counter is `member_sequence_numbers`. Leaving any behind
-        // is a stale-desync foothold: a DID later re-admitted under the same
-        // string would inherit a phantom assignment, suspension, read-exclusion,
-        // or sequence number. All are no-ops if absent.
+        // Drop all per-DID state the removed member left behind. Native
+        // `execute_remove_member` strips `role_state.members`, `assignments`,
+        // `member_capabilities`, the access key store entry, and the pseudonym
+        // routing entry — but it deliberately LEAVES the member's
+        // `suspended_capabilities` in place. WASM goes one step beyond native
+        // and ALSO clears the suspensions (the `restore_capabilities` call
+        // below): leaving any per-DID state behind is a stale-desync foothold,
+        // so a DID later re-admitted under the same string would otherwise
+        // inherit a phantom assignment, suspension, read-exclusion, or sequence
+        // number. The CEK-exclusion state is `read_exclusion_list` and the MLS
+        // sequence counter is `member_sequence_numbers`. All removals are
+        // no-ops if absent.
         ctx.role_state.assignments.remove(did);
         ctx.role_state.member_capabilities.remove(did);
         if let Some(suspended) = ctx.role_state.suspended_for(did) {
@@ -5308,17 +5350,6 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx
-            .role_state
-            .suspended_for(author_did)
-            .is_some_and(|caps| caps.contains(&Capability::MessagesWrite))
-        {
-            return Err(ScpWasmError::Permission {
-                message: format!("write access has been suspended for {author_did}"),
-                code: codes::PERM_3000.to_owned(),
-            });
-        }
-
         let bc = ctx
             .broadcast_context
             .as_ref()
@@ -5339,6 +5370,35 @@ impl WasmContextManager {
             return Err(ScpWasmError::Context {
                 message: format!("author '{author_did}' not found in members"),
                 code: codes::CTX_2019.to_owned(),
+            });
+        }
+
+        // Positive role-grant authorization gate. Native broadcast publish
+        // (`broadcast_helpers::reserve_broadcast_publish`) gates only on the
+        // `MessagesWrite` suspension overlay because native authors MAY be
+        // registered with the `BroadcastContext` without being `role_state`
+        // members. The WASM bridge always seeds a registered author as a
+        // member with a write-granting role, so it can — and does, for
+        // defense-in-depth — apply the SAME positive `member_has_capability`
+        // check used by `send_message`: a write-granting author whose
+        // `messages:write` is suspended is rejected, and the distinct
+        // suspended-vs-not-granted message matches `send_message` / native.
+        if !ctx
+            .role_state
+            .member_has_capability(author_did, &Capability::MessagesWrite)
+        {
+            let is_suspended = ctx
+                .role_state
+                .suspended_for(author_did)
+                .is_some_and(|caps| caps.contains(&Capability::MessagesWrite));
+            let message = if is_suspended {
+                format!("write access has been suspended for {author_did}")
+            } else {
+                format!("author {author_did} role does not grant messages:write")
+            };
+            return Err(ScpWasmError::Permission {
+                message,
+                code: codes::PERM_3000.to_owned(),
             });
         }
         let seq_entry = ctx
@@ -6590,7 +6650,7 @@ impl WasmContextManager {
                 .map(|s| ucan_string_to_capability(s)),
         );
         let mut role_state = ContextRoleState::new(
-            snap.creator_did.clone(),
+            context_id.clone(),
             snap.creator_did.clone(),
             imported_ceiling,
             Vec::new(),
@@ -6600,10 +6660,6 @@ impl WasmContextManager {
             message: format!("imported role state initialization failed: {e}"),
             code: codes::CTX_2032.to_owned(),
         })?;
-        // `ContextRoleState::new` sets `context_id` to the creator DID above
-        // (the bridge has no separate constructor); correct it to the real
-        // context id so minted-token resource URIs and the stored id match.
-        context_id.clone_into(&mut role_state.context_id);
         // The membership set is exactly the snapshot's. `new` auto-added the
         // creator as admin; clear the derived membership/assignment maps and
         // rebuild them purely from the snapshot so a snapshot that does NOT list
@@ -9684,6 +9740,205 @@ mod tests {
                 assert_eq!(code, codes::CTX_2019);
             }
             other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// Builds a free (no economic policy), unencrypted context whose ceiling
+    /// grants `messages:read` + `messages:write`, with the creator as `admin`,
+    /// ready for the role-grant send-authorization tests below.
+    fn make_free_ctx_for_send_auth(context_id: &str, creator: &str) -> WasmContextManager {
+        let mut state = make_bare_per_context_state(context_id, creator);
+        // Seed the ceiling so the built-in roles actually grant their caps
+        // (built-ins intersect their desired set with the ceiling). This
+        // refreshes the role definitions AND the creator's `member_capabilities`.
+        state.test_insert_ceiling("messages:read");
+        state.test_insert_ceiling("messages:write");
+        let mut mgr = WasmContextManager::new();
+        mgr.contexts.insert(context_id.to_owned(), state);
+        mgr
+    }
+
+    /// A read-only-role member (`observer`, granted only `messages:read`)
+    /// CANNOT `send_message`: the positive `messages:write` role-grant gate
+    /// rejects them with `SCP-PERM-3000` and a "does not grant" message,
+    /// matching native `messaging_helpers::send_message`. This is the HIGH
+    /// fix — before the slice changed `SuspendAccess` to suspend only
+    /// role-granted caps, this member could send.
+    #[test]
+    fn read_only_role_member_cannot_send_message() {
+        let context_id = "ctx-send-observer";
+        let creator = "did:dht:zcreator";
+        let observer = "did:dht:zobserver";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        mgr.contexts
+            .get_mut(context_id)
+            .unwrap()
+            .test_insert_member(observer, "observer");
+
+        let err = mgr
+            .send_message(context_id, observer, "aGVsbG8=", None)
+            .expect_err("an observer (messages:read only) must not be able to send");
+        match err {
+            ScpWasmError::Permission {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, codes::PERM_3000);
+                assert!(
+                    message.contains("does not grant messages:write"),
+                    "expected a not-granted message, got: {message}"
+                );
+            }
+            other => panic!("expected Permission error, got: {other:?}"),
+        }
+        // The rejected send must not advance the sender's sequence number.
+        assert_eq!(
+            mgr.contexts[context_id]
+                .member_sequence_numbers
+                .get(observer)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "rejected send must not advance the observer's sequence number"
+        );
+    }
+
+    /// A write-granting-role member (`member`, granted `messages:write`) CAN
+    /// `send_message` on a free, unencrypted context with no consequence
+    /// rules — the positive gate lets them through and the send completes.
+    #[test]
+    fn write_granting_role_member_can_send_message() {
+        let context_id = "ctx-send-member";
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        mgr.contexts
+            .get_mut(context_id)
+            .unwrap()
+            .test_insert_member(member, "member");
+
+        mgr.send_message(context_id, member, "aGVsbG8=", None)
+            .expect("a member (messages:write) must be able to send");
+        // The accepted send advanced the sender's sequence number.
+        assert_eq!(
+            mgr.contexts[context_id]
+                .member_sequence_numbers
+                .get(member)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "accepted send must advance the member's sequence number"
+        );
+
+        // The creator (`admin`, full ceiling) can also send.
+        mgr.send_message(context_id, creator, "aGVsbG8=", None)
+            .expect("admin must be able to send");
+    }
+
+    /// A write-granting member whose `messages:write` was suspended via
+    /// `SuspendAccess` CANNOT `send_message`: the suspension-aware positive
+    /// gate rejects with the distinct "suspended" message. Proves the gate
+    /// keeps enforcing suspension even though it is now a single positive
+    /// check.
+    #[test]
+    fn suspended_write_member_cannot_send_message() {
+        let context_id = "ctx-send-suspended";
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        {
+            let ctx = mgr.contexts.get_mut(context_id).unwrap();
+            ctx.test_insert_member(member, "member");
+            // Suspend the member's full effective set (SuspendAccess semantics).
+            assert!(ctx.suspend_all_pub(member), "member had caps to suspend");
+        }
+
+        let err = mgr
+            .send_message(context_id, member, "aGVsbG8=", None)
+            .expect_err("a suspended member must not be able to send");
+        match err {
+            ScpWasmError::Permission {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, codes::PERM_3000);
+                assert!(
+                    message.contains("suspended"),
+                    "expected a suspended message, got: {message}"
+                );
+            }
+            other => panic!("expected Permission error, got: {other:?}"),
+        }
+    }
+
+    /// Broadcast publish enforces the SAME role-grant gate: a registered
+    /// author with a write-granting role can publish; once their
+    /// `messages:write` is suspended they cannot, with the distinct
+    /// "suspended" message. A read-only author is rejected with the
+    /// "does not grant" message.
+    #[test]
+    fn publish_broadcast_enforces_write_role_grant_and_suspension() {
+        let context_id = "ctx-bc-auth";
+        let creator = "did:dht:zcreator";
+        let author = "did:dht:zauthor";
+        let observer_author = "did:dht:zobsauthor";
+        let mut mgr =
+            make_manager_with_broadcast(context_id, creator, &[author, observer_author], &[]);
+        {
+            let ctx = mgr.contexts.get_mut(context_id).unwrap();
+            // Grant write/read in the ceiling so author roles actually grant.
+            ctx.test_insert_ceiling("messages:read");
+            ctx.test_insert_ceiling("messages:write");
+            // `author` gets a write-granting role; `observer_author` is a
+            // registered broadcast author but only holds the read-only role.
+            ctx.test_insert_member(author, "author");
+            ctx.test_insert_member(observer_author, "observer");
+        }
+
+        // Write-granting author publishes successfully.
+        mgr.publish_broadcast(context_id, author, "aGVsbG8=")
+            .expect("a write-granting author must be able to publish");
+
+        // A registered author with only the read-only role is rejected by the
+        // positive role-grant gate.
+        let err = mgr
+            .publish_broadcast(context_id, observer_author, "aGVsbG8=")
+            .expect_err("a read-only-role author must not be able to publish");
+        match err {
+            ScpWasmError::Permission {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, codes::PERM_3000);
+                assert!(
+                    message.contains("does not grant messages:write"),
+                    "expected a not-granted message, got: {message}"
+                );
+            }
+            other => panic!("expected Permission error, got: {other:?}"),
+        }
+
+        // Suspend the write-granting author and confirm publish is now blocked
+        // with the distinct suspended message.
+        mgr.contexts
+            .get_mut(context_id)
+            .unwrap()
+            .suspend_all_pub(author);
+        let err = mgr
+            .publish_broadcast(context_id, author, "aGVsbG8=")
+            .expect_err("a suspended author must not be able to publish");
+        match err {
+            ScpWasmError::Permission {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, codes::PERM_3000);
+                assert!(
+                    message.contains("suspended"),
+                    "expected a suspended message, got: {message}"
+                );
+            }
+            other => panic!("expected Permission error, got: {other:?}"),
         }
     }
 

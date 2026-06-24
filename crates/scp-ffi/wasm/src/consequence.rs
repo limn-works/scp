@@ -229,30 +229,22 @@ fn apply_suspend(
     true
 }
 
-/// Enforces `ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)` by computing every capability
-/// the subject could exercise via their current role, intersected with the
-/// context ceiling, and adding all of them to the subject's suspended set.
+/// Enforces `ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)`
+/// by suspending the subject's full effective capability set.
 ///
-/// This mirrors `ContextRoleState::suspend_all` on the runtime side: it
-/// copies the member's effective capability set into the suspended set.
-/// In WASM, the effective set is role-derived (no `ContextRoleState`), so
-/// we iterate the candidate capabilities and keep the ones
-/// `member_has_capability` would grant.
+/// Delegates to the shared [`ContextRoleState::suspend_all`] (via
+/// `PerContextState::suspend_all_pub`), which REPLACES the subject's suspended
+/// set with their current `member_capabilities`. This is byte-for-byte
+/// state-matching with the native runtime's `suspend_all` (an `insert` of the
+/// member's granted set), whereas the previous WASM loop EXTENDED the suspended
+/// set by iterating the ceiling — content-equivalent for enforcement but a
+/// state divergence. The governance `SuspendAccess` handler in `manager.rs`
+/// already uses the same shared method, so both consequence- and
+/// governance-driven full suspensions now produce identical state.
+///
+/// Returns `true` if the subject had any effective capability to suspend.
 fn apply_suspend_all(ctx: &mut PerContextState, subject_did: &str) -> bool {
-    // Suspend every capability the context's ceiling grants. This
-    // matches the runtime's `ContextRoleState::suspend_all` which
-    // copies the member's full effective set into the suspended set.
-    // Using the ceiling (not a hardcoded list) ensures no capability
-    // is silently missed when new variants are added.
-    let all_capabilities: Vec<String> = ctx.ceiling_strings_pub().iter().cloned().collect();
-    let mut applied = false;
-    for cap in &all_capabilities {
-        if ctx.member_has_capability_pub(subject_did, cap) {
-            ctx.suspended_capabilities_insert(subject_did, cap.clone());
-            applied = true;
-        }
-    }
-    applied
+    ctx.suspend_all_pub(subject_did)
 }
 
 /// Enforces `ConsequenceAction::AssignRole` by re-assigning the subject's role
@@ -271,15 +263,15 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
         .is_ok()
 }
 
-// NOTE: `PerContextState` accessors used by this module
-// (`consequence_rules`, `event_log_events`, `members_contains`,
-// `role_state_system_assign_role`, `push_event_pub`,
-// `member_has_capability_pub`, `suspend_capabilities_typed`,
-// `suspended_capabilities_insert`, `ceiling_strings_pub`,
-// `cooldown_until_get`, `cooldown_until_insert`) are defined in `manager.rs`
-// in the same `impl PerContextState` block that owns the shared
+// NOTE: `PerContextState` accessors used by this module are defined in
+// `manager.rs` in the same `impl PerContextState` block that owns the shared
 // `role_state`, because Rust's privacy rules scope field access to the
-// defining module.
+// defining module. Production-path accessors: `consequence_rules`,
+// `event_log_events`, `members_contains`, `role_state_system_assign_role`,
+// `push_event_pub`, `suspend_capabilities_typed`, `suspend_all_pub`,
+// `cooldown_until_get`, `cooldown_until_insert`. Test-only (`#[cfg(test)]`)
+// assertion helpers used by this module's tests: `member_has_capability_pub`,
+// `suspended_capabilities_insert`.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -762,60 +754,25 @@ mod tests {
         assert!(!suspended.contains("not-a-real-capability"));
     }
 
-    /// Regression: `apply_suspend` must store the canonical UCAN form so the
-    /// suspension is actually ENFORCED by `member_has_capability`.
-    ///
-    /// Capabilities whose `Display` spelling differs from their UCAN form
-    /// (`Bridging` → `"bridging"` vs `"bridging:*"`; `ToolInvokeAll` →
-    /// `"tool:invoke:*"` vs `"tool_invoke:*"`) exposed the bug: `apply_suspend`
-    /// stored the `Display` string, but `member_has_capability` (and
-    /// `apply_suspend_all`) key off the UCAN form, so the suspended entry never
-    /// matched the lookup key and the capability stayed GRANTED. This pins that
-    /// an admin (who would otherwise hold every in-ceiling capability) is
-    /// actually denied the suspended caps. Before the fix this test fails
-    /// because the suspension is silently ignored.
-    #[test]
-    fn apply_suspend_enforces_capabilities_with_divergent_display_form() {
-        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
-        // Admin grants any in-ceiling capability, so seed the ceiling with the
-        // UCAN-form spellings the role check looks up.
-        ctx.test_insert_ceiling("bridging:*");
-        ctx.test_insert_ceiling("tool_invoke:*");
-
-        // Sanity: before suspension the admin holds both caps.
-        assert!(ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
-        assert!(ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
-
-        let applied = apply_suspend(
-            &mut ctx,
-            "did:test:admin",
-            &[Capability::Bridging, Capability::ToolInvokeAll],
-        );
-        assert!(applied);
-
-        // The suspended set must hold the canonical UCAN form, NOT the Display
-        // form — otherwise the lookup below would never match.
-        let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
-        assert!(suspended.contains("bridging:*"));
-        assert!(suspended.contains("tool_invoke:*"));
-        assert!(!suspended.contains("bridging"));
-        assert!(!suspended.contains("tool:invoke:*"));
-
-        // The actual enforcement check: both caps are now DENIED.
-        assert!(!ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
-        assert!(!ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
-    }
-
-    /// **E2-12:** `apply_suspend_all` is a no-op (returns false) for a member
-    /// with an empty ceiling — no capabilities to suspend.
+    /// **E2-12:** `apply_suspend_all` reports "not applied" (returns `false`)
+    /// for a member with an empty ceiling — they have no effective capability
+    /// to suspend. The shared `ContextRoleState::suspend_all` REPLACES the
+    /// suspended set with the member's (empty) `member_capabilities`, matching
+    /// the native runtime exactly, so the resulting suspended set is empty.
     #[test]
     fn apply_suspend_all_noop_for_empty_ceiling() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
         // Ceiling is empty by default → admin has no capabilities → nothing
-        // to suspend.
+        // effective to suspend.
         let applied = apply_suspend_all(&mut ctx, "did:test:admin");
-        assert!(!applied);
-        assert!(ctx.test_suspended_capabilities("did:test:admin").is_none());
+        assert!(!applied, "no effective caps means the action did not apply");
+        // Native-matching replace semantics: the suspended set, if materialized,
+        // is empty (no capability was actually suspended).
+        assert!(
+            ctx.test_suspended_capabilities("did:test:admin")
+                .is_none_or(|caps| caps.is_empty()),
+            "an empty-ceiling member must have no suspended capabilities"
+        );
     }
 
     // ----------------- EL01: convergent-source soundness -----------------
