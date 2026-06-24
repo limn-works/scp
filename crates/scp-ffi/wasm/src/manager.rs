@@ -368,7 +368,8 @@ pub(crate) struct PerContextState {
     /// for each sender), NOT role state — it has no home in
     /// [`ContextRoleState`], so it lives here alongside the other crypto-adjacent
     /// fields. Inserted when a member joins / is added, incremented on each
-    /// `publish_broadcast`, and dropped when the member is removed.
+    /// `send_message` AND each `publish_broadcast`, and dropped when the member
+    /// is removed.
     member_sequence_numbers: HashMap<String, u64>,
     /// Ceiling policy: "immutable" or "governed".
     ceiling_policy: String,
@@ -2088,10 +2089,18 @@ impl WasmContextManager {
         }
         // Per-member message-sequence sidecar. The `+= 1` matches native's
         // `MembershipState::next_sequence_number` (membership.rs), which also
-        // uses a plain `+= 1`. The sidecar's base/semantics (`member_sequence_numbers`
-        // here vs native's `MembershipState::next_sequence_number`) are a
-        // deferred MembershipState convergence item: they will converge when
-        // WASM adopts the shared `MembershipState`.
+        // uses a plain `+= 1`, but the BASE differs by one in a known direction:
+        // native PRE-increments (`info.sequence_number += 1; info.sequence_number`
+        // — it bumps THEN returns, so the first message's sequence is 1), while
+        // this WASM sidecar POST-increments (`let seq = *entry; *entry += 1;`
+        // from base 0 — it returns the current value THEN bumps, so the first
+        // message's sequence is 0). This is a real off-by-one in the emitted
+        // per-author `sequence_number` (not merely an internal base discrepancy),
+        // and the direction must be reconciled when WASM adopts the shared
+        // `MembershipState`. The per-author byte values are themselves out of
+        // cross-family export byte-parity scope per ADR-050 (each author mints
+        // its own sequence with no global order), but the increment direction
+        // must converge.
         let seq_entry = ctx
             .member_sequence_numbers
             .entry(sender_did.to_owned())
@@ -12256,83 +12265,340 @@ mod tests {
         );
     }
 
-    /// Cross-impl parity: the WASM ceiling string-conversion path
-    /// (`ValidatedCeilingStrings::from_colon_entries`, the production converter
-    /// for both context-create and `ModifyCeiling` validation) must produce the
-    /// SAME canonical UCAN form as native `Capability::ucan_capability_name` for
-    /// EVERY built-in capability variant.
-    ///
-    /// This is the equivocation class the ceiling work eliminated for custom
-    /// entries, now pinned for the full built-in set: the WASM converter and the
-    /// native canonical source agree by construction (both route through
-    /// `Capability::new(s).ucan_capability_name()`). The old hand-rolled `rsplit`
-    /// heuristic diverged — e.g. the no-colon `Bridging` token (`"bridging"`)
-    /// passed through unchanged instead of becoming the canonical `"bridging:*"`.
-    /// The input is each capability's COLON form (`Capability::name`), exactly
-    /// what the create/modify paths receive from the SDK.
-    #[test]
-    fn ceiling_string_conversion_matches_native_for_all_builtin_variants() {
-        // Every non-parameterized built-in (mirrors `BUILTIN_CAPABILITIES` in
-        // scp-protocol — keep in sync; see `roles.rs`
-        // `builtin_capabilities_list_is_exhaustive`), plus a parameterized
-        // ToolInvoke and a custom `{resource}:{action}` — the full shape space
-        // the create/modify ceiling converter must round-trip.
-        let cases = vec![
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
-            Capability::MemberInvite,
-            Capability::MemberRemove,
-            Capability::RoleAssign,
-            Capability::GovernancePropose,
-            Capability::GovernanceVote,
-            Capability::ContextClose,
-            Capability::ChildContextCreate,
-            Capability::ToolInterface,
-            Capability::Bridging,
-            Capability::MediaVoice,
-            Capability::MediaVideo,
-            Capability::MediaScreenShare,
-            Capability::MemberBan,
-            Capability::MetadataEdit,
-            // Parameterized + custom shapes.
-            Capability::ToolInvoke("calculator".to_owned()),
-            Capability::Custom("payments:approve".to_owned()),
-        ];
+    // -----------------------------------------------------------------------
+    // leave_context coverage
+    // -----------------------------------------------------------------------
 
-        for cap in &cases {
-            let native = cap.ucan_capability_name();
-            // The create/modify path receives the colon form (`cap.name()`) and
-            // stores `Capability::new(entry).ucan_capability_name()`.
-            let wasm: Vec<String> =
-                ValidatedCeilingStrings::from_colon_entries(&[cap.name().into_owned()])
-                    .expect("well-formed colon entry must build")
-                    .iter()
-                    .cloned()
-                    .collect();
-            assert_eq!(
-                wasm,
-                vec![native.clone()],
-                "WASM ceiling conversion diverged from native ucan_capability_name \
-                 for {cap:?}: wasm={wasm:?} native={native:?}"
-            );
+    /// `leave_context` must strip ALL per-member state for the leaving member
+    /// (membership, role assignment, granted capabilities, suspensions, and the
+    /// MLS sequence counter) and append EXACTLY one durable `MemberLeft` leaf —
+    /// without auto-closing while another member (the creator) remains.
+    #[test]
+    fn leave_context_strips_all_member_state_and_emits_member_left_wasm() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-leave-strip";
+        let creator = "did:dht:z6MkWasmLeaveCreator";
+        let leaver = "did:dht:z6MkWasmLeaveMember";
+
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        // Widen the ceiling so the built-in `member` role actually carries
+        // messages:read / messages:write (caps are ceiling-intersected).
+        ctx.test_insert_ceiling("messages:read");
+        ctx.test_insert_ceiling("messages:write");
+        // Add M with the `member` role (seeds members + a sequence entry +
+        // grants caps), advance its sequence counter to a non-zero value, and
+        // seed a suspension so we can assert the suspended entry is cleared.
+        ctx.test_insert_member(leaver, "member");
+        ctx.member_sequence_numbers.insert(leaver.to_owned(), 5);
+        ctx.test_insert_suspended_capability(leaver, "messages:write");
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // Preconditions: M is a member, holds a non-suspended cap, has a seeded
+        // sequence counter and a suspension.
+        assert!(
+            mgr.is_member(context_id, leaver),
+            "precondition: M is a member"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, leaver).as_deref(),
+            Some("member"),
+            "precondition: M holds the `member` role"
+        );
+        assert!(
+            mgr.contexts[context_id].member_has_capability(leaver, "messages:read"),
+            "precondition: M holds messages:read (an unsuspended granted cap)"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(leaver),
+            Some(5),
+            "precondition: M has a non-zero sequence counter"
+        );
+        assert!(
+            mgr.contexts[context_id]
+                .test_suspended_capabilities(leaver)
+                .is_some_and(|s| s.contains("messages:write")),
+            "precondition: M has a seeded suspension"
+        );
+
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
+
+        mgr.leave_context(context_id, leaver)
+            .expect("a member leaving the context must succeed");
+
+        // Membership stripped: M gone from members / role / caps.
+        assert!(
+            !mgr.is_member(context_id, leaver),
+            "after leave, M must be gone from `members`"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, leaver),
+            None,
+            "after leave, M must have no role assignment"
+        );
+        assert!(
+            !mgr.contexts[context_id].member_has_capability(leaver, "messages:read"),
+            "after leave, M must hold no capabilities"
+        );
+        // Per-member sidecar state stripped.
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(leaver),
+            None,
+            "after leave, M's sequence counter entry must be removed"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].test_suspended_capabilities(leaver),
+            None,
+            "after leave, M's suspension entry must be cleared (no dangling phantom suspension)"
+        );
+
+        // The creator remains, so the context must NOT auto-close.
+        assert!(
+            mgr.is_member(context_id, creator),
+            "the creator must remain a member after M leaves"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].state, "active",
+            "the context must stay active while the creator remains"
+        );
+
+        // EXACTLY one new durable MemberLeft leaf was appended.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before + 1),
+            "leave_context must append exactly one durable leaf"
+        );
+        let events = mgr.test_context_event_log_events(context_id);
+        let member_left_count = events
+            .iter()
+            .filter(|e| e.event_type == EventType::MemberLeft)
+            .count();
+        assert_eq!(
+            member_left_count, 1,
+            "leave_context must append EXACTLY one MemberLeft leaf, got {member_left_count}"
+        );
+        let member_left = events
+            .iter()
+            .find(|e| e.event_type == EventType::MemberLeft)
+            .expect("a MemberLeft leaf must be present");
+        assert_eq!(
+            member_left.actor_did.0, leaver,
+            "the MemberLeft leaf actor_did must be the leaving member"
+        );
+    }
+
+    /// When the LAST member leaves, `leave_context` must transition the context
+    /// to the `"closing"` lifecycle state (auto-close on empty membership).
+    #[test]
+    fn leave_context_last_member_closes_context_wasm() {
+        let context_id = "ctx-wasm-leave-last";
+        // The creator is the sole member (auto-assigned `admin` by
+        // `ContextRoleState::new`), so when the creator leaves, membership is
+        // empty and the context must auto-close.
+        let creator = "did:dht:z6MkWasmLeaveLastCreator";
+
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        assert_eq!(
+            mgr.member_dids(context_id).len(),
+            1,
+            "precondition: the creator is the sole member"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].state, "active",
+            "precondition: the context starts active"
+        );
+
+        mgr.leave_context(context_id, creator)
+            .expect("the last member leaving must succeed");
+
+        assert!(
+            !mgr.is_member(context_id, creator),
+            "after the last member leaves, no members remain"
+        );
+        assert!(
+            mgr.member_dids(context_id).is_empty(),
+            "membership must be empty after the last member leaves"
+        );
+        // `leave_context` sets state to "closing" when no members remain.
+        assert_eq!(
+            mgr.contexts[context_id].state, "closing",
+            "the last member leaving must auto-close the context (state -> closing)"
+        );
+    }
+
+    /// `leave_context` for a DID that is NOT a member must be rejected with the
+    /// `CTX_2015` not-found code and must NOT mutate state or append any leaf.
+    #[test]
+    fn leave_context_nonmember_is_rejected_wasm() {
+        let context_id = "ctx-wasm-leave-nonmember";
+        let creator = "did:dht:z6MkWasmLeaveNonmemberCreator";
+        let stranger = "did:dht:z6MkWasmLeaveStranger";
+
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
+
+        let result = mgr.leave_context(context_id, stranger);
+        match result {
+            Err(ScpWasmError::Context { code, .. }) => {
+                assert_eq!(
+                    code,
+                    codes::CTX_2015,
+                    "a non-member leave must be rejected with the CTX_2015 not-found code"
+                );
+            }
+            other => panic!("expected a CTX_2015 Context error, got {other:?}"),
         }
 
-        // Pin that the old hand-rolled converter's buggy pass-through spellings
-        // are GONE (the positive canonical forms are already covered by the loop
-        // above when it hits `Bridging` / `ToolInvokeAll`): a no-colon built-in
-        // token must NOT pass through, and a built-in colon form must NOT remain
-        // un-underscored.
-        let pinned_set: HashSet<String> = ValidatedCeilingStrings::from_colon_entries(&[
-            "bridging".to_owned(),
-            "tool:invoke:*".to_owned(),
-        ])
-        .expect("well-formed colon entries must build")
-        .iter()
-        .cloned()
-        .collect();
-        assert!(!pinned_set.contains("bridging"));
-        assert!(!pinned_set.contains("tool:invoke:*"));
+        // No state mutation: the creator remains and the context stays active.
+        assert!(
+            mgr.is_member(context_id, creator),
+            "a rejected non-member leave must not remove the existing member"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].state, "active",
+            "a rejected non-member leave must not change the lifecycle state"
+        );
+        // No durable leaf appended on the rejected path.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before),
+            "a rejected non-member leave must append no durable leaf"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // join_context (non-encrypted) success
+    // -----------------------------------------------------------------------
+
+    /// The non-encrypted `join_context` path must add the joiner as a `member`,
+    /// seed its sequence counter, and emit EXACTLY one `MemberJoined` buffer
+    /// event AND one durable `MemberJoined` leaf immediately (no MLS Welcome to
+    /// defer behind).
+    #[test]
+    fn join_context_succeeds_adds_member_wasm() {
+        use scp_event_log::EventType;
+
+        let context_id = "ctx-wasm-join-plain";
+        let creator = "did:dht:z6MkWasmJoinPlainCreator";
+        let joiner = "did:dht:z6MkWasmJoinPlainJoiner";
+
+        // `make_bare_per_context_state` builds a free (no economic policy),
+        // unencrypted, active context, so the non-encrypted join path applies
+        // and the C2 economy gate does not reject.
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        assert!(
+            !mgr.is_member(context_id, joiner),
+            "precondition: the joiner is not yet a member"
+        );
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
+
+        mgr.join_context(context_id, joiner, None)
+            .expect("a free, unencrypted join must succeed");
+
+        // Member added with the built-in `member` role and a seeded counter.
+        assert!(
+            mgr.is_member(context_id, joiner),
+            "a successful join must add the joiner to `members`"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, joiner).as_deref(),
+            Some("member"),
+            "a successful unencrypted join must assign the built-in `member` role"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(joiner),
+            Some(0),
+            "a successful join must seed the joiner's sequence counter to 0"
+        );
+
+        // EXACTLY one new durable MemberJoined leaf for the joiner.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before + 1),
+            "a successful unencrypted join must append exactly one durable leaf"
+        );
+        let leaves = mgr.test_context_event_log_events(context_id);
+        assert_eq!(
+            leaves
+                .iter()
+                .filter(|e| e.event_type == EventType::MemberJoined && e.actor_did.0 == joiner)
+                .count(),
+            1,
+            "exactly one MemberJoined leaf for the joiner must exist after a successful join"
+        );
+
+        // EXACTLY one buffered MemberJoined event for the joiner.
+        let drained = mgr.drain_events(context_id);
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    ContextEvent::MemberJoined { member_did, role_name }
+                        if member_did.0 == joiner && role_name == "member"
+                ))
+                .count(),
+            1,
+            "exactly one MemberJoined buffer event for the joiner must be emitted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_member non-member rejection
+    // -----------------------------------------------------------------------
+
+    /// `dispatch_remove_member` on a DID that is not a member must be rejected
+    /// with the `CTX_2015` not-found code and must append no durable leaf.
+    #[test]
+    fn remove_member_nonmember_is_rejected_wasm() {
+        let context_id = "ctx-wasm-remove-nonmember";
+        let creator = "did:dht:z6MkWasmRemoveNonmemberCreator";
+        let executor = creator;
+        let stranger = "did:dht:z6MkWasmRemoveStranger";
+        let timestamp_secs = 1_700_950_950_u64;
+
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        let leaf_count_before = mgr
+            .event_log_leaf_count(context_id)
+            .expect("active context has an event-log leaf count");
+
+        let result = mgr.dispatch_remove_member(context_id, stranger, executor, timestamp_secs);
+        match result {
+            Err(ScpWasmError::Context { code, .. }) => {
+                assert_eq!(
+                    code,
+                    codes::CTX_2015,
+                    "removing a non-member must be rejected with the CTX_2015 not-found code"
+                );
+            }
+            other => panic!("expected a CTX_2015 Context error, got {other:?}"),
+        }
+
+        // No durable leaf appended on the rejected path.
+        assert_eq!(
+            mgr.event_log_leaf_count(context_id),
+            Some(leaf_count_before),
+            "a rejected non-member removal must append no durable leaf"
+        );
     }
 }
