@@ -1629,7 +1629,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
 | `"SCP-BCAST-HOST-REQ-V1:"` | Broadcast hosting request signing | §5.14.13 |
 | `"SCP-BCAST-HOST-GRANT-V1:"` | Broadcast hosting grant signing | §5.14.13 |
-| `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction, NOT a §9.5.1 signature-preimage separator (the colon-join is non-§9.5.1; `"standing-"` is an output id-prefix) | §5.15.8 |
+| `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
 
