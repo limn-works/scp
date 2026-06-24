@@ -284,7 +284,10 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 /// "payments:approve")` → `payments:approve` (NOT the raw-string
 /// `custom_payments:approve` the old `build_ceiling_strings` produced), and
 /// import validates+stores the canonical UCAN form, create / modify / import all
-/// produce the byte-identical ceiling the native bridge stores.
+/// produce the same canonical UCAN-string set the native bridge yields via
+/// [`Capability::ucan_capability_name`] (native stores `Capability` enums per
+/// ADR-034; the convergent property is this string projection, not the in-memory
+/// representation).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ValidatedCeilingStrings(HashSet<String>);
 
@@ -303,6 +306,16 @@ impl ValidatedCeilingStrings {
         )
     }
 
+    /// Maps a [`CeilingEntryError`] into the canonical bridge validation error
+    /// (`SCP-VALID-7000`). Shared by all three validating constructors so the
+    /// reject surface is identical across the create / modify / import paths.
+    fn validation_error(e: scp_protocol::context::roles::CeilingEntryError) -> ScpWasmError {
+        ScpWasmError::Validation {
+            message: e.to_string(),
+            code: codes::VALID_7000.to_owned(),
+        }
+    }
+
     /// Builds a validated ceiling from user-supplied COLON-form entries (the
     /// `create_context` path). An empty list yields [`Self::defaults`].
     ///
@@ -318,10 +331,7 @@ impl ValidatedCeilingStrings {
         for entry in entries {
             let cap = scp_protocol::context::roles::Capability::new(entry);
             cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpWasmError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
+                .map_err(Self::validation_error)?;
             set.insert(cap.ucan_capability_name());
         }
         Ok(Self(set))
@@ -340,10 +350,7 @@ impl ValidatedCeilingStrings {
         let mut set = HashSet::with_capacity(caps.len());
         for cap in caps {
             cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpWasmError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
+                .map_err(Self::validation_error)?;
             set.insert(cap.ucan_capability_name());
         }
         Ok(Self(set))
@@ -367,12 +374,8 @@ impl ValidatedCeilingStrings {
     {
         let mut set = HashSet::new();
         for entry in entries {
-            scp_protocol::context::roles::validate_ucan_ceiling_string(entry).map_err(|e| {
-                ScpWasmError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                }
-            })?;
+            scp_protocol::context::roles::validate_ucan_ceiling_string(entry)
+                .map_err(Self::validation_error)?;
             set.insert(entry.clone());
         }
         Ok(Self(set))
