@@ -1386,8 +1386,7 @@ impl Supervisor {
     /// the seam the saga FSM + crash-recovery tests use to drive the REAL
     /// journal write-ordering over co-resident actors, and the seam by which a
     /// durable saga journal will be wired into production bridges in a later
-    /// phase of the ADR-049 saga work, once the durable saga journal and FFI
-    /// saga surface land.
+    /// phase of the ADR-049 saga work.
     ///
     /// Production bridges currently construct via [`Self::with_providers`],
     /// which hardcodes [`NoopSagaJournal`] — i.e. NO durable

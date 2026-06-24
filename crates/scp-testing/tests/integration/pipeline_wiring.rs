@@ -907,28 +907,32 @@ fn restore_on_startup_runs_restore_before_replay() {
 // distinguish "calls the combined entry" from "merely names the token" — an
 // in-crate caller could name `restore_all_contexts(&sup)` via UFCS (no
 // `.restore_all_contexts()` substring) plus a no-op `restore_on_startup` shadow
-// and still pass this gate. The cross-crate UFCS route is no longer a concern:
-// `restore_all_contexts` is `pub(crate)`, so naming it from another crate is a
-// compile error (E0624). Hardening the in-crate locator with more spellings is a
-// non-convergent denylist (CLAUDE.md). The REAL enforcement that the bridge path
-// runs BOTH the restore and the replay legs is
+// and still pass this gate. Hardening the in-crate locator with more spellings is
+// a non-convergent denylist (CLAUDE.md).
+//
+// `restore_all_contexts` is `pub(crate)`, so no out-of-crate bridge can name the
+// bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)` call
+// is a compile error (E0624). This source-text gate is therefore retained purely
+// as cheap IN-CRATE defense-in-depth against the obvious "names the bare leg"
+// regression: it catches an in-crate caller (or a future re-widening of the
+// visibility) that names the bare leg and skips the saga-journal replay. It
+// covers the shared bridge-instance core AND each of the three FFI exports (PyO3
+// / napi / UniFFI), since each exports its own `context_restore_all`-shaped entry
+// point. Its assertions are not weakened.
+//
+// The REAL enforcement is twofold. The type system enforces it by construction:
+// `replay_unresolved_sagas` requires a `RestoredContexts` witness that only
+// `restore_all_contexts` can mint, so replay-before-restore does not compile
+// (restore-then-replay ORDERING); and `restore_all_contexts` being `pub(crate)`
+// makes the bare leg unnameable cross-crate (E0624, above — NO-BARE-RESTORE leg
+// coverage, the same fact this source-text gate cheaply backstops in-crate). And
 // the behavioral bootstrap integration test
 // `bridge_restore_entry_runs_restore_and_replay_legs`
-// (`crates/scp-testing/tests/integration/saga_bridge_bootstrap.rs`), which drives
-// the shared bridge entry `restore_all_persisted_contexts` over a real
-// persistence backend + durable saga journal and asserts a persisted context was
-// restored AND a crash-orphaned saga was reconciled to terminal. This gate is
-// kept as cheap defense-in-depth against the obvious "names the bare leg"
-// regression; its assertions are not weakened.
-//
-// `restore_all_contexts` is now `pub(crate)`, so no out-of-crate bridge can name
-// the bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)`
-// call is a compile error (E0624). This source-text gate is therefore retained
-// purely as cheap IN-CRATE defense-in-depth: it catches an in-crate caller (or a
-// future re-widening of the visibility) that names the bare leg and skips the
-// saga-journal replay. It covers the shared bridge-instance core AND each of the
-// three FFI exports (PyO3 / napi / UniFFI), since each exports its own
-// `context_restore_all`-shaped entry point.
+// (`crates/scp-testing/tests/integration/saga_bridge_bootstrap.rs`) is what
+// proves BOTH legs run: it drives the shared bridge entry
+// `restore_all_persisted_contexts` over a real persistence backend + durable saga
+// journal and asserts a persisted context was restored AND a crash-orphaned saga
+// was reconciled to terminal.
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {
     // 1) Shared bridge-instance core: the production startup/resume path.
