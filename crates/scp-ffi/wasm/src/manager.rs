@@ -4055,59 +4055,43 @@ impl WasmContextManager {
             GovernanceAction::TransferAdmin { new_admin } => {
                 let ctx = self.require_active_context_mut(context_id)?;
                 let new_admin_str: &str = new_admin;
-                let old_admin = ctx.role_state.creator_did.clone();
-                // Demote the previous admin and promote the new admin via the
-                // shared `system_assign_role` (which validates the role exists
-                // and refreshes `member_capabilities`). No-op if the DID is not
-                // a member, preserving the prior `if let Some` semantics.
+                // Converges to native `execute_transfer_admin`
+                // (`governance_helpers.rs`): admin is a transferable ROLE, not
+                // `creator_did`. The transfer (a) REJECTS a non-member new_admin
+                // before any mutation, (b) demotes EVERY current admin-role
+                // holder to "member", then (c) promotes new_admin to "admin" —
+                // all via the shared `system_assign_role`. `creator_did` is the
+                // immutable original creator (UCAN root / export signer / HMAC
+                // identity / exporter_did) and is NEVER touched by a role
+                // transfer.
                 //
-                // Defense-in-depth rollback: both `system_assign_role` calls
-                // target built-in roles ("member" / "admin"), whose caps are
-                // ceiling-filtered at `ContextRoleState` construction, so they
-                // cannot return `RoleNotFound` / `MemberNotInContext` /
-                // `CapabilityOutsideCeiling` today — this branch is unreachable
-                // by construction. It exists for uniform fail-closed atomicity:
-                // this is the one membership/role-state mutation path that
-                // would otherwise lack the rollback the sibling paths have. If a
-                // future change made the promotion fallible, returning its error
-                // after the demotion already landed would leave the old admin
-                // demoted with NO admin restored — a zero-admin vacancy. Capture
-                // the old admin's prior role and restore it (and `creator_did`)
-                // on promotion failure so the role state is unchanged on error.
-                let old_admin_prior_role = ctx
+                // Reject-before-mutate: the membership guard returns before any
+                // `system_assign_role`, and the two assignments target built-in
+                // roles ("member" / "admin") whose caps are ceiling-filtered at
+                // `ContextRoleState` construction, so they cannot fail here —
+                // no rollback is needed (mirrors native, which returns its
+                // guard `Err` before persisting).
+                if !ctx.role_state.members.contains(new_admin_str) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("member '{new_admin_str}' not found"),
+                        code: codes::CTX_2015.to_owned(),
+                    });
+                }
+                let current_admins: Vec<String> = ctx
                     .role_state
                     .assignments
-                    .get(&old_admin)
-                    .map(|a| a.role_name.clone());
-                if ctx.role_state.members.contains(&old_admin) {
+                    .iter()
+                    .filter(|(_, a)| a.role_name == "admin")
+                    .map(|(did, _)| did.clone())
+                    .collect();
+                for admin_did in &current_admins {
                     ctx.role_state
-                        .system_assign_role(&old_admin, "member", &crate::time::WasmClock)
+                        .system_assign_role(admin_did, "member", &crate::time::WasmClock)
                         .map_err(map_role_error)?;
                 }
-                if ctx.role_state.members.contains(new_admin_str)
-                    && let Err(e) = ctx.role_state.system_assign_role(
-                        new_admin_str,
-                        "admin",
-                        &crate::time::WasmClock,
-                    )
-                {
-                    // Restore the old admin's prior role so the demotion above
-                    // does not leave a zero-admin vacancy. Only re-assign if the
-                    // old admin actually had a recorded role and is still a
-                    // member; `creator_did` was not yet mutated, so it needs no
-                    // restore here.
-                    if let Some(prior_role) = old_admin_prior_role
-                        && ctx.role_state.members.contains(&old_admin)
-                    {
-                        let _ = ctx.role_state.system_assign_role(
-                            &old_admin,
-                            &prior_role,
-                            &crate::time::WasmClock,
-                        );
-                    }
-                    return Err(map_role_error(e));
-                }
-                new_admin_str.clone_into(&mut ctx.role_state.creator_did);
+                ctx.role_state
+                    .system_assign_role(new_admin_str, "admin", &crate::time::WasmClock)
+                    .map_err(map_role_error)?;
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
             }
             GovernanceAction::SuspendCapability { did, capabilities } => {
@@ -10465,6 +10449,120 @@ mod tests {
         assert!(
             !ctx.member_has_capability(target, "messages:write"),
             "observer must NOT have messages:write"
+        );
+    }
+
+    /// Convergence with native `execute_transfer_admin`: a `TransferAdmin` to a
+    /// member demotes EVERY current admin-role holder to "member", promotes the
+    /// `new_admin` to "admin", and leaves `creator_did` (the immutable export
+    /// signer / UCAN root) UNCHANGED. Admin is a transferable ROLE, never
+    /// `creator_did`.
+    #[test]
+    fn transfer_admin_to_member_demotes_old_promotes_new_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let context_id = "ctx-transfer-admin-ok";
+
+        // `make_bare_per_context_state` auto-assigns the creator the "admin"
+        // role. Add a plain member that will receive admin via the transfer.
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        state.test_insert_member(member, "member");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        // Precondition: creator is admin, member is member, creator_did set.
+        assert_eq!(
+            mgr.member_role(context_id, creator).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            mgr.member_role(context_id, member).as_deref(),
+            Some("member")
+        );
+        let creator_did_before = mgr.contexts[context_id].role_state.creator_did.clone();
+
+        let action = GovernanceAction::TransferAdmin {
+            new_admin: DID(member.to_owned()),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000aa";
+        mgr.propose_governance_action(context_id, creator, proposal_id, &action)
+            .expect("TransferAdmin to an existing member must succeed");
+
+        // The new admin holds "admin"; the prior admin is demoted to "member".
+        assert_eq!(
+            mgr.member_role(context_id, member).as_deref(),
+            Some("admin"),
+            "new_admin must be promoted to the admin role"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, creator).as_deref(),
+            Some("member"),
+            "the prior admin must be demoted to member"
+        );
+        // `creator_did` is the immutable original creator / export signer — a
+        // ROLE transfer must NOT relocate it.
+        assert_eq!(
+            mgr.contexts[context_id].role_state.creator_did, creator_did_before,
+            "TransferAdmin must NOT mutate creator_did (the export signer)"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].role_state.creator_did, creator,
+            "creator_did must still point at the original creator"
+        );
+    }
+
+    /// Convergence with native `execute_transfer_admin`: a `TransferAdmin` to a
+    /// NON-member is REJECTED before any mutation. The prior admin keeps the
+    /// admin role (no zero-admin vacancy) and `creator_did` is unchanged (no
+    /// export-signer relocation to a non-member).
+    #[test]
+    fn transfer_admin_to_nonmember_is_rejected_wasm() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreator";
+        let stranger = "did:dht:zstranger"; // never added to the context
+        let context_id = "ctx-transfer-admin-nonmember";
+
+        let mut state = make_bare_per_context_state(context_id, creator);
+        state.test_set_governance("single_admin");
+        state.test_insert_ceiling("governance:propose");
+        state.test_insert_ceiling("governance:vote");
+        mgr.contexts.insert(context_id.to_owned(), state);
+
+        let creator_did_before = mgr.contexts[context_id].role_state.creator_did.clone();
+
+        let action = GovernanceAction::TransferAdmin {
+            new_admin: DID(stranger.to_owned()),
+        };
+        let proposal_id = "deadbeef000000000000000000000000000000000000000000000000000000bb";
+        let result = mgr.propose_governance_action(context_id, creator, proposal_id, &action);
+
+        // Rejected with the member-not-found Context code (CTX_2015) — the same
+        // code `dispatch_change_role` uses for a missing member and that
+        // `map_role_error` maps `RoleError::MemberNotInContext` to.
+        match result {
+            Err(ScpWasmError::Context { ref code, .. }) => assert_eq!(
+                code,
+                codes::CTX_2015,
+                "TransferAdmin to a non-member must reject with the member-not-found CTX_2015 code"
+            ),
+            other => panic!(
+                "TransferAdmin to a non-member MUST be rejected with a                  member-not-found Context error, got: {other:?}"
+            ),
+        }
+
+        // The reject-before-mutate guard means the prior admin still holds
+        // admin (no zero-admin vacancy) and creator_did is untouched.
+        assert_eq!(
+            mgr.member_role(context_id, creator).as_deref(),
+            Some("admin"),
+            "a rejected TransferAdmin must leave the original admin's role intact"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].role_state.creator_did, creator_did_before,
+            "a rejected TransferAdmin must NOT relocate creator_did to a non-member"
         );
     }
 
