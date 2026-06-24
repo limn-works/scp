@@ -370,15 +370,31 @@ let channel = sdk.standing_context(&bob_did).await?;
 // Returns existing bilateral-persistent context if one exists,
 // creates one if not. Idempotent.
 
+// NOTE: if this side obtained its replica via Welcome-join (the common
+// non-initiating peer, or a collision-losing did_hi), send fails-closed
+// until the Phase-2E spawn-from-Welcome entrypoint lands (spec §5.15.8).
 channel.send("Are you available for the 3pm sync?").await?;
 
 // Python
 channel = await sdk.standing_context(bob_did)
+# send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
 await channel.send("Are you available for the 3pm sync?")
 
 // Swift
 let channel = try await sdk.standingContext(with: bobDID)
+// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
 try await channel.send("Are you available for the 3pm sync?")
+
+// TypeScript — NOTE: the return shape MUST NOT add a `created: bool` /
+// `peer_joined` discriminant; it is identical to every other binding.
+const channel = await sdk.standingContext(bobDid);
+// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+await channel.send("Are you available for the 3pm sync?");
+
+// Kotlin
+val channel = sdk.standingContext(bobDid)
+// send fails-closed on a Welcome-joiner until Phase-2E (spec §5.15.8)
+channel.send("Are you available for the 3pm sync?")
 ```
 
 **Semantics of `standing_context`** (see spec §5.15.8 for the normative contract):

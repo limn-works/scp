@@ -750,6 +750,15 @@ DID resolution is the trust root for the entire protocol. If resolution can be M
 
 **Key Continuity Verification:** Signal-style safety numbers for DIDs, enabling out-of-band verification that two parties have the correct keys for each other. See §9.11.
 
+### 3.8.1 Canonical DID string form (deterministic-derivation input)
+
+Wherever a DID string feeds a **deterministic hash preimage** — any place two independent resolvers must agree byte-for-byte or they would derive divergent identifiers (e.g. the `derived_context_id` of §5.15.8, the snapshot-lookup/dedup keys of §5.14.13) — the DID MUST be reduced to its **canonical string form**, the single comparison form DID resolution yields per method:
+
+- **did:dht** — its self-certifying form: lowercase z-base-32 of the Ed25519 public key (§9.6.1). This is already a single canonical form; no further normalization applies.
+- **did:web** — canonicalized per the W3C did:web method: the host is **lowercased**; an internationalized (IDN) host is reduced to its **punycode / A-label** form; the default `:443` port is **omitted**; the authority carries **no trailing dot**; path segments are **percent-encoded with UPPERCASE hex digits**; and the literal `:` separators of the method-specific identifier are percent-encoded as **`%3A`**.
+
+A DID whose method admits **no** canonical string form (no deterministic single comparison form) is **rejected at the same fail-loud method-admission gate** the §5.15.8 injectivity invariant relies on — never silently coerced — so a deterministic derivation can never be fed two distinct encodings of the same DID, nor an un-normalizable one.
+
 ## 3.9 Key Lifecycle
 
 Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.

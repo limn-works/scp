@@ -257,15 +257,21 @@ Members must be in at least one parent to join the child. Eligibility is continu
 ### Standing Context (contact graph, §5.12.6)
 
 ```
-// Get-or-create a bilateral-persistent context with a peer.
-// Idempotent: returns existing if one exists.
+// Get-or-create a bilateral-persistent context with a peer. Idempotent.
+// Ok ≠ peer joined: offline/slow/blocking/declining peers all yield the
+//   identical Ok (no synchronous join confirmation — forecloses the
+//   block/pair-existence oracle).
+// Welcome-joiner can decrypt but NOT send until Phase-2E spawn-from-Welcome.
+// A dangling/reaped handle auto-revives under the deterministic id.
+// No create-vs-found / peer_joined discriminant — identical shape across
+//   all bindings.
 SCP.Context.standingContext(
   identity: Identity,
   peer: DID
 ) → Context { contextID, peer, template: .bilateralPersistent }
 ```
 
-Standing contexts are bilateral-persistent contexts used for ongoing direct communication. Zero idle cost (no keepalives, ~2-5KB storage each). Persist across restarts. The agent's contact graph.
+Standing contexts are bilateral-persistent contexts used for ongoing direct communication. Zero idle cost (no keepalives, ~2-5KB storage each). Persist across restarts. The agent's contact graph. See spec §5.15.8 for the normative get-or-create contract.
 
 ### Auto-Accept Policies (§5.12.2)
 
