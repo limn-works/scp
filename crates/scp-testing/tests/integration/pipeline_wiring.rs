@@ -917,8 +917,9 @@ fn restore_on_startup_runs_restore_before_replay() {
 // regression: it catches an in-crate caller (or a future re-widening of the
 // visibility) that names the bare leg and skips the saga-journal replay. It
 // covers the shared bridge-instance core AND each of the three FFI exports (PyO3
-// / napi / UniFFI), since each exports its own `context_restore_all`-shaped entry
-// point. Its assertions are not weakened.
+// / napi / UniFFI), since each exports its own per-instance restore entry
+// (`restore_all_contexts` on PyO3/UniFFI, `context_restore_all_on` on napi). Its
+// assertions are not weakened.
 //
 // The REAL enforcement is twofold. The type system enforces it by construction:
 // `replay_unresolved_sagas` requires a `RestoredContexts` witness that only
