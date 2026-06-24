@@ -46,9 +46,12 @@ use scp_protocol::context::governance::{
 };
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ContextMode;
-use scp_protocol::context::roles::{
-    Capability, CapabilityCeiling, ContextRoleState, builtin_broadcast_roles, builtin_roles,
-};
+use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+// `builtin_roles` / `builtin_broadcast_roles` are used only by the test-only
+// `set_ceiling_and_refresh` scaffolding (the production `ModifyCeiling` path calls
+// `set_ceiling` only, matching native — no built-in-role rebuild).
+#[cfg(test)]
+use scp_protocol::context::roles::{builtin_broadcast_roles, builtin_roles};
 use scp_protocol::crypto::ucan::UcanError;
 use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker,
@@ -777,23 +780,28 @@ impl PerContextState {
         self.cooldown_until.insert(rule_index, until_secs);
     }
 
-    /// Replaces the ceiling and RE-DERIVES the built-in role definitions and
-    /// every member's granted-capability set from the new ceiling.
+    /// TEST-ONLY scaffolding: replaces the ceiling and RE-DERIVES the built-in
+    /// role definitions and every member's granted-capability set from the new
+    /// ceiling, so a test can incrementally widen a context's ceiling on an
+    /// already-constructed context and have built-in roles + member capabilities
+    /// recompute against it.
     ///
-    /// The shared [`ContextRoleState`] snapshots a member's `member_capabilities`
-    /// at assignment time from the role definition (which is itself derived from
-    /// the ceiling at construction). The WASM bridge's former flat model instead
-    /// resolved an admin's capabilities against the LIVE ceiling on every check,
-    /// so a ceiling change took effect immediately. To preserve that semantics
-    /// over the shared type, this:
+    /// This does NOT model the production `ModifyCeiling` path. Production
+    /// `dispatch_modify_ceiling` converges with native
+    /// (`apply_pending_ceiling_modification`): it calls `set_ceiling` ONLY, with
+    /// no built-in-role rebuild and no per-member `system_assign_role` refresh, so
+    /// `member_capabilities` go stale-on-ceiling-change exactly like native. This
+    /// helper exists only so test setup can mutate the ceiling of a context that
+    /// already has members assigned (the production path seeds the ceiling at
+    /// construction via [`ContextRoleState::new`], which derives built-in roles
+    /// from the ceiling up front).
+    ///
+    /// It:
     /// 1. installs the new ceiling (`set_ceiling`),
     /// 2. rebuilds the built-in role definitions (`admin` = the whole new
     ///    ceiling; the role-subset roles intersected with it),
     /// 3. re-runs `system_assign_role` for every current member at their existing
-    ///    role so `member_capabilities` reflects the new ceiling. The
-    ///    SHRINK-only suspension prune that `system_assign_role` performs keeps
-    ///    suspensions that the refreshed role still grants and drops the rest —
-    ///    the same fail-safe direction as native.
+    ///    role so `member_capabilities` reflects the new ceiling.
     ///
     /// Custom (non-built-in) role definitions are preserved as-is; only the
     /// protocol built-ins are re-derived (WASM only assigns built-in role names).
@@ -805,6 +813,7 @@ impl PerContextState {
     /// `ContextRoleState::set_ceiling` is fail-closed, so on a rejected write the
     /// prior ceiling, role definitions, and member capabilities are ALL left
     /// unchanged (the refresh below runs only after a successful `set_ceiling`).
+    #[cfg(test)]
     fn set_ceiling_and_refresh(
         &mut self,
         ceiling: CapabilityCeiling,
@@ -3663,15 +3672,26 @@ impl WasmContextManager {
     /// a malformed proposed entry (no-colon / stray-`*` / multi-colon `Custom`)
     /// is rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
     /// is left UNCHANGED (fail-closed). The validated replacement is then stored
-    /// via `set_ceiling_and_refresh`, which routes through the shared
-    /// `ContextRoleState::set_ceiling` (itself a §5.3.1.1 enforcement point,
-    /// defense in depth) and re-derives every member's granted-capability set
-    /// against the new ceiling so admins immediately reflect the new bound
-    /// (preserving the prior live-ceiling semantics). WASM keeps the single-phase
-    /// immediate write — native's two-phase governed-ceiling deferral is a
-    /// separate slice. Because the validation and the stored form both flow from
-    /// the same shared `Capability` grammar, native and WASM store the SAME
-    /// effective ceiling for the same `ModifyCeiling` action.
+    /// via the shared `ContextRoleState::set_ceiling` (itself a §5.3.1.1
+    /// enforcement point, defense in depth), and nothing else.
+    ///
+    /// Convergence with native (`apply_pending_ceiling_modification`): native
+    /// applies a ceiling modification with `role_state.set_ceiling(...)` ONLY — it
+    /// does NOT rebuild built-in role definitions nor re-run `system_assign_role`
+    /// to refresh members' `member_capabilities`. Those snapshots stay as computed
+    /// at the last explicit role assignment and are recomputed only on the next
+    /// assignment. WASM matches that exactly here: validate → `set_ceiling` → done.
+    /// Eagerly refreshing on a ceiling WIDEN would, via `system_assign_role`'s
+    /// SHRINK-only `prune_suspensions_to_role_grants`, silently re-grant a
+    /// `SuspendAccess`-suspended member the newly-added capability (the suspended
+    /// set never gains the new cap, but the refreshed `member_capabilities` does);
+    /// not refreshing keeps the suspended member fully suspended, matching native.
+    ///
+    /// WASM keeps the single-phase immediate write — native's two-phase
+    /// governed-ceiling deferral is a separate slice. Because the validation and
+    /// the stored form both flow from the same shared `Capability` grammar, native
+    /// and WASM store the SAME effective ceiling for the same `ModifyCeiling`
+    /// action.
     fn dispatch_modify_ceiling(
         &mut self,
         context_id: &str,
@@ -3688,10 +3708,12 @@ impl WasmContextManager {
             });
         }
         // The entries are pre-validated above, so the shared `set_ceiling`
-        // re-validation inside `set_ceiling_and_refresh` cannot fail here; surface
-        // it as a `Validation` error regardless (no silent swallow), keeping the
-        // store fail-closed.
-        ctx.set_ceiling_and_refresh(CapabilityCeiling::new(new_ceiling.iter().cloned()))
+        // re-validation cannot fail here; surface it as a `Validation` error
+        // regardless (no silent swallow), keeping the store fail-closed. No
+        // built-in-role rebuild and no per-member `system_assign_role` refresh —
+        // `member_capabilities` go stale-on-ceiling-change exactly like native.
+        ctx.role_state
+            .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;
         Ok(serde_json::json!({"action": "ModifyCeiling"}))
     }
@@ -9649,79 +9671,113 @@ mod tests {
         );
     }
 
-    /// Governance `SuspendCapability` / `RestoreAccess` store and remove the
-    /// suspended-capability key in the SAME canonical UCAN form
-    /// (`Capability::ucan_capability_name`) the consequence path
-    /// (`apply_suspend`) and `member_has_capability` use — formatting directly
-    /// off the typed `Capability`, so the spelling is identical across every
-    /// store path and a `RestoreAccess` actually clears a prior suspension.
+    /// Native-parity regression: a member placed under `SuspendAccess` STAYS
+    /// fully suspended across a governed `ModifyCeiling` that WIDENS the ceiling
+    /// — they must NOT regain a capability the widen added.
     ///
-    /// Includes capabilities whose `Display` form differs from their UCAN form
-    /// (`Bridging`, `ToolInvokeAll`) and a `Custom` whose inner string collides
-    /// with a built-in spelling (`Custom("bridging")`) or carries the `custom:`
-    /// disambiguator (`Custom("custom:foo")`) — the shapes where a lossy
-    /// `name()` → `Capability::new` string round-trip would have diverged.
+    /// This proves the convergence fix in `dispatch_modify_ceiling`. The former
+    /// WASM behavior eagerly re-ran `system_assign_role` for every member on a
+    /// ceiling change to refresh `member_capabilities`. On a WIDEN, that refresh
+    /// recomputed the suspended member's `member_capabilities` to INCLUDE the
+    /// newly-added cap, while `prune_suspensions_to_role_grants` (SHRINK-only —
+    /// it can only REMOVE entries from the suspended set, never add) left the
+    /// suspended set as the pre-widen snapshot. The new cap was therefore present
+    /// in `member_capabilities` and absent from the suspended set, so
+    /// `member_has_capability` returned `true`: a suspended member silently
+    /// regained authority.
+    ///
+    /// Native (`apply_pending_ceiling_modification`) calls `set_ceiling` only — no
+    /// refresh — so the suspended member's `member_capabilities` never gains the
+    /// new cap and they stay fully suspended. WASM now matches: the assertions
+    /// below confirm the member regains NOTHING across the widen.
     #[test]
-    fn governance_suspend_restore_uses_canonical_form_for_all_shapes() {
+    fn test_wasm_suspended_member_stays_suspended_across_ceiling_widen() {
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        // Seed `member:ban` so the `SuspendAccess` governance action is permitted
+        // (it requires `member:ban` in the ceiling), alongside `messages:read`.
         let mut mgr = manager_with_governed_context(
-            "ctx-susp",
-            "did:dht:zcreator",
-            &["messages:read", "bridging:*", "tool_invoke:*", "member:ban"],
+            "ctx-suspend-widen",
+            creator,
+            &["messages:read", "member:ban"],
         );
 
-        let subject = DID("did:dht:zsubject".to_owned());
-        let caps = vec![
-            Capability::Bridging,
-            Capability::ToolInvokeAll,
-            Capability::Custom("custom:foo".to_owned()),
-            Capability::Custom("bridging".to_owned()),
-        ];
-
-        mgr.dispatch_governance_action(
-            "ctx-susp",
-            &GovernanceAction::SuspendCapability {
-                did: subject.clone(),
-                capabilities: caps.clone(),
-            },
-            "did:dht:zcreator",
-            0,
-        )
-        .expect("SuspendCapability must succeed");
-
-        // Each stored key is exactly `cap.ucan_capability_name()` — the same
-        // value `apply_suspend` and `member_has_capability` produce/consume.
-        let stored: HashSet<String> = mgr
-            .contexts
-            .get("ctx-susp")
+        // Add `member` as admin so their `member_capabilities` snapshot is the
+        // whole current ceiling, i.e. {messages:read, member:ban}.
+        mgr.contexts
+            .get_mut("ctx-suspend-widen")
             .unwrap()
-            .suspended_capabilities
-            .get(subject.as_ref())
-            .expect("subject must have a suspended set")
-            .clone();
-        let expected: HashSet<String> = caps.iter().map(Capability::ucan_capability_name).collect();
-        assert_eq!(
-            stored, expected,
-            "governance SuspendCapability must store canonical UCAN-form keys"
+            .test_insert_member(member, "admin");
+        assert!(
+            mgr.contexts
+                .get("ctx-suspend-widen")
+                .unwrap()
+                .member_has_capability_pub(member, "messages:read"),
+            "precondition: member holds messages:read before suspension"
         );
 
-        // RestoreAccess removes the SAME canonical keys, fully clearing the set.
+        // SuspendAccess → suspend_all copies the member's effective capability
+        // set ({messages:read, member:ban}) into their suspended set.
         mgr.dispatch_governance_action(
-            "ctx-susp",
-            &GovernanceAction::RestoreAccess {
-                did: subject.clone(),
-                capabilities: caps,
+            "ctx-suspend-widen",
+            &GovernanceAction::SuspendAccess {
+                did: DID(member.to_owned()),
             },
-            "did:dht:zcreator",
+            creator,
             0,
         )
-        .expect("RestoreAccess must succeed");
+        .expect("SuspendAccess must succeed");
         assert!(
             !mgr.contexts
-                .get("ctx-susp")
+                .get("ctx-suspend-widen")
                 .unwrap()
-                .suspended_capabilities
-                .contains_key(subject.as_ref()),
-            "RestoreAccess must clear every key SuspendCapability stored"
+                .member_has_capability_pub(member, "messages:read"),
+            "after SuspendAccess the member must hold no capability"
+        );
+
+        // Governed ModifyCeiling WIDENS the ceiling: adds messages:write
+        // (retaining messages:read + member:ban).
+        mgr.dispatch_governance_action(
+            "ctx-suspend-widen",
+            &GovernanceAction::ModifyCeiling {
+                new_ceiling: vec![
+                    Capability::MessagesRead,
+                    Capability::MessagesWrite,
+                    Capability::MemberBan,
+                ],
+            },
+            creator,
+            0,
+        )
+        .expect("well-formed governed ModifyCeiling widen must succeed");
+
+        let ctx = mgr.contexts.get("ctx-suspend-widen").unwrap();
+
+        // Convergence: the ceiling itself WAS widened (set_ceiling ran).
+        assert_eq!(
+            ctx.role_state.ceiling().to_ucan_string_set(),
+            HashSet::from([
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "member:ban".to_owned()
+            ]),
+            "the ceiling must be widened to include messages:write"
+        );
+
+        // The bug-fix proof: the suspended member must NOT regain the newly-added
+        // capability across the widen. No eager refresh ran, so the member's
+        // `member_capabilities` was never recomputed to include messages:write —
+        // exactly as native leaves it.
+        assert!(
+            !ctx.member_has_capability_pub(member, "messages:write"),
+            "a SuspendAccess-suspended member must NOT gain a capability that a \
+             governed ceiling widen added (native parity: no per-member refresh)"
+        );
+
+        // And they remain suspended for the originally-suspended capability too.
+        assert!(
+            !ctx.member_has_capability_pub(member, "messages:read"),
+            "the member must remain fully suspended across the ceiling widen"
         );
     }
 
