@@ -381,12 +381,18 @@ let channel = try await sdk.standingContext(with: bobDID)
 try await channel.send("Are you available for the 3pm sync?")
 ```
 
-**Semantics of `standing_context`:**
+**Semantics of `standing_context`** (see spec §5.15.8 for the normative contract):
 
 1. Check local state for an existing `bilateral-persistent` context with this peer DID.
 2. If found and `Active`, return it. Zero network cost — instant.
-3. If not found, create one (`bilateral-persistent` template), send invitation, return the handle. First message queues until the peer joins.
-4. If found but peer has left, create a new one (re-invitation).
+3. If not found, create one (`bilateral-persistent` template), dispatch the Welcome, return the handle. First message queues until the peer joins.
+4. If a prior handle was reaped or never joined, it is transparently **auto-revived** under the deterministic `derived_context_id` (spec §5.15.8, ADR-049 §10) — *not* a fresh create. A dangling/reaped handle never surfaces an error.
+
+**`Ok` does not mean "peer joined."** A successful `standing_context` return means the **initiator's replica is created and the Welcome dispatched** — it does *not* block on the peer joining and does *not* confirm a bidirectional channel. An offline, slow, blocking, or consent-declining peer **all yield the identical `Ok`** (no synchronous join confirmation; the peer's join is observed only out-of-band). This uniformity is intentional: it is what forecloses a synchronous block/pair-existence oracle.
+
+**Welcome-joiner caveat (decrypt-but-not-send until Phase 2E).** A caller whose replica was obtained via **Welcome-join** — the common non-initiating peer, and a collision-losing `did_hi` — can join and **decrypt** but **cannot send** in the standing context until the Phase-2E spawn-from-Welcome entrypoint lands (ADR-049 §Follow-ups #1, spec §5.15.8). Do **not** assume `standing_context(peer)` immediately yields a send-capable channel on the joiner side; the initiator side is unaffected.
+
+**No create-vs-found discriminant (MUST).** FFI/SDK bindings **MUST NOT** enrich the `standing_context` return with a create-vs-found or `peer_joined` discriminant (e.g. a `created: bool`) — such a field re-opens the existence oracle the uniform `Ok` forecloses. The return shape MUST be identical across all four bindings.
 
 **Startup reconnection.** On SDK initialization, reconnect transport for all standing contexts. This is background work — the SDK reconnects to relays for all active persistent contexts and begins receiving queued messages. Standing contexts are available immediately after `sdk.init()` returns.
 
