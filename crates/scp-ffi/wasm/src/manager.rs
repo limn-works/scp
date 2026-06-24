@@ -1860,9 +1860,16 @@ impl WasmContextManager {
         // roll BOTH the `members` insert and the sequence seed back so a
         // rejected join leaves NO partial membership behind (fail-closed
         // atomicity — mirrors `dispatch_add_member` / `subscribe_broadcast`).
-        // The error is unreachable today for the built-in "member" role, but
-        // uniform atomicity at this security-relevant invariant is the correct
-        // posture across all three membership-add paths.
+        //
+        // Defense-in-depth: this assigns the built-in "member" role, whose caps
+        // are ceiling-filtered at `ContextRoleState` construction, so
+        // `system_assign_role` cannot return `RoleNotFound` /
+        // `MemberNotInContext` / `CapabilityOutsideCeiling` here — the error
+        // branch is unreachable today (infallible by construction). The
+        // rollback exists for uniform fail-closed atomicity across all
+        // membership-add paths and as robustness if a future change makes this
+        // assignment fallible. The load-bearing, genuinely-reachable rollback
+        // is `dispatch_add_member`'s (caller-supplied arbitrary role).
         ctx.role_state.members.insert(member_did.to_owned());
         ctx.member_sequence_numbers.insert(member_did.to_owned(), 0);
         if let Err(e) =
@@ -2264,13 +2271,52 @@ impl WasmContextManager {
         self.join_context(context_id, member_did, None)?;
 
         // Then set up MLS crypto state from the Welcome.
+        //
+        // REACHABLE-ROLLBACK: unlike the role-assign rollbacks elsewhere in
+        // this file (which guard a built-in-role assignment that is infallible
+        // by construction), `join_from_welcome` failure is genuinely reachable
+        // — a malformed, stale, or otherwise un-processable Welcome (or any
+        // subsequent crypto-setup error) returns `Err`. The inner
+        // `join_context` above already committed full membership state
+        // (`role_state.members` + `assignments` + `member_capabilities` +
+        // `member_sequence_numbers`) and the pending key package was already
+        // consumed. If we returned the crypto error here without rolling that
+        // membership back, the joiner would be left as a PHANTOM member: full
+        // role/sequence/membership state, counted by `member_count` /
+        // `is_member` / `member_dids`, charged against `WASM_MEMBER_CAP`, and
+        // role-assignable — yet with no MLS leaf, so unable to decrypt or send.
+        // Strip the membership the inner `join_context` added before
+        // propagating the error so the failed join leaves NO partial
+        // membership behind (fail-closed atomicity).
         let mls_group =
-            crate::crypto::group::WasmMlsGroup::join_from_welcome(welcome_bytes, holder).map_err(
-                |e| ScpWasmError::Crypto {
-                    message: format!("MLS welcome processing failed: {e}"),
-                    code: codes::CRYPTO_4021.to_owned(),
-                },
-            )?;
+            match crate::crypto::group::WasmMlsGroup::join_from_welcome(welcome_bytes, holder) {
+                Ok(group) => group,
+                Err(e) => {
+                    // Inline-strip rather than calling `leave_context`: this is an
+                    // as-if-never-joined rollback, so it must NOT emit a
+                    // `MemberLeft` buffer/log event, unsubscribe a broadcast that
+                    // was never subscribed, or trip `leave_context`'s
+                    // auto-close-on-empty. Mirror `leave_context`'s per-member
+                    // state teardown (members, role assignment, granted caps,
+                    // suspensions, MLS sequence counter) without those side
+                    // effects. No crypto state was installed yet, so there is none
+                    // to destroy. `require_active_context_mut` is reused because
+                    // the inner `join_context` may have re-borrowed `self`.
+                    let ctx = self.require_active_context_mut(context_id)?;
+                    ctx.role_state.members.remove(member_did);
+                    ctx.role_state.assignments.remove(member_did);
+                    ctx.role_state.member_capabilities.remove(member_did);
+                    if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
+                        let caps: Vec<Capability> = suspended.iter().cloned().collect();
+                        ctx.role_state.restore_capabilities(member_did, &caps);
+                    }
+                    ctx.member_sequence_numbers.remove(member_did);
+                    return Err(ScpWasmError::Crypto {
+                        message: format!("MLS welcome processing failed: {e}"),
+                        code: codes::CRYPTO_4021.to_owned(),
+                    });
+                }
+            };
 
         let ctx = self.require_active_context_mut(context_id)?;
         ctx.crypto = Some(crate::crypto::WasmCryptoState {
@@ -3932,15 +3978,52 @@ impl WasmContextManager {
                 // shared `system_assign_role` (which validates the role exists
                 // and refreshes `member_capabilities`). No-op if the DID is not
                 // a member, preserving the prior `if let Some` semantics.
+                //
+                // Defense-in-depth rollback: both `system_assign_role` calls
+                // target built-in roles ("member" / "admin"), whose caps are
+                // ceiling-filtered at `ContextRoleState` construction, so they
+                // cannot return `RoleNotFound` / `MemberNotInContext` /
+                // `CapabilityOutsideCeiling` today — this branch is unreachable
+                // by construction. It exists for uniform fail-closed atomicity:
+                // this is the one membership/role-state mutation path that
+                // would otherwise lack the rollback the sibling paths have. If a
+                // future change made the promotion fallible, returning its error
+                // after the demotion already landed would leave the old admin
+                // demoted with NO admin restored — a zero-admin vacancy. Capture
+                // the old admin's prior role and restore it (and `creator_did`)
+                // on promotion failure so the role state is unchanged on error.
+                let old_admin_prior_role = ctx
+                    .role_state
+                    .assignments
+                    .get(&old_admin)
+                    .map(|a| a.role_name.clone());
                 if ctx.role_state.members.contains(&old_admin) {
                     ctx.role_state
                         .system_assign_role(&old_admin, "member", &crate::time::WasmClock)
                         .map_err(map_role_error)?;
                 }
-                if ctx.role_state.members.contains(new_admin_str) {
-                    ctx.role_state
-                        .system_assign_role(new_admin_str, "admin", &crate::time::WasmClock)
-                        .map_err(map_role_error)?;
+                if ctx.role_state.members.contains(new_admin_str)
+                    && let Err(e) = ctx.role_state.system_assign_role(
+                        new_admin_str,
+                        "admin",
+                        &crate::time::WasmClock,
+                    )
+                {
+                    // Restore the old admin's prior role so the demotion above
+                    // does not leave a zero-admin vacancy. Only re-assign if the
+                    // old admin actually had a recorded role and is still a
+                    // member; `creator_did` was not yet mutated, so it needs no
+                    // restore here.
+                    if let Some(prior_role) = old_admin_prior_role
+                        && ctx.role_state.members.contains(&old_admin)
+                    {
+                        let _ = ctx.role_state.system_assign_role(
+                            &old_admin,
+                            &prior_role,
+                            &crate::time::WasmClock,
+                        );
+                    }
+                    return Err(map_role_error(e));
                 }
                 new_admin_str.clone_into(&mut ctx.role_state.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
@@ -5350,6 +5433,15 @@ impl WasmContextManager {
         // insert first; on assignment failure roll the insertion and sequence
         // seed back so a rejected subscribe leaves NO partial membership behind
         // (fail-closed atomicity — mirrors `dispatch_add_member`).
+        //
+        // Defense-in-depth: this assigns the built-in "subscriber" role, whose
+        // caps are ceiling-filtered at `ContextRoleState` construction, so
+        // `system_assign_role` cannot return `RoleNotFound` /
+        // `MemberNotInContext` / `CapabilityOutsideCeiling` here — the error
+        // branch is unreachable today (infallible by construction). The
+        // rollback exists for uniform fail-closed atomicity and robustness if a
+        // future change makes this assignment fallible; the load-bearing,
+        // genuinely-reachable rollback is `dispatch_add_member`'s.
         if !ctx.role_state.members.contains(subscriber_did) {
             ctx.role_state.members.insert(subscriber_did.to_owned());
             ctx.member_sequence_numbers
@@ -11021,6 +11113,97 @@ mod tests {
         assert!(
             !events.iter().any(|e| e.event_type == EventType::MemberLeft),
             "no MemberLeft leaf may be appended when MLS eviction fails"
+        );
+    }
+
+    /// `join_context_encrypted` must leave NO phantom member behind when the
+    /// MLS Welcome cannot be processed. The inner `join_context` commits full
+    /// membership state (the `members` set, role `assignments`,
+    /// `member_capabilities`, and the `member_sequence_numbers` seed) and
+    /// consumes the pending key package BEFORE `join_from_welcome` runs; a
+    /// malformed Welcome (here, empty bytes that fail TLS deserialization) is a
+    /// genuinely-reachable crypto error. Without the rollback the joiner would
+    /// be a phantom member, observable via `is_member`, `member_count`, and
+    /// `member_dids`, charged against `WASM_MEMBER_CAP`, and role-assignable,
+    /// yet with no MLS leaf. This test drives that failure and asserts the
+    /// failed join is fully atomic: the member is absent and the
+    /// sequence-number seed is gone.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn join_context_encrypted_rolls_back_membership_on_welcome_failure() {
+        let context_id = "ctx-wasm-join-encrypted-rollback";
+        let creator = "did:dht:z6MkWasmJoinRollbackCreator";
+        let joiner = "did:dht:z6MkWasmJoinRollbackJoiner";
+
+        // Active, unencrypted, no-payment context: the inner `join_context`
+        // succeeds (joiner is not yet a member; the built-in "member" role
+        // assign is infallible by construction), so control reaches the
+        // reachable `join_from_welcome` failure path under test.
+        let ctx = make_bare_per_context_state(context_id, creator);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // Populate the pending key package so `join_context_encrypted` does NOT
+        // fail early at the CRYPTO_4023 "no pending key package" guard — we
+        // want it to proceed through the inner join and into `join_from_welcome`.
+        let kp_bytes = mgr
+            .generate_key_package_for_join(context_id, joiner)
+            .expect("key package generation must succeed for an active context");
+        assert!(
+            !kp_bytes.is_empty(),
+            "a generated key package must carry bytes"
+        );
+
+        // Sanity: the joiner is NOT a member before the attempt.
+        assert!(
+            !mgr.is_member(context_id, joiner),
+            "joiner must not be a member before join_context_encrypted"
+        );
+        let count_before = mgr
+            .member_count(context_id)
+            .expect("active context has a member count");
+
+        // Empty welcome bytes fail TLS deserialization inside
+        // `join_from_welcome` (a reachable crypto error), so the inner
+        // `join_context`'s membership commit must be rolled back.
+        let result = mgr.join_context_encrypted(context_id, joiner, &[]);
+        match result {
+            Err(ScpWasmError::Crypto { ref code, .. }) => assert_eq!(
+                code,
+                codes::CRYPTO_4021,
+                "a malformed Welcome must surface as the CRYPTO_4021 welcome-processing error"
+            ),
+            other => panic!(
+                "join_context_encrypted with an empty Welcome MUST fail with a \
+                 CRYPTO_4021 Crypto error, got: {other:?}"
+            ),
+        }
+
+        // Fail-closed atomicity: no phantom member remains.
+        assert!(
+            !mgr.is_member(context_id, joiner),
+            "a failed MLS welcome must NOT leave the joiner as a member"
+        );
+        assert_eq!(
+            mgr.member_count(context_id),
+            Some(count_before),
+            "member_count must be unchanged after a failed encrypted join"
+        );
+        assert!(
+            !mgr.member_dids(context_id).contains(&joiner.to_owned()),
+            "the joiner must not appear in member_dids after a failed encrypted join"
+        );
+        assert_eq!(
+            mgr.member_role(context_id, joiner),
+            None,
+            "a failed encrypted join must leave no role assignment for the joiner"
+        );
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(joiner),
+            None,
+            "a failed encrypted join must roll back the joiner's sequence-number seed \
+             (it is seeded by the inner join_context before the reachable join_from_welcome \
+             failure, so this would be Some(0) without the rollback)"
         );
     }
 
