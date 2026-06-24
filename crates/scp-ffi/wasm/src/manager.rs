@@ -1961,6 +1961,7 @@ impl WasmContextManager {
         // suspension).
         ctx.role_state.assignments.remove(member_did);
         ctx.role_state.member_capabilities.remove(member_did);
+        // Clears the member's suspensions on removal — see the RemoveMember handler for the known native↔WASM divergence + deferred shared-removal convergence.
         if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
             let caps: Vec<Capability> = suspended.iter().cloned().collect();
             ctx.role_state.restore_capabilities(member_did, &caps);
@@ -2085,6 +2086,12 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
+        // Per-member message-sequence sidecar. The `+= 1` matches native's
+        // `MembershipState::next_sequence_number` (membership.rs), which also
+        // uses a plain `+= 1`. The sidecar's base/semantics (`member_sequence_numbers`
+        // here vs native's `MembershipState::next_sequence_number`) are a
+        // deferred MembershipState convergence item: they will converge when
+        // WASM adopts the shared `MembershipState`.
         let seq_entry = ctx
             .member_sequence_numbers
             .entry(sender_did.to_owned())
@@ -2356,6 +2363,7 @@ impl WasmContextManager {
                     ctx.role_state.members.remove(member_did);
                     ctx.role_state.assignments.remove(member_did);
                     ctx.role_state.member_capabilities.remove(member_did);
+                    // Clears the member's suspensions on removal — see the RemoveMember handler for the known native↔WASM divergence + deferred shared-removal convergence.
                     if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
                         let caps: Vec<Capability> = suspended.iter().cloned().collect();
                         ctx.role_state.restore_capabilities(member_did, &caps);
@@ -3991,17 +3999,22 @@ impl WasmContextManager {
         ctx.role_state.members.remove(did);
 
         // Drop all per-DID state the removed member left behind. Native
-        // `execute_remove_member` strips `role_state.members`, `assignments`,
-        // `member_capabilities`, the access key store entry, and the pseudonym
-        // routing entry — but it deliberately LEAVES the member's
-        // `suspended_capabilities` in place. WASM goes one step beyond native
-        // and ALSO clears the suspensions (the `restore_capabilities` call
-        // below): leaving any per-DID state behind is a stale-desync foothold,
-        // so a DID later re-admitted under the same string would otherwise
-        // inherit a phantom assignment, suspension, read-exclusion, or sequence
-        // number. The CEK-exclusion state is `read_exclusion_list` and the MLS
-        // sequence counter is `member_sequence_numbers`. All removals are
-        // no-ops if absent.
+        // `execute_remove_member` (governance_helpers.rs) leaves the removed
+        // member's `suspended_capabilities` entry in place — it strips
+        // members/assignments/member_capabilities (plus the access key store
+        // entry and the pseudonym routing entry) but has no removal primitive
+        // that clears the suspension. WASM clears it here (via
+        // `restore_capabilities`) as the safer behavior: a re-admitted same-DID
+        // member must not inherit a phantom suspension, assignment,
+        // read-exclusion, or sequence number. The CEK-exclusion state is
+        // `read_exclusion_list` and the MLS sequence counter is
+        // `member_sequence_numbers`. All removals are no-ops if absent.
+        //
+        // This is a KNOWN native↔WASM divergence where native should converge
+        // TO WASM; the convergence — a shared `ContextRoleState::remove_member`
+        // primitive in scp-protocol with a spec-decided canonical
+        // suspension-on-removal policy — is deferred to the MembershipState /
+        // shared-removal slice.
         ctx.role_state.assignments.remove(did);
         ctx.role_state.member_capabilities.remove(did);
         if let Some(suspended) = ctx.role_state.suspended_for(did) {
@@ -5591,6 +5604,8 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
+        // Per-member sequence sidecar — see `send_message` for the deferred
+        // MembershipState convergence note.
         let seq_entry = ctx
             .member_sequence_numbers
             .entry(author_did.to_owned())
@@ -6560,11 +6575,11 @@ impl WasmContextManager {
             });
         }
 
-        // Fail closed on pre-signature (unsigned) envelopes. Versions below 4
-        // carried no Ed25519 snapshot signature, so the embedded snapshot was
-        // not cross-party verifiable — refuse rather than import unverifiable
-        // membership/role/governance state (§23.16.8). Distinct from a
-        // signature failure: this is a version error.
+        // Fail closed on pre-signature (unsigned) envelopes. Versions below
+        // `WASM_EXPORT_VERSION` carried no Ed25519 snapshot signature, so the
+        // embedded snapshot was not cross-party verifiable — refuse rather than
+        // import unverifiable membership/role/governance state (§23.16.8).
+        // Distinct from a signature failure: this is a version error.
         if envelope.version < WASM_EXPORT_VERSION {
             return Err(ScpWasmError::Context {
                 message: format!(
