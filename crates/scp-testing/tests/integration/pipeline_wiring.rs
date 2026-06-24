@@ -932,7 +932,7 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
             "restore_all_persisted_contexts",
             "restore_on_startup()"
         ),
-        "BridgeInstanceCore::restore_all_persisted_contexts (the production startup/resume path) \
+        "CoreFields::restore_all_persisted_contexts (the production startup/resume path) \
          must call Supervisor::restore_on_startup() so the §17.16.4 saga-journal replay runs \
          after context restore on every process restart"
     );
@@ -942,7 +942,7 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
             "restore_all_persisted_contexts",
             "restore_all_contexts()"
         ),
-        "BridgeInstanceCore::restore_all_persisted_contexts must NOT call the bare \
+        "CoreFields::restore_all_persisted_contexts must NOT call the bare \
          restore_all_contexts() — that bypasses the saga-journal replay; route through \
          restore_on_startup() instead"
     );

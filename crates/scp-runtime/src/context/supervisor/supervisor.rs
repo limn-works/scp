@@ -1362,9 +1362,11 @@ impl Supervisor {
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Arc<Self> {
-        // The default provider bootstrap wires the no-op saga journal (the
-        // bridge attaches a durable journal separately). Saga unit/integration
-        // tests that need a durable journal use
+        // The default provider bootstrap wires the no-op saga journal. This is
+        // the path production bridges currently take — no durable journal is
+        // attached at the bridge today; durable journal wiring lands in a later
+        // phase by switching the bridge to `with_providers_and_journal`. Saga
+        // unit/integration tests that need a durable journal use
         // [`Self::with_providers_and_journal`].
         Self::with_providers_and_journal(
             crypto,
@@ -1382,20 +1384,28 @@ impl Supervisor {
 
     /// Like [`Self::with_providers`] but with a caller-supplied saga journal —
     /// the seam the saga FSM + crash-recovery tests use to drive the REAL
-    /// journal write-ordering over co-resident actors. Production bootstrap goes
-    /// through [`Self::with_providers`] (no-op journal); a durable journal is
-    /// attached at the bridge layer.
+    /// journal write-ordering over co-resident actors, and the seam by which a
+    /// durable saga journal will be wired into production bridges in a later
+    /// phase (Phase 2D / PR-7).
+    ///
+    /// Production bridges currently construct via [`Self::with_providers`],
+    /// which hardcodes [`NoopSagaJournal`] — i.e. NO durable
+    /// `ProtocolRepositorySagaJournal` is attached at the bridge today. When the
+    /// production journal-wiring lands, the bridges switch from
+    /// [`Self::with_providers`] to this constructor with a real
+    /// `ProtocolRepositorySagaJournal`.
     ///
     /// **Visibility (`pub`, intentional).** Kept `pub` so the bridge-path
     /// bootstrap test (`scp-testing`, a separate crate) can construct a
     /// supervisor that has BOTH a durable saga journal AND a populated
     /// helper-persistence slot — the two ingredients a real
     /// [`Self::restore_on_startup`] needs to exercise restore-then-replay
-    /// end-to-end through the FFI bridge entry. This does NOT widen the
-    /// journal-injection surface: the already-`pub` [`Self::new`] accepts an
-    /// arbitrary `Arc<dyn SagaJournal>` too, so any crate could already inject a
-    /// journal; this constructor merely adds the provider wiring that
-    /// [`Self::with_providers`] already exposes.
+    /// end-to-end through the FFI bridge entry. The real precedent for exposing
+    /// this provider-wiring surface as `pub` is the unconditionally-`pub`
+    /// [`Self::with_providers`], which already accepts exactly these providers
+    /// (it merely hardcodes [`NoopSagaJournal`] in place of the caller-supplied
+    /// journal). This constructor only adds the `saga_journal` parameter to that
+    /// already-public surface; it does not widen any other injection point.
     #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
     pub fn with_providers_and_journal(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
@@ -8009,20 +8019,24 @@ impl Supervisor {
     /// Call [`RestoredContexts::ids`] / [`RestoredContexts::into_ids`] to read the
     /// IDs.
     ///
-    /// **Visibility (`pub`, intentional).** Kept `pub` — not `pub(crate)` —
-    /// because the persistence E2E integration suite (`scp-testing`, a separate
-    /// crate) drives context restore directly against a real SQLite-backed repo.
-    /// The production FFI bridges never call this directly on the bootstrap
-    /// path; they route through [`Self::restore_on_startup`] (so the §17.16.4
-    /// saga-journal replay always runs), and the
-    /// `bridge_resume_path_routes_through_restore_on_startup` structural gate
-    /// enforces that no bridge calls the bare restore and skips replay.
+    /// **Visibility (`pub(crate)`, intentional — restore-implies-replay seal).**
+    /// Narrowed from `pub` to `pub(crate)` so the bare restore leg cannot be
+    /// reached cross-crate: a future bridge could otherwise call this directly,
+    /// take [`RestoredContexts::into_ids`], and silently skip the §17.16.4
+    /// saga-journal replay. Closing the visibility forces every cross-crate
+    /// startup/resume caller through [`Self::restore_on_startup`], which runs
+    /// restore THEN replay. The witness already enforces "no replay before
+    /// restore" by construction; this `pub(crate)` closes the dual seam ("no
+    /// restore without replay") at the compiler. In-crate callers
+    /// ([`Self::restore_on_startup`] and the in-crate tests) are unaffected.
     ///
     /// # Errors
     ///
     /// - [`ContextError::PersistenceFailed`] if the persistence
     ///   provider is unconfigured or `list_persisted_contexts` fails.
-    pub async fn restore_all_contexts(self: &Arc<Self>) -> Result<RestoredContexts, ContextError> {
+    pub(crate) async fn restore_all_contexts(
+        self: &Arc<Self>,
+    ) -> Result<RestoredContexts, ContextError> {
         let ids = crate::context::lifecycle_helpers::restore_all_contexts(self).await?;
         Ok(RestoredContexts::new(ids))
     }

@@ -385,14 +385,19 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     );
 
     manager2.register_local_did(alice.clone()).await.unwrap();
+    // Route through the production startup entry (`restore_on_startup` =
+    // restore THEN saga-journal replay). The bare `restore_all_contexts` leg is
+    // `pub(crate)` (restore-implies-replay seal); cross-crate callers must use
+    // this combined entry. Replay over this manager's `NoopSagaJournal` (wired
+    // by `with_providers`) is a no-op — no saga is ever started here — so the
+    // restore semantics this test asserts on are preserved.
     let restored = manager2
-        .restore_all_contexts()
+        .restore_on_startup()
         .await
-        .expect("restore_all_contexts must succeed against sqlite-backed repo");
+        .expect("restore_on_startup must succeed against sqlite-backed repo");
     assert!(
-        restored.ids().iter().any(|id| id == ctx_id),
-        "restore_all_contexts must return the previously-persisted context id, got {:?}",
-        restored.ids()
+        restored.iter().any(|id| id == ctx_id),
+        "restore_on_startup must return the previously-persisted context id, got {restored:?}"
     );
 
     // ---- Phase 4: Verify state survived. ----

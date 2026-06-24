@@ -1,10 +1,10 @@
 //! Bridge-path startup recovery bootstrap (ADR-049 Phase 2D, §17.16.4).
 //!
-//! This is the BEHAVIORAL enforcement that the shared FFI bridge restore entry
-//! point — `BridgeInstanceCore::restore_all_persisted_contexts`, which all three
-//! non-WASM bridges (`PyBridgeInstance`, `NapiBridgeInstance`,
-//! `UniffiBridgeInstance`) delegate to — runs BOTH legs of the §17.16.4
-//! restore-then-replay startup sweep:
+//! This is the BEHAVIORAL enforcement that the shared bridge restore entry
+//! `CoreFields::restore_all_persisted_contexts`, which all three non-WASM
+//! bridges (`PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance`)
+//! reach through the `BridgeInstanceCore::resume` default body — runs BOTH legs
+//! of the §17.16.4 restore-then-replay startup sweep:
 //!
 //! 1. RESTORE — rehydrate every persisted `Active` context's actor from the
 //!    persistence provider.
