@@ -291,16 +291,16 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 // malformed ceiling from bytes (the `#[serde(try_from)]` path). The shared type is
 // the single enforcement point both bridges share.
 //
-// Two boundary validators remain because the WASM bridge parses untyped JS input
-// (colon-form create strings) and untrusted deserialized peer exports (UCAN-form
-// import strings) into typed `Capability`s before they reach `ContextRoleState`,
-// and the parse alone is lossy (an unrecognized colon-form token silently becomes
-// `Custom`): validating the PARSED enum / the UCAN string up front rejects a
-// malformed or non-canonical entry with the canonical bridge `Validation` error
-// (`SCP-VALID-7000`) instead of the shared type's `RoleError`, AND — on import —
-// rejects a non-canonical COLON-form built-in that the lossy parse would otherwise
-// canonicalize and accept (BLACK-002 ModifyCeiling, BLACK-003 create, BLACK-005
-// import).
+// `ceiling_validation_error` maps the shared `CeilingEntryError` to the canonical
+// `SCP-VALID-7000` bridge `Validation` error so the reject surface is identical
+// across the create / modify / import paths. The §5.3.1.1 grammar itself is
+// enforced exactly once by the shared type: `ContextRoleState::new` and
+// `set_ceiling` both run `CapabilityCeiling::validate_entries`, and import
+// validates the deserialized typed ceiling directly via `validate_entries`. No
+// separate WASM-side per-capability validator remains — the create path maps the
+// shared `RoleError::InvalidCeilingCategory` to `SCP-VALID-7000`, and the modify
+// path surfaces `set_ceiling`'s `CeilingEntryError` through
+// `ceiling_validation_error`.
 
 /// Maps a ceiling-grammar error into the canonical WASM bridge validation error
 /// (`SCP-VALID-7000`), so the reject surface is identical across the create /
@@ -310,28 +310,6 @@ fn ceiling_validation_error(e: scp_protocol::context::roles::CeilingEntryError) 
         message: e.to_string(),
         code: codes::VALID_7000.to_owned(),
     }
-}
-
-/// Validates each already-parsed [`Capability`] against the §5.3.1.1 ceiling-entry
-/// grammar (the create path, after `Capability::new`, and the `ModifyCeiling`
-/// governance path, whose `new_ceiling` is already typed). Validates the PARSED
-/// enum so a malformed `Custom` (no-colon `payments`, stray-`*` `*:*`/`*:read`,
-/// multi-colon `a:b:c`, underscore-resource) is rejected BEFORE any mutation —
-/// the same enforcement the shared `CapabilityCeiling::validate_entries` performs,
-/// surfaced as the canonical bridge `Validation` error at the boundary.
-///
-/// # Errors
-///
-/// Returns a `Validation` error on the first capability that is not a well-formed
-/// ceiling entry per spec §5.3.1.1.
-fn validate_ceiling_capabilities(
-    caps: &[scp_protocol::context::roles::Capability],
-) -> Result<(), ScpWasmError> {
-    for cap in caps {
-        cap.validate_as_ceiling_entry()
-            .map_err(ceiling_validation_error)?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,27 +1583,23 @@ impl WasmContextManager {
             });
         }
 
-        // Build the typed capability ceiling, enforcing the §5.3.1.1 ceiling-entry
-        // grammar (BLACK-003). Empty input -> the shared `default_ceiling()` (its
-        // `to_ucan_string_set()` is byte-equal to the former
-        // `build_ceiling_strings(empty)` default — verified format-preserving).
-        // Non-empty input -> parse each user-supplied colon-form string via
-        // `Capability::new` (the same parse the shared enforcement uses), validate
-        // the PARSED enums via `validate_as_ceiling_entry`, then build the ceiling.
-        // Validating the parsed enum (not the raw string) is what closes BLACK-003:
-        // a malformed entry (no-colon `custom:payments` -> `Custom("payments")`,
-        // stray-`*` `*:*`/`*:read`, multi-colon) is rejected with the canonical
-        // `SCP-VALID-7000` error here, BEFORE the ceiling reaches the (also
-        // validating, defense-in-depth) `ContextRoleState::new`. The ceiling is
-        // stored as `Capability` enums in `ContextRoleState`; its canonical
-        // UCAN-string projection (`to_ucan_string_set`) is byte-identical to what
-        // the native bridge stores for the same logical entries.
+        // Build the typed capability ceiling. Empty input -> the shared
+        // `default_ceiling()` (its `to_ucan_string_set()` is byte-equal to the
+        // former `build_ceiling_strings(empty)` default — verified
+        // format-preserving). Non-empty input -> parse each user-supplied
+        // colon-form string via `Capability::new` (the same parse the shared
+        // enforcement uses), then build the ceiling. The §5.3.1.1 grammar is
+        // enforced by the shared `ContextRoleState::new` below, which runs
+        // `CapabilityCeiling::validate_entries` and surfaces a malformed entry as
+        // the canonical `SCP-VALID-7000` error (mapped from
+        // `RoleError::InvalidCeilingCategory`). The ceiling is stored as
+        // `Capability` enums in `ContextRoleState`; its canonical UCAN-string
+        // projection (`to_ucan_string_set`) is byte-identical to what the native
+        // bridge stores for the same logical entries.
         let ceiling: CapabilityCeiling = if ceiling.is_empty() {
             scp_protocol::context::roles::default_ceiling()
         } else {
-            let parsed: Vec<Capability> = ceiling.iter().map(Capability::new).collect();
-            validate_ceiling_capabilities(&parsed)?;
-            CapabilityCeiling::new(parsed)
+            CapabilityCeiling::new(ceiling.iter().map(Capability::new))
         };
 
         // Parse and validate minProtocolVersion from params (spec §13.4).
@@ -1699,12 +1673,12 @@ impl WasmContextManager {
 
         // Initialize the shared role state: `ContextRoleState::new` auto-derives
         // built-in role definitions from the ceiling and assigns the creator the
-        // `admin` role. It also re-validates the ceiling grammar
-        // (`validate_entries`) as defense in depth — the boundary
-        // `validate_ceiling_capabilities` above already rejected a malformed entry
-        // with the canonical `SCP-VALID-7000` error, so the only error reachable
-        // here with no custom roles is a custom role outside the ceiling. Map it to
-        // a context error rather than unwrapping, per the no-unwrap policy.
+        // `admin` role. It is the single §5.3.1.1 enforcement point on the create
+        // path: it runs `CapabilityCeiling::validate_entries`, so a malformed
+        // ceiling entry surfaces as `RoleError::InvalidCeilingCategory`. Map that
+        // to the canonical `SCP-VALID-7000` `Validation` error (identical reject
+        // surface to the modify / import paths); any other error here (a custom
+        // role outside the ceiling) maps to a context error.
         let role_state = ContextRoleState::new(
             context_id.to_owned(),
             creator_did.to_owned(),
@@ -1712,9 +1686,14 @@ impl WasmContextManager {
             Vec::new(),
             &crate::time::WasmClock,
         )
-        .map_err(|e| ScpWasmError::Context {
-            message: format!("role state initialization failed: {e}"),
-            code: codes::CTX_2001.to_owned(),
+        .map_err(|e| match e {
+            scp_protocol::context::roles::RoleError::InvalidCeilingCategory(ce) => {
+                ceiling_validation_error(ce)
+            }
+            other => ScpWasmError::Context {
+                message: format!("role state initialization failed: {other}"),
+                code: codes::CTX_2001.to_owned(),
+            },
         })?;
 
         // Seed the creator's MLS message sequence counter.
@@ -3661,13 +3640,12 @@ impl WasmContextManager {
 
     /// Handles a `ModifyCeiling` governance action (BLACK-002).
     ///
-    /// Ceiling-entry grammar enforcement (spec §5.3.1.1): validates the PARSED
-    /// `new_ceiling` enums via `validate_as_ceiling_entry` BEFORE any mutation, so
-    /// a malformed proposed entry (no-colon / stray-`*` / multi-colon `Custom`)
-    /// is rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
-    /// is left UNCHANGED (fail-closed). The validated replacement is then stored
-    /// via the shared `ContextRoleState::set_ceiling` (itself a §5.3.1.1
-    /// enforcement point, defense in depth), and nothing else.
+    /// Ceiling-entry grammar enforcement (spec §5.3.1.1): the shared
+    /// `ContextRoleState::set_ceiling` is the single fail-closed validation point.
+    /// It runs `CapabilityCeiling::validate_entries` BEFORE storing, so a malformed
+    /// proposed entry (no-colon / stray-`*` / multi-colon `Custom`) is rejected
+    /// with the canonical `SCP-VALID-7000` error and the prior ceiling is left
+    /// UNCHANGED, and nothing else mutates.
     ///
     /// Convergence with native (`apply_pending_ceiling_modification`): native
     /// applies a ceiling modification with `role_state.set_ceiling(...)` ONLY — it
@@ -3691,9 +3669,6 @@ impl WasmContextManager {
         context_id: &str,
         new_ceiling: &[scp_protocol::context::roles::Capability],
     ) -> Result<serde_json::Value, ScpWasmError> {
-        // Validate the WHOLE replacement BEFORE any mutation, so a malformed
-        // proposed entry leaves the prior ceiling unchanged (fail-closed).
-        validate_ceiling_capabilities(new_ceiling)?;
         let ctx = self.require_active_context_mut(context_id)?;
         if ctx.ceiling_policy != "governed" {
             return Err(ScpWasmError::Permission {
@@ -3701,11 +3676,12 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
-        // The entries are pre-validated above, so the shared `set_ceiling`
-        // re-validation cannot fail here; surface it as a `Validation` error
-        // regardless (no silent swallow), keeping the store fail-closed. No
-        // built-in-role rebuild and no per-member `system_assign_role` refresh —
-        // `member_capabilities` go stale-on-ceiling-change exactly like native.
+        // The shared `set_ceiling` is the single fail-closed validation point: it
+        // runs `validate_entries` BEFORE storing, so a malformed proposed entry is
+        // rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
+        // is left UNCHANGED. No built-in-role rebuild and no per-member
+        // `system_assign_role` refresh — `member_capabilities` go
+        // stale-on-ceiling-change exactly like native.
         ctx.role_state
             .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;
@@ -8574,6 +8550,120 @@ mod tests {
         );
     }
 
+    /// `subscribe_broadcast` on a Broadcast context adds the new DID as a member,
+    /// assigns it the built-in `subscriber` role, and seeds its MLS sequence
+    /// counter — and a repeat subscribe is idempotent (the `!members.contains`
+    /// guard leaves membership / role / sequence untouched, with no error).
+    #[test]
+    fn subscribe_broadcast_adds_member_with_subscriber_role_wasm() {
+        let mut mgr = make_manager_with_broadcast(
+            "ctx-bcast",
+            "did:dht:zcreator",
+            &["did:dht:zcreator"],
+            &[],
+        );
+        let subscriber = "did:dht:zsubscriber";
+
+        // Pre-state: the subscriber is neither a member nor sequence-seeded.
+        {
+            let ctx = mgr.contexts.get("ctx-bcast").unwrap();
+            assert!(
+                !ctx.role_state.members.contains(subscriber),
+                "subscriber must not be a member before subscribing"
+            );
+            assert!(
+                !ctx.member_sequence_numbers.contains_key(subscriber),
+                "subscriber must not have a sequence counter before subscribing"
+            );
+        }
+
+        mgr.subscribe_broadcast("ctx-bcast", subscriber)
+            .expect("subscribe to an open broadcast context must succeed");
+
+        // Post-state: member, `subscriber` role, sequence seeded to 0.
+        {
+            let ctx = mgr.contexts.get("ctx-bcast").unwrap();
+            assert!(
+                ctx.role_state.members.contains(subscriber),
+                "subscriber must be a member after subscribing"
+            );
+            assert_eq!(
+                ctx.member_sequence_numbers.get(subscriber),
+                Some(&0),
+                "subscriber's MLS sequence counter must be seeded to 0"
+            );
+        }
+        assert_eq!(
+            mgr.member_role("ctx-bcast", subscriber).as_deref(),
+            Some("subscriber"),
+            "subscriber must hold the built-in `subscriber` role"
+        );
+
+        // Idempotent re-subscribe: no error, no duplicate, state unchanged.
+        mgr.subscribe_broadcast("ctx-bcast", subscriber)
+            .expect("re-subscribing must be idempotent (no error)");
+        let ctx = mgr.contexts.get("ctx-bcast").unwrap();
+        assert!(
+            ctx.role_state.members.contains(subscriber),
+            "re-subscribe must leave membership intact"
+        );
+        assert_eq!(
+            ctx.member_sequence_numbers.get(subscriber),
+            Some(&0),
+            "re-subscribe must not reset or duplicate the sequence counter"
+        );
+        assert_eq!(
+            mgr.member_role("ctx-bcast", subscriber).as_deref(),
+            Some("subscriber"),
+            "re-subscribe must leave the `subscriber` role intact"
+        );
+    }
+
+    /// `subscribe_broadcast` on a NON-broadcast context is rejected with the
+    /// `not a broadcast context` `Context` error (`SCP-CTX-2001`) and performs NO
+    /// membership mutation — the would-be subscriber is never added.
+    #[test]
+    fn subscribe_broadcast_on_non_broadcast_context_is_rejected_wasm() {
+        // A bare active context is Unencrypted with `broadcast_context: None`.
+        let mut mgr = WasmContextManager::new();
+        let ctx = make_bare_per_context_state("ctx-plain", "did:dht:zcreator");
+        mgr.contexts.insert("ctx-plain".to_owned(), ctx);
+        let subscriber = "did:dht:zsubscriber";
+
+        let err = mgr
+            .subscribe_broadcast("ctx-plain", subscriber)
+            .expect_err("subscribing to a non-broadcast context must be rejected");
+        match err {
+            ScpWasmError::Context {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(code, codes::CTX_2001);
+                assert!(
+                    message.contains("not a broadcast context"),
+                    "expected `not a broadcast context`, got: {message}"
+                );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+
+        // No membership mutation: only the creator remains; the subscriber was
+        // never inserted into members or sequence-seeded.
+        let ctx = mgr.contexts.get("ctx-plain").unwrap();
+        assert!(
+            !ctx.role_state.members.contains(subscriber),
+            "a rejected subscribe must not add the subscriber to members"
+        );
+        assert!(
+            !ctx.member_sequence_numbers.contains_key(subscriber),
+            "a rejected subscribe must not seed a sequence counter"
+        );
+        assert!(
+            mgr.member_role("ctx-plain", subscriber).is_none(),
+            "a rejected subscribe must not assign any role"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ucan_revoke idempotent-at-capacity tests (#895)
     // -----------------------------------------------------------------------
@@ -9425,8 +9515,8 @@ mod tests {
     }
 
     /// CREATE-PATH canonical-form parity: the WASM create path parses each
-    /// user-supplied colon-form entry via `Capability::new`, validates it
-    /// (`validate_ceiling_capabilities`), and stores the typed ceiling inside
+    /// user-supplied colon-form entry via `Capability::new`, validates it via the
+    /// shared `ContextRoleState::new` (`validate_entries`), and stores the typed ceiling inside
     /// `ContextRoleState`; its canonical UCAN-string projection
     /// (`ceiling().to_ucan_string_set()`) is byte-identical to the native bridge's
     /// `Capability::ucan_capability_name` set for the SAME logical entries — closing
@@ -9447,10 +9537,11 @@ mod tests {
             "context:child:create".to_owned(),
             "billing:*".to_owned(),
         ];
-        // Mirror the create path: parse each entry, validate the parsed enums,
-        // build the typed ceiling, and store it in `ContextRoleState`.
+        // Mirror the create path: parse each entry, build the typed ceiling, and
+        // store it in `ContextRoleState`. `ContextRoleState::new` runs
+        // `validate_entries` — the single §5.3.1.1 enforcement point — so the
+        // `.expect` below also proves the well-formed entries validate.
         let parsed: Vec<Capability> = entries.iter().map(Capability::new).collect();
-        validate_ceiling_capabilities(&parsed).expect("well-formed colon entries must validate");
         let role_state = ContextRoleState::new(
             "ctx-create-parity",
             "did:dht:zcreator",
@@ -9550,7 +9641,7 @@ mod tests {
             "custom:payments:approve".to_owned(),
             "tool:invoke:*".to_owned(),
         ];
-        let caps = vec![
+        let caps = [
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
             Capability::ToolInvokeAll,
@@ -9561,17 +9652,20 @@ mod tests {
             "tool_invoke:*".to_owned(),
         ];
 
-        // CREATE: parse colon input, validate, build ceiling, project to UCAN form.
+        // CREATE: parse colon input, validate via the shared `validate_entries`,
+        // build ceiling, project to UCAN form.
         let parsed: Vec<Capability> = colon_input.iter().map(Capability::new).collect();
-        validate_ceiling_capabilities(&parsed).unwrap();
-        let from_create: HashSet<String> = CapabilityCeiling::new(parsed).to_ucan_string_set();
+        let create_ceiling = CapabilityCeiling::new(parsed);
+        create_ceiling.validate_entries().unwrap();
+        let from_create: HashSet<String> = create_ceiling.to_ucan_string_set();
 
-        // MODIFY: validate the typed enums, project the SAME way the stored
-        // `ContextRoleState` ceiling does (`set_ceiling_and_refresh` stores these
-        // enums; `to_ucan_string_set` is their canonical projection).
-        validate_ceiling_capabilities(&caps).unwrap();
-        let from_modify: HashSet<String> =
-            CapabilityCeiling::new(caps.iter().cloned()).to_ucan_string_set();
+        // MODIFY: validate the typed enums via the shared `validate_entries`,
+        // project the SAME way the stored `ContextRoleState` ceiling does
+        // (`set_ceiling_and_refresh` stores these enums; `to_ucan_string_set` is
+        // their canonical projection).
+        let modify_ceiling = CapabilityCeiling::new(caps.iter().cloned());
+        modify_ceiling.validate_entries().unwrap();
+        let from_modify: HashSet<String> = modify_ceiling.to_ucan_string_set();
 
         // IMPORT: the ceiling now arrives inside the typed `ContextRoleState`
         // (carried + restored VERBATIM). Reconstruct the ceiling from the

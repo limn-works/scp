@@ -113,14 +113,13 @@ Real MLS encryption using OpenMLS 0.8 with `features = ["js"]`. **Not a reimplem
 
 ## Runtime Registry
 
-WASM is single-threaded. The context registry uses `thread_local! { static CONTEXT_REGISTRY: RefCell<HashMap<String, WasmContextRuntime>> }` — no `Mutex` or `DashMap` needed. `with_context(id, closure)` is the access pattern, mirroring the PyO3 bridge's pattern.
+WASM is single-threaded. The context registry is a single `thread_local! { static MANAGER: RefCell<WasmContextManager> }` whose `WasmContextManager` holds `contexts: HashMap<String, PerContextState>` keyed by context ID — no `Mutex` or `DashMap` needed. `with_manager(closure)` is the access pattern, handing the closure `&mut WasmContextManager`.
 
-`WasmContextRuntime` fields:
+`PerContextState` fields (selected):
 - `tool_registry: ToolRegistry` — tool registration/invocation
 - `event_log: EventLog` — from `scp_event_log` (shared implementation)
 - `revoked_tokens: HashSet<String>` — UCAN revocation set (CIDs)
-- `ceiling_strings: HashSet<String>` — capability ceiling for UCAN validation
-- `creator_did: String` — DID of the context creator
+- `role_state: ContextRoleState` — the shared `scp_protocol::context::roles::ContextRoleState`, which owns the capability ceiling (`role_state.ceiling()`, enforced via `validate_entries`), the creator/admin assignment, members, and role definitions. The former flat `ceiling_strings: HashSet<String>` / `creator_did: String` fields are GONE — that state now lives inside `role_state`, the single enforcement point shared with the native bridge.
 
 ## Event Log — Shared Implementation
 
@@ -154,4 +153,4 @@ cargo check --target wasm32-unknown-unknown -p scp-ffi-wasm
 - `js_sys::Date::now()` returns milliseconds since epoch as `f64` — divide by 1000.0 for seconds. Do not use `std::time::SystemTime` (not available on wasm32).
 - `rand_core = { version = "0.6", features = ["getrandom"] }` provides `OsRng` for Ed25519 key generation. Works via `getrandom` 0.2 with `js` feature -> `crypto.getRandomValues`. Must match `ed25519-dalek`'s `rand_core` 0.6 version.
 - `zbase32_encode` is duplicated in `identity.rs` and `ucan.rs`. Extract to shared module if a third consumer appears.
-- Context close must clean up `CONTEXT_REGISTRY` in `runtime.rs`. Call `remove_context(context_id)` to release the `WasmContextRuntime` entry.
+- Context close is handled by `WasmContextManager::close_context`, which transitions the context's `PerContextState` to closed and tears down its broadcast/crypto state.
