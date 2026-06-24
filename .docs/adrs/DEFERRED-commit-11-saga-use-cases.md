@@ -1,6 +1,6 @@
 # DEFERRED — ADR-049 commit 11.5: saga use-case wiring
 
-**Status:** RESOLVED (commit 11.5). Three of the four saga use cases are now specced (§5.15.8, §6.2.4, §5.14.13); the fourth (Gap 4, migration custody handover) is RESOLVED-AS-WITHDRAWN — the operation does not exist. See "## Resolution (commit 11.5)" below.
+**Status:** RESOLVED (commit 11.5). Three of the four saga use cases were originally specced (§5.15.8, §6.2.4, §5.14.13); the fourth (Gap 4, migration custody handover) is RESOLVED-AS-WITHDRAWN — the operation does not exist. See "## Resolution (commit 11.5)" below. **Correction (2026-06-18):** of the three originally specced, §5.15.8 standing-pair creation was subsequently reclassified as **single-context async creation — not a saga** (a 2-member MLS group is one context; replica sync is MLS + the event-log consistency layer, not a saga journal). Only **two** live sagas remain — cross-context tool invocation (§6.2.4) and broadcast hosting handshake (§5.14.13). See spec §5.15.8 and ADR-049 §3/§3a.
 
 **Context.** ADR-049 commit 11 migrates the non-saga standing-pair, tool,
 and broadcast handlers to the actor shape. The 4 cross-context saga
@@ -162,7 +162,7 @@ dispatch returns `NotImplemented`.
 
 ## Gap 5 — FFI SagaId wire format (block-until-terminal vs async)
 
-> **Superseded — see "Resolution (commit 11.5)" below: RESOLVED by ADR-049 §3a. The wait model is **block-until-terminal** for all three live sagas (supervisor-minted `SagaId`; **no** async/poll `saga_state` query — that option was contemplated only for the now-withdrawn Gap-4 custody handover). The present-tense text below — including the "likely async" and `saga_state(id)` poll option — is the original problem statement, retained for historical provenance only.**
+> **Superseded — see "Resolution (commit 11.5)" below: RESOLVED by ADR-049 §3a. The wait model is **block-until-terminal** for both live sagas — §6.2.4 cross-context tool invocation and §5.14.13 broadcast hosting handshake (supervisor-minted `SagaId`; **no** async/poll `saga_state` query — that option was contemplated only for the now-withdrawn Gap-4 custody handover). (Corrected 2026-06-18: standing-pair creation, §5.15.8, is **not** a saga — it is single-context async creation reached via the `standing_context` get-or-create path, so the saga count is **two**, not three.) The present-tense text below — including the "likely async" and `saga_state(id)` poll option — is the original problem statement, retained for historical provenance only.**
 
 **What's missing.** FFI bridges currently have no `SagaId` exports.
 The saga surface requires a decision on the caller's wait model:
@@ -213,7 +213,7 @@ export — the async/poll wait model was withdrawn with Gap 4 per ADR-049 §3a.)
 - ADR-049 — actor-per-context architecture
 - Spec §5.12.6 (the contact graph; §5.12.4 is actually *Context Creation as a Runtime Operation*, not the contact graph)
 - Spec §5.14.2 (broadcast contexts, hosting handshake) and §5.14.13 (broadcast hosting handshake saga)
-- Spec §5.12.6 (contact graph) and §5.15.8 (standing-pair creation saga)
+- Spec §5.12.6 (contact graph) and §5.15.8 (standing-pair creation — single-context async, not a saga)
 - Spec §6.2 (Context-to-Context Tool Interfaces / single-context tool invocation) and §6.2.4 (cross-context tool invocation saga)
 - Spec §9.4.3 (saga journal secret handling)
 - Spec §17.16 (saga journal API)
@@ -228,7 +228,11 @@ artifact-flow invariant; the Phase 2C implementation is a separate
 downstream PR):
 
 - **Gap 1 — Standing-pair 2-phase decomposition → RESOLVED by
-  §5.15.8 (Standing-Pair Creation Saga).** Deterministic
+  §5.15.8 (standing-pair creation — single-context async, not a saga).**
+
+  > **Corrected (2026-06-18) — §5.15.8 is single-context async creation, NOT a saga.** The Gap-1 problem statement and the Prepare-A/Prepare-B/`CreationReceipt`/reserve-at-Prepare/consume-at-Commit/rollback machinery described below is the **original (superseded) framing**, retained for historical provenance only. A standing pair is **one** MLS context with two members (both parties derive the identical `derived_context_id`), so its creation is ordinary single-context async creation — `create` + `add_member` + Welcome, with the consent gate applied by the joining peer on Welcome receipt — synchronized by MLS + the event-log consistency layer, with **no** two-phase commit, **no** `CreationReceipt`, **no** reserve-not-consume, and **no** saga journal. See the rewritten spec §5.15.8 and ADR-049 §3/§3a; standing-pair creation is **not** among the live sagas.
+
+  *(Original framing, superseded — see the correction above.)* Deterministic
   `derived_context_id` derivation (which also keys MLS group
   isolation via the provider's `Entry::Vacant` guard — no separate
   `group_id`), Prepare-A/Prepare-B exchange, the `CreationReceipt` canonical JCS
@@ -287,8 +291,11 @@ downstream PR):
   (re-scoped to "no live instance").
 
 - **Gap 5 — FFI SagaId wire format → RESOLVED by ADR-049 §3a (FFI
-  Saga Surface).** All three sagas use the block-until-terminal wait
-  model (the async/poll model contemplated here was only for the
+  Saga Surface).** Both sagas (§6.2.4, §5.14.13) use the block-until-terminal wait
+  model; standing-pair creation is **not** a saga (single-context async
+  creation, §5.15.8 — corrected 2026-06-18) and follows the ordinary
+  `standing_context` get-or-create path, not the saga wait model
+  (the async/poll model contemplated here was only for the
   now-cut custody handover); `SagaId` is a UUIDv4 string at every
   bridge, always supervisor-minted and never caller-supplied; the
   `SCP-SAGA-*` error taxonomy maps each terminal state; drop-while-
