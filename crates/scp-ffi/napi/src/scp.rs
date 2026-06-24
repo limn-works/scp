@@ -2990,6 +2990,33 @@ impl Scp {
         .await
     }
 
+    /// Diagnostic, read-only evaluation of a UCAN token.
+    ///
+    /// Counterpart to `ucanValidate`: runs the same 11-step ADR-016 pipeline
+    /// but returns a structured `NapiCapabilityValidation` (six booleans,
+    /// camelCased for JS) instead of throwing, and never records the token's
+    /// nonce.
+    #[napi(js_name = "ucanEvaluate")]
+    pub async fn ucan_evaluate(
+        &self,
+        handle: &NapiContextHandle,
+        token: String,
+        capability: String,
+        presenting_agent_did: Option<String>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        crate::ucan::ucan_evaluate_on(
+            &self.inner,
+            handle,
+            token,
+            capability,
+            presenting_agent_did,
+            proof_tokens,
+        )
+        .await
+    }
+
     /// Per-instance equivalent of the free-function `ucan_mint`.
     #[napi(js_name = "ucanMint")]
     pub async fn ucan_mint(

@@ -19,8 +19,9 @@ use wasm_bindgen_futures::future_to_promise;
 use scp_protocol::context::roles::default_ceiling;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
-    DidResolver, InMemoryProofResolver, InMemoryRevocationChecker,
-    NonceTracker as ValidationNonceTracker, ValidationContext, parse_ucan, validate_ucan,
+    CapabilityValidation, DidResolver, InMemoryProofResolver, InMemoryRevocationChecker,
+    NonceTracker as ValidationNonceTracker, ValidationContext, evaluate_ucan, parse_ucan,
+    validate_ucan,
 };
 use scp_protocol::crypto::ucan::{CapabilityUri, UcanError, UcanToken};
 
@@ -387,6 +388,114 @@ fn run_validate_ucan(
 }
 
 // ---------------------------------------------------------------------------
+// Read-only structured evaluation
+// ---------------------------------------------------------------------------
+
+/// Structured, side-effect-free result of evaluating a UCAN token.
+///
+/// Serialized to a JS object via `#[serde(rename_all = "camelCase")]`, so JS
+/// sees `{tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked,
+/// timeBoundsValid}`. Mirrors scp-protocol's [`CapabilityValidation`].
+//
+// Six per-stage outcome flags are the mandated public shape of this diagnostic,
+// mirroring scp-protocol's `CapabilityValidation`. They are pure data — not
+// behavior-selecting flags — so the `struct_excessive_bools` suggestion would
+// obscure the API and break the flat named-field shape JS consumes.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmCapabilityValidation {
+    tokens_valid: bool,
+    signatures_valid: bool,
+    within_ceiling: bool,
+    nonce_valid: bool,
+    not_revoked: bool,
+    time_bounds_valid: bool,
+}
+
+impl From<CapabilityValidation> for WasmCapabilityValidation {
+    fn from(v: CapabilityValidation) -> Self {
+        Self {
+            tokens_valid: v.tokens_valid,
+            signatures_valid: v.signatures_valid,
+            within_ceiling: v.within_ceiling,
+            nonce_valid: v.nonce_valid,
+            not_revoked: v.not_revoked,
+            time_bounds_valid: v.time_bounds_valid,
+        }
+    }
+}
+
+/// Extracts UCAN validation state from `WasmContextManager` and calls
+/// `scp_protocol::crypto::ucan::validate::evaluate_ucan`.
+///
+/// This is the **read-only** counterpart to [`run_validate_ucan`]: it runs the
+/// same 11-step pipeline but returns a per-stage [`CapabilityValidation`]
+/// summary instead of failing at the first error, and performs NO writeback —
+/// the nonce is probed (`check_replay`), never recorded. There is therefore no
+/// EXTRACT-VALIDATE-WRITEBACK step 4 here; calling this never consumes a nonce.
+fn run_evaluate_ucan(
+    context_id: &str,
+    token: &UcanToken,
+    required_capability: &CapabilityUri,
+    expected_aud_did: &str,
+    proof_tokens: Option<&[String]>,
+) -> Result<CapabilityValidation, String> {
+    // 1. EXTRACT state from WasmContextManager.
+    let (ceiling, creator_did, revoked_cids) =
+        with_manager(|mgr| mgr.ucan_context_state(context_id)).map_err(|e| e.to_string())?;
+
+    // When the ceiling is empty, apply the default ceiling instead of skipping
+    // enforcement entirely — matching ucan_validate and the other bridges.
+    let effective_ceiling = if ceiling.is_empty() {
+        default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling
+    };
+
+    // 2. BUILD trait impls from extracted state.
+    let did_resolver = WasmDidResolver;
+
+    let seen_nonces_set: HashSet<String> =
+        with_manager(|mgr| mgr.ucan_seen_nonce_keys(context_id)).map_err(|e| e.to_string())?;
+
+    // evaluate_ucan probes the tracker read-only (check_replay) and never
+    // records, so no writeback occurs.
+    let mut nonce_tracker = WasmNonceTracker::new(seen_nonces_set);
+
+    let mut revocation_checker = InMemoryRevocationChecker::new();
+    revocation_checker.revoked = revoked_cids;
+
+    let mut proof_resolver = InMemoryProofResolver::new();
+    if let Some(proofs) = proof_tokens {
+        for encoded in proofs {
+            let parsed = parse_ucan(encoded).map_err(|e| e.to_string())?;
+            let cid = compute_proof_cid(encoded);
+            proof_resolver.proofs.insert(cid, parsed);
+        }
+    }
+
+    let clock = WasmClock;
+
+    // 3. CALL evaluate_ucan from scp-protocol. It takes `&ValidationContext`
+    // (shared) and returns a structured result, never an error.
+    let ctx = ValidationContext {
+        did_resolver: &did_resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        ceiling: &effective_ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: expected_aud_did,
+        clock_skew_tolerance_secs:
+            scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &clock,
+    };
+
+    Ok(evaluate_ucan(token, required_capability, &ctx))
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -471,6 +580,114 @@ pub fn ucan_validate(
         })?;
 
         Ok(JsValue::UNDEFINED)
+    })
+}
+
+/// Evaluates a UCAN token and resolves to a structured per-stage validity
+/// summary instead of rejecting at the first failure.
+///
+/// Diagnostic, **read-only** counterpart to [`ucan_validate`]: it runs the same
+/// 11-step ADR-016 pipeline via
+/// `scp_protocol::crypto::ucan::validate::evaluate_ucan`, but resolves the
+/// Promise with an object `{tokensValid, signaturesValid, withinCeiling,
+/// nonceValid, notRevoked, timeBoundsValid}` rather than rejecting on the first
+/// failing stage. It never records the token's nonce (no writeback), so calling
+/// it does not consume the token's nonce.
+///
+/// The Promise still rejects for malformed FFI inputs (invalid token /
+/// capability / DID strings) or an unparseable token / capability URI;
+/// capability, signature, and expiry outcomes are reported via the resolved
+/// booleans.
+#[wasm_bindgen]
+pub fn ucan_evaluate(
+    context: &WasmContextHandle,
+    token: String,
+    capability: String,
+    expected_aud_did: String,
+    proof_tokens_json: Option<String>,
+) -> Promise {
+    if let Err(e) = validate_ucan_token(&token) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_capability_uri(&capability) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&expected_aud_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = context.context_id();
+
+    future_to_promise(async move {
+        let parsed = parse_ucan(&token).map_err(|e| {
+            // Route UCAN error classification through the shared mapping so all
+            // four bridges stay in lockstep on the malformed-token code.
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
+            ScpWasmError::Permission {
+                message: format!("malformed token: {e}"),
+                code,
+            }
+            .into_js()
+        })?;
+
+        let proof_tokens: Option<Vec<String>> = match proof_tokens_json {
+            Some(json_str) => {
+                let arr: Vec<String> = serde_json::from_str(&json_str).map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "proof_tokens_json is not a valid JSON array of strings: {e}"
+                        ),
+                        code: codes::VALID_7000.to_owned(),
+                    }
+                    .into_js()
+                })?;
+                Some(arr)
+            }
+            None => None,
+        };
+
+        let required_capability: CapabilityUri = capability.parse().map_err(|e: UcanError| {
+            ScpWasmError::Permission {
+                message: format!("invalid capability URI: {e}"),
+                code: codes::PERM_3000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let evaluation = run_evaluate_ucan(
+            &context_id,
+            &parsed,
+            &required_capability,
+            &expected_aud_did,
+            proof_tokens.as_deref(),
+        )
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: codes::PERM_3000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        // Serialize the camelCase summary and parse into a real JS object so
+        // consumers see `{tokensValid, signaturesValid, ...}`.
+        let summary = WasmCapabilityValidation::from(evaluation);
+        let json = serde_json::to_string(&summary).map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!("failed to serialize capability validation: {e}"),
+                code: codes::PERM_3000.to_owned(),
+            }
+            .into_js()
+        })?;
+        js_sys::JSON::parse(&json).map_err(|_| {
+            JsValue::from(
+                ScpWasmError::Permission {
+                    message: "failed to parse capability validation JSON into a JS object"
+                        .to_owned(),
+                    code: codes::PERM_3000.to_owned(),
+                }
+                .into_js(),
+            )
+        })
     })
 }
 

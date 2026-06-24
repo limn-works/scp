@@ -46,7 +46,8 @@ use scp_core::crypto::ucan::capability::CapabilityUri;
 use scp_core::crypto::ucan::mint::{DelegateParams, MintParams, delegate_ucan, mint_ucan};
 use scp_core::crypto::ucan::revoke::revoke_ucan as core_revoke_ucan;
 use scp_core::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+    CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, evaluate_ucan,
+    parse_ucan, validate_ucan,
 };
 
 use crate::bridge_adapters::{
@@ -63,10 +64,12 @@ use crate::validate;
 ///
 /// Contains the token metadata accessible to Python code: a unique token ID
 /// (derived from the nonce), the issuer DID, the audience DID, the list of
-/// granted capabilities, and an optional expiry timestamp.
+/// granted capabilities, an optional expiry timestamp, and the encoded JWT.
 ///
-/// The raw signature and encoded JWT are not exposed -- they are internal
-/// to the Rust crypto layer and not needed by Python callers.
+/// The encoded JWT is exposed so callers can feed a freshly minted token back
+/// into `ucan_validate` / `ucan_evaluate` / `ucan_delegate` (which all take the
+/// JWT string), matching the `encoded` accessor the NAPI and `UniFFI` bridges
+/// already expose. The raw signature remains internal to the Rust crypto layer.
 ///
 /// See ADR-016 (UCAN validation) and ADR-013 §6 (bridge layer).
 #[pyclass(name = "UcanToken")]
@@ -101,6 +104,14 @@ pub struct PyUcanToken {
     #[pyo3(get)]
     pub proofs: Vec<String>,
 
+    /// Encoded JWT string (`header.payload.signature`).
+    ///
+    /// The full wire form of the token, suitable for passing back into
+    /// `ucan_validate` / `ucan_evaluate` / `ucan_delegate`. Mirrors the
+    /// `encoded` accessor on the NAPI `NapiUcanToken` and `UniFFI` `UcanToken`.
+    #[pyo3(get)]
+    pub encoded: String,
+
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
     ///
     /// `dead_code` allowance: future commits of this PR will add
@@ -130,6 +141,87 @@ impl PyUcanToken {
             self.capabilities.len(),
             self.expires_at,
             self.proofs.len()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyCapabilityValidation
+// ---------------------------------------------------------------------------
+
+/// Structured, side-effect-free result of evaluating a UCAN token.
+///
+/// Produced by [`PyScp::ucan_evaluate`], this mirrors scp-core's
+/// [`CapabilityValidation`] — the diagnostic counterpart to the fail-closed
+/// `ucan_validate` gate. Each boolean reflects whether the corresponding
+/// pipeline stage ran and passed; because the pipeline short-circuits, a field
+/// is `true` only if its stage AND every prior stage passed.
+///
+/// Unlike `ucan_validate`, evaluation records NO state — the nonce is probed
+/// read-only and never recorded, so `ucan_evaluate` is safe to call repeatedly
+/// on the same token. The result is a point-in-time diagnostic snapshot, NOT a
+/// promise that a subsequent `ucan_validate` will accept the token.
+///
+/// See ADR-016 and `scp_core::crypto::ucan::validate::CapabilityValidation`.
+//
+// Six per-stage outcome flags are the mandated public shape of this diagnostic
+// (one boolean per pipeline stage group), mirroring scp-core's
+// `CapabilityValidation`. These are pure data — not behavior-selecting flags —
+// so the `struct_excessive_bools` suggestion (a state machine / two-variant
+// enums) would obscure, not clarify, the API and break the flat named-field
+// shape the SDK trust signal consumes.
+#[allow(clippy::struct_excessive_bools)]
+#[pyclass(name = "CapabilityValidation")]
+#[derive(Debug, Clone)]
+pub struct PyCapabilityValidation {
+    /// Step 1: the token parsed and its header/attestation set validated.
+    #[pyo3(get)]
+    pub tokens_valid: bool,
+    /// Steps 2-7: signature, delegation chain, root issuer, audience, key
+    /// scope, capability grant-match, Category-A enforcement, and attenuation
+    /// all passed (whole-chain).
+    #[pyo3(get)]
+    pub signatures_valid: bool,
+    /// Step 8: every granted capability is within the context's ceiling.
+    #[pyo3(get)]
+    pub within_ceiling: bool,
+    /// Step 9: nonce format, freshness, and uniqueness passed (probed
+    /// read-only — the nonce is NOT recorded).
+    #[pyo3(get)]
+    pub nonce_valid: bool,
+    /// Step 10: the token's revocation CID is not on the revocation list.
+    #[pyo3(get)]
+    pub not_revoked: bool,
+    /// Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance).
+    #[pyo3(get)]
+    pub time_bounds_valid: bool,
+}
+
+impl From<CapabilityValidation> for PyCapabilityValidation {
+    fn from(v: CapabilityValidation) -> Self {
+        Self {
+            tokens_valid: v.tokens_valid,
+            signatures_valid: v.signatures_valid,
+            within_ceiling: v.within_ceiling,
+            nonce_valid: v.nonce_valid,
+            not_revoked: v.not_revoked,
+            time_bounds_valid: v.time_bounds_valid,
+        }
+    }
+}
+
+#[pymethods]
+impl PyCapabilityValidation {
+    fn __repr__(&self) -> String {
+        format!(
+            "CapabilityValidation(tokens_valid={}, signatures_valid={}, within_ceiling={}, \
+             nonce_valid={}, not_revoked={}, time_bounds_valid={})",
+            self.tokens_valid,
+            self.signatures_valid,
+            self.within_ceiling,
+            self.nonce_valid,
+            self.not_revoked,
+            self.time_bounds_valid
         )
     }
 }
@@ -235,6 +327,106 @@ impl crate::scp::PyScp {
         Ok(())
     }
 
+    /// Evaluates a UCAN token and returns a structured per-stage validity
+    /// summary instead of throwing at the first failure.
+    ///
+    /// This is the diagnostic, **side-effect-free** counterpart to
+    /// [`PyScp::ucan_validate`]. It runs the EXACT same 11-step ADR-016
+    /// pipeline via `scp_core::crypto::ucan::validate::evaluate_ucan`, but:
+    ///
+    /// - returns a [`PyCapabilityValidation`] (six booleans) rather than
+    ///   raising on the first failing stage; and
+    /// - is **read-only** — the nonce is probed (never recorded), so calling
+    ///   `ucan_evaluate` does NOT consume the token's nonce. A later
+    ///   `ucan_validate` can still accept the same token.
+    ///
+    /// # Arguments
+    ///
+    /// Identical to [`PyScp::ucan_validate`]: `context_id`, `token`,
+    /// `capability`, optional `presenting_agent_did` (defaults to the token's
+    /// `aud`), and optional `proof_tokens` for delegation chains.
+    ///
+    /// # Returns
+    ///
+    /// A [`PyCapabilityValidation`]. A token that cannot be parsed yields
+    /// `tokens_valid=False` with every later field `False`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` only for malformed FFI inputs (invalid
+    /// `context_id`/`token`/`capability`/`did` strings) or an unparseable
+    /// token / capability URI. Capability/signature/expiry failures are
+    /// reported via the returned booleans, not as exceptions.
+    ///
+    /// See ADR-016 §5 and `CapabilityValidation` in scp-core.
+    #[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
+    pub fn ucan_evaluate(
+        &self,
+        context_id: &str,
+        token: &str,
+        capability: &str,
+        presenting_agent_did: Option<&str>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> PyResult<PyCapabilityValidation> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_ucan_token(token)?;
+        validate::validate_capability_uri(capability)?;
+        if let Some(did) = presenting_agent_did {
+            validate::validate_did(did)?;
+        }
+        if let Some(ref tokens) = proof_tokens {
+            for t in tokens {
+                validate::validate_ucan_token(t)?;
+            }
+        }
+        // Step 1: Parse the UCAN token using scp-core's parser.
+        let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
+
+        // Parse the required capability URI.
+        let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
+            ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
+        })?;
+
+        // Determine the presenting agent DID: explicit parameter or token audience.
+        let agent_did = presenting_agent_did.unwrap_or(&parsed_token.payload.aud);
+
+        // Build proof resolver from optional proof tokens.
+        let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
+
+        // Run the read-only evaluation pipeline within the context runtime.
+        // evaluate_ucan takes `&ValidationContext` and never records the nonce,
+        // so a read-only probe of the nonce tracker suffices.
+        let result = crate::runtime::with_context(bi, context_id, |rt| {
+            let production_resolver = crate::runtime::did_resolver(bi);
+            let did_resolver =
+                DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+            let revocation_checker = BridgeRevocationChecker {
+                revocation_list: &rt.revocation_list,
+            };
+            let mut nonce_adapter = BridgeNonceTracker {
+                inner: &mut rt.nonce_tracker,
+            };
+
+            let ctx = ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &rt.ceiling_strings,
+                context_creator_did: &rt.creator_did,
+                presenting_agent_did: agent_did,
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_primitives::SystemClock,
+            };
+
+            Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+        })?;
+
+        Ok(PyCapabilityValidation::from(result))
+    }
+
     /// Mints a new UCAN token for a context member.
     ///
     /// Creates a new UCAN token granting the specified capabilities to the
@@ -337,6 +529,7 @@ impl crate::scp::PyScp {
             // Unix timestamp seconds fit in f64 mantissa for centuries.
             #[allow(clippy::cast_precision_loss)]
             expires_at: Some(token.payload.exp as f64),
+            encoded: token.encoded,
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
@@ -461,6 +654,7 @@ impl crate::scp::PyScp {
             capabilities: capability_uris,
             #[allow(clippy::cast_precision_loss)]
             expires_at: Some(token.payload.exp as f64),
+            encoded: token.encoded,
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
@@ -583,6 +777,7 @@ pub(crate) fn build_proof_resolver_from_tokens(
 /// Returns `PyErr` if registration of classes fails.
 pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUcanToken>()?;
+    m.add_class::<PyCapabilityValidation>()?;
     Ok(())
 }
 

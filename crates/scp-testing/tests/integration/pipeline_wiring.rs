@@ -141,11 +141,31 @@ const HANDLERS_MESSAGING_SRC: &str =
 const UCAN_VALIDATE_SRC: &str =
     include_str!("../../../../crates/scp-protocol/src/crypto/ucan/validate.rs");
 
+// PyO3 bridge UCAN source — owns `ucan_evaluate`, the structured read-only
+// diagnostic op. The `ucan_evaluate_routes_to_core_evaluate_ucan` assertion
+// below pins the bridge to consuming the shared core `evaluate_ucan` pipeline
+// rather than re-implementing capability evaluation locally (which would let
+// the diagnostic and the enforcing `validate_ucan` gate silently diverge).
+const PYO3_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
+
+// The other three FFI bridges' UCAN sources. Each owns its own `ucan_evaluate`
+// entry point and MUST route to the shared core `evaluate_ucan` pipeline rather
+// than re-implementing capability evaluation locally (which would let the
+// read-only diagnostic and the enforcing `validate_ucan` gate silently diverge).
+// NAPI's body lives in the `ucan_evaluate_on` per-instance helper; WASM's lives
+// in the `run_evaluate_ucan` free function; UniFFI's lives in the
+// `ucan_evaluate` bridge method.
+const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
+const WASM_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 45;
+// Raised 46 -> 49 when the `ucan_evaluate` routing assertion was extended from
+// PyO3-only to all four bridges (PyO3 + NAPI + WASM + UniFFI), adding three new
+// per-bridge routing tests.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 49;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2310,6 +2330,61 @@ fn ucan_step8_enforces_ceiling_over_all_att() {
         "validate_ucan step 8 must NOT scope the ceiling check to only the \
          invoked capability — that lets a token smuggle an out-of-ceiling \
          attestation (spec §7.2.1 step 8)"
+    );
+}
+
+/// The structured `ucan_evaluate` bridge op must route to the shared core
+/// `evaluate_ucan` pipeline, not re-implement capability evaluation locally.
+///
+/// `ucan_evaluate` is the read-only diagnostic counterpart to the throwing
+/// `ucan_validate` gate. If the bridge fork-implemented its own evaluation
+/// instead of calling core `evaluate_ucan`, the diagnostic could report a
+/// token as acceptable that the enforcing pipeline would reject (or vice
+/// versa). Pinning the call site keeps both surfaces on one pipeline.
+#[test]
+fn ucan_evaluate_routes_to_core_evaluate_ucan() {
+    assert!(
+        fn_body_contains(PYO3_UCAN_SRC, "ucan_evaluate", "evaluate_ucan("),
+        "PyO3 ucan_evaluate must call the shared core evaluate_ucan pipeline \
+         (it is the read-only diagnostic counterpart to validate_ucan and must \
+         not re-implement capability evaluation locally)"
+    );
+}
+
+/// NAPI's `ucan_evaluate` body lives in the `ucan_evaluate_on` per-instance
+/// helper; it must route to the shared core `evaluate_ucan` pipeline. Same
+/// rationale as the PyO3 assertion above — keep the diagnostic and the
+/// enforcing gate on one pipeline.
+#[test]
+fn napi_ucan_evaluate_routes_to_core_evaluate_ucan() {
+    assert!(
+        fn_body_contains(NAPI_UCAN_SRC, "ucan_evaluate_on", "evaluate_ucan("),
+        "NAPI ucan_evaluate (ucan_evaluate_on helper) must call the shared core \
+         evaluate_ucan pipeline, not re-implement capability evaluation locally"
+    );
+}
+
+/// WASM's `ucan_evaluate` body lives in the `run_evaluate_ucan` free function;
+/// it must route to the shared core `evaluate_ucan` pipeline. WASM re-uses the
+/// scp-protocol algorithms directly (ADR-034), so this pins that the diagnostic
+/// is the same pipeline, not a wasm-local fork.
+#[test]
+fn wasm_ucan_evaluate_routes_to_core_evaluate_ucan() {
+    assert!(
+        fn_body_contains(WASM_UCAN_SRC, "run_evaluate_ucan", "evaluate_ucan("),
+        "WASM ucan_evaluate (run_evaluate_ucan helper) must call the shared core \
+         evaluate_ucan pipeline, not re-implement capability evaluation locally"
+    );
+}
+
+/// UniFFI's `ucan_evaluate` bridge method must route to the shared core
+/// `evaluate_ucan` pipeline. Same rationale as the other three bridges.
+#[test]
+fn uniffi_ucan_evaluate_routes_to_core_evaluate_ucan() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "ucan_evaluate", "evaluate_ucan("),
+        "UniFFI ucan_evaluate must call the shared core evaluate_ucan pipeline, \
+         not re-implement capability evaluation locally"
     );
 }
 

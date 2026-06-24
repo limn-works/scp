@@ -1614,6 +1614,54 @@ pub struct Message {
     pub provenance: Option<DataProvenance>,
 }
 
+/// Structured, side-effect-free result of evaluating a UCAN token.
+///
+/// Mirrors scp-core's `CapabilityValidation` — the diagnostic counterpart to
+/// the fail-closed `ucan_validate` gate. Each boolean reflects whether the
+/// corresponding pipeline stage ran and passed; the pipeline short-circuits, so
+/// a field is `true` only if its stage AND every prior stage passed.
+///
+/// Unlike `ucan_validate`, evaluation records NO state (the nonce is probed
+/// read-only, never recorded). See ADR-016.
+//
+// Six per-stage outcome flags are the mandated public shape of this diagnostic,
+// mirroring scp-core's `CapabilityValidation`. They are pure data — not
+// behavior-selecting flags — so the `struct_excessive_bools` suggestion (a
+// state machine / two-variant enums) would obscure the API and break the flat
+// named-field shape the SDK trust signal consumes.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct CapabilityValidationRecord {
+    /// Step 1: the token parsed and its header/attestation set validated.
+    pub tokens_valid: bool,
+    /// Steps 2-7: signature, delegation chain, root issuer, audience, key
+    /// scope, capability grant-match, Category-A enforcement, and attenuation
+    /// all passed (whole-chain).
+    pub signatures_valid: bool,
+    /// Step 8: every granted capability is within the context's ceiling.
+    pub within_ceiling: bool,
+    /// Step 9: nonce format, freshness, and uniqueness passed (probed
+    /// read-only — the nonce is NOT recorded).
+    pub nonce_valid: bool,
+    /// Step 10: the token's revocation CID is not on the revocation list.
+    pub not_revoked: bool,
+    /// Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance).
+    pub time_bounds_valid: bool,
+}
+
+impl From<scp_core::crypto::ucan::validate::CapabilityValidation> for CapabilityValidationRecord {
+    fn from(v: scp_core::crypto::ucan::validate::CapabilityValidation) -> Self {
+        Self {
+            tokens_valid: v.tokens_valid,
+            signatures_valid: v.signatures_valid,
+            within_ceiling: v.within_ceiling,
+            nonce_valid: v.nonce_valid,
+            not_revoked: v.not_revoked,
+            time_bounds_valid: v.time_bounds_valid,
+        }
+    }
+}
+
 /// Current data availability status of the source context (spec §24.2.2).
 ///
 /// Reflects operational state, not creation-time memory scope. A persistent
@@ -13234,6 +13282,115 @@ impl Scp {
             .await
             .map_err(|e| ScpError::Permission {
                 msg: format!("tokio task join error during UCAN validation: {e}"),
+                code: codes::PERM_3003.to_owned(),
+            })?
+    }
+
+    /// Diagnostic, read-only evaluation of a UCAN token.
+    ///
+    /// Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+    /// pipeline via `evaluate_ucan` but returns a structured
+    /// [`CapabilityValidationRecord`] (six booleans) instead of failing at the
+    /// first error, and never records the token's nonce (read-only probe).
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn ucan_evaluate(
+        &self,
+        handle: Arc<ContextHandle>,
+        token: String,
+        capability: String,
+        presenting_agent_did: Option<String>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> Result<CapabilityValidationRecord, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_ucan_token(&token)?;
+                validate_capability_uri(&capability)?;
+
+                use scp_core::crypto::ucan::capability::CapabilityUri;
+                use scp_core::crypto::ucan::validate::{
+                    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, evaluate_ucan, parse_ucan,
+                };
+
+                // Step 1: Parse the UCAN token. Route through the canonical
+                // `From<UcanError>` impl so parse failures surface the same
+                // error code as every other bridge.
+                let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
+
+                // Parse the required capability URI.
+                let required_cap: CapabilityUri = capability
+                    .parse()
+                    .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
+
+                // Determine the presenting agent DID: explicit parameter or token audience.
+                let agent_did = presenting_agent_did
+                    .as_deref()
+                    .unwrap_or(&parsed_token.payload.aud);
+
+                // Build proof resolver from optional proof tokens.
+                let mut proofs = std::collections::HashMap::new();
+                if let Some(ref tokens) = proof_tokens {
+                    for encoded in tokens {
+                        let proof_token = parse_ucan(encoded).map_err(ScpError::from)?;
+                        let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+                        proofs.insert(cid, proof_token);
+                    }
+                }
+                let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+                // Ensure UCAN state is registered for this context on this instance.
+                bi.ensure_ucan_registered(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+
+                // evaluate_ucan takes `&ValidationContext` and is read-only — it
+                // probes the nonce tracker via check_replay but never records,
+                // so per-context UCAN state is not mutated.
+                let evaluation = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let production_resolver = bi.did_resolver();
+                        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                            production_resolver.as_deref(),
+                        );
+                        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                            revocation_list: &ucan_state.revocation_list,
+                        };
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                            inner: &mut ucan_state.nonce_tracker,
+                        };
+
+                        let ctx = ValidationContext {
+                            did_resolver: &did_resolver,
+                            nonce_tracker: &mut nonce_adapter,
+                            revocation_checker: &revocation_checker,
+                            proof_resolver: &proof_resolver,
+                            ceiling: &ucan_state.ceiling_strings,
+                            context_creator_did: &ucan_state.creator_did,
+                            presenting_agent_did: agent_did,
+                            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                            clock: &scp_primitives::SystemClock,
+                        };
+
+                        evaluate_ucan(&parsed_token, &required_cap, &ctx)
+                    })
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                        code: codes::PERM_3002.to_owned(),
+                    })?;
+
+                Ok(CapabilityValidationRecord::from(evaluation))
+            })
+            .await
+            .map_err(|e| ScpError::Permission {
+                msg: format!("tokio task join error during UCAN evaluation: {e}"),
                 code: codes::PERM_3003.to_owned(),
             })?
     }

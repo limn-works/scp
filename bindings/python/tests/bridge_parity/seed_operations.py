@@ -26,10 +26,13 @@ and emit identical canonical output. See `OpContext.attached_scp` for the
 full rationale. Non-context ops (identity_create, scpid_sign error paths,
 transport_status) need no supervisor and keep the bare `SCP({"type": "in_memory"})` constructor.
 
-Current op library: 11 ops. The first 5 are the MVP per ADR-046;
+Current op library: 12 ops. The first 5 are the MVP per ADR-046;
 ops 6-10 cover tool registration, UCAN mint/validate-error, transport
 status, and filtered event-log query; op 11 pins the
-unregistered-DID rejection code (SCP-IDENT-1001) across every bridge.
+unregistered-DID rejection code (SCP-IDENT-1001) across every bridge;
+the structured `ucan_evaluate` op pins the six-boolean
+`CapabilityValidation` return (no-throw partial-false path) across
+every bridge.
 Crypto outputs compare byte-exactly: `identity_create_deterministic`
 pins DID + identity-key verifying bytes under a fixed seed, and
 `sign_message` pins the SCPID signature byte-exactly under the
@@ -781,6 +784,166 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op: ucan_evaluate_malformed
+#
+# Companion to OP_UCAN_VALIDATE_MALFORMED. Where `ucan_validate` THROWS on a
+# malformed token, the structured `ucan_evaluate` op returns a per-stage
+# CapabilityValidation summary. A malformed JWT fails at stage 1 (parse), so
+# every bridge must return tokens_valid=false with all later fields false —
+# WITHOUT throwing. This pins the new structured op's cross-bridge shape and
+# the all-false short-circuit behavior. (A "not.a.jwt" string fails the FFI
+# UCAN-token validator before reaching evaluate; the bridges all surface that
+# as a thrown ValidationError. The parity contract here is the THROWN-code
+# alignment, identical to the validate companion.)
+#
+# The OTHER half of the structured contract — a parseable, well-signed token
+# that reaches evaluate_ucan and returns a PARTIAL-FALSE struct without
+# throwing — is exercised by OP_UCAN_EVALUATE_STRUCTURED (below), which
+# compares the six returned booleans byte-for-byte across every bridge. The
+# six-field short-circuit field mapping and the read-only / no-nonce-record
+# invariant are additionally pinned at the core level by the
+# `evaluate_ucan_*` tests in
+# `crates/scp-runtime/tests/ucan_validate_integration.rs`.
+# ---------------------------------------------------------------------------
+
+
+def _py_ucan_evaluate_malformed(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(
+        identity.did, {"name": "parity-ucan-e", "mode": "encrypted", "ceiling": _UCAN_CEILING}
+    )
+    try:
+        scp.ucan_evaluate(
+            handle.context_id,
+            _MALFORMED_UCAN,
+            "scp:ctx:any/messages:read",
+        )
+    except Exception as err:
+        err_type = type(err).__name__
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {"error": {"type": err_type, "code": code or "UNKNOWN"}}
+    return {"error": {"type": "none", "code": "NONE"}}
+
+
+OP_UCAN_EVALUATE_MALFORMED = OpSpec(
+    name="ucan_evaluate_malformed",
+    py_call=_py_ucan_evaluate_malformed,
+    node_call={
+        "op": "ucan_evaluate_malformed",
+        "args": {"ceiling": _UCAN_CEILING},
+    },
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            FieldSpec("error.code", "exact"),
+        )
+    ),
+    expected_values=(("error.code", _EXPECTED_MALFORMED_UCAN_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
+# op: ucan_evaluate_structured
+#
+# The structured-return half of the `ucan_evaluate` contract. Where
+# OP_UCAN_EVALUATE_MALFORMED pins the THROWN-code path (a "not.a.jwt" string
+# rejected by the FFI token validator before the pipeline runs), this op pins
+# the NO-THROW path: a parseable, validly-signed root UCAN that reaches core
+# `evaluate_ucan` and returns a per-stage `CapabilityValidation` (six booleans)
+# WITHOUT throwing.
+#
+# Construction: mint a valid root token granting `messages:read` in a context
+# whose ceiling is `messages:read`, then evaluate it requiring `messages:write`
+# (a capability the token does NOT grant). The pipeline short-circuits: parse
+# succeeds (`tokens_valid: true`), but the step-6 invoked-capability grant-match
+# fails — `messages:write` is not in the token's `att` set — so `signatures_valid`
+# and everything after it are false. The result is therefore the deterministic,
+# identical-across-bridges partial struct:
+#
+#   {tokens_valid: true, signatures_valid: false, within_ceiling: false,
+#    nonce_valid: false, not_revoked: false, time_bounds_valid: false}
+#
+# All six booleans are compared exactly across every bridge (PyO3 reference vs.
+# NAPI / WASM / UniFFI-Kotlin / UniFFI-Swift). The literals are pinned via
+# `expected_values` so joint drift (e.g. all bridges flipping a field) is caught.
+#
+# WASM has no in-bridge key custody (ADR-034), so it cannot mint a token on the
+# raw-bridge path the parity harness drives — same constraint as OP_UCAN_MINT.
+# WASM is therefore xfail'd here for the identical reason.
+# ---------------------------------------------------------------------------
+
+
+# Token grants `messages:read`; evaluation requires `messages:write`. The
+# ceiling permits both so the divergence is purely the unstated invoked
+# capability, keeping the failing stage (grant-match, inside `signatures_valid`)
+# unambiguous and identical across bridges.
+_UCAN_STRUCTURED_GRANTED_CAPS = ["messages:read"]
+_UCAN_STRUCTURED_REQUIRED_CAP = "messages:write"
+
+
+def _py_ucan_evaluate_structured(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(
+        identity.did,
+        {"name": "parity-ucan-es", "mode": "encrypted", "ceiling": _UCAN_CEILING},
+    )
+    token = scp.ucan_mint(handle.context_id, _UCAN_MEMBER_DID, _UCAN_STRUCTURED_GRANTED_CAPS)
+    # Evaluate against a capability the token does NOT grant. The required URI is
+    # context-scoped exactly as minting scopes the granted caps.
+    required = f"scp:ctx:{handle.context_id}/{_UCAN_STRUCTURED_REQUIRED_CAP}"
+    result = scp.ucan_evaluate(handle.context_id, token.encoded, required)
+    return {
+        "tokens_valid": result.tokens_valid,
+        "signatures_valid": result.signatures_valid,
+        "within_ceiling": result.within_ceiling,
+        "nonce_valid": result.nonce_valid,
+        "not_revoked": result.not_revoked,
+        "time_bounds_valid": result.time_bounds_valid,
+    }
+
+
+OP_UCAN_EVALUATE_STRUCTURED = OpSpec(
+    name="ucan_evaluate_structured",
+    py_call=_py_ucan_evaluate_structured,
+    node_call={
+        "op": "ucan_evaluate_structured",
+        "args": {
+            "member_did": _UCAN_MEMBER_DID,
+            "capabilities": _UCAN_STRUCTURED_GRANTED_CAPS,
+            "required_capability": _UCAN_STRUCTURED_REQUIRED_CAP,
+            "ceiling": _UCAN_CEILING,
+        },
+    },
+    schema=OpSchema(
+        fields=(
+            FieldSpec("tokens_valid", "exact"),
+            FieldSpec("signatures_valid", "exact"),
+            FieldSpec("within_ceiling", "exact"),
+            FieldSpec("nonce_valid", "exact"),
+            FieldSpec("not_revoked", "exact"),
+            FieldSpec("time_bounds_valid", "exact"),
+        )
+    ),
+    expected_values=(
+        ("tokens_valid", True),
+        ("signatures_valid", False),
+        ("within_ceiling", False),
+        ("nonce_valid", False),
+        ("not_revoked", False),
+        ("time_bounds_valid", False),
+    ),
+    # WASM cannot mint on the raw-bridge path (no in-bridge custody, ADR-034) —
+    # identical constraint to OP_UCAN_MINT.
+    xfail_bridges=("wasm",),
+    xfail_reason=(
+        "WASM UCAN mint requires JS-side custody (SubtleCrypto) via the TS SDK"
+        " wrapper; the raw-bridge parity harness has no custody to mint the"
+        " token this op evaluates (ADR-034)."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # op 9: transport_status_disconnected
 #
 # Query the transport status with no relay connected.
@@ -981,6 +1144,8 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_TOOL_REGISTER,
     OP_UCAN_MINT,
     OP_UCAN_VALIDATE_MALFORMED,
+    OP_UCAN_EVALUATE_MALFORMED,
+    OP_UCAN_EVALUATE_STRUCTURED,
     OP_TRANSPORT_STATUS,
     OP_EVENT_LOG_FILTERED,
     OP_UNREGISTERED_DID_REJECTED,
