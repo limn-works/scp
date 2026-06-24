@@ -759,34 +759,9 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not a
 /// well-formed UCAN-form ceiling entry.
 pub fn validate_ucan_ceiling_string(entry: &str) -> Result<(), CeilingEntryError> {
-    // Length cap + sanitization first, identical to `validate_ceiling_entry`, so
-    // the two validators reject oversize/control/HTML/whitespace identically.
-    if entry.len() > MAX_CEILING_ENTRY_LENGTH {
-        return Err(CeilingEntryError::invalid(
-            entry,
-            format!(
-                "exceeds maximum length of {MAX_CEILING_ENTRY_LENGTH} bytes (got {} bytes)",
-                entry.len()
-            ),
-        ));
-    }
-    for ch in entry.chars() {
-        if ch.is_control() {
-            return Err(CeilingEntryError::invalid(
-                entry,
-                "contains a control character (U+0000–U+001F / U+007F–U+009F)",
-            ));
-        }
-        if ch.is_whitespace() {
-            return Err(CeilingEntryError::invalid(entry, "contains whitespace"));
-        }
-        if matches!(ch, '<' | '>' | '&' | '"' | '\'') {
-            return Err(CeilingEntryError::invalid(
-                entry,
-                "contains an HTML-special character (< > & \" ')",
-            ));
-        }
-    }
+    // Length cap + character sanitization (§9.1A), shared with the colon-form
+    // validator so both reject oversize/control/HTML/whitespace identically.
+    validate_ceiling_entry_charset(entry)?;
 
     // 1. Built-in UCAN spelling — exact match against every built-in's
     //    `ucan_capability_name()`.
@@ -825,6 +800,49 @@ pub fn validate_ucan_ceiling_string(entry: &str) -> Result<(), CeilingEntryError
     //    accepting a colon-form built-in here would let an import store a spelling
     //    that diverges from the canonical form every gate check matches against.
     validate_custom_ceiling_entry(entry)
+}
+
+/// Shared length-cap + character-sanitization prelude for BOTH ceiling-entry
+/// validators ([`validate_ceiling_entry`] colon form and
+/// [`validate_ucan_ceiling_string`] UCAN form), per §9.1A string-field
+/// validation. Rejects, before any structural parse: an entry exceeding
+/// [`MAX_CEILING_ENTRY_LENGTH`] bytes, any control character
+/// (U+0000–U+001F / U+007F–U+009F), any whitespace, and any HTML-special
+/// character (`< > & " '`). Both validators MUST reject these identically, so
+/// the check lives in one place.
+///
+/// # Errors
+///
+/// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is oversize
+/// or contains a forbidden character.
+fn validate_ceiling_entry_charset(entry: &str) -> Result<(), CeilingEntryError> {
+    if entry.len() > MAX_CEILING_ENTRY_LENGTH {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            format!(
+                "exceeds maximum length of {MAX_CEILING_ENTRY_LENGTH} bytes (got {} bytes)",
+                entry.len()
+            ),
+        ));
+    }
+    for ch in entry.chars() {
+        if ch.is_control() {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains a control character (U+0000–U+001F / U+007F–U+009F)",
+            ));
+        }
+        if ch.is_whitespace() {
+            return Err(CeilingEntryError::invalid(entry, "contains whitespace"));
+        }
+        if matches!(ch, '<' | '>' | '&' | '"' | '\'') {
+            return Err(CeilingEntryError::invalid(
+                entry,
+                "contains an HTML-special character (< > & \" ')",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Returns `true` if every byte of `token` is in the kebab-case charset
@@ -877,38 +895,9 @@ fn is_tool_id_token(tool_id: &str) -> bool {
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not
 /// well-formed.
 pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
-    // Length cap (bytes), per §9.1A string-field validation.
-    if entry.len() > MAX_CEILING_ENTRY_LENGTH {
-        return Err(CeilingEntryError::invalid(
-            entry,
-            format!(
-                "exceeds maximum length of {MAX_CEILING_ENTRY_LENGTH} bytes (got {} bytes)",
-                entry.len()
-            ),
-        ));
-    }
-
-    // String sanitization (§9.1A): reject control chars, HTML-special chars, and
-    // any whitespace anywhere in the entry. This applies uniformly before any
-    // structural parse — a control char inside an otherwise built-in-looking
-    // string is still malformed.
-    for ch in entry.chars() {
-        if ch.is_control() {
-            return Err(CeilingEntryError::invalid(
-                entry,
-                "contains a control character (U+0000–U+001F / U+007F–U+009F)",
-            ));
-        }
-        if ch.is_whitespace() {
-            return Err(CeilingEntryError::invalid(entry, "contains whitespace"));
-        }
-        if matches!(ch, '<' | '>' | '&' | '"' | '\'') {
-            return Err(CeilingEntryError::invalid(
-                entry,
-                "contains an HTML-special character (< > & \" ')",
-            ));
-        }
-    }
+    // Length cap + character sanitization (§9.1A), shared with the UCAN-form
+    // validator so both reject oversize/control/HTML/whitespace identically.
+    validate_ceiling_entry_charset(entry)?;
 
     // 1. Built-in categories: exact, case-sensitive match.
     if BUILTIN_CEILING_CATEGORIES.contains(&entry) {
@@ -4141,6 +4130,43 @@ mod tests {
                 "deserializing a ceiling with malformed entry {malformed:?} must fail; got {result:?}"
             );
         }
+    }
+
+    /// The TYPE-LEVEL invariant holds for `MessagePack` too, not just JSON: the
+    /// signed context-export snapshot is decoded via `rmp_serde::from_slice`, so
+    /// the validating `Deserialize` (`#[serde(try_from)]`) must reject a malformed
+    /// ceiling in BOTH the array (`to_vec`) and named-map (`to_vec_named`)
+    /// `MessagePack` encodings.
+    #[test]
+    fn ceiling_deserialize_rejects_malformed_entry_msgpack() {
+        let bad = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments".to_owned()), // no colon — malformed
+        ]);
+
+        let array_bytes = rmp_serde::to_vec(&bad).expect("serialize (array) a value");
+        let array_result: Result<CapabilityCeiling, _> = rmp_serde::from_slice(&array_bytes);
+        assert!(
+            array_result.is_err(),
+            "rmp_serde (array) must reject a malformed ceiling at deserialize"
+        );
+
+        let named_bytes = rmp_serde::to_vec_named(&bad).expect("serialize (named) a value");
+        let named_result: Result<CapabilityCeiling, _> = rmp_serde::from_slice(&named_bytes);
+        assert!(
+            named_result.is_err(),
+            "rmp_serde (named) must reject a malformed ceiling at deserialize"
+        );
+
+        // And a well-formed ceiling still round-trips through MessagePack.
+        let good = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::Custom("payments:approve".to_owned()),
+        ]);
+        let good_bytes = rmp_serde::to_vec_named(&good).expect("serialize a valid ceiling");
+        let decoded: CapabilityCeiling =
+            rmp_serde::from_slice(&good_bytes).expect("a valid ceiling round-trips via msgpack");
+        assert_eq!(good, decoded);
     }
 
     /// The validating `Deserialize` propagates through any struct that EMBEDS a
