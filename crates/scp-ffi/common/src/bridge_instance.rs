@@ -417,8 +417,8 @@ pub struct CoreFields {
     ///
     /// Bridges may connect to more than one relay simultaneously
     /// (`TransportManager` already supports multi-adapter routing). The
-    /// per-bridge `resume()` override walks this set and reconnects each
-    /// URL individually, so the set is the source of truth for "which
+    /// `BridgeInstanceCore::resume` default body walks this set and reconnects
+    /// each URL individually, so the set is the source of truth for "which
     /// relays does this bridge intend to be connected to".
     ///
     /// Populated via [`Self::add_relay_url`]. Entries removed via
@@ -1125,11 +1125,10 @@ impl CoreFields {
     ///
     /// Clears the suspended flag so bridge operations can proceed.
     ///
-    /// `resume` is `async` so per-bridge overrides (see
-    /// `BridgeInstanceCore::resume`) can chain async work — reconnecting
-    /// transport from pending relay URLs, rehydrating persisted context
-    /// state — after the core flag flip. The core-only body below is `.await`-
-    /// free and remains cheap.
+    /// `resume` is `async` so the `BridgeInstanceCore::resume` default body can
+    /// chain async work — reconnecting transport from pending relay URLs,
+    /// rehydrating persisted context state — after the core flag flip. The
+    /// core-only body below is `.await`-free and remains cheap.
     ///
     /// # Errors
     ///
@@ -1363,8 +1362,9 @@ impl CoreFields {
     /// Returns a snapshot of every relay URL registered via
     /// [`Self::add_relay_url`] and not yet removed.
     ///
-    /// After [`Self::suspend`] the set is preserved so `resume()` overrides can
-    /// reconnect each relay. After [`Self::shutdown`] the set is empty.
+    /// After [`Self::suspend`] the set is preserved so the
+    /// `BridgeInstanceCore::resume` default body can reconnect each relay. After
+    /// [`Self::shutdown`] the set is empty.
     ///
     /// Returns an empty set if no URLs have been stored, if the instance
     /// has been shut down, or if the internal mutex is poisoned.
@@ -1391,8 +1391,8 @@ impl CoreFields {
     /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
     /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
     /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
-    /// stores it via [`Self::set_transport`]. Called from per-bridge
-    /// `BridgeInstanceCore::resume` overrides after the core flag flip.
+    /// stores it via [`Self::set_transport`]. Called from the
+    /// `BridgeInstanceCore::resume` default body after the core flag flip.
     ///
     /// Collects every failure and returns the first as
     /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
@@ -1674,14 +1674,15 @@ impl CoreFields {
     /// `suspend()`/`shutdown()` cycle — see
     /// `Supervisor::restore_all_contexts`.
     ///
-    /// Called from per-bridge `BridgeInstanceCore::resume` overrides after
-    /// [`Self::reconnect_transport_if_pending`]. No-ops silently when:
+    /// Called from the `BridgeInstanceCore::resume` default body after
+    /// [`Self::reconnect_transport_if_pending`] (concrete bridges MUST NOT
+    /// override `resume`). No-ops silently when:
     /// - No `ContextManager` is attached yet (the bridge hasn't seen its
     ///   first `identity_create` / `context_create`).
     /// - The attached `ContextManager` was built without persistence
     ///   (ephemeral test / in-memory path).
     ///
-    /// Routes through `Supervisor::restore_on_startup` (ADR-049 Phase 2D),
+    /// Routes through `Supervisor::restore_on_startup` (ADR-049),
     /// which restores contexts BEFORE the durable saga-journal replay in the
     /// §17.16.4-required restore-then-replay order — so a process restart
     /// rehydrates contexts and then reconciles any crash-orphaned saga journal

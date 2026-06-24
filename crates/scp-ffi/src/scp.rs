@@ -261,7 +261,7 @@ impl PyScp {
         let rt = crate::runtime()?;
         let inner = Arc::clone(&self.inner);
         // Release the GIL while we drive the tokio runtime. The
-        // `BridgeInstanceCore::resume` override performs async work
+        // `BridgeInstanceCore::resume` default body performs async work
         // (transport reconnect, context restore) that must not block the
         // Python interpreter.
         py.allow_threads(|| {

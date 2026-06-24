@@ -105,8 +105,9 @@ let manager = ContextManager::builder()
     .storage(storage)
     .build()?;
 
-// Restore all previously persisted contexts.
-manager.restore_all_contexts().await?;
+// Restore all previously persisted contexts, then replay any crash-orphaned
+// saga-journal entries (the public restore-then-replay startup entry point).
+manager.restore_on_startup().await?;
 ```
 
 ## Manual Provider Assembly

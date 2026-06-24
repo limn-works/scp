@@ -124,7 +124,7 @@ impl CrossContextSagaSeal {
 /// the saga-FSM integration suites in `crates/scp-runtime/tests/`, which drive
 /// replay in isolation over a harness with no persistence provider to restore
 /// from. The `ids` payload doubles as the public restored-id result returned by
-/// [`Self::restore_on_startup`]; it is not part of the ordering enforcement (the
+/// [`Supervisor::restore_on_startup`]; it is not part of the ordering enforcement (the
 /// mere EXISTENCE of the witness is). The type stays `pub` so the `compile_fail`
 /// doctests (external-crate compiles) can reference it.
 #[derive(Debug)]
@@ -1134,8 +1134,8 @@ pub struct Supervisor {
     ///
     /// In-memory only: this set is NOT rebuilt on restart, exactly matching
     /// the prior `AtomicBool`'s restart behavior (a restarted supervisor
-    /// starts with no reservations). When PR-7/2D wires
-    /// [`Self::replay_unresolved_sagas`] at startup, it MUST rebuild
+    /// starts with no reservations). When a later phase of the ADR-049 saga work
+    /// wires [`Self::replay_unresolved_sagas`] at startup, it MUST rebuild
     /// reservations for non-terminal unresolved journal entries — EXCLUDING
     /// `NeedsRepair` entries, whose slots are deliberately released — so a
     /// replay-driven re-drive of an in-flight saga re-takes its set before
@@ -1157,7 +1157,7 @@ pub struct Supervisor {
     /// `caller_context_id` AND `target_context_id`), so
     /// [`Self::reconstruct_xctx_prepared`] rebuilds the COMPLETE `{caller,
     /// target}` set from the evidence — see [`Self::xctx_prepared_evidence_bytes`].
-    /// When the Phase-2D startup loop rebuilds reservations for non-terminal
+    /// When the startup replay loop rebuilds reservations for non-terminal
     /// unresolved entries it reconstructs the full set from this evidence (the
     /// rebuilt reservation equals what `start_saga` would have taken), NOT a
     /// caller-only subset.
@@ -1386,7 +1386,8 @@ impl Supervisor {
     /// the seam the saga FSM + crash-recovery tests use to drive the REAL
     /// journal write-ordering over co-resident actors, and the seam by which a
     /// durable saga journal will be wired into production bridges in a later
-    /// phase (Phase 2D / PR-7).
+    /// phase of the ADR-049 saga work, once the durable saga journal and FFI
+    /// saga surface land.
     ///
     /// Production bridges currently construct via [`Self::with_providers`],
     /// which hardcodes [`NoopSagaJournal`] — i.e. NO durable
@@ -6151,7 +6152,7 @@ impl Supervisor {
     ///   clears the slot).
     ///
     /// Invoked by [`Self::recover_saga_entry`] on a `PreparingB` entry, which is
-    /// driven by the Phase-2D startup replay loop
+    /// driven by the startup replay loop
     /// ([`Self::replay_unresolved_sagas`]).
     async fn redrive_xctx_prepare_in_progress(
         &self,
@@ -6193,7 +6194,7 @@ impl Supervisor {
     ///
     /// Returns the resolution so [`Self::recover_saga_entry`] journals the right
     /// terminal. Invoked by `recover_saga_entry` on a `Committing` entry, driven
-    /// by the Phase-2D startup replay loop ([`Self::replay_unresolved_sagas`]).
+    /// by the startup replay loop ([`Self::replay_unresolved_sagas`]).
     async fn redrive_xctx_commit_in_progress(
         &self,
         saga_id: &SagaId,
@@ -8041,7 +8042,7 @@ impl Supervisor {
         Ok(RestoredContexts::new(ids))
     }
 
-    /// Single process-startup recovery entry point (ADR-049 Phase 2D).
+    /// Single process-startup recovery entry point (ADR-049).
     ///
     /// Runs the two startup sweeps in the order §17.16.4 requires —
     /// **restore, THEN reconcile**:
@@ -18565,7 +18566,7 @@ mod tests {
         );
     }
 
-    /// §17.16.4 restore-then-replay START-UP path (ADR-049 Phase 2D) — the
+    /// §17.16.4 restore-then-replay START-UP path (ADR-049) — the
     /// crash-recovery GATE for the cross-context caller reversal over a RESIDENT
     /// caller. Drives the SINGLE production startup entry point
     /// [`Supervisor::restore_on_startup`] (NOT `recover_saga_entry` directly)
@@ -18672,7 +18673,7 @@ mod tests {
         );
     }
 
-    /// §17.16.4 restore-then-replay START-UP path (ADR-049 Phase 2D) — the
+    /// §17.16.4 restore-then-replay START-UP path (ADR-049) — the
     /// genuinely ORDER-DISCRIMINATING behavioral proof. Unlike
     /// `restore_on_startup_xctx_caller_reversal_delivered_entry_terminal` (whose
     /// caller is pre-spawned + persistence empty, so it would pass under either

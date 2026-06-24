@@ -214,7 +214,7 @@ async fn replay_on_empty_journal_succeeds() {
         .unwrap();
 }
 
-/// Process-restart bootstrap wiring (ADR-049 Phase 2D), §17.16.4
+/// Process-restart bootstrap wiring (ADR-049), §17.16.4
 /// restore-THEN-replay ordering, FAIL-CLOSED half: a fresh supervisor over
 /// storage that durably retains an unresolved saga journal entry runs the
 /// single startup entry point `Supervisor::restore_on_startup`, whose RESTORE

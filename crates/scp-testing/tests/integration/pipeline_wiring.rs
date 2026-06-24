@@ -106,8 +106,8 @@ const COMMON_BROADCAST_SRC: &str =
 // Shared bridge-instance core (scp-ffi-common) — owns the production
 // startup/resume path `restore_all_persisted_contexts`, which MUST route
 // through `Supervisor::restore_on_startup` so the §17.16.4 saga-journal
-// replay runs after context restore on every process restart (ADR-049
-// Phase 2D). Pinned by `restore_on_startup_runs_restore_before_replay` and
+// replay runs after context restore on every process restart (ADR-049).
+// Pinned by `restore_on_startup_runs_restore_before_replay` and
 // `bridge_resume_path_routes_through_restore_on_startup`.
 const BRIDGE_INSTANCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
@@ -863,7 +863,7 @@ fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
     );
 }
 
-// Supervisor level (ADR-049 Phase 2D): the single startup entry point
+// Supervisor level (ADR-049): the single startup entry point
 // `restore_on_startup` MUST restore contexts BEFORE the saga-journal replay —
 // the §17.16.4 restore-then-replay crash-recovery model requires each recovery
 // arm (the cross-context caller reversal; a Commit-in-progress re-send) to drive
@@ -896,19 +896,22 @@ fn restore_on_startup_runs_restore_before_replay() {
     );
 }
 
-// Bridge level (ADR-049 Phase 2D): every production startup/resume path SHOULD
+// Bridge level (ADR-049): every production startup/resume path SHOULD
 // route through the combined `restore_on_startup` entry point — NOT call the
 // bare `restore_all_contexts` — so the saga-journal replay can never be skipped
 // on a real process restart. Guards against the "exported but never called from
 // the bootstrap path" regression.
 //
-// **This is a BEST-EFFORT source-order check, NOT the real enforcement.** A
-// substring scan cannot soundly distinguish "calls the combined entry" from
-// "merely names the token": a bridge could call `Supervisor::restore_all_contexts(&sup)`
-// via UFCS (no `.restore_all_contexts()` substring) plus a no-op
-// `restore_on_startup` shadow and still pass this gate. Hardening the locator
-// with more spellings is a non-convergent denylist (CLAUDE.md). The REAL
-// enforcement that the bridge path runs BOTH the restore and the replay legs is
+// **This is a BEST-EFFORT source-order check, NOT the real enforcement.** It is
+// best-effort for IN-CRATE callers only: a substring scan cannot soundly
+// distinguish "calls the combined entry" from "merely names the token" — an
+// in-crate caller could name `restore_all_contexts(&sup)` via UFCS (no
+// `.restore_all_contexts()` substring) plus a no-op `restore_on_startup` shadow
+// and still pass this gate. The cross-crate UFCS route is no longer a concern:
+// `restore_all_contexts` is `pub(crate)`, so naming it from another crate is a
+// compile error (E0624). Hardening the in-crate locator with more spellings is a
+// non-convergent denylist (CLAUDE.md). The REAL enforcement that the bridge path
+// runs BOTH the restore and the replay legs is
 // the behavioral bootstrap integration test
 // `bridge_restore_entry_runs_restore_and_replay_legs`
 // (`crates/scp-testing/tests/integration/saga_bridge_bootstrap.rs`), which drives
@@ -918,10 +921,13 @@ fn restore_on_startup_runs_restore_before_replay() {
 // kept as cheap defense-in-depth against the obvious "names the bare leg"
 // regression; its assertions are not weakened.
 //
-// `restore_all_contexts` is kept `pub` (the `scp-testing` persistence E2E drives
-// it directly), so a bridge COULD physically name the bare leg; this gate is the
-// best-effort check that none does. It covers the shared bridge-instance core AND
-// each of the three FFI exports (PyO3 / napi / UniFFI), since each exports its own
+// `restore_all_contexts` is now `pub(crate)`, so no out-of-crate bridge can name
+// the bare leg at all — a cross-crate `Supervisor::restore_all_contexts(&sup)`
+// call is a compile error (E0624). This source-text gate is therefore retained
+// purely as cheap IN-CRATE defense-in-depth: it catches an in-crate caller (or a
+// future re-widening of the visibility) that names the bare leg and skips the
+// saga-journal replay. It covers the shared bridge-instance core AND each of the
+// three FFI exports (PyO3 / napi / UniFFI), since each exports its own
 // `context_restore_all`-shaped entry point.
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {

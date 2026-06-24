@@ -3792,7 +3792,7 @@ pub(crate) async fn context_restore_on(
 /// Per-bridge-instance implementation of [`context_restore_all`].
 ///
 /// Returns a JSON array of restored context ID strings. Routes through the
-/// supervisor-scope direct method `restore_on_startup` (ADR-049 Phase 2D),
+/// supervisor-scope direct method `restore_on_startup` (ADR-049),
 /// which restores contexts BEFORE replaying any crash-orphaned saga journal
 /// entries in the §17.16.4-required restore-then-replay order; `restore_on_startup`
 /// operates on the supervisor-wide context registry and has no per-context

@@ -10254,7 +10254,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `restore_all_contexts`.
     ///
     /// Routes through `&*self.inner` and the supervisor-scope
-    /// `restore_on_startup` (ADR-049 Phase 2D), which restores contexts BEFORE
+    /// `restore_on_startup` (ADR-049), which restores contexts BEFORE
     /// replaying any crash-orphaned saga journal entries in the
     /// §17.16.4-required restore-then-replay order.
     pub async fn restore_all_contexts(&self) -> Result<String, ScpError> {

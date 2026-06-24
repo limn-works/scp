@@ -1,4 +1,4 @@
-//! Bridge-path startup recovery bootstrap (ADR-049 Phase 2D, §17.16.4).
+//! Bridge-path startup recovery bootstrap (ADR-049, §17.16.4).
 //!
 //! This is the BEHAVIORAL enforcement that the shared bridge restore entry
 //! `CoreFields::restore_all_persisted_contexts`, which all three non-WASM
@@ -12,11 +12,14 @@
 //!    entry left by a crash mid-saga.
 //!
 //! The source-text gate `bridge_resume_path_routes_through_restore_on_startup`
-//! in `pipeline_wiring.rs` can only assert that the bridge entry *names*
-//! `restore_on_startup()` — a substring denylist cannot soundly distinguish
-//! "calls the combined entry" from "names the token" (a bridge could call
-//! `Supervisor::restore_all_contexts(&sup)` via UFCS plus a no-op
-//! `restore_on_startup` shadow and still pass). This test drives the REAL bridge
+//! in `pipeline_wiring.rs` is best-effort for IN-CRATE callers: it can only
+//! assert that the bridge entry *names* `restore_on_startup()`, and a substring
+//! denylist cannot soundly distinguish "calls the combined entry" from "names the
+//! token" (an in-crate caller could name `restore_all_contexts(&sup)` via UFCS
+//! plus a no-op `restore_on_startup` shadow and still pass). The cross-crate UFCS
+//! route is now compile-blocked — `Supervisor::restore_all_contexts` is
+//! `pub(crate)`, so naming it from another crate is `error[E0624]`. The type
+//! system is the real enforcement; this test drives the REAL bridge
 //! entry over a real persistence backend (holding a persisted `Active` context)
 //! and a real durable saga journal (holding a PENDING unresolved entry), then
 //! asserts BOTH the context was restored AND the saga reached a reconciled
