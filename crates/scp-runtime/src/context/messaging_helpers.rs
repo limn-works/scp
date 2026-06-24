@@ -2615,6 +2615,8 @@ pub fn build_snapshot_from_state(
         // the caller deduction + void the escrow without the in-memory carrier.
         xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
+        bcast_request_nonce_dedup: bcast_request_nonce_dedup_snapshot(state),
+        bcast_committed_grants: bcast_committed_grants_snapshot(state),
     }
 }
 
@@ -2722,6 +2724,26 @@ pub(in crate::context) fn xctx_nonce_dedup_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<[u8; 16], u64> {
     state.class_s.xctx_nonce_dedup.entries()
+}
+
+/// Build the Class-S snapshot projection of the actor's B-owned broadcast
+/// hosting-handshake request nonce-dedup cache (spec §5.14.13 "Freshness";
+/// ADR-049 §9). Same crash-survival discipline as [`xctx_nonce_dedup_snapshot`]:
+/// persisting it makes the request-replay window survive a restart; same-node
+/// restore rehydrates it, cross-node export/import drops it to empty.
+pub(in crate::context) fn bcast_request_nonce_dedup_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<[u8; 16], u64> {
+    state.class_s.bcast_request_nonce_dedup.entries()
+}
+
+/// Build the Class-S snapshot projection of the host-side durable broadcast
+/// hosting-grant proofs (spec §5.14.13 Commit-A; ADR-049 §9). Same crash-survival
+/// discipline as the other Class-S saga witnesses.
+pub(in crate::context) fn bcast_committed_grants_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<crate::context::supervisor::saga_journal::SagaId, Vec<u8>> {
+    state.class_s.bcast_committed_grants.clone()
 }
 
 // ---------------------------------------------------------------------------

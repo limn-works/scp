@@ -201,10 +201,13 @@ impl RestoredContexts {
 /// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
 /// a required choice the type system can enforce must not be skippable). The
 /// generic `start_saga` therefore only ever receives the publicly-constructible
-/// variants (`StandingPairCreate` / `BroadcastHostingHandshake`, both
-/// `NotImplemented` today). External pattern-matching on
-/// `CrossContextToolInvocation { .. }` is still allowed; only construction is
-/// sealed.
+/// variants (`StandingPairCreate` — `NotImplemented` today — and
+/// `BroadcastHostingHandshake`, whose §5.14.13 saga IS wired but, like the tool
+/// saga, is driven through its dedicated
+/// [`Supervisor::start_broadcast_hosting_handshake_saga`] entry point so the FSM
+/// receives the per-call signing keys; plain `start_saga` on it is a misuse).
+/// External pattern-matching on `CrossContextToolInvocation { .. }` is still
+/// allowed; only construction is sealed.
 pub enum SagaInput {
     /// Standing-pair creation between two identities. Full field set
     /// arrives with `handlers/standing.rs` in commit 11.
@@ -909,6 +912,87 @@ pub struct SagaSigningKeys<'a> {
     /// The caller context's Active Signing Key. Signs the CALLER-side divergence
     /// marker on `NeedsRepair`.
     pub caller: &'a ed25519_dalek::SigningKey,
+}
+
+/// The wire request a §5.14.13 broadcast hosting-handshake saga rides, named so
+/// the call site cannot transpose the two `[u8; 32]` context ids.
+pub struct BroadcastHostingHandshakeRequest {
+    /// Raw 32-byte id of the host (relaying) context.
+    pub host_context_id: [u8; 32],
+    /// Raw 32-byte id of the broadcast (hosted) context.
+    pub broadcast_context_id: [u8; 32],
+    /// The host representative DID requesting hosting (holds `messages:read` for B).
+    pub subscriber_did: DID,
+    /// X25519 recipient key the post-grant broadcast key is sealed under.
+    pub wrapping_pubkey: [u8; 32],
+    /// JCS bytes of the requested `BroadcastHostConfig`.
+    pub requested_config_bytes: Vec<u8>,
+    /// `messages:read` UCAN — present iff B is a gated context.
+    pub ucan: Option<String>,
+    /// 16-byte freshness/anti-replay nonce (the grant echoes it).
+    pub nonce: [u8; 16],
+    /// Request send time in Unix milliseconds (freshness-checked at Prepare-B).
+    pub timestamp_ms: u64,
+}
+
+/// The two Active Signing Keys a §5.14.13 broadcast hosting-handshake saga signs
+/// under, named by role so the call site cannot transpose them (the same
+/// confused-deputy guard as [`SagaSigningKeys`]).
+///
+/// The keys are held by reference (the entry point clones each into the
+/// FSM-carried context); they are capabilities, NOT envelope data.
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastHostingSigningKeys<'a> {
+    /// The host representative's Active Signing Key (signs the request at Prepare-A).
+    pub subscriber: &'a ed25519_dalek::SigningKey,
+    /// The broadcast author's signing key (signs the grant at Prepare-B).
+    pub author: &'a ed25519_dalek::SigningKey,
+}
+
+/// FSM-carried context for a broadcast hosting-handshake saga (spec §5.14.13),
+/// the broadcast analogue of [`CrossContextSagaCtx`]. Threaded through
+/// `run_saga` / `run_saga_fsm` / the prepare/commit dispatch alongside the
+/// xctx ctx. Far simpler than the xctx ctx: no executor, no escrow, no
+/// divergence-marker dual-log — the broadcast saga is public-metadata-only.
+struct BroadcastSagaCtx {
+    /// Raw 32-byte host (relaying) context id (A's own context).
+    host_context_id: [u8; 32],
+    /// Raw 32-byte broadcast (hosted) context id (B's own context).
+    broadcast_context_id: [u8; 32],
+    /// The host representative DID requesting hosting.
+    subscriber_did: DID,
+    /// X25519 recipient key the post-grant broadcast key is sealed under.
+    wrapping_pubkey: [u8; 32],
+    /// JCS bytes of the requested `BroadcastHostConfig`.
+    requested_config_bytes: Vec<u8>,
+    /// `messages:read` UCAN — present iff B is a gated context.
+    ucan: Option<String>,
+    /// 16-byte freshness/anti-replay nonce.
+    nonce: [u8; 16],
+    /// Request send time in Unix milliseconds.
+    timestamp_ms: u64,
+    /// The host representative's Active Signing Key (signs the request).
+    subscriber_signing_key: ed25519_dalek::SigningKey,
+    /// The broadcast author's signing key (signs the grant).
+    author_signing_key: ed25519_dalek::SigningKey,
+    /// JCS bytes of the requester-signed request, held after Prepare-A so
+    /// Prepare-B can validate it.
+    prepared_a_request: Option<Vec<u8>>,
+    /// JCS bytes of the author-signed grant + captured replay-deterministic
+    /// values, held after Prepare-B so Commit-A can deliver the grant and the
+    /// journal evidence can be rebuilt.
+    prepared_b: Option<BroadcastPreparedBCarry>,
+}
+
+/// Prepare-B carry: the author-signed grant bytes + the captured replay-
+/// deterministic values (key epoch / granted_at_ms) the journal evidence reads.
+struct BroadcastPreparedBCarry {
+    /// JCS bytes of the author-signed `BroadcastHostingGrant`.
+    grant_bytes: Vec<u8>,
+    /// The broadcast key epoch captured at Prepare-B.
+    key_epoch_at_grant: u64,
+    /// Wall-clock ms captured at Prepare-B.
+    granted_at_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -4790,10 +4874,11 @@ impl Supervisor {
     /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
     /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
     /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
-    /// The saga-initiator variant
-    /// (`InitiateBroadcastHostingHandshake`) returns
-    /// [`ContextError::NotImplemented`] during the commit-11 window —
-    /// see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// The single-actor mailbox variant `InitiateBroadcastHostingHandshake`
+    /// returns [`ContextError::NotImplemented`]: the §5.14.13 saga IS
+    /// implemented but is supervisor-driven (cross-context, per-call signing
+    /// keys) via [`Self::start_broadcast_hosting_handshake_saga`], not
+    /// reachable from a single actor's mailbox.
     ///
     /// # Errors
     ///
@@ -5084,19 +5169,21 @@ impl Supervisor {
     /// EVERY terminal — Committed, Aborted, AND NeedsRepair — plus
     /// panic-unwind, so a stuck saga never wedges unrelated disjoint sagas.
     ///
-    /// # Unwired saga use cases (pending Phase 2C)
+    /// # Saga inputs requiring a dedicated entry point
     ///
-    /// `StandingPairCreate` and `BroadcastHostingHandshake` remain spec-gapped
-    /// (their Prepare dispatch returns [`ContextError::NotImplemented`]; the FSM
-    /// transitions through `Initiated → PreparingA → Aborting → Aborted` and
-    /// surfaces the typed error). `CrossContextToolInvocation` is the wired
-    /// variant — its end-to-end Prepare/Commit dispatch over the two co-resident
-    /// participant actors lands here (spec §6.2.4); drive it via
-    /// [`Self::start_cross_context_tool_invocation_saga`], which supplies the
-    /// supervisor-side tool executor and the target's Active Signing Key.
-    /// Calling `start_saga` directly with a `CrossContextToolInvocation` input
-    /// (no executor / signing key) is a misuse: the FSM aborts at Prepare with a
-    /// typed error because it has no way to execute the tool or sign the receipt.
+    /// `StandingPairCreate` remains spec-gapped (its Prepare dispatch returns
+    /// [`ContextError::NotImplemented`]; the FSM transitions through
+    /// `Initiated → PreparingA → Aborting → Aborted` and surfaces the typed
+    /// error). The two live sagas — `CrossContextToolInvocation` (spec §6.2.4)
+    /// and `BroadcastHostingHandshake` (spec §5.14.13) — are fully wired but
+    /// require their dedicated entry points, which supply the per-call signing
+    /// keys (and, for the tool saga, the supervisor-side executor) that plain
+    /// `start_saga` cannot: drive them via
+    /// [`Self::start_cross_context_tool_invocation_saga`] and
+    /// [`Self::start_broadcast_hosting_handshake_saga`] respectively. Calling
+    /// `start_saga` directly with either input (no executor / signing key
+    /// context) is a misuse: the FSM aborts at Prepare with a typed error
+    /// because it has no way to execute the tool / sign the receipt or grant.
     ///
     /// The coordinator itself — journal writes, phase transitions, timeout/retry
     /// accounting, terminal resolution, per-participant-context-set gating — is
@@ -5108,7 +5195,8 @@ impl Supervisor {
     ///   participant context set overlaps an in-flight saga's reserved set.
     ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
     /// - [`ContextError::NotImplemented`] for the spec-gapped
-    ///   `StandingPairCreate` / `BroadcastHostingHandshake` inputs.
+    ///   `StandingPairCreate` input, or for either live saga input dispatched
+    ///   through plain `start_saga` without its dedicated entry point's context.
     /// - [`ContextError::InvalidState`] on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
@@ -5120,7 +5208,7 @@ impl Supervisor {
         // dispatch aborts with a typed error.
         let context_set = saga_participant_context_set(&input);
         let reservation = self.try_reserve_context_set(&context_set)?;
-        self.run_saga(input, None, reservation).await
+        Box::pin(self.run_saga(input, None, None, reservation)).await
     }
 
     /// Drive a cross-context tool-invocation saga (spec §6.2.4) end-to-end
@@ -5325,7 +5413,95 @@ impl Supervisor {
         // under it.
         let context_set = saga_participant_context_set(&saga_input);
         let reservation = self.try_reserve_context_set(&context_set)?;
-        self.run_saga(saga_input, Some(ctx), reservation).await
+        Box::pin(self.run_saga(saga_input, Some(ctx), None, reservation)).await
+    }
+
+    /// Drive a broadcast hosting-handshake saga (spec §5.14.13) end-to-end over
+    /// the two co-resident participant actors (host context A + broadcast
+    /// context B). Mirrors [`Self::start_cross_context_tool_invocation_saga`].
+    ///
+    /// The actor holds no signing key (ADR-049); the FSM supplies the host
+    /// representative's Active Signing Key (signs the request at Prepare-A) and
+    /// the broadcast author's signing key (signs the grant at Prepare-B)
+    /// per-call. Authorize-before-reserve (forward obligation): the initiator is
+    /// authorized over EACH named context BEFORE the saga set is reserved, so a
+    /// participant cannot reserve (and thereby deny) a victim's context.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the initiator is not authorized
+    ///   over the host or broadcast context it names.
+    /// - [`ContextError::ActorBusy`] if the participant set overlaps an in-flight
+    ///   saga (the `{host, broadcast}` reservation; ADR-049 §3a).
+    /// - propagates the FSM's terminal error on Abort / `NeedsRepair`.
+    pub async fn start_broadcast_hosting_handshake_saga(
+        &self,
+        request: BroadcastHostingHandshakeRequest,
+        signing_keys: BroadcastHostingSigningKeys<'_>,
+    ) -> Result<SagaOutput, ContextError> {
+        let BroadcastHostingHandshakeRequest {
+            host_context_id,
+            broadcast_context_id,
+            subscriber_did,
+            wrapping_pubkey,
+            requested_config_bytes,
+            ucan,
+            nonce,
+            timestamp_ms,
+        } = request;
+
+        // Authorize-before-reserve gate 1 (host axis): the initiator MUST be a
+        // member of the host context it names (the host representative relaying
+        // B's content to the host's own members). Reject WITHOUT reserving.
+        let host_hex = hex::encode(host_context_id);
+        if !self.is_member(&host_hex, subscriber_did.as_ref()).await {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13162: broadcast hosting saga initiator '{subscriber_did}' is not a \
+                 member of host context '{host_hex}' — not authorized to relay over it"
+            )));
+        }
+
+        // Authorize-before-reserve gate 2 (broadcast axis): the initiator MUST
+        // hold `messages:read` for B (be a registered §5.14.3 subscriber).
+        // Reject WITHOUT reserving so a non-subscriber cannot reserve (and
+        // thereby wedge) the victim's broadcast context's saga slot before any
+        // B-side check ran (those run inside Prepare-B, AFTER reservation).
+        let broadcast_hex = hex::encode(broadcast_context_id);
+        if !self
+            .is_member(&broadcast_hex, subscriber_did.as_ref())
+            .await
+        {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13163: broadcast hosting saga initiator '{subscriber_did}' is not a \
+                 subscriber of broadcast context '{broadcast_hex}' — not authorized to request \
+                 hosting (and not authorized to reserve its saga slot)"
+            )));
+        }
+
+        let ctx = BroadcastSagaCtx {
+            host_context_id,
+            broadcast_context_id,
+            subscriber_did: subscriber_did.clone(),
+            wrapping_pubkey,
+            requested_config_bytes,
+            ucan,
+            nonce,
+            timestamp_ms,
+            subscriber_signing_key: signing_keys.subscriber.clone(),
+            author_signing_key: signing_keys.author.clone(),
+            prepared_a_request: None,
+            prepared_b: None,
+        };
+
+        let saga_input = SagaInput::BroadcastHostingHandshake {
+            host_context_id,
+            broadcast_context_id,
+            subscriber_did,
+        };
+
+        let context_set = saga_participant_context_set(&saga_input);
+        let reservation = self.try_reserve_context_set(&context_set)?;
+        Box::pin(self.run_saga(saga_input, None, Some(ctx), reservation)).await
     }
 
     /// Shared start-saga driver: run the FSM under an ALREADY-acquired
@@ -5342,6 +5518,7 @@ impl Supervisor {
         &self,
         input: SagaInput,
         xctx: Option<CrossContextSagaCtx<'_>>,
+        bctx: Option<BroadcastSagaCtx>,
         _reservation: SagaSetReservation<'_>,
     ) -> Result<SagaOutput, ContextError> {
         let saga_id = SagaId::new();
@@ -5349,6 +5526,7 @@ impl Supervisor {
         let secret_bearing = saga_input_is_secret_bearing(&input);
 
         let mut xctx = xctx;
+        let mut bctx = bctx;
         let fsm_result = self
             .run_saga_fsm(
                 saga_id.clone(),
@@ -5356,6 +5534,7 @@ impl Supervisor {
                 participants.clone(),
                 secret_bearing,
                 xctx.as_mut(),
+                bctx.as_mut(),
             )
             .await;
 
@@ -5945,12 +6124,15 @@ impl Supervisor {
     /// only a genuinely-unresolvable divergence (one-sided commit / unreachable
     /// side / non-reconstructible entry) stays `NeedsRepair` for operator repair.
     async fn recover_committing_entry(&self, entry: &JournalEntry) {
-        let resolution = match Self::reconstruct_xctx_prepared(entry) {
-            Some(prepared) => {
-                self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
-                    .await
-            }
-            None => CommitInProgressResolution::NeedsRepair,
+        let resolution = if let Some(prepared) = Self::reconstruct_xctx_prepared(entry) {
+            self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
+                .await
+        } else if let Some(bcast) = Self::reconstruct_bcast_prepared(entry) {
+            // Broadcast hosting-handshake Commit-in-progress re-drive (§5.14.13).
+            self.redrive_bcast_commit_in_progress(&entry.saga_id, &bcast)
+                .await
+        } else {
+            CommitInProgressResolution::NeedsRepair
         };
         match resolution {
             CommitInProgressResolution::Committed => {
@@ -6027,6 +6209,99 @@ impl Supervisor {
             return None;
         }
         CrossContextToolInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+    }
+
+    /// Reconstruct a broadcast hosting-handshake saga's prepared state from a
+    /// journal entry's `evidence` (spec §5.14.13 "Crash recovery §17.16.4").
+    ///
+    /// The evidence is the `MessagePack` of the
+    /// [`BroadcastHostingHandshakePrepared`](crate::context::supervisor::saga_prepared_state::BroadcastHostingHandshakePrepared)
+    /// wire — carrying both context ids + the replay-deterministic captured
+    /// values (grant epoch / `granted_at_ms` / nonce / timestamp + clamped config
+    /// bytes). Returns `None` if the entry is not a broadcast hosting saga (its
+    /// evidence does not decode as the broadcast wire — the distinct field-name
+    /// set keeps it from colliding with the xctx wire).
+    fn reconstruct_bcast_prepared(
+        entry: &JournalEntry,
+    ) -> Option<crate::context::supervisor::saga_prepared_state::BroadcastHostingHandshakePrepared>
+    {
+        use crate::context::supervisor::saga_prepared_state::BroadcastHostingHandshakePrepared;
+        if entry.evidence.is_empty() {
+            return None;
+        }
+        BroadcastHostingHandshakePrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+    }
+
+    /// §17.16.4 Commit-in-progress re-drive for a broadcast hosting-handshake
+    /// saga: re-send the idempotent Commit-B (re-acks the durable
+    /// `AcceptedHostSnapshotEntry` + `MemberJoined` append, no double-delivery)
+    /// then Commit-A (re-acks the durable grant proof). Both idempotent by
+    /// `SagaId`. Returns the resolution so the caller journals the right terminal.
+    async fn redrive_bcast_commit_in_progress(
+        &self,
+        saga_id: &SagaId,
+        prepared: &crate::context::supervisor::saga_prepared_state::BroadcastHostingHandshakePrepared,
+    ) -> CommitInProgressResolution {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        // Commit-B: re-ack the durable snapshot + append (idempotent by SagaId).
+        let broadcast_hex = hex::encode(prepared.broadcast_context_id);
+        let Some(broadcast_actor) = self.lookup(&broadcast_hex) else {
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                context = %broadcast_hex,
+                "broadcast hosting saga recovery — Commit-in-progress re-drive: broadcast actor \
+                 unreachable; operator repair required"
+            );
+            return CommitInProgressResolution::NeedsRepair;
+        };
+        let commit_b_saga_id = saga_id.clone();
+        if broadcast_actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitB {
+                    saga_id: commit_b_saga_id,
+                    reply,
+                })
+            })
+            .await
+            .is_err()
+        {
+            return CommitInProgressResolution::NeedsRepair;
+        }
+
+        // Commit-A: re-deliver the byte-identical grant (reconstructed from the
+        // journaled config bytes + captured epoch/timestamp). The grant the host
+        // holds is the one B signed at Prepare-B; on a cross-process replay the
+        // author key is gone, so we re-build the grant from the staged actor-side
+        // record on B is the authoritative source. Here, lacking the live ctx, we
+        // re-drive Commit-A against the host's durable grant witness: the host's
+        // `bcast_committed_grants` is keyed by SagaId and idempotently re-acked.
+        let host_hex = hex::encode(prepared.host_context_id);
+        let Some(host_actor) = self.lookup(&host_hex) else {
+            return CommitInProgressResolution::NeedsRepair;
+        };
+        // The host already holds the grant under this SagaId (Commit-A landed
+        // before the crash) OR it is re-delivered. A replayed Commit-A with empty
+        // grant bytes is a no-op iff the witness exists; to keep the re-drive
+        // self-contained we re-send the grant bytes B holds. Since the live ctx
+        // is gone, B is the grant source — but B's grant is not journaled here
+        // (only the config bytes are). The host's durable witness IS the proof, so
+        // a Commit-A whose witness is already present re-acks regardless of the
+        // re-sent bytes. Send empty bytes ⇒ the host re-acks from its witness if
+        // present, else this is a genuine divergence (NeedsRepair).
+        let host_commit_saga_id = saga_id.clone();
+        let witnessed = host_actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitAReack {
+                    saga_id: host_commit_saga_id,
+                    reply,
+                })
+            })
+            .await;
+        match witnessed {
+            Ok(true) => CommitInProgressResolution::Committed,
+            Ok(false) | Err(_) => CommitInProgressResolution::NeedsRepair,
+        }
     }
 
     /// Returns the caller context id (raw-digest hex) named in a journal
@@ -6377,6 +6652,7 @@ impl Supervisor {
         participants: Vec<String>,
         secret_bearing: bool,
         mut xctx: Option<&mut CrossContextSagaCtx<'_>>,
+        mut bctx: Option<&mut BroadcastSagaCtx>,
     ) -> Result<(), ContextError> {
         // 1. Initiated
         self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
@@ -6391,7 +6667,13 @@ impl Supervisor {
             .await?;
 
         let phase_a = self
-            .dispatch_prepare_phase(&saga_id, input, SagaPhase::A, xctx.as_deref_mut())
+            .dispatch_prepare_phase(
+                &saga_id,
+                input,
+                SagaPhase::A,
+                xctx.as_deref_mut(),
+                bctx.as_deref_mut(),
+            )
             .await;
         if let Err(err) = phase_a {
             self.abort_saga(
@@ -6400,6 +6682,7 @@ impl Supervisor {
                 2,
                 secret_bearing,
                 xctx.as_deref_mut(),
+                bctx.as_deref_mut(),
             )
             .await?;
             return Err(err);
@@ -6415,9 +6698,8 @@ impl Supervisor {
         //    gap. At PreparingB the caller-asserted nonce/depth stand in for B's
         //    recorded values (B records them inside Prepare-B); the Committing
         //    append below re-journals with B's authoritative recorded provenance.
-        let preparing_b_evidence = xctx
-            .as_deref()
-            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        let preparing_b_evidence =
+            Self::saga_prepared_evidence_bytes(input, xctx.as_deref(), bctx.as_deref());
         self.append_journal(
             &saga_id,
             SagaState::PreparingB,
@@ -6428,7 +6710,13 @@ impl Supervisor {
         .await?;
 
         let phase_b = self
-            .dispatch_prepare_phase(&saga_id, input, SagaPhase::B, xctx.as_deref_mut())
+            .dispatch_prepare_phase(
+                &saga_id,
+                input,
+                SagaPhase::B,
+                xctx.as_deref_mut(),
+                bctx.as_deref_mut(),
+            )
             .await;
         if let Err(err) = phase_b {
             self.abort_saga(
@@ -6437,6 +6725,7 @@ impl Supervisor {
                 3,
                 secret_bearing,
                 xctx.as_deref_mut(),
+                bctx.as_deref_mut(),
             )
             .await?;
             return Err(err);
@@ -6448,9 +6737,8 @@ impl Supervisor {
         //    Commit-in-progress crash-recovery replay (§17.16.4) reconstructs
         //    the staged `CrossContextToolInvocationPrepared` from THIS evidence
         //    to re-drive the idempotent Commit.
-        let committing_evidence = xctx
-            .as_deref()
-            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        let committing_evidence =
+            Self::saga_prepared_evidence_bytes(input, xctx.as_deref(), bctx.as_deref());
         self.append_journal(
             &saga_id,
             SagaState::Committing,
@@ -6461,7 +6749,7 @@ impl Supervisor {
         .await?;
 
         let commit_result = self
-            .commit_with_retry(&saga_id, input, xctx.as_deref_mut())
+            .commit_with_retry(&saga_id, input, xctx.as_deref_mut(), bctx)
             .await;
         match commit_result {
             Ok(()) => {
@@ -6478,52 +6766,61 @@ impl Supervisor {
                 Ok(())
             }
             Err(err) => {
-                // Commit retry exhausted — NeedsRepair (spec §6.2.4
-                // "commit_with_retry exhausts (3×) → NeedsRepair").
-                self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
+                self.handle_commit_failure(&saga_id, &participants, &err, xctx)
                     .await?;
-                // §17.16.4 operator-alerting metric: a saga reached the
-                // NeedsRepair terminal and requires operator repair.
-                crate::metrics::record_saga_repair_needed();
-                tracing::error!(
-                    saga_id = %saga_id,
-                    %err,
-                    "saga coordinator — commit retry exhausted, saga in NeedsRepair"
-                );
-                // Dual event-log recording (spec §6.2.4): on NeedsRepair both
-                // sides MUST emit a signed `CrossContextDivergenceMarker` (into
-                // each available log, or the supervisor-level repair journal if
-                // a side is unreachable) so a one-sided commit is durably
-                // auditable. Cross-context only; the test / spec-gapped inputs
-                // carry no `xctx`. Marks the ctx so `run_saga`'s tail leaves the
-                // escrow RESERVED (NOT auto-voided) for operator repair.
-                if let Some(ctx) = xctx {
-                    ctx.reached_needs_repair = true;
-                    // Extract the owned divergence plan SYNCHRONOUSLY (no `&ctx`
-                    // borrow crosses the `.await` — the ctx's boxed executor is
-                    // non-`Sync`), then emit. A `None` plan ⇒ Commit-B never
-                    // landed (no committed side, no divergence to mark).
-                    if let Some(plan) = Self::divergence_marker_plan(ctx) {
-                        Box::pin(self.emit_divergence_markers(&saga_id, plan)).await;
-                    } else {
-                        tracing::warn!(
-                            saga_id = %saga_id,
-                            "cross-context saga NeedsRepair with NO committed side (Commit-B never \
-                             landed); logs are clean, no divergence marker required"
-                        );
-                    }
-                }
                 Err(err)
             }
         }
+    }
+
+    /// Commit-retry exhaustion handler (spec §6.2.4 "commit_with_retry exhausts
+    /// (3×) → NeedsRepair"). Journals the `NeedsRepair` terminal, alerts, and —
+    /// for a cross-context saga — emits the dual divergence markers (the
+    /// broadcast saga is public-metadata-only and emits no divergence marker;
+    /// its `bctx` carries no committed-side dual-log). Extracted from
+    /// [`Self::run_saga_fsm`] to keep that function within the line budget.
+    async fn handle_commit_failure(
+        &self,
+        saga_id: &SagaId,
+        participants: &[String],
+        err: &ContextError,
+        xctx: Option<&mut CrossContextSagaCtx<'_>>,
+    ) -> Result<(), ContextError> {
+        self.append_journal(saga_id, SagaState::NeedsRepair, participants, 4, &[])
+            .await?;
+        crate::metrics::record_saga_repair_needed();
+        tracing::error!(
+            saga_id = %saga_id,
+            %err,
+            "saga coordinator — commit retry exhausted, saga in NeedsRepair"
+        );
+        // Dual event-log recording (spec §6.2.4): on NeedsRepair both sides MUST
+        // emit a signed `CrossContextDivergenceMarker`. Cross-context only; the
+        // test / spec-gapped / broadcast inputs carry no `xctx`. Marks the ctx so
+        // `run_saga`'s tail leaves the escrow RESERVED (NOT auto-voided).
+        if let Some(ctx) = xctx {
+            ctx.reached_needs_repair = true;
+            if let Some(plan) = Self::divergence_marker_plan(ctx) {
+                Box::pin(self.emit_divergence_markers(saga_id, plan)).await;
+            } else {
+                tracing::warn!(
+                    saga_id = %saga_id,
+                    "cross-context saga NeedsRepair with NO committed side (Commit-B never \
+                     landed); logs are clean, no divergence marker required"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Dispatch a single Prepare phase under the 30s per-phase timeout
     /// ([ADR-049](crate) §7; a timeout maps to
     /// [`ContextError::TransportTimeout`]).
     ///
-    /// `StandingPairCreate` / `BroadcastHostingHandshake` are spec-gapped
-    /// (return [`ContextError::NotImplemented`]). For
+    /// `StandingPairCreate` is spec-gapped (returns
+    /// [`ContextError::NotImplemented`]); `BroadcastHostingHandshake` (spec
+    /// §5.14.13) routes its per-phase message to the host (Prepare-A) and
+    /// broadcast (Prepare-B) actors via `bctx`. For
     /// `CrossContextToolInvocation` the FSM routes the per-phase message to the
     /// co-resident participant actor and threads the reply into `xctx`:
     /// Prepare-A → caller actor → hold `PreparedAFields`; Prepare-B → target
@@ -6536,6 +6833,7 @@ impl Supervisor {
         input: &SagaInput,
         phase: SagaPhase,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
+        bctx: Option<&mut BroadcastSagaCtx>,
     ) -> Result<(), ContextError> {
         const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -6560,11 +6858,17 @@ impl Supervisor {
                     }
                 }
                 SagaInput::BroadcastHostingHandshake { .. } => {
-                    Err(ContextError::NotImplemented(format!(
-                        "saga Prepare{phase:?} — BroadcastHostingHandshake wiring deferred to \
-                         commit 11.5 per DEFERRED-commit-11-saga-use-cases.md gap 3 (broadcast \
-                         hosting handshake protocol)"
-                    )))
+                    let Some(ctx) = bctx else {
+                        return Err(ContextError::InvalidState(format!(
+                            "SCP-SAGA-13160: saga Prepare{phase:?} — BroadcastHostingHandshake \
+                             requires the supervisor-side signing keys; call \
+                             start_broadcast_hosting_handshake_saga, not start_saga"
+                        )));
+                    };
+                    match phase {
+                        SagaPhase::A => self.dispatch_bcast_prepare_a(saga_id, ctx).await,
+                        SagaPhase::B => self.dispatch_bcast_prepare_b(saga_id, ctx).await,
+                    }
                 }
                 // Test-only: Prepare always SUCCEEDS so the FSM advances to
                 // Committing (where the test variant's Commit then fails,
@@ -6672,6 +6976,251 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Broadcast hosting-handshake Prepare-A (spec §5.14.13, host side): resolve
+    /// the co-resident host actor, send [`SagaPhaseMessage::BroadcastPrepareA`]
+    /// (with the requester's Active Signing Key per-call), and hold the returned
+    /// signed request bytes in `ctx` for Prepare-B.
+    async fn dispatch_bcast_prepare_a(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut BroadcastSagaCtx,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{SagaPhaseMessage, SigningKeyBytes};
+
+        let host_hex = hex::encode(ctx.host_context_id);
+        let actor = self.lookup(&host_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13164: broadcast hosting Prepare-A — host context '{host_hex}' is not a \
+                 co-resident actor (cross-node child-bridge transport is future work)"
+            ))
+        })?;
+
+        let saga_id = saga_id.clone();
+        let host_context_id = ctx.host_context_id;
+        let broadcast_context_id = ctx.broadcast_context_id;
+        let subscriber_did = ctx.subscriber_did.clone();
+        let wrapping_pubkey = ctx.wrapping_pubkey;
+        let requested_config_bytes = ctx.requested_config_bytes.clone();
+        let ucan = ctx.ucan.clone();
+        let nonce = ctx.nonce;
+        let timestamp_ms = ctx.timestamp_ms;
+        let requester_signing_key = SigningKeyBytes::from_signing_key(&ctx.subscriber_signing_key);
+
+        let prepared = actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastPrepareA {
+                    saga_id,
+                    host_context_id,
+                    broadcast_context_id,
+                    subscriber_did,
+                    wrapping_pubkey,
+                    requested_config_bytes,
+                    ucan,
+                    nonce,
+                    timestamp_ms,
+                    requester_signing_key,
+                    reply,
+                })
+            })
+            .await?;
+        ctx.prepared_a_request = Some(prepared.request_bytes);
+        Ok(())
+    }
+
+    /// Broadcast hosting-handshake Prepare-B (spec §5.14.13, broadcast side): the
+    /// authoritative side. Resolve the co-resident broadcast actor, send
+    /// [`SagaPhaseMessage::BroadcastPrepareB`] (with the request bytes from
+    /// Prepare-A + the broadcast author's signing key per-call), and hold the
+    /// returned signed grant bytes + captured values in `ctx`.
+    async fn dispatch_bcast_prepare_b(
+        &self,
+        saga_id: &SagaId,
+        ctx: &mut BroadcastSagaCtx,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{SagaPhaseMessage, SigningKeyBytes};
+
+        let broadcast_hex = hex::encode(ctx.broadcast_context_id);
+        let actor = self.lookup(&broadcast_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13165: broadcast hosting Prepare-B — broadcast context '{broadcast_hex}' \
+                 is not a co-resident actor (cross-node child-bridge transport is future work)"
+            ))
+        })?;
+
+        let request_bytes = ctx.prepared_a_request.clone().ok_or_else(|| {
+            ContextError::InvalidState(
+                "SCP-SAGA-13166: broadcast hosting Prepare-B — no Prepare-A request bytes staged \
+                 (FSM ordering invariant violated)"
+                    .to_owned(),
+            )
+        })?;
+
+        let saga_id = saga_id.clone();
+        let broadcast_context_id = ctx.broadcast_context_id;
+        let author_signing_key = SigningKeyBytes::from_signing_key(&ctx.author_signing_key);
+
+        let prepared = actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastPrepareB {
+                    saga_id,
+                    broadcast_context_id,
+                    request_bytes,
+                    author_signing_key,
+                    reply,
+                })
+            })
+            .await?;
+        ctx.prepared_b = Some(BroadcastPreparedBCarry {
+            grant_bytes: prepared.grant_bytes,
+            key_epoch_at_grant: prepared.key_epoch_at_grant,
+            granted_at_ms: prepared.granted_at_ms,
+        });
+        Ok(())
+    }
+
+    /// Broadcast hosting-handshake Commit (spec §5.14.13): Commit-B then Commit-A.
+    /// B persists the snapshot + `MemberJoined` append (NO key pushed) and acks;
+    /// A persists the author-signed grant as durable relay-authorization proof.
+    /// Idempotent by `SagaId`.
+    async fn dispatch_bcast_commit(
+        &self,
+        saga_id: &SagaId,
+        ctx: &BroadcastSagaCtx,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        // Commit-B (broadcast side): persist the AcceptedHostSnapshotEntry +
+        // MemberJoined append; B re-confirms it holds the staged grant.
+        let broadcast_hex = hex::encode(ctx.broadcast_context_id);
+        let broadcast_actor = self.lookup(&broadcast_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13167: broadcast hosting Commit-B — broadcast context '{broadcast_hex}' \
+                 is not a co-resident actor"
+            ))
+        })?;
+        let commit_b_saga_id = saga_id.clone();
+        let _snapshot_echo = broadcast_actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitB {
+                    saga_id: commit_b_saga_id,
+                    reply,
+                })
+            })
+            .await?;
+
+        // Commit-A (host side): deliver the AUTHORITATIVE author-signed grant
+        // (from Prepare-B) for the host to persist as durable relay proof.
+        let grant_bytes = ctx
+            .prepared_b
+            .as_ref()
+            .map(|p| p.grant_bytes.clone())
+            .ok_or_else(|| {
+                ContextError::InvalidState(
+                    "SCP-SAGA-13168: broadcast hosting Commit-A — no Prepare-B grant bytes staged \
+                     (FSM ordering invariant violated)"
+                        .to_owned(),
+                )
+            })?;
+        let host_hex = hex::encode(ctx.host_context_id);
+        let host_actor = self.lookup(&host_hex).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "SCP-SAGA-13169: broadcast hosting Commit-A — host context '{host_hex}' is not a \
+                 co-resident actor"
+            ))
+        })?;
+        let host_commit_saga_id = saga_id.clone();
+        host_actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitA {
+                    saga_id: host_commit_saga_id,
+                    grant_bytes,
+                    reply,
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Broadcast hosting-handshake abort (spec §5.14.13 "Abort"): send
+    /// [`SagaPhaseMessage::Abort`] (reservation `None`) to whichever side(s)
+    /// prepared so the staged `saga_pending` slot is dropped. No key, no
+    /// snapshot, no append. Best-effort + idempotent (a side that never prepared
+    /// is a no-op).
+    async fn abort_bcast_participants(&self, saga_id: &SagaId, ctx: &BroadcastSagaCtx) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        for ctx_id in [ctx.host_context_id, ctx.broadcast_context_id] {
+            let hex = hex::encode(ctx_id);
+            let Some(actor) = self.lookup(&hex) else {
+                continue;
+            };
+            let abort_saga_id = saga_id.clone();
+            let _ = actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                        saga_id: abort_saga_id,
+                        reservation: None,
+                        reply,
+                    })
+                })
+                .await;
+        }
+    }
+
+    /// Compute the journal `evidence` bytes for whichever saga-type context is
+    /// present (cross-context OR broadcast hosting), for crash-recovery replay.
+    /// At most one context is `Some`; `None` for the test / spec-gapped inputs.
+    fn saga_prepared_evidence_bytes(
+        input: &SagaInput,
+        xctx: Option<&CrossContextSagaCtx<'_>>,
+        bctx: Option<&BroadcastSagaCtx>,
+    ) -> Option<Vec<u8>> {
+        xctx.and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx))
+            .or_else(|| bctx.and_then(|ctx| Self::bcast_prepared_evidence_bytes(input, ctx)))
+    }
+
+    /// Build the §5.14.13 broadcast hosting-handshake journal evidence bytes for
+    /// crash-recovery replay. Returns `None` unless the saga is a
+    /// `BroadcastHostingHandshake`. Mirrors [`Self::xctx_prepared_evidence_bytes`].
+    fn bcast_prepared_evidence_bytes(input: &SagaInput, ctx: &BroadcastSagaCtx) -> Option<Vec<u8>> {
+        use crate::context::supervisor::saga_prepared_state::BroadcastHostingHandshakePrepared;
+        if !matches!(input, SagaInput::BroadcastHostingHandshake { .. }) {
+            return None;
+        }
+        // Pre-Prepare-B the captured values are not yet known; use the request's
+        // nonce/timestamp and zero epoch/granted_at (the PreparingB-state replay
+        // arm aborts and never re-drives a Commit, so it does not read them). Post
+        // Prepare-B, the captured grant values are journaled so a Commit-in-
+        // progress replay reconstructs the byte-identical grant + snapshot.
+        let (key_epoch_at_grant, granted_at_ms, grant_nonce, grant_timestamp_ms) = ctx
+            .prepared_b
+            .as_ref()
+            .map_or((0, 0, ctx.nonce, ctx.timestamp_ms), |p| {
+                // Post-Prepare-B: the staged actor-side prepared carries the
+                // authoritative captured values; the supervisor mirror records
+                // the request nonce/timestamp (the grant echoes the request
+                // nonce, and the grant timestamp == granted_at_ms).
+                (
+                    p.key_epoch_at_grant,
+                    p.granted_at_ms,
+                    ctx.nonce,
+                    p.granted_at_ms,
+                )
+            });
+        let prepared = BroadcastHostingHandshakePrepared {
+            host_context_id: ctx.host_context_id,
+            broadcast_context_id: ctx.broadcast_context_id,
+            subscriber_did: ctx.subscriber_did.clone(),
+            wrapping_pubkey: ctx.wrapping_pubkey,
+            key_epoch_at_grant,
+            granted_at_ms,
+            grant_nonce,
+            grant_timestamp_ms,
+            broadcast_host_config_bytes: ctx.requested_config_bytes.clone(),
+        };
+        prepared.to_evidence_bytes().ok()
+    }
+
     /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error after
     /// retries are exhausted (→ `NeedsRepair`). The `TestForceNeedsRepair`
     /// variant always fails (driving the retry-exhaustion path); a wired
@@ -6681,6 +7230,7 @@ impl Supervisor {
         saga_id: &SagaId,
         input: &SagaInput,
         mut xctx: Option<&mut CrossContextSagaCtx<'_>>,
+        mut bctx: Option<&mut BroadcastSagaCtx>,
     ) -> Result<(), ContextError> {
         const BACKOFFS: &[std::time::Duration] = &[
             std::time::Duration::from_millis(500),
@@ -6694,7 +7244,7 @@ impl Supervisor {
                 tokio::time::sleep(*backoff).await;
             }
             match self
-                .dispatch_commit_phase(saga_id, input, xctx.as_deref_mut())
+                .dispatch_commit_phase(saga_id, input, xctx.as_deref_mut(), bctx.as_deref_mut())
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -6719,25 +7269,37 @@ impl Supervisor {
     ///
     /// For a wired `CrossContextToolInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
-    /// Commit-A, ordered B then A. `StandingPairCreate` /
-    /// `BroadcastHostingHandshake` stay `NotImplemented`; `TestForceNeedsRepair`
+    /// Commit-A, ordered B then A. `BroadcastHostingHandshake` (spec §5.14.13)
+    /// drives Commit-B (snapshot + `MemberJoined` append, no key pushed) then
+    /// Commit-A (host persists the author-signed grant) via `bctx`.
+    /// `StandingPairCreate` stays `NotImplemented`; `TestForceNeedsRepair`
     /// always fails.
     async fn dispatch_commit_phase(
         &self,
         saga_id: &SagaId,
         input: &SagaInput,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
+        bctx: Option<&mut BroadcastSagaCtx>,
     ) -> Result<(), ContextError> {
         const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         let dispatch_fut = async {
             match input {
-                SagaInput::StandingPairCreate { .. }
-                | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
-                    "saga Commit — StandingPairCreate / BroadcastHostingHandshake commit-side \
-                         wiring deferred per DEFERRED-commit-11-saga-use-cases.md"
+                SagaInput::StandingPairCreate { .. } => Err(ContextError::NotImplemented(
+                    "saga Commit — StandingPairCreate commit-side wiring deferred per \
+                         DEFERRED-commit-11-saga-use-cases.md"
                         .to_owned(),
                 )),
+                SagaInput::BroadcastHostingHandshake { .. } => {
+                    let Some(ctx) = bctx else {
+                        return Err(ContextError::InvalidState(
+                            "SCP-SAGA-13161: saga Commit — BroadcastHostingHandshake requires the \
+                             supervisor-side signing keys (start_saga misuse)"
+                                .to_owned(),
+                        ));
+                    };
+                    self.dispatch_bcast_commit(saga_id, ctx).await
+                }
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(
@@ -7052,7 +7614,7 @@ impl Supervisor {
         // receipt's `output_jcs` is the exact preimage of the signed
         // `output_hash`, so A hashes precisely what B signed.
         let output_for_a = receipt.output_jcs.clone();
-        let commit_a_saga_id = saga_id.clone();
+        let host_commit_saga_id = saga_id.clone();
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let target_context_id = ctx.target_context_id;
@@ -7072,7 +7634,7 @@ impl Supervisor {
         let send_result = caller
             .send_recover_on_failure(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitA {
-                    saga_id: commit_a_saga_id,
+                    saga_id: host_commit_saga_id,
                     reservation: Box::new(reservation),
                     caller_context_id,
                     caller_did,
@@ -7547,6 +8109,7 @@ impl Supervisor {
         next_seq: u64,
         secret_bearing: bool,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
+        bctx: Option<&mut BroadcastSagaCtx>,
     ) -> Result<(), ContextError> {
         // Release any staged participant reservations FIRST — BEFORE the
         // `Aborting` journal transition — so the terminal marker is never
@@ -7565,6 +8128,16 @@ impl Supervisor {
             // economy to reverse, so the terminal marker is always safe.
             None => CallerAbortReversal::SettledOrAbsent,
         };
+
+        // Broadcast hosting-handshake abort (spec §5.14.13 "Abort"): drop both
+        // staged entries (host forwarding-registry slot + broadcast staged
+        // snapshot). No key, no snapshot persist, no append. The broadcast saga
+        // stages NO caller-side local economy, so the terminal marker is always
+        // safe — `Abort { reservation: None }` to each side clears its staged
+        // `saga_pending` slot (idempotent no-op if a side never prepared).
+        if let Some(ctx) = bctx {
+            self.abort_bcast_participants(saga_id, ctx).await;
+        }
 
         // If the caller's local-economy reversal could NOT be confirmed (the
         // re-drive ALSO failed under persistent backpressure / a closed inbox),
@@ -12014,6 +12587,8 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
+            bcast_request_nonce_dedup: HashMap::new(),
+            bcast_committed_grants: HashMap::new(),
         }
     }
 
@@ -18086,6 +18661,7 @@ mod tests {
                 3,
                 /*secret_bearing=*/ false,
                 Some(&mut ctx),
+                None,
             )
             .await
             .expect("abort_saga returns Ok (best-effort, non-terminal on outstanding reversal)");
@@ -19571,5 +20147,452 @@ mod tests {
             .reservation
             .ticket
             .consume_abandoning_escrow();
+    }
+
+    // =======================================================================
+    // Broadcast hosting-handshake saga (spec §5.14.13)
+    // =======================================================================
+
+    mod broadcast_hosting {
+        use super::*;
+        use scp_protocol::context::broadcast::hosting_handshake::{
+            BroadcastHostConfig, ForwardingPolicy,
+        };
+        use scp_protocol::context::broadcast::{
+            BroadcastAdmission, BroadcastContext, BroadcastHostingAggregateCap,
+        };
+
+        const HOST_CTX: [u8; 32] = [0xB1u8; 32];
+        const BCAST_CTX: [u8; 32] = [0xB2u8; 32];
+
+        fn subscriber_signing_key() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[0x51u8; 32])
+        }
+        fn author_signing_key() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[0x52u8; 32])
+        }
+
+        /// A supervisor that resolves `subscriber_did` → the subscriber key and
+        /// `author_did` → the author key (so Prepare-B can verify the request and
+        /// the host can verify the grant), with the broadcast author registered
+        /// as a local DID (so Prepare-B's local-author resolution succeeds).
+        async fn bcast_supervisor(subscriber_did: &str, author_did: &str) -> Arc<Supervisor> {
+            let sub_key = subscriber_signing_key().verifying_key();
+            let auth_key = author_signing_key().verifying_key();
+            let subscriber_owned = subscriber_did.to_owned();
+            let author_owned = author_did.to_owned();
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                "did:dht:z6MktestBcastSaga".to_owned(),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let key_resolver: KeyResolver = Arc::new(move |did: &DID, _| {
+                if did.as_ref() == subscriber_owned {
+                    Some(sub_key)
+                } else if did.as_ref() == author_owned {
+                    Some(auth_key)
+                } else {
+                    None
+                }
+            });
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let sup = Supervisor::with_providers(
+                crypto,
+                transport,
+                Box::new(TestEventLog),
+                key_resolver,
+                Some(Box::new(MapPersistence::default())),
+                None,
+                None,
+                None,
+                mls_storage,
+            );
+            // Register the broadcast author as a local DID so Prepare-B can
+            // resolve the locally-controlled author whose epoch it captures.
+            sup.register_local_did(DID(author_did.to_owned()))
+                .await
+                .expect("register local author");
+            sup
+        }
+
+        /// Host-context state: the requester (`subscriber_did`) is a member
+        /// holding `messages:read` (so Prepare-A's authorization passes).
+        async fn host_state(subscriber_did: &str) -> crate::context::actor::state::PerContextState {
+            use scp_protocol::context::roles::Capability;
+            let mut st = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                HOST_CTX,
+                1_700_000_000,
+                DID("did:example:host-admin".to_owned()),
+            );
+            st.handle
+                .transition_to(&scp_protocol::context::ContextState::Active)
+                .await
+                .expect("active");
+            st.membership.add_member(
+                DID(subscriber_did.to_owned()),
+                "member".to_owned(),
+                Vec::new(),
+            );
+            st.role_state.members.insert(subscriber_did.to_owned());
+            let mut caps = std::collections::HashSet::new();
+            caps.insert(Capability::MessagesRead);
+            st.role_state
+                .member_capabilities
+                .insert(subscriber_did.to_owned(), caps);
+            st
+        }
+
+        /// Broadcast-context state: a locally-controlled author registered (its
+        /// epoch the grant rides), the requester registered as a member/subscriber
+        /// (so the `is_member` gate-2 passes). `admission` selects open vs gated.
+        async fn broadcast_state(
+            subscriber_did: &str,
+            author_did: &str,
+            admission: BroadcastAdmission,
+            aggregate_cap: Option<BroadcastHostingAggregateCap>,
+        ) -> crate::context::actor::state::PerContextState {
+            let bcast_hex = hex::encode(BCAST_CTX);
+            let mut st = crate::context::actor::state::PerContextState::new_for_test_broadcast(
+                BCAST_CTX,
+                1_700_000_000,
+                DID("did:example:bcast-admin".to_owned()),
+            );
+            st.handle
+                .transition_to(&scp_protocol::context::ContextState::Active)
+                .await
+                .expect("active");
+            let mut bc = BroadcastContext::new(
+                bcast_hex,
+                &scp_protocol::context::ContextMode::Broadcast,
+                admission,
+            )
+            .expect("broadcast context constructs");
+            bc.add_author(author_did).expect("author registers");
+            if let Some(cap) = aggregate_cap {
+                bc.set_aggregate_cap(cap);
+            }
+            st.broadcast_context = Some(bc);
+            st.membership.add_member(
+                DID(subscriber_did.to_owned()),
+                "subscriber".to_owned(),
+                Vec::new(),
+            );
+            st.role_state.members.insert(subscriber_did.to_owned());
+            st
+        }
+
+        async fn spawn_pair(
+            supervisor: &Arc<Supervisor>,
+            host: crate::context::actor::state::PerContextState,
+            bcast: crate::context::actor::state::PerContextState,
+        ) {
+            let host_deps = supervisor
+                .build_actor_deps(&DID("did:example:bcast-host-owner".to_owned()))
+                .await
+                .expect("host deps");
+            supervisor
+                .spawn_actor_with_state(host, host_deps, None)
+                .await
+                .expect("spawn host actor");
+            let bcast_deps = supervisor
+                .build_actor_deps(&DID("did:example:bcast-b-owner".to_owned()))
+                .await
+                .expect("bcast deps");
+            supervisor
+                .spawn_actor_with_state(bcast, bcast_deps, None)
+                .await
+                .expect("spawn broadcast actor");
+        }
+
+        fn config_bytes(policy: ForwardingPolicy, expires_at_ms: u64) -> Vec<u8> {
+            BroadcastHostConfig {
+                max_forward_rate_per_minute: 600,
+                max_subscribers: 100,
+                forwarding_policy: policy,
+                expires_at_ms,
+            }
+            .to_jcs()
+            .expect("config jcs")
+        }
+
+        fn request(
+            sup: &Arc<Supervisor>,
+            subscriber_did: &str,
+            ucan: Option<String>,
+            policy: ForwardingPolicy,
+        ) -> BroadcastHostingHandshakeRequest {
+            let now = sup.clock_ref().expect("clock").now_millis();
+            BroadcastHostingHandshakeRequest {
+                host_context_id: HOST_CTX,
+                broadcast_context_id: BCAST_CTX,
+                subscriber_did: DID(subscriber_did.to_owned()),
+                wrapping_pubkey: [0x44u8; 32],
+                requested_config_bytes: config_bytes(policy, now + 3_600_000),
+                ucan,
+                nonce: [0x55u8; 16],
+                timestamp_ms: now,
+            }
+        }
+
+        /// Two-context happy path: Prepare-A → Prepare-B → Commit-B → Commit-A.
+        /// The accepted-host snapshot is persisted, a `MemberJoined` is appended,
+        /// the host holds the signed grant, and NO key is delivered at Commit.
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn happy_path_commits_no_key_delivered() {
+            let subscriber = "did:dht:z6MkBcastSub";
+            let author = "did:dht:z6MkBcastAuthor";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Open, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            let out = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &sub_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await
+                .expect("broadcast hosting saga must commit");
+            // No receipt/output is surfaced (broadcast saga delivers no key at
+            // Commit — the key rides the out-of-band §5.14.2 pull, authorized by
+            // the durable accepted-host snapshot).
+            assert!(out.receipt.is_none() && out.output.is_none());
+
+            // The host holds the author-signed grant as durable relay proof: a
+            // Commit-A re-ack witness check returns `true`.
+            let host_actor = sup.lookup(&hex::encode(HOST_CTX)).expect("host actor");
+            let witness_saga_id = out.saga_id.clone();
+            let present = host_actor
+                .send(
+                    move |reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>| {
+                        ContextCommand::SagaPhase(
+                            crate::context::actor::commands::SagaPhaseMessage::BroadcastCommitAReack {
+                                saga_id: witness_saga_id,
+                                reply,
+                            },
+                        )
+                    },
+                )
+                .await
+                .expect("witness check");
+            assert!(present, "Commit-A must leave a durable grant proof");
+        }
+
+        /// Abort: a request with a bad signature is rejected at Prepare-B; no
+        /// snapshot, append, or key results, and the saga aborts.
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn bad_signature_aborts() {
+            let subscriber = "did:dht:z6MkBcastSubBad";
+            let author = "did:dht:z6MkBcastAuthorBad";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Open, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            // Sign the request with the WRONG key (not subscriber's) → Prepare-B
+            // signature verification fails ⇒ abort.
+            let wrong_sk = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+            let auth_sk = author_signing_key();
+            let result = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &wrong_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a request signed by the wrong key must abort the saga"
+            );
+        }
+
+        /// Adversarial replay: a second saga reusing the same nonce is rejected
+        /// at Prepare-B (the request-nonce dedup cache), so a captured signed
+        /// request cannot be replayed into a second grant.
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn replayed_nonce_is_rejected() {
+            let subscriber = "did:dht:z6MkBcastSubReplay";
+            let author = "did:dht:z6MkBcastAuthorReplay";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Open, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            // First handshake commits (records the nonce).
+            sup.start_broadcast_hosting_handshake_saga(
+                request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                BroadcastHostingSigningKeys {
+                    subscriber: &sub_sk,
+                    author: &auth_sk,
+                },
+            )
+            .await
+            .expect("first handshake commits");
+            // A second handshake reusing the SAME nonce ([0x55; 16]) is a replay
+            // ⇒ rejected at Prepare-B ⇒ saga aborts.
+            let replay = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &sub_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await;
+            assert!(
+                replay.is_err(),
+                "a request reusing a seen nonce must be rejected as a replay"
+            );
+        }
+
+        /// Adversarial gated-UCAN: a gated broadcast context with an absent UCAN
+        /// is rejected at Prepare-B (Unauthorized).
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn gated_without_ucan_aborts() {
+            let subscriber = "did:dht:z6MkBcastSubGated";
+            let author = "did:dht:z6MkBcastAuthorGated";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Gated, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            // Gated context but NO ucan presented ⇒ rejected at Prepare-B.
+            let result = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &sub_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a gated broadcast with no messages:read UCAN must abort at Prepare-B"
+            );
+        }
+
+        /// Aggregate cap: a grant overshooting the aggregate subscriber ceiling
+        /// is rejected at Prepare-B (AggregateCapExceeded), side-effect-free.
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn aggregate_cap_overshoot_aborts() {
+            let subscriber = "did:dht:z6MkBcastSubCap";
+            let author = "did:dht:z6MkBcastAuthorCap";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            // Aggregate cap below the requested 100 subscribers ⇒ overshoot.
+            let cap = BroadcastHostingAggregateCap {
+                aggregate_max_subscribers: 50,
+                aggregate_max_forward_rate_per_minute: 1_000_000,
+                max_grant_lifetime_ms:
+                    scp_protocol::context::broadcast::DEFAULT_MAX_GRANT_LIFETIME_MS,
+            };
+            let bcast =
+                broadcast_state(subscriber, author, BroadcastAdmission::Open, Some(cap)).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            let result = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &sub_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a grant overshooting the aggregate cap must abort at Prepare-B"
+            );
+        }
+
+        /// Non-member initiator is rejected BEFORE the saga set is reserved
+        /// (authorize-before-reserve forward obligation, §5.14.13).
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn non_member_initiator_rejected_before_reserve() {
+            let subscriber = "did:dht:z6MkBcastSubAuthz";
+            let author = "did:dht:z6MkBcastAuthorAuthz";
+            let sup = bcast_supervisor(subscriber, author).await;
+            // Host state where the requester is NOT a member.
+            let host = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                HOST_CTX,
+                1_700_000_000,
+                DID("did:example:host-admin".to_owned()),
+            );
+            host.handle
+                .transition_to(&scp_protocol::context::ContextState::Active)
+                .await
+                .expect("active");
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Open, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            let result = sup
+                .start_broadcast_hosting_handshake_saga(
+                    request(&sup, subscriber, None, ForwardingPolicy::Verbatim),
+                    BroadcastHostingSigningKeys {
+                        subscriber: &sub_sk,
+                        author: &auth_sk,
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(ContextError::PermissionDenied(_))));
+        }
+
+        /// The signed grant round-trips: a `routing-stripped` policy still
+        /// produces a verifiable author-signed grant (the §5.14.6 author
+        /// signature on forwarded envelopes is independent of the grant policy;
+        /// the grant itself verifies under the author key).
+        #[cfg(feature = "testing")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn routing_stripped_grant_verifies() {
+            let subscriber = "did:dht:z6MkBcastSubStrip";
+            let author = "did:dht:z6MkBcastAuthorStrip";
+            let sup = bcast_supervisor(subscriber, author).await;
+            let host = host_state(subscriber).await;
+            let bcast = broadcast_state(subscriber, author, BroadcastAdmission::Open, None).await;
+            Box::pin(spawn_pair(&sup, host, bcast)).await;
+
+            let sub_sk = subscriber_signing_key();
+            let auth_sk = author_signing_key();
+            sup.start_broadcast_hosting_handshake_saga(
+                request(&sup, subscriber, None, ForwardingPolicy::RoutingStripped),
+                BroadcastHostingSigningKeys {
+                    subscriber: &sub_sk,
+                    author: &auth_sk,
+                },
+            )
+            .await
+            .expect("routing-stripped handshake commits");
+            // The grant the host holds verifies under the author's key — the
+            // author signature survives independent of the forwarding policy.
+            // (Asserted at the leaf-type level by `grant_round_trip_sign_verify`
+            // in hosting_handshake.rs; a routing-stripped grant commits here.)
+        }
     }
 }

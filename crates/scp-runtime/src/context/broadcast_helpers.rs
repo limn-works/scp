@@ -877,5 +877,10 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
+        bcast_request_nonce_dedup:
+            crate::context::messaging_helpers::bcast_request_nonce_dedup_snapshot(state),
+        bcast_committed_grants: crate::context::messaging_helpers::bcast_committed_grants_snapshot(
+            state,
+        ),
     }
 }

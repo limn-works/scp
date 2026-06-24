@@ -1533,6 +1533,13 @@ pub async fn create_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // Broadcast hosting-handshake request anti-replay cache (spec
+            // §5.14.13 "Freshness"): fresh on create, same TTL discipline as the
+            // cross-context dedup above.
+            bcast_request_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
+            bcast_committed_grants: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2207,6 +2214,13 @@ pub async fn import_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // Broadcast hosting-handshake request anti-replay cache (spec
+            // §5.14.13 "Freshness"): fresh on create, same TTL discipline as the
+            // cross-context dedup above.
+            bcast_request_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
+            bcast_committed_grants: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2711,6 +2725,20 @@ pub async fn restore_context(
             // abort can reverse the caller deduction + void the escrow from the
             // record. Dropped on cross-node import (caller economy is local).
             xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+            // ADR-049 §9 Class S: same-node restore REHYDRATES B's broadcast
+            // hosting-handshake request anti-replay cache (spec §5.14.13
+            // "Freshness") so a crash inside the dedup TTL cannot re-open a
+            // captured-signed-request replay. Cross-node import drops it (the
+            // snapshot field is empty). Rehydrated with the same SAGA dedup TTL.
+            bcast_request_nonce_dedup:
+                scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
+                    ctx_snapshot.bcast_request_nonce_dedup,
+                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                ),
+            // ADR-049 §9 Class S: same-node restore REHYDRATES the host-side
+            // durable hosting-grant proofs (spec §5.14.13 Commit-A). Cross-node
+            // import drops them (the snapshot field is empty).
+            bcast_committed_grants: ctx_snapshot.bcast_committed_grants,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,

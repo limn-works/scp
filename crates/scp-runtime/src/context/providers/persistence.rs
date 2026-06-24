@@ -237,6 +237,8 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: std::collections::HashMap::new(),
+            bcast_request_nonce_dedup: std::collections::HashMap::new(),
+            bcast_committed_grants: std::collections::HashMap::new(),
         }
     }
 

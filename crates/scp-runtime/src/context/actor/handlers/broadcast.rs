@@ -31,16 +31,25 @@
 //! holds `&mut PerContextState` only briefly, and concurrent publishes
 //! each reserve a distinct sequence.
 //!
-//! # SAGA WIRING DEFERRED — see
-//! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+//! # Broadcast hosting-handshake saga (spec §5.14.13)
 //!
-//! The `InitiateBroadcastHostingHandshake` saga-initiator variant
-//! returns [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! because broadcast hosting handshake protocol is spec-gapped — the
-//! spec does not yet define the subscriber→host key-exchange frames,
-//! host-config negotiation, or §5.14.2 step-4 transport. Until those
-//! land, the saga-initiator path returns
-//! `ContextError::NotImplemented`.
+//! The §5.14.13 broadcast hosting-handshake saga IS implemented. Like the
+//! §6.2.4 cross-context tool saga, it is a cross-context (host A + broadcast
+//! B) two-phase saga that the supervisor mints and drives — the FSM supplies
+//! the host representative's and broadcast author's per-call signing keys
+//! (ADR-049: the actor holds no signing key). Its sole production entry point
+//! is
+//! [`Supervisor::start_broadcast_hosting_handshake_saga`](crate::context::supervisor::supervisor::Supervisor::start_broadcast_hosting_handshake_saga);
+//! the per-phase Prepare/Commit work runs in
+//! [`crate::context::actor::handlers::broadcast_saga`].
+//!
+//! The single-actor mailbox variant `InitiateBroadcastHostingHandshake`
+//! therefore [`reply_saga_deferred`]s: a cross-context saga cannot be driven
+//! from one actor's mailbox (it carries neither the second context's signing
+//! key nor the supervisor handle that mints the `SagaId`). Callers reach the
+//! saga through the supervisor entry point above, exactly as the §6.2.4 tool
+//! saga's `InitiateCrossContextToolInvocation` mailbox variant defers to
+//! [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_tool_invocation_saga).
 
 use std::time::Duration;
 

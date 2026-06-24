@@ -1741,11 +1741,16 @@ pub enum BroadcastCommand {
         reply: BroadcastAdmissionReply,
     },
 
-    /// Saga-initiator path for the broadcast-hosting handshake. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the handshake
-    /// protocol (subscriber-to-host key exchange, host config negotiation,
-    /// §5.14.2 step 4 transport) is spec-gapped. See
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// Single-actor mailbox stand-in for the broadcast-hosting handshake
+    /// (spec §5.14.13). The §5.14.13 saga IS implemented, but — like the
+    /// §6.2.4 cross-context tool saga — it is a cross-context (host +
+    /// broadcast) two-phase saga driven by the supervisor, whose sole
+    /// production entry point is
+    /// [`Supervisor::start_broadcast_hosting_handshake_saga`](crate::context::supervisor::supervisor::Supervisor::start_broadcast_hosting_handshake_saga)
+    /// (it supplies the per-call signing keys and mints the `SagaId`). This
+    /// single-actor variant therefore defers
+    /// ([`ContextError::NotImplemented`]): a cross-context saga cannot be
+    /// driven from one actor's mailbox.
     InitiateBroadcastHostingHandshake {
         /// Host context ID (32-byte hash).
         host_context_id: [u8; 32],
@@ -2680,6 +2685,50 @@ pub struct PreparedBFields {
     pub recorded_chain_depth: u8,
 }
 
+/// Output of the broadcast hosting-handshake Prepare-A handler (spec §5.14.13
+/// "Prepare-A"). The host-context actor confirms the context is Active and that
+/// the requester (`subscriber_did`) holds `messages:read` for B, stages the
+/// forwarding-registry entry, and returns the requester-signed
+/// [`BroadcastHostingRequest`](scp_protocol::context::broadcast::hosting_handshake::BroadcastHostingRequest)
+/// bytes (JCS) for the FSM to carry to Prepare-B. The request is signed with the
+/// requester's Active Signing Key supplied per-call (the actor holds no key,
+/// ADR-049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastPreparedAFields {
+    /// JCS bytes of the signed `BroadcastHostingRequest`.
+    pub request_bytes: Vec<u8>,
+}
+
+/// Output of the broadcast hosting-handshake Prepare-B handler (spec §5.14.13
+/// "Prepare-B", the authoritative side).
+///
+/// The broadcast-context actor validated the request signature (bound to
+/// `subscriber_did`), freshness + nonce-dedup, block-list, rate-limit,
+/// gated-UCAN, aggregate cap; clamped the config; captured the epoch /
+/// `granted_at_ms` / grant nonce + timestamp at the single Prepare-B instant;
+/// staged the prepared into `saga_pending`; and signed the
+/// [`BroadcastHostingGrant`](scp_protocol::context::broadcast::hosting_handshake::BroadcastHostingGrant).
+/// It surfaces the grant bytes (JCS) for the FSM to carry to Commit-A, plus the
+/// captured replay-deterministic values an auditor / the journal evidence reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastPreparedBFields {
+    /// JCS bytes of the author-signed `BroadcastHostingGrant`.
+    pub grant_bytes: Vec<u8>,
+    /// The broadcast key epoch captured at Prepare-B (matches the grant's `current_key_epoch`).
+    pub key_epoch_at_grant: u64,
+    /// Wall-clock ms captured at Prepare-B.
+    pub granted_at_ms: u64,
+}
+
+/// Reply-channel type aliases for the broadcast hosting-handshake phases
+/// (spec §5.14.13). Factored out to satisfy `clippy::type_complexity`.
+pub type BroadcastPrepareAReply = oneshot::Sender<Result<BroadcastPreparedAFields, ContextError>>;
+/// Reply-channel type alias for the broadcast Prepare-B phase.
+pub type BroadcastPrepareBReply = oneshot::Sender<Result<BroadcastPreparedBFields, ContextError>>;
+/// Reply-channel type alias for the broadcast Commit-B phase (returns the
+/// author-signed grant bytes B returns to host A on Commit-A).
+pub type BroadcastCommitBReply = oneshot::Sender<Result<Vec<u8>, ContextError>>;
+
 /// Reply payload for [`SagaPhaseMessage::CommitBReserve`] (spec §6.2.4
 /// "Commit", split-execution model). The Commit-B phase is two actor
 /// round-trips with the non-`Send` tool executor running supervisor-side in
@@ -2959,6 +3008,103 @@ pub enum SagaPhaseMessage {
         signing_key: SigningKeyBytes,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Broadcast hosting-handshake Prepare-A (spec §5.14.13) — runs on the LOCAL
+    /// host-context actor. Confirms the host context is Active and the requester
+    /// (`subscriber_did`) holds `messages:read` for B, stages the
+    /// forwarding-registry entry, and builds + signs the
+    /// `BroadcastHostingRequest` with the requester's Active Signing Key
+    /// (`requester_signing_key`, supplied per-call — the actor holds no key).
+    /// Class-S fail-closed persist of the staged entry. Replies the signed
+    /// request bytes for the FSM to carry to Prepare-B.
+    BroadcastPrepareA {
+        /// Durable saga identifier (the staged-slot key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Host (relaying) context id (raw 32-byte digest) — the actor's own context.
+        host_context_id: [u8; 32],
+        /// Broadcast (hosted) context id (raw 32-byte digest).
+        broadcast_context_id: [u8; 32],
+        /// The host representative DID requesting hosting (holds `messages:read` for B).
+        subscriber_did: scp_identity::DID,
+        /// X25519 recipient key the post-grant broadcast key is sealed under.
+        wrapping_pubkey: [u8; 32],
+        /// JCS bytes of the requested `BroadcastHostConfig`.
+        requested_config_bytes: Vec<u8>,
+        /// `messages:read` UCAN — present iff B is a gated context.
+        ucan: Option<String>,
+        /// 16-byte freshness/anti-replay nonce (the grant echoes it).
+        nonce: [u8; 16],
+        /// Request send time in Unix milliseconds (freshness-checked at Prepare-B).
+        timestamp_ms: u64,
+        /// The requester's Active Signing Key. The actor holds NO key (ADR-049);
+        /// the FSM resolves the key authorized for `subscriber_did` and passes it
+        /// per-call. Zeroizes on drop.
+        requester_signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. See [`BroadcastPrepareAReply`].
+        reply: BroadcastPrepareAReply,
+    },
+    /// Broadcast hosting-handshake Prepare-B (spec §5.14.13) — runs on the LOCAL
+    /// broadcast-context actor, the AUTHORITATIVE side. Validates the request
+    /// signature is bound to `subscriber_did`; freshness (§9.14 skew + the
+    /// broadcast author's bounded TTL'd nonce-dedup cache); block-list +
+    /// rate-limit; for a gated context the `messages:read` UCAN re-bound to
+    /// `subscriber_did`; clamps the config; checks the aggregate cap; captures
+    /// `current_key_epoch` / `granted_at_ms` / grant nonce + timestamp at the
+    /// single Prepare-B instant; stages the prepared into `saga_pending`; and
+    /// signs the `BroadcastHostingGrant` with the broadcast author's key
+    /// (`author_signing_key`, supplied per-call). Class-S fail-closed persist.
+    BroadcastPrepareB {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Broadcast (hosted) context id (raw 32-byte digest) — the actor's own context.
+        broadcast_context_id: [u8; 32],
+        /// JCS bytes of the requester-signed `BroadcastHostingRequest` (from Prepare-A).
+        request_bytes: Vec<u8>,
+        /// The broadcast author's Active Signing Key — signs the grant. The actor
+        /// holds NO key (ADR-049); the FSM passes it per-call. Zeroizes on drop.
+        author_signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. See [`BroadcastPrepareBReply`].
+        reply: BroadcastPrepareBReply,
+    },
+    /// Broadcast hosting-handshake Commit-B (spec §5.14.13) — runs on the LOCAL
+    /// broadcast-context actor. Persists the `AcceptedHostSnapshotEntry` on the
+    /// §5.15.3 sync-persisted path together with the `MemberJoined{subscriber}`
+    /// append (idempotently re-registering the host representative under its
+    /// handshake `wrapping_pubkey`); **NO key is pushed at Commit** — the
+    /// snapshot authorizes the host's later §5.14.2 HPKE pull. Returns the
+    /// byte-identical author-signed grant bytes B holds for return to host A.
+    /// Idempotent by `SagaId`: a replayed Commit re-acks the existing snapshot +
+    /// append and re-returns the byte-identical grant.
+    BroadcastCommitB {
+        /// Durable saga identifier (the staged-slot + snapshot anchor).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply channel. See [`BroadcastCommitBReply`].
+        reply: BroadcastCommitBReply,
+    },
+    /// Broadcast hosting-handshake Commit-A (spec §5.14.13) — runs on the LOCAL
+    /// host-context actor. Persists the author-signed `BroadcastHostingGrant` as
+    /// durable proof of relay authorization and does host-registration.
+    /// Idempotent by `SagaId`: a re-sent Commit re-acks, delivering nothing new.
+    BroadcastCommitA {
+        /// Durable saga identifier (the staged-slot key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// JCS bytes of the author-signed `BroadcastHostingGrant` (from Commit-B).
+        grant_bytes: Vec<u8>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Broadcast hosting-handshake Commit-A witness check (spec §5.14.13 crash
+    /// recovery §17.16.4) — runs on the LOCAL host-context actor. READ-ONLY:
+    /// reports whether the durable grant proof for this `SagaId` is present in
+    /// `bcast_committed_grants` (i.e. Commit-A durably landed before a crash). The
+    /// FSM uses it on a `Committing` re-drive to resolve `Committed` (witness
+    /// present) vs `NeedsRepair`, without re-delivering a grant it no longer holds
+    /// the author key to re-sign (analogous to [`Self::CommitACheckWitness`]).
+    BroadcastCommitAReack {
+        /// Durable saga identifier (the `bcast_committed_grants` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply: `true` iff Commit-A is durably recorded for this saga.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
     },
 }
 

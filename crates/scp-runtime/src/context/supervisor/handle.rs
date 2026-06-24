@@ -81,7 +81,10 @@ impl SupervisorHandle {
     /// See `Supervisor::start_saga`. Commit 6: always
     /// [`ContextError::NotImplemented`].
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
-        self.supervisor.start_saga(input).await
+        // `Box::pin` the FSM future: the saga driver now carries two optional
+        // per-saga contexts (cross-context + broadcast), pushing the future over
+        // the `large_futures` lint threshold when held inline (clippy).
+        Box::pin(self.supervisor.start_saga(input)).await
     }
 
     /// Snapshot the local-DIDs set. Returned as an `Arc` so callers read

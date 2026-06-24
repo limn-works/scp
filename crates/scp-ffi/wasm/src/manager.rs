@@ -6524,6 +6524,9 @@ impl WasmContextManager {
                 admission,
                 subscribers,
                 authors,
+                accepted_hosts: Vec::new(),
+                aggregate_cap:
+                    scp_protocol::context::broadcast::BroadcastHostingAggregateCap::default(),
             })
         });
 

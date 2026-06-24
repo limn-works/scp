@@ -95,6 +95,8 @@ fn make_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
         admission: BroadcastAdmission::Open,
         subscribers,
         authors,
+        accepted_hosts: Vec::new(),
+        aggregate_cap: scp_core::context::broadcast::BroadcastHostingAggregateCap::default(),
     }
 }
 

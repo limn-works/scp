@@ -372,5 +372,10 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(ctx),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
+        bcast_request_nonce_dedup:
+            crate::context::messaging_helpers::bcast_request_nonce_dedup_snapshot(ctx),
+        bcast_committed_grants: crate::context::messaging_helpers::bcast_committed_grants_snapshot(
+            ctx,
+        ),
     }
 }

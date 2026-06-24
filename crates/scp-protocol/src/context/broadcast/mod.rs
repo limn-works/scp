@@ -537,6 +537,84 @@ pub struct ReservedPublishApply {
 }
 
 // ---------------------------------------------------------------------------
+// Hosting aggregate cap (spec §5.14.13 "Aggregate cap value and derivation")
+// ---------------------------------------------------------------------------
+
+/// Default `aggregate_max_subscribers` (§5.14.13): ten per-host defaults.
+pub const DEFAULT_AGGREGATE_MAX_SUBSCRIBERS: u32 = 100_000;
+/// Inclusive permitted range for `aggregate_max_subscribers` (§5.14.13).
+pub const AGGREGATE_MAX_SUBSCRIBERS_RANGE: (u32, u32) = (1, 100_000_000);
+
+/// Default `aggregate_max_forward_rate_per_minute` (§5.14.13): ten per-host defaults.
+pub const DEFAULT_AGGREGATE_MAX_FORWARD_RATE_PER_MINUTE: u32 = 6_000;
+/// Inclusive permitted range for `aggregate_max_forward_rate_per_minute` (§5.14.13).
+pub const AGGREGATE_MAX_FORWARD_RATE_PER_MINUTE_RANGE: (u32, u32) = (1, 60_000_000);
+
+/// Default `max_grant_lifetime_ms` (§5.14.13): 7 days.
+pub const DEFAULT_MAX_GRANT_LIFETIME_MS: u64 = 604_800_000;
+/// Inclusive permitted range for `max_grant_lifetime_ms` (§5.14.13): up to 365 days.
+pub const MAX_GRANT_LIFETIME_MS_RANGE: (u64, u64) = (1, 31_536_000_000);
+
+/// The per-broadcast-context aggregate amplification ceiling (spec §5.14.13,
+/// *Aggregate cap value and derivation*).
+///
+/// Two cap fields are each summed across all of B's currently-live
+/// [`hosting_handshake::AcceptedHostSnapshotEntry`] records; `max_grant_lifetime_ms`
+/// is the B-imposed ceiling on any single grant's lifetime
+/// (`granted_config.expires_at_ms` is clamped to
+/// `min(requested, granted_at_ms + max_grant_lifetime_ms)`).
+///
+/// Raising any field beyond its default requires explicit governance, not a
+/// default-template grant — a longer lifetime or higher aggregate directly
+/// extends the bounded amplification residual (§5.14.13 *Epoch tracking and
+/// fail-closed forwarding*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BroadcastHostingAggregateCap {
+    /// Sum ceiling for `max_subscribers` across all live host grants.
+    pub aggregate_max_subscribers: u32,
+    /// Sum ceiling for `max_forward_rate_per_minute` across all live host grants.
+    pub aggregate_max_forward_rate_per_minute: u32,
+    /// Ceiling on any single grant's lifetime (`granted_at_ms` → `expires_at_ms`).
+    pub max_grant_lifetime_ms: u64,
+}
+
+impl Default for BroadcastHostingAggregateCap {
+    /// The §5.14.13 default-template aggregate cap.
+    fn default() -> Self {
+        Self {
+            aggregate_max_subscribers: DEFAULT_AGGREGATE_MAX_SUBSCRIBERS,
+            aggregate_max_forward_rate_per_minute: DEFAULT_AGGREGATE_MAX_FORWARD_RATE_PER_MINUTE,
+            max_grant_lifetime_ms: DEFAULT_MAX_GRANT_LIFETIME_MS,
+        }
+    }
+}
+
+/// Reason a hosting grant was refused at Prepare-B against the aggregate cap
+/// (spec §5.14.13).
+///
+/// Both caps are enforced **independently** — exceeding EITHER is a refusal;
+/// headroom in one is not fungible for the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateCapExceeded {
+    /// The requested grant's `max_subscribers`, added to the sum over all OTHER
+    /// live entries, would exceed `aggregate_max_subscribers`.
+    Subscribers {
+        /// The would-be total subscribers across all live grants including this one.
+        would_be_total: u64,
+        /// The configured `aggregate_max_subscribers` ceiling.
+        ceiling: u32,
+    },
+    /// The requested grant's `max_forward_rate_per_minute`, added to the sum over
+    /// all OTHER live entries, would exceed `aggregate_max_forward_rate_per_minute`.
+    ForwardRate {
+        /// The would-be total forward-rate across all live grants including this one.
+        would_be_total: u64,
+        /// The configured `aggregate_max_forward_rate_per_minute` ceiling.
+        ceiling: u32,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // BroadcastContext
 // ---------------------------------------------------------------------------
 
@@ -560,6 +638,18 @@ pub struct BroadcastContext {
     subscribers: HashMap<String, SubscriberRecord>,
     /// Per-author broadcast key state, keyed by author DID.
     authors: HashMap<String, AuthorState>,
+    /// Durable accepted-host snapshot (spec §5.14.13), keyed by
+    /// `(host_context_id_hex, subscriber_did)`. **At-most-one-live invariant:**
+    /// a successful re-handshake for the same pair SUPERSEDES the prior entry.
+    /// This — not a re-presented grant — authorizes the host's §5.14.2 HPKE
+    /// pull. Part of B's broadcast-context state (§5.14.7); persisted on the
+    /// §5.15.3 sync-persisted path. **Class S** (its loss breaks grant
+    /// authorization + the at-most-one-live anti-replay invariant).
+    accepted_hosts: HashMap<(String, String), hosting_handshake::AcceptedHostSnapshotEntry>,
+    /// The per-broadcast-context aggregate amplification ceiling (spec §5.14.13).
+    /// Defaults to [`BroadcastHostingAggregateCap::default`]; raising any field
+    /// above its default is a governance decision, not a default-template change.
+    aggregate_cap: BroadcastHostingAggregateCap,
 }
 
 impl BroadcastContext {
@@ -582,6 +672,8 @@ impl BroadcastContext {
             admission,
             subscribers: HashMap::new(),
             authors: HashMap::new(),
+            accepted_hosts: HashMap::new(),
+            aggregate_cap: BroadcastHostingAggregateCap::default(),
         })
     }
 
@@ -1607,6 +1699,209 @@ impl BroadcastContext {
         self.authors.keys()
     }
 
+    // -----------------------------------------------------------------------
+    // Hosting handshake accepted-host snapshot (spec §5.14.13)
+    // -----------------------------------------------------------------------
+
+    /// The per-broadcast-context aggregate amplification ceiling (§5.14.13).
+    #[must_use]
+    pub const fn aggregate_cap(&self) -> BroadcastHostingAggregateCap {
+        self.aggregate_cap
+    }
+
+    /// Set the aggregate cap (a governance decision when raised above default,
+    /// §5.14.13). Used at context construction / governance time, not by the
+    /// handshake saga itself.
+    pub const fn set_aggregate_cap(&mut self, cap: BroadcastHostingAggregateCap) {
+        self.aggregate_cap = cap;
+    }
+
+    /// Look up the single live accepted-host entry for a `(host_context_id_hex,
+    /// subscriber_did)` pair (§5.14.13 at-most-one-live invariant). The §5.14.2
+    /// post-grant pull resolves on this.
+    #[must_use]
+    pub fn accepted_host(
+        &self,
+        host_context_id_hex: &str,
+        subscriber_did: &str,
+    ) -> Option<&hosting_handshake::AcceptedHostSnapshotEntry> {
+        self.accepted_hosts
+            .get(&(host_context_id_hex.to_owned(), subscriber_did.to_owned()))
+    }
+
+    /// The number of currently-live accepted-host entries.
+    #[must_use]
+    pub fn accepted_host_count(&self) -> usize {
+        self.accepted_hosts.len()
+    }
+
+    /// Check a requested grant against the aggregate amplification cap
+    /// (spec §5.14.13, *Aggregate cap value and derivation*).
+    ///
+    /// Sums `max_subscribers` (and `max_forward_rate_per_minute`) over all live
+    /// entries **other than any live entry for the requesting
+    /// `(host_context_id_hex, subscriber_did)` pair** (that prior entry, if
+    /// present, is superseded at Commit — it MUST be excluded so a renewal is
+    /// charged only the NET change), then adds the requested host's **clamped**
+    /// values. The two caps are enforced **independently**: exceeding EITHER is
+    /// a refusal.
+    ///
+    /// `Ok(())` means the grant fits both caps; `Err` carries which cap (and the
+    /// would-be total) was exceeded.
+    ///
+    /// # Errors
+    ///
+    /// [`AggregateCapExceeded`] if the requested grant would overshoot either
+    /// aggregate ceiling.
+    pub fn check_aggregate_cap(
+        &self,
+        host_context_id_hex: &str,
+        subscriber_did: &str,
+        requested_max_subscribers: u32,
+        requested_max_forward_rate_per_minute: u32,
+    ) -> Result<(), AggregateCapExceeded> {
+        let exclude = (host_context_id_hex.to_owned(), subscriber_did.to_owned());
+        // Sum over OTHER live entries (the requesting pair's prior entry, if any,
+        // is superseded at Commit — excluding it charges only the net change).
+        let (other_subs, other_rate): (u64, u64) = self
+            .accepted_hosts
+            .iter()
+            .filter(|(key, _)| **key != exclude)
+            .fold((0u64, 0u64), |(s, r), (_, entry)| {
+                (
+                    s + u64::from(entry.granted_config.max_subscribers),
+                    r + u64::from(entry.granted_config.max_forward_rate_per_minute),
+                )
+            });
+
+        let total_subs = other_subs + u64::from(requested_max_subscribers);
+        if total_subs > u64::from(self.aggregate_cap.aggregate_max_subscribers) {
+            return Err(AggregateCapExceeded::Subscribers {
+                would_be_total: total_subs,
+                ceiling: self.aggregate_cap.aggregate_max_subscribers,
+            });
+        }
+
+        let total_rate = other_rate + u64::from(requested_max_forward_rate_per_minute);
+        if total_rate > u64::from(self.aggregate_cap.aggregate_max_forward_rate_per_minute) {
+            return Err(AggregateCapExceeded::ForwardRate {
+                would_be_total: total_rate,
+                ceiling: self.aggregate_cap.aggregate_max_forward_rate_per_minute,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Insert or SUPERSEDE the accepted-host snapshot entry for its
+    /// `(host_context_id, subscriber_did)` pair at Commit (spec §5.14.13
+    /// at-most-one-live invariant). A re-handshake replaces the prior entry
+    /// (writing a fresh `saga_id`), so a replayed Commit of the OLD saga (whose
+    /// `saga_id` no longer matches the live entry) is a no-op.
+    ///
+    /// Returns `true` if this write LANDED a new/updated live entry, `false` if
+    /// the identical entry (same `saga_id`) was already live — making a replayed
+    /// Commit an observable no-op for idempotency.
+    pub fn upsert_accepted_host(
+        &mut self,
+        entry: hosting_handshake::AcceptedHostSnapshotEntry,
+    ) -> bool {
+        let key = (
+            hex::encode(entry.host_context_id),
+            entry.subscriber_did.clone(),
+        );
+        if self
+            .accepted_hosts
+            .get(&key)
+            .is_some_and(|live| *live == entry)
+        {
+            // Byte-identical replay of the same committed entry — no-op.
+            return false;
+        }
+        self.accepted_hosts.insert(key, entry);
+        true
+    }
+
+    /// Remove the live accepted-host entry for a pair (e.g. grant revocation).
+    /// Returns the removed entry, if any.
+    pub fn remove_accepted_host(
+        &mut self,
+        host_context_id_hex: &str,
+        subscriber_did: &str,
+    ) -> Option<hosting_handshake::AcceptedHostSnapshotEntry> {
+        self.accepted_hosts
+            .remove(&(host_context_id_hex.to_owned(), subscriber_did.to_owned()))
+    }
+
+    /// Validate a `messages:read` UCAN against THIS broadcast context, re-bound
+    /// to the presenting subscriber (spec §5.14.13 Prepare-B gated requirement;
+    /// §5.14.4 key-request validation). Used by the hosting-handshake saga's
+    /// Prepare-B for a **gated** broadcast context: an absent or invalid UCAN ⇒
+    /// the grant is refused. The full 11-step ADR-016 pipeline runs (signature,
+    /// delegation chain, expiry, **revocation**, capability match for
+    /// `messages:read`), so a token revoked between subscribe and handshake is
+    /// rejected here — the grant-time validation does NOT stand in for this
+    /// current re-check.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::PermissionDenied`] if the UCAN fails any validation step.
+    pub fn validate_messages_read_ucan_public<D, N, R, P, S>(
+        &self,
+        token: &UcanToken,
+        ctx: &mut ValidationContext<'_, D, N, R, P, S>,
+    ) -> Result<(), ContextError>
+    where
+        D: DidResolver,
+        N: NonceTracker,
+        R: RevocationChecker,
+        P: ProofResolver,
+        S: BuildHasher,
+    {
+        validate_messages_read_ucan(token, &self.context_id, ctx)
+    }
+
+    /// The locally-controlled broadcast author DID whose `current_key_epoch`
+    /// the handshake captures at Prepare-B, if exactly one author is registered
+    /// and locally controlled. Returns `None` if there is no unambiguous local
+    /// author (the handshake saga resolves the author explicitly in that case).
+    #[must_use]
+    pub fn sole_author_did(&self) -> Option<&str> {
+        let mut iter = self.authors.keys();
+        let first = iter.next()?;
+        if iter.next().is_some() {
+            return None;
+        }
+        Some(first.as_str())
+    }
+
+    /// The current key epoch for a given broadcast author (§5.14.2), if registered.
+    #[must_use]
+    pub fn author_key_epoch(&self, author_did: &str) -> Option<u64> {
+        self.authors.get(author_did).map(|a| a.epoch)
+    }
+
+    /// Idempotently register a host representative as a subscriber at hosting-
+    /// handshake Commit (spec §5.14.13: registering, or idempotently
+    /// re-registering, the host representative under its handshake
+    /// `wrapping_pubkey`). Because the host representative already holds
+    /// `messages:read` (a Prepare-A precondition), an already-registered
+    /// subscriber DID is an idempotent update, NOT a duplicate-membership error
+    /// (mirroring `register_standing_context` idempotency, §5.15.8). The
+    /// `has_ucan` flag is set per the admission mode (gated requires a UCAN,
+    /// validated at Prepare-B).
+    pub fn register_host_subscriber(&mut self, subscriber_did: &str, registered_at: u64) {
+        let has_ucan = self.admission == BroadcastAdmission::Gated;
+        self.subscribers.insert(
+            subscriber_did.to_owned(),
+            SubscriberRecord {
+                subscriber_did: subscriber_did.to_owned(),
+                registered_at,
+                has_ucan,
+            },
+        );
+    }
+
     /// Creates a serializable snapshot of the broadcast context state.
     ///
     /// Captures authors (with key material and epochs), subscribers, and
@@ -1638,6 +1933,12 @@ impl BroadcastContext {
             admission: self.admission,
             subscribers: self.subscribers.clone(),
             authors,
+            // Accepted-host entries are serialized as a flat Vec (the
+            // `(host_id_hex, subscriber_did)` map key is derivable from each
+            // entry's `host_context_id` + `subscriber_did`), avoiding a
+            // tuple-keyed map that some serializers (JSON) cannot encode.
+            accepted_hosts: self.accepted_hosts.values().cloned().collect(),
+            aggregate_cap: self.aggregate_cap,
         }
     }
 
@@ -1665,11 +1966,27 @@ impl BroadcastContext {
             })
             .collect();
 
+        let accepted_hosts = snapshot
+            .accepted_hosts
+            .into_iter()
+            .map(|entry| {
+                (
+                    (
+                        hex::encode(entry.host_context_id),
+                        entry.subscriber_did.clone(),
+                    ),
+                    entry,
+                )
+            })
+            .collect();
+
         Self {
             context_id: snapshot.context_id,
             admission: snapshot.admission,
             subscribers: snapshot.subscribers,
             authors,
+            accepted_hosts,
+            aggregate_cap: snapshot.aggregate_cap,
         }
     }
 }
@@ -1701,6 +2018,16 @@ pub struct BroadcastContextSnapshot {
     pub subscribers: HashMap<String, SubscriberRecord>,
     /// Per-author broadcast key state, keyed by author DID.
     pub authors: HashMap<String, AuthorStateSnapshot>,
+    /// Durable accepted-host snapshot entries (spec §5.14.13). Serialized as a
+    /// flat list; the `(host_id_hex, subscriber_did)` map key is rebuilt from
+    /// each entry on restore. `#[serde(default)]` so a snapshot written before
+    /// hosting handshakes existed restores to an empty registry.
+    #[serde(default)]
+    pub accepted_hosts: Vec<hosting_handshake::AcceptedHostSnapshotEntry>,
+    /// Per-broadcast-context aggregate amplification ceiling (spec §5.14.13).
+    /// `#[serde(default)]` so an older snapshot restores to the default cap.
+    #[serde(default)]
+    pub aggregate_cap: BroadcastHostingAggregateCap,
 }
 
 /// Serializable snapshot of per-author broadcast key state.
@@ -5045,5 +5372,152 @@ mod tests {
         assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
         assert_eq!(decoded.timestamp, reg.timestamp);
         assert_eq!(decoded.signature, reg.signature);
+    }
+
+    // -----------------------------------------------------------------------
+    // Accepted-host snapshot + aggregate cap (spec §5.14.13)
+    // -----------------------------------------------------------------------
+
+    fn host_entry(
+        host: [u8; 32],
+        subscriber: &str,
+        max_subscribers: u32,
+        max_rate: u32,
+        saga_id: &str,
+    ) -> hosting_handshake::AcceptedHostSnapshotEntry {
+        hosting_handshake::AcceptedHostSnapshotEntry {
+            host_context_id: host,
+            subscriber_did: subscriber.to_owned(),
+            wrapping_pubkey: [0x44; 32],
+            granted_config: hosting_handshake::BroadcastHostConfig {
+                max_forward_rate_per_minute: max_rate,
+                max_subscribers,
+                forwarding_policy: hosting_handshake::ForwardingPolicy::Verbatim,
+                expires_at_ms: 1_700_000_100_000,
+            },
+            granted_at_ms: 1_700_000_000_000,
+            key_epoch_at_grant: 3,
+            saga_id: saga_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn accepted_host_upsert_and_lookup() {
+        let mut bc = make_open_ctx();
+        let host = [0x11; 32];
+        let entry = host_entry(host, "did:example:host-rep", 100, 60, "saga-1");
+        assert!(bc.upsert_accepted_host(entry.clone()));
+        // Byte-identical replay is an idempotent no-op.
+        assert!(!bc.upsert_accepted_host(entry));
+        let found = bc
+            .accepted_host(&hex::encode(host), "did:example:host-rep")
+            .expect("entry present");
+        assert_eq!(found.saga_id, "saga-1");
+        assert_eq!(bc.accepted_host_count(), 1);
+    }
+
+    #[test]
+    fn accepted_host_supersedes_same_pair() {
+        let mut bc = make_open_ctx();
+        let host = [0x11; 32];
+        bc.upsert_accepted_host(host_entry(host, "did:example:host-rep", 100, 60, "saga-1"));
+        // A re-handshake for the SAME pair supersedes (writes a fresh saga_id),
+        // never coexists — at-most-one-live invariant (§5.14.13).
+        bc.upsert_accepted_host(host_entry(host, "did:example:host-rep", 200, 120, "saga-2"));
+        assert_eq!(bc.accepted_host_count(), 1);
+        let live = bc
+            .accepted_host(&hex::encode(host), "did:example:host-rep")
+            .expect("entry present");
+        assert_eq!(live.saga_id, "saga-2");
+        assert_eq!(live.granted_config.max_subscribers, 200);
+    }
+
+    #[test]
+    fn aggregate_cap_excludes_requesting_pair_on_renewal() {
+        // A renewal for the SAME pair is charged only the NET change: the prior
+        // entry is excluded from the Prepare-B sum (§5.14.13).
+        let mut bc = make_open_ctx();
+        bc.set_aggregate_cap(BroadcastHostingAggregateCap {
+            aggregate_max_subscribers: 150,
+            aggregate_max_forward_rate_per_minute: 100,
+            max_grant_lifetime_ms: DEFAULT_MAX_GRANT_LIFETIME_MS,
+        });
+        let host = [0x11; 32];
+        bc.upsert_accepted_host(host_entry(host, "did:example:host-rep", 100, 60, "saga-1"));
+        // Renewal raising to 150 subs: prior 100 EXCLUDED, so total = 150 ≤ 150.
+        assert!(
+            bc.check_aggregate_cap(&hex::encode(host), "did:example:host-rep", 150, 80)
+                .is_ok(),
+            "renewal charged only net change must fit the cap"
+        );
+    }
+
+    #[test]
+    fn aggregate_cap_rejects_subscribers_overshoot() {
+        let mut bc = make_open_ctx();
+        bc.set_aggregate_cap(BroadcastHostingAggregateCap {
+            aggregate_max_subscribers: 150,
+            aggregate_max_forward_rate_per_minute: 100_000,
+            max_grant_lifetime_ms: DEFAULT_MAX_GRANT_LIFETIME_MS,
+        });
+        bc.upsert_accepted_host(host_entry([0x11; 32], "did:example:a", 100, 10, "saga-1"));
+        // A DIFFERENT pair requesting 60 more: 100 + 60 = 160 > 150.
+        let err = bc
+            .check_aggregate_cap(&hex::encode([0x22; 32]), "did:example:b", 60, 10)
+            .expect_err("must overshoot the subscriber cap");
+        assert!(matches!(
+            err,
+            AggregateCapExceeded::Subscribers {
+                would_be_total: 160,
+                ceiling: 150
+            }
+        ));
+    }
+
+    #[test]
+    fn aggregate_cap_rejects_rate_overshoot_independently() {
+        // Headroom in the subscriber cap is NOT fungible for the rate cap.
+        let mut bc = make_open_ctx();
+        bc.set_aggregate_cap(BroadcastHostingAggregateCap {
+            aggregate_max_subscribers: 1_000_000,
+            aggregate_max_forward_rate_per_minute: 100,
+            max_grant_lifetime_ms: DEFAULT_MAX_GRANT_LIFETIME_MS,
+        });
+        bc.upsert_accepted_host(host_entry([0x11; 32], "did:example:a", 1, 80, "saga-1"));
+        let err = bc
+            .check_aggregate_cap(&hex::encode([0x22; 32]), "did:example:b", 1, 60)
+            .expect_err("must overshoot the rate cap even with subscriber headroom");
+        assert!(matches!(
+            err,
+            AggregateCapExceeded::ForwardRate {
+                would_be_total: 140,
+                ceiling: 100
+            }
+        ));
+    }
+
+    #[test]
+    fn accepted_hosts_survive_snapshot_round_trip() {
+        let mut bc = make_open_ctx();
+        let host = [0x11; 32];
+        bc.upsert_accepted_host(host_entry(host, "did:example:host-rep", 100, 60, "saga-1"));
+        bc.set_aggregate_cap(BroadcastHostingAggregateCap {
+            aggregate_max_subscribers: 42,
+            aggregate_max_forward_rate_per_minute: 24,
+            max_grant_lifetime_ms: 1_000,
+        });
+        let snapshot = bc.to_snapshot();
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: BroadcastContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let restored = BroadcastContext::from_snapshot(decoded);
+        assert_eq!(restored.accepted_host_count(), 1);
+        assert_eq!(
+            restored
+                .accepted_host(&hex::encode(host), "did:example:host-rep")
+                .map(|e| e.saga_id.clone()),
+            Some("saga-1".to_owned())
+        );
+        assert_eq!(restored.aggregate_cap().aggregate_max_subscribers, 42);
+        assert_eq!(restored.aggregate_cap().max_grant_lifetime_ms, 1_000);
     }
 }

@@ -28,6 +28,7 @@
 )]
 
 pub mod broadcast;
+pub mod broadcast_saga;
 pub mod economy;
 pub mod governance;
 pub mod lifecycle;

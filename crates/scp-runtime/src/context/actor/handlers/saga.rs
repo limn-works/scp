@@ -181,6 +181,15 @@ pub(crate) async fn dispatch(
     cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
     match cmd {
+        // Broadcast hosting-handshake phases (spec §5.14.13) route to their own
+        // handler module to keep this router and the xctx bodies separate.
+        broadcast @ (SagaPhaseMessage::BroadcastPrepareA { .. }
+        | SagaPhaseMessage::BroadcastPrepareB { .. }
+        | SagaPhaseMessage::BroadcastCommitB { .. }
+        | SagaPhaseMessage::BroadcastCommitA { .. }
+        | SagaPhaseMessage::BroadcastCommitAReack { .. }) => {
+            crate::context::actor::handlers::broadcast_saga::dispatch(cell, deps, broadcast).await
+        }
         // Prepare arms (slice 3b) route to a dedicated helper to keep this
         // router within the per-function line budget.
         prepare @ (SagaPhaseMessage::PrepareA { .. } | SagaPhaseMessage::PrepareB { .. }) => {
@@ -260,6 +269,15 @@ async fn dispatch_prepare_phase(
         SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
         SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
             misrouted(reply, "EmitDivergenceMarker")
+        }
+        // Broadcast phases are partitioned to `broadcast_saga::dispatch` and
+        // never reach this xctx prepare router. Statically unreachable.
+        SagaPhaseMessage::BroadcastPrepareA { reply, .. } => misrouted(reply, "BroadcastPrepareA"),
+        SagaPhaseMessage::BroadcastPrepareB { reply, .. } => misrouted(reply, "BroadcastPrepareB"),
+        SagaPhaseMessage::BroadcastCommitB { reply, .. } => misrouted(reply, "BroadcastCommitB"),
+        SagaPhaseMessage::BroadcastCommitA { reply, .. } => misrouted(reply, "BroadcastCommitA"),
+        SagaPhaseMessage::BroadcastCommitAReack { reply, .. } => {
+            misrouted(reply, "BroadcastCommitAReack")
         }
     }
 }
@@ -347,6 +365,16 @@ async fn dispatch_commit_phase(
         // shape (NEVER panic — ADR-049 §10 handler panic ban).
         SagaPhaseMessage::PrepareA { reply, .. } => misrouted(reply, "PrepareA"),
         SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
+        // Broadcast hosting-handshake phases are partitioned to
+        // `broadcast_saga::dispatch` in the top-level `dispatch` router and
+        // never reach here. Statically unreachable; misroute per reply shape.
+        SagaPhaseMessage::BroadcastPrepareA { reply, .. } => misrouted(reply, "BroadcastPrepareA"),
+        SagaPhaseMessage::BroadcastPrepareB { reply, .. } => misrouted(reply, "BroadcastPrepareB"),
+        SagaPhaseMessage::BroadcastCommitB { reply, .. } => misrouted(reply, "BroadcastCommitB"),
+        SagaPhaseMessage::BroadcastCommitA { reply, .. } => misrouted(reply, "BroadcastCommitA"),
+        SagaPhaseMessage::BroadcastCommitAReack { reply, .. } => {
+            misrouted(reply, "BroadcastCommitAReack")
+        }
     }
 }
 

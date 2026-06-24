@@ -393,6 +393,8 @@ async fn broadcast_state_store_load_roundtrip() {
         admission: BroadcastAdmission::Open,
         subscribers,
         authors,
+        accepted_hosts: Vec::new(),
+        aggregate_cap: scp_core::context::broadcast::BroadcastHostingAggregateCap::default(),
     };
 
     store.store_broadcast_state(ctx, &snapshot).await.unwrap();

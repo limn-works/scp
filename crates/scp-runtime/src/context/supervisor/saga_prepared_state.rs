@@ -381,21 +381,146 @@ impl CrossContextToolInvocationPrepared {
 // Broadcast hosting handshake
 // ---------------------------------------------------------------------------
 
-/// Staged state for a broadcast-hosting-handshake saga.
+/// Staged state for a broadcast-hosting-handshake saga (spec §5.14.13
+/// `BroadcastHostingHandshakePrepared` field table).
 ///
-/// **Not bearer-bearing.** Public per spec §5.14.2: the host context, the
-/// broadcast context, the subscriber DID, and the negotiated host config
-/// (encoded opaquely here pending the broadcast handler's migration).
+/// **Not bearer-bearing.** Every field is PUBLIC per spec §5.14.13 (the
+/// broadcast key is delivered out-of-band post-Commit via the §5.14.2 HPKE
+/// pull, never through this saga). `mark_resolved(secret_bearing=false)`.
+///
+/// # Replay-deterministic fields captured at the single Prepare-B instant
+///
+/// The B-side captures `key_epoch_at_grant`, `granted_at_ms`, `grant_nonce`,
+/// `grant_timestamp_ms`, and the clamped `broadcast_host_config_bytes` ALL at
+/// the one Prepare-B instant precisely so a Commit replayed after a crash
+/// re-sends the BYTE-IDENTICAL author-signed `BroadcastHostingGrant` (whose
+/// preimage covers `RawBytes16(nonce)`, `U64(timestamp_ms)`, `U64(current_key_epoch)`,
+/// and `VarBytes(jcs(granted_config))`) and writes the ORIGINAL epoch /
+/// `granted_at_ms` into the snapshot — never a later (advanced) epoch or a
+/// fresh-clock variant divergent from the copy the host received on the first
+/// Commit attempt (§5.14.13 *Prepare / Commit / Abort*, *staged-field rows*).
+///
+/// # Serialization
+///
+/// Deliberately NOT `Serialize` (the wrapping [`SagaPreparedState`] enum carries
+/// the §9.4.3 non-derive barrier). Journal evidence is produced via the explicit
+/// [`BroadcastHostingHandshakePreparedWire`] mirror, reached through
+/// [`BroadcastHostingHandshakePrepared::to_evidence_bytes`] /
+/// [`BroadcastHostingHandshakePrepared::from_evidence_bytes`], mirroring the
+/// [`CrossContextToolInvocationPrepared`] discipline above.
 pub struct BroadcastHostingHandshakePrepared {
-    /// The hosting context ID.
+    /// The hosting (relaying) context ID — raw 32-byte digest (§5.14.13 id-form).
     pub host_context_id: [u8; 32],
-    /// The broadcast context ID being hosted.
+    /// The broadcast (hosted) context ID — raw 32-byte digest.
     pub broadcast_context_id: [u8; 32],
-    /// The subscriber DID requesting hosting.
+    /// The host representative DID requesting hosting (holds `messages:read` for B).
     pub subscriber_did: DID,
-    /// Encoded `BroadcastHostConfig` bytes. Concrete type is wired in
-    /// when the broadcast handler migrates to the actor model.
+    /// The X25519 recipient key the post-grant broadcast key is sealed under,
+    /// echoed from the request and bound into the author-signed grant. The
+    /// §5.14.2 delivery MUST seal ONLY to this grant-committed key.
+    pub wrapping_pubkey: [u8; 32],
+    /// The broadcast key epoch captured at Prepare-B and bound into the grant's
+    /// `current_key_epoch`; staged so a replayed Commit writes a snapshot
+    /// `key_epoch_at_grant` matching the already-signed grant, not a later epoch.
+    pub key_epoch_at_grant: u64,
+    /// Wall-clock ms captured at Prepare-B; staged so a replayed Commit writes
+    /// the same `granted_at_ms` as the original (a fresh clock read would make
+    /// the persisted snapshot non-deterministic across replays).
+    pub granted_at_ms: u64,
+    /// The grant's 16-byte `nonce` (echoes the request's `nonce`, never freshly
+    /// drawn); staged so a replayed Commit re-sends the byte-identical grant.
+    pub grant_nonce: [u8; 16],
+    /// The grant's `timestamp_ms` captured at the same Prepare-B instant; staged
+    /// for the identical replay-determinism reason as `grant_nonce`.
+    pub grant_timestamp_ms: u64,
+    /// JCS (RFC 8785) of the CLAMPED, authoritative `granted_config` — the exact
+    /// `BroadcastHostConfig` B signs into the grant and persists into the
+    /// `AcceptedHostSnapshotEntry`, NOT the pre-clamp `requested_config`.
     pub broadcast_host_config_bytes: Vec<u8>,
+}
+
+/// `Serialize`/`Deserialize` wire mirror of the **public** fields of
+/// [`BroadcastHostingHandshakePrepared`], used to produce the journal
+/// `evidence` (spec §5.14.13 "Public-metadata journaling": the `MessagePack` of
+/// the public staged fields). The actor-side
+/// [`BroadcastHostingHandshakePrepared`] is deliberately non-`Serialize`
+/// because the wrapping [`SagaPreparedState`] enum carries the §9.4.3
+/// non-derive barrier; this explicit mirror is the sanctioned serialization
+/// path, matching the [`CrossContextToolInvocationPreparedWire`] discipline
+/// above.
+///
+/// All fields are public plan-metadata classified **public** — there is no
+/// §9.4.3 secret commitment (`mark_resolved(secret_bearing=false)`). `DID` is
+/// carried as its canonical string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::context) struct BroadcastHostingHandshakePreparedWire {
+    /// The raw 32-byte hosting context id.
+    pub host_context_id: [u8; 32],
+    /// The raw 32-byte broadcast context id.
+    pub broadcast_context_id: [u8; 32],
+    /// `subscriber_did.0`.
+    pub subscriber_did: String,
+    /// The grant-committed X25519 recipient key.
+    pub wrapping_pubkey: [u8; 32],
+    /// Prepare-B-captured broadcast key epoch (matches the grant's `current_key_epoch`).
+    pub key_epoch_at_grant: u64,
+    /// Prepare-B-captured wall-clock ms.
+    pub granted_at_ms: u64,
+    /// The grant's echoed 16-byte nonce.
+    pub grant_nonce: [u8; 16],
+    /// The grant's `timestamp_ms`.
+    pub grant_timestamp_ms: u64,
+    /// JCS of the clamped `granted_config`.
+    pub broadcast_host_config_bytes: Vec<u8>,
+}
+
+impl BroadcastHostingHandshakePrepared {
+    /// Encode the public prepared state to its journal `evidence` bytes —
+    /// `MessagePack` of the [`BroadcastHostingHandshakePreparedWire`] mirror
+    /// (spec §5.14.13 "Public-metadata journaling"). Classified **public**; the
+    /// supervisor wraps these bytes in the standard `Zeroizing` envelope for
+    /// uniformity only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `rmp_serde` encode error string if serialization fails.
+    pub(in crate::context) fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
+        let wire = BroadcastHostingHandshakePreparedWire {
+            host_context_id: self.host_context_id,
+            broadcast_context_id: self.broadcast_context_id,
+            subscriber_did: self.subscriber_did.0.clone(),
+            wrapping_pubkey: self.wrapping_pubkey,
+            key_epoch_at_grant: self.key_epoch_at_grant,
+            granted_at_ms: self.granted_at_ms,
+            grant_nonce: self.grant_nonce,
+            grant_timestamp_ms: self.grant_timestamp_ms,
+            broadcast_host_config_bytes: self.broadcast_host_config_bytes.clone(),
+        };
+        rmp_serde::to_vec_named(&wire).map_err(|e| format!("encode: {e}"))
+    }
+
+    /// Decode public prepared state from its journal `evidence` bytes,
+    /// reversing [`Self::to_evidence_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the `rmp_serde` decode error string if `bytes` is not a valid
+    /// `MessagePack` encoding of the wire mirror.
+    pub(in crate::context) fn from_evidence_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let wire: BroadcastHostingHandshakePreparedWire =
+            rmp_serde::from_slice(bytes).map_err(|e| format!("decode: {e}"))?;
+        Ok(Self {
+            host_context_id: wire.host_context_id,
+            broadcast_context_id: wire.broadcast_context_id,
+            subscriber_did: DID(wire.subscriber_did),
+            wrapping_pubkey: wire.wrapping_pubkey,
+            key_epoch_at_grant: wire.key_epoch_at_grant,
+            granted_at_ms: wire.granted_at_ms,
+            grant_nonce: wire.grant_nonce,
+            grant_timestamp_ms: wire.grant_timestamp_ms,
+            broadcast_host_config_bytes: wire.broadcast_host_config_bytes,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,8 +612,11 @@ pub struct CrossContextToolInvocationSnapshot {
 }
 
 /// Public snapshot payload for
-/// [`SagaPreparedState::BroadcastHostingHandshake`] (§5.14.2; all fields
+/// [`SagaPreparedState::BroadcastHostingHandshake`] (§5.14.13; all fields
 /// public, not bearer-bearing).
+///
+/// Mirrors the staged-state field table so a same-node crash-recovery restore
+/// re-drives a byte-identical Commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastHostingHandshakeSnapshot {
     /// The raw 32-byte hosting context id.
@@ -497,8 +625,17 @@ pub struct BroadcastHostingHandshakeSnapshot {
     pub broadcast_context_id: [u8; 32],
     /// `subscriber_did.0`.
     pub subscriber_did: String,
-    /// Encoded `BroadcastHostConfig` bytes (opaque pending the broadcast
-    /// handler's actor migration).
+    /// The grant-committed X25519 recipient key.
+    pub wrapping_pubkey: [u8; 32],
+    /// Prepare-B-captured broadcast key epoch.
+    pub key_epoch_at_grant: u64,
+    /// Prepare-B-captured wall-clock ms.
+    pub granted_at_ms: u64,
+    /// The grant's echoed 16-byte nonce.
+    pub grant_nonce: [u8; 16],
+    /// The grant's `timestamp_ms`.
+    pub grant_timestamp_ms: u64,
+    /// JCS of the clamped `granted_config`.
     pub broadcast_host_config_bytes: Vec<u8>,
 }
 
@@ -536,6 +673,11 @@ impl SagaPreparedStateSnapshot {
                     host_context_id: inner.host_context_id,
                     broadcast_context_id: inner.broadcast_context_id,
                     subscriber_did: inner.subscriber_did.0.clone(),
+                    wrapping_pubkey: inner.wrapping_pubkey,
+                    key_epoch_at_grant: inner.key_epoch_at_grant,
+                    granted_at_ms: inner.granted_at_ms,
+                    grant_nonce: inner.grant_nonce,
+                    grant_timestamp_ms: inner.grant_timestamp_ms,
                     broadcast_host_config_bytes: inner.broadcast_host_config_bytes.clone(),
                 })
             }
@@ -573,6 +715,11 @@ impl SagaPreparedStateSnapshot {
                     host_context_id: snap.host_context_id,
                     broadcast_context_id: snap.broadcast_context_id,
                     subscriber_did: DID(snap.subscriber_did),
+                    wrapping_pubkey: snap.wrapping_pubkey,
+                    key_epoch_at_grant: snap.key_epoch_at_grant,
+                    granted_at_ms: snap.granted_at_ms,
+                    grant_nonce: snap.grant_nonce,
+                    grant_timestamp_ms: snap.grant_timestamp_ms,
                     broadcast_host_config_bytes: snap.broadcast_host_config_bytes,
                 })
             }
@@ -875,24 +1022,56 @@ mod tests {
         assert_eq!(back, wire);
     }
 
+    fn sample_broadcast_prepared() -> BroadcastHostingHandshakePrepared {
+        BroadcastHostingHandshakePrepared {
+            host_context_id: [6u8; 32],
+            broadcast_context_id: [7u8; 32],
+            subscriber_did: bob(),
+            wrapping_pubkey: [0x44; 32],
+            key_epoch_at_grant: 9,
+            granted_at_ms: 1_700_000_000_123,
+            grant_nonce: [0x55; 16],
+            grant_timestamp_ms: 1_700_000_000_123,
+            broadcast_host_config_bytes: vec![0xDD; 48],
+        }
+    }
+
     #[test]
     fn broadcast_hosting_handshake_constructs() {
-        let state =
-            SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
-                host_context_id: [6u8; 32],
-                broadcast_context_id: [7u8; 32],
-                subscriber_did: bob(),
-                broadcast_host_config_bytes: vec![0xDD; 48],
-            });
+        let state = SagaPreparedState::BroadcastHostingHandshake(sample_broadcast_prepared());
         match state {
             SagaPreparedState::BroadcastHostingHandshake(inner) => {
                 assert_eq!(inner.host_context_id, [6u8; 32]);
                 assert_eq!(inner.broadcast_context_id, [7u8; 32]);
                 assert_eq!(inner.subscriber_did, bob());
+                assert_eq!(inner.wrapping_pubkey, [0x44; 32]);
+                assert_eq!(inner.key_epoch_at_grant, 9);
+                assert_eq!(inner.granted_at_ms, 1_700_000_000_123);
+                assert_eq!(inner.grant_nonce, [0x55; 16]);
+                assert_eq!(inner.grant_timestamp_ms, 1_700_000_000_123);
                 assert_eq!(inner.broadcast_host_config_bytes, vec![0xDD; 48]);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn broadcast_hosting_evidence_round_trips_all_fields() {
+        let original = sample_broadcast_prepared();
+        let bytes = original.to_evidence_bytes().unwrap();
+        let back = BroadcastHostingHandshakePrepared::from_evidence_bytes(&bytes).unwrap();
+        assert_eq!(back.host_context_id, original.host_context_id);
+        assert_eq!(back.broadcast_context_id, original.broadcast_context_id);
+        assert_eq!(back.subscriber_did, original.subscriber_did);
+        assert_eq!(back.wrapping_pubkey, original.wrapping_pubkey);
+        assert_eq!(back.key_epoch_at_grant, original.key_epoch_at_grant);
+        assert_eq!(back.granted_at_ms, original.granted_at_ms);
+        assert_eq!(back.grant_nonce, original.grant_nonce);
+        assert_eq!(back.grant_timestamp_ms, original.grant_timestamp_ms);
+        assert_eq!(
+            back.broadcast_host_config_bytes,
+            original.broadcast_host_config_bytes
+        );
     }
 
     /// Compile-time witnesses that the prepared-state types ARE
@@ -983,6 +1162,11 @@ mod tests {
                 host_context_id: [0x3Cu8; 32],
                 broadcast_context_id: [0x4Du8; 32],
                 subscriber_did: bob(),
+                wrapping_pubkey: [0x7Eu8; 32],
+                key_epoch_at_grant: 11,
+                granted_at_ms: 1_700_222_333_444,
+                grant_nonce: [0x6Fu8; 16],
+                grant_timestamp_ms: 1_700_222_333_444,
                 broadcast_host_config_bytes: vec![0xAB, 0xCD, 0xEF],
             });
         let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
@@ -994,6 +1178,11 @@ mod tests {
                 assert_eq!(inner.host_context_id, [0x3Cu8; 32]);
                 assert_eq!(inner.broadcast_context_id, [0x4Du8; 32]);
                 assert_eq!(inner.subscriber_did, bob());
+                assert_eq!(inner.wrapping_pubkey, [0x7Eu8; 32]);
+                assert_eq!(inner.key_epoch_at_grant, 11);
+                assert_eq!(inner.granted_at_ms, 1_700_222_333_444);
+                assert_eq!(inner.grant_nonce, [0x6Fu8; 16]);
+                assert_eq!(inner.grant_timestamp_ms, 1_700_222_333_444);
                 assert_eq!(inner.broadcast_host_config_bytes, vec![0xAB, 0xCD, 0xEF]);
             }
             _ => panic!("wrong variant after rehydrate"),

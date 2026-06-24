@@ -745,8 +745,27 @@ impl ContextActor {
             ContextCommand::SagaPhase(
                 SagaPhaseMessage::CommitA { reply, .. }
                 | SagaPhaseMessage::Abort { reply, .. }
-                | SagaPhaseMessage::EmitDivergenceMarker { reply, .. },
+                | SagaPhaseMessage::EmitDivergenceMarker { reply, .. }
+                | SagaPhaseMessage::BroadcastCommitA { reply, .. },
             ) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            // Broadcast hosting-handshake phases reply distinct outcome shapes
+            // (Prepare-A → BroadcastPreparedAFields, Prepare-B →
+            // BroadcastPreparedBFields, Commit-B → grant bytes), so each is acked
+            // separately on the skeleton (stateless) actor.
+            ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastPrepareA { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastPrepareB { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitB { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::BroadcastCommitAReack {
+                reply, ..
+            }) => {
                 ack_not_impl(reply, "saga_phase");
             }
             ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply }) => {

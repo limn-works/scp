@@ -819,6 +819,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // B's freshness/replay cache has no authority on a foreign node and a
         // fresh node starts its own replay window — dropped from the export.
         xctx_nonce_dedup: HashMap::new(),
+        // Broadcast hosting-handshake request dedup cache — same drop-on-export
+        // discipline (§5.14.13 freshness state is local to the granting node).
+        bcast_request_nonce_dedup: HashMap::new(),
+        bcast_committed_grants: HashMap::new(),
     })
 }
 
@@ -1015,6 +1019,10 @@ mod tests {
             // B's freshness/replay cache has no authority on a foreign node and
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
+            // Broadcast hosting-handshake request dedup cache — dropped on
+            // export for the same local-authority reason (§5.14.13).
+            bcast_request_nonce_dedup: HashMap::new(),
+            bcast_committed_grants: HashMap::new(),
         }
     }
 

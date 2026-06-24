@@ -888,6 +888,45 @@ pub struct ClassSState {
         SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
+
+    /// Broadcast-side (B-owned) anti-replay nonce-dedup cache for the broadcast
+    /// hosting-handshake `BroadcastHostingRequest` (spec §5.14.13 "Freshness",
+    /// mirroring §6.2.2 discovery discipline). Keyed by the request's 16-byte
+    /// `nonce`; bounded 10,000-entry / 5-minute-TTL / oldest-first eviction (the
+    /// same [`NonceDedup`] discipline as [`Self::xctx_nonce_dedup`]).
+    ///
+    /// **The broadcast author — the Prepare-B verifying party — owns this
+    /// cache.** The freshness/replay state lives where the authorization
+    /// decision is made: Prepare-A runs on the host's actor and cannot
+    /// authoritatively dedup against B's state. Prepare-B rejects a duplicate
+    /// `nonce` and records a fresh one on accept. Only the REQUEST is
+    /// dedup-checked — the grant's `nonce` echoes the request's and is never
+    /// independently dedup'd (§5.14.13 "Freshness").
+    ///
+    /// **Class-S persisted — crash survival is load-bearing.** Captured into the
+    /// Class-S snapshot and rehydrated on restore: a crash between accept and the
+    /// coalesce-window persist would clear the seen-nonce set and re-open the
+    /// §5.14.13 replay window (a captured signed request replayed into repeated
+    /// re-grants). Distinct from [`Self::xctx_nonce_dedup`] (the cross-context
+    /// tool-saga envelope cache) so the two protocols' replay state never
+    /// cross-contaminate.
+    pub(crate) bcast_request_nonce_dedup: NonceDedup,
+
+    /// Host-side (A-owned) durable proof of relay authorization for committed
+    /// broadcast hosting handshakes, keyed by `SagaId` (spec §5.14.13 Commit-A:
+    /// "A persists it as its durable proof of relay authorization"). Commit-A
+    /// inserts the author-signed `BroadcastHostingGrant` bytes (JCS) here as the
+    /// idempotency witness; a replayed Commit-A finds the witness and re-acks
+    /// without re-persisting. The host can present this author-signed grant to
+    /// prove which recipient key the author empowered (amplification-
+    /// accountability non-repudiation).
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9), the same
+    /// `SagaId`-witness discipline as [`Self::xctx_committed_invocations`]: a
+    /// crash that rolled the witness back behind an acked Commit-A would lose the
+    /// durable relay-authorization proof. Survives same-node restore; dropped on
+    /// cross-node export/import (a foreign saga must never drive local replay).
+    pub(crate) bcast_committed_grants: std::collections::HashMap<SagaId, Vec<u8>>,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -925,6 +964,13 @@ pub struct ClassSStateSnapshot {
         SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
+    /// `(nonce → first-seen-secs)` entries of [`ClassSState::bcast_request_nonce_dedup`].
+    pub(crate) bcast_request_nonce_dedup_entries: HashMap<[u8; 16], u64>,
+    /// TTL of [`ClassSState::bcast_request_nonce_dedup`], captured so restore
+    /// rebuilds the same replay window via [`NonceDedup::from_entries_with_ttl`].
+    pub(crate) bcast_request_nonce_dedup_ttl_secs: u64,
+    /// Mirror of [`ClassSState::bcast_committed_grants`].
+    pub(crate) bcast_committed_grants: std::collections::HashMap<SagaId, Vec<u8>>,
 }
 
 #[allow(
@@ -953,6 +999,9 @@ impl ClassSState {
             xctx_committed_outputs: self.xctx_committed_outputs.clone(),
             xctx_committed_invocations: self.xctx_committed_invocations.clone(),
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
+            bcast_request_nonce_dedup_entries: self.bcast_request_nonce_dedup.entries(),
+            bcast_request_nonce_dedup_ttl_secs: self.bcast_request_nonce_dedup.ttl_secs(),
+            bcast_committed_grants: self.bcast_committed_grants.clone(),
         }
     }
 
@@ -972,6 +1021,11 @@ impl ClassSState {
         self.xctx_committed_outputs = snap.xctx_committed_outputs;
         self.xctx_committed_invocations = snap.xctx_committed_invocations;
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
+        self.bcast_request_nonce_dedup = NonceDedup::from_entries_with_ttl(
+            snap.bcast_request_nonce_dedup_entries,
+            snap.bcast_request_nonce_dedup_ttl_secs,
+        );
+        self.bcast_committed_grants = snap.bcast_committed_grants;
     }
 }
 
@@ -1456,6 +1510,13 @@ impl PerContextState {
                 xctx_committed_outputs: HashMap::new(),
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
+                // Same production TTL discipline as `xctx_nonce_dedup` (strictly
+                // longer than the freshness skew) so the broadcast handshake's
+                // anti-replay window matches prod in handler tests.
+                bcast_request_nonce_dedup: NonceDedup::with_ttl(
+                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                ),
+                bcast_committed_grants: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
@@ -1685,7 +1746,11 @@ mod tests {
             xctx_committed_outputs,
             xctx_committed_invocations,
             xctx_caller_reservations,
+            bcast_request_nonce_dedup,
+            bcast_committed_grants,
         } = class_s;
+        let _ = &bcast_request_nonce_dedup;
+        let _ = &bcast_committed_grants;
 
         // Identity + lifetime.
         assert_eq!(context_id, [3u8; 32]);
@@ -1807,6 +1872,8 @@ mod tests {
                     xctx_committed_outputs: _,
                     xctx_committed_invocations: _,
                     xctx_caller_reservations: _,
+                    bcast_request_nonce_dedup: _,
+                    bcast_committed_grants: _,
                 },
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,

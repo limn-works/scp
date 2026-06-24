@@ -1097,6 +1097,31 @@ pub struct ContextSnapshot {
     /// snapshots deserialize as an empty cache.
     #[serde(default)]
     pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
+
+    /// Broadcast-side (B-owned) anti-replay nonce-dedup cache for the broadcast
+    /// hosting-handshake `BroadcastHostingRequest` (spec §5.14.13 "Freshness"),
+    /// keyed by the request's 16-byte `nonce`.
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed, mirroring
+    /// [`Self::xctx_nonce_dedup`]. If it reinitialized empty on restore, an actor
+    /// crash inside the TTL window would let an attacker re-submit a captured
+    /// signed `BroadcastHostingRequest` into repeated re-grants. Same-node
+    /// restore REHYDRATES it (TTL rebuilt from `SAGA_NONCE_DEDUP_TTL_SECS`);
+    /// cross-node import / `strip_snapshot_for_public` DROP it to empty — B's
+    /// freshness state has no authority on a foreign node. `#[serde(default)]`
+    /// so legacy / stripped snapshots deserialize as an empty cache.
+    #[serde(default)]
+    pub bcast_request_nonce_dedup: HashMap<[u8; 16], u64>,
+
+    /// Host-side (A-owned) durable proof of relay authorization for committed
+    /// broadcast hosting handshakes, keyed by `SagaId` string → author-signed
+    /// `BroadcastHostingGrant` bytes (spec §5.14.13 Commit-A). **Class S** —
+    /// synchronously persisted, so a crash after an acked Commit-A does not lose
+    /// the relay-authorization proof. Same-node restore rehydrates it; cross-node
+    /// import / strip DROP it (a foreign saga must never drive local replay).
+    /// `#[serde(default)]` so legacy / stripped snapshots deserialize as empty.
+    #[serde(default)]
+    pub bcast_committed_grants: HashMap<crate::context::supervisor::saga_journal::SagaId, Vec<u8>>,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.
