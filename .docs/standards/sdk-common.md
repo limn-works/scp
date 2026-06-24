@@ -332,7 +332,7 @@ SDKs implement local auto-accept policy evaluation for incoming context invitati
 // Rust
 sdk.set_auto_accept_policy(AutoAcceptPolicy {
     template: Template::BilateralEphemeral,
-    from: TrustRequirement::SharedContext,   // Must share ≥1 active context
+    from: TrustRequirement::KnownDid(vec![alice_did]), // explicit allowlist — the only trigger
     max_ttl: Some(Duration::from_secs(600)), // ≤10 minutes
     rate_limit: Some(Rate::per_hour(5)),     // Max 5 auto-accepts/hour
 });
@@ -340,11 +340,13 @@ sdk.set_auto_accept_policy(AutoAcceptPolicy {
 // Python
 sdk.set_auto_accept_policy(
     template="bilateral-ephemeral",
-    trust=TrustRequirement.SHARED_CONTEXT,
+    trust=TrustRequirement.known_did([alice_did]),  # explicit allowlist — the only trigger
     max_ttl=timedelta(minutes=10),
     rate_limit=Rate.per_hour(5),
 )
 ```
+
+**No default:** absent an explicit, human-configured policy, every invitation prompts the agent/human (default-deny). `known_did` is the only auto-accept trigger; co-membership and discoverability are not trust signals.
 
 **Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any tool-related capability (`ToolInvokeAll`, `ToolInvokeSpecific`, `ToolRegister`). Tool-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
 

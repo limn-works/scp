@@ -281,14 +281,14 @@ SCP.Context.setAutoAcceptPolicy(
   identity: Identity,
   policy: AutoAcceptPolicy {
     template: TemplateID,            // which template(s) to auto-accept
-    from: .sharedContext             // DID shares ≥1 active context with me
-        | .knownDID([DID])           // explicit allowlist
-        | .discoveryContext,         // DID registered in trusted context
+    from: .knownDID([DID]),          // explicit operator allowlist — the only auto-accept trigger
     maxTTL: Duration?,               // optional cap
     rateLimit: Rate?                 // max auto-accepts per time window
   }
 ) → void
 ```
+
+**No default:** absent an explicit, human-configured `AutoAcceptPolicy`, every invitation prompts the human (default-deny).
 
 **Hard rule (non-overridable):** Auto-accept never applies to contexts with tool capabilities in the ceiling. Tool access always requires explicit confirmation.
 
