@@ -9,8 +9,11 @@ cross-context tool invocation, broadcast hosting handshake) were
 deferred to commit 11.5 because the current spec did not fully define
 the wire-level protocols needed to execute the 2-phase Prepare+Commit
 FSM end to end. *(Historical — see **Status** above and the Resolution
-below: only **3** are live sagas; "migration" is the cross-identity
-custody handover, **WITHDRAWN** — it is not a saga and does not exist.)*
+below: only **two** are live sagas (cross-context tool invocation and
+broadcast hosting handshake); "migration" is the cross-identity custody
+handover, **WITHDRAWN** — it is not a saga and does not exist; and
+standing-pair creation was reclassified as single-context async creation,
+also not a saga.)*
 
 **What commit 11 DOES land.**
 - Full `ContextCommand` sub-enum extension for standing / tools /
@@ -189,18 +192,24 @@ synchronously; commit 11.5 defines the FFI surface.
 
 ## Commit 11.5 exit criteria
 
-Commit 11.5 MUST land — not commit 12 — if any saga use case needs to
-go to production. (Superseded by the Resolution below: Gap 4 is WITHDRAWN,
-so the criteria cover **3** live sagas, not 4, and there is no `saga_state`
-export — the async/poll wait model was withdrawn with Gap 4 per ADR-049 §3a.)
+Commit 11.5 MUST land — not commit 12 — if any of these use cases needs
+to go to production. (Superseded by the Resolution below: Gap 4 is
+WITHDRAWN, so the criteria cover **3 spec gaps** — **2 sagas**
+(cross-context tool invocation, broadcast hosting handshake) plus the
+§5.15.8 single-context-async standing-pair spec, **not** 4 — and there
+is no `saga_state` export, the async/poll wait model having been
+withdrawn with Gap 4 per ADR-049 §3a.)
 
-1. A spec update (.docs/specs/ or a new ADR) filling in the **3** live
-   saga wire-format gaps (Gaps 1–3) with canonical wire formats and
-   state-machine tables. (Gap 4 is withdrawn, not specced; Gap 5 is the
-   FFI surface, item 4 below.)
+1. A spec update (.docs/specs/ or a new ADR) filling in the **3** spec
+   gaps (Gaps 1–3) with canonical wire formats and state-machine tables —
+   Gap 1 being the §5.15.8 single-context-async standing-pair spec (not
+   a saga) and Gaps 2–3 the two live sagas. (Gap 4 is withdrawn, not
+   specced; Gap 5 is the FFI surface, item 4 below.)
 2. Replacement of the **3** `reply_saga_deferred` placeholders in
-   `handlers/{standing,tools,broadcast}.rs` with real Prepare+Commit
-   dispatches. (No migration handler — Gap 4 withdrawn.)
+   `handlers/{standing,tools,broadcast}.rs` with real dispatches —
+   Prepare+Commit for the two sagas, the single-context-async
+   `create` + `add_member` + Welcome path for standing-pair. (No
+   migration handler — Gap 4 withdrawn.)
 3. Per-use-case integration tests (covering all **3** variants) under
    `crates/scp-runtime/tests/actor_saga_*.rs`.
 4. FFI bridge exports for `start_saga` **only** — block-until-terminal,
