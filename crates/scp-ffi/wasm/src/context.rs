@@ -734,6 +734,19 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// # Returns
 ///
 /// `Promise<string>` — resolves to a JSON result of the governance action.
+///
+/// For membership-changing actions (`RemoveMember`), the result JSON includes a
+/// `commit` field: a hex-encoded MLS Commit message that evicts the removed
+/// member from the group key schedule. **The caller MUST distribute this commit
+/// to the other context members via the relay.** The WASM bridge has no internal
+/// transport (ADR-034) and performs no automatic broadcast or retry — unlike the
+/// native runtime, which auto-broadcasts the eviction commit. If the caller does
+/// not relay it, the MLS group silently forks: the remaining members never
+/// advance their epoch, never learn of the eviction, and the removed member's
+/// key schedule stays valid for traffic those members keep producing on the old
+/// epoch. An empty `commit` string means no MLS commit was produced — the
+/// context is broadcast/unencrypted, or the removed member held no MLS leaf — and
+/// there is nothing to distribute.
 #[wasm_bindgen]
 pub fn context_execute_governance(handle: &WasmContextHandle, proposal_id_hex: String) -> Promise {
     if let Err(e) = validate_proposal_id_hex(&proposal_id_hex) {

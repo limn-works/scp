@@ -2401,12 +2401,15 @@ fn cross_impl_governance_proposal_vote_leaf_is_empty() {
 /// appends `GovernanceActionExecuted`. A WASM regression that stamped the target
 /// DID into the leaf, used a non-empty payload, used local `now()`, or reversed
 /// the order would diverge the cross-platform `tree::root` and false-positive
-/// §9.9.3 equivocation. This test drives native's REAL durable appends in the
-/// `execute_remove_member` order and pins both the empty `MemberLeft` payload and
-/// the `MemberLeft`-before-`GovernanceActionExecuted` ordering. (The scp-runtime
-/// test crate cannot dev-depend on the `scp-ffi-wasm` cdylib, so the WASM side
-/// asserts the same empty-payload + ordering invariants in its own crate's
-/// `dispatch_remove_member` tests.)
+/// §9.9.3 equivocation. This test REPLAYS the two appends that
+/// `execute_remove_member` performs, in that order (the empty `MemberLeft` leaf
+/// then `GovernanceActionExecuted`), and pins both the empty `MemberLeft` payload
+/// and the `MemberLeft`-before-`GovernanceActionExecuted` ordering. It does NOT
+/// invoke `execute_remove_member` itself: the scp-runtime test crate cannot
+/// dev-depend on the `scp-ffi-wasm` cdylib, and the helper lives behind the actor
+/// machinery — native's real-path ordering is covered by the native governance
+/// tests, while the WASM side asserts the same empty-payload + ordering
+/// invariants in its own crate's `dispatch_remove_member` tests.
 #[test]
 fn cross_impl_remove_member_leaf_is_empty_and_precedes_executed() {
     use scp_event_log::EventPayload;
@@ -2422,7 +2425,8 @@ fn cross_impl_remove_member_leaf_is_empty_and_precedes_executed() {
     let log = MerkleEventLogProvider::new();
     log.init_event_log(&ctx).unwrap();
 
-    // Drive native's REAL appends in `execute_remove_member` order:
+    // Replay the two appends `execute_remove_member` performs, in that order
+    // (this test does not invoke `execute_remove_member` itself):
     // 1) the empty-payload `MemberLeft` leaf via `append_context_event`
     //    (stamped with the EXECUTOR, not the removed member),
     log.append_context_event(&ctx, EventType::MemberLeft, executor_did, ts)

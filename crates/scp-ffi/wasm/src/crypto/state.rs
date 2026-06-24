@@ -131,12 +131,18 @@ impl WasmCryptoState {
     /// `MlsCrypto::remove_member` (called FIRST in
     /// `scp_runtime::context::governance_helpers::execute_remove_member`).
     ///
+    /// A member who is in the context's membership set but carries no MLS leaf
+    /// (e.g. never MLS-added) is a NO-OP that returns an empty commit — matching
+    /// native `MlsCryptoProvider::remove_member`, because the governance layer
+    /// is authoritative for membership and the crypto layer only manages MLS
+    /// state. See
+    /// [`WasmMlsGroup::remove_member_by_did`](super::group::WasmMlsGroup::remove_member_by_did).
+    ///
     /// # Errors
     ///
-    /// Returns an error if the group is destroyed or no MLS leaf carries the
-    /// given DID (governance verifies membership before calling, so a miss is a
-    /// real state divergence — see
-    /// [`WasmMlsGroup::remove_member_by_did`](super::group::WasmMlsGroup::remove_member_by_did)).
+    /// Returns an error if the group is destroyed, or if a leaf IS found but the
+    /// underlying remove/commit serialization fails — genuine MLS failures that
+    /// must propagate so the dispatch layer can fail closed (keep the member).
     pub fn governance_remove_from_group(
         &mut self,
         member_did: &str,

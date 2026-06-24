@@ -213,21 +213,45 @@ impl WasmMlsGroup {
     /// TLS-serialized commit that evicts them from the MLS group.
     ///
     /// Resolves the DID to its leaf via [`leaf_index_for_did`](Self::leaf_index_for_did)
-    /// and delegates to [`remove_member`](Self::remove_member). The governance
-    /// layer has ALREADY verified the member is in the context before calling
-    /// this, so a missing MLS leaf is a real native↔WASM state divergence — it
-    /// fails loudly rather than silently skipping the cryptographic eviction
-    /// (the removed member would otherwise keep the group key schedule).
+    /// and delegates to [`remove_member`](Self::remove_member).
+    ///
+    /// A missing MLS leaf is a NO-OP, not an error: it returns an empty commit
+    /// (`Ok(Vec::new())`) and logs a warning to the browser console. This matches native
+    /// `MlsCryptoProvider::remove_member`, which returns
+    /// `RemoveMemberOutput::default()` (empty commit) for a member with no MLS
+    /// leaf. The governance/`WasmContextManager` layer is authoritative for
+    /// membership; the crypto layer only manages MLS group state. A member who
+    /// is in the context's membership set but was never MLS-added (or is the
+    /// local member under a different DID in a multi-identity environment) is
+    /// removed from membership by the dispatch layer regardless, and there is
+    /// no MLS key schedule to advance. The eviction security property — a
+    /// removed member can no longer derive the group key — rests on the MLS
+    /// epoch advance, which only exists when the member actually held a leaf.
     ///
     /// # Errors
     ///
     /// Returns [`WasmCryptoError::GroupDestroyed`] if the group has been
-    /// destroyed, or [`WasmCryptoError::RemoveMemberFailed`] if no MLS leaf
-    /// carries `member_did` or the underlying remove fails.
+    /// destroyed, or [`WasmCryptoError::RemoveMemberFailed`] if a leaf IS found
+    /// but the underlying remove/commit serialization fails. Those are genuine
+    /// MLS failures and must propagate so the dispatch layer can fail closed
+    /// (keep the member rather than report a removal that did not cut the key).
     pub fn remove_member_by_did(&mut self, member_did: &str) -> Result<Vec<u8>, WasmCryptoError> {
-        let leaf_index = self.leaf_index_for_did(member_did)?.ok_or_else(|| {
-            WasmCryptoError::RemoveMemberFailed(format!("no MLS leaf for DID '{member_did}'"))
-        })?;
+        // `leaf_index_for_did` propagates `GroupDestroyed` (group is None) as a
+        // genuine error; `Ok(None)` means the DID has no MLS leaf.
+        let Some(leaf_index) = self.leaf_index_for_did(member_did)? else {
+            // Diagnostic only — the no-op behaviour (empty commit) is the
+            // contract. `web_sys::console` is unavailable on non-wasm32 test
+            // targets, so gate the log to the browser build.
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::warn_1(
+                &format!(
+                    "[SCP] remove_member_by_did: member DID '{member_did}' not found in MLS \
+                     group leaf nodes — member may not have been MLS-added"
+                )
+                .into(),
+            );
+            return Ok(Vec::new());
+        };
         self.remove_member(&leaf_index)
     }
 
@@ -563,19 +587,48 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn remove_member_by_did_errors_for_non_member() {
+    fn remove_member_by_did_is_noop_for_non_member() {
         let alice_cred = test_credential("alice");
         let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
 
-        // No member with this DID exists — governance would never reach here in
-        // production (it verifies membership first), so an MLS miss is a real
-        // divergence and must surface as an error, not a silent no-op.
-        let err = alice_group
+        let epoch_before = alice_group.epoch().unwrap();
+
+        // No member with this DID has an MLS leaf. This matches native
+        // `MlsCryptoProvider::remove_member`: a missing leaf is a NO-OP that
+        // returns an empty commit (the governance layer is authoritative for
+        // membership; the crypto layer only manages MLS state). It must NOT
+        // error and must NOT advance the epoch.
+        let commit = alice_group
             .remove_member_by_did("did:dht:z6MkGhostMember")
-            .expect_err("removing a non-member by DID must error");
+            .expect("missing-leaf removal must be a no-op, not an error");
         assert!(
-            matches!(err, WasmCryptoError::RemoveMemberFailed(_)),
-            "missing-leaf removal must be a RemoveMemberFailed error, got {err:?}"
+            commit.is_empty(),
+            "a missing-leaf removal must produce an empty commit (no-op)"
+        );
+        assert_eq!(
+            alice_group.epoch().unwrap(),
+            epoch_before,
+            "a missing-leaf removal must NOT advance the MLS epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn remove_member_by_did_errors_on_destroyed_group() {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = WasmMlsGroup::create_group(&alice_cred).unwrap();
+
+        // A destroyed group (group is None) is a genuine MLS failure:
+        // `leaf_index_for_did` returns `GroupDestroyed`, which must propagate as
+        // an error so the dispatch layer fails closed (keeps the member) rather
+        // than reporting a removal that never cut the key.
+        alice_group.destroy();
+        let err = alice_group
+            .remove_member_by_did("did:dht:z6MkAnyone")
+            .expect_err("removal against a destroyed group must error");
+        assert!(
+            matches!(err, WasmCryptoError::GroupDestroyed),
+            "destroyed-group removal must be GroupDestroyed, got {err:?}"
         );
     }
 
