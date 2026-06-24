@@ -744,6 +744,8 @@ TrustRequirement:
   | known_did(list)   // explicit operator allowlist — the only auto-accept trigger
 ```
 
+> **Provenance (spec leads code, 2026-06-24).** The reference implementation's `TrustRequirement` (`scp-protocol` `context::policy`) currently still carries `Any` (accept from *any* identity) and `SharedContext` (co-membership) variants alongside the allowlist (`Explicit(Vec<DID>)`), and never implemented the prior `discovery_context` arm — a spec/code divergence predating this change. The allowlist (`known_did` / `Explicit`) is the sole surviving auto-accept trigger; `Any` and `SharedContext` are removed in the downstream code-correctness PR. Removing `Any` — a silent accept-from-*any*-identity default — is a security fix. No code is changed in this spec-only change.
+
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID on my allowlist, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
