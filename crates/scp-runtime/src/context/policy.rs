@@ -143,7 +143,7 @@ mod tests {
         let identity = DID::from("did:dht:z6MkAlice");
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::SharedContext,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         };
@@ -167,7 +167,7 @@ mod tests {
         let identity = DID::from("did:dht:z6MkBob");
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralPersistent,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: None,
             rate_limit: None,
         };
@@ -201,7 +201,7 @@ mod tests {
         let identity = DID::from("did:dht:z6MkAlice");
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: None,
             rate_limit: None,
         };
@@ -415,7 +415,7 @@ mod tests {
     fn auto_accept_policy_serde_roundtrip() {
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::SharedContext,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         };
@@ -425,10 +425,10 @@ mod tests {
     }
 
     #[test]
-    fn trust_requirement_explicit_serde_roundtrip() {
+    fn trust_requirement_known_did_serde_roundtrip() {
         let policy = AutoAcceptPolicy {
             template: TemplateId::Coordination,
-            from: TrustRequirement::Explicit(vec![
+            from: TrustRequirement::KnownDid(vec![
                 DID::from("did:dht:z6MkAlice"),
                 DID::from("did:dht:z6MkBob"),
             ]),
@@ -450,13 +450,13 @@ mod tests {
 
         let alice_policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: Some(Duration::from_mins(5)),
             rate_limit: None,
         };
         let bob_policy = AutoAcceptPolicy {
             template: TemplateId::BilateralPersistent,
-            from: TrustRequirement::SharedContext,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: None,
             rate_limit: Some(RateLimit::per_hour(10)),
         };
@@ -484,13 +484,13 @@ mod tests {
 
         let policy_v1 = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: None,
             rate_limit: None,
         };
         let policy_v2 = AutoAcceptPolicy {
             template: TemplateId::BilateralPersistent,
-            from: TrustRequirement::SharedContext,
+            from: TrustRequirement::KnownDid(vec![DID::from("did:dht:z6MkPeer")]),
             max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(3)),
         };

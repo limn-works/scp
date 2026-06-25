@@ -9,7 +9,7 @@ surface with mocked ``_native`` objects:
 - :meth:`SCP.context_create` forwards Pythonic parameters correctly
 - :meth:`SCP.context_join` / ``context_leave`` / ``context_close`` /
   ``context_send`` / ``context_receive`` / ``tool_invoke`` dispatch
-- :meth:`SCP.evaluate_invitation` with ``spending_json`` / ``trusted_dids``
+- :meth:`SCP.evaluate_invitation` with ``spending_json``
 - Consequence event message types
 
 Tests mock the PyO3 ``_native`` bridge; no Rust extension required.
@@ -651,12 +651,17 @@ class TestEconomicPolicyRoundtrip:
 
 
 # ---------------------------------------------------------------------------
-# SCP.evaluate_invitation with spending/trusted_dids (#1537, #1593, #1594)
+# SCP.evaluate_invitation with spending forwarding
 # ---------------------------------------------------------------------------
 
 
 class TestEvaluateInvitationSpending:
-    """Tests for :meth:`SCP.evaluate_invitation` spending/trusted_dids forwarding."""
+    """Tests for :meth:`SCP.evaluate_invitation` spending forwarding.
+
+    Trust is allowlist-only (§5.12.2): the ``known_did`` allowlist travels
+    inside ``policy_json`` (the policy's ``TrustRequirement::KnownDid``
+    variant), so there is no separate trusted-DID parameter to forward.
+    """
 
     @pytest.mark.asyncio
     async def test_accepts_spending_json(self) -> None:
@@ -694,61 +699,42 @@ class TestEvaluateInvitationSpending:
         assert native.evaluate_invitation.call_args[0][4] is None
 
     @pytest.mark.asyncio
-    async def test_accepts_empty_trusted_dids(self) -> None:
-        """H14 regression: empty trusted_dids must round-trip as a JSON
-        empty array so "auto-reject everyone" stays distinct from "no
-        policy" (None).
+    async def test_known_did_allowlist_travels_in_policy(self) -> None:
+        """The ``known_did`` allowlist is carried inside ``policy_json``; the
+        wrapper forwards the policy verbatim and adds no separate trusted-DID
+        argument (only five positionals reach the native bridge).
         """
-        from scp_sdk.scp import SCP
-
-        native = MagicMock()
-        native.evaluate_invitation.return_value = "prompt_agent"
-        scp = _make_scp(native)
-
-        await SCP.evaluate_invitation(
-            scp,
-            '{"ceiling":[]}',
-            "did:dht:z6MkBob",
-            "did:dht:z6MkLocal",
-            None,
-            None,
-            "[]",
-        )
-
-        call = native.evaluate_invitation.call_args[0]
-        assert call[5] == "[]"
-
-    @pytest.mark.asyncio
-    async def test_none_trusted_dids_passes_none(self) -> None:
-        from scp_sdk.scp import SCP
-
-        native = MagicMock()
-        native.evaluate_invitation.return_value = "prompt_agent"
-        scp = _make_scp(native)
-
-        await SCP.evaluate_invitation(scp, '{"ceiling":[]}', "did:dht:z6MkBob", "did:dht:z6MkLocal")
-        assert native.evaluate_invitation.call_args[0][5] is None
-
-    @pytest.mark.asyncio
-    async def test_populated_trusted_dids(self) -> None:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
         native.evaluate_invitation.return_value = "auto_accept"
         scp = _make_scp(native)
 
+        policy_json = json.dumps(
+            {
+                "template": "bilateral-ephemeral",
+                "from": {"KnownDid": ["did:dht:z6MkBob", "did:dht:z6MkCarol"]},
+                "max_ttl": None,
+                "rate_limit": None,
+            }
+        )
+
         await SCP.evaluate_invitation(
             scp,
             '{"ceiling":[]}',
             "did:dht:z6MkBob",
             "did:dht:z6MkLocal",
-            None,
-            None,
-            json.dumps(["did:dht:z6MkBob", "did:dht:z6MkCarol"]),
+            policy_json,
         )
 
         call = native.evaluate_invitation.call_args[0]
-        assert json.loads(call[5]) == ["did:dht:z6MkBob", "did:dht:z6MkCarol"]
+        # No trusted-DID positional exists: exactly five args are forwarded.
+        assert len(call) == 5
+        # The allowlist rides inside policy_json (the 4th positional, index 3).
+        assert json.loads(call[3])["from"]["KnownDid"] == [
+            "did:dht:z6MkBob",
+            "did:dht:z6MkCarol",
+        ]
 
 
 # ---------------------------------------------------------------------------

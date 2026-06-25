@@ -527,8 +527,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/evaluateInvitation`` on ``inner``.
-    func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws -> String {
-        try inner.evaluateInvitation(paramsJson: paramsJson, inviterDid: inviterDid, identityDid: identityDid, policyJson: policyJson, spendingJson: spendingJson, trustedDids: trustedDids)
+    func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?) throws -> String {
+        try inner.evaluateInvitation(paramsJson: paramsJson, inviterDid: inviterDid, identityDid: identityDid, policyJson: policyJson, spendingJson: spendingJson)
     }
 
     /// Forwards to ``Scp/eventLogCheckpoint`` on ``inner``.

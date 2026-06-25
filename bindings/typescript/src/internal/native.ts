@@ -1698,7 +1698,6 @@ export function createNativeBridge(scp: SCP): Bridge {
       identityDid: string,
       policyJson: string | null,
       spendingJson: string | null,
-      trustedDidsJson: string | null,
     ) {
       return (
         native.evaluateInvitation as (
@@ -1707,9 +1706,8 @@ export function createNativeBridge(scp: SCP): Bridge {
           id: string,
           pol: string | null,
           sp: string | null,
-          td: string | null,
         ) => { decision: string }
-      )(paramsJson, inviterDid, identityDid, policyJson, spendingJson, trustedDidsJson);
+      )(paramsJson, inviterDid, identityDid, policyJson, spendingJson);
     },
 
     // MetadataRecord inspection (§5.7.2, #615)

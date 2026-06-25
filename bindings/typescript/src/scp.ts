@@ -1607,13 +1607,17 @@ export class SCP {
     return fn([...grantedCapabilities], requiredCapability);
   }
 
+  /**
+   * The `known_did` allowlist (the sole auto-accept trigger, §5.12.2) travels
+   * inside `policyJson` -- the policy's `TrustRequirement` `KnownDid` variant.
+   * There is no separate trusted-DID parameter.
+   */
   evaluateInvitation(
     paramsJson: string,
     inviterDid: string,
     identityDid: string,
     policyJson?: string | null,
     spendingJson?: string | null,
-    trustedDidsJson?: string | null,
   ): unknown {
     return (
       this.#native.evaluateInvitation as (
@@ -1622,16 +1626,8 @@ export class SCP {
         id: string,
         pol: string | null,
         sp: string | null,
-        td: string | null,
       ) => unknown
-    )(
-      paramsJson,
-      inviterDid,
-      identityDid,
-      policyJson ?? null,
-      spendingJson ?? null,
-      trustedDidsJson ?? null,
-    );
+    )(paramsJson, inviterDid, identityDid, policyJson ?? null, spendingJson ?? null);
   }
 
   metadataRecordToJson(

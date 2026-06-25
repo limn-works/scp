@@ -1262,9 +1262,13 @@ class SCP:
         identity_did: str,
         policy_json: str | None = None,
         spending_json: str | None = None,
-        trusted_dids_json: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.evaluate_invitation``."""
+        """Delegate to ``_scp_core.SCP.evaluate_invitation``.
+
+        The ``known_did`` allowlist (the sole auto-accept trigger, §5.12.2)
+        travels inside ``policy_json`` -- the policy's ``TrustRequirement``
+        ``KnownDid`` variant. There is no separate trusted-DID parameter.
+        """
         return await asyncio.to_thread(
             self._native.evaluate_invitation,
             params_json,
@@ -1272,7 +1276,6 @@ class SCP:
             identity_did,
             policy_json,
             spending_json,
-            trusted_dids_json,
         )
 
     async def finalize_close(self, handle: Any) -> Any:

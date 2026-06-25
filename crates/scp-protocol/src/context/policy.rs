@@ -16,17 +16,23 @@ use scp_primitives::DID;
 
 /// Trust requirement for auto-accept policy evaluation.
 ///
-/// Determines the minimum trust level an inviter must meet for the policy to
-/// trigger automatic acceptance. See `.docs/standards/sdk-common.md`.
+/// An explicit DID allowlist is the **only** permitted basis for auto-accept.
+/// This is a single-variant enum by design: co-membership in a shared context
+/// and registration/discoverability in an open registry are **not** trust
+/// signals and never trigger auto-accept (inferring trust from either is
+/// unsound, and discovery is how strangers *reach* you, not whom you
+/// auto-trust). There is no accept-from-any option: absent an explicit,
+/// human-configured policy, every invitation prompts the human (default-deny).
+///
+/// See `.docs/specs/05-contexts.md` section 5.12.2 and
+/// `.docs/standards/sdk-common.md` section "Auto-accept policies".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrustRequirement {
-    /// Accept from any identity. Least restrictive.
-    Any,
-    /// Accept only from identities that share at least one active context
-    /// with this identity.
-    SharedContext,
-    /// Accept only from identities explicitly listed by DID.
-    Explicit(Vec<DID>),
+    /// Accept only from identities explicitly listed by DID (the allowlist).
+    ///
+    /// The allowlist is set by the evaluating party; a candidate cannot add
+    /// itself (no self-clear path).
+    KnownDid(Vec<DID>),
 }
 
 // ---------------------------------------------------------------------------

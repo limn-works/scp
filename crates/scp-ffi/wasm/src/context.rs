@@ -2555,28 +2555,22 @@ fn params_require_payment(params: &serde_json::Value) -> bool {
             .is_some_and(|v| !v.is_null())
 }
 
-/// Checks trust requirement against the inviter and trusted DID list.
-fn check_trust(
-    policy: &serde_json::Value,
-    inviter_did: &str,
-    trusted_dids_json: Option<&String>,
-) -> bool {
-    match policy.get("from").and_then(serde_json::Value::as_str) {
-        Some("Any") => true,
-        Some("SharedContext") => {
-            let trusted: Vec<String> = trusted_dids_json.map_or_else(Vec::new, |json| {
-                serde_json::from_str(json).unwrap_or_default()
-            });
-            trusted.contains(&inviter_did.to_owned())
-        }
-        _ => policy.get("from").is_some_and(|from_obj| {
-            from_obj.get("Explicit").is_some_and(|explicit| {
-                explicit
-                    .as_array()
-                    .is_some_and(|arr| arr.iter().any(|d| d.as_str() == Some(inviter_did)))
-            })
-        }),
-    }
+/// Checks the trust requirement against the inviter.
+///
+/// `TrustRequirement` is allowlist-only: the sole variant is
+/// `KnownDid(Vec<DID>)`, which serde serializes (externally tagged) as
+/// `{ "KnownDid": [ ...dids ] }`. Auto-accept fires only when the inviter's DID
+/// appears in that embedded allowlist. There is no accept-from-any or
+/// co-membership trigger (§5.12.2); the allowlist travels inside the policy
+/// itself, so no separate trusted-DID input is needed.
+fn check_trust(policy: &serde_json::Value, inviter_did: &str) -> bool {
+    policy.get("from").is_some_and(|from_obj| {
+        from_obj.get("KnownDid").is_some_and(|known| {
+            known
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|d| d.as_str() == Some(inviter_did)))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,7 +2684,6 @@ fn check_auto_accept(
     policy_json: Option<&String>,
     inviter_did: &str,
     identity_did: &str,
-    trusted_dids_json: Option<&String>,
 ) -> Result<Option<&'static str>, JsValue> {
     let Some(pjson) = policy_json else {
         return Ok(None);
@@ -2713,7 +2706,7 @@ fn check_auto_accept(
 
     if policy_template.is_none()
         || policy_template != params_template
-        || !check_trust(&policy, inviter_did, trusted_dids_json)
+        || !check_trust(&policy, inviter_did)
     {
         return Ok(None);
     }
@@ -3014,7 +3007,6 @@ pub fn evaluate_invitation(
     identity_did: String,
     policy_json: Option<String>,
     spending_json: Option<String>,
-    trusted_dids_json: Option<String>,
 ) -> Promise {
     future_to_promise(async move {
         validate_did(&inviter_did).map_err(|e| ScpWasmError::from(e).into_js())?;
@@ -3036,13 +3028,9 @@ pub fn evaluate_invitation(
         }
 
         // Step 3: Auto-accept check (B1 — rate limiting).
-        if let Some(decision) = check_auto_accept(
-            &params,
-            policy_json.as_ref(),
-            &inviter_did,
-            &identity_did,
-            trusted_dids_json.as_ref(),
-        )? {
+        if let Some(decision) =
+            check_auto_accept(&params, policy_json.as_ref(), &inviter_did, &identity_did)?
+        {
             return Ok(JsValue::from_str(&format!(
                 r#"{{"decision":"{decision}"}}"#
             )));
