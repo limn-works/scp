@@ -51,7 +51,7 @@ use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Discriminated union over the saga types defined by ADR-049 §3
+// Discriminated union over the ADR-049 §3 saga type-space (one variant today; extensible)
 // ---------------------------------------------------------------------------
 
 /// Prepared (Prepare-time) snapshot for an in-flight saga.
