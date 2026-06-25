@@ -2736,7 +2736,6 @@ impl Scp {
         identity_did: String,
         policy_json: Option<String>,
         spending_json: Option<String>,
-        trusted_dids_json: Option<String>,
     ) -> napi::Result<NapiEvaluationResult> {
         crate::context::evaluate_invitation_on(
             &self.inner,
@@ -2745,7 +2744,6 @@ impl Scp {
             identity_did,
             policy_json,
             spending_json,
-            trusted_dids_json,
         )
     }
 

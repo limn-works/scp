@@ -5,8 +5,9 @@ Background (H14 / M16): the Python SDK historically used `if x else None`
 or `x or []` / `x or {}` on parameters that are typed `Optional[list[...]]`
 or `Optional[dict[...]]`. That collapses an explicit empty collection to
 `None`, which destroys the semantic distinction the spec preserves at the
-FFI boundary (e.g. an empty `trusted_dids` list is "auto-reject everyone",
-not "no policy"). The correct form is always `if x is not None`.
+FFI boundary (e.g. an empty `consequence_rules` list is "explicitly no
+rules", not "use the default"). The correct form is always
+`if x is not None`.
 
 This check parses every `bindings/python/scp_sdk/**/*.py` file with the
 `ast` module and flags:
@@ -164,8 +165,8 @@ def main() -> int:
             print(f"  {v}", file=sys.stderr)
         print(
             f"\n{len(all_violations)} violation(s). "
-            "See the `evaluate_invitation` method in bindings/python/scp_sdk/scp.py "
-            "for the canonical fix.",
+            "See the Optional-collection forwarding in bindings/python/scp_sdk/trust.py "
+            "(`json.dumps(x) if x is not None else ...`) for the canonical fix.",
             file=sys.stderr,
         )
         return 1

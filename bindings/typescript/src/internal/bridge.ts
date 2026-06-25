@@ -545,7 +545,6 @@ export interface Bridge {
     identityDid: string,
     policyJson: string | null,
     spendingJson: string | null,
-    trustedDidsJson: string | null,
   ): string | { decision: string } | Promise<string | { decision: string }>;
 
   // MetadataRecord inspection (§5.7.2, #615)

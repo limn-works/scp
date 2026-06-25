@@ -2388,7 +2388,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `evaluate_invitation`.
      */
-    func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws  -> String
+    func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?) throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `event_log_checkpoint`.
@@ -4429,15 +4429,14 @@ open func economyVerifyPaymentReceipts(receiptsJson: String)async throws  -> Str
     /**
      * Per-instance equivalent of the free-function `evaluate_invitation`.
      */
-open func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String])throws  -> String  {
+open func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_evaluate_invitation(self.uniffiClonePointer(),
         FfiConverterString.lower(paramsJson),
         FfiConverterString.lower(inviterDid),
         FfiConverterString.lower(identityDid),
         FfiConverterOptionString.lower(policyJson),
-        FfiConverterOptionString.lower(spendingJson),
-        FfiConverterSequenceString.lower(trustedDids),$0
+        FfiConverterOptionString.lower(spendingJson),$0
     )
 })
 }
@@ -15508,7 +15507,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 59132) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {

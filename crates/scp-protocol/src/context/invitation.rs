@@ -322,17 +322,18 @@ mod tests {
         }
     }
 
-    /// A trust oracle that checks the explicit DID list.
-    struct ExplicitTrust {
-        trusted_dids: Vec<DID>,
-    }
+    /// A trust oracle that honors the policy's `KnownDid` allowlist.
+    ///
+    /// Trust is allowlist-only (§5.12.2): the allowlist travels inside the
+    /// `TrustRequirement::KnownDid(dids)` variant of the policy itself, so the
+    /// oracle carries no external state and simply checks membership of the
+    /// inviter in that embedded list. This mirrors the production FFI oracles.
+    struct KnownDidTrust;
 
-    impl TrustOracle for ExplicitTrust {
+    impl TrustOracle for KnownDidTrust {
         fn satisfies_trust(&self, inviter: &DID, requirement: &TrustRequirement) -> bool {
             match requirement {
-                TrustRequirement::Any => true,
-                TrustRequirement::SharedContext => self.trusted_dids.contains(inviter),
-                TrustRequirement::Explicit(dids) => dids.contains(inviter),
+                TrustRequirement::KnownDid(dids) => dids.contains(inviter),
             }
         }
     }
@@ -360,7 +361,12 @@ mod tests {
     fn default_policy() -> AutoAcceptPolicy {
         AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            // Allowlist the inviter used throughout these tests (`bob()`). Tests
+            // that assert auto-accept pair this with `AlwaysTrust(true)`; tests
+            // that assert prompt pair it with `AlwaysTrust(false)`. The oracle
+            // controls the trust outcome, so the allowlist contents are inert
+            // here — they exist only to keep the policy self-consistent.
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         }
@@ -644,7 +650,7 @@ mod tests {
         };
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: None,
             rate_limit: None,
         };
@@ -726,16 +732,14 @@ mod tests {
         let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Explicit(vec![alice()]),
+            from: TrustRequirement::KnownDid(vec![alice()]),
             max_ttl: Some(Duration::from_mins(10)),
             rate_limit: None,
         };
-        let oracle = ExplicitTrust {
-            trusted_dids: vec![alice()],
-        };
+        let oracle = KnownDidTrust;
         let mut tracker = RateLimitTracker::new();
 
-        // Bob invites, but only Alice is in the explicit list.
+        // Bob invites, but only Alice is in the policy's `KnownDid` allowlist.
         let result = evaluate_invitation(
             &params,
             &bob(),
@@ -765,7 +769,7 @@ mod tests {
         let params = bilateral_ephemeral_params(Duration::from_hours(1)); // 1 hour
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: Some(Duration::from_mins(10)), // Cap at 10 minutes
             rate_limit: None,
         };
@@ -788,7 +792,7 @@ mod tests {
         let params = bilateral_ephemeral_params(Duration::from_mins(5)); // 5 minutes
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: Some(Duration::from_mins(10)), // Cap at 10 minutes
             rate_limit: None,
         };
@@ -811,7 +815,7 @@ mod tests {
         let params = bilateral_ephemeral_params(Duration::from_hours(24)); // 24 hours
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: None, // No cap
             rate_limit: None,
         };
@@ -834,7 +838,7 @@ mod tests {
         let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: None,
             rate_limit: Some(RateLimit {
                 max_count: 2,
@@ -962,7 +966,7 @@ mod tests {
         params.ttl = Some(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::Coordination,
-            from: TrustRequirement::Any,
+            from: TrustRequirement::KnownDid(vec![bob()]),
             max_ttl: None,
             rate_limit: None,
         };

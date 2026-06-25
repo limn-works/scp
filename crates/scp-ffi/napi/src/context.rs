@@ -4354,9 +4354,11 @@ pub struct NapiEvaluationResult {
 }
 
 /// FFI-concrete implementation of `TrustOracle`.
-struct NapiBridgeTrustOracle {
-    trusted_dids: Vec<scp_identity::DID>,
-}
+///
+/// Trust is allowlist-only (§5.12.2): the allowlist travels inside the policy's
+/// `TrustRequirement::KnownDid(dids)` variant, so the oracle carries no external
+/// state and checks membership of the inviter in that embedded list.
+struct NapiBridgeTrustOracle;
 
 impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
     fn satisfies_trust(
@@ -4365,11 +4367,7 @@ impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
-            scp_core::context::policy::TrustRequirement::Any => true,
-            scp_core::context::policy::TrustRequirement::SharedContext => {
-                self.trusted_dids.contains(inviter)
-            }
-            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+            scp_core::context::policy::TrustRequirement::KnownDid(dids) => dids.contains(inviter),
         }
     }
 }
@@ -4382,7 +4380,6 @@ pub(crate) fn evaluate_invitation_on(
     identity_did: String,
     policy_json: Option<String>,
     spending_json: Option<String>,
-    trusted_dids_json: Option<String>,
 ) -> napi::Result<NapiEvaluationResult> {
     use scp_core::context::invitation::{
         EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
@@ -4430,23 +4427,7 @@ pub(crate) fn evaluate_invitation_on(
         None => None,
     };
 
-    let trusted_dids: Vec<scp_identity::DID> = match trusted_dids_json {
-        Some(ref json) => {
-            let did_strings: Vec<String> = serde_json::from_str(json).map_err(|e| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!("failed to parse trusted DIDs JSON: {e}"),
-                    code: codes::VALID_7010.to_owned(),
-                })
-            })?;
-            did_strings
-                .into_iter()
-                .map(scp_identity::DID::from)
-                .collect()
-        }
-        None => Vec::new(),
-    };
-
-    let oracle = NapiBridgeTrustOracle { trusted_dids };
+    let oracle = NapiBridgeTrustOracle;
     let inviter = scp_identity::DID::from(inviter_did.as_str());
 
     let decision = bi.core.with_rate_limit_tracker(&identity_did, |tracker| {
@@ -5146,7 +5127,6 @@ mod tests {
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
             None,
             Some(spending_json),
-            None,
         );
 
         // Free context: pipeline reaches prompt_agent regardless of spending.
@@ -5167,7 +5147,6 @@ mod tests {
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
             None,
             Some("not valid json".to_owned()),
-            None,
         );
 
         assert!(result.is_err(), "invalid spending JSON should be rejected");
@@ -5184,7 +5163,6 @@ mod tests {
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
-            None,
             None,
             None,
         );

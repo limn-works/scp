@@ -1564,14 +1564,11 @@ fn py_check_scoped_capability(
 
 /// FFI-concrete implementation of [`scp_core::context::invitation::TrustOracle`].
 ///
-/// At the FFI boundary, we cannot accept a trait object. Instead, the caller
-/// provides a list of trusted DIDs. The bridge implements `TrustOracle` by
-/// checking membership in this list.
-struct FfiBridgeTrustOracle {
-    /// DIDs that the inviter is checked against for `SharedContext` and
-    /// `Explicit` trust requirements.
-    trusted_dids: Vec<scp_identity::DID>,
-}
+/// At the FFI boundary, we cannot accept a trait object. Trust is allowlist-only
+/// (§5.12.2): the allowlist travels inside the policy's
+/// `TrustRequirement::KnownDid(dids)` variant, so the oracle carries no external
+/// state and checks membership of the inviter in that embedded list.
+struct FfiBridgeTrustOracle;
 
 impl scp_core::context::invitation::TrustOracle for FfiBridgeTrustOracle {
     fn satisfies_trust(
@@ -1580,11 +1577,7 @@ impl scp_core::context::invitation::TrustOracle for FfiBridgeTrustOracle {
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
-            scp_core::context::policy::TrustRequirement::Any => true,
-            scp_core::context::policy::TrustRequirement::SharedContext => {
-                self.trusted_dids.contains(inviter)
-            }
-            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+            scp_core::context::policy::TrustRequirement::KnownDid(dids) => dids.contains(inviter),
         }
     }
 }
@@ -5099,9 +5092,10 @@ impl crate::scp::PyScp {
     ///   the pipeline always falls through to prompt-agent.
     /// * `spending_json` -- Optional JSON-serialized `SpendingContext`. Required
     ///   when the context has an economic policy requiring payment.
-    /// * `trusted_dids_json` -- JSON array of DID strings representing identities
-    ///   trusted by the local identity (e.g., shared-context peers). Used for
-    ///   `SharedContext` trust requirement evaluation.
+    ///
+    /// The `KnownDid` allowlist (the sole auto-accept trigger) travels inside the
+    /// `policy_json`'s `TrustRequirement::KnownDid(dids)` variant; there is no
+    /// separate trusted-DID parameter.
     ///
     /// # Returns
     ///
@@ -5121,7 +5115,7 @@ impl crate::scp::PyScp {
     /// `.docs/specs/19-economic-governance.md` sections 19.3, 19.14.
     #[pyo3(
         name = "evaluate_invitation",
-        signature = (params_json, inviter_did, identity_did, policy_json=None, spending_json=None, trusted_dids_json=None)
+        signature = (params_json, inviter_did, identity_did, policy_json=None, spending_json=None)
     )]
     pub fn evaluate_invitation(
         &self,
@@ -5130,7 +5124,6 @@ impl crate::scp::PyScp {
         identity_did: &str,
         policy_json: Option<&str>,
         spending_json: Option<&str>,
-        trusted_dids_json: Option<&str>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         use scp_core::context::invitation::{
@@ -5166,22 +5159,7 @@ impl crate::scp::PyScp {
             None => None,
         };
 
-        let trusted_dids: Vec<scp_identity::DID> = match trusted_dids_json {
-            Some(json) => {
-                let did_strings: Vec<String> = serde_json::from_str(json).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "failed to parse trusted DIDs JSON: {e}"
-                    ))
-                })?;
-                did_strings
-                    .into_iter()
-                    .map(scp_identity::DID::from)
-                    .collect()
-            }
-            None => Vec::new(),
-        };
-
-        let oracle = FfiBridgeTrustOracle { trusted_dids };
+        let oracle = FfiBridgeTrustOracle;
         let inviter = scp_identity::DID::from(inviter_did);
 
         // Route the rate-limit tracker through this instance's core
@@ -5692,7 +5670,6 @@ mod tests {
         identity_did: &str,
         policy_json: Option<&str>,
         spending_json: Option<&str>,
-        trusted_dids_json: Option<&str>,
     ) -> PyResult<String> {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         scp.evaluate_invitation(
@@ -5701,7 +5678,6 @@ mod tests {
             identity_did,
             policy_json,
             spending_json,
-            trusted_dids_json,
         )
     }
 
@@ -6460,7 +6436,6 @@ mod tests {
                 "did:dht:z6MkLocal",
                 None,
                 None,
-                None,
             );
             assert!(result.is_err());
         });
@@ -6474,7 +6449,6 @@ mod tests {
                 "not valid json",
                 "did:dht:z6MkBob",
                 "did:dht:z6MkLocal",
-                None,
                 None,
                 None,
             );
@@ -6493,7 +6467,6 @@ mod tests {
                 &params_json,
                 "did:dht:z6MkBob",
                 "did:dht:z6MkLocal",
-                None,
                 None,
                 None,
             );
@@ -6827,7 +6800,6 @@ mod tests {
                 "did:dht:z6MkLocal",
                 None,
                 Some(spending_json),
-                None,
             );
 
             // Free contexts do not require spending, so the pipeline should
@@ -6852,7 +6824,6 @@ mod tests {
                 "did:dht:z6MkLocal",
                 None,
                 Some("not valid json"),
-                None,
             );
 
             assert!(result.is_err(), "invalid spending JSON should be rejected");
@@ -6872,7 +6843,6 @@ mod tests {
                 "did:dht:z6MkLocal",
                 None,
                 None, // No spending context
-                None,
             );
 
             match &result {

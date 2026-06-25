@@ -726,9 +726,10 @@ public nonisolated struct InvitationEvaluationResult: Sendable {
 ///   - paramsJson: JSON-serialized ``ContextParams`` from the invitation.
 ///   - inviterDid: DID string of the identity sending the invitation.
 ///   - identityDid: DID string of the local identity receiving the invitation.
-///   - policyJson: Optional JSON-serialized ``AutoAcceptPolicy``.
+///   - policyJson: Optional JSON-serialized ``AutoAcceptPolicy``. The
+///     ``known_did`` allowlist (the sole auto-accept trigger, §5.12.2) travels
+///     inside this policy's ``TrustRequirement.knownDid`` variant.
 ///   - spendingJson: Optional JSON-serialized ``SpendingContext``.
-///   - trustedDids: Optional array of trusted DID strings.
 /// - Returns: An ``InvitationEvaluationResult`` with the pipeline decision.
 /// - Throws: ``ScpError`` if evaluation fails.
 public func evaluateContextInvitation(
@@ -737,16 +738,14 @@ public func evaluateContextInvitation(
     inviterDid: String,
     identityDid: String,
     policyJson: String? = nil,
-    spendingJson: String? = nil,
-    trustedDids: [String] = []
+    spendingJson: String? = nil
 ) throws -> InvitationEvaluationResult {
     let decision = try scp.evaluateInvitation(
         paramsJson: paramsJson,
         inviterDid: inviterDid,
         identityDid: identityDid,
         policyJson: policyJson,
-        spendingJson: spendingJson,
-        trustedDids: trustedDids
+        spendingJson: spendingJson
     )
     return InvitationEvaluationResult(decision: decision)
 }

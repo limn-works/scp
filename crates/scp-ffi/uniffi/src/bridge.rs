@@ -7580,9 +7580,11 @@ pub fn sandbox_check_capability(
 // ---------------------------------------------------------------------------
 
 /// FFI-concrete implementation of `TrustOracle`.
-struct UniffiBridgeTrustOracle {
-    trusted_dids: Vec<scp_identity::DID>,
-}
+///
+/// Trust is allowlist-only (§5.12.2): the allowlist travels inside the policy's
+/// `TrustRequirement::KnownDid(dids)` variant, so the oracle carries no external
+/// state and checks membership of the inviter in that embedded list.
+struct UniffiBridgeTrustOracle;
 
 impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
     fn satisfies_trust(
@@ -7591,11 +7593,7 @@ impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
-            scp_core::context::policy::TrustRequirement::Any => true,
-            scp_core::context::policy::TrustRequirement::SharedContext => {
-                self.trusted_dids.contains(inviter)
-            }
-            scp_core::context::policy::TrustRequirement::Explicit(dids) => dids.contains(inviter),
+            scp_core::context::policy::TrustRequirement::KnownDid(dids) => dids.contains(inviter),
         }
     }
 }
@@ -16469,7 +16467,6 @@ impl Scp {
         identity_did: String,
         policy_json: Option<String>,
         spending_json: Option<String>,
-        trusted_dids: Vec<String>,
     ) -> Result<String, ScpError> {
         use scp_core::context::invitation::{
             EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
@@ -16509,13 +16506,7 @@ impl Scp {
             None => None,
         };
 
-        let oracle_dids: Vec<scp_identity::DID> = trusted_dids
-            .into_iter()
-            .map(scp_identity::DID::from)
-            .collect();
-        let oracle = UniffiBridgeTrustOracle {
-            trusted_dids: oracle_dids,
-        };
+        let oracle = UniffiBridgeTrustOracle;
         let inviter = scp_identity::DID::from(inviter_did.as_str());
 
         let decision = self
@@ -18355,7 +18346,6 @@ mod tests {
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
             None,
             Some(spending_json),
-            vec![],
         );
 
         assert!(
@@ -18376,7 +18366,6 @@ mod tests {
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
             None,
             Some("not valid json".to_owned()),
-            vec![],
         );
 
         assert!(result.is_err(), "invalid spending JSON should be rejected");
@@ -18393,7 +18382,6 @@ mod tests {
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
             None,
             None,
-            vec![],
         );
 
         assert!(

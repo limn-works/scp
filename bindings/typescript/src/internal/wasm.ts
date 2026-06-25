@@ -520,7 +520,6 @@ interface WasmModule {
     identityDid: string,
     policyJson: string | null,
     spendingJson: string | null,
-    trustedDidsJson: string | null,
   ) => string;
   // MetadataRecord (§5.7.2)
   metadata_record_to_json: (
@@ -2012,7 +2011,6 @@ export function createWasmBridge(): Bridge {
       identityDid: string,
       policyJson: string | null,
       spendingJson: string | null,
-      trustedDidsJson: string | null,
     ) {
       const wasm = getWasm();
       return wasm.evaluate_invitation(
@@ -2021,7 +2019,6 @@ export function createWasmBridge(): Bridge {
         identityDid,
         policyJson,
         spendingJson,
-        trustedDidsJson,
       );
     },
 

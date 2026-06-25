@@ -836,15 +836,19 @@ class SCP internal constructor(
     suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String =
         inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
 
-    /** Forwards to [NativeScp.evaluateInvitation] on [inner]. */
-    @Suppress("LongParameterList")
+    /**
+     * Forwards to [NativeScp.evaluateInvitation] on [inner].
+     *
+     * The `known_did` allowlist (the sole auto-accept trigger, §5.12.2) travels
+     * inside [policyJson] -- the policy's `TrustRequirement` `KnownDid` variant.
+     * There is no separate trusted-DID parameter.
+     */
     fun evaluateInvitation(
         paramsJson: String,
         inviterDid: String,
         identityDid: String,
         policyJson: String?,
         spendingJson: String?,
-        trustedDids: List<String>,
     ): String =
         inner.evaluateInvitation(
             paramsJson = paramsJson,
@@ -852,7 +856,6 @@ class SCP internal constructor(
             identityDid = identityDid,
             policyJson = policyJson,
             spendingJson = spendingJson,
-            trustedDids = trustedDids,
         )
 
     /** Forwards to [NativeScp.eventLogCheckpoint] on [inner]. */

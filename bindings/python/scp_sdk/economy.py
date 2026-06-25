@@ -72,7 +72,7 @@ def estimate_cost(
     # `is not None` because there is no semantic difference at the boundary;
     # both branches produce the same Rust input. Do NOT generalise this
     # pattern -- callers operating on Optional collections at FFI boundaries
-    # MUST use `is not None` (see context.py:trusted_dids and trust.py).
+    # MUST use `is not None` (see trust.py).
     m = metrics if metrics is not None else {}
     return bridge.economy_estimate_cost(policy_json, action_type, m)
 
