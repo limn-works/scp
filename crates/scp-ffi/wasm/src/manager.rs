@@ -10377,6 +10377,152 @@ mod tests {
         );
     }
 
+    /// A member who is present in `role_state.members` but has NO entry in
+    /// `member_sequence_numbers` (the post-`import_context` shape: `import`
+    /// restores `member_sequence_numbers` verbatim and INDEPENDENTLY of
+    /// `role_state.members`, so a member who was added but never sent has no
+    /// seq entry) must, on a FAILED first-ever send, end up with NO seq entry
+    /// again — not a left-behind `Some(0)`.
+    ///
+    /// This exercises the `!seq_was_present` rollback branch (the `or_insert(0)`
+    /// creates a fresh `0` entry to reserve the send; on failure the rollback
+    /// `saturating_sub`s it back to `0` and then REMOVES it because it was
+    /// created solely for this send). The `None`-vs-`Some(0)` distinction is
+    /// the mutation guard: deleting the `remove` line would leave `Some(0)`.
+    ///
+    /// The send fails at the `CRYPTO_4001` base64-decode step, which runs
+    /// BEFORE `encrypt_message`, so the sender does not need a valid MLS leaf —
+    /// crypto is attached only so the fallible encrypt closure (and thus the
+    /// reserve/rollback path) actually runs.
+    #[test]
+    fn send_message_first_send_failure_removes_unseeded_entry_wasm() {
+        let context_id = "ctx-send-unseeded-rollback";
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        {
+            let ctx = mgr.contexts.get_mut(context_id).unwrap();
+            // Attach real MLS crypto so the encrypt closure (reserve -> rollback)
+            // runs. The creator created the group; the member only needs the
+            // decode step, which fails first.
+            ctx.crypto = Some(
+                crate::crypto::WasmCryptoState::new_for_context(creator)
+                    .expect("MLS group creation must succeed"),
+            );
+            // Add a write-granting member (so the role gate passes), then strip
+            // its seq entry to reproduce the post-import "in members, no seq
+            // entry" shape.
+            ctx.test_insert_member(member, "member");
+            ctx.member_sequence_numbers.remove(member);
+        }
+
+        // Precondition: the member is in role_state.members but has NO seq entry.
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(member),
+            None,
+            "precondition: an added-but-never-sent member must have no seq entry"
+        );
+
+        // First-ever send fails at the base64 decode step (CRYPTO_4001).
+        let err = mgr
+            .send_message(context_id, member, "@@@not-valid-base64@@@", None)
+            .expect_err("an invalid-base64 payload must fail the encrypt path");
+        match err {
+            ScpWasmError::Crypto { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::CRYPTO_4001,
+                    "invalid base64 must surface the decode error class"
+                );
+            }
+            other => panic!("expected Crypto error, got: {other:?}"),
+        }
+
+        // The fresh `0` entry created by `or_insert(0)` was REMOVED by the
+        // rollback — the map is back to its pre-send shape (no entry), NOT
+        // left at `Some(0)`. MUTATION GUARD: deleting the `remove` line in the
+        // rollback would make this read `Some(0)` and the test would go RED.
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(member),
+            None,
+            "a FAILED first-ever send must leave NO seq entry (the reserve-only \
+             entry is removed on rollback), not a left-behind Some(0)"
+        );
+    }
+
+    /// HONEST KNOWN-GAP MARKER (deliberately `#[ignore]`d — do NOT remove the
+    /// attribute to make it "pass").
+    ///
+    /// The WASM per-member message sequence is 0-based: the sidecar
+    /// POST-increments from base `0` (`let seq = *entry; *entry += 1;`), so the
+    /// FIRST message's emitted `sequence_number` is `0` and the counter then
+    /// reads `Some(1)`. Native's `MembershipState::next_sequence_number`
+    /// PRE-increments (`info.sequence_number += 1; info.sequence_number`), so
+    /// the first message's sequence is `1`. This is a real off-by-one in the
+    /// emitted per-author `sequence_number`, not merely an internal base
+    /// discrepancy, and the direction must be reconciled when WASM adopts the
+    /// shared `MembershipState`. The per-author byte values are themselves out
+    /// of cross-family export byte-parity scope per ADR-050 (each author mints
+    /// its own sequence with no global order), but the increment direction must
+    /// converge — hence this tracking marker rather than a silent comment.
+    ///
+    /// The body asserts the CURRENT WASM behavior (first send emits sequence
+    /// `0`; counter then reads `Some(1)`) so that when WASM adopts the shared
+    /// `MembershipState`, this test flips RED and forces a deliberate update.
+    #[test]
+    #[ignore = "WASM per-member message sequence is 0-based (post-increment); native \
+                MembershipState::next_sequence_number is 1-based (pre-increment). \
+                Reconcile when WASM adopts the shared MembershipState. Out of \
+                cross-family export byte-parity scope per ADR-050."]
+    fn wasm_per_member_sequence_base_diverges_from_native_pending() {
+        let context_id = "ctx-seq-base-divergence";
+        let creator = "did:dht:zcreator";
+        let member = "did:dht:zmember";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        {
+            let ctx = mgr.contexts.get_mut(context_id).unwrap();
+            // Real MLS crypto so the encrypt path runs and a MessageSent leaf is
+            // emitted to the receive buffer.
+            ctx.crypto = Some(
+                crate::crypto::WasmCryptoState::new_for_context(creator)
+                    .expect("MLS group creation must succeed"),
+            );
+            ctx.test_insert_member(member, "member");
+        }
+
+        // One successful send by the creator (group creator, can encrypt).
+        mgr.send_message(context_id, creator, "aGVsbG8=", None)
+            .expect("a valid encrypted send must succeed");
+
+        // CURRENT WASM behavior: the first emitted MessageSent carries
+        // sequence_number 0 (0-based, post-increment). Native would emit 1.
+        let first_seq = mgr
+            .drain_events(context_id)
+            .into_iter()
+            .find_map(|e| match e {
+                ContextEvent::MessageSent {
+                    sender_did,
+                    sequence_number,
+                    ..
+                } if sender_did.0 == creator => Some(sequence_number),
+                _ => None,
+            })
+            .expect("the successful send must emit a MessageSent buffer event");
+        assert_eq!(
+            first_seq, 0,
+            "CURRENT WASM behavior: the first per-author message sequence is 0 \
+             (post-increment from base 0). Native pre-increments to 1 — when \
+             WASM adopts the shared MembershipState this assertion must flip."
+        );
+
+        // And the counter now reads Some(1) (the post-increment landed).
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(creator),
+            Some(1),
+            "after the first send the 0-based counter reads Some(1)"
+        );
+    }
+
     /// A write-granting member whose `messages:write` was suspended via
     /// `SuspendAccess` CANNOT `send_message`: the suspension-aware positive
     /// gate rejects with the distinct "suspended" message. Proves the gate
