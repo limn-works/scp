@@ -16,9 +16,9 @@ The common failure mode was **counting contexts instead of testing atomicity**, 
 
 **Lesson**: Three durable takeaways.
 
-1. **"Touches two contexts" is not a saga criterion — a *harmful partial commit* is.** If either side's effect is benign on loss, or one side is a unilateral write the other never blocks on, sequence it. Most "cross-context" features are sequenceable; the saga is the rare exception that needs both-or-neither atomicity across contexts sharing no sync protocol.
+1. **"Touches two contexts" is not a saga criterion — a *harmful partial commit* is** (guard (a)). If either side's effect is benign on loss, or one side is a unilateral write the other never blocks on, sequence it. Most "cross-context" features are sequenceable; the saga is the rare exception.
 
-2. **Content never flows *through* an intermediate context.** Encryption-as-access-control means a context's content is readable only by an entity that independently joins it. Any design where context X relays context Y's content to X's own members requires X to decrypt-then-re-encrypt — a §5.11A.6 violation. Fan-out/scale-out is always a transport-layer re-serving of public ciphertext, never a context-level "hosting" relationship.
+2. **Content never flows *through* an intermediate context** (guard (b)). A context's content is readable only by an entity that independently joins it; any "X relays Y's content to X's members" design requires decrypt-then-re-encrypt (§5.11A.6 violation). Fan-out/scale-out is transport-layer re-serving of public ciphertext, never a context-level "hosting" relationship.
 
 3. **As-built scaffolding is not justification.** A landed `SagaInput` variant, a spec section, and a registered error band describe a decision; they do not validate it. When 3 of 4 arms of an abstraction turn out to be category errors, the defect is in the admission criteria, not the individual arms — write the guard, then re-test every surviving and future member against it.
 

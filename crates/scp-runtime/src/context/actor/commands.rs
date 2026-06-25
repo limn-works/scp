@@ -1568,9 +1568,7 @@ pub struct BroadcastBlockPayload {
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
-/// method on [`crate::context::broadcast_helpers`] that is NOT the
-/// saga-wired broadcast-hosting handshake. The handshake is spec-gapped
-/// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+/// method on [`crate::context::broadcast_helpers`].
 ///
 /// # Key-custody handoff
 ///
@@ -2195,9 +2193,11 @@ pub enum TtlCloseCommand {
 /// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 /// — that method is the cross-context tool-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
-/// cross the actor mailbox. The cross-context saga path is spec-gapped
-/// regardless; see
-/// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+/// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
+/// reached via
+/// [`Supervisor::start_cross_context_tool_invocation_saga`]); what remains
+/// deferred is its FFI export, pending per-participant-set saga gating
+/// (ADR-049 §3a), and the actor-mailbox path for this method.
 ///
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
@@ -2294,9 +2294,12 @@ pub enum ToolsCommand {
     },
 
     /// Saga-initiator path for cross-context tool invocation. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the cross-context
-    /// invoke transport protocol (caller→target context forwarding,
-    /// UCAN proof plumbing, receipt relay) is spec-gapped. See
+    /// [`ContextError::NotImplemented`] in commit 11 — the saga itself is
+    /// specified (§6.2.4: caller→target forwarding, UCAN proof plumbing,
+    /// receipt relay) and wired via
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`]; deferred
+    /// here is this variant's actor-mailbox path, pending the saga's FFI
+    /// export (per-participant-set gating, ADR-049 §3a). See
     /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
     InitiateCrossContextToolInvocation {
         /// Calling context ID (32-byte hash).

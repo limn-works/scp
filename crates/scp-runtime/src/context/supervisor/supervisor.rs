@@ -250,12 +250,16 @@ pub enum SagaInput {
     },
     /// Test-only saga whose Prepare phases succeed and whose Commit phase
     /// ALWAYS fails, so the FSM runs all the way to Committing, exhausts the
-    /// commit-retry budget, and lands in `NeedsRepair`. This is the ONLY way
-    /// to drive `start_saga` to a real `NeedsRepair` terminal while the three
-    /// production saga variants' Prepare/Commit dispatch is still spec-gapped
-    /// (Phase 2C) — it lets the gating tests assert that `NeedsRepair`
-    /// RELEASES the participant-context-set reservation (ADR-049 §3a, spec
-    /// §5.15.4). Gated behind `test`/`testing` so a production FFI build can
+    /// commit-retry budget, and lands in `NeedsRepair`. The sole production
+    /// saga (`CrossContextToolInvocation`) reaches its real Prepare/Commit
+    /// dispatch only via
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`]; driven through
+    /// the generic `start_saga`, an executor-less input aborts at Prepare-A
+    /// with `InvalidState` (no executor) and never reaches Committing. So this
+    /// variant remains the ONLY way to drive `start_saga` to a real
+    /// `NeedsRepair` terminal — it lets the gating tests assert that
+    /// `NeedsRepair` RELEASES the participant-context-set reservation
+    /// (ADR-049 §3a, spec §5.15.4). Gated behind `test`/`testing` so a production FFI build can
     /// never construct or dispatch it.
     #[cfg(any(test, feature = "testing"))]
     TestForceNeedsRepair {
@@ -5291,7 +5295,9 @@ impl Supervisor {
     /// a panic-unwind through `run_saga_fsm`, so a stuck saga never wedges
     /// unrelated, disjoint sagas. `xctx` carries the cross-context executor +
     /// phase-data when the saga is a wired `CrossContextToolInvocation`; it is
-    /// `None` for the spec-gapped / test inputs.
+    /// `None` for the executor-less test inputs (the `TestForceNeedsRepair`
+    /// variant, or a `CrossContextToolInvocation` driven through the generic
+    /// `start_saga` without an executor).
     async fn run_saga(
         &self,
         input: SagaInput,
@@ -5438,7 +5444,7 @@ impl Supervisor {
 
     /// Test-only: deterministically reserve a saga's participant context set
     /// and return the RAII reservation, so a test can hold a saga's slots
-    /// "in flight" without racing the (instantaneous, spec-gapped) FSM. This
+    /// "in flight" without racing the (instantaneous, executor-less test) FSM. This
     /// exercises the SAME `try_reserve_context_set` critical section that
     /// [`Self::start_saga`] uses, so the overlap / disjoint / release
     /// semantics under test are the production ones, not a parallel mock.
@@ -6310,7 +6316,7 @@ impl Supervisor {
     /// abort sequencing. `xctx` threads the per-phase data hand-off for a
     /// `CrossContextToolInvocation` saga (spec §6.2.4): Prepare-A's reservation,
     /// Prepare-B's recorded provenance, and Commit-B's captured receipt/output
-    /// flow A→B→Commit through it. `None` for the spec-gapped / test inputs.
+    /// flow A→B→Commit through it. `None` for the executor-less test inputs.
     async fn run_saga_fsm(
         &self,
         saga_id: SagaId,
@@ -6323,8 +6329,11 @@ impl Supervisor {
         self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
             .await?;
 
-        // 2. PreparingA — dispatch to the caller actor (cross-context) or
-        //    NotImplemented (spec-gapped). On failure the FSM transitions
+        // 2. PreparingA — dispatch to the caller actor (a wired
+        //    cross-context saga), succeed trivially (the `TestForceNeedsRepair`
+        //    test variant), or fail `InvalidState` (a `CrossContextToolInvocation`
+        //    driven through `start_saga` without an executor). On failure the
+        //    FSM transitions
         //    directly to Aborted, releasing any side that prepared, and
         //    surfaces the typed error. Every phase transition is journaled so
         //    crash-recovery tests see the right states.
@@ -6435,7 +6444,7 @@ impl Supervisor {
                 // sides MUST emit a signed `CrossContextDivergenceMarker` (into
                 // each available log, or the supervisor-level repair journal if
                 // a side is unreachable) so a one-sided commit is durably
-                // auditable. Cross-context only; the test / spec-gapped inputs
+                // auditable. Cross-context only; the executor-less test inputs
                 // carry no `xctx`. Marks the ctx so `run_saga`'s tail leaves the
                 // escrow RESERVED (NOT auto-voided) for operator repair.
                 if let Some(ctx) = xctx {
@@ -7397,7 +7406,7 @@ impl Supervisor {
     /// in (B re-derives them at Prepare-B, and the PreparingB-state replay arm
     /// only ever ABORTS — it never re-drives a Commit, so it does not depend on
     /// the recorded values). Returns `None` for a non-`CrossContextToolInvocation`
-    /// input (the test / spec-gapped variants carry no `xctx`).
+    /// input (the test-only `TestForceNeedsRepair` variant carries no `xctx`).
     fn xctx_prepared_evidence_bytes(
         input: &SagaInput,
         ctx: &CrossContextSagaCtx<'_>,
@@ -7480,7 +7489,7 @@ impl Supervisor {
         // economy from the durable `CallerReservationRecord`.
         let caller_reversal = match xctx {
             Some(ctx) => self.abort_xctx_participants(saga_id, ctx).await,
-            // Non-cross-context (spec-gapped / test) saga: no caller-side local
+            // Non-cross-context (test-only) saga: no caller-side local
             // economy to reverse, so the terminal marker is always safe.
             None => CallerAbortReversal::SettledOrAbsent,
         };
