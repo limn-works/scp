@@ -2070,9 +2070,6 @@ mod tests {
                 assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 2);
             }
-            SagaPreparedState::BroadcastHostingHandshake(_) => {
-                panic!("wrong saga variant after restore")
-            }
         }
         // xctx_nonce_dedup: the recorded nonce + TTL survive (a fresh replay of
         // the same nonce within the TTL is still detected).

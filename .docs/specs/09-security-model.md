@@ -284,7 +284,7 @@ The full list of sync-persisted operations (which is a superset of the downward-
 
 The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (unrevoked proof tokens that would authorize action on their own; any future evidence that carries usable secret material) are secret-bearing; plan-level metadata and public identifiers are not.
 
-**No saga is secret-bearing today.** **Both defined sagas** — cross-context tool invocation (§6.2.4) and broadcast hosting handshake (§5.14.13) — are public-metadata-only: their journals and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token; the broadcast key is delivered out-of-band via HPKE after Commit). (Standing-pair creation is **not** a saga and journals nothing — it is single-context async creation, §5.15.8.) This section is therefore the **contract any *future* secret-bearing saga MUST satisfy**, currently with **no instance**. The requirements below are normative for any such future saga.
+**No saga is secret-bearing today.** **The single defined saga** — cross-context tool invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token). (Standing-pair creation is **not** a saga and journals nothing — it is single-context async creation, §5.15.8.) This section is therefore the **contract any *future* secret-bearing saga MUST satisfy**, currently with **no instance**. The requirements below are normative for any such future saga.
 
 **Commitment construction.** Secret-bearing sagas MUST journal only a commitment — never the bearer bytes. The commitment is constructed as:
 
@@ -1627,8 +1627,6 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
 | `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
-| `"SCP-BCAST-HOST-REQ-V1:"` | Broadcast hosting request signing | §5.14.13 |
-| `"SCP-BCAST-HOST-GRANT-V1:"` | Broadcast hosting grant signing | §5.14.13 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels

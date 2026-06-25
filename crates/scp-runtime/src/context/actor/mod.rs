@@ -1430,10 +1430,6 @@ impl ContextActor {
                 reply,
                 "broadcast::release_broadcast_reservation (use Supervisor::dispatch_broadcast_command_with_custody)",
             ),
-            BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::initiate_broadcast_hosting_handshake (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
-            ),
         }
     }
 }

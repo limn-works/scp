@@ -3491,11 +3491,6 @@ mod tests {
                 assert_eq!(p.recorded_chain_depth, 3);
                 assert_eq!(p.recorded_nonce, [0x42; 16]);
             }
-            // `SagaPreparedState` is non-Debug (§9.4.3 barrier), so name the
-            // wrong arm without formatting it.
-            SagaPreparedState::BroadcastHostingHandshake(_) => {
-                panic!("wrong staged variant — expected CrossContextToolInvocation")
-            }
         }
     }
 
@@ -5124,9 +5119,7 @@ mod tests {
             .saga_pending
             .get(&saga)
             .expect("slot restored");
-        let SagaPreparedState::CrossContextToolInvocation(p) = restored else {
-            panic!("restored slot must be a cross-context prepared");
-        };
+        let SagaPreparedState::CrossContextToolInvocation(p) = restored;
         assert_eq!(
             p.ucan_proof_id, "gated-proof-index-42",
             "the restored slot must preserve ucan_proof_id (no lossy reconstruction)"

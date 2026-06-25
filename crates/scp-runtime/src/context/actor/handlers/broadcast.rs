@@ -30,17 +30,6 @@
 //! [`BroadcastCommand::ReleaseBroadcastReservation`]. Each mailbox phase
 //! holds `&mut PerContextState` only briefly, and concurrent publishes
 //! each reserve a distinct sequence.
-//!
-//! # SAGA WIRING DEFERRED — see
-//! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-//!
-//! The `InitiateBroadcastHostingHandshake` saga-initiator variant
-//! returns [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! because broadcast hosting handshake protocol is spec-gapped — the
-//! spec does not yet define the subscriber→host key-exchange frames,
-//! host-config negotiation, or §5.14.2 step-4 transport. Until those
-//! land, the saga-initiator path returns
-//! `ContextError::NotImplemented`.
 
 use std::time::Duration;
 
@@ -146,9 +135,6 @@ async fn dispatch_inner(
         }
         BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
             handle_release_broadcast_reservation(cell, *payload, reply)
-        }
-        BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
-            reply_saga_deferred(reply)
         }
     }
 }
@@ -583,17 +569,6 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
     const MSG: &str = "BroadcastCommand::Placeholder — real variants migrate in commit 11 of \
                        ADR-049; Placeholder retained for commit-6 compile stability and \
                        deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-}
-
-fn reply_saga_deferred(
-    reply: oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
-) -> Outcome<()> {
-    const MSG: &str = "broadcast::initiate_broadcast_hosting_handshake — saga wiring deferred \
-                       to commit 11.5 per 5 enumerated spec gaps; see \
-                       .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 3: broadcast \
-                       hosting handshake protocol)";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

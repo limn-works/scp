@@ -178,13 +178,12 @@ impl RestoredContexts {
     }
 }
 
-/// Input to `Supervisor::start_saga`. The variant enumerates the 3
-/// saga types defined in plan §"Cross-context saga protocol"
-/// (standing-pair create, cross-context tool invoke, broadcast hosting
-/// handshake). Commit 6 lands the enum shape; real field sets arrive
-/// when each handler migrates.
+/// Input to `Supervisor::start_saga`. The sole production saga is
+/// cross-context tool invocation (spec §6.2.4); the other contemplated
+/// arms (custody handover, standing-pair create, broadcast hosting
+/// handshake) were all withdrawn as category errors (ADR-049 §3/§3b).
 ///
-/// The type is a discriminated union so that adding a fourth saga type
+/// The type is a discriminated union so that adding a new saga type
 /// later is a compile error at every call site — the default branch is
 /// not permitted.
 ///
@@ -200,8 +199,8 @@ impl RestoredContexts {
 /// the only entry point that can supply the supervisor-side tool executor and
 /// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
 /// a required choice the type system can enforce must not be skippable). The
-/// generic `start_saga` therefore only ever receives the publicly-constructible
-/// variant (`BroadcastHostingHandshake`, `NotImplemented` today). External
+/// generic `start_saga` therefore only ever receives a publicly-constructible
+/// input — the executor-less misuse path that aborts in Prepare-A. External
 /// pattern-matching on `CrossContextToolInvocation { .. }` is still allowed;
 /// only construction is sealed.
 pub enum SagaInput {
@@ -248,15 +247,6 @@ pub enum SagaInput {
         /// supplies the executor + signing keys the generic `start_saga`
         /// cannot.
         _seal: CrossContextSagaSeal,
-    },
-    /// Broadcast hosting handshake.
-    BroadcastHostingHandshake {
-        /// Host context.
-        host_context_id: [u8; 32],
-        /// Broadcast context.
-        broadcast_context_id: [u8; 32],
-        /// Subscriber requesting hosting.
-        subscriber_did: DID,
     },
     /// Test-only saga whose Prepare phases succeed and whose Commit phase
     /// ALWAYS fails, so the FSM runs all the way to Committing, exhausts the
@@ -317,7 +307,7 @@ pub struct SagaOutput {
     pub saga_id: SagaId,
     /// The target's signed `CrossContextToolReceipt` bytes (JCS), present
     /// for a committed `CrossContextToolInvocation` saga. `None` for saga
-    /// types that produce no receipt (standing-pair / broadcast).
+    /// inputs that produce no receipt (e.g. the test-only NeedsRepair driver).
     pub receipt: Option<Vec<u8>>,
     /// The captured tool output bytes (the receipt's canonical `output_jcs`),
     /// present for a committed `CrossContextToolInvocation` saga. The exact
@@ -332,9 +322,9 @@ pub struct SagaOutput {
 /// to the settle round-trip).
 ///
 /// Boxed as a trait object so [`Supervisor::run_saga_fsm`] stays
-/// non-generic across the (test / standing-pair / broadcast) saga inputs
-/// that have no executor; only the `CrossContextToolInvocation` arm
-/// consumes it. The future is boxed for the same reason. The closure is
+/// non-generic across saga inputs that have no executor (e.g. the
+/// test-only NeedsRepair driver); only the `CrossContextToolInvocation`
+/// arm consumes it. The future is boxed for the same reason. The closure is
 /// `FnOnce` — it executes the tool exactly once (§6.2.4 "Exactly-once
 /// execution"); a replayed Commit short-circuits before reaching it via
 /// the actor-side `AlreadyCommitted` capture, so the FSM never invokes the
@@ -4752,14 +4742,6 @@ impl Supervisor {
                 let _ = reply.send(Ok(()));
                 Outcome::ok(())
             }
-            BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
-                const MSG: &str = "broadcast::initiate_broadcast_hosting_handshake — saga wiring \
-                     deferred to commit 11.5 per 5 enumerated spec gaps; see \
-                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 3: broadcast \
-                     hosting handshake protocol)";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
         }
     }
 
@@ -4769,10 +4751,6 @@ impl Supervisor {
     /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
     /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
     /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
-    /// The saga-initiator variant
-    /// (`InitiateBroadcastHostingHandshake`) returns
-    /// [`ContextError::NotImplemented`] during the commit-11 window —
-    /// see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
     ///
     /// # Errors
     ///
@@ -5063,19 +5041,17 @@ impl Supervisor {
     /// EVERY terminal — Committed, Aborted, AND NeedsRepair — plus
     /// panic-unwind, so a stuck saga never wedges unrelated disjoint sagas.
     ///
-    /// # Unwired saga use cases (pending Phase 2C)
+    /// # Sole production saga
     ///
-    /// `BroadcastHostingHandshake` remains spec-gapped
-    /// (its Prepare dispatch returns [`ContextError::NotImplemented`]; the FSM
-    /// transitions through `Initiated → PreparingA → Aborting → Aborted` and
-    /// surfaces the typed error). `CrossContextToolInvocation` is the wired
-    /// variant — its end-to-end Prepare/Commit dispatch over the two co-resident
-    /// participant actors lands here (spec §6.2.4); drive it via
+    /// `CrossContextToolInvocation` is the only production saga — its
+    /// end-to-end Prepare/Commit dispatch over the two co-resident participant
+    /// actors lands here (spec §6.2.4); drive it via
     /// [`Self::start_cross_context_tool_invocation_saga`], which supplies the
     /// supervisor-side tool executor and the target's Active Signing Key.
     /// Calling `start_saga` directly with a `CrossContextToolInvocation` input
-    /// (no executor / signing key) is a misuse: the FSM aborts at Prepare with a
-    /// typed error because it has no way to execute the tool or sign the receipt.
+    /// (no executor / signing key) is a misuse: the FSM aborts at Prepare-A with
+    /// a typed [`ContextError::InvalidState`] because it has no way to execute
+    /// the tool or sign the receipt.
     ///
     /// The coordinator itself — journal writes, phase transitions, timeout/retry
     /// accounting, terminal resolution, per-participant-context-set gating — is
@@ -5086,9 +5062,8 @@ impl Supervisor {
     /// - [`ContextError::ActorBusy`] (a `SagaBusy` reason) if the new saga's
     ///   participant context set overlaps an in-flight saga's reserved set.
     ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
-    /// - [`ContextError::NotImplemented`] for the spec-gapped
-    ///   `BroadcastHostingHandshake` input.
-    /// - [`ContextError::InvalidState`] on journal I/O failure.
+    /// - [`ContextError::InvalidState`] on the executor-less
+    ///   `CrossContextToolInvocation` misuse path, or on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
         // acquire the gating reservation HERE on the start path (the gate
@@ -5998,7 +5973,7 @@ impl Supervisor {
     /// the staged provenance. Decoding it yields the FULL `{caller, target}`
     /// participant set and the prepared provenance the replay re-drive needs.
     /// Returns `None` if the entry is not a cross-context saga (its evidence
-    /// does not decode), e.g. a standing-pair / broadcast / test entry.
+    /// does not decode), e.g. a test entry.
     fn reconstruct_xctx_prepared(entry: &JournalEntry) -> Option<XctxPrepared> {
         use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
         if entry.evidence.is_empty() {
@@ -6015,26 +5990,15 @@ impl Supervisor {
     /// participants are exactly the triple
     /// `[hex(caller_context_id), caller_did, tool_registration_id]` — length 3
     /// with a 64-char lowercase-hex first element (the caller's raw-digest
-    /// context id, the canonical `lookup` / persistence key). The other saga
-    /// variants either record a different shape (`BroadcastHostingHandshake`
-    /// ⇒ 3 but with a DID/hex shape whose `participants[0]` is the host context
-    /// hex — see below) or a single-element set (`TestForceNeedsRepair`).
+    /// context id, the canonical `lookup` / persistence key).
+    /// `CrossContextToolInvocation` is the only multi-context saga; the sole
+    /// other input (`TestForceNeedsRepair`) records a single-element set.
     ///
-    /// To avoid misclassifying a `BroadcastHostingHandshake` (also length 3,
-    /// also `hex(...)` first element) as a cross-context caller, this is used
-    /// ONLY on a `PreparingA` or `PreparingB` entry whose evidence FAILED to
-    /// reconstruct as the xctx prepared wire (a `PreparingA` entry ALWAYS has
-    /// empty evidence, so it always reaches this participant-keyed discriminant):
-    /// the broadcast-hosting saga journals NO
-    /// `CrossContextToolInvocationPrepared` evidence at all (its evidence either
-    /// decodes as xctx — handled by the `Some` arm — or is genuinely a different
-    /// saga). The length-3 + 64-hex shape is therefore a sound discriminant for
-    /// "a cross-context entry whose evidence is corrupt"; a broadcast entry that
-    /// reaches here drives a record-keyed `Abort { None }` against its host
-    /// context, which is a clean no-op (the host holds no caller
-    /// `CallerReservationRecord` keyed by this saga id), so a false-positive
-    /// classification cannot strand or mis-reverse anything — it is at worst a
-    /// harmless extra lookup.
+    /// This is used ONLY on a `PreparingA` or `PreparingB` entry whose evidence
+    /// FAILED to reconstruct as the xctx prepared wire (a `PreparingA` entry
+    /// ALWAYS has empty evidence, so it always reaches this participant-keyed
+    /// discriminant). The length-3 + 64-hex shape is therefore a sound
+    /// discriminant for "a cross-context entry whose evidence is corrupt".
     fn xctx_caller_hex_from_participants(entry: &JournalEntry) -> Option<String> {
         const RAW_DIGEST_HEX_LEN: usize = 64;
         if entry.participants.len() != 3 {
@@ -6499,10 +6463,8 @@ impl Supervisor {
     /// ([ADR-049](crate) §7; a timeout maps to
     /// [`ContextError::TransportTimeout`]).
     ///
-    /// `BroadcastHostingHandshake` is spec-gapped
-    /// (returns [`ContextError::NotImplemented`]). For
-    /// `CrossContextToolInvocation` the FSM routes the per-phase message to the
-    /// co-resident participant actor and threads the reply into `xctx`:
+    /// For `CrossContextToolInvocation` the FSM routes the per-phase message to
+    /// the co-resident participant actor and threads the reply into `xctx`:
     /// Prepare-A → caller actor → hold `PreparedAFields`; Prepare-B → target
     /// actor → hold `PreparedBFields`. A missing executor context for a
     /// cross-context input is a misuse (`start_saga` without an executor) and
@@ -6530,13 +6492,6 @@ impl Supervisor {
                         SagaPhase::A => self.dispatch_xctx_prepare_a(saga_id, ctx).await,
                         SagaPhase::B => self.dispatch_xctx_prepare_b(saga_id, ctx).await,
                     }
-                }
-                SagaInput::BroadcastHostingHandshake { .. } => {
-                    Err(ContextError::NotImplemented(format!(
-                        "saga Prepare{phase:?} — BroadcastHostingHandshake wiring deferred to \
-                         commit 11.5 per DEFERRED-commit-11-saga-use-cases.md gap 3 (broadcast \
-                         hosting handshake protocol)"
-                    )))
                 }
                 // Test-only: Prepare always SUCCEEDS so the FSM advances to
                 // Committing (where the test variant's Commit then fails,
@@ -6691,8 +6646,7 @@ impl Supervisor {
     ///
     /// For a wired `CrossContextToolInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
-    /// Commit-A, ordered B then A. `BroadcastHostingHandshake` stays
-    /// `NotImplemented`; `TestForceNeedsRepair` always fails.
+    /// Commit-A, ordered B then A. `TestForceNeedsRepair` always fails.
     async fn dispatch_commit_phase(
         &self,
         saga_id: &SagaId,
@@ -6703,11 +6657,6 @@ impl Supervisor {
 
         let dispatch_fut = async {
             match input {
-                SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
-                    "saga Commit — BroadcastHostingHandshake commit-side \
-                         wiring deferred per DEFERRED-commit-11-saga-use-cases.md"
-                        .to_owned(),
-                )),
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(
@@ -10381,8 +10330,8 @@ impl Supervisor {
                 Some(payload.context_id.as_str())
             }
             // PublishBroadcast / PublishBroadcastContent need
-            // KeyCustody on the shim; InitiateBroadcastHostingHandshake
-            // and Placeholder have no string target for this router.
+            // KeyCustody on the shim; Placeholder has no string target
+            // for this router.
             _ => None,
         }
     }
@@ -10639,15 +10588,6 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             caller_did.to_string(),
             tool_registration_id.clone(),
         ],
-        SagaInput::BroadcastHostingHandshake {
-            host_context_id,
-            broadcast_context_id,
-            subscriber_did,
-        } => vec![
-            hex::encode(host_context_id),
-            hex::encode(broadcast_context_id),
-            subscriber_did.to_string(),
-        ],
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
     }
@@ -10675,16 +10615,15 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
 /// Every variant reserves the **raw-digest hex** of each context it spans —
 /// `hex::encode([u8; 32])` — which is the canonical wire form
 /// (spec §5.15.8: the `derived_context_id` is "the raw digest before prefix
-/// and hex"; §6.2.4 / §5.14.13 for the cross-context / broadcast wire ids).
+/// and hex"; §6.2.4 for the cross-context wire ids).
 /// The gating reservation key is canonicalized to the raw-digest hex (NOT any
 /// prefixed actor-registry id) so that two sagas which share the SAME
 /// underlying context reserve the IDENTICAL key and therefore OVERLAP
 /// (defeating it otherwise would let two sagas touch the shared context
 /// concurrently, breaking the §5.15.4 serialization the §5.15.8 anti-griefing
-/// and §5.14.13 aggregate-cap arguments depend on).
+/// argument depends on).
 ///
 /// - `CrossContextToolInvocation` → `{caller, target}` context ids.
-/// - `BroadcastHostingHandshake` → `{host, broadcast}` context ids.
 fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
     let raw: Vec<String> = match input {
         SagaInput::CrossContextToolInvocation {
@@ -10695,19 +10634,11 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
             hex::encode(caller_context_id),
             hex::encode(target_context_id),
         ],
-        SagaInput::BroadcastHostingHandshake {
-            host_context_id,
-            broadcast_context_id,
-            ..
-        } => vec![
-            hex::encode(host_context_id),
-            hex::encode(broadcast_context_id),
-        ],
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
     };
     // De-dup: a saga must never self-conflict. Two ids that collapse to one
-    // (caller == target, host == broadcast) reserve a single slot.
+    // (caller == target) reserve a single slot.
     let mut seen = HashSet::with_capacity(raw.len());
     raw.into_iter()
         .filter(|id| seen.insert(id.clone()))
@@ -10734,8 +10665,7 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
 /// type) so recovery resolution also overwrites prior on-disk evidence.
 const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
     match input {
-        SagaInput::CrossContextToolInvocation { .. }
-        | SagaInput::BroadcastHostingHandshake { .. } => false,
+        SagaInput::CrossContextToolInvocation { .. } => false,
         // The test-only NeedsRepair driver carries no bearer material.
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { .. } => false,
@@ -11185,38 +11115,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_saga_returns_not_implemented_for_spec_gapped_input() {
-        // The spec-gapped `BroadcastHostingHandshake` variant is not yet
-        // wired — the FSM journals Initiated + PreparingA then fails the
-        // Prepare dispatch with NotImplemented, rolls back via abort_saga,
-        // and returns the typed error. This exercises the coordinator
-        // through the PreparingA → Aborting → Aborted arm of the FSM
-        // without needing spec-filled inputs.
+    async fn start_saga_returns_invalid_state_for_executorless_input() {
+        // Driving a `CrossContextToolInvocation` through the generic
+        // `start_saga` (no supervisor-side executor / signing key) is a
+        // misuse — the FSM journals Initiated + PreparingA then fails the
+        // Prepare-A dispatch with InvalidState (SCP-SAGA-13051), rolls back
+        // via abort_saga, and returns the typed error. This exercises the
+        // coordinator through the PreparingA → Aborting → Aborted arm of the
+        // FSM without needing a co-resident executor context.
         let s = test_supervisor();
         let err = s
-            .start_saga(SagaInput::BroadcastHostingHandshake {
-                host_context_id: [1u8; 32],
-                broadcast_context_id: [2u8; 32],
-                subscriber_did: DID("did:example:sub".to_owned()),
-            })
+            .start_saga(SagaInput::test_cross_context_for_gating(
+                [1u8; 32], [2u8; 32],
+            ))
             .await
             .unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
+        assert!(matches!(err, ContextError::InvalidState(_)));
 
         // The participant-context-set reservation must be RELEASED after a
-        // saga terminates (even on a NotImplemented abort) so a subsequent
+        // saga terminates (even on an InvalidState abort) so a subsequent
         // saga over the SAME set can reserve and start. This is the
         // same-set sequential re-arm property: the RAII `SagaSetReservation`
         // drop frees the slots on every terminal.
         let err2 = s
-            .start_saga(SagaInput::BroadcastHostingHandshake {
-                host_context_id: [1u8; 32],
-                broadcast_context_id: [2u8; 32],
-                subscriber_did: DID("did:example:sub".to_owned()),
-            })
+            .start_saga(SagaInput::test_cross_context_for_gating(
+                [1u8; 32], [2u8; 32],
+            ))
             .await
             .unwrap_err();
-        assert!(matches!(err2, ContextError::NotImplemented(_)));
+        assert!(matches!(err2, ContextError::InvalidState(_)));
     }
 
     #[tokio::test]
@@ -14351,10 +14278,9 @@ mod tests {
         state.access.read_exclusion_list.insert(excluded.clone());
 
         // saga_pending (ADR-049 §9 line 144 — staged cross-context saga
-        // evidence). Stage TWO variants under distinct saga ids: the live
-        // slice-2 cross-context-tool variant (eight journaled fields) and the
-        // receipt-bearing standing-pair variant. Both must survive the
-        // snapshot round-trip through their sanctioned non-derive mirror.
+        // evidence). Stage the cross-context-tool prepared variant (eight
+        // journaled fields); it must survive the snapshot round-trip through
+        // its sanctioned non-derive mirror.
         let xctx_saga_id =
             crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
         state.class_s.saga_pending.insert(
@@ -14463,23 +14389,18 @@ mod tests {
             .saga_pending
             .get(&xctx_saga_id)
             .expect("Class S: cross-context saga must round-trip");
-        assert!(
-            matches!(
-                xctx_snap,
-                SagaPreparedStateSnapshot::CrossContextToolInvocation(_)
-            ),
-            "Class S: wrong cross-context saga variant after round-trip"
-        );
-        if let SagaPreparedStateSnapshot::CrossContextToolInvocation(snap) = xctx_snap {
-            assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
-            assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
-            assert_eq!(snap.caller_did, "did:example:class-s-caller");
-            assert_eq!(snap.tool_registration_id, "class-s-tool-v1");
-            assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
-            assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
-            assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
-            assert_eq!(snap.recorded_chain_depth, 4);
-        }
+        // `SagaPreparedStateSnapshot` is a single-variant enum, so the bind is
+        // irrefutable — the round-trip preserving the cross-context variant is
+        // guaranteed by construction; here we assert the field-level fidelity.
+        let SagaPreparedStateSnapshot::CrossContextToolInvocation(snap) = xctx_snap;
+        assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
+        assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
+        assert_eq!(snap.caller_did, "did:example:class-s-caller");
+        assert_eq!(snap.tool_registration_id, "class-s-tool-v1");
+        assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
+        assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
+        assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
+        assert_eq!(snap.recorded_chain_depth, 4);
 
         // The mirror must rehydrate to the identical live `SagaPreparedState`
         // (the same-node restore contract). Exercise `into_prepared` directly.
@@ -14489,14 +14410,10 @@ mod tests {
             .expect("present")
             .clone()
             .into_prepared();
-        assert!(
-            matches!(rehydrated, SagaPreparedState::CrossContextToolInvocation(_)),
-            "Class S: rehydrated wrong variant"
-        );
-        if let SagaPreparedState::CrossContextToolInvocation(p) = rehydrated {
-            assert_eq!(p.recorded_chain_depth, 4);
-            assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
-        }
+        // Single-variant enum: the bind is irrefutable.
+        let SagaPreparedState::CrossContextToolInvocation(p) = rehydrated;
+        assert_eq!(p.recorded_chain_depth, 4);
+        assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
 
         // Committed cross-context tool invocation (spec §6.2.4 "Exactly-once
         // execution with durable output capture"): the TARGET-side durable

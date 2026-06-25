@@ -67,9 +67,6 @@ pub enum SagaPreparedState {
     /// here — only the proof's identifier — to keep the prepared-state non-
     /// secret-bearing.
     CrossContextToolInvocation(CrossContextToolInvocationPrepared),
-    /// Broadcast-hosting handshake. Public per spec §5.14.2; not
-    /// secret-bearing.
-    BroadcastHostingHandshake(BroadcastHostingHandshakePrepared),
 }
 
 // ---------------------------------------------------------------------------
@@ -244,27 +241,6 @@ impl CrossContextToolInvocationPrepared {
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast hosting handshake
-// ---------------------------------------------------------------------------
-
-/// Staged state for a broadcast-hosting-handshake saga.
-///
-/// **Not bearer-bearing.** Public per spec §5.14.2: the host context, the
-/// broadcast context, the subscriber DID, and the negotiated host config
-/// (encoded opaquely here pending the broadcast handler's migration).
-pub struct BroadcastHostingHandshakePrepared {
-    /// The hosting context ID.
-    pub host_context_id: [u8; 32],
-    /// The broadcast context ID being hosted.
-    pub broadcast_context_id: [u8; 32],
-    /// The subscriber DID requesting hosting.
-    pub subscriber_did: DID,
-    /// Encoded `BroadcastHostConfig` bytes. Concrete type is wired in
-    /// when the broadcast handler migrates to the actor model.
-    pub broadcast_host_config_bytes: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
 // Class-S snapshot mirror (ADR-049 §9 line 144)
 // ---------------------------------------------------------------------------
 
@@ -303,8 +279,6 @@ pub struct BroadcastHostingHandshakePrepared {
 pub enum SagaPreparedStateSnapshot {
     /// Mirror of [`SagaPreparedState::CrossContextToolInvocation`].
     CrossContextToolInvocation(CrossContextToolInvocationSnapshot),
-    /// Mirror of [`SagaPreparedState::BroadcastHostingHandshake`].
-    BroadcastHostingHandshake(BroadcastHostingHandshakeSnapshot),
 }
 
 /// Public snapshot payload for
@@ -330,22 +304,6 @@ pub struct CrossContextToolInvocationSnapshot {
     pub recorded_chain_depth: u8,
 }
 
-/// Public snapshot payload for
-/// [`SagaPreparedState::BroadcastHostingHandshake`] (§5.14.2; all fields
-/// public, not bearer-bearing).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BroadcastHostingHandshakeSnapshot {
-    /// The raw 32-byte hosting context id.
-    pub host_context_id: [u8; 32],
-    /// The raw 32-byte broadcast context id being hosted.
-    pub broadcast_context_id: [u8; 32],
-    /// `subscriber_did.0`.
-    pub subscriber_did: String,
-    /// Encoded `BroadcastHostConfig` bytes (opaque pending the broadcast
-    /// handler's actor migration).
-    pub broadcast_host_config_bytes: Vec<u8>,
-}
-
 impl SagaPreparedStateSnapshot {
     /// Project a live [`SagaPreparedState`] onto its serializable Class-S
     /// snapshot mirror.
@@ -367,14 +325,6 @@ impl SagaPreparedStateSnapshot {
                     recorded_chain_depth: inner.recorded_chain_depth,
                 })
             }
-            SagaPreparedState::BroadcastHostingHandshake(inner) => {
-                Self::BroadcastHostingHandshake(BroadcastHostingHandshakeSnapshot {
-                    host_context_id: inner.host_context_id,
-                    broadcast_context_id: inner.broadcast_context_id,
-                    subscriber_did: inner.subscriber_did.0.clone(),
-                    broadcast_host_config_bytes: inner.broadcast_host_config_bytes.clone(),
-                })
-            }
         }
     }
 
@@ -394,14 +344,6 @@ impl SagaPreparedStateSnapshot {
                     recorded_timestamp_ms: snap.recorded_timestamp_ms,
                     recorded_nonce: snap.recorded_nonce,
                     recorded_chain_depth: snap.recorded_chain_depth,
-                })
-            }
-            Self::BroadcastHostingHandshake(snap) => {
-                SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
-                    host_context_id: snap.host_context_id,
-                    broadcast_context_id: snap.broadcast_context_id,
-                    subscriber_did: DID(snap.subscriber_did),
-                    broadcast_host_config_bytes: snap.broadcast_host_config_bytes,
                 })
             }
         }
@@ -584,7 +526,6 @@ mod tests {
                 assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 3);
             }
-            SagaPreparedState::BroadcastHostingHandshake(_) => panic!("wrong variant"),
         }
     }
 
@@ -632,26 +573,6 @@ mod tests {
         assert_eq!(back, wire);
     }
 
-    #[test]
-    fn broadcast_hosting_handshake_constructs() {
-        let state =
-            SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
-                host_context_id: [6u8; 32],
-                broadcast_context_id: [7u8; 32],
-                subscriber_did: bob(),
-                broadcast_host_config_bytes: vec![0xDD; 48],
-            });
-        match state {
-            SagaPreparedState::BroadcastHostingHandshake(inner) => {
-                assert_eq!(inner.host_context_id, [6u8; 32]);
-                assert_eq!(inner.broadcast_context_id, [7u8; 32]);
-                assert_eq!(inner.subscriber_did, bob());
-                assert_eq!(inner.broadcast_host_config_bytes, vec![0xDD; 48]);
-            }
-            SagaPreparedState::CrossContextToolInvocation(_) => panic!("wrong variant"),
-        }
-    }
-
     /// Compile-time witnesses that the prepared-state types ARE
     /// `Send + Sync` (required for `ActorDeps` movement into
     /// `tokio::spawn`), the only auto-trait obligation they carry.
@@ -667,7 +588,6 @@ mod tests {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SagaPreparedState>();
         assert_send_sync::<CrossContextToolInvocationPrepared>();
-        assert_send_sync::<BroadcastHostingHandshakePrepared>();
     }
 
     /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
@@ -701,37 +621,6 @@ mod tests {
                 assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
                 assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 7);
-            }
-            SagaPreparedState::BroadcastHostingHandshake(_) => {
-                panic!("wrong variant after rehydrate")
-            }
-        }
-    }
-
-    /// Same round-trip for the broadcast-hosting-handshake variant
-    /// (§5.14.2 public fields).
-    #[test]
-    fn snapshot_mirror_round_trips_broadcast_hosting() {
-        let prepared =
-            SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
-                host_context_id: [0x3Cu8; 32],
-                broadcast_context_id: [0x4Du8; 32],
-                subscriber_did: bob(),
-                broadcast_host_config_bytes: vec![0xAB, 0xCD, 0xEF],
-            });
-        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
-        let bytes = serde_json::to_vec(&mirror).unwrap();
-        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(mirror, back);
-        match back.into_prepared() {
-            SagaPreparedState::BroadcastHostingHandshake(inner) => {
-                assert_eq!(inner.host_context_id, [0x3Cu8; 32]);
-                assert_eq!(inner.broadcast_context_id, [0x4Du8; 32]);
-                assert_eq!(inner.subscriber_did, bob());
-                assert_eq!(inner.broadcast_host_config_bytes, vec![0xAB, 0xCD, 0xEF]);
-            }
-            SagaPreparedState::CrossContextToolInvocation(_) => {
-                panic!("wrong variant after rehydrate")
             }
         }
     }

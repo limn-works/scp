@@ -1740,25 +1740,6 @@ pub enum BroadcastCommand {
         /// Oneshot reply channel. See [`BroadcastAdmissionReply`].
         reply: BroadcastAdmissionReply,
     },
-
-    /// Saga-initiator path for the broadcast-hosting handshake. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the handshake
-    /// protocol (subscriber-to-host key exchange, host config negotiation,
-    /// §5.14.2 step 4 transport) is spec-gapped. See
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-    InitiateBroadcastHostingHandshake {
-        /// Host context ID (32-byte hash).
-        host_context_id: [u8; 32],
-        /// Broadcast context ID (32-byte hash).
-        broadcast_context_id: [u8; 32],
-        /// Subscriber DID requesting hosting.
-        subscriber_did: scp_identity::DID,
-        /// Oneshot reply channel. Carries the saga's durable ID on
-        /// success; `ContextError::NotImplemented` during the deferred
-        /// window.
-        reply:
-            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
-    },
 }
 
 /// Reply-channel type alias for
