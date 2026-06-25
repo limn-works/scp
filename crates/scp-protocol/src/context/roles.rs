@@ -390,7 +390,7 @@ impl Capability {
     /// no-colon `Custom("payments")` or `Custom("*:*")`) is rejected at ceiling
     /// construction rather than silently widened or stored.
     ///
-    /// # No privileged-built-in collision (the untrusted-`Custom` backstop)
+    /// # No privileged-built-in collision (the sole authoritative mechanism, §5.3.1.1)
     ///
     /// A [`Custom`](Self::Custom) wraps an arbitrary string that an untrusted peer
     /// can put on the wire (`Capability` derives a plain `Deserialize` with no
@@ -399,20 +399,26 @@ impl Capability {
     /// onto the EXACT canonical UCAN form of a privileged built-in — e.g.
     /// `Custom("tool:invoke:*")` → `"tool_invoke:*"` (== [`ToolInvokeAll`](Self::ToolInvokeAll))
     /// — so a non-conformant `Custom` could masquerade as "invoke any tool" if it
-    /// reached the stored ceiling. Routing the raw string through
-    /// [`validate_ceiling_entry`] is NOT sufficient: that validator early-accepts a
-    /// built-in's COLON spelling (`tool:invoke:*`, `tool:invoke:{id}`) before the
-    /// shared custom-grammar collision test can run.
+    /// reached the stored ceiling. Plain grammar validation
+    /// ([`validate_ceiling_entry`]) does NOT catch this: it early-accepts a built-in's
+    /// COLON spelling (`tool:invoke:*`, `tool:invoke:{id}`) and otherwise applies only
+    /// the custom `{resource}:{action}` grammar, neither of which distinguishes a
+    /// masquerading custom from a legitimate one.
     ///
-    /// The sound, spelling-agnostic guard is to re-resolve the `Custom` string
-    /// through the canonical parser [`Capability::new`]: if it resolves to ANY
-    /// non-[`Custom`](Self::Custom) variant, the string names a built-in in SOME
-    /// spelling (colon OR UCAN form, including the parameterized `ToolInvoke(id)`
-    /// family for any concrete `tool_id`) and the `Custom` is rejected. A legitimate
-    /// custom (`Custom("payments:read")`) re-resolves back to a `Custom` and proceeds
-    /// to grammar validation. This covers EVERY built-in spelling by construction —
-    /// the parser is the single authority on "what string is a built-in" — rather
-    /// than enumerating forbidden spellings.
+    /// The sound, spelling-agnostic enforcement — and the **single authoritative
+    /// mechanism** for §5.3.1.1 "No privileged-built-in collision" — is to re-resolve
+    /// the `Custom` string through the canonical parser [`Capability::new`]: if it
+    /// resolves to ANY non-[`Custom`](Self::Custom) variant, the string names a
+    /// built-in in SOME spelling (colon OR UCAN form, including the parameterized
+    /// `ToolInvoke(id)` family for any concrete `tool_id`) and the `Custom` is
+    /// rejected. A legitimate custom (`Custom("payments:read")`) re-resolves back to a
+    /// `Custom` and proceeds to grammar validation. This covers EVERY built-in
+    /// spelling by construction — the parser is the single authority on "what string
+    /// is a built-in" — rather than enumerating forbidden spellings. It is applied
+    /// here, at the point a `Custom` value is admitted, because that is the only place
+    /// a masquerading `Custom` (including one materialized directly from untrusted
+    /// deserialized bytes that never passed through the colon parser at create time)
+    /// can enter the stored ceiling.
     ///
     /// # Errors
     ///
@@ -832,13 +838,13 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
 ///    `[a-z0-9_-]` token (spec §5.4.1) — `tool_invoke:*` is already covered by
 ///    rule 1 via [`Capability::ToolInvokeAll`];
 /// 3. a well-formed custom `{resource}:{action}` accepted by the shared
-///    [`validate_custom_ceiling_entry`] core, which also applies the §5.3.1.1
-///    "No privileged-built-in collision" rule (see that function for the
-///    authoritative explanation).
+///    [`validate_custom_ceiling_entry`] grammar core.
 ///
-/// Every built-in UCAN form is recognized by rule 1 BEFORE the custom core is
-/// reached, so the core's collision test never false-rejects a legitimate
-/// built-in on this path.
+/// Every built-in UCAN form is recognized by rule 1 BEFORE the custom grammar
+/// core is reached, so a legitimate built-in is never misclassified as a custom on
+/// this path. The import path stores raw UCAN strings verbatim with no `Custom`
+/// wrapper, so the §5.3.1.1 collision rule (which guards `Custom` values) has no
+/// surface here.
 ///
 /// # Errors
 ///
@@ -976,16 +982,14 @@ fn is_tool_id_token(tool_id: &str) -> bool {
 /// strings exceeding [`MAX_CEILING_ENTRY_LENGTH`] bytes. There is **no implicit
 /// or silent wildcard** — a wildcard must be written explicitly as `:*`.
 ///
-/// A well-formed custom additionally must not project onto a built-in (§5.3.1.1
-/// "No privileged-built-in collision"), enforced by the shared
-/// [`validate_custom_ceiling_entry`] core — see that function for the
-/// authoritative explanation.
+/// This validator checks **grammar only**. The §5.3.1.1 "No privileged-built-in
+/// collision" rule is enforced separately, by canonical resolution at the point a
+/// `Custom` value is admitted ([`Capability::validate_as_ceiling_entry`]).
 ///
 /// # Errors
 ///
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not
-/// well-formed, or if it is a well-formed custom that collides with a built-in's
-/// canonical UCAN form (§5.3.1.1).
+/// well-formed per the ceiling-entry grammar (§5.3.1.1).
 pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
     // Length cap + character sanitization (§9.1A), shared with the UCAN-form
     // validator so both reject oversize/control/HTML/whitespace identically.
@@ -1036,24 +1040,17 @@ pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
 /// spelling (the resource is single-segment, so no `:`→`_` conversion occurs),
 /// which is why both validators can share this core.
 ///
-/// # No privileged-built-in collision (spec §5.3.1.1)
-///
-/// After the grammar checks pass, the validated `entry` string IS its own
-/// canonical UCAN projection (see the note above), so a final
-/// **closed-by-construction membership test** rejects any custom whose projection
-/// is a member of the built-in UCAN-form set ([`BUILTIN_CAPABILITIES`]'s
-/// [`Capability::ucan_capability_name`]s). This is a positive non-membership
-/// assertion against the authoritative built-in set — NOT a denylist of forbidden
-/// spellings — so a custom can never masquerade as a privileged built-in (e.g. a
-/// colon-form `bridging:*`, whose built-in colon spelling is the bare `bridging`,
-/// slips past the early [`BUILTIN_CEILING_CATEGORIES`] check yet projects onto the
-/// [`Capability::Bridging`] built-in and is rejected here).
+/// This function performs **pure grammar validation only**. The §5.3.1.1 "No
+/// privileged-built-in collision" rule is NOT enforced here: it is enforced by
+/// canonical resolution at the point a `Custom` value is admitted — see
+/// [`Capability::validate_as_ceiling_entry`], which re-resolves the string through
+/// [`Capability::new`] and rejects anything that does not round-trip back to a
+/// `Custom`. That is the sole authoritative mechanism for the collision rule.
 ///
 /// # Errors
 ///
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not a
-/// well-formed custom ceiling entry, OR if it is well-formed but its canonical
-/// UCAN projection collides with a built-in capability (§5.3.1.1).
+/// well-formed custom ceiling entry.
 fn validate_custom_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
     let Some((resource, action)) = entry.split_once(':') else {
         return Err(CeilingEntryError::invalid(
@@ -1085,20 +1082,6 @@ fn validate_custom_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
         return Err(CeilingEntryError::invalid(
             entry,
             "action must be a non-empty kebab-case [a-z0-9-] token or the single literal '*'",
-        ));
-    }
-
-    // §5.3.1.1: reject if the validated entry — which here equals its own canonical
-    // UCAN projection (single-segment kebab resource ⇒ no `:`→`_` conversion) — is a
-    // built-in UCAN form. See this function's doc section for the full rationale.
-    if BUILTIN_CAPABILITIES
-        .iter()
-        .any(|c| c.ucan_capability_name() == entry)
-    {
-        return Err(CeilingEntryError::invalid(
-            entry,
-            "custom ceiling entry collides with a built-in capability's canonical \
-             UCAN form (§5.3.1.1 no privileged-built-in collision)",
         ));
     }
 
@@ -4181,88 +4164,15 @@ mod tests {
         }
     }
 
-    /// §5.3.1.1 "No privileged-built-in collision": a well-formed custom COLON-form
-    /// entry whose canonical UCAN projection equals a built-in's UCAN form is
-    /// rejected by [`validate_ceiling_entry`]. The worked example is `bridging:*`:
-    /// resource `bridging` is a valid kebab token and action `*` is a valid explicit
-    /// wildcard, so it passes the custom grammar AND slips past the early
-    /// [`BUILTIN_CEILING_CATEGORIES`] check (which holds the bare `bridging`, not
-    /// `bridging:*`) — but its projection collides with [`Capability::Bridging`] and
-    /// MUST be rejected. The reason text is asserted so the test proves it is the
-    /// MEMBERSHIP test rejecting it, not an unrelated grammar failure.
-    #[test]
-    fn ceiling_entry_rejects_custom_colliding_with_builtin_ucan_form() {
-        let err = validate_ceiling_entry("bridging:*").expect_err(
-            "custom `bridging:*` collides with the Bridging built-in and must be rejected",
-        );
-        let CeilingEntryError::InvalidCeilingCategory { entry, reason } = err;
-        assert_eq!(entry, "bridging:*");
-        assert!(
-            reason.contains("collides with a built-in") && reason.contains("§5.3.1.1"),
-            "rejection must be the collision membership test (reason was {reason:?})"
-        );
-    }
-
-    /// The collision rule is general over [`BUILTIN_CAPABILITIES`], not a
-    /// `bridging`-only special case. For every built-in whose canonical UCAN form
-    /// is NOT also one of the early-accepted colon built-in categories
-    /// ([`BUILTIN_CEILING_CATEGORIES`]) — i.e. the "slip" case, where the UCAN form
-    /// would otherwise reach the custom core — the membership test in the shared
-    /// core MUST reject it with the collision reason. (Built-ins whose colon and
-    /// UCAN spellings coincide are accepted by rule 1 as built-ins and never reach
-    /// the custom core; they are not customs and must stay accepted.) `bridging:*`
-    /// is the sole current slip case, but this asserts the property generally so a
-    /// future built-in with a divergent UCAN form is covered automatically.
-    #[test]
-    fn ceiling_entry_rejects_every_builtin_ucan_form_that_slips_to_custom() {
-        for cap in BUILTIN_CAPABILITIES {
-            let ucan = cap.ucan_capability_name();
-            if BUILTIN_CEILING_CATEGORIES.contains(&ucan.as_str()) {
-                // Colon and UCAN spelling coincide → accepted as a built-in (rule 1),
-                // never a custom. This is correct, not a collision.
-                validate_ceiling_entry(&ucan).unwrap_or_else(|e| {
-                    panic!("built-in colon/UCAN spelling {ucan:?} must be accepted: {e}")
-                });
-                continue;
-            }
-            // Slip case: UCAN form is not an early colon built-in. It must NOT be
-            // accepted as a custom. Two sub-cases, both rejections:
-            //   - UCAN form is a well-formed custom SHAPE (single colon, kebab
-            //     resource, `*`/kebab action), e.g. `bridging:*` — caught by the
-            //     collision membership test with the collision reason.
-            //   - UCAN form is not even a valid custom shape (e.g. `tool_invoke:*`,
-            //     `context_child:create` — `_` in the resource is outside the kebab
-            //     charset) — rejected earlier by the grammar.
-            let err = validate_ceiling_entry(&ucan)
-                .expect_err("slip-case built-in UCAN form must be rejected, not accepted");
-            let CeilingEntryError::InvalidCeilingCategory { reason, .. } = err;
-            // If the UCAN form is a well-formed custom shape, the ONLY thing standing
-            // between it and acceptance is the collision membership test, so the
-            // rejection reason must be the collision reason.
-            let is_wellformed_custom_shape =
-                ucan.split_once(':').is_some_and(|(resource, action)| {
-                    is_kebab_token(resource)
-                        && !action.contains(':')
-                        && (action == "*" || is_kebab_token(action))
-                });
-            if is_wellformed_custom_shape {
-                assert!(
-                    reason.contains("collides with a built-in"),
-                    "well-formed-shape slip-case {ucan:?} must be rejected by the collision \
-                     membership test, but reason was {reason:?}"
-                );
-            }
-        }
-    }
-
     /// The enum-form entry point: a `Custom` carrying a built-in's spelling
     /// (`bridging:*`, whose canonical UCAN form is the [`Capability::Bridging`]
     /// built-in) is rejected. The rejection comes from the `validate_as_ceiling_entry`
-    /// re-resolution backstop — `Capability::new("bridging:*")` resolves to the
-    /// `Bridging` variant (not a `Custom`) — which fires BEFORE the grammar-core
-    /// collision membership test, so the reason is the "names a built-in" §5.3.1.1
-    /// guard. (A `Custom("bridging:*")` is constructed only by bypassing `new`,
-    /// e.g. via untrusted deserialization — exactly the surface this guard defends.)
+    /// re-resolution check — `Capability::new("bridging:*")` resolves to the
+    /// `Bridging` variant (not a `Custom`) — which is the sole authoritative §5.3.1.1
+    /// "No privileged-built-in collision" mechanism, so the reason is the "names a
+    /// built-in" §5.3.1.1 guard. (A `Custom("bridging:*")` is constructed only by
+    /// bypassing `new`, e.g. via untrusted deserialization — exactly the surface this
+    /// guard defends.)
     #[test]
     fn validate_as_ceiling_entry_rejects_custom_colliding_with_builtin() {
         let err = Capability::Custom("bridging:*".to_owned())
@@ -4300,9 +4210,9 @@ mod tests {
     }
 
     /// A built-in's own UCAN string is accepted as a BUILT-IN by the UCAN-form
-    /// validator (matched by rule 1 BEFORE the shared custom core is reached), so
-    /// the collision test in the shared core never false-rejects a legitimate
-    /// built-in on the UCAN/import path. `bridging:*` is the worked example.
+    /// validator (matched by rule 1 BEFORE the shared custom grammar core is
+    /// reached), so a legitimate built-in is never misclassified as a custom on the
+    /// UCAN/import path. `bridging:*` is the worked example.
     #[test]
     fn validate_ucan_ceiling_string_accepts_builtin_form_not_false_rejected() {
         validate_ucan_ceiling_string("bridging:*")
@@ -4320,9 +4230,9 @@ mod tests {
     /// spelling of the privileged `tool:invoke:*` built-in must be rejected by the
     /// enum-form entry point. The colon spelling early-accepts inside
     /// [`validate_ceiling_entry`] (`tool:invoke:*` is in
-    /// [`BUILTIN_CEILING_CATEGORIES`]) and so slips past the grammar-core collision
-    /// test; the rejection here comes from the `validate_as_ceiling_entry`
-    /// re-resolution backstop (the string resolves to [`Capability::ToolInvokeAll`],
+    /// [`BUILTIN_CEILING_CATEGORIES`]), so plain grammar validation would let it
+    /// through; the rejection here comes from the `validate_as_ceiling_entry`
+    /// re-resolution check (the string resolves to [`Capability::ToolInvokeAll`],
     /// not a `Custom`). Without this guard, `Custom("tool:invoke:*")` would store
     /// `tool_invoke:*` — "invoke any tool" — onto the ceiling fed to UCAN minting.
     /// The reason text is asserted so the test proves the §5.3.1.1 guard rejected it.
@@ -4342,9 +4252,9 @@ mod tests {
     /// §5.3.1.1 HIGH-severity regression: a `Custom` naming the parameterized
     /// `tool:invoke:{tool_id}` built-in family (here `tool:invoke:calc`) must be
     /// rejected. The colon spelling early-accepts as a parameterized built-in inside
-    /// [`validate_ceiling_entry`] (rule 1b), so the grammar-core collision test never
-    /// runs; the rejection comes from the `validate_as_ceiling_entry` re-resolution
-    /// backstop (the string resolves to `Capability::ToolInvoke("calc")`, not a
+    /// [`validate_ceiling_entry`] (rule 1b), so plain grammar validation would let it
+    /// through; the rejection comes from the `validate_as_ceiling_entry` re-resolution
+    /// check (the string resolves to `Capability::ToolInvoke("calc")`, not a
     /// `Custom`). Confirms the parameterized family is covered for a concrete `tool_id`.
     #[test]
     fn validate_as_ceiling_entry_rejects_custom_naming_parameterized_tool_invoke_builtin() {
@@ -4401,9 +4311,11 @@ mod tests {
     /// `validate_entries` boundary. This is the exact attack surface the HIGH finding
     /// described: `Capability` derives a plain `Deserialize` with no normalization,
     /// so `{"Custom":"tool:invoke:*"}` deserializes verbatim; the type-level
-    /// validating `Deserialize` must refuse to materialize it. `bridging:*` (already
-    /// covered by the grammar core) is included so the deserialize guard is shown to
-    /// catch the whole family.
+    /// validating `Deserialize` must refuse to materialize it. `bridging:*` is
+    /// included so the deserialize guard is shown to catch the whole family — like
+    /// the other masquerade strings, it is rejected by the `validate_as_ceiling_entry`
+    /// re-resolution check (`Capability::new("bridging:*")` resolves to the `Bridging`
+    /// built-in), not by the custom grammar (which `bridging:*` satisfies).
     #[test]
     fn ceiling_deserialize_rejects_custom_naming_builtin() {
         for masquerade in ["tool:invoke:*", "tool:invoke:calc", "bridging:*"] {
