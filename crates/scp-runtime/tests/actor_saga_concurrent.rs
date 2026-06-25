@@ -117,10 +117,10 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
 /// `CrossContextToolInvocation` through `start_saga` (no executor / signing
 /// key) aborts at Prepare-A with `InvalidState` (the executor-context misuse
 /// guard, SCP-SAGA-13051) — BEFORE the co-resident lookup — so the FSM never
-/// reaches `ContextNotRegistered` here; the spec-gapped variants abort with
-/// `NotImplemented`. Any of these is a valid "reservation released" terminal —
-/// the gating property under test is the ABSENCE of `ActorBusy`, not the
-/// specific terminal error.
+/// reaches `ContextNotRegistered` here. Any non-busy terminal (`InvalidState`,
+/// or the defensively-accepted `ContextNotRegistered` / `NotImplemented`) is a
+/// valid "reservation released" outcome — the gating property under test is the
+/// ABSENCE of `ActorBusy`, not the specific terminal error.
 #[track_caller]
 fn assert_non_busy_terminal(
     result: &Result<scp_runtime::context::supervisor::SagaOutput, ContextError>,
@@ -145,9 +145,9 @@ fn ctx(byte: u8) -> [u8; 32] {
 
 /// DISJOINT participant sets run concurrently: two sagas spanning entirely
 /// different contexts BOTH reach a terminal — NEITHER returns ActorBusy.
-/// Because the production variants are spec-gapped, "terminal" is the
-/// `NotImplemented` abort; the load-bearing assertion is the ABSENCE of
-/// ActorBusy, proving disjoint sets never serialize.
+/// Because the executor-less `start_saga` path aborts at Prepare-A, "terminal"
+/// here is the `InvalidState` abort; the load-bearing assertion is the ABSENCE
+/// of ActorBusy, proving disjoint sets never serialize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disjoint_participant_sets_run_concurrently() {
     let supervisor = test_supervisor();
@@ -170,7 +170,7 @@ async fn disjoint_participant_sets_run_concurrently() {
 /// flight, a second saga sharing ≥1 context returns ActorBusy with a
 /// `SagaBusy` reason. The in-flight saga is simulated deterministically by
 /// holding the reservation guard (the production gating critical section),
-/// because the spec-gapped FSM terminates too fast to race.
+/// because the executor-less FSM terminates too fast to race.
 #[tokio::test]
 async fn overlapping_participant_sets_reject_busy() {
     let supervisor = test_supervisor();
