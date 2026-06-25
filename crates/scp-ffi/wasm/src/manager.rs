@@ -1681,8 +1681,9 @@ impl WasmContextManager {
         // path: it runs `CapabilityCeiling::validate_entries`, so a malformed
         // ceiling entry surfaces as `RoleError::InvalidCeilingCategory`. Map that
         // to the canonical `SCP-VALID-7000` `Validation` error (identical reject
-        // surface to the modify / import paths); any other error here (a custom
-        // role outside the ceiling) maps to a context error.
+        // surface to the modify path; the import path surfaces the SCP-CTX-2032
+        // deserialize error class); any other error here (a custom role outside
+        // the ceiling) maps to a context error.
         let role_state = ContextRoleState::new(
             context_id.to_owned(),
             creator_did.to_owned(),
@@ -2084,6 +2085,9 @@ impl WasmContextManager {
         // cross-family export byte-parity scope per ADR-050 (each author mints
         // its own sequence with no global order), but the increment direction
         // must converge.
+        // Note whether the sender already had a sequence entry, so a failure
+        // that created a fresh `0` entry can remove it cleanly on rollback.
+        let seq_was_present = ctx.member_sequence_numbers.contains_key(sender_did);
         let seq_entry = ctx
             .member_sequence_numbers
             .entry(sender_did.to_owned())
@@ -2092,29 +2096,55 @@ impl WasmContextManager {
         *seq_entry += 1;
 
         // If crypto state is available, encrypt the payload before recording.
-        let recorded_payload = if let Some(ref mut crypto) = ctx.crypto {
-            let raw_bytes = base64::engine::general_purpose::STANDARD
-                .decode(payload_base64)
-                .map_err(|e| ScpWasmError::Crypto {
-                    message: format!("invalid base64 payload: {e}"),
-                    code: codes::CRYPTO_4001.to_owned(),
+        //
+        // The reserved sequence above is rolled back on ANY failure before the
+        // message is recorded, mirroring native
+        // `MembershipState::rollback_sequence_number` (membership.rs, a
+        // `saturating_sub(1)`): a failed send (invalid base64, MLS epoch read,
+        // encryption) must burn no sequence, so two honest members never
+        // diverge on a gap. The fallible work is wrapped in a closure so the
+        // single `?`-propagating error path is captured for rollback rather
+        // than early-returning. The closure borrows `ctx.crypto` mutably; the
+        // rollback touches `ctx.member_sequence_numbers` only after the closure
+        // returns, so the two `&mut` borrows are sequential, not overlapping.
+        let recorded_payload = match (|| -> Result<String, ScpWasmError> {
+            if let Some(ref mut crypto) = ctx.crypto {
+                let raw_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(payload_base64)
+                    .map_err(|e| ScpWasmError::Crypto {
+                        message: format!("invalid base64 payload: {e}"),
+                        code: codes::CRYPTO_4001.to_owned(),
+                    })?;
+
+                let epoch = crypto.mls_group.epoch().map_err(|e| ScpWasmError::Crypto {
+                    message: format!("failed to read MLS epoch: {e}"),
+                    code: codes::CRYPTO_4002.to_owned(),
                 })?;
 
-            let epoch = crypto.mls_group.epoch().map_err(|e| ScpWasmError::Crypto {
-                message: format!("failed to read MLS epoch: {e}"),
-                code: codes::CRYPTO_4002.to_owned(),
-            })?;
+                let ciphertext = crypto
+                    .encrypt_message(&raw_bytes, context_id, sender_did, epoch, seq)
+                    .map_err(|e| ScpWasmError::Crypto {
+                        message: format!("encryption failed: {e}"),
+                        code: codes::CRYPTO_4003.to_owned(),
+                    })?;
 
-            let ciphertext = crypto
-                .encrypt_message(&raw_bytes, context_id, sender_did, epoch, seq)
-                .map_err(|e| ScpWasmError::Crypto {
-                    message: format!("encryption failed: {e}"),
-                    code: codes::CRYPTO_4003.to_owned(),
-                })?;
-
-            base64::engine::general_purpose::STANDARD.encode(&ciphertext)
-        } else {
-            payload_base64.to_owned()
+                Ok(base64::engine::general_purpose::STANDARD.encode(&ciphertext))
+            } else {
+                Ok(payload_base64.to_owned())
+            }
+        })() {
+            Ok(payload) => payload,
+            Err(e) => {
+                if let Some(entry) = ctx.member_sequence_numbers.get_mut(sender_did) {
+                    *entry = entry.saturating_sub(1);
+                    // If we created the entry purely to reserve this (failed)
+                    // send, drop it so the map matches its pre-send shape.
+                    if !seq_was_present && *entry == 0 {
+                        ctx.member_sequence_numbers.remove(sender_did);
+                    }
+                }
+                return Err(e);
+            }
         };
 
         ctx.push_event(ContextEvent::MessageSent {
@@ -10285,6 +10315,66 @@ mod tests {
         // The creator (`admin`, full ceiling) can also send.
         mgr.send_message(context_id, creator, "aGVsbG8=", None)
             .expect("admin must be able to send");
+    }
+
+    /// A send that FAILS in the fallible encrypt path must NOT advance the
+    /// sender's per-member sequence counter — the reserved sequence is rolled
+    /// back, mirroring native `MembershipState::rollback_sequence_number`
+    /// (`saturating_sub`). Without the rollback a failed send burns a sequence,
+    /// opening a gap that two honest members would derive differently.
+    ///
+    /// Exercises the REAL crypto path (`WasmCryptoState::new_for_context` so
+    /// `ctx.crypto` is `Some`): one successful encrypted send (seq 0, counter
+    /// -> 1), then a send with an invalid-base64 payload that fails at the
+    /// `CRYPTO_4001` decode step. The counter must stay at 1, not advance to 2.
+    #[test]
+    fn send_message_failure_does_not_advance_sequence_wasm() {
+        let context_id = "ctx-send-rollback";
+        let creator = "did:dht:zcreator";
+        let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
+        // Attach real MLS crypto so the fallible encrypt branch runs. The
+        // creator is the MLS group creator, so its own leaf can encrypt.
+        {
+            let ctx = mgr.contexts.get_mut(context_id).unwrap();
+            ctx.crypto = Some(
+                crate::crypto::WasmCryptoState::new_for_context(creator)
+                    .expect("MLS group creation must succeed"),
+            );
+        }
+
+        // First send succeeds: seq 0 is consumed, counter advances to 1.
+        mgr.send_message(context_id, creator, "aGVsbG8=", None)
+            .expect("a valid encrypted send must succeed");
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(creator),
+            Some(1),
+            "an accepted encrypted send must advance the sender's sequence to 1"
+        );
+
+        // Second send fails at the base64 decode step (CRYPTO_4001). The
+        // reserved sequence must be rolled back so the counter stays at 1.
+        let err = mgr
+            .send_message(context_id, creator, "@@@not-valid-base64@@@", None)
+            .expect_err("an invalid-base64 payload must fail the encrypt path");
+        match err {
+            ScpWasmError::Crypto { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::CRYPTO_4001,
+                    "invalid base64 must surface the decode error class"
+                );
+            }
+            other => panic!("expected Crypto error, got: {other:?}"),
+        }
+
+        // The failed send burned NO sequence: counter is still 1 (not 2).
+        // With the old code (no rollback) this would be 2 — the mutation guard.
+        assert_eq!(
+            mgr.contexts[context_id].test_member_sequence_number(creator),
+            Some(1),
+            "a FAILED send must not advance the sequence — the reserved value \
+             is rolled back, mirroring native rollback_sequence_number"
+        );
     }
 
     /// A write-granting member whose `messages:write` was suspended via
