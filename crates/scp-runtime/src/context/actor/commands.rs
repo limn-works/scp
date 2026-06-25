@@ -701,9 +701,9 @@ pub enum LifecycleCommand {
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
     /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
     ///
-    /// Saga-compatible: the same variant carries the
-    /// `create_context`-for-standing-pair-prepare flow in commit 11; for
-    /// commit 9 the handler goes straight through the legacy method.
+    /// Standing-pair creation also routes through `create_context` — it is
+    /// single-context async creation (not a saga-prepare flow; spec §5.15.8),
+    /// so the handler goes straight through the method.
     ///
     /// Boxed payload — [`ContextParams`](scp_protocol::context::params::ContextParams)
     /// is ~1KB, which would blow up every sibling variant under
