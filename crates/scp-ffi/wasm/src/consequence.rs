@@ -849,6 +849,45 @@ mod tests {
         assert!(!suspended.contains("not-a-real-capability"));
     }
 
+    /// Suspension enforcement holds for capabilities whose Display form diverges
+    /// from their canonical UCAN form. `Bridging` Displays as `bridging` but its
+    /// UCAN form is `bridging:*`; `ToolInvokeAll` Displays as `tool:invoke:*` but
+    /// its UCAN form is `tool_invoke:*`. The typed `apply_suspend` stores the
+    /// canonical UCAN spelling (via `Capability::ucan_capability_name`), so the
+    /// suspension-aware capability check denies BOTH — the divergent-display
+    /// regression cannot reappear because there are no strings to misspell.
+    #[test]
+    fn apply_suspend_enforces_capabilities_with_divergent_display_form() {
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Admin grants any in-ceiling capability, so seed the ceiling with the
+        // UCAN-form spellings the role check looks up.
+        ctx.test_insert_ceiling("bridging:*");
+        ctx.test_insert_ceiling("tool_invoke:*");
+
+        // Sanity: before suspension the admin holds both caps.
+        assert!(ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
+        assert!(ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
+
+        let applied = apply_suspend(
+            &mut ctx,
+            "did:test:admin",
+            &[Capability::Bridging, Capability::ToolInvokeAll],
+        );
+        assert!(applied);
+
+        // The suspended set must hold the canonical UCAN form, NOT the Display
+        // form — otherwise the lookup below would never match.
+        let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
+        assert!(suspended.contains("bridging:*"));
+        assert!(suspended.contains("tool_invoke:*"));
+        assert!(!suspended.contains("bridging"));
+        assert!(!suspended.contains("tool:invoke:*"));
+
+        // The actual enforcement check: both caps are now DENIED.
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "bridging:*"));
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
+    }
+
     /// **E2-12:** `apply_suspend_all` reports "not applied" (returns `false`)
     /// for a member with an empty ceiling — they have no effective capability
     /// to suspend. The shared `ContextRoleState::suspend_all` REPLACES the

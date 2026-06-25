@@ -9796,6 +9796,156 @@ mod tests {
         mgr
     }
 
+    /// Governance `SuspendCapability` / `RestoreAccess` store and clear the SAME
+    /// canonical UCAN-form keys for every capability shape — built-in
+    /// (`Bridging`), parameterized (`ToolInvokeAll`), and `Custom` (both a
+    /// `resource:action` form and a bare no-colon token that canonicalizes to
+    /// `name:name`). The typed `ContextRoleState` stores suspensions as typed
+    /// `Capability` values; `test_suspended_capabilities` projects them to their
+    /// `Capability::ucan_capability_name` form — the exact spelling
+    /// `apply_suspend` and `member_has_capability` produce and consume. Restore
+    /// must then clear every key suspend stored, leaving the subject with no
+    /// suspended set at all.
+    #[test]
+    fn governance_suspend_restore_uses_canonical_form_for_all_shapes() {
+        let mut mgr = manager_with_governed_context(
+            "ctx-susp",
+            "did:dht:zcreator",
+            &["messages:read", "bridging:*", "tool_invoke:*", "member:ban"],
+        );
+
+        let subject = DID("did:dht:zsubject".to_owned());
+        let caps = vec![
+            Capability::Bridging,
+            Capability::ToolInvokeAll,
+            Capability::Custom("custom:foo".to_owned()),
+            Capability::Custom("bridging".to_owned()),
+        ];
+
+        mgr.dispatch_governance_action(
+            "ctx-susp",
+            &GovernanceAction::SuspendCapability {
+                did: subject.clone(),
+                capabilities: caps.clone(),
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("SuspendCapability must succeed");
+
+        // Each stored key is exactly `cap.ucan_capability_name()` — the same
+        // value `apply_suspend` and `member_has_capability` produce/consume. The
+        // typed storage is projected to UCAN-form strings via
+        // `test_suspended_capabilities`.
+        let stored: HashSet<String> = mgr
+            .contexts
+            .get("ctx-susp")
+            .unwrap()
+            .test_suspended_capabilities(subject.as_ref())
+            .expect("subject must have a suspended set");
+        let expected: HashSet<String> = caps.iter().map(Capability::ucan_capability_name).collect();
+        assert_eq!(
+            stored, expected,
+            "governance SuspendCapability must store canonical UCAN-form keys"
+        );
+
+        // RestoreAccess removes the SAME canonical keys, fully clearing the set.
+        mgr.dispatch_governance_action(
+            "ctx-susp",
+            &GovernanceAction::RestoreAccess {
+                did: subject.clone(),
+                capabilities: caps,
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("RestoreAccess must succeed");
+        assert!(
+            mgr.contexts
+                .get("ctx-susp")
+                .unwrap()
+                .test_suspended_capabilities(subject.as_ref())
+                .is_none(),
+            "RestoreAccess must clear every key SuspendCapability stored"
+        );
+    }
+
+    /// Canonical-form parity for EVERY built-in capability variant: the slice's
+    /// single ceiling-conversion path (parse the colon-form `name()` via
+    /// `Capability::new`, build a `CapabilityCeiling`, project via
+    /// `to_ucan_string_set` — the one canonical source the typed
+    /// `ContextRoleState` routes all ceiling writes through) must produce exactly
+    /// `Capability::ucan_capability_name()` for each variant, byte-identical to
+    /// native. This is the exhaustive built-in counterpart to the multi-entry
+    /// create/modify/import convergence tests, and it pins that the old
+    /// hand-rolled converter's buggy pass-through spellings (bare `bridging`, the
+    /// un-underscored `tool:invoke:*`) are GONE.
+    #[test]
+    fn ceiling_string_conversion_matches_native_for_all_builtin_variants() {
+        use scp_protocol::context::roles::CapabilityCeiling;
+
+        // Every non-parameterized built-in (mirrors `BUILTIN_CAPABILITIES` in
+        // scp-protocol `roles.rs`; kept exhaustive by
+        // `builtin_capabilities_list_is_exhaustive`), plus a parameterized
+        // `ToolInvoke` and a custom `{resource}:{action}` — the full shape space
+        // the create/modify ceiling converter must round-trip.
+        let cases = vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+            // Parameterized + custom shapes.
+            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::Custom("payments:approve".to_owned()),
+        ];
+
+        for cap in &cases {
+            let native = cap.ucan_capability_name();
+            // The slice's create/modify path receives the colon form
+            // (`cap.name()`), parses it via `Capability::new`, and stores the
+            // typed ceiling whose canonical projection is `to_ucan_string_set`.
+            let wasm: Vec<String> = CapabilityCeiling::new([Capability::new(cap.name().as_ref())])
+                .to_ucan_string_set()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                wasm,
+                vec![native.clone()],
+                "WASM ceiling conversion diverged from native ucan_capability_name \
+                 for {cap:?}: wasm={wasm:?} native={native:?}"
+            );
+        }
+
+        // Pin that the old hand-rolled converter's buggy pass-through spellings
+        // are GONE (the positive canonical forms are already covered by the loop
+        // above when it hits `Bridging` / `ToolInvokeAll`): a no-colon built-in
+        // token must NOT pass through, and a built-in colon form must NOT remain
+        // un-underscored.
+        let pinned_set: HashSet<String> = CapabilityCeiling::new([
+            Capability::new("bridging"),
+            Capability::new("tool:invoke:*"),
+        ])
+        .to_ucan_string_set();
+        assert!(!pinned_set.contains("bridging"));
+        assert!(!pinned_set.contains("tool:invoke:*"));
+        assert!(pinned_set.contains("bridging:*"));
+        assert!(pinned_set.contains("tool_invoke:*"));
+    }
+
     /// WASM `ModifyCeiling` (BLACK-002) rejects a malformed proposed ceiling
     /// entry (spec §5.3.1.1) and leaves the prior ceiling UNCHANGED — closing the
     /// divergence where the handler rebuilt the ceiling with no validation.
