@@ -10,8 +10,8 @@
 //!
 //! # Determinism
 //!
-//! `StandingPairCreate` / `BroadcastHostingHandshake` remain spec-gapped
-//! (their Prepare dispatch returns `NotImplemented`). `CrossContextToolInvocation`
+//! `BroadcastHostingHandshake` remains spec-gapped
+//! (its Prepare dispatch returns `NotImplemented`). `CrossContextToolInvocation`
 //! is wired, but driving it through `start_saga` (no executor / signing key)
 //! over contexts with NO co-resident actors aborts INSTANTLY at Prepare-A with
 //! a typed `ContextNotRegistered` (co-resident scope) — the PreparingA →
@@ -100,12 +100,15 @@ fn test_supervisor() -> Arc<Supervisor> {
     ))
 }
 
-/// A standing-pair saga between two DIDs. Its participant context set is
-/// the single deterministic standing-pair context id derived from the pair.
-fn standing_pair(a: &str, b: &str) -> SagaInput {
-    SagaInput::StandingPairCreate {
-        local_did: DID(a.to_owned()),
-        peer_did: DID(b.to_owned()),
+/// A broadcast-hosting-handshake saga over the given host/broadcast contexts.
+/// Its participant context set is `{host, broadcast}`. The subscriber DID is a
+/// placeholder — these gating tests only exercise the reservation key (the two
+/// context ids), never the spec-gapped Prepare body.
+fn broadcast_hosting(host: [u8; 32], broadcast: [u8; 32]) -> SagaInput {
+    SagaInput::BroadcastHostingHandshake {
+        host_context_id: host,
+        broadcast_context_id: broadcast,
+        subscriber_did: DID("did:example:subscriber".to_owned()),
     }
 }
 
@@ -219,43 +222,38 @@ async fn overlapping_participant_sets_reject_busy() {
     );
 }
 
-/// A standing-pair saga and a CROSS-CONTEXT saga that touch the SAME context
-/// serialize — overlap detection is purely set-membership, not saga-type.
+/// A BROADCAST-hosting saga and a CROSS-CONTEXT saga that touch the SAME
+/// context serialize — overlap detection is purely set-membership, not
+/// saga-type.
 ///
-/// This is the FIX-1 regression guard: it genuinely crosses saga TYPES. A
-/// `StandingPairCreate` saga reserves the CANONICAL raw-digest hex of its
-/// standing context (spec §5.15.8 — the digest BEFORE the `"standing-"`
-/// prefix), and a `CrossContextToolInvocation` over that SAME raw digest must
-/// collide. If the standing-pair saga reserved the `"standing-"`-prefixed
-/// display id instead (the pre-FIX-1 bug), the cross-context saga's
-/// `hex::encode([u8; 32])` key would never equal the prefixed string, overlap
-/// would NOT be detected, and this assertion would FAIL — exactly the wedge
-/// FIX 1 closes.
+/// This genuinely crosses saga TYPES. Both variants reserve the raw-digest hex
+/// (`hex::encode([u8; 32])`) of every context they span. A held broadcast saga
+/// over `{shared, other}` and a `CrossContextToolInvocation` over that SAME
+/// `shared` raw digest must collide. If overlap detection keyed off the saga
+/// type rather than pure set-membership, the cross-context saga would not be
+/// rejected and this assertion would FAIL.
 #[tokio::test]
 async fn overlap_is_set_membership_across_saga_types() {
     let supervisor = test_supervisor();
 
-    // Hold a STANDING-PAIR saga in flight via the production reservation
-    // primitive. It reserves the canonical raw-digest hex of the pair's
-    // standing context.
+    // A deterministic raw 32-byte context digest shared between the two sagas.
     let alice = DID("did:example:alice".to_owned());
     let bob = DID("did:example:bob".to_owned());
-    let pair = standing_pair("did:example:alice", "did:example:bob");
-    let held = supervisor
-        .test_reserve_saga_context_set(&pair)
-        .expect("standing-pair reservation must succeed");
+    let shared_digest = Supervisor::test_standing_pair_context_digest(&alice, &bob);
 
-    // Compute the EXACT raw 32-byte digest that the held standing-pair saga
-    // reserved (the canonical gating key), then name it as one leg of a
-    // CROSS-CONTEXT saga (a DIFFERENT saga type). The cross-context saga's
-    // `caller_context_id` is the standing context's raw digest; its
-    // `target_context_id` is an unrelated context. The shared raw digest forces
-    // an overlap across saga types.
-    let standing_digest = Supervisor::test_standing_pair_context_digest(&alice, &bob);
+    // Hold a BROADCAST-hosting saga in flight via the production reservation
+    // primitive. Its participant set is {shared_digest, 0x08}.
+    let held = supervisor
+        .test_reserve_saga_context_set(&broadcast_hosting(shared_digest, ctx(8)))
+        .expect("broadcast-hosting reservation must succeed");
+
+    // A CROSS-CONTEXT saga (a DIFFERENT saga type) whose `caller_context_id`
+    // is the SAME `shared_digest` and whose `target_context_id` is unrelated.
+    // The shared raw digest forces an overlap across saga types.
     let err = supervisor
-        .start_saga(cross_context(standing_digest, ctx(9)))
+        .start_saga(cross_context(shared_digest, ctx(9)))
         .await
-        .expect_err("cross-context saga over the held standing context must collide");
+        .expect_err("cross-context saga over the held shared context must collide");
     match err {
         ContextError::ActorBusy(msg) => assert!(
             msg.contains("SagaBusy"),
@@ -264,12 +262,12 @@ async fn overlap_is_set_membership_across_saga_types() {
         other => panic!("expected ActorBusy(SagaBusy), got: {other:?}"),
     }
 
-    // Releasing the standing-pair reservation lets the previously-overlapping
+    // Releasing the broadcast reservation lets the previously-overlapping
     // cross-context saga through — proving the rejection WAS the shared raw
     // digest (the reservation), not some unrelated failure.
     drop(held);
     let r2 = supervisor
-        .start_saga(cross_context(standing_digest, ctx(9)))
+        .start_saga(cross_context(shared_digest, ctx(9)))
         .await;
     assert_non_busy_terminal(
         &r2,

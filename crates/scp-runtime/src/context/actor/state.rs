@@ -2070,8 +2070,7 @@ mod tests {
                 assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 2);
             }
-            SagaPreparedState::StandingPairCreate(_)
-            | SagaPreparedState::BroadcastHostingHandshake(_) => {
+            SagaPreparedState::BroadcastHostingHandshake(_) => {
                 panic!("wrong saga variant after restore")
             }
         }

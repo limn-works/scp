@@ -50,13 +50,11 @@
 use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
-use crate::context::supervisor::creation_receipt::CreationReceipt;
-
 // ---------------------------------------------------------------------------
-// Discriminated union over the 3 saga types defined by ADR-049 §3
+// Discriminated union over the saga types defined by ADR-049 §3
 // ---------------------------------------------------------------------------
 
-/// Discriminated union over the 3 saga types defined by ADR-049 §3.
+/// Discriminated union over the saga types defined by ADR-049 §3.
 ///
 /// Each variant carries every field needed to replay Commit deterministically
 /// from the Prepare-time snapshot. The shape is saga-type specific; see the
@@ -65,9 +63,6 @@ use crate::context::supervisor::creation_receipt::CreationReceipt;
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
 pub enum SagaPreparedState {
-    /// Standing-pair creation between two identities. All public per spec
-    /// §5.15.8; not secret-bearing.
-    StandingPairCreate(StandingPairCreatePrepared),
     /// Cross-context tool invocation. The UCAN proof bytes are NOT carried
     /// here — only the proof's identifier — to keep the prepared-state non-
     /// secret-bearing.
@@ -75,137 +70,6 @@ pub enum SagaPreparedState {
     /// Broadcast-hosting handshake. Public per spec §5.14.2; not
     /// secret-bearing.
     BroadcastHostingHandshake(BroadcastHostingHandshakePrepared),
-}
-
-// ---------------------------------------------------------------------------
-// Standing-pair create
-// ---------------------------------------------------------------------------
-
-/// Staged state for a standing-pair-creation saga (spec §5.15.8 Prepare-A
-/// / Prepare-B field table).
-///
-/// All fields are public per spec §5.15.8 (standing-pair handshake): the
-/// peer DID, the local DID, the deterministically-derived context ID, and
-/// — on the A-side only — the staged [`CreationReceipt`]. None of these
-/// are bearer artifacts.
-///
-/// # No `group_id`
-///
-/// There is **no** `group_id` field. MLS group isolation keys off
-/// `derived_context_id`; the crypto provider computes the MLS group id
-/// internally as `SHA-256("standing-" ‖ hex(derived_context_id))` inside
-/// `create_mls_group`'s `Entry::Vacant` collision guard. Neither party
-/// allocates or carries a separate group id (§5.15.8).
-///
-/// # A-side vs B-side
-///
-/// `creation_receipt` is `Some` on the **A-side** (the lower DID,
-/// `local_did == did_lo`) and `None` on the **B-side** (`local_did ==
-/// did_hi`). The `CreationReceipt` booleans are inherently A-local
-/// creation state — B, joining via Welcome, creates no group or sender
-/// key and authors no independent receipt (§5.15.8 "Prepare-B").
-///
-/// # Serialization
-///
-/// This actor-side prepared state is deliberately NOT `Serialize` (the
-/// wrapping [`SagaPreparedState`] enum carries the §9.4.3 non-derive
-/// barrier). Journal evidence is produced via the explicit
-/// [`StandingPairCreatePreparedWire`] mirror (`MessagePack` of the public
-/// fields, §5.15.8 "Commitment coverage"), reached through
-/// [`StandingPairCreatePrepared::to_evidence_bytes`] /
-/// [`StandingPairCreatePrepared::from_evidence_bytes`].
-pub struct StandingPairCreatePrepared {
-    /// The remote peer's DID. A-side: `did_hi`; B-side: `did_lo`.
-    pub peer_did: DID,
-    /// The local identity's DID. A-side: `did_lo`; B-side: `did_hi`.
-    pub local_did: DID,
-    /// The 32-byte context ID derived from the sorted DID pair — see
-    /// §5.15.8 "Determinism precondition" for the derivation. This is the
-    /// raw digest (before the `"standing-"` prefix and hex), and is the
-    /// key the crypto provider indexes MLS group state by.
-    pub derived_context_id: [u8; 32],
-    /// Staged [`CreationReceipt`] — `Some` on the A-side (`local_did ==
-    /// did_lo`), `None` on the B-side. B authors no receipt (§5.15.8
-    /// "Prepare-B").
-    ///
-    /// `private_interfaces` is allowed for the deliberate-by-design
-    /// asymmetry: the field is `pub` (matching the rest of the struct's
-    /// public surface) while [`CreationReceipt`] is `pub(in crate::context)`
-    /// — the receipt type is crate-context-internal but the field through
-    /// which a handler reads it is public, mirroring the
-    /// `SupervisorHandle`/`OwnedIdentityDid` discipline in this module.
-    #[allow(private_interfaces)]
-    pub creation_receipt: Option<CreationReceipt>,
-}
-
-/// `Serialize`/`Deserialize` wire mirror of the **public** fields of
-/// [`StandingPairCreatePrepared`], used to produce the journal `evidence`
-/// (spec §5.15.8 "Commitment coverage": the `MessagePack` of the public
-/// prepared state). The actor-side [`StandingPairCreatePrepared`] is
-/// deliberately non-`Serialize` because the wrapping [`SagaPreparedState`]
-/// enum carries the §9.4.3 non-derive barrier; this explicit mirror is the
-/// sanctioned serialization path, matching the
-/// `JournalEntryWire`/`EvidenceWire` discipline in
-/// [`crate::context::supervisor::saga_journal`].
-///
-/// All fields are public plan-metadata classified **public** — there is
-/// no §9.4.3 secret commitment. `DID` is carried as its canonical string.
-///
-/// `dead_code` is allowed: this wire mirror and the `to_evidence_bytes` /
-/// `from_evidence_bytes` helpers below are the journal-evidence path for
-/// the standing-pair saga, consumed when the saga dispatch wiring lands in
-/// a follow-on PR. The unit tests exercise the round-trip now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub(in crate::context) struct StandingPairCreatePreparedWire {
-    /// `peer_did.0`.
-    pub peer_did: String,
-    /// `local_did.0`.
-    pub local_did: String,
-    /// The raw 32-byte derived context id.
-    pub derived_context_id: [u8; 32],
-    /// `Some` on the A-side; `None` on the B-side (§5.15.8 "Prepare-B").
-    pub creation_receipt: Option<CreationReceipt>,
-}
-
-#[allow(dead_code)] // evidence path consumed by the saga dispatch wiring PR
-impl StandingPairCreatePrepared {
-    /// Encode the public prepared state to its journal `evidence` bytes —
-    /// `MessagePack` of the [`StandingPairCreatePreparedWire`] mirror
-    /// (spec §5.15.8 "Commitment coverage"). Classified **public**; the
-    /// supervisor wraps these bytes in the standard `Zeroizing` envelope
-    /// for uniformity only.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `rmp_serde` encode error string if serialization fails.
-    pub(in crate::context) fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
-        let wire = StandingPairCreatePreparedWire {
-            peer_did: self.peer_did.0.clone(),
-            local_did: self.local_did.0.clone(),
-            derived_context_id: self.derived_context_id,
-            creation_receipt: self.creation_receipt.clone(),
-        };
-        rmp_serde::to_vec_named(&wire).map_err(|e| format!("encode: {e}"))
-    }
-
-    /// Decode public prepared state from its journal `evidence` bytes,
-    /// reversing [`Self::to_evidence_bytes`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the `rmp_serde` decode error string if `bytes` is not a
-    /// valid `MessagePack` encoding of the wire mirror.
-    pub(in crate::context) fn from_evidence_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let wire: StandingPairCreatePreparedWire =
-            rmp_serde::from_slice(bytes).map_err(|e| format!("decode: {e}"))?;
-        Ok(Self {
-            peer_did: DID(wire.peer_did),
-            local_did: DID(wire.local_did),
-            derived_context_id: wire.derived_context_id,
-            creation_receipt: wire.creation_receipt,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +118,8 @@ impl StandingPairCreatePrepared {
 /// public fields), reached through
 /// [`CrossContextToolInvocationPrepared::to_evidence_bytes`] /
 /// [`CrossContextToolInvocationPrepared::from_evidence_bytes`], mirroring
-/// the [`StandingPairCreatePrepared`] discipline above.
+/// the `JournalEntryWire`/`EvidenceWire` discipline in
+/// [`crate::context::supervisor::saga_journal`].
 pub struct CrossContextToolInvocationPrepared {
     /// Calling context ID — the raw 32-byte context-id digest (never a
     /// `"standing-"`-prefixed string), matching the id-form rule §6.2.4
@@ -297,7 +162,8 @@ pub struct CrossContextToolInvocationPrepared {
 /// [`CrossContextToolInvocationPrepared`] is deliberately non-`Serialize`
 /// because the wrapping [`SagaPreparedState`] enum carries the §9.4.3
 /// non-derive barrier; this explicit mirror is the sanctioned serialization
-/// path, matching the [`StandingPairCreatePreparedWire`] discipline above.
+/// path, matching the `JournalEntryWire`/`EvidenceWire` discipline in
+/// [`crate::context::supervisor::saga_journal`].
 ///
 /// All eight fields are public plan-metadata classified **public** — there
 /// is no §9.4.3 secret commitment (`mark_resolved(secret_bearing=false)`).
@@ -435,32 +301,10 @@ pub struct BroadcastHostingHandshakePrepared {
 /// visibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SagaPreparedStateSnapshot {
-    /// Mirror of [`SagaPreparedState::StandingPairCreate`].
-    StandingPairCreate(StandingPairCreateSnapshot),
     /// Mirror of [`SagaPreparedState::CrossContextToolInvocation`].
     CrossContextToolInvocation(CrossContextToolInvocationSnapshot),
     /// Mirror of [`SagaPreparedState::BroadcastHostingHandshake`].
     BroadcastHostingHandshake(BroadcastHostingHandshakeSnapshot),
-}
-
-/// Public snapshot payload for [`SagaPreparedState::StandingPairCreate`]
-/// (§5.15.8; all fields public, not bearer-bearing).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StandingPairCreateSnapshot {
-    /// `peer_did.0`.
-    pub peer_did: String,
-    /// `local_did.0`.
-    pub local_did: String,
-    /// The raw 32-byte derived context id.
-    pub derived_context_id: [u8; 32],
-    /// `Some` on the A-side; `None` on the B-side (§5.15.8 "Prepare-B").
-    ///
-    /// `private_interfaces` is allowed for the same deliberate asymmetry as
-    /// the live [`StandingPairCreatePrepared::creation_receipt`] field: the
-    /// field is `pub` (the snapshot rides the public [`ContextSnapshot`]
-    /// surface) while [`CreationReceipt`] is `pub(in crate::context)`.
-    #[allow(private_interfaces)]
-    pub creation_receipt: Option<CreationReceipt>,
 }
 
 /// Public snapshot payload for
@@ -511,14 +355,6 @@ impl SagaPreparedStateSnapshot {
     #[must_use]
     pub fn from_prepared(prepared: &SagaPreparedState) -> Self {
         match prepared {
-            SagaPreparedState::StandingPairCreate(inner) => {
-                Self::StandingPairCreate(StandingPairCreateSnapshot {
-                    peer_did: inner.peer_did.0.clone(),
-                    local_did: inner.local_did.0.clone(),
-                    derived_context_id: inner.derived_context_id,
-                    creation_receipt: inner.creation_receipt.clone(),
-                })
-            }
             SagaPreparedState::CrossContextToolInvocation(inner) => {
                 Self::CrossContextToolInvocation(CrossContextToolInvocationSnapshot {
                     caller_context_id: inner.caller_context_id,
@@ -548,14 +384,6 @@ impl SagaPreparedStateSnapshot {
     #[must_use]
     pub fn into_prepared(self) -> SagaPreparedState {
         match self {
-            Self::StandingPairCreate(snap) => {
-                SagaPreparedState::StandingPairCreate(StandingPairCreatePrepared {
-                    peer_did: DID(snap.peer_did),
-                    local_did: DID(snap.local_did),
-                    derived_context_id: snap.derived_context_id,
-                    creation_receipt: snap.creation_receipt,
-                })
-            }
             Self::CrossContextToolInvocation(snap) => {
                 SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
                     caller_context_id: snap.caller_context_id,
@@ -732,77 +560,6 @@ mod tests {
         DID("did:example:bob".to_owned())
     }
 
-    fn sample_receipt() -> CreationReceipt {
-        CreationReceipt::new_pending(format!("standing-{}", "cd".repeat(32)), &alice(), &bob())
-    }
-
-    #[test]
-    fn standing_pair_create_a_side_constructs() {
-        // A-side: local_did = did_lo (alice), receipt present.
-        let receipt = sample_receipt();
-        let state = SagaPreparedState::StandingPairCreate(StandingPairCreatePrepared {
-            peer_did: bob(),
-            local_did: alice(),
-            derived_context_id: [1u8; 32],
-            creation_receipt: Some(receipt.clone()),
-        });
-        match state {
-            SagaPreparedState::StandingPairCreate(inner) => {
-                assert_eq!(inner.peer_did, bob());
-                assert_eq!(inner.local_did, alice());
-                assert_eq!(inner.derived_context_id, [1u8; 32]);
-                assert_eq!(inner.creation_receipt, Some(receipt));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn standing_pair_create_b_side_has_no_receipt() {
-        // B-side: local_did = did_hi (bob), receipt absent (§5.15.8
-        // Prepare-B — B authors no CreationReceipt).
-        let inner = StandingPairCreatePrepared {
-            peer_did: alice(),
-            local_did: bob(),
-            derived_context_id: [2u8; 32],
-            creation_receipt: None,
-        };
-        assert_eq!(inner.local_did, bob());
-        assert!(inner.creation_receipt.is_none());
-    }
-
-    #[test]
-    fn standing_pair_evidence_round_trips_a_side() {
-        let original = StandingPairCreatePrepared {
-            peer_did: bob(),
-            local_did: alice(),
-            derived_context_id: [9u8; 32],
-            creation_receipt: Some(sample_receipt()),
-        };
-        let bytes = original.to_evidence_bytes().unwrap();
-        let back = StandingPairCreatePrepared::from_evidence_bytes(&bytes).unwrap();
-        assert_eq!(back.peer_did, original.peer_did);
-        assert_eq!(back.local_did, original.local_did);
-        assert_eq!(back.derived_context_id, original.derived_context_id);
-        assert_eq!(back.creation_receipt, original.creation_receipt);
-    }
-
-    #[test]
-    fn standing_pair_evidence_round_trips_b_side() {
-        let original = StandingPairCreatePrepared {
-            peer_did: alice(),
-            local_did: bob(),
-            derived_context_id: [3u8; 32],
-            creation_receipt: None,
-        };
-        let bytes = original.to_evidence_bytes().unwrap();
-        let back = StandingPairCreatePrepared::from_evidence_bytes(&bytes).unwrap();
-        assert_eq!(back.peer_did, original.peer_did);
-        assert_eq!(back.local_did, original.local_did);
-        assert_eq!(back.derived_context_id, original.derived_context_id);
-        assert!(back.creation_receipt.is_none());
-    }
-
     #[test]
     fn cross_context_tool_invocation_constructs() {
         let state =
@@ -827,7 +584,7 @@ mod tests {
                 assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 3);
             }
-            _ => panic!("wrong variant"),
+            SagaPreparedState::BroadcastHostingHandshake(_) => panic!("wrong variant"),
         }
     }
 
@@ -891,7 +648,7 @@ mod tests {
                 assert_eq!(inner.subscriber_did, bob());
                 assert_eq!(inner.broadcast_host_config_bytes, vec![0xDD; 48]);
             }
-            _ => panic!("wrong variant"),
+            SagaPreparedState::CrossContextToolInvocation(_) => panic!("wrong variant"),
         }
     }
 
@@ -909,37 +666,12 @@ mod tests {
     fn types_are_send_sync() {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SagaPreparedState>();
-        assert_send_sync::<StandingPairCreatePrepared>();
         assert_send_sync::<CrossContextToolInvocationPrepared>();
         assert_send_sync::<BroadcastHostingHandshakePrepared>();
     }
 
     /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
-    /// deserialize, then rehydrate to an identical live `SagaPreparedState`
-    /// for the standing-pair variant (receipt-bearing A-side).
-    #[test]
-    fn snapshot_mirror_round_trips_standing_pair_a_side() {
-        let prepared = SagaPreparedState::StandingPairCreate(StandingPairCreatePrepared {
-            peer_did: bob(),
-            local_did: alice(),
-            derived_context_id: [0x5Cu8; 32],
-            creation_receipt: Some(sample_receipt()),
-        });
-        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
-        let bytes = serde_json::to_vec(&mirror).unwrap();
-        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(mirror, back);
-        match back.into_prepared() {
-            SagaPreparedState::StandingPairCreate(inner) => {
-                assert_eq!(inner.peer_did, bob());
-                assert_eq!(inner.local_did, alice());
-                assert_eq!(inner.derived_context_id, [0x5Cu8; 32]);
-                assert_eq!(inner.creation_receipt, Some(sample_receipt()));
-            }
-            _ => panic!("wrong variant after rehydrate"),
-        }
-    }
-
+    /// deserialize, then rehydrate to an identical live `SagaPreparedState`.
     /// Same round-trip for the cross-context tool-invocation variant — all
     /// eight journaled fields must survive (§6.2.4 public-metadata journaling).
     #[test]
@@ -970,7 +702,9 @@ mod tests {
                 assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
                 assert_eq!(inner.recorded_chain_depth, 7);
             }
-            _ => panic!("wrong variant after rehydrate"),
+            SagaPreparedState::BroadcastHostingHandshake(_) => {
+                panic!("wrong variant after rehydrate")
+            }
         }
     }
 
@@ -996,7 +730,9 @@ mod tests {
                 assert_eq!(inner.subscriber_did, bob());
                 assert_eq!(inner.broadcast_host_config_bytes, vec![0xAB, 0xCD, 0xEF]);
             }
-            _ => panic!("wrong variant after rehydrate"),
+            SagaPreparedState::CrossContextToolInvocation(_) => {
+                panic!("wrong variant after rehydrate")
+            }
         }
     }
 }

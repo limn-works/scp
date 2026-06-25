@@ -1318,10 +1318,6 @@ impl ContextActor {
                 reply,
                 "standing::reconnect_all_standing (use Supervisor::dispatch_standing_command during commit 11)",
             ),
-            StandingCommand::InitiateStandingPairCreate { reply, .. } => ack_not_impl(
-                reply,
-                "standing::initiate_standing_pair_create (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
-            ),
         }
     }
 

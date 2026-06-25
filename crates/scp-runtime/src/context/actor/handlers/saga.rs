@@ -3493,8 +3493,7 @@ mod tests {
             }
             // `SagaPreparedState` is non-Debug (§9.4.3 barrier), so name the
             // wrong arm without formatting it.
-            SagaPreparedState::StandingPairCreate(_)
-            | SagaPreparedState::BroadcastHostingHandshake(_) => {
+            SagaPreparedState::BroadcastHostingHandshake(_) => {
                 panic!("wrong staged variant — expected CrossContextToolInvocation")
             }
         }
