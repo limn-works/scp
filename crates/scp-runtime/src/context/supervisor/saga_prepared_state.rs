@@ -54,11 +54,21 @@ use serde::{Deserialize, Serialize};
 // Discriminated union over the saga types defined by ADR-049 §3
 // ---------------------------------------------------------------------------
 
-/// Discriminated union over the saga types defined by ADR-049 §3.
+/// Prepared (Prepare-time) snapshot for an in-flight saga.
 ///
-/// Each variant carries every field needed to replay Commit deterministically
-/// from the Prepare-time snapshot. The shape is saga-type specific; see the
-/// per-variant documentation.
+/// The sole production saga is cross-context tool invocation (spec §6.2.4);
+/// the other contemplated saga types (custody handover, standing-pair create,
+/// broadcast hosting handshake) were all withdrawn as category errors
+/// (ADR-049 §3/§3b), so today this carries a single variant.
+///
+/// It is retained as a discriminated union so that adding a new saga type
+/// later is a compile error at every match site — the default branch is not
+/// permitted, and no future variant can be silently dropped from the replay
+/// or snapshot paths.
+///
+/// The variant carries every field needed to replay Commit deterministically
+/// from the Prepare-time snapshot; see the variant's own documentation for the
+/// per-saga shape.
 ///
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
@@ -269,12 +279,13 @@ impl CrossContextToolInvocationPrepared {
 /// to compile here until its snapshot projection is decided, so a new saga
 /// type can never be silently dropped from the Class-S snapshot.
 ///
-/// Each variant carries its OWN public-field payload struct rather than
-/// reusing the `pub(in crate::context)` journal `*Wire` mirrors: the
+/// The variant carries its OWN public-field payload struct rather than
+/// reusing the `pub(in crate::context)` journal `*Wire` mirror: the
 /// snapshot rides the fully-`pub` [`ContextSnapshot`] surface, while the
-/// journal wires stay crate-context-internal to the evidence path. The two
+/// journal wire stays crate-context-internal to the evidence path. The two
 /// projections cover the identical public fields but have independent
-/// visibility.
+/// visibility. A future saga type would add its own branch here under the
+/// same discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SagaPreparedStateSnapshot {
     /// Mirror of [`SagaPreparedState::CrossContextToolInvocation`].
@@ -515,18 +526,16 @@ mod tests {
                 recorded_nonce: [0xABu8; 16],
                 recorded_chain_depth: 3,
             });
-        match state {
-            SagaPreparedState::CrossContextToolInvocation(inner) => {
-                assert_eq!(inner.caller_context_id, [5u8; 32]);
-                assert_eq!(inner.target_context_id, [6u8; 32]);
-                assert_eq!(inner.caller_did, alice());
-                assert_eq!(inner.tool_registration_id, "calculator-v1");
-                assert_eq!(inner.ucan_proof_id, "ucan-token-abcdef");
-                assert_eq!(inner.recorded_timestamp_ms, 1_725_000_000_123);
-                assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
-                assert_eq!(inner.recorded_chain_depth, 3);
-            }
-        }
+        // Single-variant enum: the bind is irrefutable.
+        let SagaPreparedState::CrossContextToolInvocation(inner) = state;
+        assert_eq!(inner.caller_context_id, [5u8; 32]);
+        assert_eq!(inner.target_context_id, [6u8; 32]);
+        assert_eq!(inner.caller_did, alice());
+        assert_eq!(inner.tool_registration_id, "calculator-v1");
+        assert_eq!(inner.ucan_proof_id, "ucan-token-abcdef");
+        assert_eq!(inner.recorded_timestamp_ms, 1_725_000_000_123);
+        assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
+        assert_eq!(inner.recorded_chain_depth, 3);
     }
 
     #[test]
@@ -611,17 +620,15 @@ mod tests {
         let bytes = serde_json::to_vec(&mirror).unwrap();
         let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(mirror, back);
-        match back.into_prepared() {
-            SagaPreparedState::CrossContextToolInvocation(inner) => {
-                assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
-                assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
-                assert_eq!(inner.caller_did, alice());
-                assert_eq!(inner.tool_registration_id, "calc-v2");
-                assert_eq!(inner.ucan_proof_id, "ucan-xyz");
-                assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
-                assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
-                assert_eq!(inner.recorded_chain_depth, 7);
-            }
-        }
+        // Single-variant enum: the bind is irrefutable.
+        let SagaPreparedState::CrossContextToolInvocation(inner) = back.into_prepared();
+        assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
+        assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
+        assert_eq!(inner.caller_did, alice());
+        assert_eq!(inner.tool_registration_id, "calc-v2");
+        assert_eq!(inner.ucan_proof_id, "ucan-xyz");
+        assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
+        assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
+        assert_eq!(inner.recorded_chain_depth, 7);
     }
 }

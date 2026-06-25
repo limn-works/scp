@@ -2054,23 +2054,20 @@ mod tests {
         // --- Assert observable state is value-stable ---
         // saga_pending: the staged variant + its eight journaled fields survive.
         assert_eq!(state.class_s.saga_pending.len(), 1);
-        match state
+        // Single-variant enum: the bind is irrefutable.
+        let SagaPreparedState::CrossContextToolInvocation(inner) = state
             .class_s
             .saga_pending
             .get(&saga_a)
-            .expect("saga restored")
-        {
-            SagaPreparedState::CrossContextToolInvocation(inner) => {
-                assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
-                assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
-                assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
-                assert_eq!(inner.tool_registration_id, "lossless-tool-v1");
-                assert_eq!(inner.ucan_proof_id, "lossless-ucan");
-                assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
-                assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
-                assert_eq!(inner.recorded_chain_depth, 2);
-            }
-        }
+            .expect("saga restored");
+        assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
+        assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
+        assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
+        assert_eq!(inner.tool_registration_id, "lossless-tool-v1");
+        assert_eq!(inner.ucan_proof_id, "lossless-ucan");
+        assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
+        assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
+        assert_eq!(inner.recorded_chain_depth, 2);
         // xctx_nonce_dedup: the recorded nonce + TTL survive (a fresh replay of
         // the same nonce within the TTL is still detected).
         assert!(
