@@ -1962,11 +1962,8 @@ pub enum TrustRecoveryCommand {
     },
 }
 
-/// See [`ContextCommand::Standing`]. Real variants cover every public
-/// method on [`crate::context::standing_helpers`] that is NOT the
-/// saga-wired standing-pair-create initiator path. The saga path is
-/// spec-gapped — see
-/// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+/// See [`ContextCommand::Standing`]. Real variants cover the public
+/// methods on [`crate::context::standing_helpers`].
 pub enum StandingCommand {
     /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
     /// ADR-049 (post-review-round-1 plan). Used as a no-op
@@ -2043,22 +2040,6 @@ pub enum StandingCommand {
     ReconnectAllStanding {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<usize, ContextError>>,
-    },
-
-    /// Saga-initiator path for standing-pair creation. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the 2-phase
-    /// Prepare+Commit decomposition is spec-gapped. See
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-    InitiateStandingPairCreate {
-        /// Local identity DID initiating the pair.
-        local_did: scp_identity::DID,
-        /// Remote peer DID.
-        peer_did: scp_identity::DID,
-        /// Oneshot reply channel. Carries the saga's durable ID on
-        /// success; `ContextError::NotImplemented` during the deferred
-        /// window.
-        reply:
-            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 

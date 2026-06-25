@@ -201,19 +201,10 @@ impl RestoredContexts {
 /// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
 /// a required choice the type system can enforce must not be skippable). The
 /// generic `start_saga` therefore only ever receives the publicly-constructible
-/// variants (`StandingPairCreate` / `BroadcastHostingHandshake`, both
-/// `NotImplemented` today). External pattern-matching on
-/// `CrossContextToolInvocation { .. }` is still allowed; only construction is
-/// sealed.
+/// variant (`BroadcastHostingHandshake`, `NotImplemented` today). External
+/// pattern-matching on `CrossContextToolInvocation { .. }` is still allowed;
+/// only construction is sealed.
 pub enum SagaInput {
-    /// Standing-pair creation between two identities. Full field set
-    /// arrives with `handlers/standing.rs` in commit 11.
-    StandingPairCreate {
-        /// The local identity initiating the pair.
-        local_did: DID,
-        /// The remote peer.
-        peer_did: DID,
-    },
     /// Cross-context tool invocation.
     CrossContextToolInvocation {
         /// Calling context.
@@ -4388,11 +4379,7 @@ impl Supervisor {
     /// (ADR-049 commit 11 / plan row 11).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
-    /// contact-graph (standing context) paths from spec §5.12.4. The
-    /// saga-initiator variant
-    /// (`StandingCommand::InitiateStandingPairCreate`) returns
-    /// [`ContextError::NotImplemented`] during the commit-11 window —
-    /// see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// contact-graph (standing context) paths from spec §5.12.4.
     ///
     /// # Errors
     ///
@@ -4513,14 +4500,6 @@ impl Supervisor {
                     };
                 let _ = reply.send(reply_result);
                 outcome
-            }
-            StandingCommand::InitiateStandingPairCreate { reply, .. } => {
-                const MSG: &str = "standing::initiate_standing_pair_create — saga wiring deferred to \
-                     commit 11.5 per 5 enumerated spec gaps; see \
-                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 1: standing-pair \
-                     2-phase decomposition)";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
             }
         }
     }
@@ -5086,8 +5065,8 @@ impl Supervisor {
     ///
     /// # Unwired saga use cases (pending Phase 2C)
     ///
-    /// `StandingPairCreate` and `BroadcastHostingHandshake` remain spec-gapped
-    /// (their Prepare dispatch returns [`ContextError::NotImplemented`]; the FSM
+    /// `BroadcastHostingHandshake` remains spec-gapped
+    /// (its Prepare dispatch returns [`ContextError::NotImplemented`]; the FSM
     /// transitions through `Initiated → PreparingA → Aborting → Aborted` and
     /// surfaces the typed error). `CrossContextToolInvocation` is the wired
     /// variant — its end-to-end Prepare/Commit dispatch over the two co-resident
@@ -5108,7 +5087,7 @@ impl Supervisor {
     ///   participant context set overlaps an in-flight saga's reserved set.
     ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
     /// - [`ContextError::NotImplemented`] for the spec-gapped
-    ///   `StandingPairCreate` / `BroadcastHostingHandshake` inputs.
+    ///   `BroadcastHostingHandshake` input.
     /// - [`ContextError::InvalidState`] on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
@@ -5504,14 +5483,13 @@ impl Supervisor {
         self.try_reserve_context_set(&set)
     }
 
-    /// Test-only: the CANONICAL gating reservation key a standing-pair saga
-    /// over `(local_did, peer_did)` reserves — the raw-digest hex
+    /// Test-only: the CANONICAL standing-context digest over
+    /// `(local_did, peer_did)` — the raw-digest hex
     /// (`hex::encode(derive_standing_context_digest(..))`), NOT the
-    /// `"standing-"`-prefixed actor-registry id. Lets a cross-saga-type
-    /// overlap test feed the EXACT key a `StandingPairCreate` saga reserves
-    /// into a `CrossContextToolInvocation` saga's `[u8; 32]` context field,
-    /// proving overlap detection is pure set-membership across saga types
-    /// (ADR-049 §3a, spec §5.15.4 / §5.15.8).
+    /// `"standing-"`-prefixed actor-registry id. Lets a gating overlap test
+    /// feed an arbitrary deterministic `[u8; 32]` context key into a
+    /// `CrossContextToolInvocation` saga's context field, proving overlap
+    /// detection is pure set-membership (ADR-049 §3a, spec §5.15.4 / §5.15.8).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn test_standing_pair_context_digest(local_did: &DID, peer_did: &DID) -> [u8; 32] {
@@ -6038,10 +6016,9 @@ impl Supervisor {
     /// `[hex(caller_context_id), caller_did, tool_registration_id]` — length 3
     /// with a 64-char lowercase-hex first element (the caller's raw-digest
     /// context id, the canonical `lookup` / persistence key). The other saga
-    /// variants either record a different-length set (`StandingPairCreate` ⇒ 2,
-    /// `BroadcastHostingHandshake` ⇒ 3 but with a DID/hex shape whose
-    /// `participants[0]` is the host context hex — see below) or a single-element
-    /// set (`TestForceNeedsRepair`).
+    /// variants either record a different shape (`BroadcastHostingHandshake`
+    /// ⇒ 3 but with a DID/hex shape whose `participants[0]` is the host context
+    /// hex — see below) or a single-element set (`TestForceNeedsRepair`).
     ///
     /// To avoid misclassifying a `BroadcastHostingHandshake` (also length 3,
     /// also `hex(...)` first element) as a cross-context caller, this is used
@@ -6522,8 +6499,8 @@ impl Supervisor {
     /// ([ADR-049](crate) §7; a timeout maps to
     /// [`ContextError::TransportTimeout`]).
     ///
-    /// `StandingPairCreate` / `BroadcastHostingHandshake` are spec-gapped
-    /// (return [`ContextError::NotImplemented`]). For
+    /// `BroadcastHostingHandshake` is spec-gapped
+    /// (returns [`ContextError::NotImplemented`]). For
     /// `CrossContextToolInvocation` the FSM routes the per-phase message to the
     /// co-resident participant actor and threads the reply into `xctx`:
     /// Prepare-A → caller actor → hold `PreparedAFields`; Prepare-B → target
@@ -6541,11 +6518,6 @@ impl Supervisor {
 
         let dispatch_fut = async {
             match input {
-                SagaInput::StandingPairCreate { .. } => Err(ContextError::NotImplemented(format!(
-                    "saga Prepare{phase:?} — StandingPairCreate wiring deferred to commit 11.5 \
-                     per DEFERRED-commit-11-saga-use-cases.md gap 1 (standing-pair 2-phase \
-                     decomposition)"
-                ))),
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(format!(
@@ -6719,9 +6691,8 @@ impl Supervisor {
     ///
     /// For a wired `CrossContextToolInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
-    /// Commit-A, ordered B then A. `StandingPairCreate` /
-    /// `BroadcastHostingHandshake` stay `NotImplemented`; `TestForceNeedsRepair`
-    /// always fails.
+    /// Commit-A, ordered B then A. `BroadcastHostingHandshake` stays
+    /// `NotImplemented`; `TestForceNeedsRepair` always fails.
     async fn dispatch_commit_phase(
         &self,
         saga_id: &SagaId,
@@ -6732,9 +6703,8 @@ impl Supervisor {
 
         let dispatch_fut = async {
             match input {
-                SagaInput::StandingPairCreate { .. }
-                | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
-                    "saga Commit — StandingPairCreate / BroadcastHostingHandshake commit-side \
+                SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
+                    "saga Commit — BroadcastHostingHandshake commit-side \
                          wiring deferred per DEFERRED-commit-11-saga-use-cases.md"
                         .to_owned(),
                 )),
@@ -10492,30 +10462,19 @@ impl Supervisor {
 
     /// Extract the target context_id from a [`StandingCommand`].
     ///
-    /// Variants that carry both `local_did` and `peer_did` derive their
-    /// context_id deterministically via
-    /// [`crate::context::standing_helpers::generate_standing_context_id`]
-    /// — this returns `Some(<derived_id>)` so the dispatch helper can
-    /// route through any per-context actor that already exists for the
-    /// derived ID. The other variants are supervisor-scoped (count /
-    /// has / register / reconnect-all) — they touch the supervisor's
-    /// standing index directly, not per-context state, so they return
-    /// `None` and dispatch routes them to the SupervisorHandle.
+    /// Every current variant is supervisor-scoped (get-or-create / count /
+    /// has / register / reconnect-all / placeholder): they touch the
+    /// supervisor's standing index or the get-or-create path directly, not a
+    /// pre-existing per-context actor's state, so they return `None` and
+    /// dispatch routes them to the SupervisorHandle.
     ///
-    /// Returns an owned `String` rather than `&str` because the derived
-    /// ID is computed on demand from the variant's DID fields; there is
-    /// no backing string to borrow.
-    fn standing_command_context_id(cmd: &StandingCommand) -> Option<String> {
+    /// Returns an owned `String` (rather than `&str`) so a future variant that
+    /// carries both `local_did` and `peer_did` can derive its context_id on
+    /// demand via
+    /// [`crate::context::standing_helpers::generate_standing_context_id`]
+    /// and route through an already-spawned per-context actor.
+    const fn standing_command_context_id(cmd: &StandingCommand) -> Option<String> {
         match cmd {
-            // The saga-initiator variant targets the per-context actor for
-            // the derived standing id (Prepare/Commit lands on that actor).
-            StandingCommand::InitiateStandingPairCreate {
-                local_did,
-                peer_did,
-                ..
-            } => Some(
-                crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did),
-            ),
             // `StandingContext` get-or-create is supervisor-scoped, NOT
             // per-context: the actor-native body
             // ([`Self::standing_context`]) may CREATE the target actor (it
@@ -10663,10 +10622,6 @@ enum SagaPhase {
 /// carried separately (via [`SagaState`]).
 fn saga_input_participants(input: &SagaInput) -> Vec<String> {
     match input {
-        SagaInput::StandingPairCreate {
-            local_did,
-            peer_did,
-        } => vec![local_did.to_string(), peer_did.to_string()],
         SagaInput::CrossContextToolInvocation {
             caller_context_id,
             // `target_context_id` is part of the gating participant set
@@ -10718,33 +10673,20 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
 /// # Canonical reservation key
 ///
 /// Every variant reserves the **raw-digest hex** of each context it spans —
-/// `hex::encode([u8; 32])` — which is the canonical saga-evidence / wire form
+/// `hex::encode([u8; 32])` — which is the canonical wire form
 /// (spec §5.15.8: the `derived_context_id` is "the raw digest before prefix
 /// and hex"; §6.2.4 / §5.14.13 for the cross-context / broadcast wire ids).
-/// In particular `StandingPairCreate` reserves
-/// `hex::encode(derive_standing_context_digest(local, peer))` — the RAW digest,
-/// NOT the `"standing-"`-prefixed actor-registry id. The standing context still
-/// LIVES under the prefixed id in the actor registry; only the gating
-/// reservation key is canonicalized to the raw-digest hex so that a
-/// cross-context or broadcast saga which shares that same standing context
-/// reserves the IDENTICAL key and therefore OVERLAPS (defeating it otherwise
-/// would let two sagas touch the shared context concurrently, breaking the
-/// §5.15.4 serialization the §5.15.8 anti-griefing and §5.14.13 aggregate-cap
-/// arguments depend on).
+/// The gating reservation key is canonicalized to the raw-digest hex (NOT any
+/// prefixed actor-registry id) so that two sagas which share the SAME
+/// underlying context reserve the IDENTICAL key and therefore OVERLAP
+/// (defeating it otherwise would let two sagas touch the shared context
+/// concurrently, breaking the §5.15.4 serialization the §5.15.8 anti-griefing
+/// and §5.14.13 aggregate-cap arguments depend on).
 ///
-/// - `StandingPairCreate` → the single deterministic standing-pair raw-digest
-///   hex (`derive_standing_context_digest`, the hex of spec §5.15.8's
-///   `derived_context_id`).
 /// - `CrossContextToolInvocation` → `{caller, target}` context ids.
 /// - `BroadcastHostingHandshake` → `{host, broadcast}` context ids.
 fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
     let raw: Vec<String> = match input {
-        SagaInput::StandingPairCreate {
-            local_did,
-            peer_did,
-        } => vec![hex::encode(
-            crate::context::standing_helpers::derive_standing_context_digest(local_did, peer_did),
-        )],
         SagaInput::CrossContextToolInvocation {
             caller_context_id,
             target_context_id,
@@ -10792,8 +10734,7 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
 /// type) so recovery resolution also overwrites prior on-disk evidence.
 const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
     match input {
-        SagaInput::StandingPairCreate { .. }
-        | SagaInput::CrossContextToolInvocation { .. }
+        SagaInput::CrossContextToolInvocation { .. }
         | SagaInput::BroadcastHostingHandshake { .. } => false,
         // The test-only NeedsRepair driver carries no bearer material.
         #[cfg(any(test, feature = "testing"))]
@@ -11245,17 +11186,18 @@ mod tests {
 
     #[tokio::test]
     async fn start_saga_returns_not_implemented_for_spec_gapped_input() {
-        // All 3 current SagaInput variants are not yet wired — the FSM
-        // journals Initiated + PreparingA then fails the Prepare
-        // dispatch with NotImplemented, rolls back via abort_saga, and
-        // returns the typed error. This exercises the coordinator
+        // The spec-gapped `BroadcastHostingHandshake` variant is not yet
+        // wired — the FSM journals Initiated + PreparingA then fails the
+        // Prepare dispatch with NotImplemented, rolls back via abort_saga,
+        // and returns the typed error. This exercises the coordinator
         // through the PreparingA → Aborting → Aborted arm of the FSM
         // without needing spec-filled inputs.
         let s = test_supervisor();
         let err = s
-            .start_saga(SagaInput::StandingPairCreate {
-                local_did: DID("did:example:a".to_owned()),
-                peer_did: DID("did:example:b".to_owned()),
+            .start_saga(SagaInput::BroadcastHostingHandshake {
+                host_context_id: [1u8; 32],
+                broadcast_context_id: [2u8; 32],
+                subscriber_did: DID("did:example:sub".to_owned()),
             })
             .await
             .unwrap_err();
@@ -11267,9 +11209,10 @@ mod tests {
         // same-set sequential re-arm property: the RAII `SagaSetReservation`
         // drop frees the slots on every terminal.
         let err2 = s
-            .start_saga(SagaInput::StandingPairCreate {
-                local_did: DID("did:example:a".to_owned()),
-                peer_did: DID("did:example:b".to_owned()),
+            .start_saga(SagaInput::BroadcastHostingHandshake {
+                host_context_id: [1u8; 32],
+                broadcast_context_id: [2u8; 32],
+                subscriber_did: DID("did:example:sub".to_owned()),
             })
             .await
             .unwrap_err();
@@ -14429,21 +14372,6 @@ mod tests {
                 },
             ),
         );
-        let standing_saga_id =
-            crate::context::supervisor::saga_journal::SagaId("saga-class-s-standing".to_owned());
-        let standing_derived = [0x9Du8; 32];
-        state.class_s.saga_pending.insert(
-            standing_saga_id.clone(),
-            crate::context::supervisor::saga_prepared_state::SagaPreparedState::StandingPairCreate(
-                crate::context::supervisor::saga_prepared_state::StandingPairCreatePrepared {
-                    peer_did: DID("did:example:class-s-peer".to_owned()),
-                    local_did: DID("did:example:class-s-admin".to_owned()),
-                    derived_context_id: standing_derived,
-                    creation_receipt: None,
-                },
-            ),
-        );
-
         // Committed cross-context tool invocation (ADR-049 §9 line 144 — spec
         // §6.2.4 "Exactly-once execution with durable output capture"). Both the
         // TARGET-side durable output capture and the CALLER-side commit witness
@@ -14518,15 +14446,15 @@ mod tests {
             "Class S: read_exclusion_list must round-trip (access revocation)"
         );
 
-        // saga_pending (ADR-049 §9 line 144): both staged variants must survive
+        // saga_pending (ADR-049 §9 line 144): the staged variant must survive
         // the snapshot round-trip through the `SagaPreparedStateSnapshot`
         // mirror, and rehydrate to the identical live `SagaPreparedState`. A
         // field that the builder dropped, or a mirror that lost a journaled
         // field, is exactly the regression this asserts against.
         assert_eq!(
             restored.saga_pending.len(),
-            2,
-            "Class S: both staged sagas must round-trip the snapshot"
+            1,
+            "Class S: the staged saga must round-trip the snapshot"
         );
         // `SagaPreparedStateSnapshot`/`SagaPreparedState` mismatches are asserted
         // via `matches!` + `if let` (no `panic!`/`unreachable!` — handler
@@ -14551,24 +14479,6 @@ mod tests {
             assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
             assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
             assert_eq!(snap.recorded_chain_depth, 4);
-        }
-
-        let standing_snap = restored
-            .saga_pending
-            .get(&standing_saga_id)
-            .expect("Class S: standing-pair saga must round-trip");
-        assert!(
-            matches!(
-                standing_snap,
-                SagaPreparedStateSnapshot::StandingPairCreate(_)
-            ),
-            "Class S: wrong standing-pair saga variant after round-trip"
-        );
-        if let SagaPreparedStateSnapshot::StandingPairCreate(snap) = standing_snap {
-            assert_eq!(snap.peer_did, "did:example:class-s-peer");
-            assert_eq!(snap.local_did, "did:example:class-s-admin");
-            assert_eq!(snap.derived_context_id, standing_derived);
-            assert!(snap.creation_receipt.is_none());
         }
 
         // The mirror must rehydrate to the identical live `SagaPreparedState`

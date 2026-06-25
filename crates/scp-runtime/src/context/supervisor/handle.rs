@@ -820,19 +820,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_saga_propagates_not_implemented() {
-        let (_sup, handle) = test_handle();
-        let err = handle
-            .start_saga(SagaInput::StandingPairCreate {
-                local_did: DID("did:example:a".to_owned()),
-                peer_did: DID("did:example:b".to_owned()),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
-    }
-
-    #[tokio::test]
     async fn my_wrapping_public_key_returns_none_when_unset() {
         let (_sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());

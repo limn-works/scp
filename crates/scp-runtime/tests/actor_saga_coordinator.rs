@@ -8,8 +8,8 @@
 //!
 //! # Spec-gap guardrail
 //!
-//! All 4 current [`SagaInput`] variants are spec-gapped — the Prepare
-//! dispatch returns `ContextError::NotImplemented`. The FSM
+//! The `BroadcastHostingHandshake` [`SagaInput`] variant is spec-gapped —
+//! the Prepare dispatch returns `ContextError::NotImplemented`. The FSM
 //! transitions through `Initiated → PreparingA → Aborting → Aborted`
 //! and returns the typed error. This is the observable behaviour the
 //! tests assert.
@@ -105,9 +105,10 @@ fn test_supervisor() -> Supervisor {
 }
 
 fn spec_gapped_input() -> SagaInput {
-    SagaInput::StandingPairCreate {
-        local_did: DID("did:example:a".to_owned()),
-        peer_did: DID("did:example:b".to_owned()),
+    SagaInput::BroadcastHostingHandshake {
+        host_context_id: [1u8; 32],
+        broadcast_context_id: [2u8; 32],
+        subscriber_did: DID("did:example:subscriber".to_owned()),
     }
 }
 
@@ -131,7 +132,7 @@ async fn saga_prepare_a_notimplemented_aborts_and_returns_error() {
         .unwrap_err();
     assert!(
         matches!(err, ContextError::NotImplemented(_)),
-        "expected NotImplemented for spec-gapped StandingPairCreate, got {err:?}"
+        "expected NotImplemented for spec-gapped BroadcastHostingHandshake, got {err:?}"
     );
 }
 

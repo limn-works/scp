@@ -113,11 +113,6 @@
 // vector at the compiler instead of via a source-text scanner.
 #![deny(non_local_definitions)]
 
-/// Public, A-authored standing-pair creation metadata (spec §5.15.8) plus
-/// its reverse-order best-effort rollback. `pub(in crate::context)` —
-/// reachable by the saga prepared-state wire type and the (later) abort
-/// handler, never by external crates or FFI bridges.
-pub(in crate::context) mod creation_receipt;
 pub mod handle;
 pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;
@@ -138,7 +133,7 @@ pub use saga_journal::{
 pub use saga_prepared_state::{
     BroadcastHostingHandshakePrepared, BroadcastHostingHandshakeSnapshot,
     CrossContextToolInvocationPrepared, CrossContextToolInvocationSnapshot, SagaPreparedState,
-    SagaPreparedStateSnapshot, StandingPairCreatePrepared, StandingPairCreateSnapshot,
+    SagaPreparedStateSnapshot,
 };
 /// The per-saga participant-context-set reservation RAII guard. Exposed only
 /// under `test`/`testing` so integration tests can deterministically hold a

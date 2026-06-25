@@ -13,25 +13,7 @@
 //! `Supervisor::dispatch_standing_direct` in
 //! [`crate::context::supervisor::supervisor`].
 //!
-//! # SAGA WIRING DEFERRED — see
-//! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-//!
-//! The `InitiateStandingPairCreate` saga-initiator variant returns
-//! [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! because the 2-phase Prepare+Commit decomposition of
-//! [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context)
-//! is spec-gapped — the spec does not yet define:
-//!   - which fields of the `CreationReceipt` are covered by the
-//!     Prepare-side commitment (public fields vs. committed-to-bytes),
-//!   - how PrepareB rolls back if the remote side's key package fetch
-//!     fails after a local MLS group was created,
-//!   - whether the TOCTOU re-check in the legacy implementation should
-//!     be driven by Commit-side idempotence or by a Prepare-side lock.
-//!
-//! Until those land, the saga-initiator path returns
-//! `ContextError::NotImplemented`. Non-saga standing commands are fully
-//! migrated in this commit (ADR-049 commit 11). The
-//! `StandingContext` get-or-create variant still routes through the
+//! The `StandingContext` get-or-create variant still routes through the
 //! legacy path, which is idempotent by construction.
 
 use std::time::Duration;
@@ -86,7 +68,6 @@ async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
         StandingCommand::ReconnectAllStanding { reply } => {
             handle_reconnect_all_standing(deps, reply).await
         }
-        StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
 }
 
@@ -218,17 +199,6 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
     const MSG: &str = "StandingCommand::Placeholder — real variants migrate in commit 11 of \
                        ADR-049; Placeholder retained for commit-6 compile stability and \
                        deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-}
-
-fn reply_saga_deferred(
-    reply: oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
-) -> Outcome<()> {
-    const MSG: &str = "standing::initiate_standing_pair_create — saga wiring deferred to \
-                       commit 11.5 per 5 enumerated spec gaps; see \
-                       .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 1: standing-pair \
-                       2-phase decomposition)";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }
