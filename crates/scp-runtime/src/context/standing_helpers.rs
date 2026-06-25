@@ -47,8 +47,8 @@ use crate::context::actor::deps::ActorDeps;
 /// [`generate_standing_context_id`] wraps this digest with the `"standing-"`
 /// display prefix + hex for the actor-registry key; the saga concurrency
 /// gating (ADR-049 §3a, spec §5.15.4) reserves the RAW-digest hex
-/// (`hex::encode(derive_standing_context_digest(..))`) so a cross-context or
-/// broadcast saga that shares the same standing context reserves the SAME
+/// (`hex::encode(derive_standing_context_digest(..))`) so a cross-context
+/// saga that shares the same standing context reserves the SAME
 /// canonical key and therefore overlaps. Keeping the prefixed id and the raw
 /// digest derived from one shared body guarantees they cannot drift apart.
 pub fn derive_standing_context_digest(local_did: &DID, peer_did: &DID) -> [u8; 32] {

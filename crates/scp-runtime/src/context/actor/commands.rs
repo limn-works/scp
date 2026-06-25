@@ -100,8 +100,8 @@ pub enum ContextCommand {
     /// Trust recovery — epoch floor reconciliation, recovery proofs
     /// (spec §23.17).
     TrustRecovery(TrustRecoveryCommand),
-    /// Standing — saga initiator for standing-pair creation
-    /// (spec §5.15.7).
+    /// Standing — standing-pair get-or-create (single-context async
+    /// creation, NOT a saga; spec §5.15.8).
     Standing(StandingCommand),
     /// TTL close — timer-driven close path (spec §5.8).
     TtlClose(TtlCloseCommand),
@@ -677,12 +677,13 @@ pub struct RestoreContextPayload {
 /// state mutations to the actor's owned
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
 ///
-/// **Create-as-prepare.** `CreateContext` / `JoinContext` are legitimate
-/// saga entry points in later commits (standing-pair creation,
-/// migration). Commit 9 routes them through
+/// **Create / join.** `CreateContext` / `JoinContext` route directly through
 /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
-/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
-/// directly; saga wiring moves into this enum in commit 11.
+/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+/// Neither is a saga entry point: standing-pair creation is single-context
+/// async creation (not a 2-phase saga; spec §5.15.8), and cross-identity
+/// context migration was withdrawn (ADR-049 §4). The sole cross-context saga
+/// is tool invocation (§6.2.4), driven from the supervisor, not this enum.
 pub enum LifecycleCommand {
     /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
     /// ADR-049 (post-review-round-1 plan). Used by the actor's
@@ -1962,14 +1963,13 @@ pub enum StandingCommand {
     /// returning `Active` or `Creating` surfaces the same context ID
     /// without error.
     ///
-    /// # Saga scope
+    /// # Not a saga
     ///
-    /// The legacy method internally calls
+    /// The method internally calls
     /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
-    /// Commit 11 routes through that legacy path directly — the
-    /// standing-pair-create saga FSM (Prepare+Commit 2-phase) is
-    /// deferred per
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// Standing-pair creation is single-context async creation (create +
+    /// add_member + Welcome + consent-on-receipt; spec §5.15.8) routed
+    /// directly through that path — NOT a 2-phase-commit saga FSM.
     StandingContext {
         /// Local identity DID.
         local_did: scp_identity::DID,
