@@ -1356,7 +1356,7 @@ impl ContextActor {
             ),
             ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => ack_not_impl(
                 reply,
-                "tools::initiate_cross_context_tool_invocation (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
+                "tools::initiate_cross_context_tool_invocation (the §6.2.4 saga is wired via Supervisor::start_cross_context_tool_invocation_saga; this actor-mailbox initiator and the saga's FFI export are deferred — see DEFERRED-commit-11-saga-use-cases.md gap 2)",
             ),
         }
     }

@@ -282,8 +282,11 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 fn reply_saga_deferred(
     reply: oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
 ) -> Outcome<()> {
-    const MSG: &str = "tools::initiate_cross_context_tool_invocation — saga wiring deferred \
-                       to commit 11.5 per 5 enumerated spec gaps; see \
+    const MSG: &str = "tools::initiate_cross_context_tool_invocation — the §6.2.4 cross-context \
+                       tool saga is specified and wired via \
+                       Supervisor::start_cross_context_tool_invocation_saga, not this actor \
+                       mailbox; this initiator's actor-mailbox transport leg and the saga's FFI \
+                       export are deferred (per-set gating, ADR-049 §3a); see \
                        .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 2: cross-context \
                        tool invocation transport)";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
