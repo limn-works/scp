@@ -536,7 +536,7 @@ impl NapiBridgeInstance {
     /// out to supply `Supervisor::with_providers_and_journal`; a `None` here is
     /// the storage-before-supervisor fail-closed condition (spec §17.6 / §17.16).
     #[must_use]
-    pub(crate) fn durable_providers_ref(
+    pub(crate) const fn durable_providers_ref(
         &self,
     ) -> Option<&scp_core::context::supervisor::DurableProviders> {
         self.durable_providers.as_ref()

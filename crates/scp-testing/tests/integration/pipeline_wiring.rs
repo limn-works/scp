@@ -2335,9 +2335,10 @@ fn b3_webhook_dispatch_wired() {
 fn prod_supervisor_construction_wires_durable_saga_journal() {
     // -- PyO3 reference bridge --------------------------------------------
     // `build_supervisor` routes through `with_providers_and_journal`; the
-    // journal is built by `build_saga_journal` over the bridge instance's
-    // chosen `StorageProvider` (the SAME `Clone`-shared backend `derive_mls_storage`
-    // wraps into `mls_storage`).
+    // journal + mls_storage are derived together by `durable_providers_from_bi`
+    // → `DurableProviders::from_handle` over the bridge instance's chosen
+    // `StorageProvider`, so they CANNOT diverge to different backends (spec §17.6,
+    // construction-enforced — there is no separate journal argument to mis-wire).
     let pyo3_runtime_src = include_str!("../../../../crates/scp-ffi/src/runtime.rs");
     assert!(
         fn_body_contains(
@@ -2349,24 +2350,34 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
          journal), not the NoopSagaJournal-hardcoding with_providers"
     );
     assert!(
-        fn_body_contains(pyo3_runtime_src, "build_supervisor", "build_saga_journal"),
-        "PyO3 build_supervisor must build the durable journal via build_saga_journal"
+        fn_body_contains(
+            pyo3_runtime_src,
+            "build_supervisor",
+            "durable_providers_from_bi"
+        ),
+        "PyO3 build_supervisor must derive the durable providers via durable_providers_from_bi \
+         (the single same-backend derivation), not assemble the journal/mls_storage separately"
     );
     assert!(
         fn_body_contains(
             pyo3_runtime_src,
-            "build_saga_journal",
-            "ProtocolRepositorySagaJournal"
-        ) && fn_body_contains(pyo3_runtime_src, "build_saga_journal", "storage_provider"),
-        "PyO3 build_saga_journal must construct ProtocolRepositorySagaJournal over the bridge \
-         instance's chosen storage_provider — the SAME backend as mls_storage (spec §17.6)"
+            "durable_providers_from_bi",
+            "DurableProviders::from_handle"
+        ) && fn_body_contains(
+            pyo3_runtime_src,
+            "durable_providers_from_bi",
+            "STORAGE_8000"
+        ),
+        "PyO3 durable_providers_from_bi must derive both halves from one handle via \
+         DurableProviders::from_handle (same backend by construction, spec §17.6) and preserve \
+         the STORAGE_8000 fail-closed check"
     );
 
     // -- NAPI bridge (Node.js/Bun) ----------------------------------------
     // `build_supervisor_arc` routes through `with_providers_and_journal`; the
-    // journal is built at the concrete-storage construction site via
-    // `saga_journal_from_handle` over the SAME `Arc<S>` that feeds
-    // `mls_storage_from_handle`.
+    // journal + mls_storage are derived together at the concrete-storage site via
+    // `durable_providers_from_handle` → `DurableProviders::from_handle` over ONE
+    // `Arc<S>`, so they share one backend by construction (spec §17.6).
     let napi_runtime_src = include_str!("../../../../crates/scp-ffi/napi/src/runtime.rs");
     assert!(
         fn_body_contains(
@@ -2380,11 +2391,11 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
     assert!(
         fn_body_contains(
             napi_runtime_src,
-            "saga_journal_from_handle",
-            "ProtocolRepositorySagaJournal"
+            "durable_providers_from_handle",
+            "DurableProviders::from_handle"
         ),
-        "NAPI saga_journal_from_handle must construct ProtocolRepositorySagaJournal over the \
-         concrete Storage handle that also feeds mls_storage_from_handle (spec §17.6)"
+        "NAPI durable_providers_from_handle must derive the journal AND mls_storage from one \
+         Arc<S> via DurableProviders::from_handle — same backend by construction (spec §17.6)"
     );
 
     // -- UniFFI bridge (Swift/Kotlin) -------------------------------------
@@ -2401,17 +2412,18 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
     assert!(
         fn_body_contains(
             uniffi_runtime_src,
-            "saga_journal_from_handle",
-            "ProtocolRepositorySagaJournal"
+            "durable_providers_from_handle",
+            "DurableProviders::from_handle"
         ),
-        "UniFFI saga_journal_from_handle must construct ProtocolRepositorySagaJournal over the \
-         concrete Storage handle that also feeds mls_storage_from_handle (spec §17.6)"
+        "UniFFI durable_providers_from_handle must derive the journal AND mls_storage from one \
+         Arc<S> via DurableProviders::from_handle — same backend by construction (spec §17.6)"
     );
 
     // -- Node (self-host loopback supervisor) -----------------------------
     // `connect_loopback_supervisor` routes through `with_providers_and_journal`;
-    // `build_host_site_deployer` builds the journal over the SAME
-    // `Arc<SqliteStorage>` ({storage_dir}/mls) that it wraps into mls_storage.
+    // `build_host_site_deployer` derives the journal + mls_storage together via
+    // `DurableProviders::from_handle` over the SAME `Arc<SqliteStorage>`
+    // ({storage_dir}/mls), so they share one backend by construction (spec §17.6).
     let node_self_host_src = include_str!("../../../../crates/scp-node/src/self_host.rs");
     assert!(
         fn_body_contains(
@@ -2426,10 +2438,11 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
         fn_body_contains(
             node_self_host_src,
             "build_host_site_deployer",
-            "ProtocolRepositorySagaJournal"
+            "DurableProviders::from_handle"
         ),
-        "Node build_host_site_deployer must construct ProtocolRepositorySagaJournal over the \
-         SAME Arc<SqliteStorage> ({{storage_dir}}/mls) that backs mls_storage (spec §17.6)"
+        "Node build_host_site_deployer must derive both halves from the SAME Arc<SqliteStorage> \
+         ({{storage_dir}}/mls) via DurableProviders::from_handle — same backend by construction \
+         (spec §17.6)"
     );
 }
 

@@ -573,7 +573,7 @@ impl UniffiBridgeInstance {
     /// storage-before-supervisor precondition failing closed (spec §17.6 /
     /// §17.16).
     #[must_use]
-    pub(crate) fn durable_providers_ref(
+    pub(crate) const fn durable_providers_ref(
         &self,
     ) -> Option<&scp_core::context::supervisor::DurableProviders> {
         self.durable_providers.as_ref()

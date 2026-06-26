@@ -1266,9 +1266,7 @@ fn durable_providers_from_bi(
                 .to_owned(),
             code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
         })?;
-    Ok(scp_core::context::supervisor::DurableProviders::from_handle(
-        Arc::new(provider.clone()),
-    ))
+    Ok(scp_core::context::supervisor::DurableProviders::from_handle(Arc::new(provider.clone())))
 }
 
 // ---------------------------------------------------------------------------

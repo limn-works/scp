@@ -359,7 +359,8 @@ impl SelfHostDeployer {
         // `mls_storage` — guaranteed by the `DurableProviders` newtype (§17.16 /
         // ADR-049).
         let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable).await?;
+            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
+                .await?;
         node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
