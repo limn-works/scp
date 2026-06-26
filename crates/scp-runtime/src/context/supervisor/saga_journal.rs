@@ -785,77 +785,6 @@ mod tests {
         ProtocolRepositorySagaJournal::new(Arc::new(InMemoryStorage::new()))
     }
 
-    // -----------------------------------------------------------------------
-    // Tracing capture (FIX E — metric-fired proof)
-    //
-    // The metrics facade (`metrics` crate) has NO test recorder installed in
-    // this crate — there is no snapshotter dependency, and `set_global_recorder`
-    // is never called in test code. The codebase DOES already support capturing
-    // structured events via a hand-rolled `tracing::Subscriber` (see
-    // supervisor.rs's watchdog tests). Every `record_saga_repair_needed()` call
-    // in `load_unresolved` is emitted alongside a structured `SCP-SAGA-RECOVERY`
-    // `tracing::error!`, so we assert the repair signal fired by capturing that
-    // event rather than reading a counter we have no recorder for.
-    //
-    // We install the capturing subscriber THREAD-LOCALLY via `set_default`
-    // (NOT process-globally): the default single-threaded `#[tokio::test]`
-    // keeps the future on one thread, so the returned `DefaultGuard` stays
-    // active across `load_unresolved`'s `.await` points (which never
-    // `tokio::spawn`). A thread-local default also avoids colliding with the
-    // process-global default the supervisor.rs watchdog tests install in the
-    // same test binary.
-    //
-    // Returns the shared buffer plus the guard; hold the guard for the duration
-    // of the captured calls, then read the buffer.
-    // -----------------------------------------------------------------------
-    fn install_event_capture() -> (
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        use std::sync::{Arc as StdArc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing::{Event, Metadata};
-
-        struct CaptureSub {
-            buf: StdArc<Mutex<Vec<String>>>,
-        }
-        struct LineVisitor<'a>(&'a mut String);
-        impl Visit for LineVisitor<'_> {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                use std::fmt::Write;
-                let _ = write!(self.0, " {}={value:?}", field.name());
-            }
-            fn record_str(&mut self, field: &Field, value: &str) {
-                use std::fmt::Write;
-                let _ = write!(self.0, " {}={value}", field.name());
-            }
-        }
-        impl tracing::Subscriber for CaptureSub {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &Event<'_>) {
-                let mut line = String::new();
-                let mut v = LineVisitor(&mut line);
-                event.record(&mut v);
-                self.buf.lock().unwrap().push(line);
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        let buf = StdArc::new(Mutex::new(Vec::new()));
-        let guard = tracing::subscriber::set_default(CaptureSub {
-            buf: StdArc::clone(&buf),
-        });
-        (buf, guard)
-    }
-
     fn test_entry(saga_id: &SagaId, seq: u64, state: SagaState, evidence: Vec<u8>) -> JournalEntry {
         JournalEntry {
             saga_id: saga_id.clone(),
@@ -1186,12 +1115,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Capture the structured recovery events for the metric-fired assertion
-        // (FIX E). The repair signal is `record_saga_repair_needed()`, for which
-        // no test recorder exists; it is emitted alongside the `SCP-SAGA-RECOVERY`
-        // `tracing::error!` we capture here. See `install_event_capture`.
-        let (events, _guard) = install_event_capture();
-
         let unresolved = journal.load_unresolved().await.expect(
             "a single corrupt entry must NOT abort the sweep — the other sagas must still recover",
         );
@@ -1230,17 +1153,76 @@ mod tests {
             SagaState::Committing,
             "saga_c must recover with its Committing FSM state intact",
         );
+    }
 
-        // --- Repair signal fired (FIX E): the corrupt-skip path emitted the
-        // structured `SCP-SAGA-RECOVERY` error carrying the corrupt saga_id, the
-        // log-side counterpart of the rate-only `saga_repair_needed` metric. ---
-        let lines = events.lock().unwrap().clone();
-        assert!(
-            lines.iter().any(|l| l.contains("SCP-SAGA-RECOVERY")
-                && l.contains("corrupt journal entry")
-                && l.contains(corrupt_saga_id)),
-            "the corrupt-skip must emit a SCP-SAGA-RECOVERY error tagged with the \
-             corrupt saga_id (the per-saga signal paired with the repair metric); got {lines:?}",
+    // The corrupt-skip path fires `record_saga_repair_needed()` (the rate-only
+    // operator alert). Proven here with a THREAD-LOCAL metrics recorder
+    // (`metrics::with_local_recorder`) — robust under the parallel test binary,
+    // unlike a tracing capture (whose callsite-interest cache is process-global
+    // and poisoned by other tests hitting the same `error!` callsite first).
+    #[test]
+    fn load_unresolved_corrupt_skip_increments_repair_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+                // One legit non-terminal saga that MUST still recover.
+                let saga_ok = SagaId::new();
+                journal
+                    .append(test_entry(
+                        &saga_ok,
+                        0,
+                        SagaState::PreparingB,
+                        b"legit".to_vec(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // One corrupt entry under a well-formed key.
+                let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}zzcorrupt/{:020}", 0);
+                storage
+                    .store(&corrupt_key, b"not-a-valid-wire-entry")
+                    .await
+                    .unwrap();
+
+                let unresolved = journal
+                    .load_unresolved()
+                    .await
+                    .expect("corrupt entry must be skipped, not abort the sweep");
+                assert!(
+                    unresolved.iter().any(|e| e.saga_id == saga_ok),
+                    "the legit saga must still recover past the corrupt skip",
+                );
+            });
+        });
+
+        // The corrupt-skip must have incremented the repair counter exactly once.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
+            if ck.key().name() == "scp_saga_repair_needed_total" {
+                if let DebugValue::Counter(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            count,
+            Some(1),
+            "corrupt-skip must increment scp_saga_repair_needed_total once; snapshot={snapshot:?}",
         );
     }
 
