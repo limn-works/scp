@@ -133,11 +133,19 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     pub key_resolver: scp_core::context::governance::KeyResolver,
     /// The caller's key custody backend. Borrowed for the publish dispatch.
     pub custody: &'a C,
-    /// The supervisor's `OpenMLS` storage adapter. The caller builds this over
-    /// its chosen [`Storage`] backend (a `SQLite` handle distinct from the
-    /// node's own storage, in production) via
-    /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter).
-    pub mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    /// The loopback supervisor's durable providers — the saga journal + the
+    /// `OpenMLS` `mls_storage` view bound into one
+    /// [`DurableProviders`](scp_core::context::supervisor::DurableProviders)
+    /// GUARANTEED to share a single [`Storage`] backend (spec §17.6 / §17.16 /
+    /// ADR-049).
+    ///
+    /// The caller builds this via
+    /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
+    /// over its chosen `Storage` backend (a `SQLite` handle distinct from the
+    /// node's own storage, in production), so crash-recovery replay and the
+    /// `OpenMLS` view share one backend by construction — the journal can never
+    /// be wired to a divergent store.
+    pub durable: scp_core::context::supervisor::DurableProviders,
     /// The static assets to publish, in deploy order.
     pub assets: &'a [Asset],
 }
@@ -270,7 +278,7 @@ where
         signing_key_handle,
         key_resolver,
         custody,
-        mls_storage,
+        durable,
         assets,
     } = params;
 
@@ -281,7 +289,7 @@ where
         hostname,
         signing_key_handle,
         key_resolver,
-        mls_storage,
+        durable,
     )
     .await?;
 
@@ -323,6 +331,13 @@ impl SelfHostDeployer {
     ///
     /// Returns a [`SelfHostError`] if relay connect, DID/context registration,
     /// context creation, key resolution, or projection enable fails.
+    // Provider-bootstrap entry: each argument is a distinct, required provider
+    // the loopback supervisor needs (node, identity, hostname, signing key,
+    // governance resolver, durable providers). The durable saga journal and the
+    // `mls_storage` view arrive bound into one `DurableProviders` so they cannot
+    // be wired to divergent backends — mirroring the FFI
+    // `with_providers_and_journal` bootstrap.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<S>(
         node: &ApplicationNode<S>,
         node_did: String,
@@ -330,7 +345,7 @@ impl SelfHostDeployer {
         hostname: String,
         signing_key_handle: scp_platform::KeyHandle,
         key_resolver: scp_core::context::governance::KeyResolver,
-        mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        durable: scp_core::context::supervisor::DurableProviders,
     ) -> Result<Self, SelfHostError>
     where
         S: Storage + 'static,
@@ -339,9 +354,12 @@ impl SelfHostDeployer {
 
         // Build the in-process supervisor on the node's OWN loopback relay and
         // register the local DID + the broadcast context. The supervisor carries
-        // the REAL document-derived governance resolver (ADR-053 / spec §10.17).
+        // the REAL document-derived governance resolver (ADR-053 / spec §10.17)
+        // and the durable saga journal over the SAME `Storage` backend as
+        // `mls_storage` — guaranteed by the `DurableProviders` newtype (§17.16 /
+        // ADR-049).
         let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, mls_storage)
+            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
                 .await?;
         node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
             .await
@@ -581,7 +599,7 @@ async fn connect_loopback_supervisor<S>(
     node_did: &str,
     author_did: &scp_identity::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
-    mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    durable: scp_core::context::supervisor::DurableProviders,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
     S: Storage + 'static,
@@ -612,7 +630,11 @@ where
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
-    let supervisor = scp_core::context::supervisor::Supervisor::with_providers(
+    // The durable saga journal is built over the SAME `Storage` backend as
+    // `mls_storage` so crash-recovery replay loads unresolved saga entries from
+    // one store on restart — guaranteed by the `DurableProviders` newtype
+    // (§17.16 / ADR-049).
+    let supervisor = scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
         transport,
         event_log,
@@ -621,7 +643,7 @@ where
         None,
         Some(event_tx),
         None,
-        mls_storage,
+        durable,
     );
 
     supervisor
@@ -2130,10 +2152,16 @@ where
             HostSiteError::StorageOpen(format!("failed to open MLS SQLite storage: {e}"))
         })?,
     );
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
+    // The durable saga journal and the `mls_storage` view are bound into one
+    // `DurableProviders` derived from the SAME `Arc<SqliteStorage>`, so
+    // crash-recovery replay and the `OpenMLS` view read and write one
+    // `{storage_dir}/mls` SQLCipher store and cannot diverge by construction.
+    // `DurableProviders::from_handle` is the only non-test constructor (§17.6 /
+    // §17.16 / ADR-049): a reviewer proved that deriving the two providers via
+    // separate calls let a single mutated constructor pass a fresh in-memory
+    // store to the journal while leaving every gate/test green — binding them
+    // into one newtype makes that divergence a compile error.
+    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
 
     let signing_key_handle = node.identity().identity().active_signing_key;
     SelfHostDeployer::start(
@@ -2143,7 +2171,7 @@ where
         SELF_HOST_HOSTNAME.to_owned(),
         signing_key_handle,
         key_resolver,
-        mls_storage,
+        durable,
     )
     .await
     .map_err(|e| HostSiteError::DeployerSetup(e.to_string()))

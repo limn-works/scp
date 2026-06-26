@@ -35,8 +35,8 @@ use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::ContextError;
 use scp_runtime::context::supervisor::{
-    JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaInput, SagaJournal,
-    SagaState, SagaTerminalState, Supervisor, SupervisorConfig,
+    JournalEntry, JournalError, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaInput,
+    SagaJournal, SagaState, SagaTerminalState, Supervisor, SupervisorConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +96,47 @@ fn journal_with_shared_storage() -> (
     (storage, journal)
 }
 
+/// A [`SagaJournal`] decorator that records every `append`'s
+/// `(state, seq_per_saga)` BEFORE delegating to the inner journal.
+///
+/// The durable production journal now compacts a saga's entries when it
+/// resolves (`mark_resolved` deletes the resolved saga's keys so
+/// `load_unresolved`'s cost stays bounded to unresolved sagas — spec
+/// §17.16.1). That compaction erases the in-flight write trail from final
+/// storage, so probing `list_keys("saga_journal/")` after a saga resolves no
+/// longer observes the per-phase appends. This wrapper captures each append as
+/// it happens — before compaction can erase it — so the WRITE-behaviour
+/// assertions (every phase appended; seqs strictly monotonic) remain
+/// meaningful against the compacting journal.
+struct RecordingJournal {
+    inner: Arc<dyn SagaJournal>,
+    appends: Arc<std::sync::Mutex<Vec<(SagaState, u64)>>>,
+}
+
+#[async_trait::async_trait]
+impl SagaJournal for RecordingJournal {
+    async fn append(&self, entry: JournalEntry) -> Result<(), JournalError> {
+        self.appends
+            .lock()
+            .unwrap()
+            .push((entry.state, entry.seq_per_saga));
+        self.inner.append(entry).await
+    }
+    async fn load_unresolved(&self) -> Result<Vec<JournalEntry>, JournalError> {
+        self.inner.load_unresolved().await
+    }
+    async fn mark_resolved(
+        &self,
+        saga_id: SagaId,
+        terminal: SagaTerminalState,
+        secret_bearing: bool,
+    ) -> Result<(), JournalError> {
+        self.inner
+            .mark_resolved(saga_id, terminal, secret_bearing)
+            .await
+    }
+}
+
 fn test_supervisor() -> Supervisor {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
         Arc::new(NoopPersistence);
@@ -135,39 +176,59 @@ async fn saga_prepare_a_invalid_state_aborts_and_returns_error() {
 /// The journal records Initiated, PreparingA, Aborting, and a terminal
 /// Aborted entry for an executor-less saga misuse. Verifies the
 /// coordinator appended every phase before aborting.
+///
+/// The durable journal compacts (deletes) a saga's entries on resolution, so
+/// probing final storage no longer observes the in-flight write trail. We wrap
+/// the production journal in a [`RecordingJournal`] that captures every append
+/// BEFORE compaction can erase it, then assert on the captured states.
 #[tokio::test]
 async fn saga_journal_records_every_phase_transition_on_abort() {
-    // Build a supervisor with a directly-owned journal so we can probe
-    // the raw journal state after the saga runs.
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
         Arc::new(NoopPersistence);
     let storage = Arc::new(InMemoryStorage::new());
-    let journal = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
-    let journal_for_supervisor: Arc<dyn SagaJournal> = Arc::clone(&journal) as _;
-    let supervisor = Supervisor::new(
-        persistence,
-        journal_for_supervisor,
-        SupervisorConfig::default(),
-    );
+    let prod_journal: Arc<dyn SagaJournal> =
+        Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+    let appends = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording: Arc<dyn SagaJournal> = Arc::new(RecordingJournal {
+        inner: prod_journal,
+        appends: Arc::clone(&appends),
+    });
+    let supervisor = Supervisor::new(persistence, recording, SupervisorConfig::default());
 
     let _ = supervisor.start_saga(executorless_input()).await;
 
-    // `load_unresolved` returns empty because the saga terminated
-    // (Aborted is a terminal state). So we verify via raw storage
-    // keys under the saga's prefix — the write-ordering proof.
-    let keys = scp_platform::traits::Storage::list_keys(&*storage, "saga_journal/")
-        .await
-        .unwrap();
+    // Read the captured appends (the wrapper observed them before the
+    // resolution-time compaction deleted the durable entries).
+    let states: Vec<SagaState> = appends.lock().unwrap().iter().map(|(s, _)| *s).collect();
+
     assert!(
-        !keys.is_empty(),
-        "journal should contain entries from the aborted saga"
+        !states.is_empty(),
+        "journal should have recorded appends from the aborted saga"
     );
-    // The exact number: Initiated + PreparingA + Aborting + terminal
-    // Aborted marker = 4 entries (append once per transition).
+    // The abort path is Initiated → PreparingA → Aborting (appended in-flight)
+    // → Aborted (the terminal marker, written by mark_resolved). ADR-049 §3.
     assert!(
-        keys.len() >= 3,
-        "expected at least 3 journal entries (Initiated + PreparingA + Aborting); got {}",
-        keys.len()
+        states.contains(&SagaState::Initiated),
+        "expected an Initiated append, got {states:?}"
+    );
+    assert!(
+        states.contains(&SagaState::PreparingA),
+        "expected a PreparingA append, got {states:?}"
+    );
+    assert!(
+        states.contains(&SagaState::Aborting),
+        "expected an Aborting append, got {states:?}"
+    );
+    // NB: the terminal `Aborted` marker is written by `mark_resolved` (the
+    // resolution path), NOT the public `append`, so the recording wrapper does
+    // not — and should not — capture it as an append. The three in-flight
+    // transition appends above are the "records every phase transition" proof;
+    // resolution-to-terminal is exercised by the load_unresolved/compaction tests.
+    // At least the three transition states (Initiated + PreparingA + Aborting)
+    // before the terminal marker.
+    assert!(
+        states.len() >= 3,
+        "expected at least 3 recorded transitions; got {states:?}"
     );
 }
 
@@ -215,43 +276,49 @@ async fn saga_concurrent_start_rejects_with_saga_busy() {
     );
 }
 
-/// Journal write ordering: every phase transition is persisted BEFORE
-/// the next transition begins. Verifies by inspecting the decoded
-/// journal entries' `seq_per_saga` values are strictly monotonic for
-/// the aborted saga.
+/// Journal write ordering: every phase transition is appended with a
+/// strictly-monotonic `seq_per_saga`, in append order.
+///
+/// The durable journal compacts a saga's entries on resolution, so probing
+/// final storage would observe an empty key set and assert vacuously. We wrap
+/// the production journal in a [`RecordingJournal`] that captures each append's
+/// `seq_per_saga` in append order BEFORE compaction, then assert the recorded
+/// sequence is strictly increasing.
 #[tokio::test]
 async fn saga_journal_write_ordering_is_monotonic() {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
         Arc::new(NoopPersistence);
     let storage = Arc::new(InMemoryStorage::new());
-    let journal_prod = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
-    let journal_dyn: Arc<dyn SagaJournal> = Arc::clone(&journal_prod) as _;
-    let supervisor = Supervisor::new(persistence, journal_dyn, SupervisorConfig::default());
+    let prod_journal: Arc<dyn SagaJournal> =
+        Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+    let appends = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recording: Arc<dyn SagaJournal> = Arc::new(RecordingJournal {
+        inner: prod_journal,
+        appends: Arc::clone(&appends),
+    });
+    let supervisor = Supervisor::new(persistence, recording, SupervisorConfig::default());
 
     let _ = supervisor.start_saga(executorless_input()).await;
 
-    // Collect keys under the saga prefix; they embed `seq_per_saga` as
-    // the trailing numeric suffix (20 digits, zero-padded).
-    let keys = scp_platform::traits::Storage::list_keys(&*storage, "saga_journal/")
-        .await
-        .unwrap();
-
-    let mut seqs: Vec<u64> = keys
+    // Collect the `seq_per_saga` values in the order they were appended.
+    let seqs: Vec<u64> = appends
+        .lock()
+        .unwrap()
         .iter()
-        .map(|k| {
-            k.rsplit('/')
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .expect("every journal key ends in a seq suffix")
-        })
+        .map(|(_, seq)| *seq)
         .collect();
-    seqs.sort_unstable();
 
-    // Strictly monotonic: no duplicate seq values, strictly increasing.
+    assert!(
+        !seqs.is_empty(),
+        "expected at least one recorded append for the aborted saga"
+    );
+    // Strictly monotonic in append order: each append's seq is strictly
+    // greater than the previous append's. No sort — the recorded order is the
+    // write order.
     for window in seqs.windows(2) {
         assert!(
             window[0] < window[1],
-            "journal seqs must be strictly monotonic, got {:?} then {:?}",
+            "journal seqs must be strictly monotonic in append order, got {:?} then {:?}",
             window[0],
             window[1]
         );

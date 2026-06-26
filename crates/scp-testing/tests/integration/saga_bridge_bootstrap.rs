@@ -157,8 +157,10 @@ fn bridge_supervisor(
         None,
         None,
         None,
-        mls_storage,
-        journal,
+        // The bootstrap suite builds the journal and `mls_storage` over a
+        // caller-supplied shared store, then pairs them via the test-only
+        // `for_test` constructor — production sites use `from_handle`.
+        scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
     )
 }
 

@@ -438,6 +438,17 @@ jobs:
           # invocation exercises every transport's test suite and guards against
           # the silent rot that broke the quic feature for months.
           cargo nextest run -p scp-transport --features quic,http3,udp,coap
+          # The saga-journal durable crash-recovery round-trip is gated behind
+          # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
+          # processes). --workspace does NOT activate this optional feature, so
+          # run that test explicitly with it enabled. Scoped to the
+          # saga_bridge_journal_swap target on purpose: the broader
+          # `-p scp-testing --features sqlite` also pulls in `persistence_sdk`,
+          # which has a PRE-EXISTING SqliteStorage advisory-lock-on-reopen bug
+          # (fails identically on main; the supervisor's spawned actors hold the
+          # SqliteStorage Arc past the test's reopen). That is unrelated to this
+          # journal swap and is left to its own focused fix.
+          cargo nextest run -p scp-testing --features sqlite --test saga_bridge_journal_swap
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `allow_in_memory_custody` / `scp-core/testing` /

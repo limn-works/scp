@@ -1199,7 +1199,14 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
-    let mls_storage = derive_mls_storage(bi)?;
+    // Derive the durable saga journal AND the `OpenMLS` `mls_storage` view from
+    // the bridge instance's SINGLE chosen `StorageProvider` (§17.6 / §17.16 /
+    // ADR-049), bound into one [`DurableProviders`]. Its only non-test
+    // constructor (`from_handle`) derives both halves from one handle, so a
+    // caller cannot wire the journal to a different backend than `mls_storage`,
+    // and the fail-closed `STORAGE_8000` storage-before-supervisor check fires
+    // once for both.
+    let durable = durable_providers_from_bi(bi)?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open so
@@ -1214,35 +1221,42 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
-    Ok(scp_core::context::supervisor::Supervisor::with_providers(
-        crypto,
-        transport,
-        event_log,
-        key_resolver,
-        persistence,
-        None,
-        Some(event_tx),
-        None,
-        mls_storage,
-    ))
+    Ok(
+        scp_core::context::supervisor::Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            None,
+            Some(event_tx),
+            None,
+            durable,
+        ),
+    )
 }
 
-/// Derives the supervisor's `OpenMLS` storage adapter from the bridge
-/// instance's single chosen [`StorageProvider`] (spec §17.6).
+/// Builds the bridge's [`DurableProviders`] — the durable saga journal + the
+/// `OpenMLS` `mls_storage` view bound into one same-backend-by-construction
+/// value — from this bridge instance's single chosen [`StorageProvider`]
+/// (spec §17.6 / §17.16 / ADR-049).
 ///
-/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone`, so we
-/// wrap a clone in `SpawnBlockingStorageAdapter` to obtain the dyn-safe
-/// `OpenMlsStorageAdapter` view. The clone shares the same inner backend
-/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`), so the
-/// `OpenMLS` view, persistence, and event log all read/write one backend.
+/// [`DurableProviders::from_handle`] derives BOTH halves from the one
+/// `Arc<StorageProvider>` taken from `bi.storage_provider()`, so the journal,
+/// the `OpenMLS` view, persistence, and the event log all read/write one
+/// backend — a caller cannot wire the journal to a divergent store.
+/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone` (over a
+/// shared inner `Arc`), so the cloned handle shares the same inner backend
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`).
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError::ContextError`] when no storage provider is set — the
-/// storage-before-supervisor precondition. No fabrication, no default.
-fn derive_mls_storage(
+/// Returns [`ScpPyError::ContextError`] with [`error_codes::STORAGE_8000`] when
+/// no storage provider is set — the storage-before-supervisor precondition. The
+/// runtime never defaults storage; no fabrication, no default.
+fn durable_providers_from_bi(
     bi: &PyBridgeInstance,
-) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
+) -> Result<scp_core::context::supervisor::DurableProviders, ScpPyError> {
     let provider = bi
         .storage_provider()
         .ok_or_else(|| ScpPyError::ContextError {
@@ -1252,13 +1266,7 @@ fn derive_mls_storage(
                 .to_owned(),
             code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
         })?;
-    let adapter = scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-        Arc::new(provider.clone()),
-    );
-    Ok(Arc::new(adapter)
-        as Arc<
-            dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
-        >)
+    Ok(scp_core::context::supervisor::DurableProviders::from_handle(Arc::new(provider.clone())))
 }
 
 // ---------------------------------------------------------------------------
@@ -3167,6 +3175,51 @@ mod tests {
         assert!(
             !list_b.iter().any(|(id, _)| id == &ctx_id),
             "bi_b must not see bi_a's known contexts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Saga-journal swap: fail-closed proof (PyO3 reference bridge). The
+    // structural `pipeline_wiring.rs` gate is presence-only. The SAME-backend
+    // property is now enforced BY CONSTRUCTION: `durable_providers_from_bi`
+    // returns a `DurableProviders` whose only non-test constructor
+    // (`DurableProviders::from_handle`) derives the journal AND the `mls_storage`
+    // view from ONE handle, so a divergent wiring is a compile error rather than
+    // a runtime defect. The single same-backend behavioral proof on
+    // `from_handle` lives next to it in `scp-runtime`
+    // (`durable_providers_from_handle_shares_one_backend`), where the bundled
+    // journal is reachable for an append/read-back. This test pins the remaining
+    // bridge-specific behavior the type cannot encode: the fail-closed
+    // STORAGE_8000 refusal when no storage provider has been selected.
+    // -----------------------------------------------------------------------
+
+    /// Fail-closed behavioral proof. `durable_providers_from_bi` on a bridge
+    /// instance with NO storage provider must return the `STORAGE_8000`
+    /// storage-before-supervisor error rather than attaching a Noop/absent
+    /// journal. This is the per-bridge fail-closed guard that source-text gates
+    /// alone cannot prove behaviorally.
+    #[test]
+    fn durable_providers_from_bi_fails_closed_without_storage_provider() {
+        // A bare bridge instance with no storage provider selected.
+        let bi = PyBridgeInstance::new_py();
+        assert!(
+            bi.storage_provider().is_none(),
+            "precondition: the bare bridge instance has no storage provider"
+        );
+
+        // Reduce the result to the error code without panicking on success:
+        // `Ok` -> None (no error code), the wrong error variant -> a sentinel
+        // that fails the STORAGE_8000 assertion below.
+        let observed_code = match durable_providers_from_bi(&bi) {
+            Ok(_) => None,
+            Err(ScpPyError::ContextError { code, .. }) => Some(code),
+            Err(other) => Some(format!("unexpected-error-variant: {other:?}")),
+        };
+        assert_eq!(
+            observed_code.as_deref(),
+            Some(scp_ffi_common::error_codes::STORAGE_8000),
+            "durable_providers_from_bi MUST fail closed with STORAGE_8000 when no storage \
+             provider is set (not attach a Noop/absent journal); observed {observed_code:?}"
         );
     }
 }

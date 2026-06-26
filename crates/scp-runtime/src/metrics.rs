@@ -14,7 +14,7 @@
 //! | `scp_mls_encrypt_duration_seconds`| Histogram | MLS + sender key encryption latency            |
 //! | `scp_mls_decrypt_duration_seconds`| Histogram | MLS + sender key decryption latency            |
 //! | `scp_persistence_failures_total`  | Counter   | Persistence write failures (best-effort saves) |
-//! | `scp_saga_repair_needed_total`    | Counter   | Cross-context sagas landed in `NeedsRepair` requiring operator repair (§17.16.4) |
+//! | `scp_saga_repair_needed_total`    | Counter   | Cross-context sagas needing operator repair: landed in `NeedsRepair`, OR a corrupt/torn/undecodable/vanished journal entry skipped by the crash-recovery load-sweep (§17.16.4) |
 //! | `scp_saga_caller_reversal_outstanding_total` | Counter | Cross-context saga aborts that could not confirm the caller-side reversal; the journal stays non-terminal for the §17.16.4 sweep (§6.2.4) |
 //! | `scp_pseudonym_announcements_rejected_total` | Counter | Rejected pseudonym announcements (forged DID, reserved value, or cross-DID RID collision, §9.10.4) |
 //! | `scp_class_s_token_dropped_uncommitted_total` | Counter | `ClassSCommitToken`s dropped without `commit` — a deferred Class-S persist obligation may be undurable (ADR-049 §9) |
@@ -48,15 +48,29 @@ pub fn record_persistence_failure() {
     metrics::counter!("scp_persistence_failures_total").increment(1);
 }
 
-/// Records a cross-context saga landing in `NeedsRepair` (§17.16.4).
+/// Records a cross-context saga that requires operator repair (§17.16.4).
 ///
-/// Incremented at every site that records or re-surfaces a `NeedsRepair`
-/// terminal: the live FSM commit-retry-exhaustion tail, and the crash-recovery
-/// arms (commit-in-progress that could not confirm both sides, an Aborting
-/// entry whose rollback never completed, and a `NeedsRepair` carryover observed
-/// at process start). `NeedsRepair` is FSM-terminal but NOT resolved, so the
-/// recovery scan re-surfaces it each process start until an operator repairs it
-/// — a nonzero rate is the operator-alerting signal §17.16.4 names.
+/// Incremented for TWO distinct operator conditions, both of which keep a saga
+/// out of the resolved set until a human intervenes:
+///
+/// 1. A saga landing in (or re-surfacing as) `NeedsRepair`: the live FSM
+///    commit-retry-exhaustion tail, and the crash-recovery arms
+///    (commit-in-progress that could not confirm both sides, an Aborting entry
+///    whose rollback never completed, and a `NeedsRepair` carryover observed at
+///    process start). `NeedsRepair` is FSM-terminal but NOT resolved, so the
+///    recovery scan re-surfaces it each process start until an operator repairs
+///    it.
+/// 2. The crash-recovery load-sweep skipping a corrupt, torn-write,
+///    undecodable, or vanished journal entry (§17.16.1 length-prefix + checksum
+///    framing). Such an entry is skipped-and-flagged so the rest of the sweep
+///    still recovers; the affected saga awaits operator repair. A nonzero rate
+///    here may therefore mean a corrupt journal entry needing manual repair,
+///    not just a retry-exhausted saga.
+///
+/// Either way a nonzero rate is the operator-alerting signal §17.16.4 names. The
+/// metric is intentionally rate-only (no `saga_id` label — that is an unbounded-
+/// cardinality anti-pattern); per-saga attribution comes from the structured
+/// `SCP-SAGA-RECOVERY` error log emitted alongside each increment.
 pub(crate) fn record_saga_repair_needed() {
     metrics::counter!("scp_saga_repair_needed_total").increment(1);
 }

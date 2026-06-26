@@ -84,6 +84,7 @@ openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
+metrics-util = "0.19"
 
 [[test]]
 name = "economy_integration"

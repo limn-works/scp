@@ -110,6 +110,10 @@ name = "saga_bridge_bootstrap"
 path = "tests/integration/saga_bridge_bootstrap.rs"
 
 [[test]]
+name = "saga_bridge_journal_swap"
+path = "tests/integration/saga_bridge_journal_swap.rs"
+
+[[test]]
 name = "protocol_repository"
 path = "tests/integration/protocol_repository.rs"
 

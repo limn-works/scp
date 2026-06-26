@@ -318,15 +318,33 @@ pub trait SagaJournal: Send + Sync {
     /// For `secret_bearing = true`, the implementation MUST synchronously
     /// overwrite the on-disk evidence bytes of every entry for `saga_id`
     /// with zeros before returning success — not at next compaction
-    /// (spec §9.4.3). The operation is cancel-hostile: if cancellation
-    /// occurs before the overwrite completes, the overwrite MUST complete
-    /// on next process start before the journal is opened for any other
-    /// use. Secret bytes MUST NOT survive on disk past the next journal
-    /// open.
+    /// (spec §9.4.3).
     ///
-    /// For `secret_bearing = false`, the marker may be lazy — the
-    /// implementation appends a terminal entry and MAY leave earlier
-    /// entries intact for later compaction.
+    /// The operation is cancel-hostile: if cancellation (or a crash) occurs
+    /// before the overwrite completes, un-zeroed evidence bytes can linger on
+    /// disk. Fully discharging the §9.4.3 "secret bytes MUST NOT survive past
+    /// the next journal open" guarantee therefore requires a startup
+    /// scrub-before-open hook that re-zeros any interrupted overwrite before
+    /// the journal is opened for any other use. This is a FORWARD OBLIGATION,
+    /// not a guarantee the current production
+    /// [`ProtocolRepositorySagaJournal`] makes: it implements NO
+    /// resume-on-open/scrub hook. That is sound today only because the
+    /// secret-bearing path is DORMANT — no live secret-bearing saga exists
+    /// (cross-identity custody handover was withdrawn, ADR-049 §4), so every
+    /// live `mark_resolved` call passes `secret_bearing = false` and no secret
+    /// bytes are ever written to the journal. When a real secret-bearing saga
+    /// is introduced, the startup scrub-before-open hook MUST be wired before
+    /// that saga ships; until then the resume-on-open completion above is an
+    /// unmet forward contract, deliberately not implemented (no speculative
+    /// machinery for a dormant path).
+    ///
+    /// For `secret_bearing = false`, the on-disk evidence is non-secret, so the
+    /// terminal overwrite is not security-mandated. The production implementation
+    /// nonetheless COMPACTS the saga down to zero entries on resolution (it
+    /// appends the durable terminal marker, then deletes the saga's keys in a
+    /// crash-safe order) so that `load_unresolved`'s cost stays bounded to the
+    /// number of unresolved sagas. Implementations MAY instead leave earlier
+    /// entries for later compaction; either is spec-conformant.
     ///
     /// # Errors
     ///
@@ -423,6 +441,19 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// Extract the `saga_id` segment from a journal key for log attribution.
+///
+/// Key layout is `saga_journal/{saga_id}/{seq}` (see
+/// [`SAGA_JOURNAL_KEY_PREFIX`]): strip the prefix, then take everything before
+/// the LAST `/` (the trailing segment is the seq). On any key that does not
+/// match this shape we fall back to the whole key so the log still carries
+/// something greppable rather than an empty field.
+fn saga_id_from_key(key: &str) -> &str {
+    key.strip_prefix(SAGA_JOURNAL_KEY_PREFIX)
+        .and_then(|s| s.rsplit_once('/'))
+        .map_or(key, |(id, _seq)| id)
+}
+
 // ---------------------------------------------------------------------------
 // Production impl — ProtocolRepositorySagaJournal
 // ---------------------------------------------------------------------------
@@ -435,10 +466,15 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
 /// lexicographic KV).
 ///
 /// On `mark_resolved` with `secret_bearing = true`, every entry under
-/// `saga_journal/{saga_id}/` has its evidence bytes overwritten with zeros
-/// via a zero-length-evidence re-encode, then the terminal marker is
-/// appended. This satisfies spec §9.4.3 "synchronously overwrite on-disk
-/// evidence before returning".
+/// `saga_journal/{saga_id}/` first has its evidence bytes overwritten with
+/// zeros via a zero-length-evidence re-encode (spec §9.4.3 "synchronously
+/// overwrite on-disk evidence before returning"). Then — for BOTH the
+/// secret-bearing and non-secret paths — the terminal marker is appended and
+/// the saga's keys are deleted in a crash-safe order, COMPACTING the resolved
+/// saga down to zero on-disk entries (spec §17.16.1 "Bounded-cost recovery").
+/// This keeps `load_unresolved`'s startup cost bounded to the number of
+/// UNRESOLVED sagas rather than every saga ever run. See `mark_resolved` for the
+/// crash-safety ordering argument.
 pub struct ProtocolRepositorySagaJournal<S: Storage + 'static> {
     storage: Arc<S>,
 }
@@ -487,8 +523,12 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
         // highest `seq_per_saga`.
         //
         // We materialize into (saga_id, latest_key) pairs first, then load
-        // the values. This keeps the wire-parse cost bounded to the number
-        // of unresolved sagas.
+        // the values. Because `mark_resolved` COMPACTS a resolved saga down to
+        // zero on-disk entries (it deletes the saga's keys after the terminal
+        // resolution is durable), the only keys this sweep ever lists, retrieves,
+        // and decodes belong to sagas that are still in flight — so both the
+        // listing breadth and the wire-parse cost are bounded to the number of
+        // UNRESOLVED sagas, not the number of sagas ever run.
         let mut latest_by_saga: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for key in keys {
@@ -501,6 +541,51 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                 continue;
             };
             let saga_id_str = &stripped[..slash_idx];
+            let seq_suffix = &stripped[slash_idx + 1..];
+            // SECURITY: the selection key is the lexicographic MAX per saga,
+            // but lexicographic order only equals seq order for the CANONICAL
+            // 20-digit zero-padded ASCII-digit suffix that `entry_key` writes.
+            // A storage-write attacker can plant a sibling key whose suffix
+            // sorts ABOVE every numeric seq — `~` (0x7E), `z` (0x7A), and every
+            // other non-digit byte > '9' (0x39) all sort high — and thereby win
+            // selection, overriding the real latest entry to flip a saga's FSM
+            // state / participants (resurrect a resolved saga, or shove a live
+            // saga to attacker-chosen `Committing` + participants). A purely
+            // numeric 20-digit suffix can ALSO exceed `u64::MAX`
+            // (`18446744073709551615`): twenty `9`s passes a digit-only check
+            // yet sorts lexicographically above every real zero-padded seq, so a
+            // bare length+digit test still lets such an out-of-range suffix win.
+            // So we apply the SAME `parse::<u64>` rejection posture `next_seq_for_saga` already applies (the read/select path here is STRICTER — it additionally requires an exactly-20-digit suffix) on
+            // the write path: the suffix must be EXACTLY 20 ASCII digits AND
+            // parse as a `u64` (rejecting the `> u64::MAX` overflow case).
+            //
+            // What this check rejects: MALFORMED / non-canonical / out-of-range
+            // key suffixes — anything that is not exactly the 20-digit
+            // zero-padded, in-`u64`-range seq `entry_key` writes — so they can
+            // never win latest-per-saga selection. It does NOT (and cannot)
+            // detect a forged entry stored under a perfectly CANONICAL,
+            // in-range seq key with a CRC-valid body: that residual is bounded
+            // by storage-layer integrity (the CRC framing is a torn-write
+            // detector, not a MAC), and per-entry cryptographic key→value
+            // authentication would be a separate architectural concern, out of
+            // scope for this swap. A suffix failing this check is a
+            // corrupt/planted entry — flag it and skip it so it never
+            // participates in latest-per-saga selection; the canonical real
+            // entry still wins.
+            let is_canonical_seq = seq_suffix.len() == 20
+                && seq_suffix.bytes().all(|b| b.is_ascii_digit())
+                && seq_suffix.parse::<u64>().is_ok();
+            if !is_canonical_seq {
+                crate::metrics::record_saga_repair_needed();
+                tracing::error!(
+                    key = %key,
+                    saga_id = %saga_id_str,
+                    "SCP-SAGA-RECOVERY: non-canonical journal key suffix — \
+                     entry skipped (cannot win latest-per-saga selection), \
+                     manual repair needed; other sagas unaffected"
+                );
+                continue;
+            }
             // The prior latest (if any) has a smaller lexicographic seq
             // than this one by construction.
             latest_by_saga.insert(saga_id_str.to_string(), key);
@@ -508,15 +593,63 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
 
         let mut out = Vec::with_capacity(latest_by_saga.len());
         for key in latest_by_saga.values() {
-            let raw = self
-                .storage
-                .retrieve(key)
-                .await
-                .map_err(|e| JournalError::Io(e.to_string()))?
-                .ok_or_else(|| JournalError::Io(format!("entry disappeared during load: {key}")))?;
-            let entry = decode_entry(&raw)?;
-            if !entry.state.is_terminal() {
-                out.push(entry);
+            // Fault isolation (availability): a single corrupt OR torn-write
+            // entry under `saga_journal/` MUST NOT abort the entire sweep and
+            // thereby skip EVERY other unresolved saga (recovery denied,
+            // reservations / escrow stranded). The CRC framing exists precisely
+            // because torn writes happen, so a per-entry decode failure is
+            // reachable benignly, not just adversarially. On a per-saga
+            // retrieve/decode fault we log, emit the saga-repair-needed metric
+            // so an operator is alerted, and SKIP this saga — never silently
+            // fall back to an earlier-seq entry (that risks resurrecting stale
+            // pre-commit state). All OTHER sagas are still recovered.
+            //
+            // NB: genuine `list_keys` I/O failure above stays a hard `?` — a
+            // backend that cannot list is a real failure, not a per-entry fault.
+            let raw = match self.storage.retrieve(key).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    // Latest key vanished between list and retrieve (concurrent deleter) — per-saga fault: flag and skip, never abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        saga_id = %saga_id_from_key(key),
+                        "SCP-SAGA-RECOVERY: journal entry disappeared during load — \
+                         saga skipped, manual repair needed; other sagas unaffected"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Backend retrieve error on ONE key is a per-saga fault, not
+                    // a list-level failure: flag and skip, do not abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        saga_id = %saga_id_from_key(key),
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: journal entry retrieve failed — \
+                         saga skipped, manual repair needed; other sagas unaffected"
+                    );
+                    continue;
+                }
+            };
+            match decode_entry(&raw) {
+                Ok(entry) => {
+                    if !entry.state.is_terminal() {
+                        out.push(entry);
+                    }
+                }
+                Err(e) => {
+                    // Corrupt / torn-write entry: flag and skip, do not abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        saga_id = %saga_id_from_key(key),
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: corrupt journal entry, saga skipped, \
+                         manual repair needed; other sagas unaffected"
+                    );
+                }
             }
         }
         Ok(out)
@@ -535,6 +668,17 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             // returning. We iterate every entry under the saga's prefix,
             // read it, zero the evidence, write it back, and only after
             // all are zeroed append the terminal marker.
+            //
+            // FORWARD OBLIGATION (NOT implemented here): if this overwrite loop
+            // is interrupted by a crash mid-flight, un-zeroed evidence bytes can
+            // persist on disk. This impl has NO resume-on-open/scrub hook to
+            // re-zero them on next process start. That is sound only because the
+            // secret-bearing path is DORMANT — no live secret-bearing saga
+            // exists (custody handover withdrawn, ADR-049 §4), so this branch is
+            // never reached by a live call (every live `mark_resolved` passes
+            // `secret_bearing = false`). When a real secret-bearing saga is
+            // introduced, a startup scrub-before-open hook MUST be wired before
+            // it ships. See the `SagaJournal::mark_resolved` trait doc.
             let keys = self
                 .storage
                 .list_keys(&prefix)
@@ -547,6 +691,14 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                     .await
                     .map_err(|e| JournalError::Io(e.to_string()))?;
                 if let Some(bytes) = raw {
+                    // SECURITY: unlike `load_unresolved` (availability-oriented,
+                    // skip-and-flag), the secret-bearing overwrite path FAILS
+                    // LOUD on a decode error. A corrupt entry we cannot decode is
+                    // an entry whose evidence bytes we cannot locate to zero —
+                    // silently skipping it would leave secret bytes on disk past
+                    // the next journal open (violating spec §9.4.3). Aborting
+                    // here surfaces the fault so an operator can repair it before
+                    // the secret is considered overwritten.
                     let mut entry = decode_entry(&bytes)?;
                     // Overwrite evidence with zeros of the same length so the
                     // on-disk footprint stays stable and the record remains
@@ -562,10 +714,14 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             }
         }
 
-        // Append a terminal marker. `seq_per_saga = u64::MAX` would collide
-        // with nothing real; we use a timestamped larger-than-any-prior
-        // seq by reading the latest seq and incrementing by 1.
+        // Append a terminal marker at the strictly-highest seq (max prior + 1).
+        // The 20-digit zero-padded seq formatting makes this marker the
+        // lexicographic MAXIMUM under the saga prefix, so until it is the last
+        // thing deleted below, it is the entry `load_unresolved` selects for the
+        // saga — and being terminal, it makes the saga drop out of the
+        // unresolved set.
         let next_seq = self.next_seq_for_saga(&saga_id).await?;
+        let marker_key = Self::entry_key(&saga_id, next_seq);
 
         let marker = JournalEntry {
             saga_id: saga_id.clone(),
@@ -576,6 +732,55 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             seq_per_saga: next_seq,
         };
         self.append(marker).await?;
+
+        // Compaction (spec §17.16.1 "Bounded-cost recovery"): a resolved saga
+        // leaves NO entries, so `load_unresolved` only ever lists + decodes
+        // entries for sagas that are genuinely still in flight — its cost is
+        // bounded to the number of UNRESOLVED sagas, not the number of sagas
+        // EVER run.
+        //
+        // CRASH-SAFETY ORDERING (no dependence on backend delete order):
+        //   1. The terminal marker is durable (appended above) at the strictly
+        //      max seq.
+        //   2. Delete every NON-terminal entry for this saga FIRST, leaving the
+        //      terminal marker in place as the safety net. A crash at any point
+        //      during these deletes leaves the marker — still the max-seq entry
+        //      — so `load_unresolved` selects it, sees a terminal state, and the
+        //      saga stays resolved. Removing any subset of the lower-seq
+        //      non-terminal entries while the terminal max-seq marker survives
+        //      can NEVER resurrect a stale pre-commit entry as the saga's
+        //      "latest" state.
+        //   3. Delete the terminal marker LAST. A crash before this step leaves
+        //      the saga resolved (marker present); a crash after leaves the saga
+        //      fully gone. Either outcome is terminal — never a half-state that
+        //      re-drives stale evidence.
+        //
+        // For the secret-bearing path the evidence bytes were already zeroized
+        // in place above (spec §9.4.3), so even if a delete below fails midway
+        // no secret bytes linger; deleting the prefix is then strictly better
+        // than leaving zeroed husks around.
+        let keys = self
+            .storage
+            .list_keys(&prefix)
+            .await
+            .map_err(|e| JournalError::Io(e.to_string()))?;
+        for key in &keys {
+            if key == &marker_key {
+                // Defer the terminal marker — it is the crash-safety net and
+                // must be the LAST key removed.
+                continue;
+            }
+            self.storage
+                .delete(key)
+                .await
+                .map_err(|e| JournalError::Io(e.to_string()))?;
+        }
+        // Now that no non-terminal entry remains, drop the terminal marker so a
+        // resolved saga leaves zero on-disk footprint.
+        self.storage
+            .delete(&marker_key)
+            .await
+            .map_err(|e| JournalError::Io(e.to_string()))?;
 
         Ok(())
     }
@@ -589,18 +794,32 @@ impl<S: Storage + 'static> ProtocolRepositorySagaJournal<S> {
             .list_keys(&prefix)
             .await
             .map_err(|e| JournalError::Io(e.to_string()))?;
-        // Last key is lexicographically largest — parse the trailing seq.
-        let last = keys.iter().max_by(std::cmp::Ord::cmp);
-        match last {
-            Some(k) => {
-                let suffix = k.rsplit('/').next().unwrap_or("");
-                let n: u64 = suffix.parse().map_err(|e| {
-                    JournalError::Codec(format!("malformed seq suffix {suffix:?}: {e}"))
-                })?;
-                Ok(n.saturating_add(1))
+        // Compute the max seq over all PARSEABLE trailing-seq suffixes. A
+        // single key with a malformed suffix (a corrupt key in this saga's own
+        // prefix) is skipped-and-logged rather than aborting next-seq
+        // computation — same fault-isolation posture as `load_unresolved`. The
+        // zero-padded 20-digit seq formatting means lexicographic max == numeric
+        // max, so skipping an unparseable outlier never picks a lower-than-real
+        // next seq from the well-formed entries.
+        let mut max_seq: Option<u64> = None;
+        for k in &keys {
+            let suffix = k.rsplit('/').next().unwrap_or("");
+            match suffix.parse::<u64>() {
+                Ok(n) => {
+                    max_seq = Some(max_seq.map_or(n, |m| m.max(n)));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key = %k,
+                        saga_id = %saga_id_from_key(k),
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: malformed seq suffix in journal key, \
+                         skipped for next-seq computation; manual repair may be needed"
+                    );
+                }
             }
-            None => Ok(0),
         }
+        Ok(max_seq.map_or(0, |m| m.saturating_add(1)))
     }
 }
 
@@ -725,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_resolved_secret_bearing_zeroes_evidence_bytes() {
+    async fn mark_resolved_secret_bearing_leaves_no_secret_on_disk() {
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
@@ -756,30 +975,50 @@ mod tests {
             .await
             .unwrap();
 
-        // Post-resolve: the prepare-A entry is still parseable (length-CRC
-        // invariant holds) but its evidence field is all zeros.
-        let post_raw = storage.retrieve(&key0).await.unwrap().unwrap();
-        let post_entry = decode_entry(&post_raw).unwrap();
-        assert_eq!(
-            &*post_entry.evidence,
-            &vec![0u8; secret_evidence.len()][..],
-            "evidence must be zeroed",
-        );
+        // Post-resolve: the secret-bearing path FIRST overwrites evidence bytes
+        // in place (spec §9.4.3), THEN compacts the saga to zero on-disk entries
+        // (spec §17.16.1). So the prepare-A key is gone outright...
         assert!(
-            !contains_subsequence(&post_raw, &secret_evidence),
-            "secret bytes must not survive on disk after secret-bearing mark_resolved",
+            storage.retrieve(&key0).await.unwrap().is_none(),
+            "the secret-bearing entry must be compacted away after resolution",
         );
+
+        // ...and — the security invariant that matters — NO key anywhere under
+        // the journal prefix still carries the secret subsequence. (The in-place
+        // overwrite is what guarantees this even on a backend where a delete
+        // might leave a tombstoned husk; here it is verified end-to-end.)
+        let all_keys = storage.list_keys(SAGA_JOURNAL_KEY_PREFIX).await.unwrap();
+        for key in &all_keys {
+            let raw = storage.retrieve(key).await.unwrap().unwrap();
+            assert!(
+                !contains_subsequence(&raw, &secret_evidence),
+                "secret bytes must not survive on disk after secret-bearing \
+                 mark_resolved; found in {key}",
+            );
+        }
     }
 
     #[tokio::test]
-    async fn mark_resolved_non_secret_leaves_prior_entries_intact() {
+    async fn mark_resolved_non_secret_compacts_saga_to_zero_entries() {
+        // FIX B (compaction): a non-secret resolve appends the terminal marker,
+        // then deletes every key for the saga (crash-safe order) so the resolved
+        // saga leaves ZERO on-disk entries and never participates in a later
+        // unresolved-saga scan (spec §17.16.1 "Bounded-cost recovery").
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
 
-        let ev = b"PUBLIC-EVIDENCE".to_vec();
+        // Several entries for ONE saga across its lifecycle.
         journal
-            .append(test_entry(&saga, 0, SagaState::PreparingA, ev.clone()))
+            .append(test_entry(&saga, 0, SagaState::Initiated, b"ev0".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 1, SagaState::PreparingA, b"ev1".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 2, SagaState::PreparingB, b"ev2".to_vec()))
             .await
             .unwrap();
 
@@ -788,15 +1027,93 @@ mod tests {
             .await
             .unwrap();
 
-        let key0 = ProtocolRepositorySagaJournal::<InMemoryStorage>::entry_key(&saga, 0);
-        let raw = storage.retrieve(&key0).await.unwrap().unwrap();
-        let entry = decode_entry(&raw).unwrap();
-        assert_eq!(entry.state, SagaState::PreparingA);
-        assert_eq!(&*entry.evidence, &ev[..]);
+        // No on-disk keys remain under this saga's prefix.
+        let prefix = ProtocolRepositorySagaJournal::<InMemoryStorage>::saga_prefix(&saga);
+        let remaining = storage.list_keys(&prefix).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "a resolved non-secret saga must compact to zero entries, found {remaining:?}",
+        );
+
+        // And the saga does not surface from a recovery sweep.
+        let unresolved = journal.load_unresolved().await.unwrap();
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "a compacted resolved saga must not appear in load_unresolved, got {unresolved:?}",
+        );
     }
 
     #[tokio::test]
-    async fn partial_write_truncation_detected() {
+    async fn mark_resolved_secret_bearing_compacts_saga_to_zero_entries() {
+        // FIX B (compaction) — secret-bearing variant: after the evidence
+        // overwrite (spec §9.4.3) the resolve still compacts the saga to zero
+        // residual keys, leaving no zeroed husks behind.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let saga = SagaId::new();
+
+        journal
+            .append(test_entry(
+                &saga,
+                0,
+                SagaState::PreparingA,
+                b"BEARER-ARTIFACT-COMMITMENT-BYTES".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &saga,
+                1,
+                SagaState::Committing,
+                b"more".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        journal
+            .mark_resolved(saga.clone(), SagaTerminalState::Committed, true)
+            .await
+            .unwrap();
+
+        let prefix = ProtocolRepositorySagaJournal::<InMemoryStorage>::saga_prefix(&saga);
+        let remaining = storage.list_keys(&prefix).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "a resolved secret-bearing saga must compact to zero entries, found {remaining:?}",
+        );
+
+        let unresolved = journal.load_unresolved().await.unwrap();
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "a compacted secret-bearing saga must not appear in load_unresolved, got {unresolved:?}",
+        );
+    }
+
+    #[test]
+    fn partial_write_truncation_detected_by_decode() {
+        // The CRC framing detects a torn write at the DECODE boundary. (The
+        // load sweep itself is fault-isolating — it skips a corrupt entry rather
+        // than aborting; see `load_unresolved_truncation_skips_not_aborts` — so
+        // the integrity check is asserted here directly against `decode_entry`,
+        // the single point where the length/CRC invariant is enforced.)
+        let saga = SagaId::new();
+        let entry = test_entry(&saga, 0, SagaState::Initiated, b"ev".to_vec());
+        let mut full = encode_entry(&entry).unwrap();
+        // Truncate to simulate a partial write (cut off CRC trailer).
+        full.truncate(full.len() - 2);
+
+        let err = decode_entry(&full).unwrap_err();
+        assert!(
+            matches!(err, JournalError::IntegrityFailure(_)),
+            "truncation must be caught as integrity failure, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn load_unresolved_truncation_skips_not_aborts() {
+        // A torn-write entry under the journal prefix is skipped (fault
+        // isolation), never aborting the whole sweep.
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
@@ -811,15 +1128,186 @@ mod tests {
         full.truncate(full.len() - 2);
         storage.store(&key0, &full).await.unwrap();
 
-        let err = journal.load_unresolved().await.unwrap_err();
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("a torn-write entry must be skipped, not abort the sweep");
         assert!(
-            matches!(err, JournalError::IntegrityFailure(_)),
-            "truncation must be caught as integrity failure, got {err:?}",
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "the torn-write saga must be skipped (not surfaced), got {unresolved:?}",
         );
     }
 
     #[tokio::test]
-    async fn crc_mismatch_detected() {
+    async fn load_unresolved_skips_corrupt_entry_and_recovers_the_rest() {
+        // Availability regression guard: a single corrupt (or torn-write) entry
+        // under `saga_journal/` MUST NOT blind recovery to EVERY other
+        // unresolved saga. Plant two legitimate non-terminal sagas plus one
+        // garbage key, then assert `load_unresolved` returns Ok with BOTH legit
+        // sagas present (the corrupt one skipped-and-flagged).
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+        let saga_b = SagaId::new();
+        let saga_c = SagaId::new();
+        journal
+            .append(test_entry(
+                &saga_b,
+                0,
+                SagaState::PreparingB,
+                b"legit-b".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &saga_c,
+                0,
+                SagaState::Committing,
+                b"legit-c".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Plant a garbage value under a well-formed key so it groups as its own
+        // saga and its latest key is selected for decode — exactly the entry the
+        // pre-fix `?` would have aborted the whole sweep on.
+        let corrupt_saga_id = "zzcorrupt";
+        let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}{corrupt_saga_id}/{:020}", 0);
+        storage
+            .store(&corrupt_key, b"not-a-valid-wire-entry")
+            .await
+            .unwrap();
+
+        let unresolved = journal.load_unresolved().await.expect(
+            "a single corrupt entry must NOT abort the sweep — the other sagas must still recover",
+        );
+
+        // --- Survivor presence (availability) ---
+        assert!(
+            unresolved.iter().any(|e| e.saga_id == saga_b),
+            "PreparingB saga must survive the corrupt-entry skip, got {unresolved:?}",
+        );
+        assert!(
+            unresolved.iter().any(|e| e.saga_id == saga_c),
+            "Committing saga must survive the corrupt-entry skip, got {unresolved:?}",
+        );
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id.0 == corrupt_saga_id),
+            "the corrupt saga must be skipped, not surfaced as unresolved",
+        );
+
+        // --- Survivor STATE (FIX E): the surviving sagas must carry their
+        // expected FSM state, not merely be present. ---
+        let b_entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_b)
+            .expect("saga_b present");
+        assert_eq!(
+            b_entry.state,
+            SagaState::PreparingB,
+            "saga_b must recover with its PreparingB FSM state intact",
+        );
+        let c_entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_c)
+            .expect("saga_c present");
+        assert_eq!(
+            c_entry.state,
+            SagaState::Committing,
+            "saga_c must recover with its Committing FSM state intact",
+        );
+    }
+
+    // The corrupt-skip path fires `record_saga_repair_needed()` (the rate-only
+    // operator alert). Proven here with a THREAD-LOCAL metrics recorder
+    // (`metrics::with_local_recorder`) — robust under the parallel test binary,
+    // unlike a tracing capture (whose callsite-interest cache is process-global
+    // and poisoned by other tests hitting the same `error!` callsite first).
+    #[test]
+    fn load_unresolved_corrupt_skip_increments_repair_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+                // One legit non-terminal saga that MUST still recover.
+                let saga_ok = SagaId::new();
+                journal
+                    .append(test_entry(
+                        &saga_ok,
+                        0,
+                        SagaState::PreparingB,
+                        b"legit".to_vec(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // One corrupt entry under a well-formed key.
+                let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}zzcorrupt/{:020}", 0);
+                storage
+                    .store(&corrupt_key, b"not-a-valid-wire-entry")
+                    .await
+                    .unwrap();
+
+                let unresolved = journal
+                    .load_unresolved()
+                    .await
+                    .expect("corrupt entry must be skipped, not abort the sweep");
+                assert!(
+                    unresolved.iter().any(|e| e.saga_id == saga_ok),
+                    "the legit saga must still recover past the corrupt skip",
+                );
+            });
+        });
+
+        // The corrupt-skip must have incremented the repair counter exactly once.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
+            if ck.key().name() == "scp_saga_repair_needed_total" {
+                if let DebugValue::Counter(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            count,
+            Some(1),
+            "corrupt-skip must increment scp_saga_repair_needed_total once; snapshot={snapshot:?}",
+        );
+    }
+
+    #[test]
+    fn crc_mismatch_detected_by_decode() {
+        // A flipped payload bit is caught at the decode boundary by the CRC
+        // check. (The load sweep skips such an entry; see
+        // `load_unresolved_crc_mismatch_skips_not_aborts`.)
+        let saga = SagaId::new();
+        let entry = test_entry(&saga, 0, SagaState::Initiated, b"ev".to_vec());
+        let mut full = encode_entry(&entry).unwrap();
+        // Flip a bit in the middle of the payload.
+        let mid = full.len() / 2;
+        full[mid] ^= 0xFF;
+
+        let err = decode_entry(&full).unwrap_err();
+        assert!(matches!(err, JournalError::IntegrityFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn load_unresolved_crc_mismatch_skips_not_aborts() {
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
@@ -835,8 +1323,14 @@ mod tests {
         full[mid] ^= 0xFF;
         storage.store(&key0, &full).await.unwrap();
 
-        let err = journal.load_unresolved().await.unwrap_err();
-        assert!(matches!(err, JournalError::IntegrityFailure(_)));
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("a CRC-corrupt entry must be skipped, not abort the sweep");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "the CRC-corrupt saga must be skipped, got {unresolved:?}",
+        );
     }
 
     #[tokio::test]
@@ -882,6 +1376,387 @@ mod tests {
         assert!(!SagaState::Committing.is_terminal());
         assert!(!SagaState::Aborting.is_terminal());
         assert!(!SagaState::NeedsRepair.is_terminal());
+    }
+
+    #[test]
+    fn load_unresolved_ignores_noncanonical_shadow_key() {
+        // SECURITY regression guard (seq-suffix validation): a storage-write
+        // attacker plants a sibling key whose trailing segment (`~`, 0x7E) sorts
+        // lexicographically ABOVE every canonical 20-digit seq. Without suffix
+        // validation that shadow key wins latest-per-saga selection and can flip
+        // a saga's FSM state / resurrect a resolved saga. `load_unresolved` MUST
+        // validate the suffix is exactly 20 ASCII digits and skip the shadow,
+        // letting the canonical real entry win — and flag the corrupt key via
+        // the repair metric. Proven with a THREAD-LOCAL metrics recorder, same
+        // pattern as `load_unresolved_corrupt_skip_increments_repair_metric`.
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (live_saga, resolved_saga) = (SagaId::new(), SagaId::new());
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+                // (1) A live (non-terminal) saga at canonical seq 0.
+                journal
+                    .append(test_entry(
+                        &live_saga,
+                        0,
+                        SagaState::Committing,
+                        b"real-committing".to_vec(),
+                    ))
+                    .await
+                    .unwrap();
+                // Plant a `~`-suffixed shadow key under the SAME saga that sorts
+                // above the canonical seq and (pre-fix) would override it to a
+                // resurrected / attacker-chosen state.
+                let live_shadow = format!("{SAGA_JOURNAL_KEY_PREFIX}{live_saga}/~");
+                let forged = test_entry(
+                    &live_saga,
+                    0,
+                    SagaState::PreparingA,
+                    b"attacker-rollback".to_vec(),
+                );
+                storage
+                    .store(&live_shadow, &encode_entry(&forged).unwrap())
+                    .await
+                    .unwrap();
+
+                // (2) A RESOLVED saga (its only on-disk entry is terminal), plus
+                // a `~`-suffixed shadow carrying a NON-terminal state that would
+                // resurrect it if the shadow key were selected.
+                journal
+                    .append(test_entry(
+                        &resolved_saga,
+                        0,
+                        SagaState::Committed,
+                        Vec::new(),
+                    ))
+                    .await
+                    .unwrap();
+                let resolved_shadow = format!("{SAGA_JOURNAL_KEY_PREFIX}{resolved_saga}/~");
+                let resurrect = test_entry(
+                    &resolved_saga,
+                    0,
+                    SagaState::PreparingB,
+                    b"resurrect".to_vec(),
+                );
+                storage
+                    .store(&resolved_shadow, &encode_entry(&resurrect).unwrap())
+                    .await
+                    .unwrap();
+
+                let unresolved = journal
+                    .load_unresolved()
+                    .await
+                    .expect("non-canonical shadow keys must be skipped, not abort the sweep");
+
+                // The live saga surfaces with its REAL Committing state — the
+                // `~` shadow did NOT override it.
+                let live = unresolved
+                    .iter()
+                    .find(|e| e.saga_id == live_saga)
+                    .expect("the live saga must still recover");
+                assert_eq!(
+                    live.state,
+                    SagaState::Committing,
+                    "the `~` shadow key must NOT override the canonical latest entry",
+                );
+                assert_eq!(
+                    &*live.evidence, b"real-committing",
+                    "the live saga must keep its real evidence, not the forged shadow's",
+                );
+
+                // The resolved saga must NOT be resurrected by its shadow key.
+                assert!(
+                    !unresolved.iter().any(|e| e.saga_id == resolved_saga),
+                    "a `~` shadow key must not resurrect a resolved saga, got {unresolved:?}",
+                );
+            });
+        });
+
+        // Both shadow keys were flagged as corrupt → repair counter incremented
+        // (at least once; we planted two non-canonical keys).
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
+            if ck.key().name() == "scp_saga_repair_needed_total" {
+                if let DebugValue::Counter(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(count, Some(c) if c >= 1),
+            "a non-canonical shadow key must increment scp_saga_repair_needed_total; snapshot={snapshot:?}",
+        );
+    }
+
+    #[test]
+    fn load_unresolved_rejects_twenty_digit_overflow_shadow_key() {
+        // SECURITY regression guard (read/write parity on the seq suffix): a
+        // suffix of twenty `9`s (`99999999999999999999`) is 20 ASCII DIGITS but
+        // exceeds `u64::MAX` (`18446744073709551615`). A bare length+digit check
+        // accepts it, yet it sorts lexicographically ABOVE every real
+        // zero-padded seq, so it would win latest-per-saga selection and let a
+        // storage-write attacker override the canonical entry — flipping a
+        // saga's FSM state. The write path (`next_seq_for_saga`) already rejects
+        // it via `parse::<u64>()`; `load_unresolved` MUST do the same so the
+        // canonical real entry still wins, and flag the planted key via the
+        // repair metric. Thread-local recorder, same pattern as
+        // `load_unresolved_ignores_noncanonical_shadow_key`.
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let saga = SagaId::new();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+                // A live (non-terminal) saga at canonical seq 0.
+                journal
+                    .append(test_entry(
+                        &saga,
+                        0,
+                        SagaState::Committing,
+                        b"real-committing".to_vec(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // Plant a 20-DIGIT but `> u64::MAX` overflow shadow under the
+                // SAME saga. It is all-digits and length 20, so a check lacking
+                // the `parse::<u64>()` guard accepts it; it sorts above the
+                // canonical `…00` seq and (pre-fix) would override the live
+                // entry with attacker-chosen pre-commit state.
+                let overflow_shadow =
+                    format!("{SAGA_JOURNAL_KEY_PREFIX}{saga}/99999999999999999999");
+                let forged = test_entry(
+                    &saga,
+                    0,
+                    SagaState::PreparingA,
+                    b"attacker-rollback".to_vec(),
+                );
+                storage
+                    .store(&overflow_shadow, &encode_entry(&forged).unwrap())
+                    .await
+                    .unwrap();
+
+                let unresolved = journal.load_unresolved().await.expect(
+                    "a 20-digit overflow shadow key must be skipped, not abort the sweep",
+                );
+
+                // The live saga surfaces with its REAL Committing state — the
+                // overflow shadow did NOT win latest-per-saga selection.
+                let live = unresolved
+                    .iter()
+                    .find(|e| e.saga_id == saga)
+                    .expect("the live saga must still recover");
+                assert_eq!(
+                    live.state,
+                    SagaState::Committing,
+                    "the > u64::MAX overflow shadow key must NOT override the canonical latest entry",
+                );
+                assert_eq!(
+                    &*live.evidence, b"real-committing",
+                    "the live saga must keep its real evidence, not the forged overflow shadow's",
+                );
+            });
+        });
+
+        // The overflow shadow key was flagged as corrupt → repair counter fired.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
+            if ck.key().name() == "scp_saga_repair_needed_total" {
+                if let DebugValue::Counter(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(count, Some(c) if c >= 1),
+            "a 20-digit overflow shadow key must increment scp_saga_repair_needed_total; snapshot={snapshot:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_secret_bearing_fails_loud_on_corrupt_entry() {
+        // SECURITY (fail-loud invariant, spec §9.4.3): the secret-bearing
+        // overwrite path must NOT silently skip an entry whose secret bytes it
+        // cannot locate to zero. An undecodable entry under the saga's prefix is
+        // an entry whose evidence we cannot reach — `mark_resolved(secret) MUST
+        // return Err so an operator repairs it before the secret is considered
+        // overwritten, rather than leaving secret bytes on disk.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let saga = SagaId::new();
+
+        // A secret-bearing-shaped entry across two seqs.
+        journal
+            .append(test_entry(
+                &saga,
+                0,
+                SagaState::PreparingA,
+                b"BEARER-ARTIFACT-COMMITMENT-BYTES".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &saga,
+                1,
+                SagaState::Committing,
+                b"more-secret".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Corrupt one of the saga's keys so it can no longer be decoded.
+        let key1 = ProtocolRepositorySagaJournal::<InMemoryStorage>::entry_key(&saga, 1);
+        storage.store(&key1, b"corrupt").await.unwrap();
+
+        let result = journal
+            .mark_resolved(saga.clone(), SagaTerminalState::Committed, true)
+            .await;
+        assert!(
+            result.is_err(),
+            "secret-bearing mark_resolved must fail loud on an undecodable entry \
+             (cannot zero secret bytes it cannot locate), got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_non_secret_skips_corrupt_entry_succeeds() {
+        // SECURITY contrast to `mark_resolved_secret_bearing_fails_loud_on_corrupt_entry`:
+        // the two postures are deliberately OPPOSITE on the SAME corruption
+        // fixture. Secret-bearing resolution must FAIL LOUD on an undecodable
+        // entry (it cannot zero secret bytes it cannot reach). The non-secret
+        // availability path must instead TOLERATE the same corrupt entry —
+        // skip-and-flag via the repair metric — so one torn write never denies
+        // recovery for every other unresolved saga. The non-secret
+        // `mark_resolved` does not decode prior entries (nothing to zero), so we
+        // assert the tolerant posture on the `load_unresolved` sweep over the
+        // identical corrupt fixture: it returns Ok (does not abort) and skips
+        // only the corrupt saga.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let corrupt_saga = SagaId::new();
+        let healthy_saga = SagaId::new();
+
+        // Same fixture shape as the fail-loud test: a saga across two seqs whose
+        // latest key is then overwritten with undecodable bytes.
+        journal
+            .append(test_entry(
+                &corrupt_saga,
+                0,
+                SagaState::PreparingA,
+                b"ev0".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &corrupt_saga,
+                1,
+                SagaState::Committing,
+                b"ev1".to_vec(),
+            ))
+            .await
+            .unwrap();
+        let latest = ProtocolRepositorySagaJournal::<InMemoryStorage>::entry_key(&corrupt_saga, 1);
+        storage.store(&latest, b"corrupt").await.unwrap();
+
+        // A second, healthy unresolved saga that MUST still recover despite the
+        // corrupt sibling.
+        journal
+            .append(test_entry(
+                &healthy_saga,
+                0,
+                SagaState::Committing,
+                b"healthy".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Tolerant posture: the sweep succeeds (does NOT fail loud), skips the
+        // corrupt saga, and still recovers the healthy one.
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("non-secret recovery must tolerate a corrupt entry, not fail loud");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == corrupt_saga),
+            "the corrupt saga's latest entry is undecodable → skipped, got {unresolved:?}",
+        );
+        let healthy = unresolved
+            .iter()
+            .find(|e| e.saga_id == healthy_saga)
+            .expect("a healthy unresolved saga must still recover past a corrupt sibling");
+        assert_eq!(healthy.state, SagaState::Committing);
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_aborted_compacts_saga_to_zero_entries() {
+        // Mirror of `mark_resolved_non_secret_compacts_saga_to_zero_entries` for
+        // the `Aborted` terminal variant: an aborted resolve also compacts the
+        // saga to zero on-disk entries (spec §17.16.1 "Bounded-cost recovery").
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let saga = SagaId::new();
+
+        journal
+            .append(test_entry(&saga, 0, SagaState::Initiated, b"ev0".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 1, SagaState::PreparingA, b"ev1".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 2, SagaState::Aborting, b"ev2".to_vec()))
+            .await
+            .unwrap();
+
+        journal
+            .mark_resolved(saga.clone(), SagaTerminalState::Aborted, false)
+            .await
+            .unwrap();
+
+        let prefix = ProtocolRepositorySagaJournal::<InMemoryStorage>::saga_prefix(&saga);
+        let remaining = storage.list_keys(&prefix).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "a resolved (Aborted) saga must compact to zero entries, found {remaining:?}",
+        );
+
+        let unresolved = journal.load_unresolved().await.unwrap();
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "a compacted Aborted saga must not appear in load_unresolved, got {unresolved:?}",
+        );
     }
 
     // Helper: substring search on byte slices (since std doesn't have one).
