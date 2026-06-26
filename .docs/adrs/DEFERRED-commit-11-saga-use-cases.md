@@ -80,6 +80,8 @@ the legacy direct path.
 
 ## Gap 2 — Cross-context tool invocation transport
 
+> **RESOLVED (2026-06-26).** The dead `ToolsCommand::InitiateCrossContextToolInvocation` mailbox variant that represented this "deferral" has been deleted. The §6.2.4 cross-context tool-invocation saga is produced supervisor-side by `Supervisor::start_cross_context_tool_invocation_saga`, not via the actor mailbox (its borrowed, non-`'static` `SagaSigningKeys` cannot move into a `'static` mailbox message). The saga's remaining surfaces — its FFI export (ADR-049 §3a) and cross-node wire transport (the current path drives co-resident target actors in-process) — are tracked in the saga workstream. The present-tense text below is the original problem statement, retained for historical provenance only.
+
 **What's missing.** The spec (§6.2) defines tool invocation within a
 context but not the cross-context forwarding path:
 - Wire format for forwarding a tool invocation from the calling
@@ -102,13 +104,14 @@ context but not the cross-context forwarding path:
   caller (same envelope type on a return channel vs. separate
   `CrossContextToolReceipt`).
 
-**Current placeholder.**
-`ToolsCommand::InitiateCrossContextToolInvocation` returns
-`ContextError::NotImplemented`. Note:
-`ContextManager::invoke_tool_with_economy` is not migrated to a
-command variant because its generic `F: FnOnce(Value) -> Fut`
-executor closure cannot cross the actor mailbox — it continues to
-run on the direct manager surface (FFI bridges invoke it inline).
+**Resolution.** The saga is produced directly by
+`Supervisor::start_cross_context_tool_invocation_saga` (running
+supervisor-side); the dead `ToolsCommand::InitiateCrossContextToolInvocation`
+mailbox variant and its `NotImplemented` reply have been deleted. Note:
+`ContextManager::invoke_tool_with_economy` is, for a separate reason, not
+a command variant — its generic `F: FnOnce(Value) -> Fut` executor closure
+carries no `Send` bound and so cannot cross the actor mailbox; it continues
+to run on the direct manager surface (FFI bridges invoke it inline).
 
 ## Gap 3 — Broadcast hosting handshake protocol
 
@@ -208,11 +211,14 @@ async/poll wait model having been withdrawn with Gap 4 per ADR-049 §3a.)
    Gap 1 being the §5.15.8 single-context-async standing-pair spec (not
    a saga) and Gap 2 the one live saga. (Gaps 3–4 are withdrawn, not
    specced; Gap 5 is the FFI surface, item 4 below.)
-2. Replacement of the `reply_saga_deferred` placeholders in
-   `handlers/{standing,tools}.rs` with real dispatches —
-   Prepare+Commit for the one saga, the single-context-async
-   `create` + `add_member` + Welcome path for standing-pair. (No
-   migration or broadcast-hosting handler — Gaps 3–4 withdrawn.)
+2. Replacement of the `reply_not_implemented` placeholder in
+   `handlers/standing.rs` with a real dispatch — the
+   single-context-async `create` + `add_member` + Welcome path for
+   standing-pair. (No `tools` handler placeholder: the one live saga,
+   §6.2.4 cross-context tool invocation, is produced supervisor-side by
+   `start_cross_context_tool_invocation_saga`, not via an actor-mailbox
+   handler. No migration or broadcast-hosting handler — Gaps 3–4
+   withdrawn.)
 3. Per-use-case integration tests under
    `crates/scp-runtime/tests/actor_saga_*.rs`. (The `actor_saga_*` glob is
    a filename convention, not a saga claim: the standing-pair entry is

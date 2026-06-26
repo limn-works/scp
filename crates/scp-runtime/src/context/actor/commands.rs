@@ -105,8 +105,11 @@ pub enum ContextCommand {
     Standing(StandingCommand),
     /// TTL close — timer-driven close path (spec §5.8).
     TtlClose(TtlCloseCommand),
-    /// Tools — saga initiator for cross-context tool invocation
-    /// (spec §5.16).
+    /// Tools — hard-rate-limit consume / refund plus tool-economy
+    /// reserve / settle helpers that FFI bridges call from their
+    /// tool-dispatch paths (spec §19, rate limits §6.2.0.2). NOT a saga
+    /// initiator — the cross-context tool-invocation saga runs
+    /// supervisor-side, not over this mailbox.
     Tools(ToolsCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
@@ -2195,9 +2198,11 @@ pub enum TtlCloseCommand {
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
 /// reached via
-/// [`Supervisor::start_cross_context_tool_invocation_saga`]); what remains
+/// [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga), whose
+/// borrowed (non-`'static`) [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys)
+/// keep it off the `'static` mailbox); what remains
 /// deferred is its FFI export, pending per-participant-set saga gating
-/// (ADR-049 §3a), and the actor-mailbox path for this method.
+/// (ADR-049 §3a).
 ///
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
@@ -2291,28 +2296,6 @@ pub enum ToolsCommand {
         /// (consequences + receipt + committed cost).
         reply:
             oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
-    },
-
-    /// Saga-initiator path for cross-context tool invocation. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the saga itself is
-    /// specified (§6.2.4: caller→target forwarding, UCAN proof plumbing,
-    /// receipt relay) and wired via
-    /// [`Supervisor::start_cross_context_tool_invocation_saga`]; deferred
-    /// here is this variant's actor-mailbox path, pending the saga's FFI
-    /// export (per-participant-set gating, ADR-049 §3a). See
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-    InitiateCrossContextToolInvocation {
-        /// Calling context ID (32-byte hash).
-        caller_context_id: [u8; 32],
-        /// Calling DID.
-        caller_did: scp_identity::DID,
-        /// Target tool registration ID.
-        tool_registration_id: String,
-        /// Oneshot reply channel. Carries the saga's durable ID on
-        /// success; `ContextError::NotImplemented` during the deferred
-        /// window.
-        reply:
-            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 

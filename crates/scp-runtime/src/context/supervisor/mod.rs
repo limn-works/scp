@@ -140,7 +140,7 @@ pub use saga_prepared_state::{
 #[cfg(any(test, feature = "testing"))]
 pub use supervisor::SagaSetReservation;
 pub use supervisor::{
-    ACTOR_MAILBOX_CAPACITY, CrashWindow, DurableProviders, MessageSigner, PendingSagaProjection,
-    RestoredContexts, SagaDivergenceRepairRecord, SagaInput, SagaOutput, Supervisor,
-    SupervisorConfig,
+    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextToolInvocationRequest, DurableProviders,
+    MessageSigner, PendingSagaProjection, RestoredContexts, SagaDivergenceRepairRecord, SagaInput,
+    SagaOutput, SagaSigningKeys, Supervisor, SupervisorConfig,
 };
