@@ -328,6 +328,20 @@ pub struct UniffiBridgeInstance {
     pub(crate) mls_storage_backend:
         Option<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
 
+    /// Durable saga journal (§17.16 / ADR-049) built over the SAME single
+    /// chosen `Storage` backend as `mls_storage_backend`, persistence, and the
+    /// event log. `Storage` is not object-safe (RPITIT async methods), so the
+    /// journal — a `ProtocolRepositorySagaJournal<S>` — is constructed at the
+    /// concrete-storage construction site (where `S` is the in-memory handle or
+    /// `Arc<SqliteStorage>`) from the SAME `Arc` that feeds
+    /// `mls_storage_backend`, then erased to `Arc<dyn SagaJournal>`.
+    /// `build_supervisor` reads this to supply
+    /// `Supervisor::with_providers_and_journal`'s journal argument so
+    /// crash-recovery replay is durably backed in production. `None` is the
+    /// same storage-before-supervisor fail-closed condition (spec §17.6) as a
+    /// `None` `mls_storage_backend` — both are populated together.
+    pub(crate) saga_journal: Option<Arc<dyn scp_core::context::supervisor::SagaJournal>>,
+
     /// Per-instance bridge credential store (spec §12.11).
     ///
     /// Mirrors `PyBridgeInstance::credential_store` and
@@ -356,7 +370,10 @@ impl UniffiBridgeInstance {
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         // The un-swallowed in-memory storage handle backs the supervisor's
         // `mls_storage` view. The SAME store backs the event-log repository
-        // above (spec §17.6 — one chosen backend, derived consumers).
+        // above (spec §17.6 — one chosen backend, derived consumers). The
+        // durable saga journal is built over the SAME `Arc` (cloned before the
+        // `mls_storage` wrap consumes it) so replay shares one backend.
+        let saga_journal = saga_journal_from_handle(Arc::clone(&storage_handle));
         let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
@@ -368,6 +385,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            saga_journal: Some(saga_journal),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
@@ -387,6 +405,7 @@ impl UniffiBridgeInstance {
     ) -> Self {
         let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
+        let saga_journal = saga_journal_from_handle(Arc::clone(&storage_handle));
         let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
@@ -398,6 +417,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            saga_journal: Some(saga_journal),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
@@ -493,7 +513,10 @@ impl UniffiBridgeInstance {
                 let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 // Derive the supervisor's `mls_storage` view from the same
                 // `Arc<SqliteStorage>` — erased ONCE via
-                // `SpawnBlockingStorageAdapter`.
+                // `SpawnBlockingStorageAdapter`. The durable saga journal is
+                // built over the SAME `Arc<SqliteStorage>` so saga replay reads
+                // and writes the one `SQLCipher` connection.
+                let saga_journal = saga_journal_from_handle(Arc::clone(&arc_storage));
                 let mls_storage_backend = mls_storage_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
@@ -501,6 +524,7 @@ impl UniffiBridgeInstance {
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
                     mls_storage_backend,
+                    saga_journal,
                 ))
             }
         }
@@ -526,6 +550,7 @@ impl UniffiBridgeInstance {
         persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
         mls_storage_backend: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -537,6 +562,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            saga_journal: Some(saga_journal),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
@@ -556,6 +582,21 @@ impl UniffiBridgeInstance {
         &self,
     ) -> Option<&Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
         self.mls_storage_backend.as_ref()
+    }
+
+    /// Returns the durable saga journal for this instance, if populated.
+    ///
+    /// Built at construction time over the SAME single chosen `Storage`
+    /// backend as `mls_storage_ref` (spec §17.16 / ADR-049). `build_supervisor`
+    /// reads it to supply `Supervisor::with_providers_and_journal`'s journal
+    /// argument; a `None` here is the same storage-before-supervisor
+    /// fail-closed condition (spec §17.6) as a `None` `mls_storage_ref` — both
+    /// are populated together.
+    #[must_use]
+    pub(crate) fn saga_journal_ref(
+        &self,
+    ) -> Option<&Arc<dyn scp_core::context::supervisor::SagaJournal>> {
+        self.saga_journal.as_ref()
     }
 
     /// Returns the monotonic instance id for this bridge.
@@ -792,12 +833,21 @@ impl UniffiBridgeInstance {
             );
             return;
         };
+        let Some(saga_journal) = self.saga_journal_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_did: storage-before-supervisor precondition \
+                 failed — no saga journal backend on the bridge instance; refusing to \
+                 attach a supervisor (fail closed, spec §17.6 / §17.16)"
+            );
+            return;
+        };
         let supervisor_arc = build_supervisor(
             crypto,
             Box::new(scp_core::context::NotConfiguredTransportProvider),
             event_log,
             persistence,
             mls_storage,
+            saga_journal,
             key_resolver_for_core(&self.core),
         );
 
@@ -834,12 +884,21 @@ impl UniffiBridgeInstance {
             );
             return;
         };
+        let Some(saga_journal) = self.saga_journal_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_relay_transport: storage-before-supervisor \
+                 precondition failed — no saga journal backend on the bridge instance; \
+                 refusing to attach a supervisor (fail closed, spec §17.6 / §17.16)"
+            );
+            return;
+        };
         let supervisor_arc = build_supervisor(
             crypto,
             transport,
             event_log,
             persistence,
             mls_storage,
+            saga_journal,
             key_resolver_for_core(&self.core),
         );
 
@@ -875,12 +934,21 @@ impl UniffiBridgeInstance {
             );
             return;
         };
+        let Some(saga_journal) = self.saga_journal_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_local_transport: storage-before-supervisor \
+                 precondition failed — no saga journal backend on the bridge instance; \
+                 refusing to attach a supervisor (fail closed, spec §17.6 / §17.16)"
+            );
+            return;
+        };
         let supervisor_arc = build_supervisor(
             crypto,
             transport,
             event_log,
             persistence,
             mls_storage,
+            saga_journal,
             key_resolver_for_core(&self.core),
         );
 
@@ -1166,6 +1234,25 @@ where
         as Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
 }
 
+/// Builds the durable [`ProtocolRepositorySagaJournal`] from the SAME concrete
+/// `Storage` handle that feeds [`mls_storage_from_handle`] (§17.16 / ADR-049).
+///
+/// Constructed at the concrete-storage construction site because `Storage` is
+/// not object-safe (its async methods use `-> impl Future`), so the journal's
+/// `S` type parameter cannot be recovered from the erased
+/// `Arc<dyn OpenMlsStorageAdapter>`. Passing the SAME `Arc<S>` here as is wrapped
+/// into `mls_storage` guarantees the journal, the `OpenMLS` view, persistence,
+/// and the event log all read/write one backend (spec §17.6).
+fn saga_journal_from_handle<S>(
+    handle: Arc<S>,
+) -> Arc<dyn scp_core::context::supervisor::SagaJournal>
+where
+    S: scp_platform::Storage + 'static,
+{
+    Arc::new(scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(handle))
+        as Arc<dyn scp_core::context::supervisor::SagaJournal>
+}
+
 /// Zeros the bridge's owned copy of `SQLCipher` key material after `SQLCipher`
 /// has consumed it internally.
 ///
@@ -1313,6 +1400,7 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
     key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
@@ -1326,8 +1414,10 @@ fn build_supervisor(
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // `mls_storage` is REQUIRED (non-Option): the runtime never defaults
     // storage; the bridge supplies it (spec §17.6 / ADR-049). It is the
-    // single chosen Storage erased once into the `OpenMLS` view.
-    scp_core::context::supervisor::Supervisor::with_providers(
+    // single chosen Storage erased once into the `OpenMLS` view. The durable
+    // saga journal is built over the SAME backend so crash-recovery replay
+    // loads unresolved saga entries from one store on restart (§17.16).
+    scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
         transport,
         event_log,
@@ -1337,6 +1427,7 @@ fn build_supervisor(
         Some(event_tx),
         None,
         mls_storage,
+        saga_journal,
     )
 }
 

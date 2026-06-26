@@ -138,6 +138,13 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// node's own storage, in production) via
     /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter).
     pub mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    /// The durable saga journal for the loopback supervisor (§17.16 / ADR-049).
+    /// The caller builds this over the SAME [`Storage`] backend it wraps into
+    /// `mls_storage` (a `SQLite` handle distinct from the node's own storage,
+    /// in production) via
+    /// [`ProtocolRepositorySagaJournal::new`](scp_core::context::supervisor::ProtocolRepositorySagaJournal::new),
+    /// so crash-recovery replay and the `OpenMLS` view share one backend.
+    pub saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
     /// The static assets to publish, in deploy order.
     pub assets: &'a [Asset],
 }
@@ -271,6 +278,7 @@ where
         key_resolver,
         custody,
         mls_storage,
+        saga_journal,
         assets,
     } = params;
 
@@ -282,6 +290,7 @@ where
         signing_key_handle,
         key_resolver,
         mls_storage,
+        saga_journal,
     )
     .await?;
 
@@ -323,6 +332,12 @@ impl SelfHostDeployer {
     ///
     /// Returns a [`SelfHostError`] if relay connect, DID/context registration,
     /// context creation, key resolution, or projection enable fails.
+    // Provider-bootstrap entry: each argument is a distinct, required provider
+    // the loopback supervisor needs (node, identity, hostname, signing key,
+    // governance resolver, MLS storage, durable saga journal). Bundling them
+    // into a struct would only relocate the same fields, so the per-provider
+    // signature stays — mirroring the FFI `with_providers_and_journal` bootstrap.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<S>(
         node: &ApplicationNode<S>,
         node_did: String,
@@ -331,6 +346,7 @@ impl SelfHostDeployer {
         signing_key_handle: scp_platform::KeyHandle,
         key_resolver: scp_core::context::governance::KeyResolver,
         mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
     ) -> Result<Self, SelfHostError>
     where
         S: Storage + 'static,
@@ -339,10 +355,18 @@ impl SelfHostDeployer {
 
         // Build the in-process supervisor on the node's OWN loopback relay and
         // register the local DID + the broadcast context. The supervisor carries
-        // the REAL document-derived governance resolver (ADR-053 / spec §10.17).
-        let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, mls_storage)
-                .await?;
+        // the REAL document-derived governance resolver (ADR-053 / spec §10.17)
+        // and the durable saga journal over the SAME `Storage` backend as
+        // `mls_storage` (§17.16 / ADR-049).
+        let supervisor = connect_loopback_supervisor(
+            node,
+            &node_did,
+            &author_did,
+            key_resolver,
+            mls_storage,
+            saga_journal,
+        )
+        .await?;
         node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
@@ -582,6 +606,7 @@ async fn connect_loopback_supervisor<S>(
     author_did: &scp_identity::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
     S: Storage + 'static,
@@ -612,7 +637,10 @@ where
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
-    let supervisor = scp_core::context::supervisor::Supervisor::with_providers(
+    // The durable saga journal is built over the SAME `Storage` backend as
+    // `mls_storage` so crash-recovery replay loads unresolved saga entries from
+    // one store on restart (§17.16 / ADR-049).
+    let supervisor = scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
         transport,
         event_log,
@@ -622,6 +650,7 @@ where
         Some(event_tx),
         None,
         mls_storage,
+        saga_journal,
     );
 
     supervisor
@@ -2130,6 +2159,12 @@ where
             HostSiteError::StorageOpen(format!("failed to open MLS SQLite storage: {e}"))
         })?,
     );
+    // The durable saga journal is built over the SAME `Arc<SqliteStorage>` that
+    // backs `mls_storage` so crash-recovery replay and the `OpenMLS` view read
+    // and write one `{storage_dir}/mls` SQLCipher store (§17.16 / ADR-049).
+    let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
+        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&mls_inner)),
+    );
     let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
         Arc::new(
             scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
@@ -2144,6 +2179,7 @@ where
         signing_key_handle,
         key_resolver,
         mls_storage,
+        saga_journal,
     )
     .await
     .map_err(|e| HostSiteError::DeployerSetup(e.to_string()))
