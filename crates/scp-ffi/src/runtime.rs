@@ -3212,4 +3212,120 @@ mod tests {
             "bi_b must not see bi_a's known contexts"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Saga-journal swap: same-backend seam proof + fail-closed proof (PyO3
+    // reference bridge). The structural `pipeline_wiring.rs` gate is
+    // presence-only — a seam wired to a DIVERGENT/fresh store would pass it.
+    // These behavioral tests pin the seam to the ACTUAL store SELECTION:
+    //   (a) the durable journal shares ONE backend with the bridge's
+    //       storage provider (a fresh-store wiring fails this);
+    //   (b) `build_saga_journal` fails closed with STORAGE_8000 when no
+    //       provider is set (refuses to attach a Noop/absent journal).
+    // -----------------------------------------------------------------------
+
+    /// Same-backend seam test (`PyO3` reference bridge). Constructs the journal
+    /// via the ACTUAL seam helper `build_saga_journal(bi)`, appends an entry
+    /// through it, then retrieves the SAME `saga_journal/...` key through the
+    /// bridge instance's own storage handle (`bi.storage_provider()`) and asserts
+    /// it is present — proving the journal and the storage provider/`mls_storage`
+    /// share one backend. A seam wired to a fresh store would write the entry to
+    /// a different backend and FAIL this retrieval.
+    #[test]
+    fn build_saga_journal_shares_one_backend_with_storage_provider() {
+        use scp_core::context::supervisor::{JournalEntry, SagaId, SagaState};
+
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage init must succeed");
+
+        // Build the durable journal via the production seam helper.
+        let journal = build_saga_journal(&bi).expect("build_saga_journal must succeed");
+
+        // The bridge instance's own storage handle — the SAME provider that
+        // feeds `derive_mls_storage`, persistence, and the event log.
+        let provider = bi
+            .storage_provider()
+            .cloned()
+            .expect("storage provider present after in-memory init");
+
+        let saga = SagaId::new();
+        let seq: u64 = 0;
+        let entry = JournalEntry {
+            saga_id: saga.clone(),
+            state: SagaState::PreparingB,
+            participants: vec!["ctx-seam".to_owned()],
+            evidence: Zeroizing::new(Vec::new()),
+            timestamp_ms: 1_900_000_000_000,
+            seq_per_saga: seq,
+        };
+
+        // Key the production journal writes under: `saga_journal/{saga_id}/{seq:020}`.
+        let expected_key = format!(
+            "{}{saga}/{seq:020}",
+            scp_core::context::supervisor::SAGA_JOURNAL_KEY_PREFIX
+        );
+
+        let rt = test_rt();
+        rt.block_on(async {
+            journal
+                .append(entry)
+                .await
+                .expect("append via durable journal");
+
+            // Retrieve the SAME key through the bridge's storage provider. If the
+            // seam wired the journal to a different/fresh backend, this read would
+            // miss and return None.
+            let raw = provider
+                .retrieve(&expected_key)
+                .await
+                .expect("retrieve via bridge storage provider");
+            assert!(
+                raw.is_some(),
+                "the journal entry MUST be visible through the bridge's OWN storage \
+                 provider — journal and storage provider must share one backend; a seam \
+                 wired to a fresh store would miss key {expected_key}"
+            );
+        });
+
+        // NOTE: the NAPI/UniFFI bridges build their journal through
+        // `saga_journal_from_handle(Arc::clone(handle))` over the SAME concrete
+        // `Arc<S>` storage handle that feeds `mls_storage_from_handle`, so the
+        // same-backend property holds there by construction (one `Arc<S>`, shared
+        // by clone). Driving it behaviorally would require standing up the NAPI
+        // `Env`/`ThreadsafeFunction` or the UniFFI callback-interface storage
+        // shim from a Rust unit test — disproportionate FFI scaffolding for the
+        // same `Arc`-sharing invariant the PyO3 reference bridge proves here. The
+        // NAPI/UniFFI same-backend wiring stays pinned by the structural
+        // `prod_supervisor_construction_wires_durable_saga_journal` gate.
+    }
+
+    /// Fail-closed behavioral proof. `build_saga_journal` on a bridge instance
+    /// with NO storage provider must return the `STORAGE_8000`
+    /// storage-before-supervisor error rather than attaching a Noop/absent
+    /// journal. This is the per-bridge fail-closed guard that source-text gates
+    /// alone cannot prove behaviorally.
+    #[test]
+    fn build_saga_journal_fails_closed_without_storage_provider() {
+        // A bare bridge instance with no storage provider selected.
+        let bi = PyBridgeInstance::new_py();
+        assert!(
+            bi.storage_provider().is_none(),
+            "precondition: the bare bridge instance has no storage provider"
+        );
+
+        // Reduce the result to the error code without panicking on success:
+        // `Ok` -> None (no error code), the wrong error variant -> a sentinel
+        // that fails the STORAGE_8000 assertion below.
+        let observed_code = match build_saga_journal(&bi) {
+            Ok(_) => None,
+            Err(ScpPyError::ContextError { code, .. }) => Some(code),
+            Err(other) => Some(format!("unexpected-error-variant: {other:?}")),
+        };
+        assert_eq!(
+            observed_code.as_deref(),
+            Some(scp_ffi_common::error_codes::STORAGE_8000),
+            "build_saga_journal MUST fail closed with STORAGE_8000 when no storage provider \
+             is set (not attach a Noop/absent journal); observed {observed_code:?}"
+        );
+    }
 }
