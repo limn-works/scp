@@ -555,7 +555,7 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             // (`18446744073709551615`): twenty `9`s passes a digit-only check
             // yet sorts lexicographically above every real zero-padded seq, so a
             // bare length+digit test still lets such an out-of-range suffix win.
-            // So we apply the SAME posture `next_seq_for_saga` already applies on
+            // So we apply the SAME `parse::<u64>` rejection posture `next_seq_for_saga` already applies (the read/select path here is STRICTER — it additionally requires an exactly-20-digit suffix) on
             // the write path: the suffix must be EXACTLY 20 ASCII digits AND
             // parse as a `u64` (rejecting the `> u64::MAX` overflow case).
             //
@@ -944,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_resolved_secret_bearing_zeroes_evidence_bytes() {
+    async fn mark_resolved_secret_bearing_leaves_no_secret_on_disk() {
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
