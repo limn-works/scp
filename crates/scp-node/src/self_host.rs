@@ -2154,21 +2154,49 @@ async fn build_host_site_deployer<S>(
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
+    /// Derives BOTH durable providers — the saga journal and the `OpenMLS`
+    /// `mls_storage` view — from a SINGLE `Storage` handle (§17.6 / §17.16 /
+    /// ADR-049).
+    ///
+    /// Folding the two derivations behind one handle parameter makes it
+    /// impossible to wire the saga journal to a different backend than
+    /// `mls_storage`: a reviewer proved that splitting them into separate
+    /// derivations let a single mutated constructor pass a fresh in-memory store
+    /// to the journal while leaving every gate/test green — silently disabling
+    /// crash-recovery replay. Both providers come from the one
+    /// `{storage_dir}/mls` `SQLCipher` handle, so saga replay and the `OpenMLS`
+    /// view read and write one store by construction. Kept inside
+    /// `build_host_site_deployer` so the single construction site is the only
+    /// place either provider is derived.
+    fn durable_providers_from_handle<H>(
+        handle: Arc<H>,
+    ) -> (
+        Arc<dyn scp_core::context::supervisor::SagaJournal>,
+        Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    )
+    where
+        H: Storage + 'static,
+    {
+        let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
+            scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
+        );
+        let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                handle,
+            ));
+        (saga_journal, mls_storage)
+    }
+
     let mls_inner = Arc::new(
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref()).map_err(|e| {
             HostSiteError::StorageOpen(format!("failed to open MLS SQLite storage: {e}"))
         })?,
     );
-    // The durable saga journal is built over the SAME `Arc<SqliteStorage>` that
-    // backs `mls_storage` so crash-recovery replay and the `OpenMLS` view read
-    // and write one `{storage_dir}/mls` SQLCipher store (§17.16 / ADR-049).
-    let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
-        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&mls_inner)),
-    );
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
+    // The durable saga journal and the `mls_storage` view are derived from the
+    // SAME `Arc<SqliteStorage>` in one call so crash-recovery replay and the
+    // `OpenMLS` view read and write one `{storage_dir}/mls` SQLCipher store and
+    // cannot diverge by construction (§17.6 / §17.16 / ADR-049).
+    let (saga_journal, mls_storage) = durable_providers_from_handle(mls_inner);
 
     let signing_key_handle = node.identity().identity().active_signing_key;
     SelfHostDeployer::start(

@@ -371,10 +371,9 @@ impl UniffiBridgeInstance {
         // The un-swallowed in-memory storage handle backs the supervisor's
         // `mls_storage` view. The SAME store backs the event-log repository
         // above (spec §17.6 — one chosen backend, derived consumers). The
-        // durable saga journal is built over the SAME `Arc` (cloned before the
-        // `mls_storage` wrap consumes it) so replay shares one backend.
-        let saga_journal = saga_journal_from_handle(Arc::clone(&storage_handle));
-        let mls_storage_backend = mls_storage_from_handle(storage_handle);
+        // durable saga journal and the `mls_storage` view are derived from the
+        // SAME `Arc` in one call so they cannot diverge (§17.6 / §17.16).
+        let (saga_journal, mls_storage_backend) = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
@@ -405,8 +404,8 @@ impl UniffiBridgeInstance {
     ) -> Self {
         let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
-        let saga_journal = saga_journal_from_handle(Arc::clone(&storage_handle));
-        let mls_storage_backend = mls_storage_from_handle(storage_handle);
+        // Saga journal + `mls_storage` derived from one handle (§17.6 / §17.16).
+        let (saga_journal, mls_storage_backend) = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
@@ -511,13 +510,14 @@ impl UniffiBridgeInstance {
                     ),
                 );
                 let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                // Derive the supervisor's `mls_storage` view from the same
-                // `Arc<SqliteStorage>` — erased ONCE via
-                // `SpawnBlockingStorageAdapter`. The durable saga journal is
-                // built over the SAME `Arc<SqliteStorage>` so saga replay reads
-                // and writes the one `SQLCipher` connection.
-                let saga_journal = saga_journal_from_handle(Arc::clone(&arc_storage));
-                let mls_storage_backend = mls_storage_from_handle(Arc::clone(&arc_storage));
+                // Derive the supervisor's `mls_storage` view AND the durable
+                // saga journal from the same `Arc<SqliteStorage>` in one call —
+                // `mls_storage` is erased ONCE via `SpawnBlockingStorageAdapter`
+                // and the journal is built over the SAME handle, so saga replay
+                // reads and writes the one `SQLCipher` connection (§17.6 /
+                // §17.16). They cannot diverge by construction.
+                let (saga_journal, mls_storage_backend) =
+                    durable_providers_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
                 Ok(Self::with_persistence_uniffi_arc_and_repo(
@@ -1251,6 +1251,33 @@ where
 {
     Arc::new(scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(handle))
         as Arc<dyn scp_core::context::supervisor::SagaJournal>
+}
+
+/// Derives BOTH durable providers — the saga journal and the `OpenMLS`
+/// `mls_storage` view — from a SINGLE `Storage` handle (§17.6 / §17.16 /
+/// ADR-049).
+///
+/// This is the ONLY construction-site entry point: it takes one `Arc<S>` and
+/// returns both providers built from it, so a caller physically cannot wire the
+/// saga journal to a different backend than `mls_storage`. (A reviewer proved
+/// that splitting the two derivations into separate calls let a single mutated
+/// constructor pass a fresh `InMemoryStorage` to the journal while leaving every
+/// gate/test green — silently disabling crash-recovery replay. Folding the two
+/// derivations behind one handle makes that divergence impossible by
+/// construction.) The journal is built from a clone taken BEFORE the
+/// `mls_storage` wrap consumes the handle, so both share one backend.
+fn durable_providers_from_handle<S>(
+    handle: Arc<S>,
+) -> (
+    Arc<dyn scp_core::context::supervisor::SagaJournal>,
+    Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+)
+where
+    S: scp_platform::Storage + 'static,
+{
+    let saga_journal = saga_journal_from_handle(Arc::clone(&handle));
+    let mls_storage = mls_storage_from_handle(handle);
+    (saga_journal, mls_storage)
 }
 
 /// Zeros the bridge's owned copy of `SQLCipher` key material after `SQLCipher`

@@ -1199,7 +1199,48 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
-    let mls_storage = derive_mls_storage(bi)?;
+    /// Derives BOTH durable providers — the saga journal and the `OpenMLS`
+    /// `mls_storage` view — from the bridge instance's SINGLE chosen
+    /// `StorageProvider` (spec §17.6 / §17.16 / ADR-049).
+    ///
+    /// This is the ONLY construction-site entry point for the supervisor's
+    /// durable providers: it derives both consumers from the bridge instance's
+    /// single chosen `StorageProvider`, so a caller physically cannot wire the
+    /// saga journal to a different backend than `mls_storage`. (A reviewer proved
+    /// that splitting the two derivations into separate calls at the construction
+    /// site let a single mutated constructor pass a fresh `InMemoryStorage` to
+    /// the journal while leaving every gate/test green — silently disabling
+    /// crash-recovery replay. Folding both derivations behind this one combined
+    /// call makes that divergence impossible at the construction site.) Both
+    /// [`build_saga_journal`] and [`derive_mls_storage`] read the SAME
+    /// `bi.storage_provider()` accessor and `StorageProvider` is `Clone` (enum
+    /// dispatch over a shared inner `Arc`), so every cloned handle reads/writes
+    /// one backend (spec §17.6). They remain the internal building blocks this
+    /// combined fn calls so their behavioral fail-closed / same-backend tests
+    /// still exercise the live seam. Kept nested in `build_supervisor` so the
+    /// single construction site is the only caller.
+    #[allow(clippy::type_complexity)]
+    fn build_durable_providers(
+        bi: &PyBridgeInstance,
+    ) -> Result<
+        (
+            Arc<dyn scp_core::context::supervisor::SagaJournal>,
+            Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        ),
+        ScpPyError,
+    > {
+        let saga_journal = build_saga_journal(bi)?;
+        let mls_storage = derive_mls_storage(bi)?;
+        Ok((saga_journal, mls_storage))
+    }
+
+    // Derive the durable saga journal AND the `OpenMLS` `mls_storage` view from
+    // the bridge instance's SINGLE chosen `StorageProvider` in one call (§17.6 /
+    // §17.16 / ADR-049). Folding both derivations behind one provider fetch means
+    // a caller cannot wire the journal to a different backend than `mls_storage`,
+    // and the fail-closed `STORAGE_8000` storage-before-supervisor check fires
+    // once for both.
+    let (saga_journal, mls_storage) = build_durable_providers(bi)?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open so
@@ -1214,14 +1255,6 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
-    // Durable saga journal (§17.16 / ADR-049): construct the
-    // `ProtocolRepositorySagaJournal` over the SAME chosen `StorageProvider`
-    // that backs persistence, the event log, and `mls_storage`. `StorageProvider`
-    // is `Clone` (enum dispatch over a shared inner `Arc`), so cloning it shares
-    // the single backend — exactly as `derive_mls_storage` does above. Production
-    // never defaults storage: fail closed with the same `STORAGE_8000`
-    // storage-before-supervisor error when no provider is set (spec §17.6).
-    let saga_journal = build_saga_journal(bi)?;
     Ok(
         scp_core::context::supervisor::Supervisor::with_providers_and_journal(
             crypto,
