@@ -165,7 +165,11 @@ const WASM_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/uc
 // Raised 46 -> 49 when the `ucan_evaluate` routing assertion was extended from
 // PyO3-only to all four bridges (PyO3 + NAPI + WASM + UniFFI), adding three new
 // per-bridge routing tests.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 49;
+// Raised 49 -> 50 when the production saga-journal swap added
+// `prod_supervisor_construction_wires_durable_saga_journal` — pinning that every
+// production seam constructs the durable `ProtocolRepositorySagaJournal` rather
+// than `NoopSagaJournal` — locking that assertion into the ratchet floor.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser

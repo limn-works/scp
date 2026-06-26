@@ -1020,7 +1020,7 @@ where
 /// Constructed at the concrete-storage construction site because `Storage` is
 /// not object-safe (its async methods use `-> impl Future`), so the journal's
 /// `S` type parameter cannot be recovered from the erased
-/// `Arc<dyn OpenMlsStorageAdapter>`. Passing the SAME `Arc<S>` here as is wrapped
+/// `Arc<dyn OpenMlsStorageAdapter>`. Passing the same `Arc<S>` that is wrapped
 /// into `mls_storage` guarantees the journal, the `OpenMLS` view, persistence,
 /// and the event log all read/write one backend (spec §17.6).
 fn saga_journal_from_handle<S>(
