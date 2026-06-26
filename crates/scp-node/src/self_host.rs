@@ -2181,9 +2181,9 @@ where
             scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
         );
         let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                handle,
-            ));
+            Arc::new(
+                scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle),
+            );
         (saga_journal, mls_storage)
     }
 

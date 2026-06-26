@@ -1401,8 +1401,7 @@ mod tests {
                 // Plant a `~`-suffixed shadow key under the SAME saga that sorts
                 // above the canonical seq and (pre-fix) would override it to a
                 // resurrected / attacker-chosen state.
-                let live_shadow =
-                    format!("{SAGA_JOURNAL_KEY_PREFIX}{live_saga}/~");
+                let live_shadow = format!("{SAGA_JOURNAL_KEY_PREFIX}{live_saga}/~");
                 let forged = test_entry(
                     &live_saga,
                     0,
@@ -1426,8 +1425,7 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                let resolved_shadow =
-                    format!("{SAGA_JOURNAL_KEY_PREFIX}{resolved_saga}/~");
+                let resolved_shadow = format!("{SAGA_JOURNAL_KEY_PREFIX}{resolved_saga}/~");
                 let resurrect = test_entry(
                     &resolved_saga,
                     0,
