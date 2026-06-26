@@ -1214,16 +1214,59 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
-    Ok(scp_core::context::supervisor::Supervisor::with_providers(
-        crypto,
-        transport,
-        event_log,
-        key_resolver,
-        persistence,
-        None,
-        Some(event_tx),
-        None,
-        mls_storage,
+    // Durable saga journal (§17.16 / ADR-049): construct the
+    // `ProtocolRepositorySagaJournal` over the SAME chosen `StorageProvider`
+    // that backs persistence, the event log, and `mls_storage`. `StorageProvider`
+    // is `Clone` (enum dispatch over a shared inner `Arc`), so cloning it shares
+    // the single backend — exactly as `derive_mls_storage` does above. Production
+    // never defaults storage: fail closed with the same `STORAGE_8000`
+    // storage-before-supervisor error when no provider is set (spec §17.6).
+    let saga_journal = build_saga_journal(bi)?;
+    Ok(
+        scp_core::context::supervisor::Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            None,
+            Some(event_tx),
+            None,
+            mls_storage,
+            saga_journal,
+        ),
+    )
+}
+
+/// Builds the durable [`ProtocolRepositorySagaJournal`] for this bridge
+/// instance's single chosen [`StorageProvider`] (spec §17.16 / ADR-049).
+///
+/// The journal shares the SAME backend as `mls_storage`, persistence, and the
+/// event log: `StorageProvider` is `Clone` (enum dispatch over a shared inner
+/// `Arc`), so the cloned handle reads/writes one backend. This is the exact
+/// sharing contract `derive_mls_storage` relies on.
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ContextError`] with [`error_codes::STORAGE_8000`] when
+/// no storage provider is set — the same storage-before-supervisor fail-closed
+/// condition `derive_mls_storage` raises. No fabrication, no default.
+fn build_saga_journal(
+    bi: &PyBridgeInstance,
+) -> Result<Arc<dyn scp_core::context::supervisor::SagaJournal>, ScpPyError> {
+    let provider = bi
+        .storage_provider()
+        .ok_or_else(|| ScpPyError::ContextError {
+            message: "storage-before-supervisor precondition failed: no storage provider \
+             set on the bridge instance — the runtime never defaults storage \
+             (spec §17.6). Select storage via SCP({...}) / SCP.with_storage({...}) first."
+                .to_owned(),
+            code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+        })?;
+    Ok(Arc::new(
+        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::new(
+            provider.clone(),
+        )),
     ))
 }
 
