@@ -1348,11 +1348,14 @@ impl Supervisor {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Arc<Self> {
         // The default provider bootstrap wires the no-op saga journal. This is
-        // the path production bridges currently take — no durable journal is
-        // attached at the bridge today; durable journal wiring lands in a later
-        // phase by switching the bridge to `with_providers_and_journal`. Saga
-        // unit/integration tests that need a durable journal use
-        // [`Self::with_providers_and_journal`].
+        // the TEST / LEGACY constructor: production bridges no longer call it —
+        // every production seam (PyO3, NAPI, UniFFI, scp-node) constructs via
+        // [`Self::with_providers_and_journal`] with a durable
+        // `ProtocolRepositorySagaJournal` over its single chosen `Storage`
+        // backend. `with_providers` remains for unit/integration tests that do
+        // not exercise the durable saga journal (it hardcodes
+        // [`NoopSagaJournal`]); tests that need a durable journal call
+        // [`Self::with_providers_and_journal`] directly.
         Self::with_providers_and_journal(
             crypto,
             transport,
@@ -1369,16 +1372,16 @@ impl Supervisor {
 
     /// Like [`Self::with_providers`] but with a caller-supplied saga journal —
     /// the seam the saga FSM + crash-recovery tests use to drive the REAL
-    /// journal write-ordering over co-resident actors, and the seam by which a
-    /// durable saga journal will be wired into production bridges in a later
-    /// phase of the ADR-049 saga work.
+    /// journal write-ordering over co-resident actors, AND the constructor every
+    /// production bridge now calls to attach a durable saga journal (ADR-049
+    /// saga work).
     ///
-    /// Production bridges currently construct via [`Self::with_providers`],
-    /// which hardcodes [`NoopSagaJournal`] — i.e. NO durable
-    /// `ProtocolRepositorySagaJournal` is attached at the bridge today. When the
-    /// production journal-wiring lands, the bridges switch from
-    /// [`Self::with_providers`] to this constructor with a real
-    /// `ProtocolRepositorySagaJournal`.
+    /// Production bridges construct via THIS constructor with a durable
+    /// `ProtocolRepositorySagaJournal` over their single chosen `Storage`
+    /// backend: the PyO3 reference bridge (`build_saga_journal`), NAPI and
+    /// UniFFI (`saga_journal_from_handle`), and scp-node. [`Self::with_providers`]
+    /// — which hardcodes [`NoopSagaJournal`] — is the test/legacy constructor and
+    /// is no longer on any production path.
     ///
     /// **Visibility (`pub`, intentional).** Kept `pub` so the bridge-path
     /// bootstrap test (`scp-testing`, a separate crate) can construct a
@@ -5570,8 +5573,13 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns the journal's error class (via `ContextError::InvalidState`)
-    /// if `load_unresolved` fails. Per-entry processing errors are logged
-    /// via `tracing` and do not abort the recovery sweep.
+    /// only if the journal cannot be enumerated (a backend `list_keys`
+    /// failure). Per-entry faults do NOT abort the sweep: a corrupt or
+    /// torn-write entry is skipped-and-flagged inside `load_unresolved` (it
+    /// emits the `scp_saga_repair_needed_total` metric and a `tracing::error!`
+    /// for operator repair, then continues), and a per-entry RECOVERY-arm error
+    /// is logged via `tracing` here. Either way the remaining sagas are still
+    /// reconciled — one poisoned entry never blinds recovery to the rest.
     pub async fn replay_unresolved_sagas(
         &self,
         restored: &RestoredContexts,

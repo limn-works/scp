@@ -508,15 +508,61 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
 
         let mut out = Vec::with_capacity(latest_by_saga.len());
         for key in latest_by_saga.values() {
-            let raw = self
-                .storage
-                .retrieve(key)
-                .await
-                .map_err(|e| JournalError::Io(e.to_string()))?
-                .ok_or_else(|| JournalError::Io(format!("entry disappeared during load: {key}")))?;
-            let entry = decode_entry(&raw)?;
-            if !entry.state.is_terminal() {
-                out.push(entry);
+            // Fault isolation (availability): a single corrupt OR torn-write
+            // entry under `saga_journal/` MUST NOT abort the entire sweep and
+            // thereby skip EVERY other unresolved saga (recovery denied,
+            // reservations / escrow stranded). The CRC framing exists precisely
+            // because torn writes happen, so a per-entry decode failure is
+            // reachable benignly, not just adversarially. On a per-saga
+            // retrieve/decode fault we log, emit the saga-repair-needed metric
+            // so an operator is alerted, and SKIP this saga — never silently
+            // fall back to an earlier-seq entry (that risks resurrecting stale
+            // pre-commit state). All OTHER sagas are still recovered.
+            //
+            // NB: genuine `list_keys` I/O failure above stays a hard `?` — a
+            // backend that cannot list is a real failure, not a per-entry fault.
+            let raw = match self.storage.retrieve(key).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    // The latest key vanished between list and retrieve. Treat
+                    // it as a per-saga fault: flag and skip, do not abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        "SCP-SAGA-RECOVERY: journal entry disappeared during load — \
+                         saga skipped, manual repair needed; other sagas unaffected"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // Backend retrieve error on ONE key is a per-saga fault, not
+                    // a list-level failure: flag and skip, do not abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: journal entry retrieve failed — \
+                         saga skipped, manual repair needed; other sagas unaffected"
+                    );
+                    continue;
+                }
+            };
+            match decode_entry(&raw) {
+                Ok(entry) => {
+                    if !entry.state.is_terminal() {
+                        out.push(entry);
+                    }
+                }
+                Err(e) => {
+                    // Corrupt / torn-write entry: flag and skip, do not abort.
+                    crate::metrics::record_saga_repair_needed();
+                    tracing::error!(
+                        key = %key,
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: corrupt journal entry, saga skipped, \
+                         manual repair needed; other sagas unaffected"
+                    );
+                }
             }
         }
         Ok(out)
@@ -547,6 +593,14 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                     .await
                     .map_err(|e| JournalError::Io(e.to_string()))?;
                 if let Some(bytes) = raw {
+                    // SECURITY: unlike `load_unresolved` (availability-oriented,
+                    // skip-and-flag), the secret-bearing overwrite path FAILS
+                    // LOUD on a decode error. A corrupt entry we cannot decode is
+                    // an entry whose evidence bytes we cannot locate to zero —
+                    // silently skipping it would leave secret bytes on disk past
+                    // the next journal open (violating spec §9.4.3). Aborting
+                    // here surfaces the fault so an operator can repair it before
+                    // the secret is considered overwritten.
                     let mut entry = decode_entry(&bytes)?;
                     // Overwrite evidence with zeros of the same length so the
                     // on-disk footprint stays stable and the record remains
@@ -589,18 +643,31 @@ impl<S: Storage + 'static> ProtocolRepositorySagaJournal<S> {
             .list_keys(&prefix)
             .await
             .map_err(|e| JournalError::Io(e.to_string()))?;
-        // Last key is lexicographically largest — parse the trailing seq.
-        let last = keys.iter().max_by(std::cmp::Ord::cmp);
-        match last {
-            Some(k) => {
-                let suffix = k.rsplit('/').next().unwrap_or("");
-                let n: u64 = suffix.parse().map_err(|e| {
-                    JournalError::Codec(format!("malformed seq suffix {suffix:?}: {e}"))
-                })?;
-                Ok(n.saturating_add(1))
+        // Compute the max seq over all PARSEABLE trailing-seq suffixes. A
+        // single key with a malformed suffix (a corrupt key in this saga's own
+        // prefix) is skipped-and-logged rather than aborting next-seq
+        // computation — same fault-isolation posture as `load_unresolved`. The
+        // zero-padded 20-digit seq formatting means lexicographic max == numeric
+        // max, so skipping an unparseable outlier never picks a lower-than-real
+        // next seq from the well-formed entries.
+        let mut max_seq: Option<u64> = None;
+        for k in &keys {
+            let suffix = k.rsplit('/').next().unwrap_or("");
+            match suffix.parse::<u64>() {
+                Ok(n) => {
+                    max_seq = Some(max_seq.map_or(n, |m| m.max(n)));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key = %k,
+                        error = %e,
+                        "SCP-SAGA-RECOVERY: malformed seq suffix in journal key, \
+                         skipped for next-seq computation; manual repair may be needed"
+                    );
+                }
             }
-            None => Ok(0),
         }
+        Ok(max_seq.map_or(0, |m| m.saturating_add(1)))
     }
 }
 
@@ -795,8 +862,30 @@ mod tests {
         assert_eq!(&*entry.evidence, &ev[..]);
     }
 
+    #[test]
+    fn partial_write_truncation_detected_by_decode() {
+        // The CRC framing detects a torn write at the DECODE boundary. (The
+        // load sweep itself is fault-isolating — it skips a corrupt entry rather
+        // than aborting; see `load_unresolved_truncation_skips_not_aborts` — so
+        // the integrity check is asserted here directly against `decode_entry`,
+        // the single point where the length/CRC invariant is enforced.)
+        let saga = SagaId::new();
+        let entry = test_entry(&saga, 0, SagaState::Initiated, b"ev".to_vec());
+        let mut full = encode_entry(&entry).unwrap();
+        // Truncate to simulate a partial write (cut off CRC trailer).
+        full.truncate(full.len() - 2);
+
+        let err = decode_entry(&full).unwrap_err();
+        assert!(
+            matches!(err, JournalError::IntegrityFailure(_)),
+            "truncation must be caught as integrity failure, got {err:?}",
+        );
+    }
+
     #[tokio::test]
-    async fn partial_write_truncation_detected() {
+    async fn load_unresolved_truncation_skips_not_aborts() {
+        // A torn-write entry under the journal prefix is skipped (fault
+        // isolation), never aborting the whole sweep.
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
@@ -811,15 +900,92 @@ mod tests {
         full.truncate(full.len() - 2);
         storage.store(&key0, &full).await.unwrap();
 
-        let err = journal.load_unresolved().await.unwrap_err();
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("a torn-write entry must be skipped, not abort the sweep");
         assert!(
-            matches!(err, JournalError::IntegrityFailure(_)),
-            "truncation must be caught as integrity failure, got {err:?}",
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "the torn-write saga must be skipped (not surfaced), got {unresolved:?}",
         );
     }
 
     #[tokio::test]
-    async fn crc_mismatch_detected() {
+    async fn load_unresolved_skips_corrupt_entry_and_recovers_the_rest() {
+        // Availability regression guard: a single corrupt (or torn-write) entry
+        // under `saga_journal/` MUST NOT blind recovery to EVERY other
+        // unresolved saga. Plant two legitimate non-terminal sagas plus one
+        // garbage key, then assert `load_unresolved` returns Ok with BOTH legit
+        // sagas present (the corrupt one skipped-and-flagged).
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+        let saga_b = SagaId::new();
+        let saga_c = SagaId::new();
+        journal
+            .append(test_entry(
+                &saga_b,
+                0,
+                SagaState::PreparingB,
+                b"legit-b".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &saga_c,
+                0,
+                SagaState::Committing,
+                b"legit-c".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Plant a garbage value under a well-formed key so it groups as its own
+        // saga and its latest key is selected for decode — exactly the entry the
+        // pre-fix `?` would have aborted the whole sweep on.
+        let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}zzcorrupt/{:020}", 0);
+        storage
+            .store(&corrupt_key, b"not-a-valid-wire-entry")
+            .await
+            .unwrap();
+
+        let unresolved = journal.load_unresolved().await.expect(
+            "a single corrupt entry must NOT abort the sweep — the other sagas must still recover",
+        );
+
+        assert!(
+            unresolved.iter().any(|e| e.saga_id == saga_b),
+            "PreparingB saga must survive the corrupt-entry skip, got {unresolved:?}",
+        );
+        assert!(
+            unresolved.iter().any(|e| e.saga_id == saga_c),
+            "Committing saga must survive the corrupt-entry skip, got {unresolved:?}",
+        );
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id.0 == "zzcorrupt"),
+            "the corrupt saga must be skipped, not surfaced as unresolved",
+        );
+    }
+
+    #[test]
+    fn crc_mismatch_detected_by_decode() {
+        // A flipped payload bit is caught at the decode boundary by the CRC
+        // check. (The load sweep skips such an entry; see
+        // `load_unresolved_crc_mismatch_skips_not_aborts`.)
+        let saga = SagaId::new();
+        let entry = test_entry(&saga, 0, SagaState::Initiated, b"ev".to_vec());
+        let mut full = encode_entry(&entry).unwrap();
+        // Flip a bit in the middle of the payload.
+        let mid = full.len() / 2;
+        full[mid] ^= 0xFF;
+
+        let err = decode_entry(&full).unwrap_err();
+        assert!(matches!(err, JournalError::IntegrityFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn load_unresolved_crc_mismatch_skips_not_aborts() {
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
@@ -835,8 +1001,14 @@ mod tests {
         full[mid] ^= 0xFF;
         storage.store(&key0, &full).await.unwrap();
 
-        let err = journal.load_unresolved().await.unwrap_err();
-        assert!(matches!(err, JournalError::IntegrityFailure(_)));
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("a CRC-corrupt entry must be skipped, not abort the sweep");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "the CRC-corrupt saga must be skipped, got {unresolved:?}",
+        );
     }
 
     #[tokio::test]
