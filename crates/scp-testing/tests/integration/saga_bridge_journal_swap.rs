@@ -559,6 +559,117 @@ async fn journal_swap_second_restart_replay_is_idempotent() {
 }
 
 // ===========================================================================
+// 6. SQLite durability — the on-disk durable path actually round-trips a
+//    crash-orphaned saga across a process restart.
+//
+//    The other crash-recovery tests above all use `InMemoryStorage`, which
+//    never exercises the production SQLite/SQLCipher path. This test mirrors the
+//    both-legs crash-recovery shape over a REAL `SqliteStorage` file: process 1
+//    appends a non-terminal saga to the on-disk journal, then drops + closes its
+//    storage handle (releasing the SQLite advisory exclusive lock); process 2
+//    opens the SAME sqlite file and runs `restore_on_startup`, which reconciles
+//    the crash-orphaned saga to terminal — proving the durable journal genuinely
+//    round-trips on disk, not just in memory.
+// ===========================================================================
+
+/// Drives the journal-swap crash-recovery shape over a REAL `SqliteStorage`
+/// file. Process 1 appends an `Initiated` crash-orphaned saga to the on-disk
+/// journal; its handle is closed/dropped (releasing the SQLite exclusive lock)
+/// before process 2 opens the SAME file and runs `restore_on_startup`, which
+/// must reconcile the saga to terminal (it drops out of `load_unresolved`).
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
+    use scp_platform::sqlite::SqliteStorage;
+
+    let creator_did = "did:dht:z6MkJournalSwapSqlite";
+    // One temp dir backs both "processes" — the on-disk DB survives the crash.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_dir = tmp.path().to_path_buf();
+    let db_key = [0x5Au8; 32];
+    let saga_id = SagaId::new();
+
+    // === Process 1: open the sqlite journal, append a crash-orphaned saga,
+    // then CLOSE + drop the handle (= crash, releasing the exclusive lock). ===
+    {
+        let storage1 = Arc::new(
+            SqliteStorage::new(&db_dir, &db_key).expect("process-1 sqlite open must succeed"),
+        );
+        let journal1 = ProtocolRepositorySagaJournal::new(Arc::clone(&storage1));
+        journal1
+            .append(JournalEntry {
+                saga_id: saga_id.clone(),
+                state: SagaState::Initiated,
+                participants: vec![creator_did.to_owned()],
+                evidence: zeroize::Zeroizing::new(Vec::new()),
+                timestamp_ms: 1_900_000_000_000,
+                seq_per_saga: 0,
+            })
+            .await
+            .expect("append crash-orphaned entry to on-disk journal");
+
+        // Confirm it is durably unresolved on disk before the crash.
+        let pre = journal1
+            .load_unresolved()
+            .await
+            .expect("load_unresolved over the on-disk journal");
+        assert!(
+            pre.iter().any(|e| e.saga_id == saga_id),
+            "the crash-orphaned saga must be durably unresolved on disk before restart"
+        );
+
+        // Release the SQLite advisory exclusive lock so process 2 can open the
+        // SAME database directory (drop alone would also release it, but close()
+        // releases even while outstanding Arc clones persist).
+        storage1.close();
+        drop(journal1);
+        drop(storage1);
+    }
+
+    // === Process 2: fresh supervisor over the SAME sqlite file via the
+    // production `with_providers_and_journal` bootstrap; restore_on_startup
+    // reconciles the crash-orphaned saga to terminal. ===
+    let storage2 = Arc::new(
+        SqliteStorage::new(&db_dir, &db_key).expect("process-2 sqlite reopen must succeed"),
+    );
+    let journal2: Arc<dyn SagaJournal> =
+        Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage2)));
+    let mls_storage: Arc<dyn OpenMlsStorageAdapter> =
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&storage2)));
+
+    let sup2 = journal_supervisor(
+        creator_did,
+        // The journal durability is the unit under test; context persistence is
+        // an in-memory double (no persisted contexts in this scenario).
+        Arc::new(SharedPersistence::default()),
+        Arc::clone(&journal2),
+        mls_storage,
+    );
+    sup2.register_local_did(DID::from(creator_did))
+        .await
+        .unwrap();
+
+    sup2.restore_on_startup()
+        .await
+        .expect("restore_on_startup over the reopened sqlite journal");
+
+    // The crash-orphaned Initiated saga must be reconciled to terminal-Aborted
+    // (it drops out of load_unresolved) — proving the on-disk durable path
+    // genuinely round-tripped the entry across the restart.
+    let unresolved = journal2
+        .load_unresolved()
+        .await
+        .expect("load_unresolved over the reopened sqlite journal");
+    assert!(
+        !unresolved.iter().any(|e| e.saga_id == saga_id),
+        "the crash-orphaned saga MUST be reconciled to terminal after restore_on_startup over \
+         the REAL sqlite file (durable on-disk round-trip), got {unresolved:?}"
+    );
+
+    storage2.close();
+}
+
+// ===========================================================================
 // 5. NeedsRepair is carried over (non-terminal) and replay rebuilds NO live
 //    gating reservation for it.
 // ===========================================================================
