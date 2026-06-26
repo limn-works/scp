@@ -18,10 +18,11 @@
 //! and `evaluate_consequence_rules` lives there as a pure sync function.
 //!
 //! WASM therefore re-implements `enforce_triggered_consequences` locally
-//! against the WASM-specific `PerContextState` layout (no `ContextRoleState`,
-//! a flat `suspended_capabilities: HashMap<String, HashSet<String>>` map,
-//! a simple hardcoded role-to-capability resolver) while calling the shared
-//! scp-protocol `evaluate_consequence_rules` for the rule-matching logic.
+//! against the WASM bridge's `PerContextState`, which now holds the SAME shared
+//! `scp_protocol::context::roles::ContextRoleState` the native runtime uses
+//! (members, role assignments, ceiling, per-member capabilities, suspensions),
+//! while calling the shared scp-protocol `evaluate_consequence_rules` for the
+//! rule-matching logic.
 //!
 //! # Call sites
 //!
@@ -38,7 +39,7 @@ use scp_protocol::trust::consequence::{
     evaluate_consequence_rules,
 };
 
-use crate::manager::{MemberEntry, PerContextState};
+use crate::manager::PerContextState;
 
 /// Evaluates consequence rules declared on `ctx` against `ctx.event_log`
 /// for `subject_did`, enforces any triggered consequences by mutating
@@ -141,11 +142,9 @@ fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_ev
 // WasmConsequenceDispatcher — bridges PerContextState to the shared trait
 // ---------------------------------------------------------------------------
 
-/// Implements [`ConsequenceDispatcher`] for the WASM bridge's `PerContextState`.
-///
-/// The WASM bridge uses a flat `suspended_capabilities: HashMap<String, HashSet<String>>`
-/// rather than the runtime's `ContextRoleState`, and a simple member role
-/// model (role stored as a string on `MemberEntry`).
+/// Implements [`ConsequenceDispatcher`] for the WASM bridge's `PerContextState`,
+/// which holds the shared `scp_protocol::context::roles::ContextRoleState` —
+/// the same role/ceiling/suspension representation as the native runtime.
 struct WasmConsequenceDispatcher<'a> {
     ctx: &'a mut PerContextState,
 }
@@ -224,66 +223,55 @@ fn apply_suspend(
     if caps.is_empty() {
         return false;
     }
-    for cap in caps {
-        // Store the canonical UCAN form `member_has_capability` looks up — NOT
-        // `Display`, which would never match and would silently no-op the
-        // suspension. See `apply_suspend_enforces_capabilities_with_divergent_display_form`.
-        ctx.suspended_capabilities_insert(subject_did, cap.ucan_capability_name());
-    }
+    // Suspend the typed capabilities directly through the shared
+    // `ContextRoleState::suspend_capabilities` (no string round-trip).
+    ctx.suspend_capabilities_typed(subject_did, caps);
     true
 }
 
-/// Enforces `ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)` by computing every capability
-/// the subject could exercise via their current role, intersected with the
-/// context ceiling, and adding all of them to the subject's suspended set.
+/// Enforces `ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)`
+/// by suspending the subject's full effective capability set.
 ///
-/// This mirrors `ContextRoleState::suspend_all` on the runtime side: it
-/// copies the member's effective capability set into the suspended set.
-/// In WASM, the effective set is role-derived (no `ContextRoleState`), so
-/// we iterate the candidate capabilities and keep the ones
-/// `member_has_capability` would grant.
+/// Delegates to the shared [`ContextRoleState::suspend_all`] (via
+/// `PerContextState::suspend_all_pub`), which REPLACES the subject's suspended
+/// set with their current `member_capabilities`. This is byte-for-byte
+/// state-matching with the native runtime's `suspend_all` (an `insert` of the
+/// member's granted set), whereas the previous WASM loop EXTENDED the suspended
+/// set by iterating the ceiling — content-equivalent for enforcement but a
+/// state divergence. The governance `SuspendAccess` handler in `manager.rs`
+/// already uses the same shared method, so both consequence- and
+/// governance-driven full suspensions now produce identical state.
+///
+/// Returns `true` if the subject had any effective capability to suspend.
 fn apply_suspend_all(ctx: &mut PerContextState, subject_did: &str) -> bool {
-    // Suspend every capability the context's ceiling grants. This
-    // matches the runtime's `ContextRoleState::suspend_all` which
-    // copies the member's full effective set into the suspended set.
-    // Using the ceiling (not a hardcoded list) ensures no capability
-    // is silently missed when new variants are added.
-    let all_capabilities: Vec<String> = ctx.ceiling_strings_pub().iter().cloned().collect();
-    let mut applied = false;
-    for cap in &all_capabilities {
-        if ctx.member_has_capability_pub(subject_did, cap) {
-            ctx.suspended_capabilities_insert(subject_did, cap.clone());
-            applied = true;
-        }
-    }
-    applied
+    ctx.suspend_all_pub(subject_did)
 }
 
-/// Enforces `ConsequenceAction::AssignRole` by mutating the subject's
-/// `MemberEntry.role` in place. Returns `true` if the subject is a
-/// known member and the role was updated.
+/// Enforces `ConsequenceAction::AssignRole` by re-assigning the subject's role
+/// through the shared [`ContextRoleState::system_assign_role`]. Returns `true`
+/// only if the subject is a member AND the target role is defined in the
+/// context's `role_definitions` (and within the ceiling).
 ///
-/// In WASM, roles are stored as free-form strings on `MemberEntry`; there
-/// is no separate "role exists" check (the runtime's role definitions
-/// live in `ContextRoleState`, which WASM does not replicate). Assigning a
-/// role that is not recognized by `member_has_capability` simply results
-/// in the member losing all capabilities — which is an acceptable
-/// degradation for a forcibly-applied consequence.
+/// This is the #1886 fix on the consequence path: `system_assign_role`
+/// validates the role against `role_definitions` before applying it, so an
+/// undefined / out-of-ceiling role now returns `false` (the shared
+/// `enforce_triggered` then escalates to `SuspendAll`) instead of silently
+/// accepting a free-form role string that would strip the member's
+/// capabilities. Matches the native runtime's consequence behavior.
 fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str) -> bool {
-    ctx.members_get_mut(subject_did).is_some_and(|entry| {
-        let MemberEntry { role, .. } = entry;
-        to_role.clone_into(role);
-        true
-    })
+    ctx.role_state_system_assign_role(subject_did, to_role)
+        .is_ok()
 }
 
-// NOTE: `PerContextState` accessors used by this module
-// (`consequence_rules`, `event_log_events`, `members_contains`,
-// `members_get_mut`, `push_event_pub`, `member_has_capability_pub`,
-// `suspended_capabilities_insert`, `cooldown_until_get`,
-// `cooldown_until_insert`) are defined in `manager.rs` in the same
-// `impl PerContextState` block that owns the private fields, because
-// Rust's privacy rules scope field access to the defining module.
+// NOTE: `PerContextState` accessors used by this module are defined in
+// `manager.rs` in the same `impl PerContextState` block that owns the shared
+// `role_state`, because Rust's privacy rules scope field access to the
+// defining module. Production-path accessors: `consequence_rules`,
+// `event_log_events`, `members_contains`, `role_state_system_assign_role`,
+// `push_event_pub`, `suspend_capabilities_typed`, `suspend_all_pub`,
+// `cooldown_until_get`, `cooldown_until_insert`. Test-only (`#[cfg(test)]`)
+// assertion helpers used by this module's tests: `member_has_capability_pub`,
+// `suspended_capabilities_insert`.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -581,6 +569,101 @@ mod tests {
         assert_eq!(ctx.test_member_role("did:test:bob"), Some("observer"));
     }
 
+    /// **E2-6b:** consequence-path escalation — a convergent rule triggered with
+    /// `AssignRole { to_role: <undefined role> }` on a PRESENT member must fail
+    /// (the shared `apply_assign_role` returns false because
+    /// `role_state_system_assign_role` rejects the undefined role) and the
+    /// shared `enforce_triggered` escalates to `SuspendAll`, minting a durable
+    /// `ConsequenceEscalatedToSuspendAll` leaf. This is the consequence-side
+    /// twin of the governance-path `dispatch_add_member` role validation: an
+    /// undefined role can no longer silently strip a member's capabilities; it
+    /// fails closed into a full suspension. A convergent (`WarningCount`)
+    /// trigger is used so the audit leaves are durable Merkle leaves (only
+    /// convergent-trigger consequences reach a durable leaf).
+    #[test]
+    fn enforce_triggered_assign_role_undefined_role_escalates_to_suspend_all() {
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Widen the ceiling so the member's built-in role actually grants a
+        // capability we can prove gets suspended on escalation.
+        ctx.test_insert_ceiling("messages:read");
+        ctx.test_insert_member("did:test:bob", "member");
+
+        // Sanity: bob holds messages:read via the `member` role BEFORE the
+        // failed assignment, and his role is "member".
+        assert!(
+            ctx.member_has_capability_pub("did:test:bob", "messages:read"),
+            "bob's member role must grant messages:read before the failed assign"
+        );
+        assert_eq!(ctx.test_member_role("did:test:bob"), Some("member"));
+
+        let leaves_before = ctx
+            .event_log_events()
+            .iter()
+            .filter(|e| e.event_type == EventType::ConsequenceEscalatedToSuspendAll)
+            .count();
+
+        // Convergent trigger (WarningCount) so the escalation leaf is durable.
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "not-a-real-role".to_owned(),
+            },
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: ConsequenceAction::AssignRole {
+                to_role: "not-a-real-role".to_owned(),
+            },
+            evidence: vec![make_evidence(0, "did:test:bob")],
+        }];
+
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:bob",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
+        assert_eq!(
+            dispatched, 1,
+            "the failed-assign consequence is still counted"
+        );
+
+        // (a) The member's role is UNCHANGED — the undefined role was rejected
+        // before any assignment write.
+        assert_eq!(
+            ctx.test_member_role("did:test:bob"),
+            Some("member"),
+            "a rejected AssignRole must leave the member's role unchanged"
+        );
+
+        // (b) The member's effective capabilities are FULLY suspended — the
+        // escalation called SuspendAll, so a previously-granted cap is denied.
+        assert!(
+            !ctx.member_has_capability_pub("did:test:bob", "messages:read"),
+            "escalation to SuspendAll must suspend the member's previously-granted capability"
+        );
+
+        // (c) Exactly one new `ConsequenceEscalatedToSuspendAll` durable leaf.
+        let leaves_after = ctx
+            .event_log_events()
+            .iter()
+            .filter(|e| e.event_type == EventType::ConsequenceEscalatedToSuspendAll)
+            .count();
+        assert_eq!(
+            leaves_after - leaves_before,
+            1,
+            "the failed convergent AssignRole must mint exactly one \
+             ConsequenceEscalatedToSuspendAll durable leaf"
+        );
+    }
+
     /// **E2-7:** cooldown suppression — a second dispatch within the rule's
     /// cooldown window is skipped without mutation.
     #[test]
@@ -766,18 +849,13 @@ mod tests {
         assert!(!suspended.contains("not-a-real-capability"));
     }
 
-    /// Regression: `apply_suspend` must store the canonical UCAN form so the
-    /// suspension is actually ENFORCED by `member_has_capability`.
-    ///
-    /// Capabilities whose `Display` spelling differs from their UCAN form
-    /// (`Bridging` → `"bridging"` vs `"bridging:*"`; `ToolInvokeAll` →
-    /// `"tool:invoke:*"` vs `"tool_invoke:*"`) exposed the bug: `apply_suspend`
-    /// stored the `Display` string, but `member_has_capability` (and
-    /// `apply_suspend_all`) key off the UCAN form, so the suspended entry never
-    /// matched the lookup key and the capability stayed GRANTED. This pins that
-    /// an admin (who would otherwise hold every in-ceiling capability) is
-    /// actually denied the suspended caps. Before the fix this test fails
-    /// because the suspension is silently ignored.
+    /// Suspension enforcement holds for capabilities whose Display form diverges
+    /// from their canonical UCAN form. `Bridging` Displays as `bridging` but its
+    /// UCAN form is `bridging:*`; `ToolInvokeAll` Displays as `tool:invoke:*` but
+    /// its UCAN form is `tool_invoke:*`. The typed `apply_suspend` stores the
+    /// canonical UCAN spelling (via `Capability::ucan_capability_name`), so the
+    /// suspension-aware capability check denies BOTH — the divergent-display
+    /// regression cannot reappear because there are no strings to misspell.
     #[test]
     fn apply_suspend_enforces_capabilities_with_divergent_display_form() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
@@ -810,16 +888,25 @@ mod tests {
         assert!(!ctx.member_has_capability_pub("did:test:admin", "tool_invoke:*"));
     }
 
-    /// **E2-12:** `apply_suspend_all` is a no-op (returns false) for a member
-    /// with an empty ceiling — no capabilities to suspend.
+    /// **E2-12:** `apply_suspend_all` reports "not applied" (returns `false`)
+    /// for a member with an empty ceiling — they have no effective capability
+    /// to suspend. The shared `ContextRoleState::suspend_all` REPLACES the
+    /// suspended set with the member's (empty) `member_capabilities`, matching
+    /// the native runtime exactly, so the resulting suspended set is empty.
     #[test]
     fn apply_suspend_all_noop_for_empty_ceiling() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
         // Ceiling is empty by default → admin has no capabilities → nothing
-        // to suspend.
+        // effective to suspend.
         let applied = apply_suspend_all(&mut ctx, "did:test:admin");
-        assert!(!applied);
-        assert!(ctx.test_suspended_capabilities("did:test:admin").is_none());
+        assert!(!applied, "no effective caps means the action did not apply");
+        // Native-matching replace semantics: the suspended set, if materialized,
+        // is empty (no capability was actually suspended).
+        assert!(
+            ctx.test_suspended_capabilities("did:test:admin")
+                .is_none_or(|caps| caps.is_empty()),
+            "an empty-ceiling member must have no suspended capabilities"
+        );
     }
 
     // ----------------- EL01: convergent-source soundness -----------------
@@ -1817,8 +1904,8 @@ mod cross_impl_leaf_parity {
     /// for this action — executing it where native rejected — a §9.9.3
     /// divergence AND a security gap (running an action outside the ceiling).
     /// WASM now mirrors native: `dispatch_ceiling_capability` returns
-    /// `Some("context_child:create")` (the `ucan_capability_name()` form that
-    /// `ceiling_strings` stores).
+    /// `Some("context_child:create")` (the `ucan_capability_name()` form the
+    /// typed ceiling holds).
     #[test]
     fn cross_impl_out_of_ceiling_create_child_context_rejected_wasm() {
         use crate::manager::{WasmContextManager, make_bare_per_context_state};
@@ -1892,7 +1979,7 @@ mod cross_impl_leaf_parity {
         ctx.test_insert_member(admin, "admin");
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
-        // In-ceiling: the UCAN-format string `ceiling_strings` stores for
+        // In-ceiling: the UCAN-format string the typed ceiling holds for
         // `ChildContextCreate` (`Capability::ucan_capability_name()`).
         ctx.test_insert_ceiling("context_child:create");
 
