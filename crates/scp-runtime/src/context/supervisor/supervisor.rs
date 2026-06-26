@@ -1275,17 +1275,16 @@ impl DurableProviders {
         }
     }
 
-    /// Returns a clone of the `mls_storage` (`OpenMLS`) view.
+    /// Returns a read-only clone of the `mls_storage` (`OpenMLS`) view.
     ///
-    /// Gated behind `test`/`testing` so production construction sites cannot
-    /// pull a half out and re-pair it with a divergent journal — only behavioral
-    /// tests that need to exercise the chosen backend through the `OpenMLS` view
-    /// (e.g. the FFI bridges' passphrase round-trip / fail-closed proofs) reach
-    /// it. Reading a half for assertions is harmless; the same-backend invariant
-    /// is preserved because the only way to BUILD the pair remains
-    /// [`Self::from_handle`].
+    /// Intended for callers that need to inspect the mls backend — e.g. the FFI
+    /// bridges' passphrase round-trip / fail-closed proofs, which run through
+    /// scp-runtime-as-a-dependency where `cfg(test)` does not apply. Reading a
+    /// half for assertions is harmless: the same-backend invariant is preserved
+    /// because the only way to BUILD a `DurableProviders` pair remains
+    /// [`Self::from_handle`]. This accessor returns a clone of one half and so
+    /// cannot be used to wire a divergent journal/mls pair.
     #[must_use]
-    #[cfg(any(test, feature = "testing"))]
     pub fn mls_storage(
         &self,
     ) -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
