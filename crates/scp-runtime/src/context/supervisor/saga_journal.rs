@@ -550,14 +550,31 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             // other non-digit byte > '9' (0x39) all sort high — and thereby win
             // selection, overriding the real latest entry to flip a saga's FSM
             // state / participants (resurrect a resolved saga, or shove a live
-            // saga to attacker-chosen `Committing` + participants). So we apply
-            // the SAME posture `next_seq_for_saga` already applies on the write
-            // path: only a suffix that is EXACTLY 20 ASCII digits is canonical.
-            // A non-canonical suffix is a corrupt/planted entry — flag it and
-            // skip it so it never participates in latest-per-saga selection; the
-            // canonical real entry still wins.
-            let is_canonical_seq =
-                seq_suffix.len() == 20 && seq_suffix.bytes().all(|b| b.is_ascii_digit());
+            // saga to attacker-chosen `Committing` + participants). A purely
+            // numeric 20-digit suffix can ALSO exceed `u64::MAX`
+            // (`18446744073709551615`): twenty `9`s passes a digit-only check
+            // yet sorts lexicographically above every real zero-padded seq, so a
+            // bare length+digit test still lets such an out-of-range suffix win.
+            // So we apply the SAME posture `next_seq_for_saga` already applies on
+            // the write path: the suffix must be EXACTLY 20 ASCII digits AND
+            // parse as a `u64` (rejecting the `> u64::MAX` overflow case).
+            //
+            // What this check rejects: MALFORMED / non-canonical / out-of-range
+            // key suffixes — anything that is not exactly the 20-digit
+            // zero-padded, in-`u64`-range seq `entry_key` writes — so they can
+            // never win latest-per-saga selection. It does NOT (and cannot)
+            // detect a forged entry stored under a perfectly CANONICAL,
+            // in-range seq key with a CRC-valid body: that residual is bounded
+            // by storage-layer integrity (the CRC framing is a torn-write
+            // detector, not a MAC), and per-entry cryptographic key→value
+            // authentication would be a separate architectural concern, out of
+            // scope for this swap. A suffix failing this check is a
+            // corrupt/planted entry — flag it and skip it so it never
+            // participates in latest-per-saga selection; the canonical real
+            // entry still wins.
+            let is_canonical_seq = seq_suffix.len() == 20
+                && seq_suffix.bytes().all(|b| b.is_ascii_digit())
+                && seq_suffix.parse::<u64>().is_ok();
             if !is_canonical_seq {
                 crate::metrics::record_saga_repair_needed();
                 tracing::error!(
@@ -1486,6 +1503,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_unresolved_rejects_twenty_digit_overflow_shadow_key() {
+        // SECURITY regression guard (read/write parity on the seq suffix): a
+        // suffix of twenty `9`s (`99999999999999999999`) is 20 ASCII DIGITS but
+        // exceeds `u64::MAX` (`18446744073709551615`). A bare length+digit check
+        // accepts it, yet it sorts lexicographically ABOVE every real
+        // zero-padded seq, so it would win latest-per-saga selection and let a
+        // storage-write attacker override the canonical entry — flipping a
+        // saga's FSM state. The write path (`next_seq_for_saga`) already rejects
+        // it via `parse::<u64>()`; `load_unresolved` MUST do the same so the
+        // canonical real entry still wins, and flag the planted key via the
+        // repair metric. Thread-local recorder, same pattern as
+        // `load_unresolved_ignores_noncanonical_shadow_key`.
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let saga = SagaId::new();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+
+                // A live (non-terminal) saga at canonical seq 0.
+                journal
+                    .append(test_entry(
+                        &saga,
+                        0,
+                        SagaState::Committing,
+                        b"real-committing".to_vec(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // Plant a 20-DIGIT but `> u64::MAX` overflow shadow under the
+                // SAME saga. It is all-digits and length 20, so a check lacking
+                // the `parse::<u64>()` guard accepts it; it sorts above the
+                // canonical `…00` seq and (pre-fix) would override the live
+                // entry with attacker-chosen pre-commit state.
+                let overflow_shadow =
+                    format!("{SAGA_JOURNAL_KEY_PREFIX}{saga}/99999999999999999999");
+                let forged = test_entry(
+                    &saga,
+                    0,
+                    SagaState::PreparingA,
+                    b"attacker-rollback".to_vec(),
+                );
+                storage
+                    .store(&overflow_shadow, &encode_entry(&forged).unwrap())
+                    .await
+                    .unwrap();
+
+                let unresolved = journal.load_unresolved().await.expect(
+                    "a 20-digit overflow shadow key must be skipped, not abort the sweep",
+                );
+
+                // The live saga surfaces with its REAL Committing state — the
+                // overflow shadow did NOT win latest-per-saga selection.
+                let live = unresolved
+                    .iter()
+                    .find(|e| e.saga_id == saga)
+                    .expect("the live saga must still recover");
+                assert_eq!(
+                    live.state,
+                    SagaState::Committing,
+                    "the > u64::MAX overflow shadow key must NOT override the canonical latest entry",
+                );
+                assert_eq!(
+                    &*live.evidence, b"real-committing",
+                    "the live saga must keep its real evidence, not the forged overflow shadow's",
+                );
+            });
+        });
+
+        // The overflow shadow key was flagged as corrupt → repair counter fired.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
+            if ck.key().name() == "scp_saga_repair_needed_total" {
+                if let DebugValue::Counter(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(count, Some(c) if c >= 1),
+            "a 20-digit overflow shadow key must increment scp_saga_repair_needed_total; snapshot={snapshot:?}",
+        );
+    }
+
     #[tokio::test]
     async fn mark_resolved_secret_bearing_fails_loud_on_corrupt_entry() {
         // SECURITY (fail-loud invariant, spec §9.4.3): the secret-bearing
@@ -1530,6 +1646,76 @@ mod tests {
             "secret-bearing mark_resolved must fail loud on an undecodable entry \
              (cannot zero secret bytes it cannot locate), got {result:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_non_secret_skips_corrupt_entry_succeeds() {
+        // SECURITY contrast to `mark_resolved_secret_bearing_fails_loud_on_corrupt_entry`:
+        // the two postures are deliberately OPPOSITE on the SAME corruption
+        // fixture. Secret-bearing resolution must FAIL LOUD on an undecodable
+        // entry (it cannot zero secret bytes it cannot reach). The non-secret
+        // availability path must instead TOLERATE the same corrupt entry —
+        // skip-and-flag via the repair metric — so one torn write never denies
+        // recovery for every other unresolved saga. The non-secret
+        // `mark_resolved` does not decode prior entries (nothing to zero), so we
+        // assert the tolerant posture on the `load_unresolved` sweep over the
+        // identical corrupt fixture: it returns Ok (does not abort) and skips
+        // only the corrupt saga.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let corrupt_saga = SagaId::new();
+        let healthy_saga = SagaId::new();
+
+        // Same fixture shape as the fail-loud test: a saga across two seqs whose
+        // latest key is then overwritten with undecodable bytes.
+        journal
+            .append(test_entry(
+                &corrupt_saga,
+                0,
+                SagaState::PreparingA,
+                b"ev0".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &corrupt_saga,
+                1,
+                SagaState::Committing,
+                b"ev1".to_vec(),
+            ))
+            .await
+            .unwrap();
+        let latest = ProtocolRepositorySagaJournal::<InMemoryStorage>::entry_key(&corrupt_saga, 1);
+        storage.store(&latest, b"corrupt").await.unwrap();
+
+        // A second, healthy unresolved saga that MUST still recover despite the
+        // corrupt sibling.
+        journal
+            .append(test_entry(
+                &healthy_saga,
+                0,
+                SagaState::Committing,
+                b"healthy".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Tolerant posture: the sweep succeeds (does NOT fail loud), skips the
+        // corrupt saga, and still recovers the healthy one.
+        let unresolved = journal
+            .load_unresolved()
+            .await
+            .expect("non-secret recovery must tolerate a corrupt entry, not fail loud");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == corrupt_saga),
+            "the corrupt saga's latest entry is undecodable → skipped, got {unresolved:?}",
+        );
+        let healthy = unresolved
+            .iter()
+            .find(|e| e.saga_id == healthy_saga)
+            .expect("a healthy unresolved saga must still recover past a corrupt sibling");
+        assert_eq!(healthy.state, SagaState::Committing);
     }
 
     #[tokio::test]
