@@ -1354,10 +1354,6 @@ impl ContextActor {
                 reply,
                 "tools::settle_tool_economy (use Supervisor::invoke_tool_with_economy / dispatch_tools_command)",
             ),
-            ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => ack_not_impl(
-                reply,
-                "tools::initiate_cross_context_tool_invocation (the §6.2.4 saga is wired via Supervisor::start_cross_context_tool_invocation_saga; this actor-mailbox initiator and the saga's FFI export are deferred — see DEFERRED-commit-11-saga-use-cases.md gap 2)",
-            ),
         }
     }
 

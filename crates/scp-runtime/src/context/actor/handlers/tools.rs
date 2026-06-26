@@ -1,6 +1,7 @@
 //! Tools handlers — see
 //! [`ToolsCommand`](crate::context::actor::commands::ToolsCommand)
-//! and spec §5.16 / §19.7.
+//! and spec §19 (economic governance) / §19.7 (anti-spam cost
+//! escalation); hard rate limits §6.2.0.2.
 //!
 //! # Phase 2A.4 + Phase 2A finalization -- actor-shape dispatch
 //!
@@ -15,23 +16,14 @@
 //! mailbox round-trips (see
 //! [`crate::context::tools_helpers::invoke_tool_with_economy`]).
 //!
-//! # SAGA-INITIATOR ACTOR-MAILBOX PATH DEFERRED — see
-//! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-//!
-//! The cross-context tool invocation saga itself is fully specified
-//! (§6.2.4: the `CrossContextToolInvoke` wire envelope, the party that
-//! presents the UCAN proof at the target, the `CrossContextToolReceipt`
-//! return path, and the dual event-log recording) and wired via
-//! [`Supervisor::start_cross_context_tool_invocation_saga`]. What is
-//! deferred is this method's actor-mailbox transport leg: the
-//! `InitiateCrossContextToolInvocation` saga-initiator variant returns
-//! [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! pending the saga's FFI export (per-participant-set gating, ADR-049
-//! §3a) and the actor-mailbox path for this command.
-//!
-//! Until that lands, the saga-initiator path returns
-//! `ContextError::NotImplemented`. All other tool commands run on the
-//! actor:
+//! The cross-context tool invocation saga (§6.2.4) is produced directly by
+//! [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga) — it does not
+//! cross the actor mailbox because its
+//! [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys) are
+//! borrowed (non-`'static`) `&ed25519_dalek::SigningKey` references that
+//! cannot move into a `'static` mailbox message (its executor, by
+//! contrast, is `Send + 'static`). A distinct constraint keeps the
+//! tool-economy executor off the mailbox:
 //! [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 //! takes a generic non-`Send` executor closure that cannot cross the
 //! actor mailbox, so its economy bookkeeping is split into the
@@ -95,9 +87,6 @@ pub(crate) async fn dispatch(
             reply,
         } => {
             handle_settle_tool_economy(cell, deps, &context_id, &invoker_did, *request, reply).await
-        }
-        ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
-            reply_saga_deferred(reply)
         }
     }
 }
@@ -275,20 +264,6 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
     const MSG: &str = "ToolsCommand::Placeholder — real variants migrate in commit 11 of \
                        ADR-049; Placeholder retained for commit-6 compile stability and \
                        deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-}
-
-fn reply_saga_deferred(
-    reply: oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
-) -> Outcome<()> {
-    const MSG: &str = "tools::initiate_cross_context_tool_invocation — the §6.2.4 cross-context \
-                       tool saga is specified and wired via \
-                       Supervisor::start_cross_context_tool_invocation_saga, not this actor \
-                       mailbox; this initiator's actor-mailbox transport leg and the saga's FFI \
-                       export are deferred (per-set gating, ADR-049 §3a); see \
-                       .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 2: cross-context \
-                       tool invocation transport)";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

@@ -4645,12 +4645,17 @@ impl Supervisor {
     ///
     /// Covers the hard-rate-limit consume / refund helpers that FFI
     /// bridges call from their tool-dispatch paths. The cross-context
-    /// saga-initiator variant returns [`ContextError::NotImplemented`]
-    /// during the commit-11 window — see
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. Note that
+    /// tool-invocation saga (spec §6.2.4) is produced directly by
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga),
+    /// not via the actor mailbox: that saga's
+    /// [`SagaSigningKeys`]
+    /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
+    /// references that cannot move into a `'static` mailbox message,
+    /// even though its executor is itself `Send + 'static`. Note that
     /// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
-    /// is not migrated here because its generic executor closure cannot
-    /// cross the actor mailbox.
+    /// is not migrated here for a distinct reason: its generic executor
+    /// closure carries no `Send` bound, so it cannot cross the actor
+    /// mailbox at all.
     ///
     /// # Errors
     ///
@@ -4717,8 +4722,8 @@ impl Supervisor {
 
     /// Reply to a [`ToolsCommand`] whose target context has no registered
     /// actor with a typed [`ContextError::ContextNotRegistered`] on the
-    /// variant's reply oneshot. Saga-initiator / placeholder variants keep
-    /// their own typed replies.
+    /// variant's reply oneshot. The placeholder variant keeps its own typed
+    /// reply.
     fn reply_tools_not_registered(cmd: ToolsCommand) -> Outcome<()> {
         match cmd {
             ToolsCommand::Placeholder { reply } => {
@@ -4769,17 +4774,6 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
-            ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
-                const MSG: &str = "tools::initiate_cross_context_tool_invocation — the §6.2.4 \
-                     cross-context tool saga is specified and wired via \
-                     Supervisor::start_cross_context_tool_invocation_saga, not this actor \
-                     mailbox; this initiator's actor-mailbox transport leg and the saga's FFI \
-                     export are deferred (per-set gating, ADR-049 §3a); see \
-                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 2: cross-context \
-                     tool invocation transport)";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
         }
     }
 
@@ -4789,9 +4783,9 @@ impl Supervisor {
     /// Per-context variants (subscribe/unsubscribe/block/unblock/key
     /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
     /// on their reply oneshot. The custody-bound publish variants, the
-    /// two-phase reserve/apply/release variants, the saga-initiator
-    /// variant, and the placeholder keep their own typed replies (these
-    /// never reach a per-context actor through this no-custody router).
+    /// two-phase reserve/apply/release variants, and the placeholder keep
+    /// their own typed replies (these never reach a per-context actor
+    /// through this no-custody router).
     fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
         match cmd {
             BroadcastCommand::Placeholder { reply } => {
@@ -10610,7 +10604,7 @@ impl Supervisor {
             | ToolsCommand::RefundHardRateLimit { context_id, .. }
             | ToolsCommand::ReserveToolEconomy { context_id, .. }
             | ToolsCommand::SettleToolEconomy { context_id, .. } => Some(context_id.as_str()),
-            _ => None,
+            ToolsCommand::Placeholder { .. } => None,
         }
     }
 
