@@ -2308,6 +2308,128 @@ fn b3_webhook_dispatch_wired() {
 }
 
 // ===========================================================================
+// Durable saga journal — production supervisor construction (§17.16 / ADR-049)
+// ===========================================================================
+
+/// Every production `Supervisor` construction seam (PyO3, NAPI, UniFFI, Node)
+/// MUST route through `with_providers_and_journal` and supply a
+/// `ProtocolRepositorySagaJournal` built over the SAME chosen `Storage` backend
+/// that feeds `mls_storage` — NOT the bare `with_providers` (which hardcodes
+/// `NoopSagaJournal`). Without this, a process restart loads no journal and the
+/// §17.16.4 crash-recovery replay can never reconcile a crash-orphaned saga.
+///
+/// WASM is N/A: ADR-034 forbids the tokio-backed `Supervisor` in the wasm32
+/// bridge, so there is no `with_providers*` call to wire (no cell to fill).
+///
+/// This is a source-text presence gate (defense-in-depth, NOT the primary
+/// guarantee — the type system already forces a journal argument on
+/// `with_providers_and_journal`). It pins the wiring legible so a refactor that
+/// silently reverts a seam to the `NoopSagaJournal`-hardcoding `with_providers`
+/// is flagged. The behavioral proof that BOTH legs run over the real journal is
+/// the `saga_bridge_journal_swap` integration test.
+#[test]
+fn prod_supervisor_construction_wires_durable_saga_journal() {
+    // -- PyO3 reference bridge --------------------------------------------
+    // `build_supervisor` routes through `with_providers_and_journal`; the
+    // journal is built by `build_saga_journal` over the bridge instance's
+    // chosen `StorageProvider` (the SAME `Clone`-shared backend `derive_mls_storage`
+    // wraps into `mls_storage`).
+    let pyo3_runtime_src = include_str!("../../../../crates/scp-ffi/src/runtime.rs");
+    assert!(
+        fn_body_contains(
+            pyo3_runtime_src,
+            "build_supervisor",
+            "with_providers_and_journal"
+        ),
+        "PyO3 build_supervisor must route through with_providers_and_journal (durable saga \
+         journal), not the NoopSagaJournal-hardcoding with_providers"
+    );
+    assert!(
+        fn_body_contains(pyo3_runtime_src, "build_supervisor", "build_saga_journal"),
+        "PyO3 build_supervisor must build the durable journal via build_saga_journal"
+    );
+    assert!(
+        fn_body_contains(
+            pyo3_runtime_src,
+            "build_saga_journal",
+            "ProtocolRepositorySagaJournal"
+        ) && fn_body_contains(pyo3_runtime_src, "build_saga_journal", "storage_provider"),
+        "PyO3 build_saga_journal must construct ProtocolRepositorySagaJournal over the bridge \
+         instance's chosen storage_provider — the SAME backend as mls_storage (spec §17.6)"
+    );
+
+    // -- NAPI bridge (Node.js/Bun) ----------------------------------------
+    // `build_supervisor_arc` routes through `with_providers_and_journal`; the
+    // journal is built at the concrete-storage construction site via
+    // `saga_journal_from_handle` over the SAME `Arc<S>` that feeds
+    // `mls_storage_from_handle`.
+    let napi_runtime_src = include_str!("../../../../crates/scp-ffi/napi/src/runtime.rs");
+    assert!(
+        fn_body_contains(
+            napi_runtime_src,
+            "build_supervisor_arc",
+            "with_providers_and_journal"
+        ),
+        "NAPI build_supervisor_arc must route through with_providers_and_journal (durable saga \
+         journal), not the NoopSagaJournal-hardcoding with_providers"
+    );
+    assert!(
+        fn_body_contains(
+            napi_runtime_src,
+            "saga_journal_from_handle",
+            "ProtocolRepositorySagaJournal"
+        ),
+        "NAPI saga_journal_from_handle must construct ProtocolRepositorySagaJournal over the \
+         concrete Storage handle that also feeds mls_storage_from_handle (spec §17.6)"
+    );
+
+    // -- UniFFI bridge (Swift/Kotlin) -------------------------------------
+    let uniffi_runtime_src = include_str!("../../../../crates/scp-ffi/uniffi/src/runtime.rs");
+    assert!(
+        fn_body_contains(
+            uniffi_runtime_src,
+            "build_supervisor",
+            "with_providers_and_journal"
+        ),
+        "UniFFI build_supervisor must route through with_providers_and_journal (durable saga \
+         journal), not the NoopSagaJournal-hardcoding with_providers"
+    );
+    assert!(
+        fn_body_contains(
+            uniffi_runtime_src,
+            "saga_journal_from_handle",
+            "ProtocolRepositorySagaJournal"
+        ),
+        "UniFFI saga_journal_from_handle must construct ProtocolRepositorySagaJournal over the \
+         concrete Storage handle that also feeds mls_storage_from_handle (spec §17.6)"
+    );
+
+    // -- Node (self-host loopback supervisor) -----------------------------
+    // `connect_loopback_supervisor` routes through `with_providers_and_journal`;
+    // `build_host_site_deployer` builds the journal over the SAME
+    // `Arc<SqliteStorage>` ({storage_dir}/mls) that it wraps into mls_storage.
+    let node_self_host_src = include_str!("../../../../crates/scp-node/src/self_host.rs");
+    assert!(
+        fn_body_contains(
+            node_self_host_src,
+            "connect_loopback_supervisor",
+            "with_providers_and_journal"
+        ),
+        "Node connect_loopback_supervisor must route through with_providers_and_journal (durable \
+         saga journal), not the NoopSagaJournal-hardcoding with_providers"
+    );
+    assert!(
+        fn_body_contains(
+            node_self_host_src,
+            "build_host_site_deployer",
+            "ProtocolRepositorySagaJournal"
+        ),
+        "Node build_host_site_deployer must construct ProtocolRepositorySagaJournal over the \
+         SAME Arc<SqliteStorage> ({{storage_dir}}/mls) that backs mls_storage (spec §17.6)"
+    );
+}
+
+// ===========================================================================
 // UCAN validation step 8 — all-attestation ceiling enforcement
 // ===========================================================================
 
