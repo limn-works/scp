@@ -100,8 +100,8 @@ pub enum ContextCommand {
     /// Trust recovery — epoch floor reconciliation, recovery proofs
     /// (spec §23.17).
     TrustRecovery(TrustRecoveryCommand),
-    /// Standing — saga initiator for standing-pair creation
-    /// (spec §5.15.7).
+    /// Standing — standing-pair get-or-create (single-context async
+    /// creation, NOT a saga; spec §5.15.8).
     Standing(StandingCommand),
     /// TTL close — timer-driven close path (spec §5.8).
     TtlClose(TtlCloseCommand),
@@ -677,12 +677,13 @@ pub struct RestoreContextPayload {
 /// state mutations to the actor's owned
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
 ///
-/// **Create-as-prepare.** `CreateContext` / `JoinContext` are legitimate
-/// saga entry points in later commits (standing-pair creation,
-/// migration). Commit 9 routes them through
+/// **Create / join.** `CreateContext` / `JoinContext` route directly through
 /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
-/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
-/// directly; saga wiring moves into this enum in commit 11.
+/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+/// Neither is a saga entry point: standing-pair creation is single-context
+/// async creation (not a 2-phase saga; spec §5.15.8), and cross-identity
+/// context migration was withdrawn (ADR-049 §4). The sole cross-context saga
+/// is tool invocation (§6.2.4), driven from the supervisor, not this enum.
 pub enum LifecycleCommand {
     /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
     /// ADR-049 (post-review-round-1 plan). Used by the actor's
@@ -700,9 +701,9 @@ pub enum LifecycleCommand {
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
     /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
     ///
-    /// Saga-compatible: the same variant carries the
-    /// `create_context`-for-standing-pair-prepare flow in commit 11; for
-    /// commit 9 the handler goes straight through the legacy method.
+    /// Standing-pair creation also routes through `create_context` — it is
+    /// single-context async creation (not a saga-prepare flow; spec §5.15.8),
+    /// so the handler goes straight through the method.
     ///
     /// Boxed payload — [`ContextParams`](scp_protocol::context::params::ContextParams)
     /// is ~1KB, which would blow up every sibling variant under
@@ -1568,9 +1569,7 @@ pub struct BroadcastBlockPayload {
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
-/// method on [`crate::context::broadcast_helpers`] that is NOT the
-/// saga-wired broadcast-hosting handshake. The handshake is spec-gapped
-/// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+/// method on [`crate::context::broadcast_helpers`].
 ///
 /// # Key-custody handoff
 ///
@@ -1739,25 +1738,6 @@ pub enum BroadcastCommand {
         context_id: String,
         /// Oneshot reply channel. See [`BroadcastAdmissionReply`].
         reply: BroadcastAdmissionReply,
-    },
-
-    /// Saga-initiator path for the broadcast-hosting handshake. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the handshake
-    /// protocol (subscriber-to-host key exchange, host config negotiation,
-    /// §5.14.2 step 4 transport) is spec-gapped. See
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
-    InitiateBroadcastHostingHandshake {
-        /// Host context ID (32-byte hash).
-        host_context_id: [u8; 32],
-        /// Broadcast context ID (32-byte hash).
-        broadcast_context_id: [u8; 32],
-        /// Subscriber DID requesting hosting.
-        subscriber_did: scp_identity::DID,
-        /// Oneshot reply channel. Carries the saga's durable ID on
-        /// success; `ContextError::NotImplemented` during the deferred
-        /// window.
-        reply:
-            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 
@@ -1983,14 +1963,13 @@ pub enum StandingCommand {
     /// returning `Active` or `Creating` surfaces the same context ID
     /// without error.
     ///
-    /// # Saga scope
+    /// # Not a saga
     ///
-    /// The legacy method internally calls
+    /// The method internally calls
     /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
-    /// Commit 11 routes through that legacy path directly — the
-    /// standing-pair-create saga FSM (Prepare+Commit 2-phase) is
-    /// deferred per
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    /// Standing-pair creation is single-context async creation (create +
+    /// add_member + Welcome + consent-on-receipt; spec §5.15.8) routed
+    /// directly through that path — NOT a 2-phase-commit saga FSM.
     StandingContext {
         /// Local identity DID.
         local_did: scp_identity::DID,
@@ -2214,9 +2193,11 @@ pub enum TtlCloseCommand {
 /// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 /// — that method is the cross-context tool-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
-/// cross the actor mailbox. The cross-context saga path is spec-gapped
-/// regardless; see
-/// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+/// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
+/// reached via
+/// [`Supervisor::start_cross_context_tool_invocation_saga`]); what remains
+/// deferred is its FFI export, pending per-participant-set saga gating
+/// (ADR-049 §3a), and the actor-mailbox path for this method.
 ///
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
@@ -2313,9 +2294,12 @@ pub enum ToolsCommand {
     },
 
     /// Saga-initiator path for cross-context tool invocation. Returns
-    /// [`ContextError::NotImplemented`] in commit 11 — the cross-context
-    /// invoke transport protocol (caller→target context forwarding,
-    /// UCAN proof plumbing, receipt relay) is spec-gapped. See
+    /// [`ContextError::NotImplemented`] in commit 11 — the saga itself is
+    /// specified (§6.2.4: caller→target forwarding, UCAN proof plumbing,
+    /// receipt relay) and wired via
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`]; deferred
+    /// here is this variant's actor-mailbox path, pending the saga's FFI
+    /// export (per-participant-set gating, ADR-049 §3a). See
     /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
     InitiateCrossContextToolInvocation {
         /// Calling context ID (32-byte hash).

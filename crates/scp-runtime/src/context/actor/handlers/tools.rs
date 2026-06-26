@@ -15,22 +15,21 @@
 //! mailbox round-trips (see
 //! [`crate::context::tools_helpers::invoke_tool_with_economy`]).
 //!
-//! # SAGA WIRING DEFERRED — see
+//! # SAGA-INITIATOR ACTOR-MAILBOX PATH DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
 //!
-//! The `InitiateCrossContextToolInvocation` saga-initiator variant
-//! returns [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! because cross-context tool-invocation transport is spec-gapped — the
-//! spec does not yet define:
-//!   - the wire format for forwarding a tool invocation from the
-//!     calling context to the target context,
-//!   - which party is responsible for presenting the UCAN proof at the
-//!     target (caller forwards vs. target fetches from UCAN store),
-//!   - how the tool's `ToolInvokedEvent` is relayed back to the caller
-//!     and whether the caller's event log records it separately from
-//!     the target's event log.
+//! The cross-context tool invocation saga itself is fully specified
+//! (§6.2.4: the `CrossContextToolInvoke` wire envelope, the party that
+//! presents the UCAN proof at the target, the `CrossContextToolReceipt`
+//! return path, and the dual event-log recording) and wired via
+//! [`Supervisor::start_cross_context_tool_invocation_saga`]. What is
+//! deferred is this method's actor-mailbox transport leg: the
+//! `InitiateCrossContextToolInvocation` saga-initiator variant returns
+//! [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
+//! pending the saga's FFI export (per-participant-set gating, ADR-049
+//! §3a) and the actor-mailbox path for this command.
 //!
-//! Until those land, the saga-initiator path returns
+//! Until that lands, the saga-initiator path returns
 //! `ContextError::NotImplemented`. All other tool commands run on the
 //! actor:
 //! [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
@@ -283,8 +282,11 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 fn reply_saga_deferred(
     reply: oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
 ) -> Outcome<()> {
-    const MSG: &str = "tools::initiate_cross_context_tool_invocation — saga wiring deferred \
-                       to commit 11.5 per 5 enumerated spec gaps; see \
+    const MSG: &str = "tools::initiate_cross_context_tool_invocation — the §6.2.4 cross-context \
+                       tool saga is specified and wired via \
+                       Supervisor::start_cross_context_tool_invocation_saga, not this actor \
+                       mailbox; this initiator's actor-mailbox transport leg and the saga's FFI \
+                       export are deferred (per-set gating, ADR-049 §3a); see \
                        .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 2: cross-context \
                        tool invocation transport)";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));

@@ -10,15 +10,13 @@
 //!
 //! # Determinism
 //!
-//! `BroadcastHostingHandshake` remains spec-gapped
-//! (its Prepare dispatch returns `NotImplemented`). `CrossContextToolInvocation`
-//! is wired, but driving it through `start_saga` (no executor / signing key)
-//! over contexts with NO co-resident actors aborts INSTANTLY at Prepare-A with
-//! a typed `ContextNotRegistered` (co-resident scope) — the PreparingA →
-//! Aborting → Aborted arm — too fast to hold "in flight" by racing. The
-//! load-bearing gating assertion is the ABSENCE of `ActorBusy` and that the
-//! reservation is RELEASED on every terminal; the exact terminal error class
-//! is incidental (it just must not be `ActorBusy`). To test the gating
+//! The sole production saga, `CrossContextToolInvocation`, is wired, but
+//! driving it through `start_saga` (no executor / signing key) over contexts
+//! with NO co-resident actors aborts INSTANTLY at Prepare-A with a typed error
+//! — the PreparingA → Aborting → Aborted arm — too fast to hold "in flight" by
+//! racing. The load-bearing gating assertion is the ABSENCE of `ActorBusy` and
+//! that the reservation is RELEASED on every terminal; the exact terminal error
+//! class is incidental (it just must not be `ActorBusy`). To test the gating
 //! semantics deterministically we use
 //! `Supervisor::test_reserve_saga_context_set`, which exercises the SAME
 //! `try_reserve_context_set` critical section that `start_saga` uses (not a
@@ -100,18 +98,6 @@ fn test_supervisor() -> Arc<Supervisor> {
     ))
 }
 
-/// A broadcast-hosting-handshake saga over the given host/broadcast contexts.
-/// Its participant context set is `{host, broadcast}`. The subscriber DID is a
-/// placeholder — these gating tests only exercise the reservation key (the two
-/// context ids), never the spec-gapped Prepare body.
-fn broadcast_hosting(host: [u8; 32], broadcast: [u8; 32]) -> SagaInput {
-    SagaInput::BroadcastHostingHandshake {
-        host_context_id: host,
-        broadcast_context_id: broadcast,
-        subscriber_did: DID("did:example:subscriber".to_owned()),
-    }
-}
-
 /// A cross-context tool-invocation saga over the given caller/target
 /// contexts. Its participant context set is `{caller, target}`. The
 /// envelope fields are placeholders — these gating tests never reach
@@ -131,10 +117,10 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
 /// `CrossContextToolInvocation` through `start_saga` (no executor / signing
 /// key) aborts at Prepare-A with `InvalidState` (the executor-context misuse
 /// guard, SCP-SAGA-13051) — BEFORE the co-resident lookup — so the FSM never
-/// reaches `ContextNotRegistered` here; the spec-gapped variants abort with
-/// `NotImplemented`. Any of these is a valid "reservation released" terminal —
-/// the gating property under test is the ABSENCE of `ActorBusy`, not the
-/// specific terminal error.
+/// reaches `ContextNotRegistered` here. Any non-busy terminal (`InvalidState`,
+/// or the defensively-accepted `ContextNotRegistered` / `NotImplemented`) is a
+/// valid "reservation released" outcome — the gating property under test is the
+/// ABSENCE of `ActorBusy`, not the specific terminal error.
 #[track_caller]
 fn assert_non_busy_terminal(
     result: &Result<scp_runtime::context::supervisor::SagaOutput, ContextError>,
@@ -159,9 +145,9 @@ fn ctx(byte: u8) -> [u8; 32] {
 
 /// DISJOINT participant sets run concurrently: two sagas spanning entirely
 /// different contexts BOTH reach a terminal — NEITHER returns ActorBusy.
-/// Because the production variants are spec-gapped, "terminal" is the
-/// `NotImplemented` abort; the load-bearing assertion is the ABSENCE of
-/// ActorBusy, proving disjoint sets never serialize.
+/// Because the executor-less `start_saga` path aborts at Prepare-A, "terminal"
+/// here is the `InvalidState` abort; the load-bearing assertion is the ABSENCE
+/// of ActorBusy, proving disjoint sets never serialize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disjoint_participant_sets_run_concurrently() {
     let supervisor = test_supervisor();
@@ -184,7 +170,7 @@ async fn disjoint_participant_sets_run_concurrently() {
 /// flight, a second saga sharing ≥1 context returns ActorBusy with a
 /// `SagaBusy` reason. The in-flight saga is simulated deterministically by
 /// holding the reservation guard (the production gating critical section),
-/// because the spec-gapped FSM terminates too fast to race.
+/// because the executor-less FSM terminates too fast to race.
 #[tokio::test]
 async fn overlapping_participant_sets_reject_busy() {
     let supervisor = test_supervisor();
@@ -222,16 +208,16 @@ async fn overlapping_participant_sets_reject_busy() {
     );
 }
 
-/// A BROADCAST-hosting saga and a CROSS-CONTEXT saga that touch the SAME
-/// context serialize — overlap detection is purely set-membership, not
-/// saga-type.
+/// A `TestForceNeedsRepair` saga and a `CrossContextToolInvocation` saga that
+/// touch the SAME context serialize — overlap detection is purely
+/// set-membership, not saga-type.
 ///
-/// This genuinely crosses saga TYPES. Both variants reserve the raw-digest hex
-/// (`hex::encode([u8; 32])`) of every context they span. A held broadcast saga
-/// over `{shared, other}` and a `CrossContextToolInvocation` over that SAME
-/// `shared` raw digest must collide. If overlap detection keyed off the saga
-/// type rather than pure set-membership, the cross-context saga would not be
-/// rejected and this assertion would FAIL.
+/// This genuinely crosses saga TYPES. Every variant reserves the raw-digest hex
+/// (`hex::encode([u8; 32])`) of each context it spans. A held
+/// `TestForceNeedsRepair` saga over `{shared}` and a
+/// `CrossContextToolInvocation` over that SAME `shared` raw digest must collide.
+/// If overlap detection keyed off the saga type rather than pure set-membership,
+/// the cross-context saga would not be rejected and this assertion would FAIL.
 #[tokio::test]
 async fn overlap_is_set_membership_across_saga_types() {
     let supervisor = test_supervisor();
@@ -241,11 +227,13 @@ async fn overlap_is_set_membership_across_saga_types() {
     let bob = DID("did:example:bob".to_owned());
     let shared_digest = Supervisor::test_standing_pair_context_digest(&alice, &bob);
 
-    // Hold a BROADCAST-hosting saga in flight via the production reservation
-    // primitive. Its participant set is {shared_digest, 0x08}.
+    // Hold a single-context `TestForceNeedsRepair` saga in flight via the
+    // production reservation primitive. Its participant set is {shared_digest}.
     let held = supervisor
-        .test_reserve_saga_context_set(&broadcast_hosting(shared_digest, ctx(8)))
-        .expect("broadcast-hosting reservation must succeed");
+        .test_reserve_saga_context_set(&SagaInput::TestForceNeedsRepair {
+            context_id: shared_digest,
+        })
+        .expect("test-force-needs-repair reservation must succeed");
 
     // A CROSS-CONTEXT saga (a DIFFERENT saga type) whose `caller_context_id`
     // is the SAME `shared_digest` and whose `target_context_id` is unrelated.
@@ -262,7 +250,7 @@ async fn overlap_is_set_membership_across_saga_types() {
         other => panic!("expected ActorBusy(SagaBusy), got: {other:?}"),
     }
 
-    // Releasing the broadcast reservation lets the previously-overlapping
+    // Releasing the held reservation lets the previously-overlapping
     // cross-context saga through — proving the rejection WAS the shared raw
     // digest (the reservation), not some unrelated failure.
     drop(held);

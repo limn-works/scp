@@ -3482,21 +3482,14 @@ mod tests {
             .saga_pending
             .get(&SagaId("saga-xctx-1".to_owned()))
             .unwrap();
-        match staged {
-            SagaPreparedState::CrossContextToolInvocation(p) => {
-                assert_eq!(p.target_context_id, [0x33; 32]);
-                assert_eq!(p.caller_did, DID(CALLER.to_owned()));
-                assert_eq!(p.tool_registration_id, TOOL);
-                assert_eq!(p.ucan_proof_id, "proof-1");
-                assert_eq!(p.recorded_chain_depth, 3);
-                assert_eq!(p.recorded_nonce, [0x42; 16]);
-            }
-            // `SagaPreparedState` is non-Debug (§9.4.3 barrier), so name the
-            // wrong arm without formatting it.
-            SagaPreparedState::BroadcastHostingHandshake(_) => {
-                panic!("wrong staged variant — expected CrossContextToolInvocation")
-            }
-        }
+        // Single-variant enum: the bind is irrefutable.
+        let SagaPreparedState::CrossContextToolInvocation(p) = staged;
+        assert_eq!(p.target_context_id, [0x33; 32]);
+        assert_eq!(p.caller_did, DID(CALLER.to_owned()));
+        assert_eq!(p.tool_registration_id, TOOL);
+        assert_eq!(p.ucan_proof_id, "proof-1");
+        assert_eq!(p.recorded_chain_depth, 3);
+        assert_eq!(p.recorded_nonce, [0x42; 16]);
     }
 
     /// FIX B.2 (`InboundPolicy.allowed_source_roles` enforced at Prepare-B). An
@@ -5124,9 +5117,7 @@ mod tests {
             .saga_pending
             .get(&saga)
             .expect("slot restored");
-        let SagaPreparedState::CrossContextToolInvocation(p) = restored else {
-            panic!("restored slot must be a cross-context prepared");
-        };
+        let SagaPreparedState::CrossContextToolInvocation(p) = restored;
         assert_eq!(
             p.ucan_proof_id, "gated-proof-index-42",
             "the restored slot must preserve ucan_proof_id (no lossy reconstruction)"

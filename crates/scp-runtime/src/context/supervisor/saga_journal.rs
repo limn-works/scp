@@ -5,8 +5,8 @@
 //! # Trait
 //!
 //! [`SagaJournal`] is the supervisor's durable coordinator record for
-//! cross-actor sagas (standing-pair create, cross-context tool invoke,
-//! broadcast hosting handshake). It exposes three operations per
+//! cross-actor sagas (the sole saga is cross-context tool invoke,
+//! §6.2.4). It exposes three operations per
 //! spec §17.16.1:
 //!
 //! - [`SagaJournal::append`] — durably persist a state transition. Flushes

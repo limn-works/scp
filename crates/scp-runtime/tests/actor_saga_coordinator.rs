@@ -6,19 +6,19 @@
 //! the FSM generically against a production-backed
 //! [`Supervisor`](scp_runtime::context::supervisor::Supervisor).
 //!
-//! # Spec-gap guardrail
+//! # Executor-less misuse guardrail
 //!
-//! The `BroadcastHostingHandshake` [`SagaInput`] variant is spec-gapped —
-//! the Prepare dispatch returns `ContextError::NotImplemented`. The FSM
-//! transitions through `Initiated → PreparingA → Aborting → Aborted`
-//! and returns the typed error. This is the observable behaviour the
-//! tests assert.
+//! Driving a `CrossContextToolInvocation` [`SagaInput`] through the generic
+//! `start_saga` (no supervisor-side executor / signing key) is a misuse —
+//! the Prepare-A dispatch aborts with `ContextError::InvalidState`
+//! (SCP-SAGA-13051). The FSM transitions through
+//! `Initiated → PreparingA → Aborting → Aborted` and returns the typed
+//! error. This is the observable behaviour the tests assert; the production
+//! entry point is `start_cross_context_tool_invocation_saga`.
 //!
-//! Committing-arm success tests are not yet possible without a
-//! spec-filled saga input; those are part of commit 11.5. The
-//! committing-retry-exhaustion and crash-recovery arms ARE testable
-//! today because they exercise the coordinator's retry loop and
-//! journal-replay logic against the NotImplemented dispatch surface.
+//! The committing-retry-exhaustion and crash-recovery arms exercise the
+//! coordinator's retry loop and journal-replay logic against this abort
+//! dispatch surface.
 
 #![allow(
     clippy::unwrap_used,
@@ -104,12 +104,8 @@ fn test_supervisor() -> Supervisor {
     Supervisor::new(persistence, journal_dyn, SupervisorConfig::default())
 }
 
-fn spec_gapped_input() -> SagaInput {
-    SagaInput::BroadcastHostingHandshake {
-        host_context_id: [1u8; 32],
-        broadcast_context_id: [2u8; 32],
-        subscriber_did: DID("did:example:subscriber".to_owned()),
-    }
+fn executorless_input() -> SagaInput {
+    SagaInput::test_cross_context_for_gating([1u8; 32], [2u8; 32])
 }
 
 fn alice() -> DID {
@@ -120,25 +116,25 @@ fn alice() -> DID {
 // Coordinator FSM — basic transitions
 // ---------------------------------------------------------------------------
 
-/// PreparingA failure (NotImplemented) transitions through the abort
+/// PreparingA failure (InvalidState) transitions through the abort
 /// path and returns the typed error to the caller. The saga is
 /// terminally resolved in the journal.
 #[tokio::test]
-async fn saga_prepare_a_notimplemented_aborts_and_returns_error() {
+async fn saga_prepare_a_invalid_state_aborts_and_returns_error() {
     let supervisor = test_supervisor();
     let err = supervisor
-        .start_saga(spec_gapped_input())
+        .start_saga(executorless_input())
         .await
         .unwrap_err();
     assert!(
-        matches!(err, ContextError::NotImplemented(_)),
-        "expected NotImplemented for spec-gapped BroadcastHostingHandshake, got {err:?}"
+        matches!(err, ContextError::InvalidState(_)),
+        "expected InvalidState for the executor-less CrossContextToolInvocation misuse, got {err:?}"
     );
 }
 
 /// The journal records Initiated, PreparingA, Aborting, and a terminal
-/// Aborted entry for a spec-gapped saga. Verifies the coordinator
-/// appended every phase before aborting.
+/// Aborted entry for an executor-less saga misuse. Verifies the
+/// coordinator appended every phase before aborting.
 #[tokio::test]
 async fn saga_journal_records_every_phase_transition_on_abort() {
     // Build a supervisor with a directly-owned journal so we can probe
@@ -154,7 +150,7 @@ async fn saga_journal_records_every_phase_transition_on_abort() {
         SupervisorConfig::default(),
     );
 
-    let _ = supervisor.start_saga(spec_gapped_input()).await;
+    let _ = supervisor.start_saga(executorless_input()).await;
 
     // `load_unresolved` returns empty because the saga terminated
     // (Aborted is a terminal state). So we verify via raw storage
@@ -178,8 +174,8 @@ async fn saga_journal_records_every_phase_transition_on_abort() {
 /// Coordinator serializes sagas: a second `start_saga` while the first
 /// is running returns `ContextError::ActorBusy` with the SagaBusy
 /// reason. We can't easily race two real sagas in a test without
-/// blocking, so this test uses the fact that `NotImplemented` sagas
-/// terminate quickly — so we need to race them through a spawn.
+/// blocking, so this test uses the fact that the executor-less misuse
+/// sagas terminate quickly — so we need to race them through a spawn.
 #[tokio::test]
 async fn saga_concurrent_start_rejects_with_saga_busy() {
     let supervisor = Arc::new(test_supervisor());
@@ -187,21 +183,21 @@ async fn saga_concurrent_start_rejects_with_saga_busy() {
     // Pre-load: manually claim the guard to simulate an in-flight saga.
     // We can't call private internals; we instead exercise the CAS by
     // holding one saga in a blocking future while another tries to
-    // start. Because our Prepare stub is `async { NotImplemented }`,
+    // start. Because the executor-less Prepare-A aborts with InvalidState,
     // it terminates very quickly — we serialize via `tokio::join!`
-    // and assert that AT LEAST ONE succeeds-to-not-implemented and,
+    // and assert that AT LEAST ONE aborts-with-InvalidState and,
     // when either fails with ActorBusy, the reason matches.
     //
-    // Since both sagas' FSMs are instantaneous (no await in the
-    // NotImplemented body), true interleaving is hard. The test
-    // focuses on guard re-arm: a sequence of 10 sagas must all
-    // succeed-to-NotImplemented with no residual ActorBusy errors.
+    // Since both sagas' FSMs are instantaneous (the executor-less abort
+    // has no await), true interleaving is hard. The test focuses on guard
+    // re-arm: a sequence of 10 sagas must all abort-with-InvalidState with
+    // no residual ActorBusy errors.
     let mut ok_count = 0;
     let mut busy_count = 0;
     for _ in 0..10 {
         let sup = Arc::clone(&supervisor);
-        match sup.start_saga(spec_gapped_input()).await {
-            Err(ContextError::NotImplemented(_)) => ok_count += 1,
+        match sup.start_saga(executorless_input()).await {
+            Err(ContextError::InvalidState(_)) => ok_count += 1,
             Err(ContextError::ActorBusy(msg)) => {
                 assert!(
                     msg.contains("SagaBusy") || msg.contains("already in flight"),
@@ -209,7 +205,7 @@ async fn saga_concurrent_start_rejects_with_saga_busy() {
                 );
                 busy_count += 1;
             }
-            other => panic!("unexpected result from spec-gapped saga: {other:?}"),
+            other => panic!("unexpected result from executor-less saga: {other:?}"),
         }
     }
     assert_eq!(ok_count, 10, "all sequential sagas must terminate");
@@ -232,7 +228,7 @@ async fn saga_journal_write_ordering_is_monotonic() {
     let journal_dyn: Arc<dyn SagaJournal> = Arc::clone(&journal_prod) as _;
     let supervisor = Supervisor::new(persistence, journal_dyn, SupervisorConfig::default());
 
-    let _ = supervisor.start_saga(spec_gapped_input()).await;
+    let _ = supervisor.start_saga(executorless_input()).await;
 
     // Collect keys under the saga prefix; they embed `seq_per_saga` as
     // the trailing numeric suffix (20 digits, zero-padded).

@@ -59,8 +59,7 @@ condition, even across files.
 |-----------|-------|---------|
 | `13000-13009` | `scp-protocol` `cross_context_saga.rs` | Saga-type signing / verification (pure, sync) |
 | `13010-13099` | `scp-runtime` saga handler + supervisor FSM | Prepare / Commit / Abort phase coordination |
-| `13100-13199` | `scp-protocol` `broadcast/hosting_handshake.rs` | Broadcast-hosting handshake signing / verification / config validation (§5.14.13, pure, sync) |
-| `13200-13999` | *(reserved)* | Future cross-context saga families |
+| `13100-13999` | *(reserved)* | Future cross-context saga families |
 
 Within `13010-13099`, the handler (`actor/handlers/saga.rs`, the per-context
 authorization + freshness + Commit-B execute/settle path) holds `13010-13049`,
@@ -113,9 +112,6 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13062` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
 | `SCP-SAGA-13063` | supervisor | Commit — target receipt missing for saga |
 | `SCP-SAGA-13064` | supervisor | Commit — target receipt signature invalid |
-| `SCP-SAGA-13100` | protocol (broadcast-hosting) | Broadcast-hosting handshake canonical preimage construction failed (§5.14.13) |
-| `SCP-SAGA-13101` | protocol (broadcast-hosting) | Broadcast-hosting handshake Ed25519 signature failed verification (§5.14.13) |
-| `SCP-SAGA-13102` | protocol (broadcast-hosting) | Broadcast host config invalid — `expires_at_ms == 0` (§5.14.13, clamping cannot repair) |
 
 ### Registered SCP-ATTEST- codes
 
