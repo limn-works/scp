@@ -215,38 +215,34 @@ pub struct NapiBridgeInstance {
     /// See [`ProtocolRepoVariant`] for the dispatch details.
     pub(crate) protocol_repository: ProtocolRepoVariant,
 
-    /// The single chosen `Storage` backend, erased ONCE into the supervisor's
-    /// required `mls_storage` (`OpenMLS`) view via
-    /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter):
+    /// The bridge's durable providers — the saga journal + the supervisor's
+    /// `OpenMLS` `mls_storage` view — bound into one
+    /// [`DurableProviders`](scp_core::context::supervisor::DurableProviders)
+    /// GUARANTEED to share a single `Storage` backend (spec §17.6 / §17.16 /
+    /// ADR-049).
+    ///
+    /// Built at instance construction via
+    /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
+    /// over the single chosen `Storage` backend:
     /// - in-memory path → the un-swallowed
     ///   `Arc<EncryptingAdapter<BridgeInMemoryStorage>>` handle (3rd element
     ///   returned by `build_event_log_provider`);
     /// - `SQLite` path → the same `Arc<SqliteStorage>` that backs persistence
     ///   and the event log.
     ///
-    /// `build_supervisor_arc` reads this to satisfy the required `mls_storage`
-    /// argument of `Supervisor::with_providers`. The runtime never defaults
-    /// storage (spec §17.6 / ADR-049); `None` is the
+    /// Because the pair is bound into one newtype whose only non-test
+    /// constructor derives both halves from one handle, the journal can never be
+    /// wired to a different backend than `mls_storage` — the same-backend
+    /// invariant is enforced by the type system, not by two separate `Option`s a
+    /// mutated constructor could populate from divergent stores.
+    /// `build_supervisor_arc` clones this out (two `Arc` clones, same backend) to
+    /// supply `Supervisor::with_providers_and_journal`. The runtime never
+    /// defaults storage (spec §17.6 / ADR-049); `None` is the
     /// storage-before-supervisor fail-closed condition. Note that
-    /// `NapiBridgePersistence` (a `DashMap`) is NOT a `Storage` and therefore
-    /// can never back `mls_storage` — the in-memory `mls_storage` always
-    /// comes from the `build_event_log_provider` handle.
-    pub(crate) mls_storage_backend:
-        Option<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
-
-    /// Durable saga journal (§17.16 / ADR-049) built over the SAME single
-    /// chosen `Storage` backend as `mls_storage_backend`, persistence, and the
-    /// event log. `Storage` is not object-safe (RPITIT async methods), so the
-    /// journal — a `ProtocolRepositorySagaJournal<S>` — is constructed at the
-    /// concrete-storage construction site (where `S` is `BridgeInMemoryStorage`
-    /// handle or `Arc<SqliteStorage>`) from the SAME `Arc` that feeds
-    /// `mls_storage_backend`, then erased to `Arc<dyn SagaJournal>`.
-    /// `build_supervisor_arc` reads this to supply
-    /// `Supervisor::with_providers_and_journal`'s journal argument so
-    /// crash-recovery replay is durably backed in production. `None` is the
-    /// same storage-before-supervisor fail-closed condition (spec §17.6) as a
-    /// `None` `mls_storage_backend` — both are populated together.
-    pub(crate) saga_journal: Option<Arc<dyn scp_core::context::supervisor::SagaJournal>>,
+    /// `NapiBridgePersistence` (a `DashMap`) is NOT a `Storage` and therefore can
+    /// never back `mls_storage` — the in-memory backend always comes from the
+    /// `build_event_log_provider` handle.
+    pub(crate) durable_providers: Option<scp_core::context::supervisor::DurableProviders>,
 
     // -----------------------------------------------------------------
     // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
@@ -352,16 +348,16 @@ impl NapiBridgeInstance {
         // above (spec §17.6 — one chosen backend, derived consumers). This is
         // the in-memory storage source for `mls_storage` — NOT
         // `NapiBridgePersistence`, which is a `DashMap` and not a `Storage`.
-        // The durable saga journal and the `mls_storage` view are derived from
-        // the SAME `Arc` in one call so they cannot diverge (§17.6 / §17.16).
-        let (saga_journal, mls_storage_backend) = durable_providers_from_handle(storage_handle);
+        // The durable saga journal and the `mls_storage` view are bound into one
+        // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
+        // by construction (§17.6 / §17.16).
+        let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
-            mls_storage_backend: Some(mls_storage_backend),
-            saga_journal: Some(saga_journal),
+            durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -383,15 +379,15 @@ impl NapiBridgeInstance {
     pub fn with_persistence_napi(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
         let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
-        // Saga journal + `mls_storage` derived from one handle (§17.6 / §17.16).
-        let (saga_journal, mls_storage_backend) = durable_providers_from_handle(storage_handle);
+        // Saga journal + `mls_storage` bound into one `DurableProviders` derived
+        // from one handle (§17.6 / §17.16).
+        let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
-            mls_storage_backend: Some(mls_storage_backend),
-            saga_journal: Some(saga_journal),
+            durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -478,15 +474,13 @@ impl NapiBridgeInstance {
                 // and the journal is built over the SAME handle, so saga replay
                 // reads and writes the one `SQLCipher` connection (§17.6 /
                 // §17.16). They cannot diverge by construction.
-                let (saga_journal, mls_storage_backend) =
-                    durable_providers_from_handle(Arc::clone(&arc_storage));
+                let durable_providers = durable_providers_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
                 Ok(Self::with_persistence_napi_arc_and_repo(
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
-                    mls_storage_backend,
-                    saga_journal,
+                    durable_providers,
                 ))
             }
         }
@@ -511,16 +505,14 @@ impl NapiBridgeInstance {
     fn with_persistence_napi_arc_and_repo(
         persistence: Arc<dyn ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
-        mls_storage_backend: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-        saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
+        durable_providers: scp_core::context::supervisor::DurableProviders,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
-            mls_storage_backend: Some(mls_storage_backend),
-            saga_journal: Some(saga_journal),
+            durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -532,35 +524,22 @@ impl NapiBridgeInstance {
         }
     }
 
-    /// Returns the supervisor's `mls_storage` (`OpenMLS`) backend for this
-    /// bridge instance, if populated.
+    /// Returns this bridge instance's durable providers — the saga journal + the
+    /// supervisor's `mls_storage` (`OpenMLS`) view bound into one
+    /// same-backend-by-construction
+    /// [`DurableProviders`](scp_core::context::supervisor::DurableProviders) — if
+    /// populated.
     ///
-    /// Populated at construction time from the single chosen `Storage`
-    /// backend (erased once via
-    /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter)).
-    /// `build_supervisor_arc` reads it to satisfy the required `mls_storage`
-    /// argument of `Supervisor::with_providers`; a `None` here is the
-    /// storage-before-supervisor fail-closed condition (spec §17.6).
+    /// Populated at construction time via
+    /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
+    /// over the single chosen `Storage` backend. `build_supervisor_arc` clones it
+    /// out to supply `Supervisor::with_providers_and_journal`; a `None` here is
+    /// the storage-before-supervisor fail-closed condition (spec §17.6 / §17.16).
     #[must_use]
-    pub(crate) fn mls_storage_ref(
+    pub(crate) fn durable_providers_ref(
         &self,
-    ) -> Option<&Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
-        self.mls_storage_backend.as_ref()
-    }
-
-    /// Returns the durable saga journal for this bridge instance, if populated.
-    ///
-    /// Built at construction time over the SAME single chosen `Storage` backend
-    /// as `mls_storage_ref` (spec §17.16 / ADR-049). `build_supervisor_arc`
-    /// reads it to supply `Supervisor::with_providers_and_journal`'s journal
-    /// argument; a `None` here is the same storage-before-supervisor
-    /// fail-closed condition (spec §17.6) as a `None` `mls_storage_ref` — both
-    /// are populated together.
-    #[must_use]
-    pub(crate) fn saga_journal_ref(
-        &self,
-    ) -> Option<&Arc<dyn scp_core::context::supervisor::SagaJournal>> {
-        self.saga_journal.as_ref()
+    ) -> Option<&scp_core::context::supervisor::DurableProviders> {
+        self.durable_providers.as_ref()
     }
 
     /// Returns the monotonic instance id for this bridge.
@@ -968,19 +947,11 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
     // attached and subsequent operations error, rather than fabricating an
     // in-memory default. Every constructor populates this, so this is a
     // defense-in-depth guard.
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+    let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             "init_supervisor: storage-before-supervisor precondition failed — no \
-             mls_storage backend on the bridge instance; refusing to attach a \
-             supervisor (fail closed, spec §17.6)"
-        );
-        return;
-    };
-    let Some(saga_journal) = bi.saga_journal_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor: storage-before-supervisor precondition failed — no \
-             saga journal backend on the bridge instance; refusing to attach a \
-             supervisor (fail closed, spec §17.6 / §17.16)"
+             durable providers (saga journal + mls_storage) on the bridge instance; \
+             refusing to attach a supervisor (fail closed, spec §17.6 / §17.16)"
         );
         return;
     };
@@ -989,75 +960,37 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         transport,
         event_log,
         persistence,
-        mls_storage,
-        saga_journal,
+        durable,
         key_resolver_for(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Erases a chosen `Storage` backend into the supervisor's required
-/// `mls_storage` (`OpenMLS`) view via [`SpawnBlockingStorageAdapter`].
-///
-/// The single chosen backend (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
-/// for the dev/in-memory path, or `Arc<SqliteStorage>` for the durable path)
-/// is wrapped ONCE so the event log, persistence, and the `OpenMLS` view all
-/// read/write one store (spec §17.6).
-fn mls_storage_from_handle<S>(
-    handle: Arc<S>,
-) -> Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
-where
-    S: scp_platform::Storage + 'static,
-{
-    Arc::new(scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle))
-        as Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
-}
-
-/// Builds the durable [`ProtocolRepositorySagaJournal`] from the SAME concrete
-/// `Storage` handle that feeds [`mls_storage_from_handle`] (§17.16 / ADR-049).
-///
-/// Constructed at the concrete-storage construction site because `Storage` is
-/// not object-safe (its async methods use `-> impl Future`), so the journal's
-/// `S` type parameter cannot be recovered from the erased
-/// `Arc<dyn OpenMlsStorageAdapter>`. Passing the same `Arc<S>` that is wrapped
-/// into `mls_storage` guarantees the journal, the `OpenMLS` view, persistence,
-/// and the event log all read/write one backend (spec §17.6).
-fn saga_journal_from_handle<S>(
-    handle: Arc<S>,
-) -> Arc<dyn scp_core::context::supervisor::SagaJournal>
-where
-    S: scp_platform::Storage + 'static,
-{
-    Arc::new(scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(handle))
-        as Arc<dyn scp_core::context::supervisor::SagaJournal>
-}
-
-/// Derives BOTH durable providers — the saga journal and the `OpenMLS`
-/// `mls_storage` view — from a SINGLE `Storage` handle (§17.6 / §17.16 /
-/// ADR-049).
+/// Derives the bridge's durable providers — the saga journal and the supervisor's
+/// `mls_storage` (`OpenMLS`) view — bound into one
+/// [`DurableProviders`](scp_core::context::supervisor::DurableProviders) from a
+/// SINGLE `Storage` handle (§17.6 / §17.16 / ADR-049).
 ///
 /// This is the ONLY construction-site entry point: it takes one `Arc<S>` and
-/// returns both providers built from it, so a caller physically cannot wire the
-/// saga journal to a different backend than `mls_storage`. (A reviewer proved
-/// that splitting the two derivations into separate calls let a single mutated
-/// constructor pass a fresh `InMemoryStorage` to the journal while leaving every
-/// gate/test green — silently disabling crash-recovery replay. Folding the two
-/// derivations behind one handle makes that divergence impossible by
-/// construction.) The journal is built from a clone taken BEFORE the
-/// `mls_storage` wrap consumes the handle, so both share one backend.
+/// returns the pair built from it via
+/// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle),
+/// so a caller physically cannot wire the saga journal to a different backend
+/// than `mls_storage`. (A reviewer proved that deriving the two providers via
+/// separate calls let a single mutated constructor pass a fresh `InMemoryStorage`
+/// to the journal while leaving every gate/test green — silently disabling
+/// crash-recovery replay. Binding the pair into one newtype whose only non-test
+/// constructor derives both halves from one handle makes that divergence a
+/// compile error.) The single chosen backend
+/// (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>` for the dev/in-memory path,
+/// or `Arc<SqliteStorage>` for the durable path) feeds both halves.
 fn durable_providers_from_handle<S>(
     handle: Arc<S>,
-) -> (
-    Arc<dyn scp_core::context::supervisor::SagaJournal>,
-    Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-)
+) -> scp_core::context::supervisor::DurableProviders
 where
     S: scp_platform::Storage + 'static,
 {
-    let saga_journal = saga_journal_from_handle(Arc::clone(&handle));
-    let mls_storage = mls_storage_from_handle(handle);
-    (saga_journal, mls_storage)
+    scp_core::context::supervisor::DurableProviders::from_handle(handle)
 }
 
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
@@ -1076,10 +1009,12 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// is the single entry point that constructs the supervisor +
 /// populates the lifted-provider slots.
 ///
-/// `mls_storage` is REQUIRED (non-Option): the runtime never defaults storage;
-/// the bridge supplies it (spec §17.6 / ADR-049). It is the single chosen
-/// `Storage` erased once into the `OpenMLS` view, derived from the bridge
-/// instance's `mls_storage_ref()`.
+/// `durable` is REQUIRED (non-Option): the runtime never defaults storage; the
+/// bridge supplies it (spec §17.6 / ADR-049). It bundles the single chosen
+/// `Storage` erased once into the `OpenMLS` view AND the durable saga journal
+/// built over the SAME backend, derived from the bridge instance's
+/// `durable_providers_ref()`. Binding them into `DurableProviders` makes the
+/// same-backend invariant a type guarantee.
 ///
 /// The event broadcast channel is always enabled (capacity
 /// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
@@ -1093,8 +1028,7 @@ fn build_supervisor_arc(
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Box<dyn ContextPersistence>,
-    mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-    saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal>,
+    durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     // Enable the event broadcast channel so `subscribe_events()` yields a
@@ -1112,8 +1046,7 @@ fn build_supervisor_arc(
         None,
         Some(event_tx),
         None,
-        mls_storage,
-        saga_journal,
+        durable,
     )
 }
 
@@ -1175,19 +1108,12 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+    let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             "init_supervisor_with_local_transport: storage-before-supervisor \
-             precondition failed — no mls_storage backend on the bridge instance; \
-             refusing to attach a supervisor (fail closed, spec §17.6)"
-        );
-        return;
-    };
-    let Some(saga_journal) = bi.saga_journal_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor_with_local_transport: storage-before-supervisor \
-             precondition failed — no saga journal backend on the bridge instance; \
-             refusing to attach a supervisor (fail closed, spec §17.6 / §17.16)"
+             precondition failed — no durable providers (saga journal + mls_storage) on \
+             the bridge instance; refusing to attach a supervisor (fail closed, spec \
+             §17.6 / §17.16)"
         );
         return;
     };
@@ -1196,8 +1122,7 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         transport,
         event_log,
         persistence,
-        mls_storage,
-        saga_journal,
+        durable,
         key_resolver_for(bi),
     );
 
@@ -1245,19 +1170,12 @@ pub fn init_supervisor_with_relay_transport(
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+    let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             "init_supervisor_with_relay_transport: storage-before-supervisor \
-             precondition failed — no mls_storage backend on the bridge instance; \
-             refusing to attach a supervisor (fail closed, spec §17.6)"
-        );
-        return;
-    };
-    let Some(saga_journal) = bi.saga_journal_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor_with_relay_transport: storage-before-supervisor \
-             precondition failed — no saga journal backend on the bridge instance; \
-             refusing to attach a supervisor (fail closed, spec §17.6 / §17.16)"
+             precondition failed — no durable providers (saga journal + mls_storage) on \
+             the bridge instance; refusing to attach a supervisor (fail closed, spec \
+             §17.6 / §17.16)"
         );
         return;
     };
@@ -1266,8 +1184,7 @@ pub fn init_supervisor_with_relay_transport(
         transport,
         event_log,
         persistence,
-        mls_storage,
-        saga_journal,
+        durable,
         key_resolver_for(bi),
     );
 
@@ -1380,19 +1297,11 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         return;
     }
     let event_log = event_log_provider_from_existing_repo(bi);
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+    let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             local_did,
             "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
-             no mls_storage backend on the bridge instance"
-        );
-        return;
-    };
-    let Some(saga_journal) = bi.saga_journal_ref().map(Arc::clone) else {
-        tracing::error!(
-            local_did,
-            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
-             no saga journal backend on the bridge instance"
+             no durable providers (saga journal + mls_storage) on the bridge instance"
         );
         return;
     };
@@ -1403,8 +1312,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
         Box::new(NapiBridgePersistence::new()),
-        mls_storage,
-        saga_journal,
+        durable,
         key_resolver_for(bi),
     );
 
@@ -2186,21 +2094,22 @@ mod tests {
              entries persist to the same `SQLCipher` database as context snapshots"
         );
         assert!(
-            bi.mls_storage_ref().is_some(),
-            "Sqlite path must populate the mls_storage backend (spec §17.6)"
+            bi.durable_providers_ref().is_some(),
+            "Sqlite path must populate the durable providers (saga journal + mls_storage) \
+             (spec §17.6 / §17.16)"
         );
     }
 
     #[test]
     fn test_in_memory_populates_mls_storage_backend() {
-        // The dev/in-memory path must populate `mls_storage` from the
+        // The dev/in-memory path must populate the durable providers from the
         // un-swallowed in-memory storage handle (spec §17.6 — one chosen
         // backend, derived consumers). NapiBridgePersistence (a DashMap) is
         // NOT the source; the build_event_log_provider handle is.
         let bi = NapiBridgeInstance::new_napi();
         assert!(
-            bi.mls_storage_ref().is_some(),
-            "in-memory dev path must populate the mls_storage backend"
+            bi.durable_providers_ref().is_some(),
+            "in-memory dev path must populate the durable providers"
         );
     }
 
@@ -2243,9 +2152,9 @@ mod tests {
         // Write through the mls_storage backend (the OpenMLS view shares the
         // one SQLCipher connection).
         let backend = bi
-            .mls_storage_ref()
-            .cloned()
-            .expect("passphrase path must populate mls_storage");
+            .durable_providers_ref()
+            .map(scp_core::context::supervisor::DurableProviders::mls_storage)
+            .expect("passphrase path must populate the durable providers");
         crate::runtime().block_on(async {
             backend
                 .store("scp-test/persist", b"durable-value")
@@ -2264,9 +2173,9 @@ mod tests {
         })
         .expect("reopen with same passphrase must succeed");
         let backend2 = bi2
-            .mls_storage_ref()
-            .cloned()
-            .expect("reopened passphrase path must populate mls_storage");
+            .durable_providers_ref()
+            .map(scp_core::context::supervisor::DurableProviders::mls_storage)
+            .expect("reopened passphrase path must populate the durable providers");
         let read_back = crate::runtime().block_on(async {
             backend2
                 .retrieve("scp-test/persist")
@@ -2296,9 +2205,9 @@ mod tests {
         })
         .expect("initial passphrase open must succeed");
         let backend = bi
-            .mls_storage_ref()
-            .cloned()
-            .expect("mls_storage backend present");
+            .durable_providers_ref()
+            .map(scp_core::context::supervisor::DurableProviders::mls_storage)
+            .expect("durable providers present");
         crate::runtime().block_on(async {
             backend
                 .store("scp-test/secret", b"top-secret")
@@ -2334,70 +2243,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Saga-journal swap: same-backend seam proof (NAPI bridge).
+    // Saga-journal swap: same-backend seam proof.
     //
-    // The structural `pipeline_wiring.rs` gate is presence-only: a reviewer
-    // proved that mutating `saga_journal_from_handle` to IGNORE its handle and
-    // build over a fresh `InMemoryStorage` keeps the gate (and the swap suite)
-    // green — silently disabling crash-recovery on this bridge. This behavioral
-    // test pins `saga_journal_from_handle::<S>` to the ACTUAL handle it is
-    // given: it appends through the returned journal and asserts the entry is
-    // visible by reading the SAME key directly through the original handle.
-    // A helper that builds a fresh store would write the entry elsewhere and
-    // FAIL this retrieval. No `Env`/`ThreadsafeFunction` scaffolding is needed —
-    // this tests the pure generic helper directly.
+    // The same-backend invariant is now enforced BY CONSTRUCTION: the bridge
+    // derives its durable providers via `DurableProviders::from_handle`, whose
+    // only non-test constructor binds the saga journal AND the `mls_storage` view
+    // to one handle, so a divergent wiring is a compile error rather than a
+    // runtime defect the presence-only `pipeline_wiring.rs` gate would miss. The
+    // single canonical same-backend behavioral proof on `from_handle` lives next
+    // to it in `scp-runtime`
+    // (`durable_providers_from_handle_shares_one_backend`), where the bundled
+    // journal is reachable for an append/read-back.
     // -----------------------------------------------------------------------
-    #[test]
-    fn saga_journal_from_handle_shares_one_backend() {
-        use scp_core::context::supervisor::{
-            JournalEntry, SAGA_JOURNAL_KEY_PREFIX, SagaId, SagaState,
-        };
-        use scp_platform::testing::InMemoryStorage;
-        use scp_platform::traits::Storage;
-
-        // The single concrete storage handle that, in production, feeds BOTH
-        // `saga_journal_from_handle` and `mls_storage_from_handle`.
-        let handle = Arc::new(InMemoryStorage::new());
-
-        // Build the durable journal via the ACTUAL seam helper, over a CLONE of
-        // the handle — exactly as the construction sites do.
-        let journal = saga_journal_from_handle(Arc::clone(&handle));
-
-        let saga = SagaId::new();
-        let seq: u64 = 0;
-        let entry = JournalEntry {
-            saga_id: saga.clone(),
-            state: SagaState::PreparingB,
-            participants: vec!["ctx-seam".to_owned()],
-            evidence: zeroize::Zeroizing::new(Vec::new()),
-            timestamp_ms: 1_900_000_000_000,
-            seq_per_saga: seq,
-        };
-
-        // Key the production journal writes under: `saga_journal/{saga_id}/{seq:020}`.
-        let expected_key = format!("{SAGA_JOURNAL_KEY_PREFIX}{saga}/{seq:020}");
-
-        crate::runtime().block_on(async {
-            journal
-                .append(entry)
-                .await
-                .expect("append via durable journal");
-
-            // Read the SAME key directly through the ORIGINAL handle. If the
-            // helper ignored its handle and built a fresh store, this read would
-            // miss and return None.
-            let raw = handle
-                .retrieve(&expected_key)
-                .await
-                .expect("retrieve via the original storage handle");
-            assert!(
-                raw.is_some(),
-                "the journal entry MUST be visible through the SAME storage handle \
-                 passed to saga_journal_from_handle — a helper that built a fresh store \
-                 would miss key {expected_key}"
-            );
-        });
-    }
 
     // Phase D (#1695): `test_default_instance_is_same_arc` deleted — the
     // legacy default bridge no longer exists. Each caller owns its own

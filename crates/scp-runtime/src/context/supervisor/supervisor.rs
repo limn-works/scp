@@ -1180,6 +1180,134 @@ pub struct Supervisor {
     spawn_generation: std::sync::atomic::AtomicU64,
 }
 
+/// The two durable providers — the saga journal and the `OpenMLS` `mls_storage`
+/// view — bound into one value GUARANTEED to share a single `Storage` backend
+/// (spec §17.6 / §17.16 / ADR-049).
+///
+/// The only non-test constructor is [`Self::from_handle`], which derives BOTH
+/// providers from a single `Arc<S>`. A production construction site therefore
+/// physically cannot wire the saga journal to a different backend than
+/// `mls_storage`: the same-backend invariant is enforced by the type system,
+/// not by convention or a source-text gate. (A reviewer proved that deriving the
+/// two providers via separate module-level calls let a single mutated
+/// constructor pass a fresh `InMemoryStorage` to the journal while leaving every
+/// gate/test green — silently disabling crash-recovery replay. Folding the pair
+/// behind one handle, and making the pair the ONLY accepted argument to
+/// [`Supervisor::with_providers_and_journal`], makes that divergence impossible
+/// by construction.)
+///
+/// The inner fields are private and the only consumer is the `pub(crate)`
+/// [`Self::into_parts`], so no out-of-crate caller (FFI bridge, node) can
+/// decompose the pair and re-pair the halves with divergent backends — they can
+/// only pass the whole `DurableProviders` to the supervisor constructor.
+///
+/// `Clone` is cheap (two `Arc` clones). Bridges that hold the pair in a field
+/// between instance construction and supervisor build clone it out at build
+/// time; the clone shares the same backend, preserving the invariant.
+#[derive(Clone)]
+pub struct DurableProviders {
+    saga_journal: Arc<dyn SagaJournal>,
+    mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+}
+
+impl DurableProviders {
+    /// Derives BOTH durable providers — the saga journal and the `OpenMLS`
+    /// `mls_storage` view — from ONE `Storage` handle (spec §17.6 / §17.16 /
+    /// ADR-049).
+    ///
+    /// This is the ONLY non-test constructor. The journal is a
+    /// [`ProtocolRepositorySagaJournal`](crate::context::supervisor::ProtocolRepositorySagaJournal)
+    /// over a clone of `handle`; `mls_storage` is the same `handle` erased once
+    /// via
+    /// [`SpawnBlockingStorageAdapter`](crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter).
+    /// Because both derive from the one `Arc<S>`, the journal, the `OpenMLS`
+    /// view, persistence, and the event log all read/write a single backend.
+    #[must_use]
+    pub fn from_handle<S>(handle: Arc<S>) -> Self
+    where
+        S: scp_platform::traits::Storage + 'static,
+    {
+        let saga_journal: Arc<dyn SagaJournal> = Arc::new(
+            crate::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
+        );
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle));
+        Self {
+            saga_journal,
+            mls_storage,
+        }
+    }
+
+    /// Test/legacy constructor: pairs an arbitrary caller-supplied journal with
+    /// an arbitrary caller-supplied `mls_storage`.
+    ///
+    /// Gated behind `test`/`testing` so production FFI/node construction sites
+    /// cannot reach a divergence-permitting constructor — only the
+    /// same-backend-by-construction [`Self::from_handle`] is available to them.
+    /// The saga-FSM / crash-recovery / journal-swap integration suites use this
+    /// to drive the REAL journal write-ordering over a shared in-memory store
+    /// (they build the journal and `mls_storage` over one store deliberately).
+    #[must_use]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_test(
+        saga_journal: Arc<dyn SagaJournal>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Self {
+        Self {
+            saga_journal,
+            mls_storage,
+        }
+    }
+
+    /// Pairs an `mls_storage` view with the no-op saga journal.
+    ///
+    /// `pub(crate)` so only the legacy [`Supervisor::with_providers`] test path
+    /// (which hardcodes [`NoopSagaJournal`] and is reachable from examples
+    /// without the `testing` feature) can build a `DurableProviders` with no
+    /// durable journal. It cannot cause silent crash-recovery loss via backend
+    /// divergence because it carries no durable journal at all.
+    pub(crate) fn with_noop_journal(
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Self {
+        Self {
+            saga_journal: Arc::new(NoopSagaJournal),
+            mls_storage,
+        }
+    }
+
+    /// Returns a clone of the `mls_storage` (`OpenMLS`) view.
+    ///
+    /// Gated behind `test`/`testing` so production construction sites cannot
+    /// pull a half out and re-pair it with a divergent journal — only behavioral
+    /// tests that need to exercise the chosen backend through the `OpenMLS` view
+    /// (e.g. the FFI bridges' passphrase round-trip / fail-closed proofs) reach
+    /// it. Reading a half for assertions is harmless; the same-backend invariant
+    /// is preserved because the only way to BUILD the pair remains
+    /// [`Self::from_handle`].
+    #[must_use]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn mls_storage(
+        &self,
+    ) -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+        Arc::clone(&self.mls_storage)
+    }
+
+    /// Decomposes the pair into its journal + `mls_storage` halves.
+    ///
+    /// `pub(crate)` — the ONLY consumer is
+    /// [`Supervisor::with_providers_and_journal`] inside this crate. Keeping it
+    /// crate-private is what prevents an out-of-crate caller from splitting the
+    /// pair and re-pairing the halves with divergent backends.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<dyn SagaJournal>,
+        Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) {
+        (self.saga_journal, self.mls_storage)
+    }
+}
+
 impl Supervisor {
     /// Per-context lifecycle operation budget (ADR-049 §10). Bounds
     /// `restore_context` on BOTH the `RestoreContext` dispatch arm and the
@@ -1365,8 +1493,7 @@ impl Supervisor {
             payment_adapter,
             event_tx,
             clock,
-            mls_storage,
-            Arc::new(NoopSagaJournal),
+            DurableProviders::with_noop_journal(mls_storage),
         )
     }
 
@@ -1376,12 +1503,17 @@ impl Supervisor {
     /// production bridge now calls to attach a durable saga journal (ADR-049
     /// saga work).
     ///
-    /// Production bridges construct via THIS constructor with a durable
-    /// `ProtocolRepositorySagaJournal` over their single chosen `Storage`
-    /// backend: the PyO3 reference bridge (`build_saga_journal`), NAPI and
-    /// UniFFI (`saga_journal_from_handle`), and scp-node. [`Self::with_providers`]
-    /// — which hardcodes [`NoopSagaJournal`] — is the test/legacy constructor and
-    /// is no longer on any production path.
+    /// Production bridges construct via THIS constructor, supplying the two
+    /// durable providers as one [`DurableProviders`] value built by
+    /// [`DurableProviders::from_handle`] over their single chosen `Storage`
+    /// backend — the PyO3 reference bridge, NAPI, UniFFI, and scp-node. Because
+    /// the constructor accepts ONLY a `DurableProviders` (not separate journal
+    /// and `mls_storage` arguments), and the only non-test constructor of that
+    /// type derives both halves from one handle, a production caller cannot wire
+    /// the journal to a divergent backend. [`Self::with_providers`] — which
+    /// hardcodes [`NoopSagaJournal`] via
+    /// [`DurableProviders::with_noop_journal`] — is the test/legacy constructor
+    /// and is no longer on any production path.
     ///
     /// **Visibility (`pub`, intentional).** Kept `pub` so the bridge-path
     /// bootstrap test (`scp-testing`, a separate crate) can construct a
@@ -1404,9 +1536,17 @@ impl Supervisor {
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-        saga_journal: Arc<dyn SagaJournal>,
+        durable: DurableProviders,
     ) -> Arc<Self> {
+        // The saga journal and the `OpenMLS` `mls_storage` view arrive bound into
+        // ONE [`DurableProviders`] value whose only non-test constructor
+        // ([`DurableProviders::from_handle`]) derives both from a single
+        // `Storage` handle. A production caller therefore cannot pass a journal
+        // wired to a different backend than `mls_storage` — the same-backend
+        // invariant (spec §17.6 / §17.16) is enforced by the type system here,
+        // not by convention. `into_parts` is `pub(crate)`, so this is the single
+        // in-crate site that may decompose the pair.
+        let (saga_journal, mls_storage) = durable.into_parts();
         // The supervisor's own `persistence` field is non-Option (saga
         // code requires a value); when the caller passes `None`, wire
         // the no-op stub the `for_query_shim` path uses. The
@@ -10897,6 +11037,69 @@ mod tests {
     use scp_platform::testing::InMemoryStorage;
 
     // -----------------------------------------------------------------
+    // DurableProviders same-backend behavioral proof (spec §17.6 / §17.16 /
+    // ADR-049). The same-backend invariant is enforced by construction
+    // (`from_handle` derives BOTH the journal and the `mls_storage` view from one
+    // handle), but this test pins the behavior the type guarantee rests on: an
+    // entry appended through the bundled journal is visible through the SAME
+    // handle that was passed to `from_handle`. A `from_handle` that ignored its
+    // handle and built a fresh store for either half would fail this read-back.
+    // This is the single canonical same-backend proof for all four production
+    // construction sites (PyO3, NAPI, UniFFI, scp-node), which all derive their
+    // pair via `DurableProviders::from_handle`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn durable_providers_from_handle_shares_one_backend() {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
+        use scp_platform::traits::Storage;
+
+        // ONE chosen backend handed to `from_handle`.
+        let storage = Arc::new(InMemoryStorage::new());
+        let durable = DurableProviders::from_handle(Arc::clone(&storage));
+
+        // `into_parts` is `pub(crate)`, so this in-crate test can reach the
+        // bundled journal to append through it. Out-of-crate callers cannot.
+        let (journal, _mls_storage) = durable.into_parts();
+
+        let saga = SagaId::new();
+        let seq: u64 = 0;
+        let entry = JournalEntry {
+            saga_id: saga.clone(),
+            state: SagaState::PreparingB,
+            participants: vec!["ctx-seam".to_owned()],
+            evidence: zeroize::Zeroizing::new(Vec::new()),
+            timestamp_ms: 1_900_000_000_000,
+            seq_per_saga: seq,
+        };
+
+        // Production journal write key: `saga_journal/{saga_id}/{seq:020}`.
+        let expected_key = format!(
+            "{}{saga}/{seq:020}",
+            crate::context::supervisor::SAGA_JOURNAL_KEY_PREFIX
+        );
+
+        journal
+            .append(entry)
+            .await
+            .expect("append via durable journal");
+
+        // The entry MUST be visible through the ORIGINAL handle — proving the
+        // journal and the handle that also feeds `mls_storage` share one backend.
+        let raw = storage
+            .retrieve(&expected_key)
+            .await
+            .expect("retrieve via the original storage handle");
+        assert!(
+            raw.is_some(),
+            "the journal entry MUST be visible through the SAME handle passed to \
+             from_handle — the journal and mls_storage share one backend by \
+             construction; a from_handle that built a fresh store would miss key \
+             {expected_key}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // CrashWindow pure-method unit tests (ADR-049 §10).
     //
     // These exercise the respawn-budget logic with explicit `now_ms`
@@ -16728,8 +16931,10 @@ mod tests {
             None,
             None,
             None,
-            mls_storage,
-            Arc::clone(&journal),
+            crate::context::supervisor::DurableProviders::for_test(
+                Arc::clone(&journal),
+                mls_storage,
+            ),
         );
         (supervisor, journal)
     }
@@ -17812,8 +18017,7 @@ mod tests {
             None,
             None,
             None,
-            mls_storage,
-            journal,
+            crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
         );
         let caller_did = "did:dht:z6MkXctxWave8Caller";
         let caller_state = xctx_caller_state(caller_did, &creator_did).await;
@@ -18052,8 +18256,7 @@ mod tests {
             None,
             None,
             None,
-            mls_storage,
-            journal,
+            crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
         );
         (supervisor, persistence)
     }

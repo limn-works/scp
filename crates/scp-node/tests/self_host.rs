@@ -250,15 +250,9 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
             .expect("MLS SQLite should open"),
     );
-    // Durable saga journal over the SAME `Arc<SqliteStorage>` that backs
-    // `mls_storage`, exactly as the production binary does.
-    let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
-        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&mls_inner)),
-    );
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
+    // Durable saga journal + `mls_storage` view bound into one `DurableProviders`
+    // over the SAME `Arc<SqliteStorage>`, exactly as the production binary does.
+    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
 
     // -- Embedded default site (index.html + style.css + app.js), with the node
     //    DID injected into the index <head>, just like production.
@@ -286,8 +280,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         signing_key_handle,
         key_resolver,
         custody: custody.as_ref(),
-        mls_storage,
-        saga_journal,
+        durable,
         assets: &assets,
     };
 
@@ -363,13 +356,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         SqliteStorage::new(&built.storage_dir.join("mls"), built.storage_key.as_ref())
             .expect("MLS SQLite should open"),
     );
-    let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
-        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&mls_inner)),
-    );
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
+    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
     let signing_key_handle = built.node.identity().identity().active_signing_key;
     scp_node::SelfHostDeployer::start(
         &built.node,
@@ -378,8 +365,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         "selfhost.scp.local".to_owned(),
         signing_key_handle,
         built.key_resolver(),
-        mls_storage,
-        saga_journal,
+        durable,
     )
     .await
     .expect("deployer setup should succeed")
@@ -898,13 +884,7 @@ async fn deploy_embedded_and_assert_serves<S>(
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
             .expect("MLS SQLite should open (distinct subdirectory)"),
     );
-    let saga_journal: Arc<dyn scp_core::context::supervisor::SagaJournal> = Arc::new(
-        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&mls_inner)),
-    );
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
+    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
 
     let assets = scp_node::embedded_assets(Some(&node_did));
     let expected_count = assets.len();
@@ -919,8 +899,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             signing_key_handle,
             key_resolver,
             custody,
-            mls_storage,
-            saga_journal,
+            durable,
             assets: &assets,
         },
     )

@@ -1199,48 +1199,14 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
-    /// Derives BOTH durable providers — the saga journal and the `OpenMLS`
-    /// `mls_storage` view — from the bridge instance's SINGLE chosen
-    /// `StorageProvider` (spec §17.6 / §17.16 / ADR-049).
-    ///
-    /// This is the ONLY construction-site entry point for the supervisor's
-    /// durable providers: it derives both consumers from the bridge instance's
-    /// single chosen `StorageProvider`, so a caller physically cannot wire the
-    /// saga journal to a different backend than `mls_storage`. (A reviewer proved
-    /// that splitting the two derivations into separate calls at the construction
-    /// site let a single mutated constructor pass a fresh `InMemoryStorage` to
-    /// the journal while leaving every gate/test green — silently disabling
-    /// crash-recovery replay. Folding both derivations behind this one combined
-    /// call makes that divergence impossible at the construction site.) Both
-    /// [`build_saga_journal`] and [`derive_mls_storage`] read the SAME
-    /// `bi.storage_provider()` accessor and `StorageProvider` is `Clone` (enum
-    /// dispatch over a shared inner `Arc`), so every cloned handle reads/writes
-    /// one backend (spec §17.6). They remain the internal building blocks this
-    /// combined fn calls so their behavioral fail-closed / same-backend tests
-    /// still exercise the live seam. Kept nested in `build_supervisor` so the
-    /// single construction site is the only caller.
-    #[allow(clippy::type_complexity)]
-    fn build_durable_providers(
-        bi: &PyBridgeInstance,
-    ) -> Result<
-        (
-            Arc<dyn scp_core::context::supervisor::SagaJournal>,
-            Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-        ),
-        ScpPyError,
-    > {
-        let saga_journal = build_saga_journal(bi)?;
-        let mls_storage = derive_mls_storage(bi)?;
-        Ok((saga_journal, mls_storage))
-    }
-
     // Derive the durable saga journal AND the `OpenMLS` `mls_storage` view from
-    // the bridge instance's SINGLE chosen `StorageProvider` in one call (§17.6 /
-    // §17.16 / ADR-049). Folding both derivations behind one provider fetch means
-    // a caller cannot wire the journal to a different backend than `mls_storage`,
+    // the bridge instance's SINGLE chosen `StorageProvider` (§17.6 / §17.16 /
+    // ADR-049), bound into one [`DurableProviders`]. Its only non-test
+    // constructor (`from_handle`) derives both halves from one handle, so a
+    // caller cannot wire the journal to a different backend than `mls_storage`,
     // and the fail-closed `STORAGE_8000` storage-before-supervisor check fires
     // once for both.
-    let (saga_journal, mls_storage) = build_durable_providers(bi)?;
+    let durable = durable_providers_from_bi(bi)?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open so
@@ -1265,28 +1231,32 @@ fn build_supervisor(
             None,
             Some(event_tx),
             None,
-            mls_storage,
-            saga_journal,
+            durable,
         ),
     )
 }
 
-/// Builds the durable [`ProtocolRepositorySagaJournal`] for this bridge
-/// instance's single chosen [`StorageProvider`] (spec §17.16 / ADR-049).
+/// Builds the bridge's [`DurableProviders`] — the durable saga journal + the
+/// `OpenMLS` `mls_storage` view bound into one same-backend-by-construction
+/// value — from this bridge instance's single chosen [`StorageProvider`]
+/// (spec §17.6 / §17.16 / ADR-049).
 ///
-/// The journal shares the SAME backend as `mls_storage`, persistence, and the
-/// event log: `StorageProvider` is `Clone` (enum dispatch over a shared inner
-/// `Arc`), so the cloned handle reads/writes one backend. This is the exact
-/// sharing contract `derive_mls_storage` relies on.
+/// [`DurableProviders::from_handle`] derives BOTH halves from the one
+/// `Arc<StorageProvider>` taken from `bi.storage_provider()`, so the journal,
+/// the `OpenMLS` view, persistence, and the event log all read/write one
+/// backend — a caller cannot wire the journal to a divergent store.
+/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone` (over a
+/// shared inner `Arc`), so the cloned handle shares the same inner backend
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`).
 ///
 /// # Errors
 ///
 /// Returns [`ScpPyError::ContextError`] with [`error_codes::STORAGE_8000`] when
-/// no storage provider is set — the same storage-before-supervisor fail-closed
-/// condition `derive_mls_storage` raises. No fabrication, no default.
-fn build_saga_journal(
+/// no storage provider is set — the storage-before-supervisor precondition. The
+/// runtime never defaults storage; no fabrication, no default.
+fn durable_providers_from_bi(
     bi: &PyBridgeInstance,
-) -> Result<Arc<dyn scp_core::context::supervisor::SagaJournal>, ScpPyError> {
+) -> Result<scp_core::context::supervisor::DurableProviders, ScpPyError> {
     let provider = bi
         .storage_provider()
         .ok_or_else(|| ScpPyError::ContextError {
@@ -1296,45 +1266,9 @@ fn build_saga_journal(
                 .to_owned(),
             code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
         })?;
-    Ok(Arc::new(
-        scp_core::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::new(
-            provider.clone(),
-        )),
-    ))
-}
-
-/// Derives the supervisor's `OpenMLS` storage adapter from the bridge
-/// instance's single chosen [`StorageProvider`] (spec §17.6).
-///
-/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone`, so we
-/// wrap a clone in `SpawnBlockingStorageAdapter` to obtain the dyn-safe
-/// `OpenMlsStorageAdapter` view. The clone shares the same inner backend
-/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`), so the
-/// `OpenMLS` view, persistence, and event log all read/write one backend.
-///
-/// # Errors
-///
-/// Returns [`ScpPyError::ContextError`] when no storage provider is set — the
-/// storage-before-supervisor precondition. No fabrication, no default.
-fn derive_mls_storage(
-    bi: &PyBridgeInstance,
-) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
-    let provider = bi
-        .storage_provider()
-        .ok_or_else(|| ScpPyError::ContextError {
-            message: "storage-before-supervisor precondition failed: no storage provider \
-             set on the bridge instance — the runtime never defaults storage \
-             (spec §17.6). Select storage via SCP({...}) / SCP.with_storage({...}) first."
-                .to_owned(),
-            code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
-        })?;
-    let adapter = scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+    Ok(scp_core::context::supervisor::DurableProviders::from_handle(
         Arc::new(provider.clone()),
-    );
-    Ok(Arc::new(adapter)
-        as Arc<
-            dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
-        >)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3247,99 +3181,27 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Saga-journal swap: same-backend seam proof + fail-closed proof (PyO3
-    // reference bridge). The structural `pipeline_wiring.rs` gate is
-    // presence-only — a seam wired to a DIVERGENT/fresh store would pass it.
-    // These behavioral tests pin the seam to the ACTUAL store SELECTION:
-    //   (a) the durable journal shares ONE backend with the bridge's
-    //       storage provider (a fresh-store wiring fails this);
-    //   (b) `build_saga_journal` fails closed with STORAGE_8000 when no
-    //       provider is set (refuses to attach a Noop/absent journal).
+    // Saga-journal swap: fail-closed proof (PyO3 reference bridge). The
+    // structural `pipeline_wiring.rs` gate is presence-only. The SAME-backend
+    // property is now enforced BY CONSTRUCTION: `durable_providers_from_bi`
+    // returns a `DurableProviders` whose only non-test constructor
+    // (`DurableProviders::from_handle`) derives the journal AND the `mls_storage`
+    // view from ONE handle, so a divergent wiring is a compile error rather than
+    // a runtime defect. The single same-backend behavioral proof on
+    // `from_handle` lives next to it in `scp-runtime`
+    // (`durable_providers_from_handle_shares_one_backend`), where the bundled
+    // journal is reachable for an append/read-back. This test pins the remaining
+    // bridge-specific behavior the type cannot encode: the fail-closed
+    // STORAGE_8000 refusal when no storage provider has been selected.
     // -----------------------------------------------------------------------
 
-    /// Same-backend seam test (`PyO3` reference bridge). Constructs the journal
-    /// via the ACTUAL seam helper `build_saga_journal(bi)`, appends an entry
-    /// through it, then retrieves the SAME `saga_journal/...` key through the
-    /// bridge instance's own storage handle (`bi.storage_provider()`) and asserts
-    /// it is present — proving the journal and the storage provider/`mls_storage`
-    /// share one backend. A seam wired to a fresh store would write the entry to
-    /// a different backend and FAIL this retrieval.
-    #[test]
-    fn build_saga_journal_shares_one_backend_with_storage_provider() {
-        use scp_core::context::supervisor::{JournalEntry, SagaId, SagaState};
-
-        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
-            .expect("in-memory storage init must succeed");
-
-        // Build the durable journal via the production seam helper.
-        let journal = build_saga_journal(&bi).expect("build_saga_journal must succeed");
-
-        // The bridge instance's own storage handle — the SAME provider that
-        // feeds `derive_mls_storage`, persistence, and the event log.
-        let provider = bi
-            .storage_provider()
-            .cloned()
-            .expect("storage provider present after in-memory init");
-
-        let saga = SagaId::new();
-        let seq: u64 = 0;
-        let entry = JournalEntry {
-            saga_id: saga.clone(),
-            state: SagaState::PreparingB,
-            participants: vec!["ctx-seam".to_owned()],
-            evidence: Zeroizing::new(Vec::new()),
-            timestamp_ms: 1_900_000_000_000,
-            seq_per_saga: seq,
-        };
-
-        // Key the production journal writes under: `saga_journal/{saga_id}/{seq:020}`.
-        let expected_key = format!(
-            "{}{saga}/{seq:020}",
-            scp_core::context::supervisor::SAGA_JOURNAL_KEY_PREFIX
-        );
-
-        let rt = test_rt();
-        rt.block_on(async {
-            journal
-                .append(entry)
-                .await
-                .expect("append via durable journal");
-
-            // Retrieve the SAME key through the bridge's storage provider. If the
-            // seam wired the journal to a different/fresh backend, this read would
-            // miss and return None.
-            let raw = provider
-                .retrieve(&expected_key)
-                .await
-                .expect("retrieve via bridge storage provider");
-            assert!(
-                raw.is_some(),
-                "the journal entry MUST be visible through the bridge's OWN storage \
-                 provider — journal and storage provider must share one backend; a seam \
-                 wired to a fresh store would miss key {expected_key}"
-            );
-        });
-
-        // NOTE: the NAPI and UniFFI bridges build their journal through
-        // `saga_journal_from_handle(Arc::clone(handle))` over the SAME concrete
-        // `Arc<S>` storage handle that feeds `mls_storage_from_handle`. Each of
-        // those bridges now carries its OWN behavioral same-backend proof —
-        // `saga_journal_from_handle_shares_one_backend` in
-        // `crates/scp-ffi/napi/src/runtime.rs` and
-        // `crates/scp-ffi/uniffi/src/runtime.rs` — which appends through the
-        // returned journal and reads the entry back through the original handle,
-        // so a helper that ignored its handle and built a fresh store would fail
-        // there too. The presence-only `pipeline_wiring.rs` gate is therefore
-        // backed by a same-backend behavioral test on all three bridges.
-    }
-
-    /// Fail-closed behavioral proof. `build_saga_journal` on a bridge instance
-    /// with NO storage provider must return the `STORAGE_8000`
+    /// Fail-closed behavioral proof. `durable_providers_from_bi` on a bridge
+    /// instance with NO storage provider must return the `STORAGE_8000`
     /// storage-before-supervisor error rather than attaching a Noop/absent
     /// journal. This is the per-bridge fail-closed guard that source-text gates
     /// alone cannot prove behaviorally.
     #[test]
-    fn build_saga_journal_fails_closed_without_storage_provider() {
+    fn durable_providers_from_bi_fails_closed_without_storage_provider() {
         // A bare bridge instance with no storage provider selected.
         let bi = PyBridgeInstance::new_py();
         assert!(
@@ -3350,7 +3212,7 @@ mod tests {
         // Reduce the result to the error code without panicking on success:
         // `Ok` -> None (no error code), the wrong error variant -> a sentinel
         // that fails the STORAGE_8000 assertion below.
-        let observed_code = match build_saga_journal(&bi) {
+        let observed_code = match durable_providers_from_bi(&bi) {
             Ok(_) => None,
             Err(ScpPyError::ContextError { code, .. }) => Some(code),
             Err(other) => Some(format!("unexpected-error-variant: {other:?}")),
@@ -3358,8 +3220,8 @@ mod tests {
         assert_eq!(
             observed_code.as_deref(),
             Some(scp_ffi_common::error_codes::STORAGE_8000),
-            "build_saga_journal MUST fail closed with STORAGE_8000 when no storage provider \
-             is set (not attach a Noop/absent journal); observed {observed_code:?}"
+            "durable_providers_from_bi MUST fail closed with STORAGE_8000 when no storage \
+             provider is set (not attach a Noop/absent journal); observed {observed_code:?}"
         );
     }
 }
