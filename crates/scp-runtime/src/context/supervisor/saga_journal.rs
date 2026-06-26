@@ -324,9 +324,13 @@ pub trait SagaJournal: Send + Sync {
     /// use. Secret bytes MUST NOT survive on disk past the next journal
     /// open.
     ///
-    /// For `secret_bearing = false`, the marker may be lazy — the
-    /// implementation appends a terminal entry and MAY leave earlier
-    /// entries intact for later compaction.
+    /// For `secret_bearing = false`, the on-disk evidence is non-secret, so the
+    /// terminal overwrite is not security-mandated. The production implementation
+    /// nonetheless COMPACTS the saga down to zero entries on resolution (it
+    /// appends the durable terminal marker, then deletes the saga's keys in a
+    /// crash-safe order) so that `load_unresolved`'s cost stays bounded to the
+    /// number of unresolved sagas. Implementations MAY instead leave earlier
+    /// entries for later compaction; either is spec-conformant.
     ///
     /// # Errors
     ///
@@ -423,6 +427,19 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// Extract the `saga_id` segment from a journal key for log attribution.
+///
+/// Key layout is `saga_journal/{saga_id}/{seq}` (see
+/// [`SAGA_JOURNAL_KEY_PREFIX`]): strip the prefix, then take everything before
+/// the LAST `/` (the trailing segment is the seq). On any key that does not
+/// match this shape we fall back to the whole key so the log still carries
+/// something greppable rather than an empty field.
+fn saga_id_from_key(key: &str) -> &str {
+    key.strip_prefix(SAGA_JOURNAL_KEY_PREFIX)
+        .and_then(|s| s.rsplit_once('/'))
+        .map_or(key, |(id, _seq)| id)
+}
+
 // ---------------------------------------------------------------------------
 // Production impl — ProtocolRepositorySagaJournal
 // ---------------------------------------------------------------------------
@@ -435,10 +452,15 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
 /// lexicographic KV).
 ///
 /// On `mark_resolved` with `secret_bearing = true`, every entry under
-/// `saga_journal/{saga_id}/` has its evidence bytes overwritten with zeros
-/// via a zero-length-evidence re-encode, then the terminal marker is
-/// appended. This satisfies spec §9.4.3 "synchronously overwrite on-disk
-/// evidence before returning".
+/// `saga_journal/{saga_id}/` first has its evidence bytes overwritten with
+/// zeros via a zero-length-evidence re-encode (spec §9.4.3 "synchronously
+/// overwrite on-disk evidence before returning"). Then — for BOTH the
+/// secret-bearing and non-secret paths — the terminal marker is appended and
+/// the saga's keys are deleted in a crash-safe order, COMPACTING the resolved
+/// saga down to zero on-disk entries (spec §17.16.1 "Bounded-cost recovery").
+/// This keeps `load_unresolved`'s startup cost bounded to the number of
+/// UNRESOLVED sagas rather than every saga ever run. See `mark_resolved` for the
+/// crash-safety ordering argument.
 pub struct ProtocolRepositorySagaJournal<S: Storage + 'static> {
     storage: Arc<S>,
 }
@@ -487,8 +509,12 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
         // highest `seq_per_saga`.
         //
         // We materialize into (saga_id, latest_key) pairs first, then load
-        // the values. This keeps the wire-parse cost bounded to the number
-        // of unresolved sagas.
+        // the values. Because `mark_resolved` COMPACTS a resolved saga down to
+        // zero on-disk entries (it deletes the saga's keys after the terminal
+        // resolution is durable), the only keys this sweep ever lists, retrieves,
+        // and decodes belong to sagas that are still in flight — so both the
+        // listing breadth and the wire-parse cost are bounded to the number of
+        // UNRESOLVED sagas, not the number of sagas ever run.
         let mut latest_by_saga: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for key in keys {
@@ -526,9 +552,15 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                 Ok(None) => {
                     // The latest key vanished between list and retrieve. Treat
                     // it as a per-saga fault: flag and skip, do not abort.
+                    // `record_saga_repair_needed()` is intentionally rate-only —
+                    // no `saga_id` label, because a per-saga counter dimension is
+                    // an unbounded-cardinality anti-pattern. The per-saga signal
+                    // an operator greps is the `saga_id` field on the error log
+                    // below, not a metric label.
                     crate::metrics::record_saga_repair_needed();
                     tracing::error!(
                         key = %key,
+                        saga_id = %saga_id_from_key(key),
                         "SCP-SAGA-RECOVERY: journal entry disappeared during load — \
                          saga skipped, manual repair needed; other sagas unaffected"
                     );
@@ -540,6 +572,7 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                     crate::metrics::record_saga_repair_needed();
                     tracing::error!(
                         key = %key,
+                        saga_id = %saga_id_from_key(key),
                         error = %e,
                         "SCP-SAGA-RECOVERY: journal entry retrieve failed — \
                          saga skipped, manual repair needed; other sagas unaffected"
@@ -558,6 +591,7 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
                     crate::metrics::record_saga_repair_needed();
                     tracing::error!(
                         key = %key,
+                        saga_id = %saga_id_from_key(key),
                         error = %e,
                         "SCP-SAGA-RECOVERY: corrupt journal entry, saga skipped, \
                          manual repair needed; other sagas unaffected"
@@ -616,10 +650,14 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             }
         }
 
-        // Append a terminal marker. `seq_per_saga = u64::MAX` would collide
-        // with nothing real; we use a timestamped larger-than-any-prior
-        // seq by reading the latest seq and incrementing by 1.
+        // Append a terminal marker at the strictly-highest seq (max prior + 1).
+        // The 20-digit zero-padded seq formatting makes this marker the
+        // lexicographic MAXIMUM under the saga prefix, so until it is the last
+        // thing deleted below, it is the entry `load_unresolved` selects for the
+        // saga — and being terminal, it makes the saga drop out of the
+        // unresolved set.
         let next_seq = self.next_seq_for_saga(&saga_id).await?;
+        let marker_key = Self::entry_key(&saga_id, next_seq);
 
         let marker = JournalEntry {
             saga_id: saga_id.clone(),
@@ -630,6 +668,55 @@ impl<S: Storage + 'static> SagaJournal for ProtocolRepositorySagaJournal<S> {
             seq_per_saga: next_seq,
         };
         self.append(marker).await?;
+
+        // Compaction (spec §17.16.1 "Bounded-cost recovery"): a resolved saga
+        // leaves NO entries, so `load_unresolved` only ever lists + decodes
+        // entries for sagas that are genuinely still in flight — its cost is
+        // bounded to the number of UNRESOLVED sagas, not the number of sagas
+        // EVER run.
+        //
+        // CRASH-SAFETY ORDERING (no dependence on backend delete order):
+        //   1. The terminal marker is durable (appended above) at the strictly
+        //      max seq.
+        //   2. Delete every NON-terminal entry for this saga FIRST, leaving the
+        //      terminal marker in place as the safety net. A crash at any point
+        //      during these deletes leaves the marker — still the max-seq entry
+        //      — so `load_unresolved` selects it, sees a terminal state, and the
+        //      saga stays resolved. Removing any subset of the lower-seq
+        //      non-terminal entries while the terminal max-seq marker survives
+        //      can NEVER resurrect a stale pre-commit entry as the saga's
+        //      "latest" state.
+        //   3. Delete the terminal marker LAST. A crash before this step leaves
+        //      the saga resolved (marker present); a crash after leaves the saga
+        //      fully gone. Either outcome is terminal — never a half-state that
+        //      re-drives stale evidence.
+        //
+        // For the secret-bearing path the evidence bytes were already zeroized
+        // in place above (spec §9.4.3), so even if a delete below fails midway
+        // no secret bytes linger; deleting the prefix is then strictly better
+        // than leaving zeroed husks around.
+        let keys = self
+            .storage
+            .list_keys(&prefix)
+            .await
+            .map_err(|e| JournalError::Io(e.to_string()))?;
+        for key in &keys {
+            if key == &marker_key {
+                // Defer the terminal marker — it is the crash-safety net and
+                // must be the LAST key removed.
+                continue;
+            }
+            self.storage
+                .delete(key)
+                .await
+                .map_err(|e| JournalError::Io(e.to_string()))?;
+        }
+        // Now that no non-terminal entry remains, drop the terminal marker so a
+        // resolved saga leaves zero on-disk footprint.
+        self.storage
+            .delete(&marker_key)
+            .await
+            .map_err(|e| JournalError::Io(e.to_string()))?;
 
         Ok(())
     }
@@ -660,6 +747,7 @@ impl<S: Storage + 'static> ProtocolRepositorySagaJournal<S> {
                 Err(e) => {
                     tracing::warn!(
                         key = %k,
+                        saga_id = %saga_id_from_key(k),
                         error = %e,
                         "SCP-SAGA-RECOVERY: malformed seq suffix in journal key, \
                          skipped for next-seq computation; manual repair may be needed"
@@ -695,6 +783,77 @@ mod tests {
 
     fn test_journal() -> ProtocolRepositorySagaJournal<InMemoryStorage> {
         ProtocolRepositorySagaJournal::new(Arc::new(InMemoryStorage::new()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Tracing capture (FIX E — metric-fired proof)
+    //
+    // The metrics facade (`metrics` crate) has NO test recorder installed in
+    // this crate — there is no snapshotter dependency, and `set_global_recorder`
+    // is never called in test code. The codebase DOES already support capturing
+    // structured events via a hand-rolled `tracing::Subscriber` (see
+    // supervisor.rs's watchdog tests). Every `record_saga_repair_needed()` call
+    // in `load_unresolved` is emitted alongside a structured `SCP-SAGA-RECOVERY`
+    // `tracing::error!`, so we assert the repair signal fired by capturing that
+    // event rather than reading a counter we have no recorder for.
+    //
+    // We install the capturing subscriber THREAD-LOCALLY via `set_default`
+    // (NOT process-globally): the default single-threaded `#[tokio::test]`
+    // keeps the future on one thread, so the returned `DefaultGuard` stays
+    // active across `load_unresolved`'s `.await` points (which never
+    // `tokio::spawn`). A thread-local default also avoids colliding with the
+    // process-global default the supervisor.rs watchdog tests install in the
+    // same test binary.
+    //
+    // Returns the shared buffer plus the guard; hold the guard for the duration
+    // of the captured calls, then read the buffer.
+    // -----------------------------------------------------------------------
+    fn install_event_capture() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use std::sync::{Arc as StdArc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Metadata};
+
+        struct CaptureSub {
+            buf: StdArc<Mutex<Vec<String>>>,
+        }
+        struct LineVisitor<'a>(&'a mut String);
+        impl Visit for LineVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={value}", field.name());
+            }
+        }
+        impl tracing::Subscriber for CaptureSub {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut line = String::new();
+                let mut v = LineVisitor(&mut line);
+                event.record(&mut v);
+                self.buf.lock().unwrap().push(line);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let buf = StdArc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(CaptureSub {
+            buf: StdArc::clone(&buf),
+        });
+        (buf, guard)
     }
 
     fn test_entry(saga_id: &SagaId, seq: u64, state: SagaState, evidence: Vec<u8>) -> JournalEntry {
@@ -823,30 +982,50 @@ mod tests {
             .await
             .unwrap();
 
-        // Post-resolve: the prepare-A entry is still parseable (length-CRC
-        // invariant holds) but its evidence field is all zeros.
-        let post_raw = storage.retrieve(&key0).await.unwrap().unwrap();
-        let post_entry = decode_entry(&post_raw).unwrap();
-        assert_eq!(
-            &*post_entry.evidence,
-            &vec![0u8; secret_evidence.len()][..],
-            "evidence must be zeroed",
-        );
+        // Post-resolve: the secret-bearing path FIRST overwrites evidence bytes
+        // in place (spec §9.4.3), THEN compacts the saga to zero on-disk entries
+        // (spec §17.16.1). So the prepare-A key is gone outright...
         assert!(
-            !contains_subsequence(&post_raw, &secret_evidence),
-            "secret bytes must not survive on disk after secret-bearing mark_resolved",
+            storage.retrieve(&key0).await.unwrap().is_none(),
+            "the secret-bearing entry must be compacted away after resolution",
         );
+
+        // ...and — the security invariant that matters — NO key anywhere under
+        // the journal prefix still carries the secret subsequence. (The in-place
+        // overwrite is what guarantees this even on a backend where a delete
+        // might leave a tombstoned husk; here it is verified end-to-end.)
+        let all_keys = storage.list_keys(SAGA_JOURNAL_KEY_PREFIX).await.unwrap();
+        for key in &all_keys {
+            let raw = storage.retrieve(key).await.unwrap().unwrap();
+            assert!(
+                !contains_subsequence(&raw, &secret_evidence),
+                "secret bytes must not survive on disk after secret-bearing \
+                 mark_resolved; found in {key}",
+            );
+        }
     }
 
     #[tokio::test]
-    async fn mark_resolved_non_secret_leaves_prior_entries_intact() {
+    async fn mark_resolved_non_secret_compacts_saga_to_zero_entries() {
+        // FIX B (compaction): a non-secret resolve appends the terminal marker,
+        // then deletes every key for the saga (crash-safe order) so the resolved
+        // saga leaves ZERO on-disk entries and never participates in a later
+        // unresolved-saga scan (spec §17.16.1 "Bounded-cost recovery").
         let storage = Arc::new(InMemoryStorage::new());
         let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
         let saga = SagaId::new();
 
-        let ev = b"PUBLIC-EVIDENCE".to_vec();
+        // Several entries for ONE saga across its lifecycle.
         journal
-            .append(test_entry(&saga, 0, SagaState::PreparingA, ev.clone()))
+            .append(test_entry(&saga, 0, SagaState::Initiated, b"ev0".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 1, SagaState::PreparingA, b"ev1".to_vec()))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(&saga, 2, SagaState::PreparingB, b"ev2".to_vec()))
             .await
             .unwrap();
 
@@ -855,11 +1034,67 @@ mod tests {
             .await
             .unwrap();
 
-        let key0 = ProtocolRepositorySagaJournal::<InMemoryStorage>::entry_key(&saga, 0);
-        let raw = storage.retrieve(&key0).await.unwrap().unwrap();
-        let entry = decode_entry(&raw).unwrap();
-        assert_eq!(entry.state, SagaState::PreparingA);
-        assert_eq!(&*entry.evidence, &ev[..]);
+        // No on-disk keys remain under this saga's prefix.
+        let prefix = ProtocolRepositorySagaJournal::<InMemoryStorage>::saga_prefix(&saga);
+        let remaining = storage.list_keys(&prefix).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "a resolved non-secret saga must compact to zero entries, found {remaining:?}",
+        );
+
+        // And the saga does not surface from a recovery sweep.
+        let unresolved = journal.load_unresolved().await.unwrap();
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "a compacted resolved saga must not appear in load_unresolved, got {unresolved:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_resolved_secret_bearing_compacts_saga_to_zero_entries() {
+        // FIX B (compaction) — secret-bearing variant: after the evidence
+        // overwrite (spec §9.4.3) the resolve still compacts the saga to zero
+        // residual keys, leaving no zeroed husks behind.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal = ProtocolRepositorySagaJournal::new(Arc::clone(&storage));
+        let saga = SagaId::new();
+
+        journal
+            .append(test_entry(
+                &saga,
+                0,
+                SagaState::PreparingA,
+                b"BEARER-ARTIFACT-COMMITMENT-BYTES".to_vec(),
+            ))
+            .await
+            .unwrap();
+        journal
+            .append(test_entry(
+                &saga,
+                1,
+                SagaState::Committing,
+                b"more".to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        journal
+            .mark_resolved(saga.clone(), SagaTerminalState::Committed, true)
+            .await
+            .unwrap();
+
+        let prefix = ProtocolRepositorySagaJournal::<InMemoryStorage>::saga_prefix(&saga);
+        let remaining = storage.list_keys(&prefix).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "a resolved secret-bearing saga must compact to zero entries, found {remaining:?}",
+        );
+
+        let unresolved = journal.load_unresolved().await.unwrap();
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga),
+            "a compacted secret-bearing saga must not appear in load_unresolved, got {unresolved:?}",
+        );
     }
 
     #[test]
@@ -944,16 +1179,24 @@ mod tests {
         // Plant a garbage value under a well-formed key so it groups as its own
         // saga and its latest key is selected for decode — exactly the entry the
         // pre-fix `?` would have aborted the whole sweep on.
-        let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}zzcorrupt/{:020}", 0);
+        let corrupt_saga_id = "zzcorrupt";
+        let corrupt_key = format!("{SAGA_JOURNAL_KEY_PREFIX}{corrupt_saga_id}/{:020}", 0);
         storage
             .store(&corrupt_key, b"not-a-valid-wire-entry")
             .await
             .unwrap();
 
+        // Capture the structured recovery events for the metric-fired assertion
+        // (FIX E). The repair signal is `record_saga_repair_needed()`, for which
+        // no test recorder exists; it is emitted alongside the `SCP-SAGA-RECOVERY`
+        // `tracing::error!` we capture here. See `install_event_capture`.
+        let (events, _guard) = install_event_capture();
+
         let unresolved = journal.load_unresolved().await.expect(
             "a single corrupt entry must NOT abort the sweep — the other sagas must still recover",
         );
 
+        // --- Survivor presence (availability) ---
         assert!(
             unresolved.iter().any(|e| e.saga_id == saga_b),
             "PreparingB saga must survive the corrupt-entry skip, got {unresolved:?}",
@@ -963,8 +1206,41 @@ mod tests {
             "Committing saga must survive the corrupt-entry skip, got {unresolved:?}",
         );
         assert!(
-            !unresolved.iter().any(|e| e.saga_id.0 == "zzcorrupt"),
+            !unresolved.iter().any(|e| e.saga_id.0 == corrupt_saga_id),
             "the corrupt saga must be skipped, not surfaced as unresolved",
+        );
+
+        // --- Survivor STATE (FIX E): the surviving sagas must carry their
+        // expected FSM state, not merely be present. ---
+        let b_entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_b)
+            .expect("saga_b present");
+        assert_eq!(
+            b_entry.state,
+            SagaState::PreparingB,
+            "saga_b must recover with its PreparingB FSM state intact",
+        );
+        let c_entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_c)
+            .expect("saga_c present");
+        assert_eq!(
+            c_entry.state,
+            SagaState::Committing,
+            "saga_c must recover with its Committing FSM state intact",
+        );
+
+        // --- Repair signal fired (FIX E): the corrupt-skip path emitted the
+        // structured `SCP-SAGA-RECOVERY` error carrying the corrupt saga_id, the
+        // log-side counterpart of the rate-only `saga_repair_needed` metric. ---
+        let lines = events.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l.contains("SCP-SAGA-RECOVERY")
+                && l.contains("corrupt journal entry")
+                && l.contains(corrupt_saga_id)),
+            "the corrupt-skip must emit a SCP-SAGA-RECOVERY error tagged with the \
+             corrupt saga_id (the per-saga signal paired with the repair metric); got {lines:?}",
         );
     }
 
