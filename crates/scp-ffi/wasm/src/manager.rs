@@ -4196,7 +4196,7 @@ impl WasmContextManager {
             GovernanceAction::SuspendAccess { did } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                // Suspend every capability in the context's ceiling, matching
+                // Suspend all of the member's effective capabilities, matching
                 // the runtime's `suspend_all` semantics (the shared method
                 // copies the member's full effective capability set into the
                 // suspended set).
