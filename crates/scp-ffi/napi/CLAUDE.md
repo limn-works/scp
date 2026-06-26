@@ -12,7 +12,7 @@ Node.js/Bun via napi-rs `#[napi]` types and functions.
 All context lifecycle, messaging, governance, broadcast, membership, and TTL operations
 delegate to a shared `Arc<Supervisor>` held in the per-bridge `BridgeInstanceCore.supervisor` slot. The previously-shared `Arc<ContextManager>` is gone — see `.docs/adrs/ADR-049-actor-per-context.md` for the rationale.
 
-The `Supervisor` is constructed via `Supervisor::with_providers(...)` with production provider implementations:
+The `Supervisor` is constructed via `Supervisor::with_providers_and_journal(...)` (durable saga journal) with production provider implementations:
 - `MlsCryptoProvider` — real OpenMLS-backed encryption, sender keys, and group management (#1294)
 - `NotConfiguredTransportProvider` (from `scp-core`) — returns descriptive errors until relay configured (#501)
 - `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
