@@ -990,7 +990,7 @@ fn is_tool_id_token(tool_id: &str) -> bool {
 ///
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not
 /// well-formed per the ceiling-entry grammar (§5.3.1.1).
-pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
+pub(crate) fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
     // Length cap + character sanitization (§9.1A), shared with the UCAN-form
     // validator so both reject oversize/control/HTML/whitespace identically.
     validate_ceiling_entry_charset(entry)?;
@@ -1040,17 +1040,21 @@ pub fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
 /// spelling (the resource is single-segment, so no `:`→`_` conversion occurs),
 /// which is why both validators can share this core.
 ///
-/// This function performs **pure grammar validation only**. The §5.3.1.1 "No
-/// privileged-built-in collision" rule is NOT enforced here: it is enforced by
-/// canonical resolution at the point a `Custom` value is admitted — see
+/// This function performs the ceiling-entry **grammar** checks, plus the §5.3.1.1
+/// "No built-in-resource wildcard shadow" rule (a custom `{resource}:*` whose
+/// `{resource}` is a built-in resource token is rejected — see the inline comment
+/// at that check). The separate §5.3.1.1 "No privileged-built-in collision" rule
+/// (a custom that *names* a built-in in some spelling) is NOT enforced here: it is
+/// enforced by canonical resolution at the point a `Custom` value is admitted — see
 /// [`Capability::validate_as_ceiling_entry`], which re-resolves the string through
 /// [`Capability::new`] and rejects anything that does not round-trip back to a
-/// `Custom`. That is the sole authoritative mechanism for the collision rule.
+/// `Custom`.
 ///
 /// # Errors
 ///
 /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if `entry` is not a
-/// well-formed custom ceiling entry.
+/// well-formed custom ceiling entry, or if it is a `{resource}:*` wildcard whose
+/// `{resource}` is the resource token of a built-in capability (§5.3.1.1).
 fn validate_custom_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
     let Some((resource, action)) = entry.split_once(':') else {
         return Err(CeilingEntryError::invalid(
@@ -1082,6 +1086,33 @@ fn validate_custom_ceiling_entry(entry: &str) -> Result<(), CeilingEntryError> {
         return Err(CeilingEntryError::invalid(
             entry,
             "action must be a non-empty kebab-case [a-z0-9-] token or the single literal '*'",
+        ));
+    }
+
+    // §5.3.1.1 "No built-in-resource wildcard shadow": a custom shape-3 wildcard
+    // `{resource}:*` whose `{resource}` is the resource token of any built-in is
+    // rejected. Unlike the no-collision rule (enforced by canonical resolution in
+    // `Capability::validate_as_ceiling_entry`), this rule IS enforced here in the
+    // grammar core and IS reachable/load-bearing on the UCAN-import path: a raw
+    // peer-export string like `member:*` flows `validate_ucan_ceiling_string` ->
+    // rule 3 -> here, never wrapped in a `Custom` and never re-resolved. Such a
+    // wildcard does not name a built-in (there is no `member:*` variant), so
+    // canonical resolution cannot catch it; yet ceiling wildcard coverage
+    // (`CapabilityUri::is_within_ceiling`: `ceiling.contains("{resource}:*")`) would
+    // let it silently grant the privileged built-in actions in that family (e.g.
+    // `member:ban`, which gates governance `Revoke`). The reserved set is the
+    // built-in resource tokens under the SAME `{resource}` projection
+    // `is_within_ceiling` matches against (`Capability::ucan_resource_action().0`),
+    // so this is closed-by-construction over `BUILTIN_CAPABILITIES` — not a denylist.
+    if action == "*"
+        && BUILTIN_CAPABILITIES
+            .iter()
+            .any(|c| c.ucan_resource_action().0.as_ref() == resource)
+    {
+        return Err(CeilingEntryError::invalid(
+            entry,
+            "custom resource wildcard shadows a built-in capability family \
+             (§5.3.1.1 no built-in-resource wildcard shadow)",
         ));
     }
 
@@ -4301,6 +4332,128 @@ mod tests {
                     .is_err(),
                 "Custom({spelling:?}) names the parameterized ToolInvoke built-in and must be \
                  rejected"
+            );
+        }
+    }
+
+    /// §5.3.1.1 "No built-in-resource wildcard shadow": a custom shape-3 wildcard
+    /// `{resource}:*` whose `{resource}` is a built-in resource token is rejected on
+    /// EVERY validation surface — the enum entry point, the raw UCAN-import validator,
+    /// and the deserialize boundary. Without this, `member:*` (which does NOT resolve
+    /// to a built-in, so the collision rule misses it) would be stored and, via ceiling
+    /// wildcard coverage, silently grant the privileged built-in actions in that family
+    /// (e.g. `member:ban`, which gates governance `Revoke`). Driven from
+    /// `BUILTIN_CAPABILITIES` (closed-by-construction), restricted to the kebab resource
+    /// tokens a custom can actually spell.
+    #[test]
+    fn ceiling_rejects_custom_wildcard_shadowing_builtin_resource() {
+        use std::collections::BTreeSet;
+        let mut shadowable: BTreeSet<String> = BTreeSet::new();
+        for cap in BUILTIN_CAPABILITIES {
+            let resource = cap.ucan_resource_action().0.into_owned();
+            // A custom resource is kebab `[a-z0-9-]`; built-in resources containing
+            // `_` (e.g. `tool_invoke`, `context_child`) can never be spelled by a
+            // custom, so they are not reachable shadow targets.
+            if is_kebab_token(&resource) {
+                shadowable.insert(resource);
+            }
+        }
+        for expected in [
+            "member",
+            "messages",
+            "media",
+            "tool",
+            "role",
+            "governance",
+            "context",
+            "metadata",
+        ] {
+            assert!(
+                shadowable.contains(expected),
+                "expected built-in resource {expected:?} in shadowable set {shadowable:?}"
+            );
+        }
+        for resource in &shadowable {
+            let wildcard = format!("{resource}:*");
+            // `bridging` is the one shadowable resource whose `{resource}:*` is ALSO a
+            // built-in's own canonical UCAN form (`Bridging` == `bridging:*`). For it,
+            // `Custom("bridging:*")` is rejected one rule earlier — by the no-collision
+            // re-resolution rule (it resolves to `Bridging`), reason "names a built-in"
+            // — and the raw UCAN-import string `bridging:*` is the LEGITIMATE built-in
+            // form and is accepted. Every other shadowable resource has no `{r}:*`
+            // built-in, so it is caught by the wildcard-shadow rule on every surface.
+            let wildcard_is_builtin_form = BUILTIN_CAPABILITIES
+                .iter()
+                .any(|c| c.ucan_capability_name() == wildcard);
+
+            // Enum entry point: rejected on both paths (collision OR shadow).
+            let err = Capability::Custom(wildcard.clone())
+                .validate_as_ceiling_entry()
+                .expect_err("custom wildcard over a built-in resource must be rejected");
+            let CeilingEntryError::InvalidCeilingCategory { reason, .. } = err;
+            if wildcard_is_builtin_form {
+                assert!(
+                    reason.contains("names a built-in"),
+                    "{wildcard:?} is itself a built-in UCAN form; must be rejected by the \
+                     no-collision rule (reason {reason:?})"
+                );
+            } else {
+                assert!(
+                    reason.contains("shadows a built-in"),
+                    "rejection of {wildcard:?} must be the wildcard-shadow rule (reason {reason:?})"
+                );
+            }
+
+            // UCAN-import raw string: a `{r}:*` that is a legitimate built-in form is
+            // accepted (it IS the built-in, no `Custom` wrapper, no masquerade);
+            // otherwise it must be rejected by the wildcard-shadow rule.
+            let ucan_result = validate_ucan_ceiling_string(&wildcard);
+            if wildcard_is_builtin_form {
+                assert!(
+                    ucan_result.is_ok(),
+                    "{wildcard:?} is the legitimate built-in UCAN form and must be accepted on \
+                     the import path; got {ucan_result:?}"
+                );
+            } else {
+                assert!(
+                    ucan_result.is_err(),
+                    "UCAN-import validator must reject wildcard-shadow {wildcard:?}"
+                );
+            }
+
+            // Deserialize boundary: a `Custom` wrapper is always rejected (the wrapper
+            // is the masquerade surface, regardless of which §5.3.1.1 rule fires).
+            let bad = CapabilityCeiling::new([Capability::Custom(wildcard.clone())]);
+            let json = serde_json::to_string(&bad).expect("serialize unchecked value");
+            let parsed: Result<CapabilityCeiling, _> = serde_json::from_str(&json);
+            assert!(
+                parsed.is_err(),
+                "deserializing a ceiling with a Custom {wildcard:?} must fail; got {parsed:?}"
+            );
+        }
+    }
+
+    /// The wildcard-shadow rule MUST NOT over-reject: a custom NON-wildcard action
+    /// under a built-in resource (shape 2) grants only itself via exact match and is
+    /// accepted; a custom wildcard over a NON-built-in resource is accepted.
+    #[test]
+    fn ceiling_accepts_nonshadowing_customs() {
+        for good in ["member:promote", "messages:archive", "governance:draft"] {
+            Capability::Custom(good.to_owned())
+                .validate_as_ceiling_entry()
+                .unwrap_or_else(|e| {
+                    panic!("custom action {good:?} under a built-in resource must be accepted: {e}")
+                });
+        }
+        for good in ["payments:*", "a-b-c:*", "billing:*"] {
+            Capability::Custom(good.to_owned())
+                .validate_as_ceiling_entry()
+                .unwrap_or_else(|e| {
+                    panic!("custom wildcard {good:?} over a non-built-in resource must be accepted: {e}")
+                });
+            assert!(
+                validate_ucan_ceiling_string(good).is_ok(),
+                "UCAN-import validator must accept non-shadowing wildcard {good:?}"
             );
         }
     }
