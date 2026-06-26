@@ -438,6 +438,11 @@ jobs:
           # invocation exercises every transport's test suite and guards against
           # the silent rot that broke the quic feature for months.
           cargo nextest run -p scp-transport --features quic,http3,udp,coap
+          # The saga-journal durable crash-recovery round-trip is gated behind
+          # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
+          # processes). --workspace does NOT activate this optional feature, so
+          # run scp-testing explicitly with it enabled to exercise that test.
+          cargo nextest run -p scp-testing --features sqlite
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `allow_in_memory_custody` / `scp-core/testing` /
