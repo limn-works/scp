@@ -3287,16 +3287,17 @@ mod tests {
             );
         });
 
-        // NOTE: the NAPI/UniFFI bridges build their journal through
+        // NOTE: the NAPI and UniFFI bridges build their journal through
         // `saga_journal_from_handle(Arc::clone(handle))` over the SAME concrete
-        // `Arc<S>` storage handle that feeds `mls_storage_from_handle`, so the
-        // same-backend property holds there by construction (one `Arc<S>`, shared
-        // by clone). Driving it behaviorally would require standing up the NAPI
-        // `Env`/`ThreadsafeFunction` or the UniFFI callback-interface storage
-        // shim from a Rust unit test — disproportionate FFI scaffolding for the
-        // same `Arc`-sharing invariant the PyO3 reference bridge proves here. The
-        // NAPI/UniFFI same-backend wiring stays pinned by the structural
-        // `prod_supervisor_construction_wires_durable_saga_journal` gate.
+        // `Arc<S>` storage handle that feeds `mls_storage_from_handle`. Each of
+        // those bridges now carries its OWN behavioral same-backend proof —
+        // `saga_journal_from_handle_shares_one_backend` in
+        // `crates/scp-ffi/napi/src/runtime.rs` and
+        // `crates/scp-ffi/uniffi/src/runtime.rs` — which appends through the
+        // returned journal and reads the entry back through the original handle,
+        // so a helper that ignored its handle and built a fresh store would fail
+        // there too. The presence-only `pipeline_wiring.rs` gate is therefore
+        // backed by a same-backend behavioral test on all three bridges.
     }
 
     /// Fail-closed behavioral proof. `build_saga_journal` on a bridge instance

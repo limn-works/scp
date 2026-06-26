@@ -1531,6 +1531,72 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Saga-journal swap: same-backend seam proof (UniFFI bridge).
+    //
+    // The structural `pipeline_wiring.rs` gate is presence-only: a reviewer
+    // proved that mutating `saga_journal_from_handle` to IGNORE its handle and
+    // build over a fresh `InMemoryStorage` keeps the gate (and the swap suite)
+    // green — silently disabling crash-recovery on this bridge. This behavioral
+    // test pins `saga_journal_from_handle::<S>` to the ACTUAL handle it is
+    // given: it appends through the returned journal and asserts the entry is
+    // visible by reading the SAME key directly through the original handle.
+    // A helper that builds a fresh store would write the entry elsewhere and
+    // FAIL this retrieval. No UniFFI callback-interface scaffolding is needed —
+    // this tests the pure generic helper directly.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn saga_journal_from_handle_shares_one_backend() {
+        use scp_core::context::supervisor::{
+            JournalEntry, SAGA_JOURNAL_KEY_PREFIX, SagaId, SagaState,
+        };
+        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::traits::Storage;
+
+        // The single concrete storage handle that, in production, feeds BOTH
+        // `saga_journal_from_handle` and `mls_storage_from_handle`.
+        let handle = Arc::new(InMemoryStorage::new());
+
+        // Build the durable journal via the ACTUAL seam helper, over a CLONE of
+        // the handle — exactly as the construction sites do.
+        let journal = saga_journal_from_handle(Arc::clone(&handle));
+
+        let saga = SagaId::new();
+        let seq: u64 = 0;
+        let entry = JournalEntry {
+            saga_id: saga.clone(),
+            state: SagaState::PreparingB,
+            participants: vec!["ctx-seam".to_owned()],
+            evidence: zeroize::Zeroizing::new(Vec::new()),
+            timestamp_ms: 1_900_000_000_000,
+            seq_per_saga: seq,
+        };
+
+        // Key the production journal writes under: `saga_journal/{saga_id}/{seq:020}`.
+        let expected_key = format!("{SAGA_JOURNAL_KEY_PREFIX}{saga}/{seq:020}");
+
+        crate::runtime().block_on(async {
+            journal
+                .append(entry)
+                .await
+                .expect("append via durable journal");
+
+            // Read the SAME key directly through the ORIGINAL handle. If the
+            // helper ignored its handle and built a fresh store, this read would
+            // miss and return None.
+            let raw = handle
+                .retrieve(&expected_key)
+                .await
+                .expect("retrieve via the original storage handle");
+            assert!(
+                raw.is_some(),
+                "the journal entry MUST be visible through the SAME storage handle \
+                 passed to saga_journal_from_handle — a helper that built a fresh store \
+                 would miss key {expected_key}"
+            );
+        });
+    }
+
     #[test]
     fn test_uniffi_bridge_instance_typed_registries() {
         // Typed registries start empty and support insertion via their
