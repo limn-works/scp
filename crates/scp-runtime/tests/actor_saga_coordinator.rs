@@ -199,11 +199,10 @@ async fn saga_journal_records_every_phase_transition_on_abort() {
 
     // Read the captured appends (the wrapper observed them before the
     // resolution-time compaction deleted the durable entries).
-    let recorded = appends.lock().unwrap();
-    let states: Vec<SagaState> = recorded.iter().map(|(s, _)| *s).collect();
+    let states: Vec<SagaState> = appends.lock().unwrap().iter().map(|(s, _)| *s).collect();
 
     assert!(
-        !recorded.is_empty(),
+        !states.is_empty(),
         "journal should have recorded appends from the aborted saga"
     );
     // The abort path is Initiated → PreparingA → Aborting (appended in-flight)
@@ -302,8 +301,12 @@ async fn saga_journal_write_ordering_is_monotonic() {
     let _ = supervisor.start_saga(executorless_input()).await;
 
     // Collect the `seq_per_saga` values in the order they were appended.
-    let recorded = appends.lock().unwrap();
-    let seqs: Vec<u64> = recorded.iter().map(|(_, seq)| *seq).collect();
+    let seqs: Vec<u64> = appends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, seq)| *seq)
+        .collect();
 
     assert!(
         !seqs.is_empty(),
