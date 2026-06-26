@@ -1739,20 +1739,26 @@ fn c4_napi_tool_invoke_accepts_spending_ucan() {
     );
 }
 
+// The C2 fail-closed economy gate (reject paid-context joins the WASM bridge
+// cannot cryptographically validate, ADR-034) is centralized in the shared
+// `join_context_membership_only` helper, which BOTH `join_context` (unencrypted)
+// and `join_context_encrypted` call before committing membership. Asserting
+// against the helper enforces the gate on both join paths through a single
+// chokepoint — strictly stronger than the prior per-`join_context` check.
 #[test]
 fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context")
-        .expect("WASM join_context body must exist");
+    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context_membership_only")
+        .expect("WASM join_context_membership_only body must exist");
 
     assert!(
         body.contains("spending_ucan_jwt"),
-        "WASM join_context body must reference `spending_ucan_jwt` so the \
+        "WASM join_context_membership_only body must reference `spending_ucan_jwt` so the \
          parameter is no longer silently discarded (C2 fail-closed gate)"
     );
 
     assert!(
         body.contains("economic_policy"),
-        "WASM join_context body must reference `economic_policy` to drive \
+        "WASM join_context_membership_only body must reference `economic_policy` to drive \
          the fail-closed rejection (C2 — paid policies cannot be enforced \
          on the WASM bridge per ADR-034)"
     );
@@ -1760,7 +1766,7 @@ fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
     assert!(
         body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
             || body.contains("SCP-ECON-12096"),
-        "WASM join_context must emit SCP-ECON-12096 in the C2 rejection branch"
+        "WASM join_context_membership_only must emit SCP-ECON-12096 in the C2 rejection branch"
     );
 }
 
