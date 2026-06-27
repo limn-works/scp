@@ -27,6 +27,7 @@ import { TransportError } from "../errors";
 import { __getNativeScp, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
+  CapabilityValidation,
   Checkpoint,
   DIDDocument,
   Event,
@@ -48,6 +49,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { wrapBridgeErrors } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ export function createNativeBridge(scp: SCP): Bridge {
   // the wrong handle.
   const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
-  return {
+  const bridge: Bridge = {
     // Identity
     async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
       const handle = await (native.identityCreate as (c: string) => Promise<BridgeIdentityHandle>)(
@@ -1024,6 +1026,35 @@ export function createNativeBridge(scp: SCP): Bridge {
       await (
         native.ucanValidate as (h: BridgeContextHandle, t: string, c: string) => Promise<void>
       )(handle, token, capability);
+    },
+
+    async ucanEvaluate(
+      handle: BridgeContextHandle,
+      token: string,
+      capability: string,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
+    ): Promise<CapabilityValidation> {
+      // NAPI `ucanEvaluate` (scp.rs) returns a NapiCapabilityValidation
+      // #[napi(object)] whose fields are already camelCased — no remap. The
+      // optional params map to `null` for the napi-rs `Option<…>` signature.
+      const raw = await (
+        native.ucanEvaluate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+      return {
+        tokensValid: raw.tokensValid,
+        signaturesValid: raw.signaturesValid,
+        withinCeiling: raw.withinCeiling,
+        nonceValid: raw.nonceValid,
+        notRevoked: raw.notRevoked,
+        timeBoundsValid: raw.timeBoundsValid,
+      };
     },
 
     async ucanMint(
@@ -2039,4 +2070,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       return (native.resume as () => Promise<void>)();
     },
   };
+  // Single error chokepoint: convert raw FFI errors thrown by any bridge
+  // method into typed ScpError subclasses at exactly one site (ADR-055).
+  return wrapBridgeErrors(bridge);
 }

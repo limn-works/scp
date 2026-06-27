@@ -111,7 +111,7 @@ export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types only (entry points moved to SCP)
+// Bridge Connector — types + the bridgeRegister entry point
 // ---------------------------------------------------------------------------
 
 export type {
@@ -121,6 +121,7 @@ export type {
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
+export { bridgeEvaluateTrust, bridgeRegister } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
@@ -240,6 +241,7 @@ export type {
   BehavioralRecord,
   BroadcastAdmissionPolicy,
   Capability,
+  CapabilityValidation,
   Checkpoint,
   ContextParams,
   CrossContextInvocationResult,

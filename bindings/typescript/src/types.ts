@@ -806,15 +806,50 @@ export interface EventClaim {
 // Trust
 // ---------------------------------------------------------------------------
 
+/**
+ * Layer 1 of the trust model: protocol-enforcement results (mechanical,
+ * pass/fail). Each field is one stage of the 11-step ADR-016 UCAN
+ * validation pipeline, surfaced by the read-only `ucanEvaluate` diagnostic
+ * (spec §7.2.4, ADR-055 Decision 3).
+ *
+ * The six booleans cross the FFI already camelCased (NAPI
+ * `NapiCapabilityValidation`, WASM serde `rename_all = "camelCase"`), so the
+ * SDK consumes them directly and never reverse-engineers *which* check failed
+ * by parsing human-readable error prose. All fields must be `true` for the
+ * subject to be considered protocol-compliant.
+ */
+export interface CapabilityValidation {
+  /** Step 1: UCAN tokens parse and have valid structure. */
+  readonly tokensValid: boolean;
+  /** Steps 2-7: all signatures, the delegation chain, root issuer, audience, key scope, capability grant-match, Category-A enforcement, and attenuation verify. */
+  readonly signaturesValid: boolean;
+  /** Step 8: every granted capability is within the context's ceiling. */
+  readonly withinCeiling: boolean;
+  /** Step 9: nonce format, freshness, and uniqueness passed (probed read-only — the nonce is NOT recorded). */
+  readonly nonceValid: boolean;
+  /** Step 10: no token's revocation CID is on the revocation list. */
+  readonly notRevoked: boolean;
+  /** Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance). */
+  readonly timeBoundsValid: boolean;
+}
+
 /** Trust evaluation input for a participant. */
 export interface TrustEvaluation {
   /** The subject DID being evaluated. */
   readonly subjectDid: string;
   /** The context ID in which trust is being evaluated. */
   readonly contextId: string;
-  /** Behavioral record computed from the event log. */
+  /**
+   * Layer 1: protocol enforcement (mechanical pass/fail). The six per-stage
+   * booleans are AND-combined across the evaluated capability-token set, so a
+   * single token failing a stage makes that aggregate field `false`. When no
+   * tokens were supplied every field is `false` (no stage was observed to
+   * pass).
+   */
+  readonly capabilityValidation: CapabilityValidation;
+  /** Layer 2: behavioral record computed from the event log. */
   readonly behavioralRecord: BehavioralRecord;
-  /** Attestations for the subject. */
+  /** Layer 3: attestations for the subject. */
   readonly attestations: readonly AttestationSummary[];
 }
 

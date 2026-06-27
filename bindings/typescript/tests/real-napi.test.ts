@@ -644,6 +644,94 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // Revocation by the context creator should not throw.
       await napi.ucanRevoke(ctx, token.encoded, admin.did);
     });
+
+    // C3c (ADR-055, §7.2.4): structured read-only diagnostic.
+    test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+      const result = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      expect(result).toEqual({
+        tokensValid: true,
+        signaturesValid: true,
+        withinCeiling: true,
+        nonceValid: true,
+        notRevoked: true,
+        timeBoundsValid: true,
+      });
+    });
+
+    test("ucanEvaluate reports signaturesValid:false for a forged-signature token (no throw)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // Forge the signature: a UCAN is `header.payload.signature` (base64url).
+      // Replace ONLY the signature segment so the token still PARSES
+      // (tokensValid stays true) but signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      // A different, structurally-valid base64url signature segment.
+      const forgedSig = "A".repeat((parts[2] as string).length);
+      const forged = `${parts[0]}.${parts[1]}.${forgedSig}`;
+
+      // Read-only diagnostic: must NOT throw — it reports the failure as bools.
+      const result = await napi.ucanEvaluate(ctx, forged, fullUri, member.did);
+      expect(result.tokensValid).toBe(true);
+      expect(result.signaturesValid).toBe(false);
+      // Everything downstream of the signature stage never ran → false.
+      expect(result.withinCeiling).toBe(false);
+      expect(result.nonceValid).toBe(false);
+      expect(result.notRevoked).toBe(false);
+      expect(result.timeBoundsValid).toBe(false);
+    });
+
+    test("ucanEvaluate is read-only: re-evaluating the same token keeps nonceValid:true", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      const first = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      const second = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      // The probe never records the nonce, so the second evaluation is NOT a
+      // replay — nonceValid stays true (unlike ucanValidate, which would
+      // consume the nonce and reject the second call).
+      expect(first.nonceValid).toBe(true);
+      expect(second.nonceValid).toBe(true);
+      expect(second).toEqual(first);
+    });
+
+    test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge a second token whose signature is invalid.
+      const parts = good.encoded.split(".");
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, "ctx-real", [
+        good.encoded,
+        forged,
+      ]);
+      // The valid token passes signatures; the forged one fails — the AND is false.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(false);
+      expect(result.subjectDid).toBe(member.did);
+      expect(result.contextId).toBe("ctx-real");
+      // Layer 2 behavioral record is present (event-log query succeeded).
+      expect(result.behavioralRecord).toBeDefined();
+    });
   });
 
   // ---------------------------------------------------------------------------
