@@ -319,6 +319,119 @@ impl MajorityVoteEngine {
         proposal.approvals.iter().any(|v| v.voter_did == *voter)
             || proposal.rejections.iter().any(|v| v.voter_did == *voter)
     }
+
+    /// Record an already-built vote and run the tally.
+    ///
+    /// Shared by the signed [`GovernanceEngine::approve`] /
+    /// [`GovernanceEngine::reject`] path and the keyless
+    /// [`TrustedVoteIngest`](super::TrustedVoteIngest) path. This helper begins
+    /// **after** any signature verification: the signed path verifies the vote
+    /// against the voter's DID-resolved key before calling this; the keyless
+    /// path supplies an empty-signature vote.
+    ///
+    /// The shared portion matches the original control flow exactly: the
+    /// eligibility check, the precondition block (pending check, deadline flag,
+    /// single-vote dedup), the deferral to `resolve()` when the deadline has
+    /// passed, the push into `approvals`/`rejections`, the `VoteCast` event, and
+    /// the inline early-resolution (`approvals * 2 > eligible` for an approval,
+    /// `rejections >= eligible.div_ceil(2)` for a rejection).
+    fn record_vote_and_resolve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        signed_vote: super::SignedVote,
+        vote: VoteType,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Verify voter is eligible.
+        if !self.eligible_voter_dids.contains(voter) {
+            return Err(GovernanceError::NotEligible(format!(
+                "{voter} is not an eligible voter"
+            )));
+        }
+
+        // Validate preconditions with an immutable borrow. We store a flag
+        // for deadline expiry so we can call self.resolve() after the borrow
+        // ends (resolve needs &mut self).
+        let past_deadline = {
+            let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
+                GovernanceError::ProposalNotFound {
+                    id: hex::encode(proposal_id),
+                }
+            })?;
+
+            if !proposal.status.is_pending() {
+                return Err(GovernanceError::ProposalNotPending {
+                    status: format!("{:?}", proposal.status),
+                });
+            }
+
+            let expired = context.now >= proposal.voting_deadline;
+            if !expired && Self::has_voted(proposal, voter) {
+                return Err(GovernanceError::AlreadyVoted);
+            }
+            expired
+        };
+
+        // Handle deadline expiry (self.resolve needs &mut self).
+        if past_deadline {
+            return self.resolve(proposal_id, context);
+        }
+
+        let eligible = self.eligible_voter_dids.len();
+
+        // Capture the vote discriminant before moving `vote` into the VoteCast
+        // event below, so we only consume the value once (the original
+        // approve/reject paths each handled a single, statically-known variant).
+        let is_approve = matches!(vote, VoteType::Approve);
+
+        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
+            }
+        })?;
+
+        if is_approve {
+            proposal.approvals.push(signed_vote);
+        } else {
+            proposal.rejections.push(signed_vote);
+        }
+
+        let mut events = vec![GovernanceEvent::VoteCast {
+            proposal_id: *proposal_id,
+            voter_did: voter.clone(),
+            vote,
+        }];
+
+        // Check for early resolution after recording the vote.
+        if is_approve {
+            // Early approval: absolute majority of all eligible voters.
+            let approvals = proposal.approvals.len();
+            if approvals * 2 > eligible {
+                proposal.status = ProposalStatus::Approved;
+                events.push(GovernanceEvent::ProposalResolved {
+                    proposal_id: *proposal_id,
+                    status: ProposalStatus::Approved,
+                });
+            }
+        } else {
+            // Early rejection: enough rejections to make approval impossible.
+            let rejections = proposal.rejections.len();
+            let rejection_threshold = eligible.div_ceil(2);
+            if rejections >= rejection_threshold {
+                let status = ProposalStatus::Rejected {
+                    reason: RejectionReason::MajorityRejected,
+                };
+                proposal.status = status.clone();
+                events.push(GovernanceEvent::ProposalResolved {
+                    proposal_id: *proposal_id,
+                    status,
+                });
+            }
+        }
+
+        Ok((proposal.status.clone(), events))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,42 +503,7 @@ impl GovernanceEngine for MajorityVoteEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Verify voter is eligible.
-        if !self.eligible_voter_dids.contains(voter) {
-            return Err(GovernanceError::NotEligible(format!(
-                "{voter} is not an eligible voter"
-            )));
-        }
-
-        // Validate preconditions with an immutable borrow. We store a flag
-        // for deadline expiry so we can call self.resolve() after the borrow
-        // ends (resolve needs &mut self).
-        let past_deadline = {
-            let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
-                GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                }
-            })?;
-
-            if !proposal.status.is_pending() {
-                return Err(GovernanceError::ProposalNotPending {
-                    status: format!("{:?}", proposal.status),
-                });
-            }
-
-            let expired = context.now >= proposal.voting_deadline;
-            if !expired && Self::has_voted(proposal, voter) {
-                return Err(GovernanceError::AlreadyVoted);
-            }
-            expired
-        };
-
-        // Handle deadline expiry (self.resolve needs &mut self).
-        if past_deadline {
-            return self.resolve(proposal_id, context);
-        }
-
-        // Record the signed vote. Get mutable reference for mutation.
+        // Build and sign the vote.
         let signed_vote = sign_vote(
             proposal_id,
             &VoteType::Approve,
@@ -435,6 +513,8 @@ impl GovernanceEngine for MajorityVoteEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
+        // This MUST stay strictly before record_vote_and_resolve: the signed
+        // path counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -447,34 +527,7 @@ impl GovernanceEngine for MajorityVoteEngine {
             }
         })?;
 
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex::encode(proposal_id),
-            }
-        })?;
-
-        proposal.approvals.push(signed_vote);
-
-        let mut events = vec![GovernanceEvent::VoteCast {
-            proposal_id: *proposal_id,
-            voter_did: voter.clone(),
-            vote: VoteType::Approve,
-        }];
-
-        // Check for early resolution after recording the vote.
-        let eligible = self.eligible_voter_dids.len();
-        let approvals = proposal.approvals.len();
-
-        // Early approval: absolute majority of all eligible voters.
-        if approvals * 2 > eligible {
-            proposal.status = ProposalStatus::Approved;
-            events.push(GovernanceEvent::ProposalResolved {
-                proposal_id: *proposal_id,
-                status: ProposalStatus::Approved,
-            });
-        }
-
-        Ok((proposal.status.clone(), events))
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
     }
 
     fn reject(
@@ -484,41 +537,7 @@ impl GovernanceEngine for MajorityVoteEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Verify voter is eligible.
-        if !self.eligible_voter_dids.contains(voter) {
-            return Err(GovernanceError::NotEligible(format!(
-                "{voter} is not an eligible voter"
-            )));
-        }
-
-        // Validate preconditions with an immutable borrow. Store deadline
-        // flag so we can call self.resolve() after the borrow ends.
-        let past_deadline = {
-            let proposal = self.proposals.get(proposal_id).ok_or_else(|| {
-                GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                }
-            })?;
-
-            if !proposal.status.is_pending() {
-                return Err(GovernanceError::ProposalNotPending {
-                    status: format!("{:?}", proposal.status),
-                });
-            }
-
-            let expired = context.now >= proposal.voting_deadline;
-            if !expired && Self::has_voted(proposal, voter) {
-                return Err(GovernanceError::AlreadyVoted);
-            }
-            expired
-        };
-
-        // Handle deadline expiry (self.resolve needs &mut self).
-        if past_deadline {
-            return self.resolve(proposal_id, context);
-        }
-
-        // Record the signed vote. Get mutable reference for mutation.
+        // Build and sign the rejection vote.
         let signed_vote = sign_vote(
             proposal_id,
             &VoteType::Reject,
@@ -528,6 +547,8 @@ impl GovernanceEngine for MajorityVoteEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
+        // This MUST stay strictly before record_vote_and_resolve: the signed
+        // path counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -540,37 +561,7 @@ impl GovernanceEngine for MajorityVoteEngine {
             }
         })?;
 
-        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
-            GovernanceError::ProposalNotFound {
-                id: hex::encode(proposal_id),
-            }
-        })?;
-
-        proposal.rejections.push(signed_vote);
-
-        let mut events = vec![GovernanceEvent::VoteCast {
-            proposal_id: *proposal_id,
-            voter_did: voter.clone(),
-            vote: VoteType::Reject,
-        }];
-
-        // Check for early rejection: enough rejections to make approval impossible.
-        let eligible = self.eligible_voter_dids.len();
-        let rejections = proposal.rejections.len();
-        let rejection_threshold = eligible.div_ceil(2);
-
-        if rejections >= rejection_threshold {
-            let status = ProposalStatus::Rejected {
-                reason: RejectionReason::MajorityRejected,
-            };
-            proposal.status = status.clone();
-            events.push(GovernanceEvent::ProposalResolved {
-                proposal_id: *proposal_id,
-                status,
-            });
-        }
-
-        Ok((proposal.status.clone(), events))
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
     }
 
     fn resolve(
@@ -718,6 +709,48 @@ impl GovernanceEngine for MajorityVoteEngine {
         } else {
             Ok(CheckpointAttestationStatus::PartiallyAttested)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrustedVoteIngest implementation (ADR-034 keyless path)
+// ---------------------------------------------------------------------------
+
+impl super::TrustedVoteIngest for MajorityVoteEngine {
+    fn ingest_approve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Keyless: build an empty-signature vote and feed it through the same
+        // tally as the signed path. No sign_vote, no verify_vote — the caller
+        // is responsible for authenticating the vote out-of-band (see the
+        // TrustedVoteIngest contract). The timestamp is read from
+        // GovernanceContext::now, the same clock the signed path uses. The vote
+        // is tallied against the engine's frozen eligible_voter_dids.
+        let signed_vote = super::SignedVote {
+            voter_did: voter.clone(),
+            vote: VoteType::Approve,
+            timestamp: context.now,
+            signature: Vec::new(),
+        };
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
+    }
+
+    fn ingest_reject(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let signed_vote = super::SignedVote {
+            voter_did: voter.clone(),
+            vote: VoteType::Reject,
+            timestamp: context.now,
+            signature: Vec::new(),
+        };
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
     }
 }
 
@@ -2375,5 +2408,186 @@ mod tests {
 
         let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustedVoteIngest (keyless, ADR-034) — Majority
+    // -----------------------------------------------------------------------
+
+    use crate::context::governance::TrustedVoteIngest;
+
+    #[test]
+    fn ingest_approve_reaches_absolute_majority() {
+        // 3 voters: two ingested approvals -> absolute majority (2*2 > 3) ->
+        // Approved. (Majority does not auto-count the proposer.)
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        let (status, _) = engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Pending);
+
+        let (status, events) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 2); // VoteCast + ProposalResolved
+
+        // Recorded ingested votes carry empty signatures.
+        let p = engine.get_proposal(&pid).expect("found");
+        assert_eq!(p.approvals.len(), 2);
+        assert!(p.approvals[0].signature.is_empty());
+        assert!(p.approvals[1].signature.is_empty());
+    }
+
+    #[test]
+    fn ingest_stays_pending_below_majority() {
+        // 5 voters: two ingested approvals is not an absolute majority
+        // (2*2 = 4, not > 5) and the deadline has not passed -> Pending.
+        let voters = all_five();
+        let mut engine = default_engine(voters.clone());
+        let ctx = test_context(&voters, T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn ingest_reject_reaches_early_rejection() {
+        // 3 voters: two ingested rejections >= ceil(3/2) = 2 -> early rejection.
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        let (status, _) = engine.ingest_reject(&pid, &alice(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Pending);
+
+        let (status, _) = engine.ingest_reject(&pid, &bob(), &ctx).expect("ingest");
+        assert_eq!(
+            status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::MajorityRejected
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_tallies_against_frozen_eligible_set() {
+        // The engine's frozen eligible_voter_dids is the denominator regardless
+        // of any external membership notion. The engine is frozen at 3 voters;
+        // the GovernanceContext lists a DIFFERENT (larger) membership. Two
+        // ingested approvals still reach absolute majority of the FROZEN set
+        // (2*2 > 3), proving the context membership is not consulted.
+        let mut engine = default_engine(three_voters());
+        // Context advertises five members, but the engine's frozen set is three.
+        let ctx = test_context(&all_five(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
+        // Would still be pending if the denominator were 5 (4 !> 5); Approved
+        // confirms the frozen denominator of 3 is used.
+        assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn ingest_approve_rejects_non_eligible() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        // Dave is not in the frozen eligible voter set.
+        let result = engine.ingest_approve(&proposal.proposal_id, &dave(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::NotEligible(_)
+        ));
+    }
+
+    #[test]
+    fn ingest_approve_rejects_already_voted() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+        let result = engine.ingest_approve(&pid, &alice(), &ctx);
+        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
+    }
+
+    #[test]
+    fn ingest_approve_rejects_terminal_proposal() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        // Drive to Approved (2 of 3).
+        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Approved);
+
+        let result = engine.ingest_approve(&pid, &carol(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::ProposalNotPending { .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_approve_past_deadline_triggers_resolve() {
+        // Mirrors approve_past_deadline_triggers_resolve for the keyless path:
+        // a post-deadline ingest defers to resolve(). One vote / 3 eligible =
+        // 3333 bps < 5000 quorum -> InsufficientParticipation.
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+        let pid = proposal.proposal_id;
+
+        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
+
+        let ctx_late = test_context(&three_voters(), T0 + WINDOW + 1);
+        let (status, _) = engine
+            .ingest_approve(&pid, &bob(), &ctx_late)
+            .expect("resolve");
+        assert_eq!(
+            status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::InsufficientParticipation
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_and_signed_paths_reach_identical_status() {
+        let ctx = test_context(&three_voters(), T0);
+
+        // Signed path: alice + bob approve -> absolute majority -> Approved.
+        let mut signed = default_engine(three_voters());
+        let sp = propose_add_member(&mut signed, &alice(), &ctx, &sk_alice());
+        signed
+            .approve(&sp.proposal_id, &alice(), &ctx, &sk_alice())
+            .expect("approve");
+        let (signed_status, _) = signed
+            .approve(&sp.proposal_id, &bob(), &ctx, &sk_bob())
+            .expect("approve");
+
+        // Ingest path: same sequence, keyless.
+        let mut ingested = default_engine(three_voters());
+        let ip = propose_add_member(&mut ingested, &alice(), &ctx, &sk_alice());
+        ingested
+            .ingest_approve(&ip.proposal_id, &alice(), &ctx)
+            .expect("ingest");
+        let (ingest_status, _) = ingested
+            .ingest_approve(&ip.proposal_id, &bob(), &ctx)
+            .expect("ingest");
+
+        assert_eq!(signed_status, ingest_status);
+        assert_eq!(signed_status, ProposalStatus::Approved);
     }
 }

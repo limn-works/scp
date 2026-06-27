@@ -198,6 +198,79 @@ impl UnanimityEngine {
 
         Ok((new_status, events))
     }
+
+    /// Record an already-built vote and run the tally.
+    ///
+    /// Shared by the signed [`GovernanceEngine::approve`] /
+    /// [`GovernanceEngine::reject`] path and the keyless
+    /// [`TrustedVoteIngest`](super::TrustedVoteIngest) path. This helper begins
+    /// **after** any signature verification: the signed path verifies the vote
+    /// against the voter's DID-resolved key before calling this; the keyless
+    /// path supplies an empty-signature vote. The shared portion is the
+    /// eligibility check, pending check, deadline guard, single-vote dedup, the
+    /// push into `approvals`/`rejections`, the `VoteCast` event, and the
+    /// resolve (a single rejection vetoes immediately).
+    fn record_vote_and_resolve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        signed_vote: super::SignedVote,
+        vote: VoteType,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Voter must be in the voter set.
+        if !self.is_voter(voter) {
+            return Err(GovernanceError::NotEligible(
+                "voter is not in the voter set".to_owned(),
+            ));
+        }
+
+        let proposal =
+            self.proposals
+                .get(proposal_id)
+                .ok_or_else(|| GovernanceError::ProposalNotFound {
+                    id: hex::encode(proposal_id),
+                })?;
+
+        // Must be pending.
+        if !proposal.status.is_pending() {
+            return Err(GovernanceError::ProposalNotPending {
+                status: format!("{:?}", proposal.status),
+            });
+        }
+
+        // Deadline guard -- reject votes after the voting window.
+        if context.now >= proposal.voting_deadline {
+            return Err(GovernanceError::VotingWindowExpired {
+                id: hex::encode(proposal_id),
+            });
+        }
+
+        // Must not have already voted.
+        if Self::has_voted(proposal, voter) {
+            return Err(GovernanceError::AlreadyVoted);
+        }
+
+        // Key is guaranteed present because we just looked it up via `get()` above.
+        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
+            match vote {
+                VoteType::Approve => proposal_mut.approvals.push(signed_vote),
+                VoteType::Reject => proposal_mut.rejections.push(signed_vote),
+            }
+        }
+
+        let mut events = vec![GovernanceEvent::VoteCast {
+            proposal_id: *proposal_id,
+            voter_did: voter.clone(),
+            vote,
+        }];
+
+        // Resolve after vote -- a single rejection triggers immediate veto.
+        let (status, resolve_events) = self.resolve_proposal(proposal_id, context.now)?;
+        events.extend(resolve_events);
+
+        Ok((status, events))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,40 +389,7 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Voter must be in the voter set.
-        if !self.is_voter(voter) {
-            return Err(GovernanceError::NotEligible(
-                "voter is not in the voter set".to_owned(),
-            ));
-        }
-
-        let proposal =
-            self.proposals
-                .get(proposal_id)
-                .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                })?;
-
-        // Must be pending.
-        if !proposal.status.is_pending() {
-            return Err(GovernanceError::ProposalNotPending {
-                status: format!("{:?}", proposal.status),
-            });
-        }
-
-        // Deadline guard -- reject votes after the voting window.
-        if context.now >= proposal.voting_deadline {
-            return Err(GovernanceError::VotingWindowExpired {
-                id: hex::encode(proposal_id),
-            });
-        }
-
-        // Must not have already voted.
-        if Self::has_voted(proposal, voter) {
-            return Err(GovernanceError::AlreadyVoted);
-        }
-
-        // Record the signed vote.
+        // Build and sign the vote.
         let vote = sign_vote(
             proposal_id,
             &VoteType::Approve,
@@ -359,6 +399,8 @@ impl GovernanceEngine for UnanimityEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
+        // This MUST stay strictly before record_vote_and_resolve: the signed
+        // path counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -371,22 +413,7 @@ impl GovernanceEngine for UnanimityEngine {
             }
         })?;
 
-        // Key is guaranteed present because we just looked it up via `get()` above.
-        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
-            proposal_mut.approvals.push(vote);
-        }
-
-        let mut events = vec![GovernanceEvent::VoteCast {
-            proposal_id: *proposal_id,
-            voter_did: voter.clone(),
-            vote: VoteType::Approve,
-        }];
-
-        // Resolve after vote.
-        let (status, resolve_events) = self.resolve_proposal(proposal_id, context.now)?;
-        events.extend(resolve_events);
-
-        Ok((status, events))
+        self.record_vote_and_resolve(proposal_id, voter, vote, VoteType::Approve, context)
     }
 
     fn reject(
@@ -396,40 +423,7 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Voter must be in the voter set.
-        if !self.is_voter(voter) {
-            return Err(GovernanceError::NotEligible(
-                "voter is not in the voter set".to_owned(),
-            ));
-        }
-
-        let proposal =
-            self.proposals
-                .get(proposal_id)
-                .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                })?;
-
-        // Must be pending.
-        if !proposal.status.is_pending() {
-            return Err(GovernanceError::ProposalNotPending {
-                status: format!("{:?}", proposal.status),
-            });
-        }
-
-        // Deadline guard -- reject votes after the voting window.
-        if context.now >= proposal.voting_deadline {
-            return Err(GovernanceError::VotingWindowExpired {
-                id: hex::encode(proposal_id),
-            });
-        }
-
-        // Must not have already voted.
-        if Self::has_voted(proposal, voter) {
-            return Err(GovernanceError::AlreadyVoted);
-        }
-
-        // Record the signed rejection vote.
+        // Build and sign the rejection vote.
         let vote = sign_vote(
             proposal_id,
             &VoteType::Reject,
@@ -439,6 +433,8 @@ impl GovernanceEngine for UnanimityEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
+        // This MUST stay strictly before record_vote_and_resolve: the signed
+        // path counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -451,22 +447,7 @@ impl GovernanceEngine for UnanimityEngine {
             }
         })?;
 
-        // Key is guaranteed present because we just looked it up via `get()` above.
-        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
-            proposal_mut.rejections.push(vote);
-        }
-
-        let mut events = vec![GovernanceEvent::VoteCast {
-            proposal_id: *proposal_id,
-            voter_did: voter.clone(),
-            vote: VoteType::Reject,
-        }];
-
-        // Resolve after vote -- single rejection triggers immediate veto.
-        let (status, resolve_events) = self.resolve_proposal(proposal_id, context.now)?;
-        events.extend(resolve_events);
-
-        Ok((status, events))
+        self.record_vote_and_resolve(proposal_id, voter, vote, VoteType::Reject, context)
     }
 
     fn withdraw_vote(
@@ -665,6 +646,47 @@ impl GovernanceEngine for UnanimityEngine {
         } else {
             Ok(CheckpointAttestationStatus::PartiallyAttested)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrustedVoteIngest implementation (ADR-034 keyless path)
+// ---------------------------------------------------------------------------
+
+impl super::TrustedVoteIngest for UnanimityEngine {
+    fn ingest_approve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Keyless: build an empty-signature vote and feed it through the same
+        // tally as the signed path. No sign_vote, no verify_vote — the caller
+        // is responsible for authenticating the vote out-of-band (see the
+        // TrustedVoteIngest contract). The timestamp is read from
+        // GovernanceContext::now, the same clock the signed path uses.
+        let signed_vote = super::SignedVote {
+            voter_did: voter.clone(),
+            vote: VoteType::Approve,
+            timestamp: context.now,
+            signature: Vec::new(),
+        };
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
+    }
+
+    fn ingest_reject(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let signed_vote = super::SignedVote {
+            voter_did: voter.clone(),
+            vote: VoteType::Reject,
+            timestamp: context.now,
+            signature: Vec::new(),
+        };
+        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
     }
 }
 
@@ -1937,5 +1959,176 @@ mod tests {
 
         let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustedVoteIngest (keyless, ADR-034) — Unanimity
+    // -----------------------------------------------------------------------
+
+    use crate::context::governance::TrustedVoteIngest;
+
+    /// Helper: seed a pending proposal via a signed propose, returning its id.
+    fn ingest_seed_proposal(engine: &mut UnanimityEngine, ctx: &GovernanceContext) -> ProposalId {
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), ctx, &sk_alice())
+            .expect("propose ok");
+        proposal.proposal_id
+    }
+
+    #[test]
+    fn ingest_all_approve_reaches_unanimity() {
+        // 3 voters: proposer (alice) + bob + carol all approve -> Approved.
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        let (status, _) = engine
+            .ingest_approve(&pid, &bob(), &ctx)
+            .expect("ingest ok");
+        assert_eq!(status, ProposalStatus::Pending);
+
+        let (status, events) = engine
+            .ingest_approve(&pid, &carol(), &ctx)
+            .expect("ingest ok");
+        assert_eq!(status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 2);
+
+        // Recorded ingested votes carry empty signatures.
+        let p = engine.get_proposal(&pid).expect("found");
+        assert_eq!(p.approvals.len(), 3);
+        assert!(p.approvals[1].signature.is_empty());
+        assert!(p.approvals[2].signature.is_empty());
+    }
+
+    #[test]
+    fn ingest_stays_pending_when_not_all_approved() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        // Only bob approves; carol has not -> still pending.
+        let (status, _) = engine
+            .ingest_approve(&pid, &bob(), &ctx)
+            .expect("ingest ok");
+        assert_eq!(status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn ingest_reject_breaks_unanimity() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        // A single rejection vetoes immediately.
+        let (status, _) = engine.ingest_reject(&pid, &bob(), &ctx).expect("ingest ok");
+        assert_eq!(
+            status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::UnanimityBroken { rejector: bob() }
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_approve_rejects_non_voter() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        // Dave is not in the frozen voter set.
+        let result = engine.ingest_approve(&pid, &dave(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::NotEligible(_)
+        ));
+    }
+
+    #[test]
+    fn ingest_approve_rejects_already_voted() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        // Alice already voted as proposer.
+        let result = engine.ingest_approve(&pid, &alice(), &ctx);
+        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
+    }
+
+    #[test]
+    fn ingest_approve_rejects_terminal_proposal() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        // Bob rejects -> terminal.
+        engine.ingest_reject(&pid, &bob(), &ctx).expect("ingest ok");
+
+        let result = engine.ingest_approve(&pid, &carol(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::ProposalNotPending { .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_approve_rejects_after_deadline() {
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+        let pid = ingest_seed_proposal(&mut engine, &ctx);
+
+        let expired_ctx = test_context_at(ctx.now + 86_400);
+        let result = engine.ingest_approve(&pid, &bob(), &expired_ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::VotingWindowExpired { .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_and_signed_paths_reach_identical_status() {
+        let ctx = test_context();
+
+        // Signed path: alice proposes, bob + carol approve -> Approved.
+        let mut signed =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let (sp, _) = signed
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose");
+        signed
+            .approve(&sp.proposal_id, &bob(), &ctx, &sk_bob())
+            .expect("approve");
+        let (signed_status, _) = signed
+            .approve(&sp.proposal_id, &carol(), &ctx, &sk_carol())
+            .expect("approve");
+
+        // Ingest path: same sequence, keyless approvals.
+        let mut ingested =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
+        let ip = ingest_seed_proposal(&mut ingested, &ctx);
+        ingested
+            .ingest_approve(&ip, &bob(), &ctx)
+            .expect("ingest ok");
+        let (ingest_status, _) = ingested
+            .ingest_approve(&ip, &carol(), &ctx)
+            .expect("ingest ok");
+
+        assert_eq!(signed_status, ingest_status);
+        assert_eq!(signed_status, ProposalStatus::Approved);
     }
 }
