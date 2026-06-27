@@ -325,11 +325,16 @@ export interface Bridge {
    * (six per-stage booleans) instead of throwing on a capability outcome, and
    * never records the token's nonce (spec §7.2.4, ADR-055). It still rejects
    * for malformed FFI inputs (bad token / capability / DID strings).
+   *
+   * `capability` is OPTIONAL: `null`/`undefined` (or empty) evaluates the
+   * token's intrinsic validity with no invoked-capability grant-match challenge
+   * — the mode the trust signal uses; a value additionally requires the token
+   * grants it.
    */
   ucanEvaluate(
     handle: BridgeContextHandle,
     token: string,
-    capability: string,
+    capability?: string | null,
     presentingAgentDid?: string,
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation>;

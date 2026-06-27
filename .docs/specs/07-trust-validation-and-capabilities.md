@@ -122,13 +122,20 @@ Tier-1 validation (§7.2.1) has two callers with different needs, and the protoc
 - **The enforcement gate.** At a token-presentation boundary the protocol either admits the action or rejects it. This is the throwing gate: it returns success or a single failure, fails closed, and **records the token's nonce** as a side effect of step 9 (replay defense, §9.5). It is the only operation permitted to authorize an action.
 - **The structured diagnostic.** A caller deciding whether to proceed — surfacing a trust signal — needs to know *which* checks pass, not merely whether the whole token would be admitted. This is the read-only diagnostic: it returns a structured per-check result and **never enforces, never throws, and records no state.** In particular it probes the nonce read-only (it never records it), so it is safe to call repeatedly on the same token without consuming the token's nonce.
 
+**The challenge capability is mandatory for the gate and OPTIONAL for the diagnostic.** The enforcement gate always authorizes *for* a specific invoked capability, so its `required_capability` is mandatory. The diagnostic admits two modes:
+
+- **No challenge (intrinsic-validity mode).** The diagnostic evaluates the token's intrinsic validity — every check above EXCEPT the invoked-capability grant-match (step 6), which is skipped. This is the mode a trust signal uses when assessing a participant's tokens for *general* validity, where there is no specific capability to challenge. Omitting the challenge MUST be fail-closed: every other check still runs (notably the all-attestation ceiling of step 8, over the token's own `att` set), and omitting the grant-match MUST NOT cause any per-check field to report `true` that another check would report `false`.
+- **With a challenge.** The diagnostic additionally requires that the token grants the supplied capability (step 6), exactly as the gate does.
+
+The absence of a challenge is expressed by *omitting the capability* — NOT by a wildcard or "match anything" sentinel (a bare `*` is a malformed capability URI and is rejected at parse time). The gate never admits an absent capability.
+
 **The structured capability-evaluation result is the canonical way a caller obtains a per-check breakdown.** It is a flat record of six independent booleans, one per pipeline stage group, mapping onto the 11 steps of §7.2.1:
 
 | Field | Stage(s) of §7.2.1 | Meaning when `true` |
 |-------|--------------------|---------------------|
 | `tokens_valid` | step 1 | The token parsed and its header validated, and the attestation set parsed into capability URIs (fail-closed: any unparseable attestation makes this `false`). |
-| `signatures_valid` | steps 2–7 | Signature, full delegation chain (every parent's signature/expiry/revocation), root issuer, audience, key scope, the invoked-capability grant-match, Category-A enforcement, and attenuation all passed. |
-| `within_ceiling` | step 8 | Every capability the token grants — the whole `att` set, not only the invoked capability — is within the context's immutable ceiling. Reaching this stage already implies the step-6 grant-match passed. |
+| `signatures_valid` | steps 2–7 | Signature, full delegation chain (every parent's signature/expiry/revocation), root issuer, audience, key scope, the invoked-capability grant-match, Category-A enforcement, and attenuation all passed. The invoked-capability grant-match (step 6) runs only when a challenge capability is supplied; in the diagnostic's intrinsic-validity mode it is skipped and this field reflects only the structural checks. |
+| `within_ceiling` | step 8 | Every capability the token grants — the whole `att` set, not only the invoked capability — is within the context's immutable ceiling. This check is over the token's own `att` set and is independent of any challenge capability. When a challenge was supplied, reaching this stage also implies the step-6 grant-match passed; with no challenge, it implies only that no attestation exceeds the ceiling. |
 | `nonce_valid` | step 9 | Nonce format, freshness, and uniqueness passed — **probed read-only; the nonce is NOT recorded.** |
 | `not_revoked` | step 10 | The token's revocation CID is not on the context revocation list. |
 | `time_bounds_valid` | step 11 | `exp`/`nbf` time bounds are valid within clock-skew tolerance. |

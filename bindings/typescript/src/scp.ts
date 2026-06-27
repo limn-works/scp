@@ -2023,7 +2023,11 @@ export class SCP {
    *
    * @param handle The context handle to evaluate against.
    * @param token The UCAN token string to evaluate.
-   * @param capability The required capability URI.
+   * @param capability Optional challenge capability URI. Omit it (or pass
+   *   `null`/`undefined`) to evaluate the token's INTRINSIC validity with no
+   *   invoked-capability grant-match challenge — the mode {@link evaluateTrust}
+   *   uses. Pass a capability to additionally require the token grants it. (The
+   *   enforcing {@link ucanValidate} gate keeps a mandatory capability.)
    * @param presentingAgentDid Optional presenting-agent DID; defaults to the
    *   token audience on the bridge side when omitted.
    * @param proofTokens Optional delegation-chain proof tokens.
@@ -2031,7 +2035,7 @@ export class SCP {
   async ucanEvaluate(
     handle: unknown,
     token: string,
-    capability: string,
+    capability?: string | null,
     presentingAgentDid?: string,
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation> {
@@ -2039,11 +2043,11 @@ export class SCP {
       this.#native.ucanEvaluate as (
         h: unknown,
         t: string,
-        c: string,
+        c: string | null,
         pa: string | null,
         pt: readonly string[] | null,
       ) => Promise<CapabilityValidation>
-    )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+    )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
     // NAPI `NapiCapabilityValidation` is already camelCase — read directly.
     return {
       tokensValid: raw.tokensValid,
@@ -2378,7 +2382,16 @@ export class SCP {
         // malformed FFI input rejects (and propagates). Pass the subject as the
         // presenting agent so the audience check evaluates against the DID under
         // assessment.
-        const perToken = await this.ucanEvaluate(handle, token, "*", subjectDid);
+        //
+        // No challenge capability is supplied: trust evaluation assesses each
+        // token's GENERAL (intrinsic) validity — signatures, ceiling, nonce,
+        // revocation, time bounds — not whether it grants one specific
+        // capability. Passing a concrete URI (or the old `"*"` sentinel, which
+        // the real bridge rejects) would wrongly impose an invoked-capability
+        // grant-match the caller never asked for. See ADR-055 / spec §7.2.4:
+        // the diagnostic's challenge capability is optional, and omitting it
+        // means intrinsic-validity.
+        const perToken = await this.ucanEvaluate(handle, token, null, subjectDid);
         tokensValid &&= perToken.tokensValid;
         signaturesValid &&= perToken.signaturesValid;
         withinCeiling &&= perToken.withinCeiling;

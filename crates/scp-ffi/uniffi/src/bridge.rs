@@ -13766,13 +13766,19 @@ impl Scp {
     /// [`CapabilityValidationRecord`] (six booleans) instead of failing at the
     /// first error, and never records the token's nonce (read-only probe).
     ///
+    /// `capability` is OPTIONAL: omit it (or pass an empty string) to evaluate
+    /// the token's intrinsic validity with no invoked-capability grant-match
+    /// challenge — the mode the SDK trust signal uses. Supply a capability to
+    /// additionally require the token grants it. (The enforcing `ucan_validate`
+    /// gate keeps a mandatory capability.)
+    ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     pub async fn ucan_evaluate(
         &self,
         handle: Arc<ContextHandle>,
         token: String,
-        capability: String,
+        capability: Option<String>,
         presenting_agent_did: Option<String>,
         proof_tokens: Option<Vec<String>>,
     ) -> Result<CapabilityValidationRecord, ScpError> {
@@ -13784,7 +13790,12 @@ impl Scp {
         runtime()
             .spawn(async move {
                 validate_ucan_token(&token)?;
-                validate_capability_uri(&capability)?;
+                // An empty/whitespace-only capability means "no challenge" —
+                // treat it as absent rather than validating it as a URI.
+                let capability = capability.filter(|c| !c.trim().is_empty());
+                if let Some(ref cap) = capability {
+                    validate_capability_uri(cap)?;
+                }
 
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
@@ -13796,10 +13807,15 @@ impl Scp {
                 // error code as every other bridge.
                 let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
-                // Parse the required capability URI.
-                let required_cap: CapabilityUri = capability
-                    .parse()
-                    .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
+                // Parse the optional required capability URI. `None` =>
+                // intrinsic-validity diagnostic (no grant-match challenge).
+                let required_cap: Option<CapabilityUri> = capability
+                    .as_deref()
+                    .map(|cap| {
+                        cap.parse::<CapabilityUri>()
+                            .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))
+                    })
+                    .transpose()?;
 
                 // Determine the presenting agent DID: explicit parameter or token audience.
                 let agent_did = presenting_agent_did
@@ -13852,7 +13868,7 @@ impl Scp {
                             clock: &scp_primitives::SystemClock,
                         };
 
-                        evaluate_ucan(&parsed_token, &required_cap, &ctx)
+                        evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
                     })
                     .ok_or_else(|| ScpError::Permission {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),

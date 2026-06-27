@@ -682,14 +682,21 @@ pub struct CapabilityValidation {
     pub tokens_valid: bool,
     /// Steps 2-7: signature, delegation chain, root issuer, audience, key
     /// scope, capability grant-match, Category-A enforcement, and attenuation
-    /// all passed.
+    /// all passed. The capability grant-match (step 6) only runs when
+    /// `evaluate_ucan` is called with a challenge capability (`Some`); in
+    /// intrinsic-validity mode (`None`) it is skipped, so this field reflects
+    /// only the structural checks (steps 2-5b, 6b, 7).
     pub signatures_valid: bool,
     /// Step 8 (all-attestation ceiling): every capability the token grants (the
     /// full `att` set) is within the context's immutable capability ceiling
-    /// (spec §7.2.1 step 8). Reaching this stage already implies the step-6
-    /// invoked-capability grant-match passed (it runs inside the
-    /// `signatures_valid` stage), so a `true` here means BOTH the invoked
-    /// capability is granted AND no attestation exceeds the ceiling.
+    /// (spec §7.2.1 step 8). This check is over the token's OWN `att` set and is
+    /// independent of any challenge capability. When `evaluate_ucan` was called
+    /// with a challenge capability (`Some`), reaching this stage already implies
+    /// the step-6 invoked-capability grant-match passed (it runs inside the
+    /// `signatures_valid` stage), so a `true` here additionally means the
+    /// invoked capability is granted. When called with `None` (intrinsic-validity
+    /// mode), grant-match is skipped, so a `true` means only that no attestation
+    /// exceeds the ceiling.
     pub within_ceiling: bool,
     /// Step 9: the nonce format, freshness, and uniqueness checks passed
     /// (probed read-only — the nonce is NOT recorded).
@@ -736,6 +743,34 @@ impl CapabilityValidation {
 ///   a field `true` only for stages that ran and passed; the first failing
 ///   stage and everything after it are `false`.
 ///
+/// # Capability challenge (`required_capability`)
+///
+/// This argument is OPTIONAL — it is what distinguishes the two diagnostic
+/// modes:
+///
+/// - `None`: evaluate the token's INTRINSIC validity only. The step-6
+///   invoked-capability grant-match (`check_capability_match`) is SKIPPED
+///   entirely — no specific capability is being challenged. The
+///   `signatures_valid` stage then reflects only the structural checks (steps
+///   2-5b, 6b, 7); `within_ceiling` still reflects the all-attestation ceiling
+///   check (step 8) over the token's OWN `att` set, which does not depend on any
+///   challenge capability. This is the mode the SDK trust signal uses: a
+///   participant's tokens are evaluated for general validity with no concrete
+///   capability to challenge.
+/// - `Some(c)`: additionally require that the token grants `c` (step-6
+///   grant-match against `c`). Behavior is IDENTICAL to the historical
+///   mandatory-capability contract: a token whose `att` set does not grant `c`
+///   fails the `signatures_valid` stage, exactly as before.
+///
+/// In BOTH modes the result remains fail-closed: `None` never makes a genuinely
+/// invalid token report valid (every other check still runs), and `Some(c)`
+/// with a non-granted `c` behaves exactly as it always has. The only difference
+/// `None` makes is to omit the grant-match concern — it never flips a bool to
+/// `true` that would otherwise be `false`.
+///
+/// Note the enforcing gate [`validate_ucan`] keeps a MANDATORY
+/// `required_capability` — only this read-only diagnostic admits `None`.
+///
 /// # Returns
 ///
 /// Always returns a [`CapabilityValidation`] — it never returns an error, even
@@ -744,7 +779,7 @@ impl CapabilityValidation {
 #[must_use]
 pub fn evaluate_ucan<D, N, R, P, S>(
     token: &UcanToken,
-    required_capability: &CapabilityUri,
+    required_capability: Option<&CapabilityUri>,
     ctx: &ValidationContext<'_, D, N, R, P, S>,
 ) -> CapabilityValidation
 where
@@ -792,8 +827,15 @@ where
         // Steps 5a/5b: key scope.
         validate_key_scope(token)?;
 
-        // Step 6: capability grant-match (the invoked capability).
-        check_capability_match(&granted_caps, required_capability)?;
+        // Step 6: capability grant-match (the invoked capability). SKIPPED when
+        // no challenge capability is supplied (`None`) — the intrinsic-validity
+        // diagnostic mode. Omitting this check never flips any field to `true`
+        // that another check would set `false`: every other stage still runs,
+        // and `within_ceiling` (step 8) is the independent all-attestation
+        // ceiling check over the token's own `att` set.
+        if let Some(required) = required_capability {
+            check_capability_match(&granted_caps, required)?;
+        }
 
         // Step 6b: Category-A enforcement.
         enforce_ucan_category_a(token, &granted_caps)?;
@@ -811,10 +853,12 @@ where
     }
     result.signatures_valid = true;
 
-    // Steps 6 + 8: within_ceiling reflects BOTH the invoked-capability
-    // grant-match (verified above as part of the signatures stage) AND the
-    // all-attestation ceiling check (spec §7.2.1 step 8). The grant-match
-    // already passed to reach here, so this stage is the all-att ceiling.
+    // Step 8: within_ceiling is the all-attestation ceiling check (spec §7.2.1
+    // step 8) over the token's OWN `att` set — independent of any challenge
+    // capability. When a challenge capability WAS supplied (`Some`), the step-6
+    // invoked-capability grant-match already passed above (inside the
+    // signatures stage), so a `true` here additionally implies the invoked
+    // capability is granted. When `None`, only the all-att ceiling is asserted.
     if verify_ceiling_compliance(&granted_caps, ctx.ceiling).is_err() {
         return result;
     }

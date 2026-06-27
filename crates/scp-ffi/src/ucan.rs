@@ -342,9 +342,17 @@ impl crate::scp::PyScp {
     ///
     /// # Arguments
     ///
-    /// Identical to [`PyScp::ucan_validate`]: `context_id`, `token`,
-    /// `capability`, optional `presenting_agent_did` (defaults to the token's
-    /// `aud`), and optional `proof_tokens` for delegation chains.
+    /// `context_id`, `token`, optional `capability`, optional
+    /// `presenting_agent_did` (defaults to the token's `aud`), and optional
+    /// `proof_tokens` for delegation chains.
+    ///
+    /// `capability` is OPTIONAL. When omitted (or empty), the token is evaluated
+    /// for INTRINSIC validity only — no specific capability is challenged, so the
+    /// invoked-capability grant-match step is skipped (mirroring
+    /// `evaluate_ucan(None, ..)` in scp-core). This is the mode the SDK trust
+    /// signal uses. When a capability IS supplied, the token must additionally
+    /// grant it (identical to the historical mandatory-capability behavior). The
+    /// enforcing gate [`PyScp::ucan_validate`] keeps a MANDATORY capability.
     ///
     /// # Returns
     ///
@@ -359,20 +367,25 @@ impl crate::scp::PyScp {
     /// reported via the returned booleans, not as exceptions.
     ///
     /// See ADR-016 §5 and `CapabilityValidation` in scp-core.
-    #[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
+    #[pyo3(signature = (context_id, token, capability=None, presenting_agent_did=None, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
     pub fn ucan_evaluate(
         &self,
         context_id: &str,
         token: &str,
-        capability: &str,
+        capability: Option<&str>,
         presenting_agent_did: Option<&str>,
         proof_tokens: Option<Vec<String>>,
     ) -> PyResult<PyCapabilityValidation> {
         let bi = &*self.inner;
         validate::validate_context_id(context_id)?;
         validate::validate_ucan_token(token)?;
-        validate::validate_capability_uri(capability)?;
+        // An empty/whitespace-only capability means "no challenge" — treat it as
+        // absent rather than validating it as a (non-empty) URI.
+        let capability = capability.filter(|c| !c.trim().is_empty());
+        if let Some(cap) = capability {
+            validate::validate_capability_uri(cap)?;
+        }
         if let Some(did) = presenting_agent_did {
             validate::validate_did(did)?;
         }
@@ -384,10 +397,15 @@ impl crate::scp::PyScp {
         // Step 1: Parse the UCAN token using scp-core's parser.
         let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
 
-        // Parse the required capability URI.
-        let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-            ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
-        })?;
+        // Parse the optional required capability URI. `None` => intrinsic-validity
+        // diagnostic (no invoked-capability grant-match challenge).
+        let required_cap: Option<CapabilityUri> = capability
+            .map(|cap| {
+                cap.parse::<CapabilityUri>().map_err(|e: CoreUcanError| {
+                    ScpPyError::ucan(format!("invalid capability URI '{cap}': {e}"))
+                })
+            })
+            .transpose()?;
 
         // Determine the presenting agent DID: explicit parameter or token audience.
         let agent_did = presenting_agent_did.unwrap_or(&parsed_token.payload.aud);
@@ -421,7 +439,7 @@ impl crate::scp::PyScp {
                 clock: &scp_primitives::SystemClock,
             };
 
-            Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+            Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
         })?;
 
         Ok(PyCapabilityValidation::from(result))

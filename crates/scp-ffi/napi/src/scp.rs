@@ -3119,12 +3119,18 @@ impl Scp {
     /// but returns a structured `NapiCapabilityValidation` (six booleans,
     /// camelCased for JS) instead of throwing, and never records the token's
     /// nonce.
+    ///
+    /// `capability` is OPTIONAL: omit it (or pass `null`/empty) to evaluate the
+    /// token's intrinsic validity with no invoked-capability grant-match
+    /// challenge — the mode the SDK trust signal uses. Pass a capability to
+    /// additionally require the token grants it. (The enforcing `ucanValidate`
+    /// gate keeps a mandatory capability.)
     #[napi(js_name = "ucanEvaluate")]
     pub async fn ucan_evaluate(
         &self,
         handle: &NapiContextHandle,
         token: String,
-        capability: String,
+        capability: Option<String>,
         presenting_agent_did: Option<String>,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {

@@ -252,6 +252,40 @@ class TestMultiTokenAndAggregation:
         # Both tokens were evaluated.
         assert mock_bridge.ucan_evaluate.call_count == 2
 
+    def test_evaluate_trust_supplies_no_challenge_capability(self) -> None:
+        """evaluate_trust must call ucan_evaluate WITHOUT a challenge capability.
+
+        Trust evaluation assesses each token's GENERAL (intrinsic) validity, so
+        it must NOT impose an invoked-capability grant-match. The historical
+        bug passed a ``"*"`` sentinel the real bridge rejects; the fix is to
+        pass no capability at all (intrinsic-validity mode, ADR-055 / §7.2.4).
+        This pins the call shape so the mock cannot diverge from the real
+        None-accepting contract.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.ucan_evaluate.return_value = _FakeStructuredResult()
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["only-token"],
+                )
+            )
+
+        assert mock_bridge.ucan_evaluate.call_count == 1
+        call = mock_bridge.ucan_evaluate.call_args
+        # Only context_id and token are passed — no challenge capability in
+        # either positional or keyword form, and never the rejected "*" sentinel.
+        positional = call.args
+        assert "*" not in positional
+        assert "*" not in call.kwargs.values()
+        # The diagnostic is called for general validity: context_id + token only.
+        assert positional == ("ctx-test", "only-token")
+        assert "capability" not in call.kwargs
+
     def test_all_tokens_passing_yields_all_true(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.ucan_evaluate.side_effect = [
