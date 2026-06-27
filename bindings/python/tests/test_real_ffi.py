@@ -767,6 +767,50 @@ class TestUcan:
         # A fresh, in-ceiling token is intrinsically valid on every stage.
         assert omitted == (True, True, True, True, True, True)
 
+    async def test_ucan_evaluate_empty_capability_invalid_token_still_fails(self, scp: SCP):
+        """Empty-capability coercion must NOT bypass a failing stage.
+
+        The intrinsic-validity coercion (``capability=""`` -> no challenge) is a
+        no-CHALLENGE switch, not a no-CHECK switch. A forged-signature token with
+        an empty capability must STILL report ``signatures_valid`` False --
+        coercion to no-challenge cannot be mistaken for a validity shortcut. The
+        sibling parity test only covered a VALID token; this pins the INVALID
+        case (ADR-055 / §7.2.4). TS sibling: the real-napi forged-token coercion
+        test.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        # Forge the signature segment so signature verification fails.
+        parts = token.encoded.split(".")
+        assert len(parts) == 3
+        forged = f"{parts[0]}.{parts[1]}.{'A' * len(parts[2])}"
+
+        # Empty capability == no challenge — but the failing signature stage
+        # must STILL be reported, never bypassed by the coercion.
+        empty = scp._native.ucan_evaluate(handle.context_id, forged, "", bob.did)
+        assert bool(empty.tokens_valid) is True
+        assert bool(empty.signatures_valid) is False, (
+            "empty-capability coercion must NOT bypass the failing signature "
+            "stage of a forged token"
+        )
+
+        # Equivalent to omitting the capability entirely: same failing record.
+        omitted = scp._native.ucan_evaluate(handle.context_id, forged, None, bob.did)
+        assert bool(omitted.signatures_valid) is False
+        assert bool(empty.signatures_valid) == bool(omitted.signatures_valid)
+        assert bool(empty.tokens_valid) == bool(omitted.tokens_valid)
+
 
 # ---------------------------------------------------------------------------
 # Event Log

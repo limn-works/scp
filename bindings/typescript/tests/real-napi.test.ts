@@ -794,6 +794,106 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // Layer 2 behavioral record is present (event-log query succeeded).
       expect(result.behavioralRecord).toBeDefined();
     });
+
+    // Finding M: the Layer-2 behavioral record's `toolInvocations` is a MAP
+    // keyed by tool type whose values are counts (spec §7.2.4). Drive it from
+    // the SAME raw event log `evaluateTrust` consumes so the assertion pins the
+    // ACTUAL bucketing against real bridge data, not a fabricated shape. Every
+    // queryable `ToolInvoked` event buckets under the literal "ToolInvoked" key
+    // (per-tool-type keying awaits ADR-051's richer payload). The bridge never
+    // emits a `payload` OBJECT — events carry `payloadJson` (a JSON string) —
+    // so a `payload.toolId` read (the bug this guards) is structurally
+    // impossible and would silently bucket everything under one fallback.
+    test("evaluateTrust behavioralRecord.toolInvocations buckets ToolInvoked by type from real events", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      await napi.contextJoin(ctx, member.did);
+
+      // Query the SAME raw event log the SDK consumes (this.#native path:
+      // events carry `payloadJson`, NOT a `payload` object). Compute the
+      // expected map exactly as the SDK should: count ToolInvoked events and
+      // bucket them under the single "ToolInvoked" key.
+      const rawEvents = (await scpInstance.eventLogQuery(
+        ctx,
+        JSON.stringify({ actor_did: member.did }),
+      )) as readonly { eventType: string; payloadJson?: string }[];
+      // Prove the raw shape: a `payloadJson` string, never a `payload` object.
+      for (const e of rawEvents) {
+        expect(typeof e.payloadJson).toBe("string");
+        expect((e as Record<string, unknown>).payload).toBeUndefined();
+      }
+      const toolInvokedCount = rawEvents.filter((e) => e.eventType === "ToolInvoked").length;
+      const expected = toolInvokedCount > 0 ? { ToolInvoked: toolInvokedCount } : {};
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const result = await scpInstance.evaluateTrust(ctx, member.did, "ctx-real", [good.encoded]);
+      // CONTENT assertion (not just "defined"): the map matches the real events,
+      // keyed by event type — never a per-toolId fallback off a missing field.
+      expect(result.behavioralRecord.toolInvocations).toEqual(expected);
+    });
+
+    // Finding O: audience-mismatch trust-inflation regression (TS sibling of
+    // the PyO3 `test_evaluate_trust_audience_mismatch_real_ffi`). A token whose
+    // `aud` differs from the evaluated subject must report `signaturesValid:
+    // false` — `evaluateTrust` passes `subjectDid` as the presenting agent so
+    // the step-5 audience check evaluates against the DID under assessment.
+    // Without it the bridge would default the presenting agent to the token's
+    // OWN `aud` (`aud == aud` always true), inflating trust for a token
+    // addressed to someone else. This guards a future edit that drops
+    // `subjectDid` from `evaluateTrust` (ADR-055 / §7.2.4).
+    test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const bob = await napi.identityCreate("in_memory");
+      const carol = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      // Token audience is Bob.
+      const tokenForBob = await napi.ucanMint(ctx, bob.did, ["messages:read"]);
+
+      // Evaluate trust for Carol (a DIFFERENT subject than the token audience):
+      // the audience check fails, so the structural-checks field is false.
+      const mismatch = await scpInstance.evaluateTrust(ctx, carol.did, "ctx-real", [
+        tokenForBob.encoded,
+      ]);
+      expect(mismatch.capabilityValidation.signaturesValid).toBe(false);
+
+      // Control: evaluating the SAME token for its true audience (Bob) passes
+      // the audience check — proving the false above is the mismatch, not an
+      // unrelated failure.
+      const control = await scpInstance.evaluateTrust(ctx, bob.did, "ctx-real", [
+        tokenForBob.encoded,
+      ]);
+      expect(control.capabilityValidation.signaturesValid).toBe(true);
+    });
+
+    // Finding P: empty/whitespace capability coercion must NOT bypass a failing
+    // stage. The intrinsic-validity coercion (`capability=""` → no challenge) is
+    // a no-CHALLENGE switch, not a no-CHECK switch — a forged-signature token
+    // with an empty capability must still report `signaturesValid: false`. The
+    // existing coercion parity test only covered a VALID token; this pins the
+    // INVALID case so coercion cannot be mistaken for a validity shortcut. PyO3
+    // sibling: test_ucan_evaluate_empty_capability_invalid_token_still_fails.
+    test("ucanEvaluate empty capability on a forged token still reports signaturesValid:false", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge the signature segment so signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      // Empty capability == no challenge — but the failing signature stage must
+      // STILL be reported, never bypassed by the coercion.
+      const empty = await napi.ucanEvaluate(ctx, forged, "", member.did);
+      expect(empty.tokensValid).toBe(true);
+      expect(empty.signaturesValid).toBe(false);
+      // Equivalent to omitting the capability entirely: same failing record.
+      const omitted = await napi.ucanEvaluate(ctx, forged, null, member.did);
+      expect(empty).toEqual(omitted);
+    });
   });
 
   // ---------------------------------------------------------------------------
