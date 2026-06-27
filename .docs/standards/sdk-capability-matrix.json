@@ -28,11 +28,10 @@
         {
           "name": "rotate_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
             "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
@@ -54,32 +53,23 @@
         {
           "name": "add_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "rotate_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts rotateAgentKey) but no public SDK wrapper on the Identity class yet; the named public rotateAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "remove_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts removeAgentKey) but no public SDK wrapper on the Identity class yet; the named public removeAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "identity_remove",
@@ -100,12 +90,9 @@
         {
           "name": "migrate",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "resume_migration_publish",
@@ -632,11 +619,10 @@
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": false,
           "swift": true,
           "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"
           }
         },
@@ -1302,13 +1288,12 @@
         {
           "name": "evaluate",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
-            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
-            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
+            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-055 Decision-5 and the per-SDK-idiom lesson.",
+            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-055 Decision-5 and the per-SDK-idiom lesson."
           }
         },
         {
@@ -1762,22 +1747,16 @@
         {
           "name": "register",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
-          }
+          "swift": true
         },
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "create_shadow",

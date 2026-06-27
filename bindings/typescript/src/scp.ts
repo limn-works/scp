@@ -41,6 +41,7 @@ import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
+import type { CapabilityValidation, Event, EventFilter, TrustEvaluation } from "./types";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -720,6 +721,84 @@ export class SCP {
 
   async identityLoad(did: string): Promise<Identity> {
     const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Rotate the identity's active signing key (spec §9.12, ADR-003).
+   *
+   * The rotate/agent-key/migrate operations dispatch through methods on the
+   * native identity handle itself (not the per-instance `#native` SCP handle),
+   * preserving handle affinity. The returned {@link Identity} wraps the fresh
+   * native handle.
+   *
+   * @param identity The identity whose active key should be rotated.
+   * @returns A new {@link Identity} reflecting the rotated key state.
+   */
+  async identityRotateKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { rotateKey(): Promise<unknown> }
+    ).rotateKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Add an agent key to the identity's DID document (spec §3.4, ADR-003).
+   *
+   * @param identity The identity to add an agent key to.
+   * @returns A new {@link Identity} reflecting the added agent key.
+   */
+  async identityAddAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { addAgentKey(): Promise<unknown> }
+    ).addAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Rotate the identity's agent key (spec §3.4, ADR-003).
+   *
+   * @param identity The identity whose agent key should be rotated.
+   * @returns A new {@link Identity} reflecting the rotated agent key.
+   */
+  async identityRotateAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { rotateAgentKey(): Promise<unknown> }
+    ).rotateAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Remove the identity's agent key (spec §3.4, ADR-003).
+   *
+   * @param identity The identity whose agent key should be removed.
+   * @returns A new {@link Identity} reflecting the removed agent key.
+   */
+  async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { removeAgentKey(): Promise<unknown> }
+    ).removeAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Migrate the identity to a new key, producing a `DidRotationEvent`
+   * (spec §9.12, ADR-003 §4b/4c).
+   *
+   * The returned {@link Identity} preserves the live native handle, whose
+   * `rotationEventJson` getter exposes the JSON-serialized rotation event for
+   * publication.
+   *
+   * @param identity The identity to migrate.
+   * @returns A new {@link Identity} reflecting the migrated key state.
+   */
+  async identityMigrate(identity: Identity): Promise<Identity> {
+    const raw = await (identity._rawHandle as unknown as { migrate(): Promise<unknown> }).migrate();
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }
@@ -1840,6 +1919,55 @@ export class SCP {
     )(handle, token, capability, presentingAgentDid, proofTokens);
   }
 
+  /**
+   * Read-only, structured counterpart to {@link ucanValidate}.
+   *
+   * Runs the same 11-step ADR-016 validation pipeline but, instead of
+   * throwing at the first failing stage, resolves to a
+   * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
+   * ADR-055). The probe never records the token's nonce, so calling it does
+   * not consume the token. Capability/signature/expiry outcomes are reported
+   * via the booleans; only malformed FFI inputs (bad handle / token /
+   * capability) reject.
+   *
+   * The six booleans cross the FFI already camelCased, so consumers read the
+   * per-check breakdown directly and never reverse-engineer *which* check
+   * failed by parsing error prose.
+   *
+   * @param handle The context handle to evaluate against.
+   * @param token The UCAN token string to evaluate.
+   * @param capability The required capability URI.
+   * @param presentingAgentDid Optional presenting-agent DID; defaults to the
+   *   token audience on the bridge side when omitted.
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
+  async ucanEvaluate(
+    handle: unknown,
+    token: string,
+    capability: string,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<CapabilityValidation> {
+    const raw = await (
+      this.#native.ucanEvaluate as (
+        h: unknown,
+        t: string,
+        c: string,
+        pa: string | null,
+        pt: readonly string[] | null,
+      ) => Promise<CapabilityValidation>
+    )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+    // NAPI `NapiCapabilityValidation` is already camelCase — read directly.
+    return {
+      tokensValid: raw.tokensValid,
+      signaturesValid: raw.signaturesValid,
+      withinCeiling: raw.withinCeiling,
+      nonceValid: raw.nonceValid,
+      notRevoked: raw.notRevoked,
+      timeBoundsValid: raw.timeBoundsValid,
+    };
+  }
+
   async ucanMint(
     handle: unknown,
     memberDid: string,
@@ -2105,6 +2233,122 @@ export class SCP {
       profileJson,
       requirementsJson,
     );
+  }
+
+  /**
+   * Evaluate the trustworthiness of a participant within a context.
+   *
+   * Composes the structured trust model (spec §7.2.4, ADR-055). The protocol
+   * provides the data, not the verdict — the caller decides what to do with it:
+   *
+   * - **Layer 1 — protocol enforcement.** Each supplied capability token is run
+   *   through the read-only {@link ucanEvaluate} diagnostic, yielding six
+   *   per-stage booleans. The booleans are AND-combined across the token set,
+   *   so one token failing a stage makes that aggregate field `false`. This
+   *   never inspects error prose — it reads the structured
+   *   {@link CapabilityValidation} directly. With no tokens supplied, every
+   *   field stays `false` (no stage was observed to pass).
+   * - **Layer 2 — behavioral validation.** Queries the context event log for
+   *   the subject's verifiable facts (participation, tool usage, governance).
+   *
+   * The capability outcome is non-throwing (it reads booleans); only malformed
+   * FFI inputs (bad context handle / token / capability) propagate as a typed
+   * {@link "./errors".ScpError}.
+   *
+   * @param handle The context handle to evaluate within.
+   * @param subjectDid The DID of the participant being evaluated.
+   * @param contextId The ID of the context the evaluation applies to.
+   * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
+   * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
+   */
+  async evaluateTrust(
+    handle: unknown,
+    subjectDid: string,
+    contextId: string,
+    capabilityTokens?: readonly string[],
+  ): Promise<TrustEvaluation> {
+    // Layer 1: AND-combine the structured per-stage booleans across tokens.
+    // Start from the all-true identity element of the boolean AND when at least
+    // one token is present; with no tokens, every field stays false (the
+    // dataclass default — no stage was observed to pass).
+    let capabilityValidation: CapabilityValidation = {
+      tokensValid: false,
+      signaturesValid: false,
+      withinCeiling: false,
+      nonceValid: false,
+      notRevoked: false,
+      timeBoundsValid: false,
+    };
+    if (capabilityTokens !== undefined && capabilityTokens.length > 0) {
+      let tokensValid = true;
+      let signaturesValid = true;
+      let withinCeiling = true;
+      let nonceValid = true;
+      let notRevoked = true;
+      let timeBoundsValid = true;
+      for (const token of capabilityTokens) {
+        // Read-only diagnostic — does NOT throw on capability outcomes; only
+        // malformed FFI input rejects (and propagates). Pass the subject as the
+        // presenting agent so the audience check evaluates against the DID under
+        // assessment.
+        const perToken = await this.ucanEvaluate(handle, token, "*", subjectDid);
+        tokensValid &&= perToken.tokensValid;
+        signaturesValid &&= perToken.signaturesValid;
+        withinCeiling &&= perToken.withinCeiling;
+        nonceValid &&= perToken.nonceValid;
+        notRevoked &&= perToken.notRevoked;
+        timeBoundsValid &&= perToken.timeBoundsValid;
+      }
+      capabilityValidation = {
+        tokensValid,
+        signaturesValid,
+        withinCeiling,
+        nonceValid,
+        notRevoked,
+        timeBoundsValid,
+      };
+    }
+
+    // Layer 2: behavioral record from the event log, scoped to the subject.
+    const filter: EventFilter = { actorDid: subjectDid };
+    const rawEvents = (await this.eventLogQuery(
+      handle,
+      JSON.stringify(filter),
+    )) as readonly Event[];
+    const toolInvocations: Record<string, number> = {};
+    let governanceActionsBy = 0;
+    let governanceActionsAgainst = 0;
+    for (const event of rawEvents) {
+      if (event.eventType === "ToolInvoked") {
+        // Aggregate by tool identifier when the payload carries one; otherwise
+        // bucket under the event type so the count is never silently dropped.
+        const payload = event.payload;
+        const toolKey =
+          (typeof payload?.toolId === "string" && payload.toolId) ||
+          (typeof payload?.tool_id === "string" && payload.tool_id) ||
+          "ToolInvoked";
+        toolInvocations[toolKey] = (toolInvocations[toolKey] ?? 0) + 1;
+      } else if (event.eventType === "GovernanceActionExecuted") {
+        governanceActionsBy += 1;
+      } else if (event.eventType === "GovernanceActionAgainst") {
+        governanceActionsAgainst += 1;
+      }
+    }
+    const behavioralRecord = {
+      participationCount: rawEvents.length,
+      participationDurationSeconds: 0,
+      toolInvocations,
+      governanceActionsBy,
+      governanceActionsAgainst,
+    };
+
+    return {
+      subjectDid,
+      contextId,
+      capabilityValidation,
+      behavioralRecord,
+      attestations: [],
+    };
   }
 
   aggregateTrustInput(

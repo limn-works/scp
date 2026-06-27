@@ -15,9 +15,11 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
+import { mapBridgeError } from "../errors";
 import type { SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
+  CapabilityValidation,
   Checkpoint,
   DIDDocument,
   Event,
@@ -303,6 +305,20 @@ export interface Bridge {
 
   // UCAN
   ucanValidate(handle: BridgeContextHandle, token: string, capability: string): Promise<void>;
+  /**
+   * Read-only, structured counterpart to {@link ucanValidate}: runs the same
+   * 11-step ADR-016 pipeline but resolves to a {@link CapabilityValidation}
+   * (six per-stage booleans) instead of throwing on a capability outcome, and
+   * never records the token's nonce (spec §7.2.4, ADR-055). It still rejects
+   * for malformed FFI inputs (bad token / capability / DID strings).
+   */
+  ucanEvaluate(
+    handle: BridgeContextHandle,
+    token: string,
+    capability: string,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<CapabilityValidation>;
   ucanMint(
     handle: BridgeContextHandle,
     memberDid: string,
@@ -692,6 +708,77 @@ export type BridgeTarget = "native";
 
 /** The bridge target. Always `"native"` — the SDK is napi-only (ADR-055). */
 export const BRIDGE_TARGET: BridgeTarget = "native";
+
+// ---------------------------------------------------------------------------
+// Single bridge-error chokepoint
+// ---------------------------------------------------------------------------
+
+/**
+ * Wraps a bridge object so that every raw FFI error thrown by one of its own
+ * function-valued properties is converted into a typed {@link ScpError}
+ * subclass via {@link mapBridgeError} at exactly one site per bridge.
+ *
+ * {@link createNativeBridge} returns its bridge object through this wrapper, so
+ * callers (e.g. `discovery.ts`, `trust.ts`) no longer need per-method
+ * `try/catch { throw mapBridgeError(e) }` sprinkled across the SDK — the
+ * conversion happens once, here.
+ *
+ * Behaviour:
+ * - Only the bridge's **own function properties** are wrapped. Non-function
+ *   properties (and inherited/runtime-hook lookups) pass through untouched.
+ * - Sync-vs-async is preserved without ahead-of-time knowledge: the wrapper
+ *   calls the method, and if the result is a thenable it attaches a `.catch`
+ *   that re-maps the rejection; otherwise it returns the synchronous value as
+ *   is (mapping any synchronous throw). A synchronous throw from an `async`
+ *   bridge method (e.g. an argument guard that throws before the first
+ *   `await`) is still mapped.
+ * - Returned **handle objects are NOT deep-proxied.** Methods like
+ *   `identityRotateKey` resolve to a live NAPI handle whose own methods
+ *   (`handle.rotateKey()`) must keep their identity for handle-affinity
+ *   enforcement; wrapping only the bridge surface leaves those handles intact.
+ *
+ * @param bridge The freshly constructed bridge object to guard.
+ * @returns A `Proxy` over `bridge` whose function members map their errors.
+ */
+export function wrapBridgeErrors(bridge: Bridge): Bridge {
+  return new Proxy(bridge, {
+    get(target, prop, receiver): unknown {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") {
+        return value;
+      }
+      // Re-bind to the underlying bridge so `this` inside a method (and any
+      // closure captured at factory time) stays correct.
+      const method = value as (...args: unknown[]) => unknown;
+      return (...args: unknown[]): unknown => {
+        let result: unknown;
+        try {
+          result = method.apply(target, args);
+        } catch (error) {
+          // Synchronous throw — including a guard that fires before the first
+          // `await` inside an async bridge method.
+          throw mapBridgeError(error);
+        }
+        // Preserve async vs sync: only attach error mapping when the method
+        // actually returned a thenable. A plain (sync) return value — including
+        // a returned handle object — passes through verbatim, never deep-proxied.
+        if (
+          result !== null &&
+          typeof result === "object" &&
+          typeof (result as { then?: unknown }).then === "function"
+        ) {
+          return (result as Promise<unknown>).then(
+            (v) => v,
+            (error: unknown) => {
+              throw mapBridgeError(error);
+            },
+          );
+        }
+        return result;
+      };
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Per-SCP native bridge cache
