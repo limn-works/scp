@@ -136,8 +136,12 @@ class BehavioralRecord:
     #: Number of governance actions taken against the subject.
     governance_actions_against: int = 0
 
-    #: Tool invocation history as list of ``{"type": str, "count": int}``.
-    tool_invocations: list[dict[str, Any]] = field(default_factory=list)
+    #: Tool invocations as a map keyed by tool type whose values are counts
+    #: (spec §7.2.4: ``ToolInvocationCount = tool_invocations.values().sum()``).
+    #: Until ADR-051 makes ``ToolInvoked`` a convergent leaf with a richer
+    #: payload, every ``ToolInvoked`` event buckets under the literal
+    #: ``"ToolInvoked"`` key — matching the TypeScript SDK exactly.
+    tool_invocations: dict[str, int] = field(default_factory=dict)
 
     #: Role change history.
     role_history: list[dict[str, Any]] = field(default_factory=list)
@@ -672,11 +676,15 @@ async def evaluate_trust(
             context_id,
             {"actor_did": subject_did},
         )
+        # `tool_invocations` is a MAP keyed by tool type whose values are counts
+        # (spec §7.2.4). The queryable event data does not carry a tool id, so
+        # every ToolInvoked event buckets under the literal "ToolInvoked" key —
+        # identical to the TypeScript SDK. Per-tool-type keying awaits ADR-051's
+        # richer ToolInvoked payload.
+        tool_invoked_count = sum(1 for e in events if e.event_type == "ToolInvoked")
         behavioral = BehavioralRecord(
             contexts_participated=1,
-            tool_invocations=[
-                {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
-            ],
+            tool_invocations={"ToolInvoked": tool_invoked_count} if tool_invoked_count else {},
         )
     except ContextError:
         logger.debug(

@@ -41,7 +41,7 @@ import { mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
-import type { CapabilityValidation, Event, EventFilter, TrustEvaluation } from "./types";
+import type { CapabilityValidation, EventFilter, TrustEvaluation } from "./types";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -2322,6 +2322,10 @@ export class SCP {
         notRevoked &&= perToken.notRevoked;
         timeBoundsValid &&= perToken.timeBoundsValid;
       }
+      // This is a per-FIELD AND ACROSS tokens (every token must pass each
+      // stage), NOT the six-field collapse the `allValid` accessor performs on a
+      // single record — so the accessor does not apply here. Consumers call
+      // `allValid(capabilityValidation)` afterward to collapse the result.
       capabilityValidation = {
         tokensValid,
         signaturesValid,
@@ -2337,26 +2341,35 @@ export class SCP {
     // route it through the same `mapBridgeError` chokepoint as the per-token
     // diagnostic (ADR-055 Decision 4) so a raw bridge error becomes a typed
     // `ScpError` here too. (`ucanEvaluate` above already maps its own dispatch.)
-    let rawEvents: readonly Event[];
+    // `eventLogQuery` returns the RAW bridge shape verbatim — NAPI
+    // `NapiEvent` / WASM event records carry `{eventType, actorDid, timestamp,
+    // payloadJson (a JSON string), sequence}`. There is NO `payload` object
+    // field, and the queryable `payloadJson` on the manager path is just
+    // `{"hash":...}` — it does NOT carry a tool id. So per-tool-type keying is
+    // not achievable from this data today; it awaits ADR-051 making
+    // `ToolInvoked` a convergent leaf with a richer payload. Type to the actual
+    // runtime shape (an `eventType` string) rather than the unsound
+    // `as readonly Event[]` cast, which masked a non-existent `payload` read.
+    let rawEvents: readonly { eventType: string }[];
     try {
       const filter: EventFilter = { actorDid: subjectDid };
-      rawEvents = (await this.eventLogQuery(handle, JSON.stringify(filter))) as readonly Event[];
+      rawEvents = (await this.eventLogQuery(handle, JSON.stringify(filter))) as readonly {
+        eventType: string;
+      }[];
     } catch (error) {
       throw mapBridgeError(error);
     }
+    // `tool_invocations` is a MAP keyed by tool type whose values are counts
+    // (spec §7.2.4: `ToolInvocationCount = tool_invocations.values().sum()`).
+    // Until ADR-051's richer ToolInvoked payload arrives, every ToolInvoked
+    // event buckets under the literal `"ToolInvoked"` key — matching the Python
+    // SDK exactly (`{"ToolInvoked": <count>}`).
     const toolInvocations: Record<string, number> = {};
     let governanceActionsBy = 0;
     let governanceActionsAgainst = 0;
     for (const event of rawEvents) {
       if (event.eventType === "ToolInvoked") {
-        // Aggregate by tool identifier when the payload carries one; otherwise
-        // bucket under the event type so the count is never silently dropped.
-        const payload = event.payload;
-        const toolKey =
-          (typeof payload?.toolId === "string" && payload.toolId) ||
-          (typeof payload?.tool_id === "string" && payload.tool_id) ||
-          "ToolInvoked";
-        toolInvocations[toolKey] = (toolInvocations[toolKey] ?? 0) + 1;
+        toolInvocations.ToolInvoked = (toolInvocations.ToolInvoked ?? 0) + 1;
       } else if (event.eventType === "GovernanceActionExecuted") {
         governanceActionsBy += 1;
       } else if (event.eventType === "GovernanceActionAgainst") {
