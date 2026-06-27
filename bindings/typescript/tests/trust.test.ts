@@ -15,7 +15,7 @@
  * not a nonce-consuming gate), which is what lets `evaluateTrust` be
  * idempotent.
  *
- * See `.docs/adrs/phase-5.md` ADR-055 and `.docs/specs/07-trust-validation-and-capabilities.md` §7.2.4.
+ * See `.docs/adrs/phase-2.md` ADR-055 and `.docs/specs/07-trust-validation-and-capabilities.md` §7.2.4.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";

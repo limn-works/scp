@@ -22,6 +22,7 @@ import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import { allValid } from "../src/types";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -710,6 +711,33 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(second).toEqual(first);
     });
 
+    // Cross-bridge parity (Finding K): every bridge applies
+    // `capability.filter(|c| !c.trim().is_empty())`, so an empty/whitespace
+    // capability is coerced to "no challenge" — identical to omitting it
+    // (None). Sibling of the PyO3 test_ucan_evaluate_empty_capability_coerced
+    // _to_no_challenge test; the two assert the SAME coercion so a future edit
+    // to one bridge cannot silently diverge. A bare "*" is NOT this (it is a
+    // malformed URI the bridge rejects); absence is emptiness/omission only.
+    test("ucanEvaluate empty/whitespace capability coerces to no-challenge (NAPI parity)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      // Presenting agent fixed to the token audience so the only variable is
+      // the capability argument's emptiness.
+      const omitted = await napi.ucanEvaluate(ctx, token.encoded, null, member.did);
+      const empty = await napi.ucanEvaluate(ctx, token.encoded, "", member.did);
+      const whitespace = await napi.ucanEvaluate(ctx, token.encoded, "   ", member.did);
+
+      // Empty / whitespace capability == omitted capability: identical record.
+      expect(empty).toEqual(omitted);
+      expect(whitespace).toEqual(omitted);
+      // A fresh, in-ceiling token is intrinsically valid on every stage.
+      expect(allValid(omitted)).toBe(true);
+    });
+
     // C3c (ADR-055 / §7.2.4): evaluateTrust assesses each token's GENERAL
     // (intrinsic) validity — it must NOT impose an invoked-capability
     // grant-match. The previous implementation passed a `"*"` sentinel that the
@@ -734,6 +762,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result.capabilityValidation.nonceValid).toBe(true);
       expect(result.capabilityValidation.notRevoked).toBe(true);
       expect(result.capabilityValidation.timeBoundsValid).toBe(true);
+      // The derived happy-path accessor collapses the six fields: all true.
+      expect(allValid(result.capabilityValidation)).toBe(true);
       expect(result.subjectDid).toBe(member.did);
       expect(result.contextId).toBe("ctx-real");
     });
@@ -757,6 +787,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // tokensValid (both parse) stays true.
       expect(result.capabilityValidation.tokensValid).toBe(true);
       expect(result.capabilityValidation.signaturesValid).toBe(false);
+      // A single failing stage makes the derived accessor false.
+      expect(allValid(result.capabilityValidation)).toBe(false);
       expect(result.subjectDid).toBe(member.did);
       expect(result.contextId).toBe("ctx-real");
       // Layer 2 behavioral record is present (event-log query succeeded).
