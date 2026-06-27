@@ -305,7 +305,7 @@ impl SagaInput {
 /// saga identifier plus — for a committed cross-context tool-invocation
 /// saga — the target's signed receipt and captured tool output (spec
 /// §6.2.4 "Receipt / response return path").
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SagaOutput {
     /// Durable saga identifier; usable as a handle into the journal.
     pub saga_id: SagaId,
@@ -317,6 +317,110 @@ pub struct SagaOutput {
     /// present for a committed `CrossContextToolInvocation` saga. The exact
     /// bytes the caller (A) side recorded a hash of. `None` otherwise.
     pub output: Option<Vec<u8>>,
+}
+
+/// Typed terminal-state error of the §6.2.4 cross-context tool-invocation saga
+/// — the legible terminal space the FFI saga surface (ADR-049 §3a) maps onto
+/// the `SCP-SAGA-*` taxonomy WITHOUT parsing message strings.
+///
+/// Returned only by
+/// [`Supervisor::start_cross_context_tool_invocation_saga`]. A `Committed`
+/// terminal is the `Ok(SagaOutput)` arm; every NON-committed terminal is one of
+/// these variants, so a bridge's exhaustive `match` is forced to handle every
+/// terminal:
+///
+/// - [`SagaError::Aborted`] — the saga aborted at a Prepare phase (a §6.2.4
+///   authorization / freshness / rate-limit rejection). The structured
+///   [`SagaAbortReason`] distinguishes a rate-limit abort (carrying the
+///   `retry_after_ms` back-off hint, read structurally — never re-parsed from
+///   the message) from a plain rejection; `code` carries the numeric
+///   `SCP-SAGA-13xxx` discriminant so the bridge maps to the canonical code
+///   directly. `Committed ⇒ Ok` / `Aborted ⇒ neither side committed` (spec
+///   §6.2.4 "Dual event-log recording").
+/// - [`SagaError::NeedsRepair`] — Commit-retry exhausted; the saga may have
+///   PARTIALLY committed (a possible divergence). Carries the durable
+///   [`SagaId`] so an operator drives `repair_saga(saga_id)` (ADR-049 §3a). A
+///   signed `CrossContextDivergenceMarker` was emitted (spec §6.2.4).
+/// - [`SagaError::Busy`] — the saga's participant context set overlapped an
+///   in-flight saga's set (spec §5.15.4 per-participant-context-set gating);
+///   retry with back-off. `contended_context` names the shared context id.
+///
+/// The variants carry the canonical `SCP-SAGA-13xxx` code in their `Display`
+/// so a flattened log line still `grep`-disambiguates: `Aborted` mirrors the
+/// inner reject's already-registered code; `NeedsRepair` is the registered
+/// terminal code `SCP-SAGA-13065`; `Busy` is `SCP-SAGA-13066`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SagaError {
+    /// A Prepare-phase rejection (spec §6.2.4). `Aborted ⇒ neither side
+    /// committed`. `reason` distinguishes a rate-limit abort (with a structured
+    /// `retry_after_ms`) from a plain rejection; `code` is the numeric
+    /// `SCP-SAGA-13xxx` discriminant of the underlying reject.
+    #[error("SCP-SAGA-{code}: saga aborted: {message}")]
+    Aborted {
+        /// Structured abort reason — `RateLimited { retry_after_ms }` or
+        /// `Rejected` — so the bridge reads the back-off hint without parsing.
+        reason: SagaAbortReason,
+        /// The numeric `SCP-SAGA-13xxx` discriminant of the underlying reject.
+        code: u16,
+        /// Human-readable detail (the underlying reject's message).
+        message: String,
+    },
+    /// Commit-retry exhausted — the saga diverged and requires operator repair
+    /// (ADR-049 §3a). Carries the durable [`SagaId`] for `repair_saga`.
+    #[error("SCP-SAGA-13065: saga needs repair: {saga_id}")]
+    NeedsRepair {
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: SagaId,
+        /// Human-readable detail (the Commit failure that exhausted retries).
+        message: String,
+    },
+    /// The participant context set overlapped an in-flight saga's set
+    /// (spec §5.15.4). Retry with back-off.
+    #[error("SCP-SAGA-13066: saga busy: {message}")]
+    Busy {
+        /// The shared context id that forced serialization.
+        contended_context: String,
+        /// Human-readable detail naming the contended context.
+        message: String,
+    },
+}
+
+/// The structured reason a §6.2.4 saga reached the `Aborted` terminal — carried
+/// by [`SagaError::Aborted`] so the FFI surface reads the back-off hint
+/// structurally (ADR-049 §3a "abort reason `RateLimited` carrying
+/// `retry_after_ms`, or `Rejected`"), never by re-parsing the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SagaAbortReason {
+    /// The abort was a rate-limit rejection. `retry_after_ms` carries the
+    /// limiter's back-off hint: `Some(ms)` is the §6.2.0.2 sliding-window's
+    /// computed cooldown (milliseconds until it admits the next call); `None`
+    /// means the limiter has no precise back-off instant (the token-bucket
+    /// hard limit, which has no exact refill instant to surface) and the
+    /// caller should apply its own conservative back-off. Propagated from
+    /// `ContextError::RateLimited.retry_after_ms` — never coerced to `0`, since
+    /// `0` would read as "retry immediately" and re-trip the same hard limit.
+    RateLimited {
+        /// Milliseconds until the limit admits the next call, when the tripped
+        /// limiter can compute it; `None` for the token-bucket hard limit.
+        retry_after_ms: Option<u64>,
+    },
+    /// Any other Prepare-phase rejection (authorization, freshness, schema,
+    /// co-residency) — no back-off hint applies.
+    Rejected,
+}
+
+/// Private error of the shared [`Supervisor::run_saga`] FSM driver. Carries the
+/// FSM's internal [`ContextError`] (the type the saga FSM and the saga
+/// integration tests depend on) PLUS whether the saga reached `NeedsRepair`, so
+/// the boundary methods can lift it: `start_saga` discards the flag and
+/// propagates the `ContextError`; `start_cross_context_tool_invocation_saga`
+/// lifts both into the typed [`SagaError`]. Not exposed — the FSM contract stays
+/// `ContextError` internally.
+struct RunSagaError {
+    /// The FSM's terminal error (abort reject, NeedsRepair commit failure, …).
+    error: ContextError,
+    /// `true` iff the FSM journaled `NeedsRepair` (commit-retry exhaustion).
+    needs_repair: bool,
 }
 
 /// The non-`Send` tool executor the supervisor FSM runs supervisor-side
@@ -5216,8 +5320,16 @@ impl Supervisor {
         // run the tool or sign the receipt) — the cross-context arm's prepare
         // dispatch aborts with a typed error.
         let context_set = saga_participant_context_set(&input);
-        let reservation = self.try_reserve_context_set(&context_set)?;
-        self.run_saga(input, None, reservation).await
+        let reservation = self
+            .try_reserve_context_set(&context_set)
+            .map_err(|r| r.actor_busy)?;
+        // The generic entry point keeps the internal `ContextError` contract its
+        // (test-only) callers depend on: mint the id, run, discard the
+        // `needs_repair` flag, propagate the `ContextError`. The typed
+        // `SagaError` lift lives only on the cross-context entry point.
+        self.run_saga(SagaId::new(), input, None, reservation)
+            .await
+            .map_err(|e| e.error)
     }
 
     /// Drive a cross-context tool-invocation saga (spec §6.2.4) end-to-end
@@ -5297,21 +5409,28 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::PermissionDenied`] if the initiator is not a member of
-    ///   `caller_context_id`, no established interface to `target_context_id`
-    ///   exists for `tool_registration_id`, or any Prepare-side §6.2.4 check
-    ///   rejects.
-    /// - [`ContextError::ActorBusy`] (`SagaBusy`) on a participant-set overlap.
-    /// - [`ContextError::ContextNotRegistered`] if a participant actor is not
-    ///   co-resident.
-    /// - [`ContextError::InvalidState`] on journal I/O failure or a saga driven
-    ///   to `NeedsRepair`.
+    /// Returns the typed [`SagaError`] — the legible §6.2.4 terminal space the
+    /// FFI saga surface (ADR-049 §3a) maps onto `SCP-SAGA-*` WITHOUT parsing
+    /// message strings:
+    ///
+    /// - [`SagaError::Aborted`] on any Prepare-phase rejection — the initiator
+    ///   is not a member of `caller_context_id`, no established interface to
+    ///   `target_context_id` exists for `tool_registration_id`, a participant
+    ///   actor is not co-resident, or any §6.2.4 authorization / freshness /
+    ///   rate-limit check rejects. [`SagaAbortReason::RateLimited`] (carrying
+    ///   `retry_after_ms`) is distinguished from [`SagaAbortReason::Rejected`];
+    ///   `code` carries the numeric `SCP-SAGA-13xxx` discriminant.
+    /// - [`SagaError::NeedsRepair`] (carrying the [`SagaId`]) if the saga's
+    ///   Commit retries are exhausted (a possible divergence requiring operator
+    ///   repair).
+    /// - [`SagaError::Busy`] on a participant-context-set overlap with an
+    ///   in-flight saga (spec §5.15.4).
     pub async fn start_cross_context_tool_invocation_saga<F, Fut>(
         &self,
         request: CrossContextToolInvocationRequest,
         signing_keys: SagaSigningKeys<'_>,
         executor: F,
-    ) -> Result<SagaOutput, ContextError>
+    ) -> Result<SagaOutput, SagaError>
     where
         F: FnOnce(serde_json::Value) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static,
@@ -5333,10 +5452,17 @@ impl Supervisor {
         // caller context id it does not belong to.
         let caller_hex = hex::encode(caller_context_id);
         if !self.is_member(&caller_hex, caller_did.as_ref()).await {
-            return Err(ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13050: cross-context saga initiator '{caller_did}' is not a member \
-                 of caller context '{caller_hex}' — not authorized to initiate over it"
-            )));
+            // Caller-axis authorize-before-reserve rejection ⇒ `Aborted`
+            // (neither side committed). Carries the already-allocated supervisor
+            // code so the bridge maps to `SCP-SAGA-13050` directly.
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13050,
+                message: format!(
+                    "cross-context saga initiator '{caller_did}' is not a member of caller \
+                     context '{caller_hex}' — not authorized to initiate over it"
+                ),
+            });
         }
 
         // Authorize-before-reserve gate 2 (target axis, BLACK-624-02): the caller
@@ -5353,12 +5479,19 @@ impl Supervisor {
             .has_established_tool_interface(&caller_hex, &target_hex, &tool_registration_id)
             .await
         {
-            return Err(ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13062: cross-context saga from caller context '{caller_hex}' to target \
-                 context '{target_hex}' has no established interface for tool \
-                 '{tool_registration_id}' — not authorized to invoke (and not authorized to \
-                 reserve the target's saga slot)"
-            )));
+            // Target-axis authorize-before-reserve rejection ⇒ `Aborted`
+            // (neither side committed). Carries the already-allocated supervisor
+            // code so the bridge maps to `SCP-SAGA-13062` directly.
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13062,
+                message: format!(
+                    "cross-context saga from caller context '{caller_hex}' to target context \
+                     '{target_hex}' has no established interface for tool \
+                     '{tool_registration_id}' — not authorized to invoke (and not authorized to \
+                     reserve the target's saga slot)"
+                ),
+            });
         }
 
         // Resolve the channel-authenticated caller's source ROLE in the caller
@@ -5419,10 +5552,79 @@ impl Supervisor {
 
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
         // acquire the gating reservation on the start path, then drive the FSM
-        // under it.
+        // under it. A contention lifts to the typed `SagaError::Busy` carrying
+        // the contended context id read STRUCTURALLY from the reserve call.
         let context_set = saga_participant_context_set(&saga_input);
-        let reservation = self.try_reserve_context_set(&context_set)?;
-        self.run_saga(saga_input, Some(ctx), reservation).await
+        let reservation =
+            self.try_reserve_context_set(&context_set)
+                .map_err(|r| SagaError::Busy {
+                    message: format!(
+                        "participant context set overlaps an in-flight saga at context {}",
+                        r.contended_context
+                    ),
+                    contended_context: r.contended_context,
+                })?;
+
+        // Mint the durable saga id HERE so it is available to the boundary lift
+        // even on the FSM error path — `SagaError::NeedsRepair` MUST carry the
+        // real minted id (the operator-repair handle), and the `Ok` path's
+        // `SagaOutput.saga_id` is the SAME id.
+        let saga_id = SagaId::new();
+        self.run_saga(saga_id.clone(), saga_input, Some(ctx), reservation)
+            .await
+            .map_err(|run_err| Self::lift_run_saga_error(saga_id, run_err))
+    }
+
+    /// Lift the private [`RunSagaError`] (the FSM's internal [`ContextError`] +
+    /// the `needs_repair` flag) into the typed terminal [`SagaError`] the
+    /// cross-context entry point returns (ADR-049 §3a):
+    ///
+    /// - `needs_repair` ⇒ [`SagaError::NeedsRepair`] carrying the minted
+    ///   `saga_id` (the operator-repair handle).
+    /// - otherwise an abort: [`SagaError::Aborted`]. A
+    ///   [`ContextError::RateLimited`] becomes
+    ///   [`SagaAbortReason::RateLimited`], propagating `retry_after_ms`
+    ///   STRUCTURALLY off the variant as an `Option`: `Some(ms)` is the
+    ///   §6.2.0.2 sliding-window's computed back-off; `None` means the limiter
+    ///   has no precise back-off instant (the token-bucket hard limit — which
+    ///   the Prepare-A `reserve_tool_economy` path DOES reach as a saga abort)
+    ///   and the caller should apply its own conservative back-off. The `None`
+    ///   is propagated, never coerced to `0` (a `0` would read as "retry
+    ///   immediately" and re-trip the same hard limit). Every other
+    ///   `ContextError` is a [`SagaAbortReason::Rejected`]. `code` is the
+    ///   numeric `SCP-SAGA-13xxx`
+    ///   discriminant parsed ONCE here in core from the message's canonical
+    ///   prefix (so the bridge reads the typed `code` rather than re-parsing),
+    ///   falling back to the generic saga-abort code `13067` (prefix-less
+    ///   aborts such as a Prepare-phase timeout or journal I/O — the message
+    ///   string carries the specific cause) when the error carries no saga code.
+    fn lift_run_saga_error(saga_id: SagaId, run_err: RunSagaError) -> SagaError {
+        let RunSagaError {
+            error,
+            needs_repair,
+        } = run_err;
+        let message = error.to_string();
+        if needs_repair {
+            return SagaError::NeedsRepair { saga_id, message };
+        }
+        let reason = match &error {
+            ContextError::RateLimited { retry_after_ms, .. } => SagaAbortReason::RateLimited {
+                retry_after_ms: *retry_after_ms,
+            },
+            _ => SagaAbortReason::Rejected,
+        };
+        // Prefix-less aborts (e.g. a Prepare-phase `TransportTimeout` or a
+        // journal-I/O `InvalidState`) carry no `SCP-SAGA-` prefix, so they fall
+        // back to the generic saga-abort code `13067` rather than `13050` (which
+        // is the SPECIFIC caller-membership-gate reject and must not be
+        // synthesized for an authorization failure that never occurred). The
+        // message string carries the specific cause.
+        let code = saga_code_from_message(&message).unwrap_or(13067);
+        SagaError::Aborted {
+            reason,
+            code,
+            message,
+        }
     }
 
     /// Shared start-saga driver: run the FSM under an ALREADY-acquired
@@ -5439,11 +5641,11 @@ impl Supervisor {
     /// `start_saga` without an executor).
     async fn run_saga(
         &self,
+        saga_id: SagaId,
         input: SagaInput,
         xctx: Option<CrossContextSagaCtx<'_>>,
         _reservation: SagaSetReservation<'_>,
-    ) -> Result<SagaOutput, ContextError> {
-        let saga_id = SagaId::new();
+    ) -> Result<SagaOutput, RunSagaError> {
         let participants = saga_input_participants(&input);
         let secret_bearing = saga_input_is_secret_bearing(&input);
 
@@ -5508,17 +5710,35 @@ impl Supervisor {
             }
         }
 
-        fsm_result.map(|()| {
-            // Surface the committed receipt/output (cross-context arm only).
-            let (receipt, output) = xctx
-                .and_then(|c| c.committed)
-                .map_or((None, None), |a| (Some(a.receipt), Some(a.output)));
-            SagaOutput {
-                saga_id,
-                receipt,
-                output,
+        // Whether the FSM drove the saga to `NeedsRepair` (commit-retry
+        // exhaustion) — read BEFORE `xctx` is consumed below. The public
+        // boundary lift ([`Self::start_cross_context_tool_invocation_saga`])
+        // reads this to distinguish a `NeedsRepair` terminal (carrying the
+        // `saga_id`) from a plain `Aborted` on the FSM error path. `false` for
+        // the generic / test inputs that carry no `xctx`.
+        let needs_repair = xctx.as_ref().is_some_and(|c| c.reached_needs_repair);
+
+        match fsm_result {
+            Ok(()) => {
+                // Surface the committed receipt/output (cross-context arm only).
+                let (receipt, output) = xctx
+                    .and_then(|c| c.committed)
+                    .map_or((None, None), |a| (Some(a.receipt), Some(a.output)));
+                Ok(SagaOutput {
+                    saga_id,
+                    receipt,
+                    output,
+                })
             }
-        })
+            // Carry the FSM's `ContextError` plus the `needs_repair` flag up to
+            // the boundary. `start_saga` (generic) discards the flag and
+            // propagates the `ContextError`; the cross-context entry point lifts
+            // both into the typed [`SagaError`].
+            Err(error) => Err(RunSagaError {
+                error,
+                needs_repair,
+            }),
+        }
     }
 
     /// Atomically reserve a saga's participant context set (ADR-049 §3a).
@@ -5543,8 +5763,13 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// [`ContextError::ActorBusy`] if the participant set overlaps an
-    /// in-flight saga's reserved set.
+    /// Returns a [`SagaReserveReject`] if the set overlaps an in-flight saga.
+    /// The reject carries BOTH the structured `contended_context` (the
+    /// overlapping participant id the cross-context entry point reads
+    /// STRUCTURALLY to build [`SagaError::Busy`]) AND the pre-built generic
+    /// `actor_busy` ([`ContextError::ActorBusy`] with a `SagaBusy` reason) the
+    /// non-cross-context / test paths surface. Neither caller parses the id out
+    /// of a message — both read it structurally.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "The lock guard intentionally spans the overlap check AND the \
@@ -5554,7 +5779,7 @@ impl Supervisor {
     fn try_reserve_context_set(
         &self,
         context_set: &[String],
-    ) -> Result<SagaSetReservation<'_>, ContextError> {
+    ) -> Result<SagaSetReservation<'_>, SagaReserveReject> {
         let mut reserved = self
             .reserved_saga_contexts
             .lock()
@@ -5564,10 +5789,19 @@ impl Supervisor {
         // means a shared participant context — serialize (spec §5.15.4:
         // "sharing a single context is sufficient to conflict").
         if let Some(contended) = context_set.iter().find(|id| reserved.contains(*id)) {
-            return Err(ContextError::ActorBusy(format!(
-                "Supervisor::start_saga — participant context set overlaps an in-flight saga \
-                 at context {contended} (SagaBusy)"
-            )));
+            let contended_context = contended.clone();
+            // SagaBusy: the generic / test paths surface this as the typed
+            // ContextError::ActorBusy; the cross-context entry reads
+            // `contended_context` to build SagaError::Busy. Both read the id
+            // STRUCTURALLY, never parsing it out of a message.
+            let actor_busy = ContextError::ActorBusy(format!(
+                "Supervisor::start_saga — participant context set overlaps an in-flight \
+                 saga at context {contended_context} (SagaBusy)"
+            ));
+            return Err(SagaReserveReject {
+                contended_context,
+                actor_busy,
+            });
         }
 
         // Disjoint: reserve the whole set atomically under the same lock.
@@ -5600,7 +5834,7 @@ impl Supervisor {
         input: &SagaInput,
     ) -> Result<SagaSetReservation<'_>, ContextError> {
         let set = saga_participant_context_set(input);
-        self.try_reserve_context_set(&set)
+        self.try_reserve_context_set(&set).map_err(|r| r.actor_busy)
     }
 
     /// Test-only: the CANONICAL standing-context digest over
@@ -6450,6 +6684,64 @@ impl Supervisor {
         }
     }
 
+    /// Terminal-resolve a saga that reached a FULLY SUCCESSFUL dual-commit:
+    /// Commit-B settled, Commit-A settled (the escrow was already consumed by
+    /// the Commit-A settle, so `ctx.prepared_a` is already `None`), and the
+    /// committed receipt/output is staged on `ctx`. The ONLY remaining work is
+    /// the durable terminal-resolved marker write.
+    ///
+    /// If `mark_resolved(Committed)` FAILS, both sides have already committed
+    /// (the cross-context tool EXECUTED + CHARGED and both event logs recorded).
+    /// Propagating a bare error would lift the saga to `SagaError::Aborted`,
+    /// whose contract is "NEITHER side committed" — a contract-honoring caller
+    /// would then RETRY with a fresh `SagaId` (a new §6.2.4 idempotency key),
+    /// re-executing and RE-CHARGING the tool a second time. To prevent that we
+    /// set `reached_needs_repair` BEFORE returning the error: the boundary lift
+    /// then hands back the `saga_id` handle and crash-recovery
+    /// (`recover_committing_entry`) reconciles the stuck marker to `Committed` on
+    /// next open. NO escrow change is needed here — the escrow was already
+    /// consumed by the Commit-A settle, so `ctx.prepared_a` is `None` and
+    /// `run_saga`'s tail hold/void of it is a no-op on this path.
+    ///
+    /// The `reached_needs_repair` flag set here ONLY affects the boundary lift
+    /// classification (`run_saga` reads it to choose `NeedsRepair` over
+    /// `Aborted`); it does NOT trigger divergence-marker emission (those are
+    /// emitted only in `run_saga_fsm`'s commit-exhausted `Err` arm, never in
+    /// `run_saga`'s tail).
+    async fn resolve_committed_or_needs_repair(
+        &self,
+        saga_id: &SagaId,
+        secret_bearing: bool,
+        xctx: Option<&mut CrossContextSagaCtx<'_>>,
+    ) -> Result<(), ContextError> {
+        if let Err(e) = self
+            .saga_journal
+            .mark_resolved(
+                saga_id.clone(),
+                SagaTerminalState::Committed,
+                secret_bearing,
+            )
+            .await
+        {
+            if let Some(ctx) = xctx {
+                ctx.reached_needs_repair = true;
+            }
+            // §17.16.4 operator-alerting metric: a committed saga whose terminal
+            // marker did not durably resolve needs operator reconciliation.
+            crate::metrics::record_saga_repair_needed();
+            tracing::error!(
+                saga_id = %saga_id,
+                %e,
+                "saga coordinator — dual-commit succeeded but mark_resolved(Committed) failed; \
+                 saga in NeedsRepair (do NOT retry — both sides already committed)"
+            );
+            return Err(ContextError::InvalidState(format!(
+                "saga journal mark_resolved: {e}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Run the saga FSM for a single saga. Returns `Ok(())` iff the
     /// saga reached `SagaState::Committed`. Every other terminal state
     /// (`Aborted`, `NeedsRepair`) returns a typed error that the caller
@@ -6559,21 +6851,33 @@ impl Supervisor {
             .await;
         match commit_result {
             Ok(()) => {
-                self.saga_journal
-                    .mark_resolved(
-                        saga_id.clone(),
-                        SagaTerminalState::Committed,
-                        secret_bearing,
-                    )
-                    .await
-                    .map_err(|e| {
-                        ContextError::InvalidState(format!("saga journal mark_resolved: {e}"))
-                    })?;
-                Ok(())
+                self.resolve_committed_or_needs_repair(
+                    &saga_id,
+                    secret_bearing,
+                    xctx.as_deref_mut(),
+                )
+                .await
             }
             Err(err) => {
                 // Commit retry exhausted — NeedsRepair (spec §6.2.4
                 // "commit_with_retry exhausts (3×) → NeedsRepair").
+                //
+                // Mark the divergence BEFORE the fallible NeedsRepair journal
+                // append. The divergence is a FACT the instant
+                // `commit_with_retry` exhausts its retries: Commit-B may have
+                // landed (and CHARGED) on the target side. The `?` on the
+                // append below short-circuits the `Err` arm on a journal-
+                // durability failure; if the flag were only set after the
+                // append (inside the `if let Some(ctx) = xctx` block), a failed
+                // append would leave `reached_needs_repair == false` — and
+                // `run_saga`'s tail would then auto-void+consume the escrow (a
+                // free-execution refund of a possibly-committed side) AND the
+                // lift would mis-classify the diverged saga as a clean
+                // `Aborted` ("neither side committed"). A journal-durability
+                // failure must NEVER downgrade a diverged saga to a clean abort.
+                if let Some(ctx) = xctx.as_deref_mut() {
+                    ctx.reached_needs_repair = true;
+                }
                 self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
                     .await?;
                 // §17.16.4 operator-alerting metric: a saga reached the
@@ -6589,10 +6893,11 @@ impl Supervisor {
                 // each available log, or the supervisor-level repair journal if
                 // a side is unreachable) so a one-sided commit is durably
                 // auditable. Cross-context only; the executor-less test inputs
-                // carry no `xctx`. Marks the ctx so `run_saga`'s tail leaves the
-                // escrow RESERVED (NOT auto-voided) for operator repair.
+                // carry no `xctx`. `reached_needs_repair` was already set above
+                // (before the fallible append) so `run_saga`'s tail leaves the
+                // escrow RESERVED (NOT auto-voided) for operator repair; this
+                // block only emits the divergence markers.
                 if let Some(ctx) = xctx {
-                    ctx.reached_needs_repair = true;
                     // Extract the owned divergence plan SYNCHRONOUSLY (no `&ctx`
                     // borrow crosses the `.await` — the ctx's boxed executor is
                     // non-`Sync`), then emit. A `None` plan ⇒ Commit-B never
@@ -10668,6 +10973,18 @@ fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
 // Saga FSM helpers
 // ---------------------------------------------------------------------------
 
+/// Typed overlap-reject from the saga reservation critical section
+/// ([`Supervisor::try_reserve_context_set`]). Carries BOTH the structured
+/// `contended_context` (the overlapping participant id, read STRUCTURALLY by
+/// the cross-context entry to build [`SagaError::Busy`]) AND the pre-built
+/// generic [`ContextError::ActorBusy`] (the `SagaBusy` reason the
+/// non-cross-context / test paths surface). Keeping the typed rejection in the
+/// reservation critical section is the per-set gating invariant (ADR-049 §3a).
+struct SagaReserveReject {
+    contended_context: String,
+    actor_busy: ContextError,
+}
+
 /// RAII release for a saga's per-participant-context-set reservation
 /// (ADR-049 §3a, spec §5.15.4). Holds the exact set of context IDs THIS
 /// saga reserved; on drop it synchronously re-locks
@@ -10716,6 +11033,24 @@ impl Drop for SagaSetReservation<'_> {
 enum SagaPhase {
     A,
     B,
+}
+
+/// Extract the numeric `SCP-SAGA-13xxx` discriminant from a saga reject
+/// message, parsed ONCE here in core so the typed [`SagaError::Aborted`] carries
+/// `code` and the FFI bridge reads it structurally rather than re-parsing the
+/// message string (the agent-first API tenet). Reads the run of ASCII digits
+/// immediately after the canonical `SCP-SAGA-` prefix. Returns `None` when the
+/// message carries no saga code (e.g. a co-residency / journal `ContextError`),
+/// or when the digits overflow `u16` — the caller substitutes the generic
+/// supervisor-reject code.
+fn saga_code_from_message(message: &str) -> Option<u16> {
+    const PREFIX: &str = "SCP-SAGA-";
+    let start = message.find(PREFIX)? + PREFIX.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse::<u16>().ok()
 }
 
 /// Participant identifiers extracted from a [`SagaInput`] for journal
@@ -16082,8 +16417,15 @@ mod tests {
             .await
             .expect_err("confused-deputy proof must abort the saga");
         assert!(
-            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13013")),
-            "expected SCP-SAGA-13013 confused-deputy rejection, got {err:?}"
+            matches!(
+                &err,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13013,
+                    ..
+                }
+            ),
+            "expected SCP-SAGA-13013 confused-deputy Aborted/Rejected, got {err:?}"
         );
         // The tool NEVER executed.
         assert_eq!(
@@ -16117,8 +16459,8 @@ mod tests {
             .await
             .expect_err("follow-up still rejects at Prepare-B");
         assert!(
-            !matches!(err2, ContextError::ActorBusy(_)),
-            "the aborted saga must RELEASE its reservation (no ActorBusy), got {err2:?}"
+            !matches!(err2, SagaError::Busy { .. }),
+            "the aborted saga must RELEASE its reservation (no SagaBusy), got {err2:?}"
         );
     }
 
@@ -16181,8 +16523,16 @@ mod tests {
             .await
             .expect_err("a caller with no established interface to the victim must be rejected");
         assert!(
-            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13062")),
-            "expected target-axis authorize-before-reserve rejection (SCP-SAGA-13062), got: {err:?}"
+            matches!(
+                &err,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13062,
+                    ..
+                }
+            ),
+            "expected target-axis authorize-before-reserve Aborted/Rejected (SCP-SAGA-13062), \
+             got: {err:?}"
         );
 
         // The victim's saga slot was NEVER reserved — a legitimate saga that
@@ -16267,10 +16617,267 @@ mod tests {
             .await
             .expect_err("overlapping saga must be rejected while the set is held");
         assert!(
-            matches!(&err, ContextError::ActorBusy(msg) if msg.contains("SagaBusy")),
-            "overlap rejection must be ActorBusy(SagaBusy), got: {err:?}"
+            matches!(
+                &err,
+                SagaError::Busy { contended_context, .. }
+                    if !contended_context.is_empty()
+            ),
+            "overlap rejection must be SagaError::Busy carrying the contended context, got: {err:?}"
         );
         drop(held);
+    }
+
+    /// `saga_code_from_message` extracts the `SCP-SAGA-13xxx` discriminant a
+    /// reject message embeds, so the typed `SagaError::Aborted.code` is read
+    /// once in core (the bridge never re-parses the message). A message with no
+    /// saga code yields `None` (the lift then substitutes the generic
+    /// supervisor-reject code).
+    #[test]
+    fn saga_code_from_message_extracts_canonical_discriminant() {
+        assert_eq!(
+            super::saga_code_from_message(
+                "SCP-SAGA-13013: UCAN re-validation failed (confused-deputy)"
+            ),
+            Some(13013)
+        );
+        assert_eq!(
+            super::saga_code_from_message(
+                "SCP-SAGA-13026: per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B"
+            ),
+            Some(13026)
+        );
+        // No saga code in the message ⇒ None (co-residency / journal failures).
+        assert_eq!(
+            super::saga_code_from_message("context 'abc' is not a co-resident actor"),
+            None
+        );
+    }
+
+    /// `lift_run_saga_error` maps the FSM's internal `RunSagaError` into the
+    /// typed terminal `SagaError`: `needs_repair` ⇒ `NeedsRepair` carrying the
+    /// minted `saga_id`; a `RateLimited` abort ⇒ `Aborted` with a STRUCTURED
+    /// `retry_after_ms` (never re-parsed); any other reject ⇒ `Aborted/Rejected`
+    /// carrying the message's saga code.
+    #[test]
+    fn lift_run_saga_error_maps_every_terminal() {
+        // NeedsRepair carries the minted saga id (the operator-repair handle).
+        let saga_id = SagaId("saga-lift-test".to_owned());
+        let lifted = Supervisor::lift_run_saga_error(
+            saga_id.clone(),
+            RunSagaError {
+                error: ContextError::InvalidState("commit retries exhausted".to_owned()),
+                needs_repair: true,
+            },
+        );
+        match lifted {
+            SagaError::NeedsRepair { saga_id: id, .. } => assert_eq!(id, saga_id),
+            other => panic!("expected NeedsRepair, got {other:?}"),
+        }
+
+        // A RateLimited abort surfaces the structured retry_after_ms + saga code.
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-rl".to_owned()),
+            RunSagaError {
+                error: ContextError::RateLimited {
+                    resource: "tool_interface".to_owned(),
+                    message: "SCP-SAGA-13023: per-interface rate limit exceeded".to_owned(),
+                    retry_after_ms: Some(4500),
+                },
+                needs_repair: false,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::RateLimited {
+                        retry_after_ms: Some(4500)
+                    },
+                    code: 13023,
+                    ..
+                }
+            ),
+            "RateLimited abort must carry structured retry_after_ms + code 13023"
+        );
+
+        // Any other reject ⇒ Aborted/Rejected carrying the message's code.
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-rej".to_owned()),
+            RunSagaError {
+                error: ContextError::PermissionDenied("SCP-SAGA-13013: confused-deputy".to_owned()),
+                needs_repair: false,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13013,
+                    ..
+                }
+            ),
+            "non-rate-limit reject must lift to Aborted/Rejected with the message's code"
+        );
+
+        // A genuinely-reachable prefix-less abort — the Prepare-phase 30s
+        // timeout, which surfaces as a `TransportTimeout` carrying NO
+        // `SCP-SAGA-` prefix — must fall back to the generic saga-abort code
+        // `13067`, NOT `13050` (the SPECIFIC caller-membership-gate reject). A
+        // `13050` here would surface as a caller-authorization failure that
+        // never occurred.
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-timeout".to_owned()),
+            RunSagaError {
+                error: ContextError::TransportTimeout(
+                    "saga PrepareA exceeded 30s phase budget".to_owned(),
+                ),
+                needs_repair: false,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    ..
+                }
+            ),
+            "a reject with no saga code (e.g. a Prepare-phase timeout) must fall back to the \
+             generic saga-abort code 13067, not the specific caller-membership code 13050"
+        );
+    }
+
+    /// Regression for the SYMMETRIC `commit_result == Ok(())` defect in
+    /// `run_saga_fsm`: after a FULLY SUCCESSFUL dual-commit (both sides executed
+    /// and charged), a failed terminal `mark_resolved(Committed)` journal write
+    /// surfaces as a prefix-less InvalidState whose message text begins with
+    /// "saga journal mark_resolved:" and carries no saga error code.
+    ///
+    /// WITHOUT the fix, the Ok arm propagated that error with
+    /// `reached_needs_repair == false`, so the boundary lift produced
+    /// `SagaError::Aborted { reason: Rejected, code: 13067 }`. `Aborted`'s
+    /// contract is "NEITHER side committed", so a contract-honoring caller would
+    /// RETRY with a fresh `SagaId` (a new §6.2.4 idempotency key) → the
+    /// cross-context tool EXECUTES AND CHARGES A SECOND TIME.
+    ///
+    /// WITH the fix, the Ok arm sets `reached_needs_repair = true` before
+    /// returning, so the SAME journal-I/O error lifts to `SagaError::NeedsRepair`
+    /// carrying the `saga_id` operator-repair handle — "needs reconciliation, do
+    /// NOT blindly retry". This asserts BOTH directions over the EXACT
+    /// `mark_resolved` message the Ok arm emits, pinning the classification pivot
+    /// the fix turns on. (The full live two-actor dual-commit + journal-fault
+    /// pipeline needed to drive `run_saga_fsm`'s Ok arm end-to-end is the same
+    /// prohibitive infra that made the `Err`-arm regression test infeasible; the
+    /// durable journal self-heals via `recover_committing_entry` on next open,
+    /// for which dedicated recovery tests already exist.)
+    #[test]
+    fn lift_run_saga_error_mark_resolved_failure_is_needs_repair_not_aborted() {
+        let mark_resolved_msg = "saga journal mark_resolved: io: disk full".to_owned();
+
+        // The exact pre-fix path: `needs_repair == false` over the
+        // `mark_resolved` journal-I/O error lifts to the DANGEROUS `Aborted`
+        // (the false "neither committed" terminal that would invite a
+        // double-charging retry). This documents the bug the fix closes.
+        let aborted = Supervisor::lift_run_saga_error(
+            SagaId("saga-mark-resolved-bug".to_owned()),
+            RunSagaError {
+                error: ContextError::InvalidState(mark_resolved_msg.clone()),
+                needs_repair: false,
+            },
+        );
+        assert!(
+            matches!(
+                aborted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    ..
+                }
+            ),
+            "without the flag, a mark_resolved failure would mis-classify a fully-committed saga \
+             as a clean Aborted (the double-charge hazard the fix closes)"
+        );
+
+        // The post-fix path: the Ok arm sets `reached_needs_repair = true` before
+        // returning the SAME error, so it lifts to `NeedsRepair` carrying the
+        // saga id — never a retry-inviting `Aborted`.
+        let saga_id = SagaId("saga-mark-resolved-fixed".to_owned());
+        let repaired = Supervisor::lift_run_saga_error(
+            saga_id.clone(),
+            RunSagaError {
+                error: ContextError::InvalidState(mark_resolved_msg),
+                needs_repair: true,
+            },
+        );
+        match repaired {
+            SagaError::NeedsRepair { saga_id: id, .. } => assert_eq!(id, saga_id),
+            other => panic!(
+                "a committed saga whose mark_resolved(Committed) failed MUST lift to NeedsRepair \
+                 (carrying the saga_id), never Aborted; got {other:?}"
+            ),
+        }
+    }
+
+    /// The token-bucket hard rate limit (`reserve_tool_economy` on the saga's
+    /// Prepare-A path) returns `ContextError::RateLimited { retry_after_ms:
+    /// None, .. }` — it has no precise refill instant. Lifting it MUST propagate
+    /// the `None` through to `SagaAbortReason::RateLimited`, never coerce it to
+    /// `Some(0)`: a `0` back-off reads as "retry immediately" and re-trips the
+    /// same hard limit, defeating the structured back-off.
+    #[test]
+    fn lift_run_saga_error_propagates_token_bucket_none_backoff() {
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-token-bucket".to_owned()),
+            RunSagaError {
+                error: ContextError::RateLimited {
+                    resource: "tool_invoke".to_owned(),
+                    message: "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard limit"
+                        .to_owned(),
+                    retry_after_ms: None,
+                },
+                needs_repair: false,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::RateLimited {
+                        retry_after_ms: None
+                    },
+                    ..
+                }
+            ),
+            "token-bucket hard-limit abort must propagate retry_after_ms: None, never coerce to Some(0)"
+        );
+    }
+
+    /// The typed `SagaError` variants render their canonical `SCP-SAGA-*` code
+    /// in `Display`, so a flattened log line still `grep`-disambiguates the
+    /// terminal — `NeedsRepair` ⇒ `13065`, `Busy` ⇒ `13066`, `Aborted` ⇒ the
+    /// inner reject's code.
+    #[test]
+    fn saga_error_display_carries_canonical_codes() {
+        let needs_repair = SagaError::NeedsRepair {
+            saga_id: SagaId("saga-x".to_owned()),
+            message: "diverged".to_owned(),
+        };
+        assert!(needs_repair.to_string().contains("SCP-SAGA-13065"));
+
+        let busy = SagaError::Busy {
+            contended_context: "ctx-1".to_owned(),
+            message: "overlaps in-flight saga".to_owned(),
+        };
+        assert!(busy.to_string().contains("SCP-SAGA-13066"));
+
+        let aborted = SagaError::Aborted {
+            reason: SagaAbortReason::Rejected,
+            code: 13013,
+            message: "confused-deputy".to_owned(),
+        };
+        assert!(aborted.to_string().contains("SCP-SAGA-13013"));
     }
 
     /// Replay: after a saga commits, re-driving Commit-B for the SAME `SagaId`

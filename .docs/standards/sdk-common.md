@@ -112,6 +112,9 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13062` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
 | `SCP-SAGA-13063` | supervisor | Commit — target receipt missing for saga |
 | `SCP-SAGA-13064` | supervisor | Commit — target receipt signature invalid |
+| `SCP-SAGA-13065` | supervisor | `NeedsRepair` terminal — Commit-retry exhausted; saga diverged and requires operator repair (carries `saga_id`) |
+| `SCP-SAGA-13066` | supervisor | `Busy` terminal — participant context set overlaps an in-flight saga (per-participant-context-set gating, §5.15.4) |
+| `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
 
 ### Registered SCP-ATTEST- codes
 

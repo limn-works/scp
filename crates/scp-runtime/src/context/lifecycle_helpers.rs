@@ -732,6 +732,8 @@ pub async fn join_context(
             return Err(ContextError::RateLimited {
                 resource: "join".to_owned(),
                 message: "hard rate limit exceeded for joiner".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
             });
         }
         // Record the join in the velocity tracker so subsequent §19.7
