@@ -1416,6 +1416,146 @@ async fn ac10_add_signer_action() {
     assert_eq!(status, ProposalStatus::Approved);
 }
 
+// =========================================================================
+// `AddSigner` ceiling-boundedness (ADR-049 §9 / ADR-050 §23.16.8).
+//
+// Promoting a member to a multisig signer grants `governance:propose` and
+// `governance:vote` into `member_capabilities`. Like every other
+// `member_capabilities` writer (MemberBan suspension, tool registration), that
+// grant MUST be bounded by the context ceiling — otherwise a signer would hold
+// governance powers the ceiling EXCLUDES, honored at the local Tier-2 gate
+// (`member_has_capability`) until the next ceiling-lowering reconcile: a real
+// authorization escalation, and a violation of the `ContextRoleState`
+// "every `member_capabilities` write is ceiling-bounded" invariant.
+//
+// Case A: ceiling EXCLUDES governance:propose/vote -> signer does NOT get them.
+// Case B: default ceiling INCLUDES them -> signer DOES get them.
+// =========================================================================
+#[tokio::test]
+async fn add_signer_excluded_governance_caps_not_granted() {
+    let manager = new_manager();
+    let ctx_id = "ctx-add-signer-excluded-ceiling";
+    // Ceiling deliberately EXCLUDES governance:propose and governance:vote.
+    // SingleAdmin so propose auto-executes the AddSigner synchronously.
+    let ceiling = vec![
+        Capability::new("messages:read"),
+        Capability::new("messages:write"),
+        Capability::new("role:assign"),
+        Capability::new("context:close"),
+    ];
+    let params = ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Bob must be a member before he can be promoted to signer.
+    let (proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+
+    // Promote Bob to signer (auto-executes under SingleAdmin).
+    let (proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddSigner { did: bob() },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+
+    let role_state = manager
+        .get_role_state(ctx_id)
+        .await
+        .expect("role state must exist for an active context");
+    let bob_did = bob().to_string();
+    assert!(
+        !role_state.member_has_capability(&bob_did, &Capability::GovernancePropose),
+        "AddSigner MUST NOT grant governance:propose when the ceiling excludes it \
+         (would be a local Tier-2 escalation; ADR-049 §9)"
+    );
+    assert!(
+        !role_state.member_has_capability(&bob_did, &Capability::GovernanceVote),
+        "AddSigner MUST NOT grant governance:vote when the ceiling excludes it \
+         (would be a local Tier-2 escalation; ADR-049 §9)"
+    );
+}
+
+#[tokio::test]
+async fn add_signer_in_ceiling_governance_caps_granted() {
+    let manager = new_manager();
+    let ctx_id = "ctx-add-signer-default-ceiling";
+    // Default governance ceiling INCLUDES governance:propose and governance:vote.
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+
+    let (proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+
+    let (proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddSigner { did: bob() },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Approved);
+
+    let role_state = manager
+        .get_role_state(ctx_id)
+        .await
+        .expect("role state must exist for an active context");
+    let bob_did = bob().to_string();
+    assert!(
+        role_state.member_has_capability(&bob_did, &Capability::GovernancePropose),
+        "AddSigner MUST grant governance:propose when the ceiling permits it"
+    );
+    assert!(
+        role_state.member_has_capability(&bob_did, &Capability::GovernanceVote),
+        "AddSigner MUST grant governance:vote when the ceiling permits it"
+    );
+}
+
 #[tokio::test]
 async fn ac10_extend_ttl_action() {
     let manager = new_manager();
