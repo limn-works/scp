@@ -893,6 +893,46 @@ pub struct SignedVote {
     pub signature: Ed25519Signature,
 }
 
+/// Outcome of an engine's pre-vote guard checks (`precheck_vote`).
+///
+/// The guard checks (eligibility, proposal existence, pending state, deadline,
+/// single-vote dedup) run **before** any signing or signature verification, so
+/// that a double vote is caught as `AlreadyVoted` regardless of which key signed
+/// it. Most engines only ever return [`Proceed`](PrecheckOutcome::Proceed) from
+/// a successful precheck. The majority engine additionally short-circuits a
+/// past-deadline vote by auto-resolving the proposal **without recording a vote
+/// and without signing** — that case is carried by
+/// [`Resolved`](PrecheckOutcome::Resolved) so the caller returns the resolution
+/// directly.
+pub(super) enum PrecheckOutcome {
+    /// Guards passed; the caller should build the vote, (for the signed path)
+    /// sign and verify it, then call `push_and_resolve`.
+    Proceed,
+    /// The proposal was auto-resolved during precheck (majority past-deadline).
+    /// The caller returns this status and its events directly, recording no
+    /// vote and performing no signing or verification.
+    Resolved((ProposalStatus, Vec<GovernanceEvent>)),
+}
+
+/// Build an unsigned (empty-signature) [`SignedVote`] for the keyless
+/// [`TrustedVoteIngest`] path.
+///
+/// Used by every engine's `ingest_approve` / `ingest_reject` implementation to
+/// construct the vote that is fed through the shared post-verify tally. The
+/// signature is deliberately empty (`Vec::new()`): the keyless path performs no
+/// signing and no verification — the caller is responsible for authenticating
+/// the vote out-of-band (see [`TrustedVoteIngest`]). The `now` argument is read
+/// from [`GovernanceContext::now`], the same clock the signed path uses, so no
+/// independent clock is introduced.
+pub(super) fn build_unsigned_vote(voter: &DID, vote: VoteType, now: u64) -> SignedVote {
+    SignedVote {
+        voter_did: voter.clone(),
+        vote,
+        timestamp: now,
+        signature: Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RejectionReason
 // ---------------------------------------------------------------------------

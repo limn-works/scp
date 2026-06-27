@@ -199,25 +199,27 @@ impl UnanimityEngine {
         Ok((new_status, events))
     }
 
-    /// Record an already-built vote and run the tally.
+    /// Run the pre-vote guard checks.
     ///
-    /// Shared by the signed [`GovernanceEngine::approve`] /
-    /// [`GovernanceEngine::reject`] path and the keyless
-    /// [`TrustedVoteIngest`](super::TrustedVoteIngest) path. This helper begins
-    /// **after** any signature verification: the signed path verifies the vote
-    /// against the voter's DID-resolved key before calling this; the keyless
-    /// path supplies an empty-signature vote. The shared portion is the
-    /// eligibility check, pending check, deadline guard, single-vote dedup, the
-    /// push into `approvals`/`rejections`, the `VoteCast` event, and the
-    /// resolve (a single rejection vetoes immediately).
-    fn record_vote_and_resolve(
-        &mut self,
+    /// This is the portion that MUST run **before** any signing or signature
+    /// verification on the signed path, so that a double vote is caught as
+    /// `AlreadyVoted` regardless of which key signed the second attempt, and an
+    /// ineligible voter is rejected as `NotEligible` rather than
+    /// `InvalidSignature`. The checks and their error variants match the
+    /// original pre-refactor `approve`/`reject` exactly: eligibility
+    /// (`NotEligible`), proposal existence (`ProposalNotFound`), pending state
+    /// (`ProposalNotPending`), deadline (`VotingWindowExpired`), single-vote
+    /// dedup (`AlreadyVoted`).
+    ///
+    /// Unanimity treats a past-deadline vote as `VotingWindowExpired` (no
+    /// auto-resolve), so this only ever returns
+    /// [`PrecheckOutcome::Proceed`](super::PrecheckOutcome::Proceed) on success.
+    fn precheck_vote(
+        &self,
         proposal_id: &ProposalId,
         voter: &DID,
-        signed_vote: super::SignedVote,
-        vote: VoteType,
         context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+    ) -> Result<super::PrecheckOutcome, GovernanceError> {
         // Voter must be in the voter set.
         if !self.is_voter(voter) {
             return Err(GovernanceError::NotEligible(
@@ -251,7 +253,27 @@ impl UnanimityEngine {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Key is guaranteed present because we just looked it up via `get()` above.
+        Ok(super::PrecheckOutcome::Proceed)
+    }
+
+    /// Record an already-checked, already-verified vote and run the tally.
+    ///
+    /// Runs **after** `precheck_vote` (and, on the signed path, after signature
+    /// verification): pushes the vote into `approvals`/`rejections`, emits the
+    /// `VoteCast` event, and resolves (a single rejection vetoes immediately).
+    /// No unverified vote ever reaches this point on the signed path — the
+    /// keyless [`TrustedVoteIngest`](super::TrustedVoteIngest) path supplies an
+    /// empty-signature vote by contract.
+    fn push_and_resolve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        signed_vote: super::SignedVote,
+        vote: VoteType,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Key is guaranteed present: precheck_vote looked it up and we hold
+        // `&mut self` continuously since then.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
             match vote {
                 VoteType::Approve => proposal_mut.approvals.push(signed_vote),
@@ -389,6 +411,15 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Guards run BEFORE sign/verify: a double vote must be caught as
+        // AlreadyVoted (and an ineligible voter as NotEligible) regardless of
+        // which key signed the attempt. Unanimity never early-resolves in
+        // precheck, so Proceed is the only success outcome.
+        match self.precheck_vote(proposal_id, voter, context)? {
+            super::PrecheckOutcome::Proceed => {}
+            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+        }
+
         // Build and sign the vote.
         let vote = sign_vote(
             proposal_id,
@@ -399,8 +430,8 @@ impl GovernanceEngine for UnanimityEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before record_vote_and_resolve: the signed
-        // path counts a vote only after its signature is verified.
+        // This MUST stay strictly before push_and_resolve: the signed path
+        // counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -413,7 +444,7 @@ impl GovernanceEngine for UnanimityEngine {
             }
         })?;
 
-        self.record_vote_and_resolve(proposal_id, voter, vote, VoteType::Approve, context)
+        self.push_and_resolve(proposal_id, voter, vote, VoteType::Approve, context)
     }
 
     fn reject(
@@ -423,6 +454,12 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        // Guards run BEFORE sign/verify (see `approve`).
+        match self.precheck_vote(proposal_id, voter, context)? {
+            super::PrecheckOutcome::Proceed => {}
+            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+        }
+
         // Build and sign the rejection vote.
         let vote = sign_vote(
             proposal_id,
@@ -433,8 +470,8 @@ impl GovernanceEngine for UnanimityEngine {
         )?;
 
         // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before record_vote_and_resolve: the signed
-        // path counts a vote only after its signature is verified.
+        // This MUST stay strictly before push_and_resolve: the signed path
+        // counts a vote only after its signature is verified.
         let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
             GovernanceError::UnknownVoter {
                 did: voter.to_string(),
@@ -447,7 +484,7 @@ impl GovernanceEngine for UnanimityEngine {
             }
         })?;
 
-        self.record_vote_and_resolve(proposal_id, voter, vote, VoteType::Reject, context)
+        self.push_and_resolve(proposal_id, voter, vote, VoteType::Reject, context)
     }
 
     fn withdraw_vote(
@@ -660,18 +697,16 @@ impl super::TrustedVoteIngest for UnanimityEngine {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Keyless: build an empty-signature vote and feed it through the same
-        // tally as the signed path. No sign_vote, no verify_vote — the caller
-        // is responsible for authenticating the vote out-of-band (see the
-        // TrustedVoteIngest contract). The timestamp is read from
-        // GovernanceContext::now, the same clock the signed path uses.
-        let signed_vote = super::SignedVote {
-            voter_did: voter.clone(),
-            vote: VoteType::Approve,
-            timestamp: context.now,
-            signature: Vec::new(),
-        };
-        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
+        // Keyless: run the same guards, then push an empty-signature vote
+        // through the same tally as the signed path. No sign_vote, no
+        // verify_vote — the caller is responsible for authenticating the vote
+        // out-of-band (see the TrustedVoteIngest contract).
+        match self.precheck_vote(proposal_id, voter, context)? {
+            super::PrecheckOutcome::Proceed => {}
+            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+        }
+        let signed_vote = super::build_unsigned_vote(voter, VoteType::Approve, context.now);
+        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
     }
 
     fn ingest_reject(
@@ -680,13 +715,12 @@ impl super::TrustedVoteIngest for UnanimityEngine {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let signed_vote = super::SignedVote {
-            voter_did: voter.clone(),
-            vote: VoteType::Reject,
-            timestamp: context.now,
-            signature: Vec::new(),
-        };
-        self.record_vote_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
+        match self.precheck_vote(proposal_id, voter, context)? {
+            super::PrecheckOutcome::Proceed => {}
+            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+        }
+        let signed_vote = super::build_unsigned_vote(voter, VoteType::Reject, context.now);
+        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
     }
 }
 
