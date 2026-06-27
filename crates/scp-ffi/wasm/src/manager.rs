@@ -1613,11 +1613,15 @@ impl WasmContextManager {
             .as_str()
             .unwrap_or("single_admin")
             .to_owned();
-        // Reject an unrecognized governance model BEFORE any state is mutated.
-        // An unknown model would otherwise be stored verbatim and silently
-        // collapse to `single_admin` auto-execute in `governance_quorum` (its
-        // `_ =>` arm) — a security-relevant fail-open. Native validates the same
-        // string into the typed `GovernanceModel` enum; this is the WASM analogue.
+        // Reject an unrecognized governance model NAME before any state is
+        // mutated. An unknown model would otherwise be stored verbatim and
+        // silently collapse to `single_admin` auto-execute in `governance_quorum`
+        // (its `_ =>` arm) — a security-relevant fail-open. This validates the
+        // model discriminant only; it does NOT validate the quorum parameters
+        // (signer set / threshold value) that native's typed `GovernanceModel`
+        // additionally carries, so a recognized model (e.g. `threshold`) can
+        // still hold a degenerate quorum until the shared governance engine is
+        // adopted on the WASM path.
         validate_governance_model(&governance)?;
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
