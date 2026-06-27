@@ -445,7 +445,7 @@ class TestBehavioralRecord:
         assert br.contexts_participated == 0
         assert br.total_duration == 0.0
         assert br.governance_actions_against == 0
-        assert br.tool_invocations == []
+        assert br.tool_invocations == {}
         assert br.role_history == []
         assert br.endorsement_accuracy is None
 

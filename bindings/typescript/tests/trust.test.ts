@@ -196,33 +196,39 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
   it("builds the Layer-2 behavioral record from ToolInvoked events", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
+    // The mock returns the REAL NAPI/WASM bridge shape that `eventLogQuery`
+    // dispatches verbatim — `{eventType, actorDid, timestamp, payloadJson (a
+    // JSON STRING), sequence}`. The bridge never emits a `payload` OBJECT, and
+    // the queryable payloadJson carries no tool id, so all ToolInvoked events
+    // bucket under the literal "ToolInvoked" key (spec §7.2.4; per-tool-type
+    // keying awaits ADR-051's richer payload).
     native.__stub("eventLogQuery", async () => [
       {
         eventType: "ToolInvoked",
         actorDid: "did:dht:subject",
         timestamp: 1,
-        payload: { toolId: "calculator" },
+        payloadJson: JSON.stringify({ hash: "aa" }),
         sequence: 0,
       },
       {
         eventType: "ToolInvoked",
         actorDid: "did:dht:subject",
         timestamp: 2,
-        payload: { toolId: "calculator" },
+        payloadJson: JSON.stringify({ hash: "bb" }),
         sequence: 1,
       },
       {
         eventType: "GovernanceActionExecuted",
         actorDid: "did:dht:subject",
         timestamp: 3,
-        payload: {},
+        payloadJson: JSON.stringify({ hash: "cc" }),
         sequence: 2,
       },
     ]);
 
     const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
     expect(result.behavioralRecord.participationCount).toBe(3);
-    expect(result.behavioralRecord.toolInvocations).toEqual({ calculator: 2 });
+    expect(result.behavioralRecord.toolInvocations).toEqual({ ToolInvoked: 2 });
     expect(result.behavioralRecord.governanceActionsBy).toBe(1);
     expect(result.subjectDid).toBe("did:dht:subject");
     expect(result.contextId).toBe("ctx-1");
