@@ -346,6 +346,14 @@ impl crate::scp::PyScp {
     /// `presenting_agent_did` (defaults to the token's `aud`), and optional
     /// `proof_tokens` for delegation chains.
     ///
+    /// WARNING: when `presenting_agent_did` is omitted (or empty) the audience
+    /// defaults to the token's OWN `aud`, making the step-5 audience check a
+    /// tautological self-check (`aud == aud`) that does NOT bind the token to any
+    /// external subject. A caller assessing a SPECIFIC subject MUST pass that
+    /// subject's DID — otherwise a token addressed to someone else would report
+    /// `signatures_valid` (trust inflation). The SDK trust path always passes the
+    /// subject; this default is a convenience for self-evaluation only.
+    ///
     /// `capability` is OPTIONAL. When omitted (or empty), the token is evaluated
     /// for INTRINSIC validity only — no specific capability is challenged, so the
     /// invoked-capability grant-match step is skipped (mirroring
