@@ -292,13 +292,17 @@ impl ThresholdEngine {
         // `precheck_vote` already validated the proposal exists, is pending, and
         // within the deadline. We re-acquire it via `get_mut` here; in the
         // single-threaded `&mut self` flow it cannot have been removed in
-        // between, so the `if let Some(..)` simply no-ops on the impossible
-        // absence rather than panicking.
-        if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
-            match vote {
-                VoteType::Approve => proposal_mut.approvals.push(signed_vote),
-                VoteType::Reject => proposal_mut.rejections.push(signed_vote),
+        // between, so the absence is impossible. We nonetheless fail loud with
+        // `ProposalNotFound` (mirroring `MajorityVoteEngine::push_and_resolve`)
+        // rather than silently mis-tallying on the impossible `None`.
+        let proposal_mut = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
             }
+        })?;
+        match vote {
+            VoteType::Approve => proposal_mut.approvals.push(signed_vote),
+            VoteType::Reject => proposal_mut.rejections.push(signed_vote),
         }
 
         let mut events = vec![GovernanceEvent::VoteCast {
@@ -438,6 +442,9 @@ impl GovernanceEngine for ThresholdEngine {
         // precheck, so Proceed is the only success outcome.
         match self.precheck_vote(proposal_id, voter, context)? {
             super::PrecheckOutcome::Proceed => {}
+            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
+            // past-deadline rather than auto-resolving. This arm exists only for
+            // call-site uniformity with the majority engine.
             super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
         }
 
@@ -478,6 +485,9 @@ impl GovernanceEngine for ThresholdEngine {
         // Guards run BEFORE sign/verify (see `approve`).
         match self.precheck_vote(proposal_id, voter, context)? {
             super::PrecheckOutcome::Proceed => {}
+            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
+            // past-deadline rather than auto-resolving. This arm exists only for
+            // call-site uniformity with the majority engine.
             super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
         }
 
@@ -725,6 +735,9 @@ impl super::TrustedVoteIngest for ThresholdEngine {
         // out-of-band (see the TrustedVoteIngest contract).
         match self.precheck_vote(proposal_id, voter, context)? {
             super::PrecheckOutcome::Proceed => {}
+            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
+            // past-deadline rather than auto-resolving. This arm exists only for
+            // call-site uniformity with the majority engine.
             super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
         }
         let signed_vote = super::build_unsigned_vote(voter, VoteType::Approve, context.now);
@@ -739,6 +752,9 @@ impl super::TrustedVoteIngest for ThresholdEngine {
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         match self.precheck_vote(proposal_id, voter, context)? {
             super::PrecheckOutcome::Proceed => {}
+            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
+            // past-deadline rather than auto-resolving. This arm exists only for
+            // call-site uniformity with the majority engine.
             super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
         }
         let signed_vote = super::build_unsigned_vote(voter, VoteType::Reject, context.now);
