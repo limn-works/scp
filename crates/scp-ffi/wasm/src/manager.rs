@@ -2071,20 +2071,17 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
-        // Per-member message-sequence sidecar. The `+= 1` matches native's
-        // `MembershipState::next_sequence_number` (membership.rs), which also
-        // uses a plain `+= 1`, but the BASE differs by one in a known direction:
-        // native PRE-increments (`info.sequence_number += 1; info.sequence_number`
-        // — it bumps THEN returns, so the first message's sequence is 1), while
-        // this WASM sidecar POST-increments (`let seq = *entry; *entry += 1;`
-        // from base 0 — it returns the current value THEN bumps, so the first
-        // message's sequence is 0). This is a real off-by-one in the emitted
-        // per-author `sequence_number` (not merely an internal base discrepancy),
-        // and the direction must be reconciled when WASM adopts the shared
-        // `MembershipState`. The per-author byte values are themselves out of
-        // cross-family export byte-parity scope per ADR-050 (each author mints
-        // its own sequence with no global order), but the increment direction
-        // must converge.
+        // Per-member message-sequence sidecar. This PRE-increments to match
+        // native's `MembershipState::next_sequence_number` (membership.rs),
+        // which does `info.sequence_number += 1; info.sequence_number` — it
+        // bumps THEN returns, so the first message's sequence is 1. The WASM
+        // sidecar bumps the stored counter from its base 0 and returns the
+        // post-increment value, so the first message's emitted
+        // `sequence_number` is likewise 1. The base divergence with native is
+        // RESOLVED: both families now emit 1-based per-author sequences. The
+        // per-author byte values remain out of cross-family export byte-parity
+        // scope per ADR-050 (each author mints its own sequence with no global
+        // order), but the increment direction and base now converge.
         // Note whether the sender already had a sequence entry, so a failure
         // that created a fresh `0` entry can remove it cleanly on rollback.
         let seq_was_present = ctx.member_sequence_numbers.contains_key(sender_did);
@@ -2092,8 +2089,8 @@ impl WasmContextManager {
             .member_sequence_numbers
             .entry(sender_did.to_owned())
             .or_insert(0);
-        let seq = *seq_entry;
         *seq_entry += 1;
+        let seq = *seq_entry;
 
         // If crypto state is available, encrypt the payload before recording.
         //
@@ -5674,14 +5671,15 @@ impl WasmContextManager {
                 code: codes::PERM_3000.to_owned(),
             });
         }
-        // Per-member sequence sidecar — see `send_message` for the deferred
-        // MembershipState convergence note.
+        // Per-member sequence sidecar — see `send_message`. PRE-increments to
+        // match native `MembershipState::next_sequence_number`, so the
+        // broadcast author's first published `sequence_number` is 1.
         let seq_entry = ctx
             .member_sequence_numbers
             .entry(author_did.to_owned())
             .or_insert(0);
-        let seq = *seq_entry;
         *seq_entry += 1;
+        let seq = *seq_entry;
 
         ctx.push_event(ContextEvent::MessageSent {
             sender_did: DID(author_did.to_owned()),
@@ -10474,9 +10472,10 @@ mod tests {
     /// opening a gap that two honest members would derive differently.
     ///
     /// Exercises the REAL crypto path (`WasmCryptoState::new_for_context` so
-    /// `ctx.crypto` is `Some`): one successful encrypted send (seq 0, counter
-    /// -> 1), then a send with an invalid-base64 payload that fails at the
-    /// `CRYPTO_4001` decode step. The counter must stay at 1, not advance to 2.
+    /// `ctx.crypto` is `Some`): one successful encrypted send (emits seq 1,
+    /// counter -> 1), then a send with an invalid-base64 payload that fails at
+    /// the `CRYPTO_4001` decode step. The counter must stay at 1, not advance
+    /// to 2.
     #[test]
     fn send_message_failure_does_not_advance_sequence_wasm() {
         let context_id = "ctx-send-rollback";
@@ -10492,7 +10491,8 @@ mod tests {
             );
         }
 
-        // First send succeeds: seq 0 is consumed, counter advances to 1.
+        // First send succeeds: it emits sequence 1 (pre-increment from base 0),
+        // and the stored counter advances to 1.
         mgr.send_message(context_id, creator, "aGVsbG8=", None)
             .expect("a valid encrypted send must succeed");
         assert_eq!(
@@ -10600,32 +10600,28 @@ mod tests {
         );
     }
 
-    /// HONEST KNOWN-GAP MARKER (deliberately `#[ignore]`d — do NOT remove the
-    /// attribute to make it "pass").
+    /// CONVERGENCE GUARD: the WASM per-member message sequence base is
+    /// reconciled to native and must stay reconciled.
     ///
-    /// The WASM per-member message sequence is 0-based: the sidecar
-    /// POST-increments from base `0` (`let seq = *entry; *entry += 1;`), so the
-    /// FIRST message's emitted `sequence_number` is `0` and the counter then
-    /// reads `Some(1)`. Native's `MembershipState::next_sequence_number`
-    /// PRE-increments (`info.sequence_number += 1; info.sequence_number`), so
-    /// the first message's sequence is `1`. This is a real off-by-one in the
-    /// emitted per-author `sequence_number`, not merely an internal base
-    /// discrepancy, and the direction must be reconciled when WASM adopts the
-    /// shared `MembershipState`. The per-author byte values are themselves out
-    /// of cross-family export byte-parity scope per ADR-050 (each author mints
-    /// its own sequence with no global order), but the increment direction must
-    /// converge — hence this tracking marker rather than a silent comment.
+    /// The WASM sidecar now PRE-increments from base `0`
+    /// (`*entry += 1; let seq = *entry;`), so the FIRST message's emitted
+    /// `sequence_number` is `1`, matching native's
+    /// `MembershipState::next_sequence_number`
+    /// (`info.sequence_number += 1; info.sequence_number`), which is also
+    /// 1-based. The prior off-by-one (WASM emitting `0` for the first message)
+    /// is RESOLVED — both families emit the same 1-based per-author sequence.
+    /// The per-author byte values remain out of cross-family export
+    /// byte-parity scope per ADR-050 (each author mints its own sequence with
+    /// no global order), but the increment direction and base now converge.
     ///
-    /// The body asserts the CURRENT WASM behavior (first send emits sequence
-    /// `0`; counter then reads `Some(1)`) so that when WASM adopts the shared
-    /// `MembershipState`, this test flips RED and forces a deliberate update.
+    /// The body drives a successful first send through the production
+    /// `send_message` path with real MLS crypto attached and asserts the
+    /// emitted `MessageSent.sequence_number` is `1` (1-based, matching native)
+    /// and the stored counter reads `Some(1)`. If a future change regresses the
+    /// base back to 0-based, this test flips RED.
     #[test]
-    #[ignore = "WASM per-member message sequence is 0-based (post-increment); native \
-                MembershipState::next_sequence_number is 1-based (pre-increment). \
-                Reconcile when WASM adopts the shared MembershipState. Out of \
-                cross-family export byte-parity scope per ADR-050."]
-    fn wasm_per_member_sequence_base_diverges_from_native_pending() {
-        let context_id = "ctx-seq-base-divergence";
+    fn wasm_per_member_sequence_base_matches_native() {
+        let context_id = "ctx-seq-base-convergence";
         let creator = "did:dht:zcreator";
         let member = "did:dht:zmember";
         let mut mgr = make_free_ctx_for_send_auth(context_id, creator);
@@ -10644,8 +10640,9 @@ mod tests {
         mgr.send_message(context_id, creator, "aGVsbG8=", None)
             .expect("a valid encrypted send must succeed");
 
-        // CURRENT WASM behavior: the first emitted MessageSent carries
-        // sequence_number 0 (0-based, post-increment). Native would emit 1.
+        // RECONCILED behavior: the first emitted MessageSent carries
+        // sequence_number 1 (1-based, pre-increment) — exactly what native's
+        // `MembershipState::next_sequence_number` emits for a first send.
         let first_seq = mgr
             .drain_events(context_id)
             .into_iter()
@@ -10659,17 +10656,18 @@ mod tests {
             })
             .expect("the successful send must emit a MessageSent buffer event");
         assert_eq!(
-            first_seq, 0,
-            "CURRENT WASM behavior: the first per-author message sequence is 0 \
-             (post-increment from base 0). Native pre-increments to 1 — when \
-             WASM adopts the shared MembershipState this assertion must flip."
+            first_seq, 1,
+            "RECONCILED: the first per-author message sequence is 1 \
+             (pre-increment from base 0), matching native \
+             MembershipState::next_sequence_number. A regression to 0-based \
+             must flip this assertion RED."
         );
 
-        // And the counter now reads Some(1) (the post-increment landed).
+        // And the stored counter reads Some(1) after the first send.
         assert_eq!(
             mgr.contexts[context_id].test_member_sequence_number(creator),
             Some(1),
-            "after the first send the 0-based counter reads Some(1)"
+            "after the first send the counter reads Some(1)"
         );
     }
 
