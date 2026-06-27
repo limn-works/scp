@@ -10039,12 +10039,15 @@ impl Scp {
                 code: codes::CTX_2060.to_owned(),
             })??;
 
-        // Re-sync role state from the Supervisor after the deferred apply: it LOWERS
-        // the ceiling and the shared `ContextRoleState::set_ceiling` eager reconcile
-        // prunes `member_capabilities`/role definitions in the actor. Without this
-        // sync the Swift/Kotlin SDKs see stale role state for UCAN/tool capability
-        // checks and the local Tier-2 gate would serve out-of-ceiling capabilities.
-        // Sync regardless of `applied` (a no-op when nothing changed; harmless).
+        // After the deferred apply (which LOWERS the ceiling and runs the shared
+        // `ContextRoleState::set_ceiling` eager reconcile in the actor), run the
+        // post-governance role-state sync for consistency with the other governance
+        // paths. NOTE: unlike the PyO3/NAPI bridges, UniFFI holds NO FFI-local
+        // role-state copy — every capability check reads live from the Supervisor —
+        // so this call does NOT write reconciled state back; it is a liveness /
+        // traceability check (it validates the context still resolves and logs). The
+        // actor-side reconcile is therefore already visible to live reads. The
+        // load-bearing stale-cache write-backs live in the PyO3/NAPI apply paths.
         if let Err(e) = self
             .inner
             .sync_role_state_from_manager(&handle.context_id)
@@ -10053,8 +10056,7 @@ impl Scp {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
-                "failed to sync role state after ceiling-modification apply — \
-                 local capability checks may be stale"
+                "post-apply role-state liveness check failed after ceiling-modification apply"
             );
         }
 

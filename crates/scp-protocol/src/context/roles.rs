@@ -1845,11 +1845,14 @@ impl ContextRoleState {
     /// (`role_definitions[*].capabilities`, `member_capabilities[*]`,
     /// `suspended_capabilities[*]`) is intersected with the new ceiling, dropping
     /// any capability no longer within it (see [`Self::reconcile_to_ceiling`]).
-    /// The reconciliation is a pure SHRINK: it is a no-op on a WIDEN (every
-    /// previously cached capability is still within a wider ceiling) and idempotent
-    /// (a second `set_ceiling` with the same ceiling yields a byte-identical
-    /// `ContextRoleState`, preserving the §23.16.8 / ADR-050 deterministic export
-    /// digest). Because this is the single whole-ceiling write chokepoint, BOTH the
+    /// The reconciliation is a pure SHRINK: it never grants, so a WIDEN adds no
+    /// capability (every previously cached capability is still within a wider
+    /// ceiling), and a same-ceiling re-application is a true no-op — the load-bearing
+    /// property for the §23.16.8 / ADR-050 deterministic export digest (stable across
+    /// repeated same-ceiling applies). (A SHRINK also drops now-empty cache entries,
+    /// so the first pass over a state holding an empty-capability entry need not be
+    /// byte-identical; an empty and an absent entry are equivalent at the gate, so
+    /// behavior is unchanged.) Because this is the single whole-ceiling write chokepoint, BOTH the
     /// native deferred-apply path (`apply_pending_ceiling_modification`) and the
     /// WASM `dispatch_modify_ceiling` path inherit reconciliation identically.
     /// Soundness of this reconciliation as guard (ii) of the read-time-trust
