@@ -36,6 +36,32 @@ import type {
 } from "../types";
 
 // ---------------------------------------------------------------------------
+// Shared CapabilityValidation projection
+// ---------------------------------------------------------------------------
+
+/**
+ * Projects a bridge `ucan_evaluate` result onto the SDK
+ * {@link CapabilityValidation} shape.
+ *
+ * The NAPI bridge result (`NapiCapabilityValidation`) already exposes the six
+ * camelCase booleans, so this is a field-for-field copy that pins the canonical
+ * six-field shape in ONE place — the native bridge factory calls it, so a field
+ * can never be silently dropped or re-spelled (ADR-055 / spec §7.2.4). The copy
+ * (rather than returning `raw`) keeps the SDK object's own identity and strips
+ * any extra bridge fields.
+ */
+export function toCapabilityValidation(raw: CapabilityValidation): CapabilityValidation {
+  return {
+    tokensValid: raw.tokensValid,
+    signaturesValid: raw.signaturesValid,
+    withinCeiling: raw.withinCeiling,
+    nonceValid: raw.nonceValid,
+    notRevoked: raw.notRevoked,
+    timeBoundsValid: raw.timeBoundsValid,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Bridge interface — the contract the native bridge implements
 // ---------------------------------------------------------------------------
 
@@ -735,7 +761,10 @@ export const BRIDGE_TARGET: BridgeTarget = "native";
 /**
  * Wraps a bridge object so that every raw FFI error thrown by one of its own
  * function-valued properties is converted into a typed {@link ScpError}
- * subclass via {@link mapBridgeError} at exactly one site per bridge.
+ * subclass via the single {@link mapBridgeError} function, applied at one site
+ * per dispatch surface — here, this `wrapBridgeErrors` Proxy over both bridge
+ * factories (and, separately, the SCP-class methods that dispatch through the
+ * raw addon directly).
  *
  * {@link createNativeBridge} returns its bridge object through this wrapper, so
  * callers (e.g. `discovery.ts`, `trust.ts`) no longer need per-method
