@@ -88,7 +88,8 @@ The 11 validation steps are:
 At **intra-context operation time**, the protocol uses a derived capability cache (`member_capabilities` in `ContextRoleState`) rather than re-running the full 11-step pipeline on every action. This cache is:
 
 - **Derived from ceiling-validated UCAN tokens:** The cache is populated exclusively from tokens minted by `mint_role_tokens()` during role assignment, which are validated against the context's capability ceiling at construction time. It is never populated from unvalidated sources.
-- **Updated atomically on role change:** When `assign_role()` succeeds, the member's cached capabilities are replaced with the new role's capability set in the same operation. There is no window where stale capabilities are served.
+- **Updated atomically on role change:** When `assign_role()` succeeds, the member's cached capabilities are replaced with the new role's capability set in the same operation.
+- **Reconciled atomically on ceiling change:** When the capability ceiling is lowered (a governed `ModifyCeiling` activation, §5.3.2 step 5), the cache and every role definition's permission set are intersected with the new ceiling in the same operation that installs it, dropping any capability no longer within it. Combined with the role-change update above, there is **no window where stale capabilities are served**: the cache never holds a capability outside the current ceiling, because every write that populates it is ceiling-bounded at write time (role assignment mints from ceiling-validated tokens; ceiling lowering eagerly prunes) — the gate therefore does not re-intersect against the ceiling at read time, and none is needed.
 - **Checked on every operation:** Every context operation — `send()`, `invoke_tool()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
 
 Operations that check the cache include:

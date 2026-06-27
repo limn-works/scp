@@ -10011,7 +10011,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
-        runtime()
+        let applied = runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 use scp_core::context::actor::commands::GovernanceCommand;
@@ -10037,7 +10037,28 @@ impl Scp {
                     "tokio task join error during apply_pending_ceiling_modification: {e}"
                 ),
                 code: codes::CTX_2060.to_owned(),
-            })?
+            })??;
+
+        // Re-sync role state from the Supervisor after the deferred apply: it LOWERS
+        // the ceiling and the shared `ContextRoleState::set_ceiling` eager reconcile
+        // prunes `member_capabilities`/role definitions in the actor. Without this
+        // sync the Swift/Kotlin SDKs see stale role state for UCAN/tool capability
+        // checks and the local Tier-2 gate would serve out-of-ceiling capabilities.
+        // Sync regardless of `applied` (a no-op when nothing changed; harmless).
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                error = %e,
+                "failed to sync role state after ceiling-modification apply — \
+                 local capability checks may be stale"
+            );
+        }
+
+        Ok(applied)
     }
 
     /// Per-instance equivalent of the free-function `finalize_close`.

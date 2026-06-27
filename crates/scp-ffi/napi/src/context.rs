@@ -3508,7 +3508,7 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
     // Route through the ADR-049 governance dispatch surface.
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = GovernanceCommand::ApplyPendingCeilingModification {
-        context_id,
+        context_id: context_id.clone(),
         current_timestamp: ts,
         reply: tx,
     };
@@ -3518,7 +3518,8 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
             code: codes::CTX_2060.to_owned(),
         })
     })?;
-    rx.await
+    let applied = rx
+        .await
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("apply_pending_ceiling_modification shim reply dropped: {e}"),
@@ -3530,7 +3531,24 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
                 message: format!("apply_pending_ceiling_modification failed: {e}"),
                 code: codes::CTX_2060.to_owned(),
             })
-        })
+        })?;
+
+    // Re-sync the FFI-local role-state cache: the deferred apply LOWERS the ceiling
+    // and the shared `ContextRoleState::set_ceiling` eager reconcile prunes
+    // `member_capabilities`/role definitions in the actor. Without this sync the FFI
+    // copy keeps the pre-lowering, out-of-ceiling capabilities and the local Tier-2
+    // gate would serve them. Sync regardless of `applied` (a no-op when nothing
+    // changed; harmless).
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to sync role state after ceiling-modification apply — \
+             local capability checks may be stale"
+        );
+    }
+
+    Ok(applied)
 }
 
 /// Per-bridge-instance implementation of [`context_finalize_close`].

@@ -7472,4 +7472,124 @@ impl ClassSCell
             "staged pending modification carries the proposed capabilities verbatim"
         );
     }
+
+    /// End-to-end: a governed `ModifyCeiling` that LOWERS the ceiling, once the
+    /// notification window elapses and `apply_pending_ceiling_modification` runs,
+    /// must PRUNE every member's now-out-of-ceiling cached capability (spec §5.3.2
+    /// step 5 eager reconciliation) so the local Tier-2 gate
+    /// (`member_has_capability`) denies it — while an in-ceiling capability is still
+    /// served. The apply routes through the shared `ContextRoleState::set_ceiling`
+    /// reconcile, so this exercises the production seam, not the unit-level mutator.
+    #[tokio::test]
+    async fn apply_pending_ceiling_modification_prunes_out_of_ceiling_member_capability() {
+        use scp_protocol::context::roles::Capability;
+
+        let deps = build_deps(Box::new(OkPersistence)).await;
+        let ctx_id = ctx_hex(0xC3);
+
+        // Seed a member who holds MessagesRead + MessagesWrite within a ceiling that
+        // permits both, BEFORE wrapping in the `!DerefMut` `ClassSCell` (ADR-049 §9
+        // gives the cell no post-construction whole-state mutator). Build the state,
+        // seat the Governed ceiling policy + activate, then wrap.
+        let alice = "did:example:alice";
+        let mut state = fresh_state(0xC3);
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+            ]))
+            .expect("well-formed initial ceiling");
+        state.role_state.members.insert(alice.to_owned());
+        state.role_state.member_capabilities.insert(
+            alice.to_owned(),
+            [Capability::MessagesRead, Capability::MessagesWrite]
+                .into_iter()
+                .collect(),
+        );
+        let params = scp_protocol::context::params::ContextParams {
+            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
+            ..scp_protocol::context::params::ContextParams::default()
+        };
+        state.handle = crate::context::ContextHandle::new(ctx_hex(0xC3), params);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+        let mut cell = ClassSCell::new(state);
+        // Precondition: the local gate serves MessagesWrite.
+        assert!(
+            cell.role_state
+                .member_has_capability(alice, &Capability::MessagesWrite),
+            "precondition: member holds MessagesWrite before the ceiling lowers"
+        );
+
+        // Stage a governed ModifyCeiling that LOWERS to read-only (drops
+        // MessagesWrite).
+        let lowered = vec![Capability::MessagesRead];
+        crate::context::governance_helpers::execute_modify_ceiling(
+            &mut cell,
+            &deps,
+            &ctx_id,
+            &lowered,
+            ceiling_commit_meta(),
+        )
+        .expect("well-formed ceiling lowering stages");
+
+        // Before the notification window elapses, apply is a no-op (returns false)
+        // and the capability is still served.
+        let applied_early = crate::context::governance_helpers::apply_pending_ceiling_modification(
+            &mut cell, &deps, &ctx_id, 0,
+        )
+        .await
+        .expect("early apply is Ok");
+        assert!(
+            !applied_early,
+            "apply before the notification period must be a no-op"
+        );
+        assert!(
+            cell.role_state
+                .member_has_capability(alice, &Capability::MessagesWrite),
+            "before activation the existing ceiling remains in effect (§5.3.2 step 2)"
+        );
+
+        // Advance the clock well past the convergent effective_at AND the
+        // non-backdatable observed_at + notification-period floor, then apply.
+        let far_future = u64::from(u32::MAX);
+        let applied = crate::context::governance_helpers::apply_pending_ceiling_modification(
+            &mut cell, &deps, &ctx_id, far_future,
+        )
+        .await
+        .expect("apply after the notification period is Ok");
+        assert!(
+            applied,
+            "the pending modification must apply after the window"
+        );
+
+        // Post-apply: the lowered ceiling is installed and the cached MessagesWrite
+        // has been reconciled away — the local gate now DENIES it, while the
+        // in-ceiling MessagesRead is still served.
+        assert_eq!(
+            cell.role_state.ceiling(),
+            &scp_protocol::context::roles::CapabilityCeiling::new([Capability::MessagesRead]),
+            "the lowered ceiling is installed"
+        );
+        assert!(
+            !cell
+                .role_state
+                .member_has_capability(alice, &Capability::MessagesWrite),
+            "the out-of-ceiling cached capability must be pruned and denied at the gate"
+        );
+        assert!(
+            cell.role_state
+                .member_has_capability(alice, &Capability::MessagesRead),
+            "an in-ceiling capability is still served after the lowering"
+        );
+        // The pending record is cleared on a successful apply.
+        assert!(
+            cell.governance.pending_ceiling_modification.is_none(),
+            "a successful apply clears the pending ceiling modification"
+        );
+    }
 }

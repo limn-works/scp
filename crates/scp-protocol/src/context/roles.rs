@@ -1467,6 +1467,27 @@ pub struct RoleAssignment {
 /// all the state needed for role assignment operations without requiring
 /// access to `ContextHandle` internals. It is the primary input for
 /// [`assign_role`].
+///
+/// # `member_capabilities`/ceiling consistency invariant
+///
+/// [`Self::member_capabilities`] is trusted verbatim at the local Tier-2 gate
+/// ([`Self::member_has_capability`]) — it is deliberately NOT re-intersected
+/// against [`Self::ceiling`] at read time. That is sound because every WRITE that
+/// can place a capability into `member_capabilities` is itself ceiling-bounded:
+/// - [`Self::new`] and [`assign_role`]/[`system_assign_role`] only ever copy in
+///   capabilities from role definitions, which `new`/`set_ceiling` keep within the
+///   ceiling;
+/// - [`Self::set_ceiling`] runs [`Self::reconcile_to_ceiling`], which intersects
+///   the cache with a lowered ceiling (closing the lowering path);
+/// - the export/import reconstruction path installs a `role_state` whose integrity
+///   is bound by the creator's Ed25519 signature over the snapshot
+///   (`import_context`), so an attacker cannot inject an out-of-ceiling grant.
+///
+/// A future writer adding any NEW mutation of `member_capabilities` (or
+/// `role_definitions[*].capabilities`) MUST preserve this invariant — keep the
+/// write within the current ceiling, or route it through `set_ceiling` so
+/// reconciliation re-establishes it. Breaking it would let the local gate serve a
+/// capability the signed ceiling does not authorize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRoleState {
     /// The context's unique identifier.
@@ -1639,6 +1660,20 @@ impl ContextRoleState {
     ///
     /// Suspension-aware: returns `false` if the capability is in the member's
     /// suspended set, even if their role grants it.
+    ///
+    /// # Ceiling consistency (deliberately no use-time re-intersection)
+    ///
+    /// This gate reads [`Self::member_capabilities`] minus
+    /// [`Self::suspended_capabilities`] and does NOT additionally re-intersect the
+    /// result against [`Self::ceiling`]. That is sound — not an oversight — because
+    /// the cache is kept within the ceiling at WRITE time: ceiling-bounded role
+    /// copies, [`Self::set_ceiling`]'s eager [`Self::reconcile_to_ceiling`] on a
+    /// lowering, and the creator-Ed25519-signature-bound import path (see the
+    /// [`ContextRoleState`] type-level invariant). Adding a `self.ceiling.contains`
+    /// check here would be a redundant use-time re-check of a write-time-enforced
+    /// property. A future writer introducing an un-ceiling-bounded mutation of
+    /// `member_capabilities` MUST preserve the write-time invariant instead of
+    /// relying on a use-time re-check.
     #[must_use]
     pub fn member_has_capability(&self, member_did: &str, capability: &Capability) -> bool {
         // Check suspension first.
@@ -1778,6 +1813,22 @@ impl ContextRoleState {
     /// ceiling is left UNCHANGED (fail-closed: a rejected write never widens or
     /// poisons the authorization envelope).
     ///
+    /// EAGER CEILING RECONCILIATION (spec §5.3.2 step 5, §7.2.2): after the new
+    /// ceiling is validated and stored, the cached authorization state
+    /// (`role_definitions[*].capabilities`, `member_capabilities[*]`,
+    /// `suspended_capabilities[*]`) is intersected with the new ceiling, dropping
+    /// any capability no longer within it (see [`Self::reconcile_to_ceiling`]).
+    /// This guarantees there is NO window where the local Tier-2 gate
+    /// ([`Self::member_has_capability`]) serves a capability the lowered ceiling no
+    /// longer authorizes — the cache never holds an out-of-ceiling capability. The
+    /// reconciliation is a pure SHRINK: it is a no-op on a WIDEN (every previously
+    /// cached capability is still within a wider ceiling) and idempotent (a second
+    /// `set_ceiling` with the same ceiling yields a byte-identical
+    /// `ContextRoleState`, preserving the §23.16.8 / ADR-050 deterministic export
+    /// digest). Because this is the single whole-ceiling write chokepoint, BOTH the
+    /// native deferred-apply path (`apply_pending_ceiling_modification`) and the
+    /// WASM `dispatch_modify_ceiling` path inherit reconciliation identically.
+    ///
     /// # Errors
     ///
     /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if any entry of
@@ -1788,7 +1839,70 @@ impl ContextRoleState {
         // malformed ceiling cannot leave the state half-written.
         ceiling.validate_entries()?;
         self.ceiling = ceiling;
+        // Reconcile cached authorization state DOWN to the (possibly lowered) new
+        // ceiling so no stale, out-of-ceiling capability survives at the local gate
+        // (spec §5.3.2 step 5, §7.2.2).
+        self.reconcile_to_ceiling();
         Ok(())
+    }
+
+    /// Intersect all cached authorization state with the current ceiling, dropping
+    /// any capability no longer within it. SHRINK-ONLY and IDEMPOTENT: a no-op when
+    /// every cached capability is still within `self.ceiling` (i.e. on a WIDEN or a
+    /// same-ceiling re-application), so the deterministic export digest (§23.16.8,
+    /// ADR-050) is unchanged in those cases.
+    ///
+    /// Reconciles three caches against [`Self::ceiling`] (using
+    /// [`CapabilityCeiling::contains`], which honors the `ToolInvoke(id)`-under-
+    /// `ToolInvokeAll` wildcard):
+    /// - `role_definitions[*].capabilities` — a custom role whose permission set is
+    ///   fully pruned is RETAINED as an empty role (its name may still be referenced
+    ///   by `assignments`/membership; deleting the name would dangle those refs).
+    /// - `member_capabilities[*]` — a member whose cached grants are fully pruned has
+    ///   their (now empty) entry removed, mirroring the empty-set cleanup style of
+    ///   [`Self::prune_suspensions_to_role_grants`].
+    /// - `suspended_capabilities[*]` — a suspension referencing a capability no
+    ///   longer granted to that member becomes dead weight; pruned the same way as
+    ///   [`Self::prune_suspensions_to_role_grants`] (a pure shrink, harmless: a
+    ///   suspended-but-out-of-ceiling capability is denied at the gate regardless).
+    ///
+    /// Called only from [`Self::set_ceiling`] (the single whole-ceiling write
+    /// chokepoint), so it never runs on the verbatim export/import reconstruction
+    /// path (which installs a creator-signed `role_state` directly, NOT via
+    /// `set_ceiling`).
+    fn reconcile_to_ceiling(&mut self) {
+        // Bind the ceiling locally so the per-field `retain` closures below borrow
+        // only `self.ceiling` immutably while a single other field is borrowed
+        // mutably (no whole-`self` borrow conflict).
+        let ceiling = &self.ceiling;
+
+        // Prune each role definition's permission set; retain empty roles so
+        // assignment/membership references stay valid.
+        for role in self.role_definitions.values_mut() {
+            role.capabilities.retain(|cap| ceiling.contains(cap));
+        }
+
+        // Prune each member's cached capability set; drop members left with an
+        // empty set so no dangling empty entries remain (digest-stable cleanup).
+        self.member_capabilities.retain(|_member, caps| {
+            caps.retain(|cap| ceiling.contains(cap));
+            !caps.is_empty()
+        });
+
+        // Prune suspensions that reference a capability no longer within the
+        // ceiling OR no longer granted to that member; drop members left with an
+        // empty suspension set. Bind the (already-pruned) `member_capabilities` to
+        // a local immutable reference so the `retain` closure splits the borrow:
+        // `self.suspended_capabilities` mutable, `member_capabilities` immutable —
+        // disjoint fields, no whole-`self` conflict. Matches the shrink semantics
+        // of `prune_suspensions_to_role_grants`.
+        let member_capabilities = &self.member_capabilities;
+        self.suspended_capabilities.retain(|member, suspended| {
+            let granted = member_capabilities.get(member);
+            suspended
+                .retain(|cap| ceiling.contains(cap) && granted.is_some_and(|g| g.contains(cap)));
+            !suspended.is_empty()
+        });
     }
 
     /// TEST-ONLY mutable access to the ceiling (ADR-049 §9). Gated
@@ -4597,6 +4711,242 @@ mod tests {
         ]);
         state.set_ceiling(replacement.clone()).unwrap();
         assert_eq!(state.ceiling(), &replacement);
+    }
+
+    // -----------------------------------------------------------------------
+    // set_ceiling eager reconciliation (spec §5.3.2 step 5, §7.2.2)
+    // -----------------------------------------------------------------------
+
+    /// A read-only ceiling — strictly narrower than `minimal_ceiling()` (which
+    /// still includes `MessagesWrite`). Used as the LOWERED target so that
+    /// `MessagesWrite` and `ToolInvokeAll` fall out of the ceiling.
+    fn read_only_ceiling() -> CapabilityCeiling {
+        CapabilityCeiling::new([Capability::MessagesRead])
+    }
+
+    /// Builds a state on `test_ceiling()` whose creator-admin holds every
+    /// ceiling capability, with `alice` assigned `member`
+    /// (`MessagesRead` + `MessagesWrite` + `ToolInvokeAll`).
+    fn state_with_member() -> ContextRoleState {
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            test_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .expect("assign member");
+        state
+    }
+
+    #[test]
+    fn set_ceiling_lower_prunes_member_capabilities() {
+        let mut state = state_with_member();
+        // Precondition: alice holds MessagesWrite (in member role + ceiling).
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+
+        // Lower the ceiling to read-only (drops MessagesWrite + everything else).
+        state.set_ceiling(read_only_ceiling()).unwrap();
+
+        // alice's cached MessagesWrite is pruned; MessagesRead survives.
+        let alice = state
+            .member_capabilities
+            .get("did:dht:alice")
+            .expect("alice still cached (MessagesRead survives)");
+        assert!(!alice.contains(&Capability::MessagesWrite));
+        assert!(alice.contains(&Capability::MessagesRead));
+        // The creator-admin's out-of-ceiling caps are likewise pruned.
+        let creator = state
+            .member_capabilities
+            .get("did:dht:creator")
+            .expect("creator still cached");
+        assert!(!creator.contains(&Capability::RoleAssign));
+        assert!(!creator.contains(&Capability::ToolInvokeAll));
+        assert!(creator.contains(&Capability::MessagesRead));
+    }
+
+    #[test]
+    fn set_ceiling_lower_prunes_role_definitions() {
+        let mut state = state_with_member();
+        // Precondition: the built-in `member` role grants MessagesWrite.
+        assert!(
+            state
+                .role_definitions
+                .get("member")
+                .unwrap()
+                .capabilities
+                .contains(&Capability::MessagesWrite)
+        );
+
+        state.set_ceiling(read_only_ceiling()).unwrap();
+
+        // Every role definition's permission set is intersected with the new
+        // ceiling; out-of-ceiling caps are gone, in-ceiling caps remain, and the
+        // role name is RETAINED even if its set becomes empty.
+        for (name, role) in &state.role_definitions {
+            for cap in &role.capabilities {
+                assert!(
+                    state.ceiling().contains(cap),
+                    "role {name} retains out-of-ceiling cap {cap:?}"
+                );
+            }
+        }
+        // The `member` role still exists (its name may back assignments).
+        assert!(state.role_definitions.contains_key("member"));
+        assert!(
+            !state
+                .role_definitions
+                .get("member")
+                .unwrap()
+                .capabilities
+                .contains(&Capability::MessagesWrite)
+        );
+    }
+
+    #[test]
+    fn set_ceiling_widen_does_not_grant() {
+        // Start narrow, assign a member, then WIDEN the ceiling. Widening must NOT
+        // add any capability to a member's cache (a grant is only ever derived
+        // from an explicit role assignment, never from a ceiling change alone).
+        // Base ceiling grants RoleAssign (so the creator-admin can assign roles)
+        // but NOT ToolInvokeAll, so the member role lacks ToolInvokeAll.
+        let narrow = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+        ]);
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            narrow,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .expect("assign member");
+
+        let alice_before = state
+            .member_capabilities
+            .get("did:dht:alice")
+            .cloned()
+            .unwrap_or_default();
+
+        // Widen to the full test ceiling.
+        state.set_ceiling(test_ceiling()).unwrap();
+
+        let alice_after = state
+            .member_capabilities
+            .get("did:dht:alice")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            alice_before, alice_after,
+            "widening the ceiling must not grant alice any new capability"
+        );
+        // Concretely: alice does not gain ToolInvokeAll just because the wider
+        // ceiling now permits it.
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::ToolInvokeAll));
+    }
+
+    #[test]
+    fn set_ceiling_reconcile_idempotent() {
+        let mut state = state_with_member();
+        state.set_ceiling(read_only_ceiling()).unwrap();
+        let after_first = state.clone();
+
+        // Re-applying the SAME ceiling must yield a byte-identical state (matters
+        // for the §23.16.8 / ADR-050 deterministic export digest).
+        state.set_ceiling(read_only_ceiling()).unwrap();
+        assert_eq!(
+            state, after_first,
+            "a second set_ceiling with the same ceiling must be a no-op"
+        );
+    }
+
+    #[test]
+    fn suspended_out_of_ceiling_stays_denied() {
+        let mut state = state_with_member();
+        // Suspend MessagesWrite for alice, then lower the ceiling to drop it.
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+
+        state.set_ceiling(read_only_ceiling()).unwrap();
+
+        // The capability is gone from the grant cache (pruned), so it is denied
+        // regardless of suspension state; and the now-meaningless suspension entry
+        // is pruned (dead weight removed).
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(
+            state
+                .suspended_for("did:dht:alice")
+                .is_none_or(|s| !s.contains(&Capability::MessagesWrite)),
+            "suspension referencing a pruned capability must be cleaned up"
+        );
+        // An in-ceiling, still-granted, NON-suspended cap remains allowed.
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+    }
+
+    #[test]
+    fn tool_invoke_wildcard_under_lowered_ceiling() {
+        // alice's cache holds a concrete ToolInvoke(id) admitted under a
+        // ToolInvokeAll ceiling. Lowering the ceiling to drop ToolInvokeAll must
+        // prune the now-out-of-ceiling concrete ToolInvoke(id) from the cache.
+        let mut state = state_with_member();
+        let tool = Capability::ToolInvoke("calc".to_owned());
+        // Seed alice's cache with the concrete tool-invoke (within the ToolInvokeAll
+        // ceiling via CapabilityCeiling::contains' wildcard rule).
+        state
+            .member_capabilities
+            .get_mut("did:dht:alice")
+            .unwrap()
+            .insert(tool.clone());
+        assert!(state.member_has_capability("did:dht:alice", &tool));
+        assert!(state.ceiling().contains(&tool));
+
+        // Lower the ceiling so it no longer contains ToolInvokeAll (read-only).
+        state.set_ceiling(read_only_ceiling()).unwrap();
+
+        assert!(
+            !state.ceiling().contains(&tool),
+            "lowered ceiling no longer admits the concrete tool-invoke"
+        );
+        assert!(
+            !state.member_has_capability("did:dht:alice", &tool),
+            "the stale concrete ToolInvoke(id) must be pruned from the cache"
+        );
+    }
+
+    #[test]
+    fn member_has_capability_false_after_lowering() {
+        let mut state = state_with_member();
+        // X = MessagesWrite (will fall out of ceiling), Y = MessagesRead (stays).
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+
+        state.set_ceiling(read_only_ceiling()).unwrap();
+
+        // After the lowering, the now-out-of-ceiling cap X is denied at the gate
+        // (because the cache was pruned), while the in-ceiling cap Y is still
+        // allowed.
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
     }
 
     #[test]

@@ -3692,7 +3692,7 @@ impl crate::scp::PyScp {
             use scp_core::context::actor::commands::GovernanceCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::ApplyPendingCeilingModification {
-                context_id,
+                context_id: context_id.clone(),
                 current_timestamp,
                 reply: tx,
             };
@@ -3701,7 +3701,8 @@ impl crate::scp::PyScp {
                     "SCP-CTX-2060: supervisor dispatch_governance_command failed: {e}"
                 ))
             })?;
-            rx.await
+            let applied = rx
+                .await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
                         "SCP-CTX-2060: apply ceiling shim reply dropped: {e}"
@@ -3711,7 +3712,27 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!(
                         "SCP-CTX-2060: apply_pending_ceiling_modification failed: {e}"
                     ))
-                })
+                })?;
+
+            // Re-sync the FFI-local role-state cache from the authoritative
+            // Supervisor: the deferred apply LOWERS the ceiling and reconciles
+            // `member_capabilities`/role definitions in the actor (the shared
+            // `ContextRoleState::set_ceiling` eager reconcile). Without this sync
+            // the FFI copy keeps the pre-lowering, out-of-ceiling capabilities and
+            // the local Tier-2 gate would serve them. Sync regardless of `applied`
+            // (a no-op when nothing changed; harmless).
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to sync role state after ceiling-modification apply — \
+                     local capability checks may be stale"
+                );
+            }
+
+            Ok(applied)
         })
     }
 

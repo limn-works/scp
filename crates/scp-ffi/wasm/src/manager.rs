@@ -49,7 +49,8 @@ use scp_protocol::context::params::ContextMode;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 // `builtin_roles` / `builtin_broadcast_roles` are used only by the test-only
 // `set_ceiling_and_refresh` scaffolding (the production `ModifyCeiling` path calls
-// `set_ceiling` only, matching native — no built-in-role rebuild).
+// `set_ceiling` only, matching native — no built-in-role rebuild; the shared
+// `set_ceiling` eagerly reconciles cached caps down to a lowered ceiling).
 #[cfg(test)]
 use scp_protocol::context::roles::{builtin_broadcast_roles, builtin_roles};
 use scp_protocol::crypto::ucan::UcanError;
@@ -746,9 +747,12 @@ impl PerContextState {
     /// This does NOT model the production `ModifyCeiling` path. Production
     /// `dispatch_modify_ceiling` converges with native
     /// (`apply_pending_ceiling_modification`): it calls `set_ceiling` ONLY, with
-    /// no built-in-role rebuild and no per-member `system_assign_role` refresh, so
-    /// `member_capabilities` go stale-on-ceiling-change exactly like native. This
-    /// helper exists only so test setup can mutate the ceiling of a context that
+    /// no built-in-role rebuild and no per-member `system_assign_role` refresh. The
+    /// shared `set_ceiling` eagerly reconciles the cached caps DOWN to a lowered
+    /// ceiling (pure shrink), but does NOT rebuild built-in roles or WIDEN any
+    /// member's caps on a ceiling raise — that widening rebuild is exactly what this
+    /// test helper adds. This helper exists only so test setup can mutate the
+    /// ceiling of a context that
     /// already has members assigned (the production path seeds the ceiling at
     /// construction via [`ContextRoleState::new`], which derives built-in roles
     /// from the ceiling up front).
@@ -3682,22 +3686,26 @@ impl WasmContextManager {
     /// UNCHANGED, and nothing else mutates.
     ///
     /// Convergence with native (`apply_pending_ceiling_modification`): native
-    /// applies a ceiling modification with `role_state.set_ceiling(...)` ONLY — it
-    /// does NOT rebuild built-in role definitions nor re-run `system_assign_role`
-    /// to refresh members' `member_capabilities`. Those snapshots stay as computed
-    /// at the last explicit role assignment and are recomputed only on the next
-    /// assignment. WASM matches that exactly here: validate → `set_ceiling` → done.
-    /// Eagerly refreshing on a ceiling WIDEN would, via `system_assign_role`'s
-    /// SHRINK-only `prune_suspensions_to_role_grants`, silently re-grant a
-    /// `SuspendAccess`-suspended member the newly-added capability (the suspended
-    /// set never gains the new cap, but the refreshed `member_capabilities` does);
-    /// not refreshing keeps the suspended member fully suspended, matching native.
+    /// applies a ceiling modification with `role_state.set_ceiling(...)` ONLY, and
+    /// WASM matches that exactly here: validate → `set_ceiling` → done. Both inherit
+    /// the shared `set_ceiling`'s EAGER CEILING RECONCILIATION (spec §5.3.2 step 5,
+    /// §7.2.2): after the new ceiling is stored, `set_ceiling` intersects the cached
+    /// `role_definitions[*].capabilities`, `member_capabilities[*]`, and
+    /// `suspended_capabilities[*]` with the new ceiling. This is a PURE SHRINK — a
+    /// no-op on a WIDEN (every cached capability is still within a wider ceiling) and
+    /// a prune on a LOWERING (any capability no longer within the ceiling is removed
+    /// from the cache). Because the reconcile is no-op on widen, it does NOT re-grant
+    /// a `SuspendAccess`-suspended member a newly-added capability: a widen leaves
+    /// `member_capabilities` untouched (no new cap appears), and the suspension set
+    /// is only ever pruned, never grown. On a lowering, native and WASM converge to
+    /// the SAME pruned `ContextRoleState` because both route the write through the
+    /// single shared `set_ceiling` chokepoint.
     ///
     /// WASM keeps the single-phase immediate write — native's two-phase
-    /// governed-ceiling deferral is a separate slice. Because the validation and
-    /// the stored form both flow from the same shared `Capability` grammar, native
-    /// and WASM store the SAME effective ceiling for the same `ModifyCeiling`
-    /// action.
+    /// governed-ceiling deferral is a separate slice. Because the validation, the
+    /// reconciliation, and the stored form all flow from the same shared
+    /// `set_ceiling`, native and WASM store the SAME effective ceiling AND the SAME
+    /// reconciled cache for the same `ModifyCeiling` action.
     fn dispatch_modify_ceiling(
         &mut self,
         context_id: &str,
@@ -3713,9 +3721,10 @@ impl WasmContextManager {
         // The shared `set_ceiling` is the single fail-closed validation point: it
         // runs `validate_entries` BEFORE storing, so a malformed proposed entry is
         // rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
-        // is left UNCHANGED. No built-in-role rebuild and no per-member
-        // `system_assign_role` refresh — `member_capabilities` go
-        // stale-on-ceiling-change exactly like native.
+        // is left UNCHANGED. It also EAGERLY RECONCILES the cached role/member
+        // capabilities down to the (possibly lowered) ceiling (pure shrink, no-op on
+        // widen), so `member_capabilities` never hold an out-of-ceiling capability —
+        // matching native, which inherits the same reconcile via the shared write.
         ctx.role_state
             .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;
