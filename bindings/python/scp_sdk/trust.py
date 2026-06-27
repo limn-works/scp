@@ -52,203 +52,6 @@ def _bridge() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# UCAN error classification for Layer 1 independent checks
-# ---------------------------------------------------------------------------
-
-# Error message prefixes that indicate an early token structure failure.
-# Maps to CapabilityValidation.tokens_valid.
-# Pipeline step 1 (parse/header validation) — fails before any other
-# check has run.
-#
-# NOTE: More specific "malformed token:" sub-patterns (e.g. DID errors,
-# capability URI errors) are matched BEFORE this list in _classify_ucan_error
-# so they route to the correct pipeline stage.
-_TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
-    "malformed token:",
-    "deserialization failed:",
-    "unsupported algorithm:",
-    "unsupported UCAN version:",
-)
-
-# Error message prefixes that indicate a signature/chain integrity failure.
-# Maps to CapabilityValidation.signatures_valid.
-# Pipeline steps: 2 (signature), 3 (chain), 4 (root issuer),
-#   5 (audience), 5a/5b (key scope), 6b (category A), 7 (attenuation).
-# Also includes DID resolution failures (step 2) that the Rust bridge
-# wraps as MalformedToken.
-#
-# Parent-token expiry/revocation in the delegation chain is also wrapped
-# as DelegationChainBroken by the Rust bridge (issue #1026), so those
-# errors match "delegation chain broken:" and classify conservatively
-# as "signatures" → _PASSED_BEFORE = {tokens_valid} only.  This avoids
-# optimistically reporting True for checks that never ran on the leaf.
-_SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
-    "signature verification failed",
-    "invalid issuer:",
-    "audience mismatch:",
-    "delegation chain broken:",
-    "circular delegation detected:",
-    "attenuation violation:",
-    "key scope mismatch:",
-    "self-delegation",
-    "Category A violation:",
-    # DID resolution failures (step 2) — all ResolutionError variants become
-    # MalformedToken("...") via From<ResolutionError> for UcanError.
-    # See crates/scp-ffi/common/src/resolvers.rs.
-    "malformed token: DID not found",
-    "malformed token: invalid DID document",
-    "malformed token: network unavailable",
-    "malformed token: DID revoked/downgraded",
-    # Runtime MalformedToken(format!(...)) constructions from validate.rs
-    # that represent signature/DID resolution failures (step 2).
-    "malformed token: verification method",
-    "malformed token: unrecognized signing key ID",
-    # Runtime MalformedToken(format!(...)) constructions from resolvers.rs
-    # BridgeDidResolver — DID decode/resolution failures (step 2).
-    "malformed token: z-base-32 decode failed",
-    "malformed token: DID public key must be 32 bytes",
-    "malformed token: hex decode failed",
-    "malformed token: unsupported DID method",
-)
-
-# Error message prefixes that indicate a capability ceiling/scope failure.
-# Maps to CapabilityValidation.within_ceiling.
-# Pipeline steps: 6 (capability match), 8 (ceiling compliance).
-# Also includes capability URI parse failures (step 6) that the Rust bridge
-# wraps as MalformedToken.
-_CAPABILITY_CEILING_PREFIXES: tuple[str, ...] = (
-    "capability outside ceiling:",
-    "capability not granted:",
-    "malformed token: unparseable capability",
-)
-
-# Error message prefixes for nonce failures (step 9).
-# By step 9, parse, signature, and ceiling checks have already passed.
-_NONCE_PREFIXES: tuple[str, ...] = (
-    "nonce reused:",
-    "nonce too old:",
-    "nonce from the future:",
-    "invalid nonce format:",
-    "nonce tracker full:",
-)
-
-# Error message prefixes that indicate a revocation failure.
-# Maps to CapabilityValidation.not_revoked.
-# Pipeline step: 10 (revocation check).
-_REVOCATION_PREFIXES: tuple[str, ...] = ("token revoked:",)
-
-# Error message prefixes for expiry/time-bounds failures (step 11).
-# By step 11, all other checks (parse, sig, ceiling, nonce, revocation) passed.
-_EXPIRY_PREFIXES: tuple[str, ...] = (
-    "token expired",
-    "token not yet valid",
-    "invalid time range:",
-    "expiry too far in the future:",
-)
-
-
-def _extract_core_error(error_message: str) -> str:
-    """Extract the core UcanError Display text from a bridge error message.
-
-    The Rust bridge formats UCAN errors as::
-
-        [SCP-PERM-3001] permission error: <UcanError Display> \u2014 <advice>
-
-    This strips the code prefix and trailing advice to yield the raw
-    ``UcanError`` Display text for prefix matching.
-    """
-    core = error_message
-    if "] permission error: " in core:
-        core = core.split("] permission error: ", 1)[1]
-    # Strip the trailing advice suffix added by the Rust From<UcanError> impl.
-    if " \u2014 " in core:
-        core = core.split(" \u2014 ", 1)[0]
-    return core
-
-
-def _classify_ucan_error(error_message: str) -> str:
-    """Classify a UCAN validation error into a fine-grained pipeline stage.
-
-    Returns one of:
-    - ``"token_parse"`` — step 1 (parse/header) failed
-    - ``"signatures"`` — steps 2-7 (signature, chain, issuer, audience,
-      key scope, attenuation) failed
-    - ``"ceiling"`` — steps 6/8 (capability match, ceiling) failed
-    - ``"nonce"`` — step 9 (nonce validation) failed
-    - ``"revoked"`` — step 10 (revocation check) failed
-    - ``"expiry"`` — step 11 (time bounds) failed
-    - ``"unknown"`` — unrecognized error
-    """
-    core = _extract_core_error(error_message)
-
-    # Check more-specific "malformed token:" sub-patterns BEFORE the
-    # generic _TOKEN_PARSE_PREFIXES catch-all, so that e.g.
-    # "malformed token: DID not found" → "signatures" (step 2) and
-    # "malformed token: unparseable capability" → "ceiling" (step 6)
-    # instead of falling through to "token_parse" (step 1).
-    for prefix in _SIGNATURE_CHAIN_PREFIXES:
-        if core.startswith(prefix):
-            return "signatures"
-
-    for prefix in _CAPABILITY_CEILING_PREFIXES:
-        if core.startswith(prefix):
-            return "ceiling"
-
-    for prefix in _TOKEN_PARSE_PREFIXES:
-        if core.startswith(prefix):
-            return "token_parse"
-
-    for prefix in _NONCE_PREFIXES:
-        if core.startswith(prefix):
-            return "nonce"
-
-    for prefix in _REVOCATION_PREFIXES:
-        if core.startswith(prefix):
-            return "revoked"
-
-    for prefix in _EXPIRY_PREFIXES:
-        if core.startswith(prefix):
-            return "expiry"
-
-    return "unknown"
-
-
-# Maps pipeline stages to which CapabilityValidation fields are known
-# to have passed when that stage fails, based on the 11-step sequential
-# pipeline in validate.rs:
-#
-#   parse(1) → sig(2) → chain(3-5) → key_scope(5a/b) → cap_match(6)
-#   → cat_A(6b) → attenuation(7) → ceiling(8) → nonce(9)
-#   → revocation(10) → expiry(11)
-#
-# Each value lists the fields that PASSED before the failure point.
-# The failing field is NOT in the set — it will be set to False.
-# Fields after the failure are also not in the set (never ran).
-_PASSED_BEFORE: dict[str, set[str]] = {
-    # Step 1: parse fails — nothing passed.
-    "token_parse": set(),
-    # Steps 2-7: signature/chain fails — parse passed.
-    "signatures": {"tokens_valid"},
-    # Steps 6/8: capability/ceiling fails — parse + sig passed.
-    "ceiling": {"tokens_valid", "signatures_valid"},
-    # Step 9: nonce fails — parse + sig + ceiling all passed.
-    "nonce": {"tokens_valid", "signatures_valid", "within_ceiling"},
-    # Step 10: revocation fails — parse + sig + ceiling + nonce passed.
-    "revoked": {"tokens_valid", "signatures_valid", "within_ceiling", "nonce_valid"},
-    # Step 11: expiry fails — parse + sig + ceiling + nonce + revocation passed.
-    "expiry": {
-        "tokens_valid",
-        "signatures_valid",
-        "within_ceiling",
-        "nonce_valid",
-        "not_revoked",
-    },
-    # Unknown: conservatively nothing passed.
-    "unknown": set(),
-}
-
-
-# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -259,24 +62,36 @@ class CapabilityValidation:
 
     All fields must be ``True`` for the subject to be considered
     protocol-compliant.
+
+    These six per-stage booleans are the canonical structured result of
+    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-055):
+    one boolean per pipeline-stage group of the 11-step ADR-016 pipeline.
+    They are populated directly from the bridge's structured result --
+    never reverse-engineered by parsing error prose. The result is
+    strictly ordered and short-circuiting: a field is ``True`` only if its
+    stage ran *and* passed, so the first failing stage and every later
+    stage are ``False``.
     """
 
-    #: UCAN tokens parse and have valid structure.
+    #: UCAN tokens parse and have valid structure (step 1).
     tokens_valid: bool = False
 
-    #: All signatures verify against the claimed DIDs.
+    #: All signatures verify against the claimed DIDs across the whole
+    #: delegation chain (steps 2-7).
     signatures_valid: bool = False
 
-    #: Requested capabilities are within the context's ceiling.
+    #: Requested capabilities are within the context's ceiling (step 8).
     within_ceiling: bool = False
 
     #: Nonce validation passed (step 9: no reuse, not stale, valid format).
+    #: Probed read-only by the diagnostic -- the nonce is NOT recorded.
     nonce_valid: bool = False
 
-    #: No tokens have been revoked.
+    #: No tokens have been revoked (step 10).
     not_revoked: bool = False
 
-    #: Token time bounds are valid (not expired, not pre-dated, valid range).
+    #: Token time bounds are valid (step 11: not expired, not pre-dated,
+    #: valid range).
     time_bounds_valid: bool = False
 
 
@@ -691,6 +506,25 @@ class RequireParticipation:
         }
 
 
+def _structured_to_capability_validation(result: Any) -> CapabilityValidation:
+    """Map a bridge ``CapabilityValidation`` record onto the SDK dataclass.
+
+    The bridge's structured ``ucan_evaluate`` result (PyO3
+    ``PyCapabilityValidation``) exposes the same six snake_case booleans as
+    the SDK :class:`CapabilityValidation`. This reads them directly -- the
+    per-check breakdown comes from the structured record, never from parsing
+    error prose (spec §7.2.4, ADR-055 Decision 3).
+    """
+    return CapabilityValidation(
+        tokens_valid=bool(result.tokens_valid),
+        signatures_valid=bool(result.signatures_valid),
+        within_ceiling=bool(result.within_ceiling),
+        nonce_valid=bool(result.nonce_valid),
+        not_revoked=bool(result.not_revoked),
+        time_bounds_valid=bool(result.time_bounds_valid),
+    )
+
+
 async def evaluate_trust(
     scp: SCP,
     subject_did: str,
@@ -701,8 +535,13 @@ async def evaluate_trust(
 
     Performs the four-layer trust evaluation model:
 
-    1. **Protocol enforcement** — validates UCAN tokens, signatures,
-       capability ceiling compliance, nonce, revocation, and expiry.
+    1. **Protocol enforcement** — evaluates each UCAN token via the
+       read-only, structured ``ucan_evaluate`` diagnostic (spec §7.2.4):
+       it returns a :class:`CapabilityValidation` of six per-stage
+       booleans without throwing on capability outcomes and without
+       recording nonce state. The six fields are AND-combined across the
+       token set, so a single token failing a stage makes that aggregate
+       field ``False``.
     2. **Behavioral validation** — queries the event log for the
        subject's participation history.
     3. **Attestation authenticity** — verifies signatures and evidence
@@ -710,11 +549,14 @@ async def evaluate_trust(
     4. **Trust evaluation inputs** — gathers endorsements, challenge
        results, and consequence structures.
 
-    Phase 4 PR 5 Agent B+C (#1549) retained this module-level function:
-    it consumes the :class:`SCP` instance to dispatch ``ucan_validate``
-    and ``event_log_query`` bridge calls, then classifies the resulting
-    errors into the independent Layer 1 fields. Moving the logic into a
-    :class:`SCP` method would just add a layer of indirection; the
+    Layer 1 consumes the structured bridge result directly (ADR-055): it
+    does not reverse-engineer *which* check failed by parsing error prose.
+    The diagnostic is non-throwing for capability outcomes; it raises only
+    for malformed FFI inputs (e.g. a ``context_id`` with control
+    characters), which propagate to the caller.
+
+    This module-level function consumes the :class:`SCP` instance to
+    dispatch ``ucan_evaluate`` and ``event_log_query`` bridge calls. The
     callers already receive the :class:`SCP` instance by value (matching
     the ADR-048 explicit-instance pattern).
 
@@ -723,7 +565,7 @@ async def evaluate_trust(
         subject_did: The DID of the participant to evaluate.
         context_id: The ID of the context to evaluate trust within.
         capability_tokens: Optional list of UCAN token strings to
-            validate as part of the evaluation.
+            evaluate as part of the evaluation.
 
     Returns:
         A :class:`TrustEvaluation` with all four layers populated.
@@ -736,20 +578,23 @@ async def evaluate_trust(
 
     bridge = _bridge()
     # `_bridge()` is the seam tests use to inject a mock — patching
-    # `scp_sdk.trust._bridge` returns a mock whose `ucan_validate` /
-    # `event_log_query` / `UcanError` attributes stand in for the live
-    # bridge. In production `_bridge()` returns the real `_scp_core`
-    # module (which no longer exposes those free functions after Phase
-    # 4 PR 4), so we route through the :class:`SCP` instance.
+    # `scp_sdk.trust._bridge` returns a mock whose `ucan_evaluate` /
+    # `event_log_query` attributes stand in for the live bridge. In
+    # production `_bridge()` returns the real `_scp_core` module (which no
+    # longer exposes those free functions after Phase 4 PR 4), so we route
+    # through the :class:`SCP` instance.
     if hasattr(bridge, "_mock_name"):
         instance: Any = bridge
     else:
         instance = scp._native
 
-    # Layer 1: validate capability tokens if provided.
+    # Layer 1: evaluate capability tokens if provided.
     cap_validation = CapabilityValidation()
     if capability_tokens:
-        # Start optimistic: assume all pass until a failure proves otherwise.
+        # Start from the all-True identity element for the boolean AND, then
+        # conjoin each token's structured result. An empty token list keeps
+        # the dataclass default (all False); a non-empty list begins all-True
+        # because no failing stage has been observed yet.
         cap_validation.tokens_valid = True
         cap_validation.signatures_valid = True
         cap_validation.within_ceiling = True
@@ -758,20 +603,17 @@ async def evaluate_trust(
         cap_validation.time_bounds_valid = True
 
         for token in capability_tokens:
-            try:
-                await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
-            except bridge.UcanError as exc:
-                error_msg = str(exc)
-                failed_category = _classify_ucan_error(error_msg)
-                passed = _PASSED_BEFORE.get(failed_category, set())
-
-                cap_validation.tokens_valid = "tokens_valid" in passed
-                cap_validation.signatures_valid = "signatures_valid" in passed
-                cap_validation.within_ceiling = "within_ceiling" in passed
-                cap_validation.nonce_valid = "nonce_valid" in passed
-                cap_validation.not_revoked = "not_revoked" in passed
-                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
-                break
+            # The structured diagnostic reads bools; it does NOT throw on
+            # capability outcomes. Malformed FFI input (bad context_id /
+            # token / capability) still raises and propagates.
+            result = await asyncio.to_thread(instance.ucan_evaluate, context_id, token, "*")
+            per_token = _structured_to_capability_validation(result)
+            cap_validation.tokens_valid &= per_token.tokens_valid
+            cap_validation.signatures_valid &= per_token.signatures_valid
+            cap_validation.within_ceiling &= per_token.within_ceiling
+            cap_validation.nonce_valid &= per_token.nonce_valid
+            cap_validation.not_revoked &= per_token.not_revoked
+            cap_validation.time_bounds_valid &= per_token.time_bounds_valid
 
     # Layer 2: query behavioral record from the event log.
     behavioral: BehavioralRecord | None = None
@@ -815,13 +657,12 @@ def aggregate_trust_input(
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
 
-    Phase 4 PR 5 Agent B+C (#1549) retained this module-level helper
-    because it is a pure serialization layer over
-    :meth:`scp_sdk.SCP.aggregate_trust_input` — it takes the
-    caller-friendly Python types (lists/dicts of ``Any``) and produces
-    the ``json.dumps``-serialized strings the bridge expects. Using ``is
-    not None`` (never a falsy check) keeps the distinction between an
-    explicit empty collection and an absent parameter — empty means
+    Phase 4 PR 5 Agent B+C retained this module-level helper because it is
+    a pure serialization layer over :meth:`scp_sdk.SCP.aggregate_trust_input`
+    -- it takes the caller-friendly Python types (lists/dicts of ``Any``)
+    and produces the ``json.dumps``-serialized strings the bridge expects.
+    Using ``is not None`` (never a falsy check) keeps the distinction between
+    an explicit empty collection and an absent parameter — empty means
     "no rules apply", absent means "use protocol defaults".
 
     Args:

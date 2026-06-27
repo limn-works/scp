@@ -1156,13 +1156,10 @@
         },
         {
           "name": "discover",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "python": "discovery.py exposes parse_address / create_query / normalize_address only; no named discover / discover_contexts / context_discover public function yet. The Python discovery wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "address_resolve",
@@ -1304,12 +1301,11 @@
         },
         {
           "name": "evaluate",
-          "python": false,
+          "python": true,
           "typescript": false,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "python": "Bridge plumbing exists (scp-ffi PyScp.ucan_evaluate returning CapabilityValidation, the read-only structured diagnostic counterpart to ucan_validate) but no public SDK wrapper yet; the named public evaluate()/evaluateTrust() wrapper lands in the C3c SDK-parity follow-up that rebuilds the trust-signal consumer on top of this bridge op.",
             "typescript": "Bridge plumbing exists (NAPI ucanEvaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
             "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
             "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
@@ -1427,14 +1423,11 @@
         },
         {
           "name": "verify_payment_receipts",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs.",
-          "exemptions": {
-            "python": "economy.py exposes estimate_cost / policy helpers / evaluate_formula only; no named verify_payment_receipts public function yet. The Python verify_payment_receipts wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs."
         },
         {
           "name": "enforce_economy_send_path",

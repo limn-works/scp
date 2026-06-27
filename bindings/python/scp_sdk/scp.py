@@ -1097,6 +1097,50 @@ class SCP:
             proof_tokens,
         )
 
+    async def ucan_evaluate(
+        self,
+        context_id: str,
+        token: str,
+        capability: str,
+        presenting_agent_did: str | None = None,
+        proof_tokens: list[str] | None = None,
+    ) -> Any:
+        """Evaluate a UCAN token and return the structured per-stage result.
+
+        Delegate to ``_scp_core.SCP.ucan_evaluate``, the read-only,
+        side-effect-free diagnostic counterpart to :meth:`ucan_validate`
+        (spec §7.2.4, ADR-055). It runs the same 11-step ADR-016 pipeline
+        but returns a :class:`~scp_sdk.trust.CapabilityValidation` of six
+        per-stage booleans instead of throwing at the first failure, and
+        probes the nonce read-only (never recording it), so it is safe to
+        call repeatedly on the same token. The result is a point-in-time
+        diagnostic snapshot, not a promise that a later ``ucan_validate``
+        will accept the token.
+
+        Raises ``ValidationError`` only for malformed FFI input
+        (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
+        ``did``); capability/signature/expiry outcomes are reported via the
+        returned booleans, never as exceptions.
+        """
+        from scp_sdk.trust import CapabilityValidation
+
+        raw = await asyncio.to_thread(
+            self._native.ucan_evaluate,
+            context_id,
+            token,
+            capability,
+            presenting_agent_did,
+            proof_tokens,
+        )
+        return CapabilityValidation(
+            tokens_valid=bool(raw.tokens_valid),
+            signatures_valid=bool(raw.signatures_valid),
+            within_ceiling=bool(raw.within_ceiling),
+            nonce_valid=bool(raw.nonce_valid),
+            not_revoked=bool(raw.not_revoked),
+            time_bounds_valid=bool(raw.time_bounds_valid),
+        )
+
     # endregion UCAN
 
     # region Broadcast
