@@ -3723,8 +3723,10 @@ impl WasmContextManager {
         // rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
         // is left UNCHANGED. It also EAGERLY RECONCILES the cached role/member
         // capabilities down to the (possibly lowered) ceiling (pure shrink, no-op on
-        // widen), so `member_capabilities` never hold an out-of-ceiling capability —
-        // matching native, which inherits the same reconcile via the shared write.
+        // widen) — matching native, which inherits the same reconcile via the shared
+        // write. Soundness of that reconcile (guard (ii) of the read-time-trust
+        // argument): see the `ContextRoleState` ceiling-consistency invariant in
+        // `scp_protocol::context::roles`.
         ctx.role_state
             .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;

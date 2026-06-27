@@ -1468,26 +1468,59 @@ pub struct RoleAssignment {
 /// access to `ContextHandle` internals. It is the primary input for
 /// [`assign_role`].
 ///
-/// # `member_capabilities`/ceiling consistency invariant
+/// # `member_capabilities`/ceiling consistency invariant (AUTHORITATIVE)
 ///
-/// [`Self::member_capabilities`] is trusted verbatim at the local Tier-2 gate
-/// ([`Self::member_has_capability`]) — it is deliberately NOT re-intersected
-/// against [`Self::ceiling`] at read time. That is sound because every WRITE that
-/// can place a capability into `member_capabilities` is itself ceiling-bounded:
-/// - [`Self::new`] and [`assign_role`]/[`system_assign_role`] only ever copy in
-///   capabilities from role definitions, which `new`/`set_ceiling` keep within the
-///   ceiling;
-/// - [`Self::set_ceiling`] runs [`Self::reconcile_to_ceiling`], which intersects
-///   the cache with a lowered ceiling (closing the lowering path);
-/// - the export/import reconstruction path installs a `role_state` whose integrity
-///   is bound by the creator's Ed25519 signature over the snapshot
-///   (`import_context`), so an attacker cannot inject an out-of-ceiling grant.
+/// This block is the single authoritative statement of why the local Tier-2 gate
+/// ([`Self::member_has_capability`]) may trust [`Self::member_capabilities`]
+/// verbatim — NOT re-intersected against [`Self::ceiling`] at read time. Other
+/// docs on this type ([`Self::member_has_capability`], [`Self::set_ceiling`],
+/// [`Self::reconcile_to_ceiling`]) point here rather than restating it.
+///
+/// The read-time trust rests on TWO distinct write-time guards, plus a third
+/// reconstruction-path argument:
+///
+/// (i) **Assignment-time gate.** Every role-derived write into
+///     `member_capabilities` is ceiling-validated at assignment time. Both
+///     [`assign_role`] and [`system_assign_role`] (the free fns AND the inherent
+///     [`Self::system_assign_role`]) call [`validate_role_definition`] against
+///     [`Self::ceiling`] BEFORE copying `role_def.capabilities` into the cache; an
+///     out-of-ceiling role definition (e.g. one built via `new_unchecked`) is
+///     rejected at that gate, so it can never poison `member_capabilities`.
+///     [`Self::new`] likewise ceiling-validates every custom role at construction
+///     and mints only the ceiling-derived `admin` role.
+///
+/// (ii) **Ceiling-lowering reconcile.** [`Self::set_ceiling`] additionally runs
+///      [`Self::reconcile_to_ceiling`], which SHRINKS the role definitions, the
+///      `member_capabilities` cache, and `suspended_capabilities` down to a
+///      lowered ceiling — closing the window where a ceiling change would
+///      otherwise leave a previously-granted, now-out-of-ceiling capability in the
+///      cache.
+///
+/// (iii) **Import is signature-bound, not construction-closed.** The export/import
+///       reconstruction path installs a `role_state` VERBATIM
+///       (`scp_runtime::context::lifecycle_helpers` consumes
+///       `export.snapshot.role_state` directly — it does NOT route through
+///       `set_ceiling`, so guards (i)/(ii) do not run on it). The creator's
+///       Ed25519 signature over the snapshot, verified in
+///       `validate_export_for_import`, binds the snapshot's ORIGIN (it came from
+///       the creator), NOT its well-formedness. A creator who signs a
+///       self-inconsistent snapshot — one whose `member_capabilities` is not a
+///       subset of `ceiling` — WOULD install an out-of-ceiling grant that this
+///       local gate then serves. This is therefore NOT construction-closed at the
+///       local gate. It is nonetheless INERT: (a) the creator is the very
+///       authority that sets the ceiling, so a self-grant beyond their own ceiling
+///       buys nothing they could not obtain by simply declaring a higher ceiling;
+///       and (b) any cross-node re-presentation of such a grant is independently
+///       re-validated against the signed ceiling (spec §7.2.1 step 8), so the
+///       local out-of-ceiling grant never propagates. Adding an import-time
+///       cap-subset-of-ceiling re-check would be a redundant re-check of a
+///       signature-bound, inert property, not a new guarantee.
 ///
 /// A future writer adding any NEW mutation of `member_capabilities` (or
 /// `role_definitions[*].capabilities`) MUST preserve this invariant — keep the
-/// write within the current ceiling, or route it through `set_ceiling` so
-/// reconciliation re-establishes it. Breaking it would let the local gate serve a
-/// capability the signed ceiling does not authorize.
+/// write within the current ceiling (guard (i)), or route it through `set_ceiling`
+/// so reconciliation re-establishes it (guard (ii)). Breaking it would let the
+/// local gate serve a capability the signed ceiling does not authorize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRoleState {
     /// The context's unique identifier.
@@ -1665,15 +1698,9 @@ impl ContextRoleState {
     ///
     /// This gate reads [`Self::member_capabilities`] minus
     /// [`Self::suspended_capabilities`] and does NOT additionally re-intersect the
-    /// result against [`Self::ceiling`]. That is sound — not an oversight — because
-    /// the cache is kept within the ceiling at WRITE time: ceiling-bounded role
-    /// copies, [`Self::set_ceiling`]'s eager [`Self::reconcile_to_ceiling`] on a
-    /// lowering, and the creator-Ed25519-signature-bound import path (see the
-    /// [`ContextRoleState`] type-level invariant). Adding a `self.ceiling.contains`
-    /// check here would be a redundant use-time re-check of a write-time-enforced
-    /// property. A future writer introducing an un-ceiling-bounded mutation of
-    /// `member_capabilities` MUST preserve the write-time invariant instead of
-    /// relying on a use-time re-check.
+    /// result against [`Self::ceiling`]. Soundness of not re-intersecting the
+    /// ceiling at read time: see the [`ContextRoleState`] ceiling-consistency
+    /// invariant.
     #[must_use]
     pub fn member_has_capability(&self, member_did: &str, capability: &Capability) -> bool {
         // Check suspension first.
@@ -1818,16 +1845,15 @@ impl ContextRoleState {
     /// (`role_definitions[*].capabilities`, `member_capabilities[*]`,
     /// `suspended_capabilities[*]`) is intersected with the new ceiling, dropping
     /// any capability no longer within it (see [`Self::reconcile_to_ceiling`]).
-    /// This guarantees there is NO window where the local Tier-2 gate
-    /// ([`Self::member_has_capability`]) serves a capability the lowered ceiling no
-    /// longer authorizes — the cache never holds an out-of-ceiling capability. The
-    /// reconciliation is a pure SHRINK: it is a no-op on a WIDEN (every previously
-    /// cached capability is still within a wider ceiling) and idempotent (a second
-    /// `set_ceiling` with the same ceiling yields a byte-identical
+    /// The reconciliation is a pure SHRINK: it is a no-op on a WIDEN (every
+    /// previously cached capability is still within a wider ceiling) and idempotent
+    /// (a second `set_ceiling` with the same ceiling yields a byte-identical
     /// `ContextRoleState`, preserving the §23.16.8 / ADR-050 deterministic export
     /// digest). Because this is the single whole-ceiling write chokepoint, BOTH the
     /// native deferred-apply path (`apply_pending_ceiling_modification`) and the
     /// WASM `dispatch_modify_ceiling` path inherit reconciliation identically.
+    /// Soundness of this reconciliation as guard (ii) of the read-time-trust
+    /// argument: see the [`ContextRoleState`] ceiling-consistency invariant.
     ///
     /// # Errors
     ///
@@ -1869,7 +1895,9 @@ impl ContextRoleState {
     /// Called only from [`Self::set_ceiling`] (the single whole-ceiling write
     /// chokepoint), so it never runs on the verbatim export/import reconstruction
     /// path (which installs a creator-signed `role_state` directly, NOT via
-    /// `set_ceiling`).
+    /// `set_ceiling`). For why that import path is nonetheless sound — and why this
+    /// reconcile is guard (ii), not the import guard — see the
+    /// [`ContextRoleState`] ceiling-consistency invariant.
     fn reconcile_to_ceiling(&mut self) {
         // Bind the ceiling locally so the per-field `retain` closures below borrow
         // only `self.ceiling` immutably while a single other field is borrowed
