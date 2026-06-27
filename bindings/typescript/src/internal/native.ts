@@ -48,7 +48,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
-import { wrapBridgeErrors } from "./bridge";
+import { toCapabilityValidation, wrapBridgeErrors } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -1003,14 +1003,9 @@ export function createNativeBridge(scp: SCP): Bridge {
           pt: readonly string[] | null,
         ) => Promise<CapabilityValidation>
       )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
-      return {
-        tokensValid: raw.tokensValid,
-        signaturesValid: raw.signaturesValid,
-        withinCeiling: raw.withinCeiling,
-        nonceValid: raw.nonceValid,
-        notRevoked: raw.notRevoked,
-        timeBoundsValid: raw.timeBoundsValid,
-      };
+      // Shared six-field projection — pins the canonical shape in one place
+      // across the native and WASM bridges.
+      return toCapabilityValidation(raw);
     },
 
     async ucanMint(
