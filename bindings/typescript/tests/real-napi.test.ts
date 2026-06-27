@@ -710,6 +710,34 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(second).toEqual(first);
     });
 
+    // C3c (ADR-055 / §7.2.4): evaluateTrust assesses each token's GENERAL
+    // (intrinsic) validity — it must NOT impose an invoked-capability
+    // grant-match. The previous implementation passed a `"*"` sentinel that the
+    // real bridge rejects ("missing scp:ctx: prefix"); the fix passes no
+    // challenge capability (intrinsic-validity mode). A single valid, in-ceiling
+    // token must therefore report all six checks true — this case would have
+    // FAILED under the old `"*"` behavior (grant-match against `*` never
+    // matches), so it is the regression guard for the actual bug.
+    test("evaluateTrust reports a single valid token as intrinsically valid (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, "ctx-real", [good.encoded]);
+      // No grant-match challenge: a fresh, well-signed, in-ceiling token is
+      // intrinsically valid on every stage.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(true);
+      expect(result.capabilityValidation.withinCeiling).toBe(true);
+      expect(result.capabilityValidation.nonceValid).toBe(true);
+      expect(result.capabilityValidation.notRevoked).toBe(true);
+      expect(result.capabilityValidation.timeBoundsValid).toBe(true);
+      expect(result.subjectDid).toBe(member.did);
+      expect(result.contextId).toBe("ctx-real");
+    });
+
     test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
@@ -724,7 +752,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         good.encoded,
         forged,
       ]);
-      // The valid token passes signatures; the forged one fails — the AND is false.
+      // Intrinsic validity per token, AND-combined: the good token passes every
+      // stage; the forged one fails signatures — so the AND is false there while
+      // tokensValid (both parse) stays true.
       expect(result.capabilityValidation.tokensValid).toBe(true);
       expect(result.capabilityValidation.signaturesValid).toBe(false);
       expect(result.subjectDid).toBe(member.did);

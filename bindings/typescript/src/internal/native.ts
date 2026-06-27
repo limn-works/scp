@@ -985,22 +985,24 @@ export function createNativeBridge(scp: SCP): Bridge {
     async ucanEvaluate(
       handle: BridgeContextHandle,
       token: string,
-      capability: string,
+      capability?: string | null,
       presentingAgentDid?: string,
       proofTokens?: readonly string[],
     ): Promise<CapabilityValidation> {
       // NAPI `ucanEvaluate` (scp.rs) returns a NapiCapabilityValidation
       // #[napi(object)] whose fields are already camelCased — no remap. The
-      // optional params map to `null` for the napi-rs `Option<…>` signature.
+      // optional params map to `null` for the napi-rs `Option<…>` signature;
+      // a `null` capability runs the intrinsic-validity diagnostic (no
+      // invoked-capability grant-match challenge).
       const raw = await (
         native.ucanEvaluate as (
           h: BridgeContextHandle,
           t: string,
-          c: string,
+          c: string | null,
           pa: string | null,
           pt: readonly string[] | null,
         ) => Promise<CapabilityValidation>
-      )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+      )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
       return {
         tokensValid: raw.tokensValid,
         signaturesValid: raw.signaturesValid,

@@ -605,8 +605,17 @@ async def evaluate_trust(
         for token in capability_tokens:
             # The structured diagnostic reads bools; it does NOT throw on
             # capability outcomes. Malformed FFI input (bad context_id /
-            # token / capability) still raises and propagates.
-            result = await asyncio.to_thread(instance.ucan_evaluate, context_id, token, "*")
+            # token) still raises and propagates.
+            #
+            # No challenge capability is supplied: trust evaluation assesses
+            # each token's GENERAL (intrinsic) validity — signatures, ceiling,
+            # nonce, revocation, time bounds — not whether it grants one
+            # specific capability. Passing a concrete URI here (or the old
+            # ``"*"`` sentinel, which the real bridge rejects) would wrongly
+            # impose an invoked-capability grant-match the caller never asked
+            # for. See ADR-055 / spec §7.2.4: the diagnostic's challenge
+            # capability is optional, and ``None`` means intrinsic-validity.
+            result = await asyncio.to_thread(instance.ucan_evaluate, context_id, token)
             per_token = _structured_to_capability_validation(result)
             cap_validation.tokens_valid &= per_token.tokens_valid
             cap_validation.signatures_valid &= per_token.signatures_valid

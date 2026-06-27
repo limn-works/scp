@@ -600,6 +600,62 @@ class TestUcan:
         except Exception:
             pass  # May fail depending on implementation state
 
+    async def test_evaluate_trust_end_to_end_real_ffi(self, scp: SCP):
+        """Exercise ``evaluate_trust`` against the real ``_scp_core`` bridge.
+
+        Closes the coverage gap where only mocks exercised ``evaluate_trust``.
+        Mints a valid token, then runs ``evaluate_trust`` (which drives the
+        read-only ``ucan_evaluate`` diagnostic with NO challenge capability —
+        intrinsic-validity mode, ADR-055 / §7.2.4) and asserts the structured
+        Layer-1 booleans. A freshly minted, well-signed, in-ceiling token must
+        report all six per-stage checks ``True``.
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        evaluation = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+
+        cv = evaluation.capability_validation
+        # Intrinsic validity of a fresh, in-ceiling, well-signed token: all true.
+        # The grant-match step is SKIPPED (no challenge), and read-only nonce
+        # probing means re-evaluation does not consume the nonce.
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.within_ceiling is True
+        assert cv.nonce_valid is True
+        assert cv.not_revoked is True
+        assert cv.time_bounds_valid is True
+
+        # Read-only: a second evaluation yields the same all-true result (the
+        # diagnostic must never record the nonce).
+        again = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+        cv2 = again.capability_validation
+        assert cv2.nonce_valid is True
+        assert cv2.tokens_valid is True
+        assert cv2.signatures_valid is True
+
 
 # ---------------------------------------------------------------------------
 # Event Log

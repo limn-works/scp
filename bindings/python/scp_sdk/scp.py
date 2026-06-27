@@ -1101,7 +1101,7 @@ class SCP:
         self,
         context_id: str,
         token: str,
-        capability: str,
+        capability: str | None = None,
         presenting_agent_did: str | None = None,
         proof_tokens: list[str] | None = None,
     ) -> Any:
@@ -1116,6 +1116,13 @@ class SCP:
         call repeatedly on the same token. The result is a point-in-time
         diagnostic snapshot, not a promise that a later ``ucan_validate``
         will accept the token.
+
+        ``capability`` is OPTIONAL. Omit it (or pass ``None``) to evaluate the
+        token's INTRINSIC validity — signatures, ceiling, nonce, revocation,
+        time bounds — with no invoked-capability grant-match challenge. This is
+        the mode :func:`scp_sdk.trust.evaluate_trust` uses. Pass a concrete
+        capability URI to additionally require the token grants it. (The
+        enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
 
         Raises ``ValidationError`` only for malformed FFI input
         (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /

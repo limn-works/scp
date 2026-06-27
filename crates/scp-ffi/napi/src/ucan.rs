@@ -332,19 +332,28 @@ pub(crate) async fn ucan_validate_on(
 /// the same 11-step ADR-016 pipeline via `evaluate_ucan` but returns a
 /// structured [`NapiCapabilityValidation`] instead of throwing, and never
 /// records the token's nonce (read-only probe).
+///
+/// `capability` is OPTIONAL: `None` (or empty) evaluates the token's intrinsic
+/// validity with no invoked-capability grant-match challenge (mirroring
+/// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     token: String,
-    capability: String,
+    capability: Option<String>,
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<NapiCapabilityValidation> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // An empty/whitespace-only capability means "no challenge" — treat it as
+    // absent rather than validating it as a (non-empty) URI.
+    let capability = capability.filter(|c| !c.trim().is_empty());
+    if let Some(ref cap) = capability {
+        validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    }
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -353,14 +362,18 @@ pub(crate) async fn ucan_evaluate_on(
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
-    // Parse the required capability URI.
-    let required_cap: CapabilityUri =
-        capability
-            .parse()
-            .map_err(|e: CoreUcanError| ScpNapiError::Permission {
-                message: format!("invalid capability URI '{capability}': {e}"),
-                code: codes::PERM_3001.to_owned(),
-            })?;
+    // Parse the optional required capability URI. `None` => intrinsic-validity
+    // diagnostic (no invoked-capability grant-match challenge).
+    let required_cap: Option<CapabilityUri> = capability
+        .as_deref()
+        .map(|cap| {
+            cap.parse::<CapabilityUri>()
+                .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                    message: format!("invalid capability URI '{cap}': {e}"),
+                    code: codes::PERM_3001.to_owned(),
+                })
+        })
+        .transpose()?;
 
     // Determine the presenting agent DID: explicit parameter or token audience.
     let agent_did = presenting_agent_did
@@ -398,7 +411,7 @@ pub(crate) async fn ucan_evaluate_on(
             clock: &scp_primitives::SystemClock,
         };
 
-        Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+        Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
     })
     .map_err(napi::Error::from)?;
 
