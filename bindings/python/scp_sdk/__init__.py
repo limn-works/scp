@@ -62,7 +62,13 @@ from scp_sdk.context import (
     validate_admission,
     validate_broadcast_key_hex,
 )
-from scp_sdk.discovery import create_query, normalize_address, parse_address
+from scp_sdk.discovery import (
+    create_query,
+    discover,
+    discover_contexts,
+    normalize_address,
+    parse_address,
+)
 from scp_sdk.economy import (
     auto_accept_blocked,
     check_policy_lock,
@@ -70,6 +76,7 @@ from scp_sdk.economy import (
     evaluate_formula,
     policy_requires_payment,
     validate_policy_change,
+    verify_payment_receipts,
 )
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
@@ -257,6 +264,8 @@ __all__ = [
     "check_policy_lock",
     "classify_offline",
     "create_query",
+    "discover",
+    "discover_contexts",
     "estimate_cost",
     "evaluate_formula",
     "get_policy",
@@ -278,4 +287,5 @@ __all__ = [
     "validate_broadcast_key_hex",
     "validate_policy_change",
     "verify_participation_requirements",
+    "verify_payment_receipts",
 ]

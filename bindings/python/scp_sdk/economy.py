@@ -9,13 +9,15 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ScpError
 
 if TYPE_CHECKING:
-    pass
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -154,6 +156,55 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 
 
 # ---------------------------------------------------------------------------
+# Payment receipt verification
+# ---------------------------------------------------------------------------
+
+
+async def verify_payment_receipts(
+    scp: SCP,
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verify a batch of payment receipts against the configured adapter.
+
+    Dispatches to the ``economy_verify_payment_receipts`` bridge op on the
+    :class:`~scp_sdk.SCP` instance, which routes through the runtime payment
+    adapter (per receipt). At most 10,000 receipts per call.
+
+    The result distinguishes adapter reachability from payment validity:
+    ``all_valid`` is ``True`` iff every receipt both reached the adapter
+    (``ok``) *and* the adapter reported it valid (``valid``); it is
+    vacuously ``True`` for an empty batch. A caller scanning for failures
+    MUST inspect ``valid`` / ``all_valid`` -- an invalid-but-reachable
+    receipt has ``ok == True``, ``valid == False``.
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch on.
+        receipts: A list of ``PaymentReceipt`` dicts (serialized to JSON
+            for the bridge).
+
+    Returns:
+        A dict ``{"all_valid": bool, "results": [...]}``. Each ``results``
+        entry is either ``{"receipt_id": str, "ok": True, "valid": bool,
+        "result": {...}}`` on success or ``{"ok": False, "error": str}``
+        on failure.
+
+    Raises:
+        ValueError: If the receipts cannot be serialized, the batch
+            exceeds the maximum, or the JSON is invalid.
+        RuntimeError: If the supervisor is not initialized.
+    """
+    instance = scp._native
+    receipts_json = json.dumps(receipts)
+    result = await asyncio.to_thread(
+        instance.economy_verify_payment_receipts,
+        receipts_json,
+    )
+    if isinstance(result, str):
+        return json.loads(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Budget tracking
 # ---------------------------------------------------------------------------
 
@@ -170,4 +221,5 @@ __all__ = [
     "evaluate_formula",
     "policy_requires_payment",
     "validate_policy_change",
+    "verify_payment_receipts",
 ]
