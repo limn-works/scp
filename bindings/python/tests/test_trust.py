@@ -344,15 +344,17 @@ class TestDiagnosticDoesNotRecordNonce:
         # Stateful gate: records the nonce; 2nd call on same token is a replay.
         recorded: set[str] = set()
 
-        def gate(context_id: str, token: str, capability: str, *args: Any) -> None:
+        def gate(context_id: str, token: str, capability: str | None = None, *args: Any) -> None:
             if token in recorded:
                 raise self._NonceReused(f"nonce reused: {token}")
             recorded.add(token)
 
         # Stateful diagnostic: NEVER records -- always reports nonce_valid=True,
-        # regardless of how many times it is called on the same token.
+        # regardless of how many times it is called on the same token. Capability
+        # is optional (evaluate_trust runs the intrinsic-validity diagnostic, so it
+        # calls ucan_evaluate(context_id, token) with no challenge capability).
         def diagnostic(
-            context_id: str, token: str, capability: str, *args: Any
+            context_id: str, token: str, capability: str | None = None, *args: Any
         ) -> _FakeStructuredResult:
             return _FakeStructuredResult(nonce_valid=True)
 
