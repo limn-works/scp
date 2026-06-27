@@ -2054,6 +2054,17 @@ pub fn execute_add_signer(
         let creator_did = state.role_state.creator_did.clone();
         let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
         for cap in &capabilities {
+            // ADR-049 §9 / ADR-050 §23.16.8: every `member_capabilities` write is
+            // ceiling-bounded. Promoting a multisig signer must not grant a
+            // governance capability the context ceiling EXCLUDES — the local
+            // Tier-2 gate would honor it until the next ModifyCeiling-lower
+            // reconcile, a real authorization escalation. Mirror the sibling
+            // ceiling-gated writers (MemberBan, tool-registration): skip caps the
+            // ceiling does not permit. Per-cap skip (not whole-op reject) so the
+            // signer is still added; only the excluded governance grant is dropped.
+            if !state.role_state.ceiling().contains(cap) {
+                continue;
+            }
             let att = roles::UcanAttestation {
                 with: format!("scp:ctx:{context_id}/{cap}"),
                 can: "invoke".to_owned(),
