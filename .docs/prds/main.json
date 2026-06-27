@@ -278,7 +278,8 @@
         "SCP-226",
         "SCP-227",
         "SCP-230",
-        "SCP-231"
+        "SCP-231",
+        "SCP-302"
       ]
     }
   ],
@@ -10312,6 +10313,62 @@
       ],
       "actionItems": [],
       "details": {}
+    },
+    {
+      "id": "SCP-302",
+      "title": "Rebuild Python and TypeScript trust-signal SDK consumption on the structured ucan_evaluate result",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [],
+      "files": [
+        "bindings/python/scp_sdk/trust.py",
+        "bindings/python/scp_sdk/discovery.py",
+        "bindings/python/scp_sdk/economy.py",
+        "bindings/typescript/src/types.ts",
+        "bindings/typescript/src/index.ts",
+        "bindings/typescript/src/scp.ts",
+        "bindings/typescript/src/internal/bridge.ts",
+        "bindings/typescript/src/internal/native.ts",
+        "bindings/typescript/src/internal/wasm.ts",
+        "bindings/typescript/tests/trust.test.ts",
+        "bindings/python/tests/test_trust.py",
+        ".docs/standards/sdk-capability-matrix.json",
+        "scripts/check-sdk-coverage.py"
+      ],
+      "description": "ADR-055 and §7.2.4 decide that capability/trust validation crosses the FFI as a typed structured record (CapabilityValidation: six per-stage booleans) and that SDKs MUST consume that result — never reverse-engineer which check failed by parsing human-readable error prose. The structured bridge op (ucan_evaluate / evaluate_ucan returning CapabilityValidation) already exists at the Rust core and all four FFI bridges; only the SDK consumers are wrong. A first-principles audit of the trust/capability SDK surface found the Python SDK string-matching error prose in trust.py to reconstruct the per-check breakdown, an antipattern that is brittle by construction and that masked a multi-attestation nonce bug (mocks emitted prose without modeling nonce state). This story is the C3c SDK rebuild: delete the Python prose-classification apparatus and consume the structured ucan_evaluate op; add the TypeScript public evaluateTrust wrapper over a ucanEvaluate bridge call plumbed through all TS bridge layers, exposing a CapabilityValidation interface, with all bridge-error typing routed through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error-code taxonomy rather than per-call prose classification; and rebuild the test mocks to model nonce state so the masked-bug class is surfaced. Per ADR-055 §Decision-5 and the per-SDK-idiom lesson, Kotlin and Swift idiomatic wrappers are OUT OF SCOPE and tracked separately (the UniFFI bridge already exports CapabilityValidationRecord). This story also lands the bundled SDK-parity wrappers the same audit identified as missing on the affected SDKs (per the UCAN.evaluate / Trust.evaluate_trust / Bridge.* / Identity.* / Discovery.discover / Economy.verify_payment_receipts capability-matrix exemptions that name \"the C3c SDK-parity follow-up\"). Per-SDK idiom is preserved throughout; the structured-result field set is identical across bindings (snake_case in Python, camelCase in TypeScript), only the wrappers are language-idiomatic.",
+      "acceptanceCriteria": [
+        "bindings/python/scp_sdk/trust.py contains zero occurrences of _classify_ucan_error, _extract_core_error, _PASSED_BEFORE, _TOKEN_PARSE_PREFIXES, _SIGNATURE_CHAIN_PREFIXES, _CAPABILITY_CEILING_PREFIXES, _NONCE_PREFIXES, _REVOCATION_PREFIXES, and _EXPIRY_PREFIXES (grep -c each returns 0), and evaluate_trust calls the structured ucan_evaluate bridge op per token and AND-combines the six CapabilityValidation booleans across the token set instead of catching and string-classifying error prose",
+        "TypeScript exposes the structured op end-to-end: a ucanEvaluate signature is declared in bindings/typescript/src/internal/bridge.ts and implemented in both bindings/typescript/src/internal/native.ts and bindings/typescript/src/internal/wasm.ts and surfaced via bindings/typescript/src/scp.ts; a CapabilityValidation interface with the six camelCase booleans (tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked, timeBoundsValid) is defined in bindings/typescript/src/types.ts and re-exported from bindings/typescript/src/index.ts; and a public method named exactly evaluateTrust consuming the structured CapabilityValidation result exists on the SCP class in bindings/typescript/src/scp.ts",
+        "TypeScript trust/capability error typing flows through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error code: exactly one mapping site exists in bindings/typescript/src/internal/native.ts and exactly one in bindings/typescript/src/internal/wasm.ts, and grep finds zero error.message / .message prose-branching (e.g. .includes(, .startsWith(, .match() on a message string) in the TypeScript trust-signal code paths",
+        "The bundled SDK-parity wrappers land on the SDKs the audit flagged: TypeScript public Identity wrappers rotateKey, addAgentKey, rotateAgentKey, removeAgentKey, and migrate exist on the SCP class; a TypeScript public bridgeRegister wrapper exists; a Python public discover() method exists in bindings/python/scp_sdk/discovery.py; and a Python public verify_payment_receipts() method exists in bindings/python/scp_sdk/economy.py",
+        "The capability matrix .docs/standards/sdk-capability-matrix.json flips these cells true and removes the now-stale C3c-follow-up exemption for each flipped cell: UCAN.evaluate (python and typescript true; kotlin and swift remain false WITH an exemption that no longer cites C3c as imminent), Trust.evaluate_trust (typescript true), Bridge.evaluate_trust (typescript true), Identity.rotate_key / Identity.add_agent_key / Identity.rotate_agent_key / Identity.remove_agent_key / Identity.migrate (typescript true), Bridge.register (typescript true), Discovery.discover (python true), and Economy.verify_payment_receipts (python true); a new (\"UCAN\", \"evaluate\") alias is added to the ALIASES table in scripts/check-sdk-coverage.py (python: evaluate/evaluate_trust, typescript: evaluateUcan/evaluateTrust); and python3.12 scripts/check-sdk-coverage.py exits 0",
+        "Tests model nonce state instead of emitting prose: TypeScript bun-addon-backed tests and Python pytest mocks for ucan_evaluate distinguish that the read-only diagnostic records NO nonce while the throwing gate (ucan_validate) DOES record it, a multi-token AND test asserts evaluate_trust is false when any single token fails a stage, and real-addon evaluate assertions run unskipped (the real-napi and real-wasm evaluate test cases are not gated out)",
+        "All gates pass on the changed surfaces: in bindings/typescript with the .node addon built, bun run check && bun run lint && bun test succeed; in bindings/python, python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed (with DYLD_LIBRARY_PATH set); python3.12 scripts/validate-prd.py exits 0; and the Rust workspace build and clippy are unchanged and green"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-055: Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.2.4 Structured Capability Evaluation: Gate vs. Diagnostic"
+        }
+      ],
+      "actionItems": [
+        "Delete the prose-classification apparatus from bindings/python/scp_sdk/trust.py (_classify_ucan_error, _extract_core_error, _PASSED_BEFORE, and the six *_PREFIXES tuples) and rewrite evaluate_trust to call the structured ucan_evaluate bridge op per token and AND-combine the six CapabilityValidation booleans across the token set",
+        "Add ucanEvaluate to bindings/typescript/src/internal/bridge.ts and implement it in internal/native.ts and internal/wasm.ts; define the CapabilityValidation interface (six camelCase booleans) in types.ts and re-export from index.ts; add the public evaluateTrust method on the SCP class in scp.ts consuming the structured result",
+        "Route TypeScript bridge-error typing through one mapping chokepoint per bridge (a single [SCP-CAT-NNNN] code->typed-error map site in internal/native.ts and one in internal/wasm.ts); remove any per-call message-string branching from TS trust-signal code",
+        "Add the bundled SDK-parity wrappers: TS SCP-class Identity wrappers rotateKey/addAgentKey/rotateAgentKey/removeAgentKey/migrate and bridgeRegister; Python discover() in discovery.py and verify_payment_receipts() in economy.py",
+        "Flip the capability-matrix cells listed in the acceptance criteria, remove each now-stale C3c-follow-up exemption (keep a non-imminent exemption only for the still-false Kotlin/Swift UCAN.evaluate cells), and add the (\"UCAN\", \"evaluate\") alias to scripts/check-sdk-coverage.py",
+        "Rebuild the test mocks to model nonce state (diagnostic records no nonce, gate records it), add a multi-token AND test, and ensure the real-napi/real-wasm evaluate assertions run unskipped",
+        "Run all local gates (bun check/lint/test with the addon built, ruff + pytest with DYLD, check-sdk-coverage.py, validate-prd.py, Rust build + clippy) and confirm green before opening the PR"
+      ],
+      "details": {
+        "outOfScope": "Kotlin and Swift idiomatic evaluate/evaluateTrust wrappers are explicitly out of scope and tracked separately per ADR-055 §Decision-5 and the per-SDK-idiom lesson; the UniFFI bridge already exports CapabilityValidationRecord, so only the idiomatic SDK sugar remains for those two languages. The bridge ucan_evaluate op, the Rust core evaluate_ucan / CapabilityValidation, and the throwing gate ucan_validate already exist and are NOT modified by this story."
+      }
     }
   ]
 }
