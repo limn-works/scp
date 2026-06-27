@@ -279,7 +279,7 @@ export type {
   VerificationMethod,
 } from "./types";
 
-export { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
+export { allValid, validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)

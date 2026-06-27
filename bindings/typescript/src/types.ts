@@ -821,7 +821,14 @@ export interface EventClaim {
 export interface CapabilityValidation {
   /** Step 1: UCAN tokens parse and have valid structure. */
   readonly tokensValid: boolean;
-  /** Steps 2-7: all signatures, the delegation chain, root issuer, audience, key scope, capability grant-match, Category-A enforcement, and attenuation verify. */
+  /**
+   * Steps 2-7: signatures, the full delegation chain, root issuer, audience,
+   * key scope, Category-A enforcement, and attenuation verify. The
+   * invoked-capability grant-match (step 6) is included ONLY when a challenge
+   * capability is supplied; in the diagnostic's intrinsic-validity mode
+   * (`evaluateTrust`'s mode — no challenge), step 6 is SKIPPED and this field
+   * reflects only the structural checks, not grant-match.
+   */
   readonly signaturesValid: boolean;
   /** Step 8: every granted capability is within the context's ceiling. */
   readonly withinCeiling: boolean;
@@ -831,6 +838,26 @@ export interface CapabilityValidation {
   readonly notRevoked: boolean;
   /** Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance). */
   readonly timeBoundsValid: boolean;
+}
+
+/**
+ * `true` iff every per-stage check in `v` passed.
+ *
+ * The one obvious correct happy-path call: collapses the six per-stage booleans
+ * of {@link CapabilityValidation} with a logical AND so consumers do not
+ * hand-roll the conjunction (and cannot silently omit a field when a new stage
+ * is added). A token is protocol-compliant only when all six are `true`.
+ * Mirrors the Python `CapabilityValidation.all_valid` accessor.
+ */
+export function allValid(v: CapabilityValidation): boolean {
+  return (
+    v.tokensValid &&
+    v.signaturesValid &&
+    v.withinCeiling &&
+    v.nonceValid &&
+    v.notRevoked &&
+    v.timeBoundsValid
+  );
 }
 
 /** Trust evaluation input for a participant. */

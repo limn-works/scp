@@ -52,6 +52,12 @@ from scp_sdk.types import CustodyType
 if TYPE_CHECKING:
     from scp_sdk.tools import SagaResult
 
+    # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate``'s return
+    # type without a runtime circular import (trust.py imports SCP). With
+    # ``from __future__ import annotations`` the annotation is a lazy string,
+    # so the name need only resolve for type checkers, not at import time.
+    from scp_sdk.trust import CapabilityValidation
+
 logger = logging.getLogger("scp_sdk")
 
 __all__ = [
@@ -1107,7 +1113,7 @@ class SCP:
         capability: str | None = None,
         presenting_agent_did: str | None = None,
         proof_tokens: list[str] | None = None,
-    ) -> Any:
+    ) -> CapabilityValidation:
         """Evaluate a UCAN token and return the structured per-stage result.
 
         Delegate to ``_scp_core.SCP.ucan_evaluate``, the read-only,
