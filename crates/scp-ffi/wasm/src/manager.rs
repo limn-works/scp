@@ -4236,10 +4236,20 @@ impl WasmContextManager {
 
                 let caps: Vec<Capability> = capabilities.clone();
                 ctx.role_state.restore_capabilities(did_str, &caps);
-                ctx.read_exclusion_list.remove(did_str);
-                if let Some(bc) = ctx.broadcast_context.as_mut() {
-                    // Governance unban: remove from ALL authors' block lists (§5.14.8).
-                    bc.governance_unban_subscriber(did_str);
+                // Clear the read-exclusion and the broadcast block ONLY when
+                // `messages:read` is among the requested capabilities — byte-
+                // identical to native `execute_restore_access`
+                // (governance_helpers.rs, §5.9), which gates both the
+                // `read_exclusion_list.remove` and the `governance_unban_subscriber`
+                // broadcast unban on `has_read`. A non-read restore (e.g.
+                // `messages:write`) must preserve a standing read-exclusion and
+                // its broadcast block rather than silently re-granting read.
+                if read_requested {
+                    ctx.read_exclusion_list.remove(did_str);
+                    if let Some(bc) = ctx.broadcast_context.as_mut() {
+                        // Governance unban: remove from ALL authors' block lists (§5.14.8).
+                        bc.governance_unban_subscriber(did_str);
+                    }
                 }
                 Ok(serde_json::json!({"action": "RestoreAccess", "did": did_str}))
             }
@@ -10069,6 +10079,80 @@ mod tests {
                 .read_exclusion_list
                 .contains(subject),
             "read restore must clear the read-exclusion"
+        );
+    }
+
+    /// §5.9 / native parity (`has_read` gate): a non-read `RestoreAccess` (e.g.
+    /// `messages:write`) for a member who is ALSO read-excluded must clear the
+    /// real write suspension WITHOUT clearing the standing read-exclusion.
+    /// Native `execute_restore_access` (`governance_helpers.rs`) gates BOTH the
+    /// `read_exclusion_list.remove` and the broadcast `governance_unban_subscriber`
+    /// on `messages:read` being requested; the WASM bridge must do the same so a
+    /// write restore never silently re-grants the read the action never asked
+    /// for.
+    #[test]
+    fn restore_access_non_read_cap_preserves_read_exclusion_wasm() {
+        // The creator is auto-admin and holds the seeded ceiling caps.
+        let mut mgr = manager_with_governed_context(
+            "ctx-nrx",
+            "did:dht:zcreator",
+            &["messages:read", "messages:write", "member:ban"],
+        );
+        let subject = "did:dht:zcreator";
+
+        // Suspend a REAL capability (messages:write) so the guard does not
+        // reject, and independently mark the member read-excluded.
+        mgr.dispatch_governance_action(
+            "ctx-nrx",
+            &GovernanceAction::SuspendCapability {
+                did: DID(subject.to_owned()),
+                capabilities: vec![Capability::MessagesWrite],
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("SuspendCapability must succeed");
+        {
+            let ctx = mgr.contexts.get_mut("ctx-nrx").expect("context must exist");
+            ctx.read_exclusion_list.insert(subject.to_owned());
+        }
+        assert!(
+            !mgr.contexts
+                .get("ctx-nrx")
+                .unwrap()
+                .member_has_capability(subject, "messages:write"),
+            "precondition: write is suspended"
+        );
+
+        // Restore ONLY messages:write — read is not requested.
+        mgr.dispatch_governance_action(
+            "ctx-nrx",
+            &GovernanceAction::RestoreAccess {
+                did: DID(subject.to_owned()),
+                capabilities: vec![Capability::MessagesWrite],
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("non-read RestoreAccess of a real suspension must succeed");
+
+        // The write suspension is cleared...
+        assert!(
+            mgr.contexts
+                .get("ctx-nrx")
+                .unwrap()
+                .member_has_capability(subject, "messages:write"),
+            "after restore, member must hold messages:write again"
+        );
+        // ...but the standing read-exclusion is PRESERVED (read was never
+        // requested, so the read carve-out must not fire).
+        assert!(
+            mgr.contexts
+                .get("ctx-nrx")
+                .unwrap()
+                .read_exclusion_list
+                .contains(subject),
+            "a non-read restore must preserve the standing read-exclusion"
         );
     }
 
