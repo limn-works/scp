@@ -44,13 +44,17 @@ regardless of prior calls is a tautology that proves nothing about the state mac
 ## Error *typing* still derives from codes, through one chokepoint
 
 Where an SDK must classify a thrown gate error into a typed SDK error, it maps on the
-structured `[SCP-CAT-NNNN]` error **code** the bridge attaches, at **one** mapping
-site (a single chokepoint), not with a try/catch ladder of `message.contains(...)` at
-each call site. Scattered string classification is the same brittle denylist this
-lesson retires, in a second location. The chokepoint must also pass already-typed
-errors through untouched — re-deriving a code from the message of an error that
-already carries a structured `.code` can only lose information (it downgrades a
-precise subclass to a generic error).
+structured `[SCP-CAT-NNNN]` error **code** the bridge attaches, through a **single
+mapping function** (one chokepoint — e.g. TS `mapBridgeError`) applied at one site per
+dispatch surface (e.g. a `wrapBridgeErrors` Proxy over the bridge factories, plus the
+SDK-class methods that dispatch through the raw addon directly), not with a try/catch
+ladder of `message.contains(...)` at each call site. Scattered string classification is
+the same brittle denylist this lesson retires, in a second location. The mapping
+function must also pass already-typed errors through untouched — re-deriving a code from
+the message of an error that already carries a structured `.code` can only lose
+information (it downgrades a precise subclass to a generic error). That pass-through is
+security-load-bearing and must be covered by a test, or a future deletion silently
+re-opens the downgrade.
 
 ## How to catch this when reviewing
 

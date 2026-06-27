@@ -1990,7 +1990,7 @@ The structured op was built precisely to retire this antipattern. This ADR recor
 
 - **Spec §7.2 (Layer 1: Protocol Enforcement), §7.2.1 (Tier 1 full UCAN validation), and §7.2.4 (Structured capability evaluation):** the normative prose this ADR enacts. §7.2.4 defines the structured-evaluation result and the gate-vs-diagnostic distinction at protocol level.
 - **ADR-016 (11-step UCAN validation pipeline, `.docs/adrs/phase-3.md`):** the gate `ucan_validate` enacts; `evaluate_ucan` mirrors its stage boundaries exactly.
-- **ADR-009 (nonce / replay defense):** the nonce side effect that distinguishes the gate (records) from the diagnostic (read-only probe).
+- **ADR-009 (Role Assignment and Capability Ceiling Enforcement):** the `NonceTracker` foundation — its acceptance criteria define the `NonceTracker` struct and the `check_and_record` (gate) / `check_replay` (diagnostic) operations whose differing nonce side effect distinguishes the gate (records) from the diagnostic (read-only probe). ADR-016 (cited above) is the normative nonce-validation pipeline (format, freshness, replay window).
 - **ADR-039 (shared-DID key scope, Category-A enforcement):** sub-checks inside the `signatures_valid` stage of `CapabilityValidation`.
 - **Agent-first API design tenet (CLAUDE.md) + per-SDK idiom lesson (`.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`):** identical record *shape* across bindings, but per-SDK idiomatic wrappers — not a single shape forced onto every language.
 - **Bridge error-code taxonomy (`[SCP-CAT-NNNN]` codes, `scripts/check-error-codes.sh`):** the source of SDK error typing, surfaced via one mapping chokepoint.
