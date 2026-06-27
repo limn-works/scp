@@ -37,7 +37,7 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
-import { mapSagaError, ValidationError } from "./errors";
+import { mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
@@ -2039,15 +2039,25 @@ export class SCP {
     presentingAgentDid?: string,
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation> {
-    const raw = await (
-      this.#native.ucanEvaluate as (
-        h: unknown,
-        t: string,
-        c: string | null,
-        pa: string | null,
-        pt: readonly string[] | null,
-      ) => Promise<CapabilityValidation>
-    )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
+    // Route the native dispatch through the single error chokepoint
+    // (`mapBridgeError`) so a raw NAPI/WASM throw or rejection surfaces as a
+    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-055
+    // Decision 4 (error typing routes through one mapping site, not per-call
+    // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
+    let raw: CapabilityValidation;
+    try {
+      raw = await (
+        this.#native.ucanEvaluate as (
+          h: unknown,
+          t: string,
+          c: string | null,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
     // NAPI `NapiCapabilityValidation` is already camelCase — read directly.
     return {
       tokensValid: raw.tokensValid,
@@ -2410,11 +2420,17 @@ export class SCP {
     }
 
     // Layer 2: behavioral record from the event log, scoped to the subject.
-    const filter: EventFilter = { actorDid: subjectDid };
-    const rawEvents = (await this.eventLogQuery(
-      handle,
-      JSON.stringify(filter),
-    )) as readonly Event[];
+    // The event-log query is the other direct native dispatch in this method;
+    // route it through the same `mapBridgeError` chokepoint as the per-token
+    // diagnostic (ADR-055 Decision 4) so a raw bridge error becomes a typed
+    // `ScpError` here too. (`ucanEvaluate` above already maps its own dispatch.)
+    let rawEvents: readonly Event[];
+    try {
+      const filter: EventFilter = { actorDid: subjectDid };
+      rawEvents = (await this.eventLogQuery(handle, JSON.stringify(filter))) as readonly Event[];
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
     const toolInvocations: Record<string, number> = {};
     let governanceActionsBy = 0;
     let governanceActionsAgainst = 0;
