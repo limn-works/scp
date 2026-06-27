@@ -440,6 +440,17 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                     }
                 }
             }
+            // §5.9: a `RestoreAccess` requested capabilities that were not
+            // actually suspended for the member (and the member is not
+            // read-excluded with read requested). Dedicated SCP-CTX-2137 instead
+            // of the CTX_2001 catch-all so a caller can detect a no-op restore
+            // (the member already held the requested access). Mirrors the WASM
+            // bridge, which surfaces the same code for byte-identical
+            // cross-bridge parity.
+            CE::NothingToRestore(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2137.to_owned(),
+            },
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -905,5 +916,17 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// §5.9: a `RestoreAccess` with nothing to restore must surface the
+    /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
+    /// The same code is surfaced by the WASM bridge for cross-bridge parity.
+    #[test]
+    fn nothing_to_restore_surfaces_ctx_2137() {
+        let err: ScpPyError = scp_core::context::ContextError::NothingToRestore(
+            "no suspended capabilities to restore for did:dht:zsubject".to_owned(),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2137);
     }
 }

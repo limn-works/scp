@@ -1149,6 +1149,16 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
+            // §5.9: a `RestoreAccess` requested capabilities that were not
+            // actually suspended for the member (and the member is not
+            // read-excluded with read requested). Dedicated SCP-CTX-2137
+            // instead of the CTX_2001 catch-all so a Swift / Kotlin caller can
+            // detect a no-op restore. Mirrors the PyO3 and WASM bridges for
+            // cross-bridge parity.
+            CE::NothingToRestore(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2137.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -18648,6 +18658,19 @@ mod tests {
         let err: ScpError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// §5.9: a `RestoreAccess` with nothing to restore must surface the
+    /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
+    /// The same code is surfaced by the `PyO3` and WASM bridges for
+    /// cross-bridge parity.
+    #[test]
+    fn nothing_to_restore_surfaces_ctx_2137() {
+        let err: ScpError = scp_core::context::ContextError::NothingToRestore(
+            "no suspended capabilities to restore for did:dht:zsubject".to_owned(),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2137);
     }
 
     /// Regression guard: an unrelated `ContextError` still falls through to

@@ -403,6 +403,17 @@ pub const CTX_2135: &str = "SCP-CTX-2135";
 ///
 /// Maps from `ContextError::KeyPackageReplay`.
 pub const CTX_2136: &str = "SCP-CTX-2136";
+/// Nothing to restore: a `RestoreAccess` governance action requested capabilities
+/// that are not actually suspended for the member, and the member is not
+/// read-excluded with read requested (§5.9).
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can detect that a
+/// restore was a no-op (the member already held the requested access) rather
+/// than a generic context error. Mirrors native `execute_restore_access`, which
+/// rejects before mutating when there is nothing to restore.
+///
+/// Maps from `ContextError::NothingToRestore`.
+pub const CTX_2137: &str = "SCP-CTX-2137";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
