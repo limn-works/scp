@@ -3721,12 +3721,12 @@ impl WasmContextManager {
         // The shared `set_ceiling` is the single fail-closed validation point: it
         // runs `validate_entries` BEFORE storing, so a malformed proposed entry is
         // rejected with the canonical `SCP-VALID-7000` error and the prior ceiling
-        // is left UNCHANGED. It also EAGERLY RECONCILES the cached role/member
-        // capabilities down to the (possibly lowered) ceiling (pure shrink, no-op on
-        // widen) — matching native, which inherits the same reconcile via the shared
-        // write. Soundness of that reconcile (guard (ii) of the read-time-trust
-        // argument): see the `ContextRoleState` ceiling-consistency invariant in
-        // `scp_protocol::context::roles`.
+        // is left UNCHANGED. It also eagerly reconciles the cached role/member
+        // capabilities down to the (possibly lowered) ceiling — for the full
+        // shrink/no-op-on-widen/idempotent semantics (and why native and WASM stay
+        // convergent via this one shared write) see
+        // `ContextRoleState::reconcile_to_ceiling` and the `ContextRoleState`
+        // ceiling-consistency invariant in `scp_protocol::context::roles`.
         ctx.role_state
             .set_ceiling(CapabilityCeiling::new(new_ceiling.iter().cloned()))
             .map_err(ceiling_validation_error)?;
