@@ -204,6 +204,56 @@ fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
     policy_requires_payment(&parsed)
 }
 
+/// Validates a stored governance-model string against the canonical set the
+/// WASM bridge recognizes, returning the input unchanged on success.
+///
+/// The four canonical models (ADR-031, spec §5.9) are `single_admin`,
+/// `threshold`, `majority`, and `unanimity`. An empty string is the documented
+/// default and normalizes to `single_admin` at the read site (the default is
+/// applied by the caller; an explicitly-empty `governance` field is accepted
+/// here for symmetry with that default).
+///
+/// # Why this exists
+///
+/// `create_context` previously stored the `governance` string verbatim with no
+/// validation, and [`WasmContextManager::governance_quorum`] treats any
+/// UNRECOGNIZED model as `single_admin` auto-execute (its `_ =>` arm). A typo
+/// such as `"threshhold"` or `"majorty"` therefore silently became single-admin
+/// auto-execute — a security-relevant fail-open in which a context the caller
+/// intended to be multi-party-governed instead auto-approves every proposal.
+/// Rejecting unknown models at the boundary (create + import) closes that
+/// fail-open: every STORED `governance` string is now one of the recognized
+/// models, so the `_ =>` quorum arm is unreachable for stored contexts.
+///
+/// # Divergence note (intentional)
+///
+/// The native FFI parser (`scp_ffi_common::context_params::parse_governance`)
+/// additionally accepts the legacy aliases `"multisig"` (→ `Threshold`) and
+/// `"token_voting"` (→ `Majority`) for backward compatibility with the older
+/// `UniFFI` typed variants. The WASM bridge has never emitted or recognized those
+/// aliases in `governance_quorum`, so accepting them here WITHOUT quorum support
+/// would reintroduce the very fail-open this fix closes (the alias would fall
+/// through to the `_ =>` auto-execute arm). We therefore validate against the
+/// canonical set ONLY; the aliases are rejected as unknown on the WASM path.
+///
+/// # Errors
+///
+/// Returns [`ScpWasmError::Validation`] with [`codes::VALID_7005`] (invalid
+/// field value — the documented code for enum-like string mismatches) when
+/// `governance` is not one of the recognized models.
+fn validate_governance_model(governance: &str) -> Result<(), ScpWasmError> {
+    match governance {
+        "single_admin" | "" | "threshold" | "majority" | "unanimity" => Ok(()),
+        other => Err(ScpWasmError::Validation {
+            message: format!(
+                "unknown governance model '{other}': expected one of \
+                 single_admin / threshold / majority / unanimity"
+            ),
+            code: codes::VALID_7005.to_owned(),
+        }),
+    }
+}
+
 /// Parses a WASM-format (UCAN `{resource}:{action}`) capability string into a
 /// typed [`Capability`].
 ///
@@ -1563,6 +1613,16 @@ impl WasmContextManager {
             .as_str()
             .unwrap_or("single_admin")
             .to_owned();
+        // Reject an unrecognized governance model NAME before any state is
+        // mutated. An unknown model would otherwise be stored verbatim and
+        // silently collapse to `single_admin` auto-execute in `governance_quorum`
+        // (its `_ =>` arm) — a security-relevant fail-open. This validates the
+        // model discriminant only; it does NOT validate the quorum parameters
+        // (signer set / threshold value) that native's typed `GovernanceModel`
+        // additionally carries, so a recognized model (e.g. `threshold`) can
+        // still hold a degenerate quorum until the shared governance engine is
+        // adopted on the WASM path.
+        validate_governance_model(&governance)?;
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
         // C2 fail-closed: reject paid economic policies at WASM context creation.
@@ -4890,7 +4950,11 @@ impl WasmContextManager {
             "threshold" => (ctx.threshold_value as usize, total),
             "majority" => (total / 2 + 1, total),
             "unanimity" => (total, total),
-            // single_admin and any unrecognized model: auto-approve.
+            // `single_admin` (quorum 0 → auto-approve). Any OTHER string is now
+            // unreachable for a stored context: `validate_governance_model`
+            // rejects unrecognized models at both `create_context` and
+            // `import_context`, so the only value that reaches this arm is
+            // `single_admin` (or the empty-string default that normalizes to it).
             _ => (0, total),
         }
     }
@@ -6877,6 +6941,16 @@ impl WasmContextManager {
                 code: codes::CTX_2032.to_owned(),
             });
         }
+
+        // Re-validate the governance model from the untrusted snapshot
+        // (defense-in-depth, mirroring the ceiling-grammar belt below). The
+        // Ed25519 envelope signature authenticates ORIGIN, not WELL-FORMEDNESS:
+        // a malicious or stale snapshot carrying an unknown governance model
+        // (e.g. `"threshhold"`) would be stored verbatim and then silently
+        // collapse to `single_admin` auto-execute in `governance_quorum` — the
+        // exact fail-open the create-path validation closes. Reject it here with
+        // the same rule so import and create agree.
+        validate_governance_model(&snap.governance)?;
 
         // Defense-in-depth: validate and check minProtocolVersion from the
         // imported snapshot's params. Rejects malformed version data and
@@ -9580,6 +9654,85 @@ mod tests {
         }
     }
 
+    /// Each canonical governance model (`single_admin`, `threshold`, `majority`,
+    /// `unanimity`) passes the governance-model gate at `create_context` and the
+    /// context is registered — proving the validation accepts every recognized
+    /// model and does not over-reject. Asserted as `Ok` because the gate runs
+    /// ahead of (and is independent of) the rest of creation, and the host build
+    /// uses real `SystemTime`, so a well-formed Encrypted create completes.
+    #[test]
+    fn create_context_accepts_recognized_governance_models_wasm() {
+        for model in ["single_admin", "threshold", "majority", "unanimity"] {
+            let mut mgr = WasmContextManager::new();
+            let creator = "did:dht:zcreator";
+            let context_id = format!("ctx-gov-{model}");
+            let params = serde_json::json!({
+                "mode": "Encrypted",
+                "ceiling": [],
+                "ceilingPolicy": "immutable",
+                "governance": model,
+                "economicPolicy": free_policy_json(),
+            });
+
+            mgr.create_context(&context_id, creator, &params)
+                .unwrap_or_else(|e| {
+                    panic!("recognized governance model {model:?} must be accepted, got: {e:?}")
+                });
+
+            assert!(
+                mgr.contexts.contains_key(&context_id),
+                "accepted context for model {model:?} must be registered"
+            );
+        }
+    }
+
+    /// A typo'd governance model (`"threshhold"`) is rejected at `create_context`
+    /// with `SCP-VALID-7005` (invalid field value) BEFORE any state mutation, and
+    /// the context is NOT registered. This is the core fail-open closure: an
+    /// unrecognized model must NOT be silently stored (where `governance_quorum`
+    /// would collapse it to `single_admin` auto-execute).
+    #[test]
+    fn create_context_rejects_unknown_governance_model_wasm() {
+        for bad_model in ["threshhold", "majorty", "multisig", "token_voting", "admin"] {
+            let mut mgr = WasmContextManager::new();
+            let creator = "did:dht:zcreator";
+            let params = serde_json::json!({
+                "mode": "Encrypted",
+                "ceiling": [],
+                "ceilingPolicy": "immutable",
+                "governance": bad_model,
+                "economicPolicy": free_policy_json(),
+            });
+
+            let err = mgr
+                .create_context("ctx-bad-gov", creator, &params)
+                .expect_err("create_context must reject an unknown governance model");
+
+            match err {
+                ScpWasmError::Validation {
+                    ref code,
+                    ref message,
+                } => {
+                    assert_eq!(
+                        code,
+                        codes::VALID_7005,
+                        "unknown governance model must surface SCP-VALID-7005 for {bad_model:?}"
+                    );
+                    assert!(
+                        message.contains("unknown governance model") && message.contains(bad_model),
+                        "expected an actionable message naming {bad_model:?}, got: {message}"
+                    );
+                }
+                other => panic!("expected Validation error for {bad_model:?}, got: {other:?}"),
+            }
+
+            assert!(
+                !mgr.contexts.contains_key("ctx-bad-gov"),
+                "rejected context must not appear in the registry for {bad_model:?}"
+            );
+        }
+    }
+
     /// CREATE-PATH canonical-form parity: the WASM create path parses each
     /// user-supplied colon-form entry via `Capability::new`, validates it via the
     /// shared `ContextRoleState::new` (`validate_entries`), and stores the typed ceiling inside
@@ -11722,6 +11875,69 @@ mod tests {
         );
 
         // Leave the shared thread-local registry clean for sibling tests.
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// A snapshot carrying an unknown governance model is rejected at
+    /// `import_context` with `SCP-VALID-7005`, even though the envelope signature
+    /// is VALID (the creator signed it). The Ed25519 snapshot signature
+    /// authenticates ORIGIN, not WELL-FORMEDNESS: a malicious or stale snapshot
+    /// could carry a typo'd model (`"threshhold"`) that `governance_quorum` would
+    /// otherwise collapse to `single_admin` auto-execute. Re-validating on import
+    /// closes that fail-open on the restore path, matching the create-path reject.
+    #[test]
+    fn import_context_rejects_unknown_governance_model_wasm() {
+        let context_id = "ctx-import-bad-gov";
+
+        // The signed export resolves the creator's #active key from the shared
+        // thread-local identity registry; register the creator first.
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        // Build a valid context, then inject an UNKNOWN governance model directly
+        // into the stored state (simulating a forged/stale snapshot). The export
+        // signs over this state verbatim, so the resulting envelope is a
+        // correctly-signed snapshot that nonetheless carries a bad model.
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        state.test_set_governance("threshhold");
+        src.contexts.insert(context_id.to_owned(), state);
+
+        let bytes = src
+            .export_context(context_id)
+            .expect("signed export of the (bad-governance) context must succeed");
+
+        // Import into a FRESH manager. The signature verifies, but the governance
+        // re-validation must reject the unknown model.
+        let mut dst = WasmContextManager::new();
+        let err = dst
+            .import_context(&bytes)
+            .expect_err("import must reject a snapshot with an unknown governance model");
+
+        match err {
+            ScpWasmError::Validation {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(
+                    code,
+                    codes::VALID_7005,
+                    "unknown governance model on import must surface SCP-VALID-7005"
+                );
+                assert!(
+                    message.contains("unknown governance model") && message.contains("threshhold"),
+                    "expected an actionable message naming the bad model, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+
+        assert!(
+            !dst.contexts.contains_key(context_id),
+            "a rejected import must not register the context"
+        );
+
         crate::identity::test_helpers::cleanup_identity_registry();
     }
 
