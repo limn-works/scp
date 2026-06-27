@@ -289,8 +289,11 @@ impl ThresholdEngine {
         vote: VoteType,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Key is guaranteed present: precheck_vote looked it up and we hold
-        // `&mut self` continuously since then.
+        // `precheck_vote` already validated the proposal exists, is pending, and
+        // within the deadline. We re-acquire it via `get_mut` here; in the
+        // single-threaded `&mut self` flow it cannot have been removed in
+        // between, so the `if let Some(..)` simply no-ops on the impossible
+        // absence rather than panicking.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
             match vote {
                 VoteType::Approve => proposal_mut.approvals.push(signed_vote),

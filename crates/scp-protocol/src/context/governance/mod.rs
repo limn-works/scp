@@ -905,7 +905,7 @@ pub struct SignedVote {
 /// [`Resolved`](PrecheckOutcome::Resolved) so the caller returns the resolution
 /// directly.
 pub(super) enum PrecheckOutcome {
-    /// Guards passed; the caller should build the vote, (for the signed path)
+    /// Guards passed; the caller should build the vote (for the signed path),
     /// sign and verify it, then call `push_and_resolve`.
     Proceed,
     /// The proposal was auto-resolved during precheck (majority past-deadline).
