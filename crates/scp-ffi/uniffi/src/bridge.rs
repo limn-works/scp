@@ -13312,6 +13312,14 @@ impl Scp {
     /// additionally require the token grants it. (The enforcing `ucan_validate`
     /// gate keeps a mandatory capability.)
     ///
+    /// WARNING: when `presenting_agent_did` is `None` (or empty) the audience
+    /// defaults to the token's OWN `aud`, making the step-5 audience check a
+    /// tautological self-check (`aud == aud`) that does NOT bind the token to any
+    /// external subject. A caller assessing a SPECIFIC subject MUST pass that
+    /// subject's DID — otherwise a token addressed to someone else would report
+    /// `signatures_valid` (trust inflation). The SDK trust path always passes the
+    /// subject; this default is a convenience for self-evaluation only.
+    ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     pub async fn ucan_evaluate(

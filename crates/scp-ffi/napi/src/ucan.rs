@@ -336,6 +336,14 @@ pub(crate) async fn ucan_validate_on(
 /// `capability` is OPTIONAL: `None` (or empty) evaluates the token's intrinsic
 /// validity with no invoked-capability grant-match challenge (mirroring
 /// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
+///
+/// WARNING: when `presenting_agent_did` is `None` (or empty) the audience
+/// defaults to the token's OWN `aud`, making the step-5 audience check a
+/// tautological self-check (`aud == aud`) that does NOT bind the token to any
+/// external subject. A caller assessing a SPECIFIC subject MUST pass that
+/// subject's DID — otherwise a token addressed to someone else would report
+/// `signatures_valid` (trust inflation). The SDK trust path always passes the
+/// subject; this default is a convenience for self-evaluation only.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
