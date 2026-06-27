@@ -14,7 +14,12 @@ an SCP context.  Trust evaluation is a four-layer model:
    and consequence structures for agent judgment.
 
 See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
-``.docs/adrs/phase-3.md`` ADR-014 for the SDK design.
+``.docs/adrs/phase-3.md`` ADR-014 for the SDK design. The structured
+``ucan_evaluate`` consumption (Layer 1 / :class:`CapabilityValidation`) is
+governed by ``.docs/adrs/phase-2.md`` ADR-055 and
+``.docs/specs/07-trust-validation-and-capabilities.md`` §7.2.4: the SDK
+consumes the typed per-stage result and never reverse-engineers which check
+failed by parsing error prose.
 """
 
 from __future__ import annotations
@@ -76,8 +81,13 @@ class CapabilityValidation:
     #: UCAN tokens parse and have valid structure (step 1).
     tokens_valid: bool = False
 
-    #: All signatures verify against the claimed DIDs across the whole
-    #: delegation chain (steps 2-7).
+    #: Signatures, the full delegation chain, root issuer, audience, key
+    #: scope, Category-A enforcement, and attenuation verify (steps 2-7). The
+    #: invoked-capability grant-match (step 6) is included ONLY when a
+    #: challenge capability is supplied; in the diagnostic's intrinsic-validity
+    #: mode (the mode :func:`evaluate_trust` uses — no challenge), step 6 is
+    #: SKIPPED and this field reflects only the structural checks, not
+    #: grant-match.
     signatures_valid: bool = False
 
     #: Requested capabilities are within the context's ceiling (step 8).
@@ -93,6 +103,24 @@ class CapabilityValidation:
     #: Token time bounds are valid (step 11: not expired, not pre-dated,
     #: valid range).
     time_bounds_valid: bool = False
+
+    @property
+    def all_valid(self) -> bool:
+        """``True`` iff every per-stage check passed.
+
+        The one obvious correct happy-path call: collapses the six per-stage
+        booleans with a logical AND so consumers do not hand-roll the
+        conjunction (and cannot silently omit a field when a new stage is
+        added). A token is protocol-compliant only when all six are ``True``.
+        """
+        return (
+            self.tokens_valid
+            and self.signatures_valid
+            and self.within_ceiling
+            and self.nonce_valid
+            and self.not_revoked
+            and self.time_bounds_valid
+        )
 
 
 @dataclass
@@ -615,7 +643,19 @@ async def evaluate_trust(
             # impose an invoked-capability grant-match the caller never asked
             # for. See ADR-055 / spec §7.2.4: the diagnostic's challenge
             # capability is optional, and ``None`` means intrinsic-validity.
-            result = await asyncio.to_thread(instance.ucan_evaluate, context_id, token)
+            #
+            # ``subject_did`` is passed as the presenting agent so the step-5
+            # audience check evaluates the token against the DID under
+            # assessment. Omitting it makes the bridge default the presenting
+            # agent to the token's OWN ``aud`` (crates/scp-ffi/src/ucan.rs),
+            # turning the audience check into the tautology ``aud == aud`` —
+            # which would report ``signatures_valid`` for a token addressed to
+            # someone else (trust inflation). The TS canonical API passes the
+            # subject the same way; this keeps an identical shape across
+            # bindings (Agent-first API design tenet).
+            result = await asyncio.to_thread(
+                instance.ucan_evaluate, context_id, token, None, subject_did
+            )
             per_token = _structured_to_capability_validation(result)
             cap_validation.tokens_valid &= per_token.tokens_valid
             cap_validation.signatures_valid &= per_token.signatures_valid

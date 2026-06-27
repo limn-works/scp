@@ -277,13 +277,17 @@ class TestMultiTokenAndAggregation:
 
         assert mock_bridge.ucan_evaluate.call_count == 1
         call = mock_bridge.ucan_evaluate.call_args
-        # Only context_id and token are passed — no challenge capability in
-        # either positional or keyword form, and never the rejected "*" sentinel.
+        # No challenge capability in either positional or keyword form, and
+        # never the rejected "*" sentinel.
         positional = call.args
         assert "*" not in positional
         assert "*" not in call.kwargs.values()
-        # The diagnostic is called for general validity: context_id + token only.
-        assert positional == ("ctx-test", "only-token")
+        # The diagnostic is called for general validity with the challenge
+        # capability None and the subject DID passed as the presenting agent
+        # (so the audience check evaluates against the DID under assessment, not
+        # the tautological token-own-aud default). Signature is
+        # ucan_evaluate(context_id, token, capability, presenting_agent_did).
+        assert positional == ("ctx-test", "only-token", None, "did:dht:z6MkBob")
         assert "capability" not in call.kwargs
 
     def test_all_tokens_passing_yields_all_true(self) -> None:
@@ -303,16 +307,7 @@ class TestMultiTokenAndAggregation:
                 )
             )
         cv = evaluation.capability_validation
-        assert all(
-            (
-                cv.tokens_valid,
-                cv.signatures_valid,
-                cv.within_ceiling,
-                cv.nonce_valid,
-                cv.not_revoked,
-                cv.time_bounds_valid,
-            )
-        )
+        assert cv.all_valid
 
 
 # -----------------------------------------------------------------------

@@ -656,6 +656,117 @@ class TestUcan:
         assert cv2.tokens_valid is True
         assert cv2.signatures_valid is True
 
+    async def test_evaluate_trust_audience_mismatch_real_ffi(self, scp: SCP):
+        """A token whose ``aud`` differs from the evaluated subject is rejected.
+
+        Regression guard for the audience tautology: ``evaluate_trust`` must
+        pass the ``subject_did`` to the diagnostic as the presenting agent so
+        the step-5 audience check evaluates against the DID under assessment.
+        Without it the bridge defaults the presenting agent to the token's OWN
+        ``aud`` (``aud == aud`` always true), reporting ``signatures_valid`` for
+        a token addressed to someone else (trust inflation). Mints a token for
+        Bob, then evaluates trust for Carol against that token and asserts the
+        structured ``signatures_valid`` is False (ADR-055 / §7.2.4).
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        carol = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        # Token audience is Bob.
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        # Evaluate trust for Carol (the relying party named a different subject
+        # than the token's audience): the audience check fails, so the
+        # structural-checks field is False.
+        evaluation = await evaluate_trust(
+            scp=scp,
+            subject_did=carol.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+
+        cv = evaluation.capability_validation
+        assert cv.signatures_valid is False, (
+            "a token whose aud != the evaluated subject must NOT report "
+            "signatures_valid — the audience check must run against the subject "
+            "DID, not the token's own audience"
+        )
+
+        # Control: evaluating the same token for its true audience (Bob) passes
+        # the audience check — proving the False above is the mismatch, not an
+        # unrelated failure.
+        control = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+        assert control.capability_validation.signatures_valid is True
+
+    async def test_ucan_evaluate_empty_capability_coerced_to_no_challenge(self, scp: SCP):
+        """An empty/whitespace capability is coerced to no-challenge (None).
+
+        Every bridge applies ``capability.filter(|c| !c.trim().is_empty())``
+        before the core diagnostic, so an empty or whitespace-only capability
+        string is treated as "no challenge" — identical to omitting it. A bare
+        ``"*"`` is NOT this (it is a malformed capability URI the bridge
+        rejects); absence is expressed by emptiness/omission only (ADR-055 /
+        §7.2.4). This pins the PyO3 bridge's coercion so the cross-bridge
+        parity test (TS real-napi sibling) and this one cannot diverge.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        def booleans(raw: object) -> tuple[bool, ...]:
+            return (
+                bool(raw.tokens_valid),  # type: ignore[attr-defined]
+                bool(raw.signatures_valid),  # type: ignore[attr-defined]
+                bool(raw.within_ceiling),  # type: ignore[attr-defined]
+                bool(raw.nonce_valid),  # type: ignore[attr-defined]
+                bool(raw.not_revoked),  # type: ignore[attr-defined]
+                bool(raw.time_bounds_valid),  # type: ignore[attr-defined]
+            )
+
+        # Presenting agent fixed to the token audience so the only variable is
+        # the capability argument's emptiness.
+        omitted = booleans(
+            scp._native.ucan_evaluate(handle.context_id, token.encoded, None, bob.did)
+        )
+        empty = booleans(scp._native.ucan_evaluate(handle.context_id, token.encoded, "", bob.did))
+        whitespace = booleans(
+            scp._native.ucan_evaluate(handle.context_id, token.encoded, "   ", bob.did)
+        )
+
+        # Empty / whitespace capability == omitted capability: same six booleans.
+        assert empty == omitted, (
+            f"empty-string capability must coerce to no-challenge: {empty} != {omitted}"
+        )
+        assert whitespace == omitted, (
+            f"whitespace capability must coerce to no-challenge: {whitespace} != {omitted}"
+        )
+        # A fresh, in-ceiling token is intrinsically valid on every stage.
+        assert omitted == (True, True, True, True, True, True)
+
 
 # ---------------------------------------------------------------------------
 # Event Log
