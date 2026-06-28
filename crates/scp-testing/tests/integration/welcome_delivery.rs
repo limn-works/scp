@@ -29,7 +29,12 @@ use scp_core::crypto::mls::provider::MlsCryptoProvider;
 fn cross_process_welcome_delivery() {
     let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-    let context_id = [0x42u8; 32];
+    // Derive the 32-byte id from a real string: `seal` binds the raw
+    // `inner.context_id` string into the AEAD AAD (§9.16.1) and asserts the
+    // supplied id is its SHA-256, and `open` rebuilds the same AAD from the
+    // raw string passed alongside the id.
+    let context_id_str = "cross-process-welcome-ctx";
+    let context_id = scp_core::context::context_id_bytes(context_id_str);
 
     // Create Alice's and Bob's crypto providers (separate "processes").
     let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
@@ -93,7 +98,7 @@ fn cross_process_welcome_delivery() {
     let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let params = scp_core::envelope::inner::InnerEnvelopeParams {
         version: scp_core::envelope::SCP_PROTOCOL_VERSION,
-        context_id: &hex::encode(context_id),
+        context_id: context_id_str,
         sender_did: alice_did,
         epoch: 0,
         generation: 0,
@@ -105,14 +110,16 @@ fn cross_process_welcome_delivery() {
         signing_key_id: scp_identity::SigningKeyId::Active,
     };
     let inner = scp_core::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
-    let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
+    let routing_id = scp_core::context::context_routing_id(context_id_str);
     let sealed = alice_crypto
         .seal(&context_id, &inner, &routing_id, 300)
         .unwrap();
 
     // Bob opens Alice's message — proves the full pipeline works:
     // MLS Welcome join + sender key distribution + seal + open.
-    let open_result = bob_crypto.open(&context_id, &sealed).unwrap();
+    let open_result = bob_crypto
+        .open(&context_id, context_id_str, &sealed)
+        .unwrap();
     let envelope = match open_result {
         scp_core::context::builder::OpenResult::Application(env) => env,
         other => panic!("expected Application, got {other:?}"),
@@ -139,7 +146,8 @@ fn cross_process_welcome_delivery() {
 fn join_time_sender_key_distribution_uses_management_channel() {
     let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-    let context_id = [0x33u8; 32];
+    let context_id_str = "sender-key-mgmt-channel-ctx";
+    let context_id = scp_core::context::context_id_bytes(context_id_str);
 
     let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
     let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
@@ -176,14 +184,14 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     // The fix: each pending distribution MUST be MLS-wrapped before
     // being posted to transport. This is what `drain_and_deliver_sender_keys`
     // does internally — we exercise the same path here.
-    let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
+    let routing_id = scp_core::context::context_routing_id(context_id_str);
     let (target_did, raw_distribution) = pending.into_iter().next().unwrap();
     assert_eq!(target_did, bob_did);
 
     // Sanity check the pre-fix shape: the raw distribution bytes are NOT
     // a valid OuterEnvelope. Bob's `open()` would error if we sent them
     // as-is via `transport.send_message`.
-    let bare_open = bob_crypto.open(&context_id, &raw_distribution);
+    let bare_open = bob_crypto.open(&context_id, context_id_str, &raw_distribution);
     assert!(
         bare_open.is_err(),
         "raw HPKE distribution bytes must not deserialize as OuterEnvelope — \
@@ -197,7 +205,9 @@ fn join_time_sender_key_distribution_uses_management_channel() {
 
     // Bob's `open()` MUST recognize the wrapped payload as Management,
     // surfacing the inner HPKE bytes for `process_incoming_sender_key`.
-    let open_result = bob_crypto.open(&context_id, &wrapped).unwrap();
+    let open_result = bob_crypto
+        .open(&context_id, context_id_str, &wrapped)
+        .unwrap();
     let payload = match open_result {
         scp_core::context::builder::OpenResult::Management {
             sender_did,

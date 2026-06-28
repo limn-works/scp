@@ -262,6 +262,56 @@ mod tests {
     }
 
     #[test]
+    fn raw_context_string_aad_differs_from_hex_of_hash() {
+        // §9.16.1 / §9.5.1: the AAD binds the RAW context_id string. A peer
+        // that (incorrectly) bound `hex(SHA-256(context_id))` would produce a
+        // different AAD and fail to interoperate. This pins that the two are
+        // distinct AAD values: a ciphertext sealed with the raw string cannot
+        // be opened with the hex-of-hash string, and vice versa.
+        let key = generate_sender_key();
+        let plaintext = b"interop-sensitive payload";
+
+        // The hex of SHA-256(raw) — exactly what native used to bind (#1909).
+        let hex_of_hash = hex::encode(crate::context::context_id_bytes(TEST_CTX));
+        assert_ne!(
+            hex_of_hash, TEST_CTX,
+            "the hex-of-hash and the raw string must be distinct AAD inputs"
+        );
+
+        // Sealed with the RAW string (the spec value).
+        let ct_raw =
+            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+                .unwrap();
+        // Opening with the hex-of-hash string fails — wrong AAD.
+        assert!(
+            decrypt_sender_layer(&key, &ct_raw, &hex_of_hash, TEST_DID, TEST_EPOCH, TEST_SEQ)
+                .is_err(),
+            "raw-sealed ciphertext must NOT open under the hex-of-hash AAD"
+        );
+        // Opening with the raw string succeeds — the spec round-trip.
+        assert_eq!(
+            decrypt_sender_layer(&key, &ct_raw, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).unwrap(),
+            plaintext,
+        );
+
+        // Symmetric direction: sealed with the hex-of-hash string cannot open
+        // under the raw string.
+        let ct_hex = encrypt_sender_layer(
+            &key,
+            plaintext,
+            &hex_of_hash,
+            TEST_DID,
+            TEST_EPOCH,
+            TEST_SEQ,
+        )
+        .unwrap();
+        assert!(
+            decrypt_sender_layer(&key, &ct_hex, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).is_err(),
+            "hex-sealed ciphertext must NOT open under the raw-string AAD"
+        );
+    }
+
+    #[test]
     fn truncated_ciphertext_fails() {
         let key = generate_sender_key();
         let result =

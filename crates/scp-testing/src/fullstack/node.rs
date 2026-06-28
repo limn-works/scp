@@ -421,8 +421,10 @@ impl FullStackNode {
     ) -> Result<(), ContextError> {
         self.crypto.join_from_welcome(context_id)?;
         self.crypto.pickup_access_keys(context_id_str);
-        self.crypto.pickup_sender_key_messages(context_id)?;
-        self.crypto.process_pending_commits(context_id)?;
+        self.crypto
+            .pickup_sender_key_messages(context_id_str, context_id)?;
+        self.crypto
+            .process_pending_commits(context_id_str, context_id)?;
         Ok(())
     }
 
@@ -560,11 +562,17 @@ impl FullStackNode {
     /// application envelope.
     pub fn open_inner_envelope(
         &self,
+        context_id_str: &str,
         context_id: &[u8; 32],
         ciphertext: &[u8],
     ) -> Result<scp_core::envelope::inner::InnerEnvelope, ContextError> {
-        self.crypto.process_pending_commits(context_id)?;
-        match self.crypto.provider.open(context_id, ciphertext)? {
+        self.crypto
+            .process_pending_commits(context_id_str, context_id)?;
+        match self
+            .crypto
+            .provider
+            .open(context_id, context_id_str, ciphertext)?
+        {
             scp_core::context::builder::OpenResult::Application(env) => Ok(env.inner),
             scp_core::context::builder::OpenResult::Control => {
                 Err(ContextError::CryptoFailed("open returned Control".into()))
@@ -599,11 +607,16 @@ impl FullStackNode {
         sender_did: &str,
     ) -> Result<Vec<u8>, ContextError> {
         // Apply any pending epoch-advance commits to sync the MLS epoch.
-        self.crypto.process_pending_commits(context_id)?;
+        self.crypto
+            .process_pending_commits(context_id_str, context_id)?;
 
         // Open: outer envelope → MLS decrypt → sender-key decrypt → inner
         // envelope → strip padding → integrity check.
-        let opened = match self.crypto.provider.open(context_id, ciphertext)? {
+        let opened = match self
+            .crypto
+            .provider
+            .open(context_id, context_id_str, ciphertext)?
+        {
             scp_core::context::builder::OpenResult::Application(env) => *env,
             scp_core::context::builder::OpenResult::Control => {
                 return Err(ContextError::CryptoFailed("open returned Control".into()));
@@ -661,8 +674,13 @@ impl FullStackNode {
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the crypto provider.
-    pub fn pickup_sender_keys(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
-        self.crypto.pickup_sender_key_messages(context_id)
+    pub fn pickup_sender_keys(
+        &self,
+        context_id_str: &str,
+        context_id: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        self.crypto
+            .pickup_sender_key_messages(context_id_str, context_id)
     }
 
     /// Drains events for a context.

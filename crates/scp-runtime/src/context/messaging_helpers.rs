@@ -2739,7 +2739,9 @@ pub fn decrypt_and_dispatch(
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
     let decrypt_start = std::time::Instant::now();
-    let open_result = deps.crypto.open(context_id_bytes, encrypted_blob)?;
+    let open_result = deps
+        .crypto
+        .open(context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {

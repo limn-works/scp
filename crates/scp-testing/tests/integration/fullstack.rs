@@ -236,9 +236,15 @@ async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
     );
 
     // Open each captured inner envelope (peer side) and classify it.
-    let inner0 = bob.open_inner_envelope(&ctx_bytes, &sent[0].1).unwrap();
-    let inner_hb = bob.open_inner_envelope(&ctx_bytes, &sent[1].1).unwrap();
-    let inner2 = bob.open_inner_envelope(&ctx_bytes, &sent[2].1).unwrap();
+    let inner0 = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[0].1)
+        .unwrap();
+    let inner_hb = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[1].1)
+        .unwrap();
+    let inner2 = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[2].1)
+        .unwrap();
 
     // AC2: the middle send is a heartbeat — heartbeat discriminator, no
     // content. (Empty user payload survives as a minimal wrapped+padded blob,

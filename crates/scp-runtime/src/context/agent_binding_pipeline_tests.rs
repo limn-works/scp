@@ -247,7 +247,7 @@ fn receive_via_verify_and_unwrap(
     resolver: &KeyResolver,
     bob_access_key: &AccessKey,
 ) -> Result<Vec<u8>, ContextError> {
-    let opened = match bob_provider.open(ctx_bytes, blob)? {
+    let opened = match bob_provider.open(ctx_bytes, ctx_str, blob)? {
         scp_protocol::context::builder::OpenResult::Application(env) => *env,
         other => {
             return Err(ContextError::CryptoFailed(format!(
@@ -644,7 +644,7 @@ mod live_supervisor_send {
         // `FullStackNode::decrypt_message`).
         for (_routing_id, blob) in bootstrap_blobs {
             match bob
-                .open(&ctx_bytes, &blob)
+                .open(&ctx_bytes, ctx_id, &blob)
                 .expect("bob opens bootstrap blob")
             {
                 OpenResult::Management {
@@ -746,7 +746,7 @@ mod live_supervisor_send {
         // Open the captured wire blob on Bob's provider and read the persona
         // straight off the recovered inner envelope.
         match bob
-            .open(&ctx_bytes, ciphertext)
+            .open(&ctx_bytes, ctx_id, ciphertext)
             .expect("bob opens the app blob")
         {
             OpenResult::Application(env) => {

@@ -1570,11 +1570,23 @@ impl MlsCryptoProvider {
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
         self.with_context(context_id, |state| {
-            // Use hex-encoded context_id bytes as AAD context string, matching
-            // the decrypt path in `open` which also uses `hex::encode(context_id)`.
-            // `seal_envelope` uses `inner.context_id` (the original string), which
-            // would cause an AAD mismatch on the receive side.
-            let ctx_str = hex::encode(context_id);
+            // The sender-layer AEAD AAD MUST bind the RAW `context_id` string
+            // (UTF-8, 4-byte BE length prefix) per spec §9.16.1 + §9.5.1 — not
+            // the hex encoding of its 32-byte hash. WASM binds the raw string;
+            // binding anything else here breaks native↔WASM interop and the
+            // spec contract. The raw string is carried on the inner envelope.
+            let ctx_str = inner.context_id.as_str();
+
+            // Defense in depth: the supplied 32-byte `context_id` MUST be the
+            // SHA-256 of the inner envelope's `context_id` string. If they
+            // diverge, the AAD would bind a string unrelated to the routing /
+            // store keying, so fail closed rather than emit an unverifiable
+            // ciphertext. (No panic/unwrap — clippy denies them on this path.)
+            if scp_protocol::context::context_id_bytes(ctx_str) != *context_id {
+                return Err(ContextError::CryptoFailed(
+                    "inner envelope context_id does not hash to the supplied context_id".into(),
+                ));
+            }
 
             // 1. Serialize inner envelope to MessagePack.
             let serialized = rmp_serde::to_vec_named(inner).map_err(|e| {
@@ -1583,13 +1595,13 @@ impl MlsCryptoProvider {
 
             // 2. Sender key encrypt (AES-256-GCM, ADR-007).
             // AAD binds context_id, sender_did, epoch, and sequence to prevent
-            // ciphertext relocation. Uses hex-encoded context_id bytes for
-            // consistency with the decrypt path.
+            // ciphertext relocation. Binds the RAW context_id string per
+            // §9.16.1 so the receive side (and WASM) can reconstruct it.
             let sender_encrypted =
                 scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
                     &state.sender_key,
                     &serialized,
-                    &ctx_str,
+                    ctx_str,
                     &self.local_did,
                     state.sender_key_epoch,
                     state.send_sequence,
@@ -1649,10 +1661,35 @@ impl MlsCryptoProvider {
     pub fn open(
         &self,
         context_id: &[u8; 32],
+        context_id_str: &str,
         outer_bytes: &[u8],
     ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
         self.with_context(context_id, |state| {
-            let ctx_str = hex::encode(context_id);
+            // Defense in depth (symmetry with `seal`): the supplied 32-byte
+            // `context_id` MUST be the SHA-256 of `context_id_str`. If they
+            // diverge, the AAD reconstructed below from `context_id_str` would
+            // bind a string unrelated to the routing / store keying, so fail
+            // fast here rather than relying on the AEAD layer to reject it.
+            // Unreachable from current callers (both are derived from one
+            // string) but cheap fail-closed insurance. (No panic/unwrap —
+            // clippy denies them on this path.)
+            if scp_protocol::context::context_id_bytes(context_id_str) != *context_id {
+                return Err(ContextError::CryptoFailed(
+                    "context_id_str does not hash to the supplied context_id".into(),
+                ));
+            }
+
+            // Hex of the 32-byte id — the LOCAL sender-key store key (matches
+            // every other store call site). NOT the AAD value.
+            let ctx_id_hex = hex::encode(context_id);
+
+            // The sender-layer AEAD AAD binds the RAW `context_id_str`
+            // (§9.16.1), not this hex. The two are reconciled on the Application
+            // path below: a `context_id_str` that does not hash to
+            // `context_id` would bind an AAD no legitimate sealer produced, so
+            // AEAD verification fails closed. Control/Management messages never
+            // reach the sender-layer AEAD, so they are unaffected by the value
+            // of `context_id_str`.
 
             // Step 0: Deserialize outer envelope to extract MLS ciphertext.
             let outer: scp_protocol::envelope::outer::OuterEnvelope =
@@ -1693,7 +1730,7 @@ impl MlsCryptoProvider {
                     // Step 2: Look up the sender's key from the sender key store.
                     let sender_key = state
                         .sender_key_store
-                        .get(&ctx_str, &sender_did)
+                        .get(&ctx_id_hex, &sender_did)
                         .cloned()
                         .ok_or_else(|| {
                             ContextError::CryptoFailed("sender key lookup failed".into())
@@ -1706,10 +1743,12 @@ impl MlsCryptoProvider {
                         )
                         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
                     // Epoch/sequence from header — see send_message comment about AAD.
+                    // The AAD binds the RAW context_id string per §9.16.1 (NOT
+                    // the hex store key), matching the `seal` / WASM encode path.
                     let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
                         sender_ciphertext,
-                        &ctx_str,
+                        context_id_str,
                         &sender_did,
                         epoch,
                         sequence,
@@ -1727,7 +1766,7 @@ impl MlsCryptoProvider {
                     // `process_incoming_sender_key` path enforces the same
                     // ceiling on key distributions; this mirrors that bound
                     // on the message receive path so the two cannot diverge.
-                    let stored_high_water = state.sender_key_store.epoch(&ctx_str, &sender_did);
+                    let stored_high_water = state.sender_key_store.epoch(&ctx_id_hex, &sender_did);
                     let allowed_epoch_ceiling = stored_high_water.saturating_add(MAX_EPOCH_ADVANCE);
                     if epoch > allowed_epoch_ceiling {
                         return Err(ContextError::CryptoFailed(format!(
@@ -4222,10 +4261,17 @@ mod tests {
     /// MLS group via the provider-level Welcome flow, exchange Alice's
     /// sender key, and return both providers ready for `seal()` /
     /// `open()`. Used by the H9 ceiling tests.
+    /// String whose SHA-256 is the `context_id` returned by
+    /// [`setup_alice_bob_two_party`]. The sender-layer AEAD AAD binds the raw
+    /// context-id string (§9.16.1), and both `seal` and `open` assert the
+    /// supplied 32-byte id is `context_id_bytes(ctx_str)`, so the fixture must
+    /// derive its id from a real string rather than an arbitrary 32-byte value.
+    const TEST_CTX_STR: &str = "h9-ceiling-ctx";
+
     fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let context_id = make_context_id();
+        let context_id = scp_protocol::context::context_id_bytes(TEST_CTX_STR);
 
         let alice = MlsCryptoProvider::new(alice_did.to_string());
         alice.create_mls_group(&context_id).unwrap();
@@ -4263,7 +4309,7 @@ mod tests {
     /// `open()`, signature verification is deferred to `ContextManager`),
     /// so an arbitrary key suffices for the H9 receive-ceiling tests.
     fn build_test_inner(
-        context_id: &[u8; 32],
+        context_id_str: &str,
         sender_did: &str,
         epoch_field: u64,
         sequence_field: u64,
@@ -4271,7 +4317,7 @@ mod tests {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let params = crate::envelope::inner::InnerEnvelopeParams {
             version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-            context_id: &hex::encode(context_id),
+            context_id: context_id_str,
             sender_did,
             epoch: epoch_field,
             generation: 0,
@@ -4313,12 +4359,12 @@ mod tests {
 
         force_alice_sender_key_epoch(&alice, &ctx_id, u64::MAX);
 
-        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
         let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
 
         let err = bob
-            .open(&ctx_id, &sealed)
+            .open(&ctx_id, TEST_CTX_STR, &sealed)
             .expect_err("u64::MAX epoch must be rejected by the H9 ceiling");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -4353,12 +4399,12 @@ mod tests {
 
         force_alice_sender_key_epoch(&alice, &ctx_id, 1002);
 
-        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
         let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
 
         let err = bob
-            .open(&ctx_id, &sealed)
+            .open(&ctx_id, TEST_CTX_STR, &sealed)
             .expect_err("epoch one past the ceiling must be rejected");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -4380,12 +4426,12 @@ mod tests {
 
         force_alice_sender_key_epoch(&alice, &ctx_id, 1001);
 
-        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
         let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
 
         let result = bob
-            .open(&ctx_id, &sealed)
+            .open(&ctx_id, TEST_CTX_STR, &sealed)
             .expect("epoch == ceiling must be accepted (boundary inclusive)");
         match result {
             scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -4410,16 +4456,18 @@ mod tests {
         let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
 
         let routing_id = ctx_routing_id(&ctx_id);
-        let inner1 = build_test_inner(&ctx_id, &alice_did, 0, 0);
-        let inner2 = build_test_inner(&ctx_id, &alice_did, 0, 1);
+        let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
+        let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
 
         // Two sequential seals at Alice's natural epoch=1, sequence
         // increments handled by `seal()` itself.
         let sealed1 = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
         let sealed2 = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
 
-        bob.open(&ctx_id, &sealed1).expect("first seal must open");
-        bob.open(&ctx_id, &sealed2).expect("second seal must open");
+        bob.open(&ctx_id, TEST_CTX_STR, &sealed1)
+            .expect("first seal must open");
+        bob.open(&ctx_id, TEST_CTX_STR, &sealed2)
+            .expect("second seal must open");
 
         let entry = bob.contexts.get(&ctx_id).unwrap();
         let state = entry.value();
@@ -4430,6 +4478,102 @@ mod tests {
             .expect("tracker must be populated by happy-path opens");
         assert_eq!(epoch, 1, "epoch should be Alice's natural epoch");
         assert_eq!(seq, 1, "sequence should advance to the second message");
+    }
+
+    #[test]
+    fn seal_open_binds_raw_context_id_string_not_hex() {
+        // §9.16.1: the sender-layer AEAD AAD MUST bind the RAW context_id
+        // string (UTF-8, BE32 length-prefixed), NOT the hex encoding of its
+        // 32-byte hash. This is the #1909 fix and the WASM↔native interop
+        // contract. Proof: a `seal`ed message opens with the raw string but
+        // FAILS to open when the hex-of-bytes string is supplied as the AAD
+        // source — the exact value native used to (incorrectly) bind.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let routing_id = ctx_routing_id(&ctx_id);
+
+        // Two independently-sealed messages. MLS forward secrecy deletes the
+        // per-message decryption secret on the FIRST `open` of a given
+        // ciphertext, so the negative and positive cases must each consume
+        // their own freshly-sealed blob — re-opening one blob twice would fail
+        // at the MLS layer for an unrelated (forward-secrecy) reason.
+        let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
+        let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
+        let sealed_neg = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
+        let sealed_pos = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
+
+        // Negative: opening with the hex-of-bytes string supplies a
+        // `context_id_str` that does NOT hash to `context_id` (the hex of the
+        // 32-byte id is not its SHA-256 preimage). `open`'s fail-fast guard —
+        // the mirror of `seal`'s hash-consistency assert — rejects this BEFORE
+        // any MLS/AEAD work, so the OLD (spec-violating) hex AAD can never even
+        // be reconstructed. This is strictly stronger than letting the AEAD
+        // layer reject it: a mismatched id/string pair is refused at the door.
+        let hex_ctx = hex::encode(ctx_id);
+        let err = bob
+            .open(&ctx_id, &hex_ctx, &sealed_neg)
+            .expect_err("opening with a context_id_str that does not hash to context_id must fail");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(
+                    msg.contains("does not hash to the supplied context_id"),
+                    "expected the fail-fast hash-consistency rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+
+        // Positive: opening the second blob with the RAW context_id string
+        // (the spec value) succeeds, proving the AAD binds the raw string.
+        let opened = bob
+            .open(&ctx_id, TEST_CTX_STR, &sealed_pos)
+            .expect("opening with the raw context_id string (spec AAD) must succeed");
+        match opened {
+            scp_protocol::context::builder::OpenResult::Application(env) => {
+                assert_eq!(env.sender_did, alice_did);
+            }
+            other => panic!("expected Application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_context_id_str_that_does_not_hash_to_context_id() {
+        // Defense-in-depth symmetry with `seal`: `open` asserts the supplied
+        // 32-byte `context_id` is `context_id_bytes(context_id_str)` and fails
+        // CLOSED if they diverge. This guard fires at the very top of `open`,
+        // BEFORE any outer-envelope deserialization, MLS decrypt, or
+        // sender-layer AEAD work — so the rejection is the fast-path
+        // hash-consistency error, distinct from an AEAD authentication failure.
+        let (_alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // A `context_id_str` whose SHA-256 is NOT `ctx_id`. (`ctx_id` is the
+        // hash of TEST_CTX_STR; any other string hashes elsewhere.)
+        let mismatched_ctx_str = "definitely-not-the-real-context-string";
+        assert_ne!(
+            scp_protocol::context::context_id_bytes(mismatched_ctx_str),
+            ctx_id,
+            "test precondition: the mismatched string must not hash to ctx_id"
+        );
+
+        // The outer bytes are deliberately garbage: the guard must reject the
+        // mismatched id/string pair BEFORE it ever attempts to deserialize or
+        // decrypt them. If the guard did not fire first, this call would
+        // instead surface an "outer envelope deserialization" error — proving
+        // by its absence that the fail-fast assert ran ahead of the AEAD layer.
+        let bogus_outer = [0xABu8; 64];
+        let err = bob
+            .open(&ctx_id, mismatched_ctx_str, &bogus_outer)
+            .expect_err("open must reject a context_id_str that does not hash to context_id");
+
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(
+                    msg, "context_id_str does not hash to the supplied context_id",
+                    "expected the fail-fast hash-consistency rejection, not an AEAD or \
+                     deserialization failure, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4444,12 +4588,12 @@ mod tests {
 
         // First, advance the receive tracker to (1, 1) via two
         // legitimate messages.
-        let inner_a = build_test_inner(&ctx_id, &alice_did, 0, 0);
-        let inner_b = build_test_inner(&ctx_id, &alice_did, 0, 1);
+        let inner_a = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
+        let inner_b = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
         let sealed_a = alice.seal(&ctx_id, &inner_a, &routing_id, 300).unwrap();
         let sealed_b = alice.seal(&ctx_id, &inner_b, &routing_id, 300).unwrap();
-        bob.open(&ctx_id, &sealed_a).unwrap();
-        bob.open(&ctx_id, &sealed_b).unwrap();
+        bob.open(&ctx_id, TEST_CTX_STR, &sealed_a).unwrap();
+        bob.open(&ctx_id, TEST_CTX_STR, &sealed_b).unwrap();
 
         // Now force Alice's send_sequence backwards and re-seal. The
         // resulting header has (epoch=1, sequence=0) which is below
@@ -4461,11 +4605,11 @@ mod tests {
             let state = entry.value_mut();
             state.send_sequence = 0;
         }
-        let inner_replay = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner_replay = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let sealed_replay = alice
             .seal(&ctx_id, &inner_replay, &routing_id, 300)
             .unwrap();
-        let err = bob.open(&ctx_id, &sealed_replay).expect_err(
+        let err = bob.open(&ctx_id, TEST_CTX_STR, &sealed_replay).expect_err(
             "lower-sequence message at the same epoch must still be rejected as replay",
         );
         match err {
@@ -4487,10 +4631,10 @@ mod tests {
             let state = entry.value_mut();
             state.send_sequence = 5;
         }
-        let inner_lower = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner_lower = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let sealed_lower = alice.seal(&ctx_id, &inner_lower, &routing_id, 300).unwrap();
         let err = bob
-            .open(&ctx_id, &sealed_lower)
+            .open(&ctx_id, TEST_CTX_STR, &sealed_lower)
             .expect_err("lower-epoch message must still be rejected as reorder");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -4586,7 +4730,7 @@ mod tests {
         let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
         let _owned = alice.take_crypto_state(&ctx_id).unwrap();
 
-        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
 
         let err = alice
@@ -4608,14 +4752,14 @@ mod tests {
 
         // Seal a message via alice BEFORE taking the state so we
         // have a valid ciphertext to feed into bob's open.
-        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
         let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
 
         // Now take bob's state — open on bob's side should error.
         let _owned = bob.take_crypto_state(&ctx_id).unwrap();
         let err = bob
-            .open(&ctx_id, &sealed)
+            .open(&ctx_id, TEST_CTX_STR, &sealed)
             .expect_err("open on a taken context must error");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -4805,7 +4949,7 @@ mod tests {
 
         // Bob opens the same blob and recovers the application plaintext,
         // proving the zeroed routing_id does not break delivery.
-        let opened = bob.open(&ctx_id, &wire).unwrap();
+        let opened = bob.open(&ctx_id, ctx_str, &wire).unwrap();
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
                 assert_eq!(
@@ -4828,14 +4972,18 @@ mod tests {
     /// over-broadly zero the control seal sites.
     #[test]
     fn control_message_seal_still_embeds_context_routing_id() {
-        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        // The context id must be derived from a real string: `seal` binds the
+        // raw `inner.context_id` into the AEAD AAD (§9.16.1) and asserts the
+        // supplied 32-byte id is its SHA-256, so a hex-of-bytes inner id (which
+        // is not the preimage of `ctx_id`) would be rejected.
+        let ctx_str = "ctx-control-routing-id";
+        let (alice, _bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let ctx_str = hex::encode(ctx_id);
 
         // Mirror the control-path inner envelope (Recovery message type).
         let params = crate::envelope::inner::InnerEnvelopeParams {
             version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-            context_id: &ctx_str,
+            context_id: ctx_str,
             sender_did: &alice_did,
             epoch: 0,
             generation: 0,
@@ -4850,7 +4998,7 @@ mod tests {
 
         // Control path passes `context_routing_id` to `seal` (as in
         // trust_recovery_helpers / supervisor / lifecycle_helpers).
-        let control_rid = scp_protocol::context::context_routing_id(&ctx_str);
+        let control_rid = scp_protocol::context::context_routing_id(ctx_str);
         let wire = alice.seal(&ctx_id, &inner, &control_rid, 300).unwrap();
 
         let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
