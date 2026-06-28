@@ -761,6 +761,26 @@ impl GovernanceEngine for MajorityVoteEngine {
 // ---------------------------------------------------------------------------
 
 impl super::TrustedVoteIngest for MajorityVoteEngine {
+    fn ingest_proposal(&mut self, proposal: GovernanceProposal) -> Result<(), GovernanceError> {
+        // Keyless seed (ADR-034): the proposer must be in the frozen eligible
+        // voter set, and the proposal_id must be new. The proposal — including
+        // its status and accumulated votes — is stored VERBATIM; no re-tally, no
+        // signature verification (see the TrustedVoteIngest::ingest_proposal
+        // contract).
+        if !self.eligible_voter_dids.contains(&proposal.proposer_did) {
+            return Err(GovernanceError::NotEligible(
+                "proposer is not in the eligible voter set".to_owned(),
+            ));
+        }
+        if self.proposals.contains_key(&proposal.proposal_id) {
+            return Err(GovernanceError::DuplicateProposal(hex::encode(
+                proposal.proposal_id,
+            )));
+        }
+        self.proposals.insert(proposal.proposal_id, proposal);
+        Ok(())
+    }
+
     fn ingest_approve(
         &mut self,
         proposal_id: &ProposalId,
@@ -2686,5 +2706,99 @@ mod tests {
             matches!(result.unwrap_err(), GovernanceError::NotEligible(_)),
             "eligibility must precede signature verification (expected NotEligible)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ingest_proposal: keyless seed (ADR-034)
+    // -----------------------------------------------------------------------
+
+    fn make_unsigned_proposal(
+        proposer: &DID,
+        ctx: &GovernanceContext,
+        status: ProposalStatus,
+    ) -> GovernanceProposal {
+        let action = GovernanceAction::AddMember {
+            did: DID::from("did:dht:z6MkNewbie"),
+            role: "member".to_owned(),
+        };
+        let action_bytes = crate::jcs::to_vec(&action).expect("jcs");
+        let proposal_id = crate::context::governance::compute_proposal_id(
+            &ctx.context_id,
+            proposer,
+            &action_bytes,
+            ctx.now,
+        );
+        GovernanceProposal {
+            proposal_id,
+            context_id: ctx.context_id.clone(),
+            proposer_did: proposer.clone(),
+            action,
+            status,
+            created_at: ctx.now,
+            voting_deadline: ctx.now + WINDOW,
+            approvals: vec![crate::context::governance::build_unsigned_vote(
+                proposer,
+                VoteType::Approve,
+                ctx.now,
+            )],
+            rejections: Vec::new(),
+            created_at_epoch: ctx.current_epoch,
+        }
+    }
+
+    #[test]
+    fn ingest_proposal_then_ingest_approve_reaches_quorum() {
+        // 3 voters: seeded proposal carries alice's approval (1); bob's keyless
+        // approval makes 2 of 3 -> absolute majority -> Approved.
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Pending);
+        let pid = proposal.proposal_id;
+
+        engine.ingest_proposal(proposal).expect("seed ok");
+        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
+        assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn ingest_proposal_preserves_terminal_status() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Approved);
+        let pid = proposal.proposal_id;
+
+        engine.ingest_proposal(proposal).expect("seed ok");
+        let result = engine.ingest_approve(&pid, &bob(), &ctx);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::ProposalNotPending { .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_proposal_rejects_non_eligible_proposer() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        // Dave is not in the frozen eligible voter set.
+        let proposal = make_unsigned_proposal(&dave(), &ctx, ProposalStatus::Pending);
+        let result = engine.ingest_proposal(proposal);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::NotEligible(_)
+        ));
+    }
+
+    #[test]
+    fn ingest_proposal_rejects_duplicate_id() {
+        let mut engine = default_engine(three_voters());
+        let ctx = test_context(&three_voters(), T0);
+        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Pending);
+        let dup = proposal.clone();
+        engine.ingest_proposal(proposal).expect("first seed ok");
+        let result = engine.ingest_proposal(dup);
+        assert!(matches!(
+            result.unwrap_err(),
+            GovernanceError::DuplicateProposal(_)
+        ));
     }
 }

@@ -640,6 +640,114 @@ fn governance_resolved_proposals_evicts_oldest_at_capacity() {
 }
 
 // ===========================================================================
+// PR-2b: WASM keyless engine path converges with native signed path
+// ===========================================================================
+
+/// The WASM bridge runs the shared governance engine via the keyless
+/// `TrustedVoteIngest` path (`ingest_proposal` + `ingest_approve` /
+/// `ingest_reject`); native runs the signed `GovernanceEngine`
+/// (`propose` + `approve`). Given the SAME frozen config and the SAME vote
+/// sequence, both MUST reach the SAME terminal `ProposalStatus`. This is the
+/// engine-boundary half of the §9.9.3 native↔WASM governance convergence the
+/// WASM engine adoption exists to guarantee: the quorum DECISION is identical,
+/// so honest native and keyless-WASM participants never diverge on
+/// Approved/Rejected.
+#[test]
+fn wasm_keyless_ingest_matches_native_signed_threshold_decision() {
+    use scp_protocol::context::governance::multisig::ThresholdEngine;
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceProposal, KeyResolver,
+        ProposalStatus, SignedVote, TrustedVoteIngest, VoteType, compute_proposal_id,
+    };
+    use scp_protocol::jcs;
+    use std::sync::Arc;
+
+    let alice = scp_identity::DID::from("did:dht:z6MkAlice");
+    let bob = scp_identity::DID::from("did:dht:z6MkBob");
+    let carol = scp_identity::DID::from("did:dht:z6MkCarol");
+    let signers = vec![alice.clone(), bob.clone(), carol];
+    let now = 1_700_000_000_u64;
+
+    let ctx = GovernanceContext {
+        context_id: "ctx-conv".to_owned(),
+        members: signers
+            .iter()
+            .map(|d| (d.clone(), "admin".to_owned()))
+            .collect(),
+        admin_dids: vec![alice.clone()],
+        current_epoch: Some(1),
+        now,
+    };
+
+    let action = GovernanceAction::AddMember {
+        did: scp_identity::DID::from("did:dht:z6MkNewbie"),
+        role: "member".to_owned(),
+    };
+
+    // Resolver maps the deterministic test seeds to verifying keys for the
+    // signed path. The keyless path never invokes it.
+    let resolver: KeyResolver = Arc::new(|did: &scp_identity::DID, _kid| {
+        let s: &str = did.as_ref();
+        let seed: [u8; 32] = match s {
+            "did:dht:z6MkAlice" => [1u8; 32],
+            "did:dht:z6MkBob" => [2u8; 32],
+            "did:dht:z6MkCarol" => [3u8; 32],
+            _ => return None,
+        };
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    });
+
+    // --- Native signed path: alice proposes (1-of-3), bob approves (2-of-3). ---
+    let mut native = ThresholdEngine::new(signers.clone(), 2, 86_400, resolver.clone())
+        .expect("valid threshold config");
+    let sk_alice = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let sk_bob = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let (native_prop, _) = native
+        .propose(&alice, action.clone(), &ctx, &sk_alice)
+        .expect("native propose");
+    let (native_status, _) = native
+        .approve(&native_prop.proposal_id, &bob, &ctx, &sk_bob)
+        .expect("native approve");
+
+    // --- Keyless WASM path: build the proposal struct (no key), seed it via
+    // ingest_proposal, then bob's keyless approval. ---
+    let action_bytes = jcs::to_vec(&action).expect("jcs");
+    let pid = compute_proposal_id(&ctx.context_id, &alice, &action_bytes, now);
+    let wasm_prop = GovernanceProposal {
+        proposal_id: pid,
+        context_id: ctx.context_id.clone(),
+        proposer_did: alice.clone(),
+        action,
+        status: ProposalStatus::Pending,
+        created_at: now,
+        voting_deadline: now + 86_400,
+        approvals: vec![SignedVote {
+            voter_did: alice.clone(),
+            vote: VoteType::Approve,
+            timestamp: now,
+            signature: Vec::new(),
+        }],
+        rejections: Vec::new(),
+        created_at_epoch: Some(1),
+    };
+    let mut wasm = ThresholdEngine::new(signers, 2, 86_400, resolver).expect("valid");
+    wasm.ingest_proposal(wasm_prop).expect("seed");
+    let (wasm_status, _) = wasm
+        .ingest_approve(&pid, &bob, &ctx)
+        .expect("ingest approve");
+
+    assert_eq!(
+        native_status, wasm_status,
+        "native signed and keyless WASM paths must reach the same status"
+    );
+    assert_eq!(
+        wasm_status,
+        ProposalStatus::Approved,
+        "2-of-3 must Approve on both paths"
+    );
+}
+
+// ===========================================================================
 // Handle registry conformance (WASM vs core HandleRegistry)
 // ===========================================================================
 
