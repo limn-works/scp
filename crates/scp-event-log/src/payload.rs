@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EventLogError, EventPayload};
+use crate::{EventLogError, EventPayload, EventType};
 
 /// Encodes a structured payload struct into [`EventPayload`] bytes using
 /// positional `MessagePack`.
@@ -257,6 +257,68 @@ pub fn consequence_event_payload(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-bridge payload projection
+// ---------------------------------------------------------------------------
+
+/// A bridge-agnostic projection of the fields an FFI `event_log_query` consumer
+/// needs to read out of a typed [`EventPayload`] without re-implementing the
+/// per-variant decode logic in each bridge.
+///
+/// # Why this exists
+///
+/// The FFI `event_log_query` projection historically discarded the event
+/// payload, emitting only the leaf hash. Layer-2 behavioral records need the
+/// `target_did` carried by governance/access-revocation events to compute
+/// participation facts (e.g. `governance_actions_against`). This struct is the
+/// single shared decode surface so that all four bridges (`PyO3`, NAPI,
+/// `UniFFI`, WASM) project byte-identical values for the same event — the
+/// cross-bridge parity contract. WASM links `scp-event-log` (not
+/// `scp-ffi-common`), so this must live here per ADR-034.
+///
+/// Fields default to `None`; only variants that carry the field decode it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventPayloadProjection {
+    /// The target DID for events that carry one (governance actions, access
+    /// revocation); `None` otherwise. An empty `target_did` in the underlying
+    /// payload (e.g. an untargeted, context-wide governance action) projects to
+    /// `None` so consumers do not key participation facts on an empty subject.
+    pub target_did: Option<String>,
+}
+
+/// Decodes the bridge-facing projection fields from a typed event payload.
+///
+/// This is the single shared entry point every FFI bridge's `event_log_query`
+/// projection calls to expose payload fields. It decodes ONLY the variants that
+/// carry a projected field; all other variants return
+/// [`EventPayloadProjection::default`] (all fields `None`).
+///
+/// # Panics
+///
+/// Never. Malformed payload bytes decode to `None` via [`decode_payload`]'s
+/// `Result`, never a panic, so a corrupt leaf cannot crash a query.
+#[must_use]
+pub fn project_payload(event_type: &EventType, payload: &EventPayload) -> EventPayloadProjection {
+    /// Maps an empty string to `None`; a non-empty string to `Some`.
+    fn non_empty(value: String) -> Option<String> {
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    match event_type {
+        EventType::GovernanceActionExecuted => EventPayloadProjection {
+            target_did: decode_payload::<GovernanceActionExecutedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.target_did)),
+        },
+        EventType::AccessRevoked => EventPayloadProjection {
+            target_did: decode_payload::<AccessRevokedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.target_did)),
+        },
+        _ => EventPayloadProjection::default(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -432,5 +494,76 @@ mod tests {
         assert_positional_array(&encoded.data, 4);
         let decoded: TtlExtendedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn project_governance_action_executed_round_trips_target_did() {
+        let p = GovernanceActionExecutedPayload {
+            target_did: "did:key:bob".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
+        assert_eq!(projection.target_did.as_deref(), Some("did:key:bob"));
+    }
+
+    #[test]
+    fn project_access_revoked_round_trips_target_did() {
+        let p = AccessRevokedPayload {
+            target_did: "did:key:alice".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::AccessRevoked, &encoded);
+        assert_eq!(projection.target_did.as_deref(), Some("did:key:alice"));
+    }
+
+    #[test]
+    fn project_untargeted_governance_action_yields_none() {
+        // An untargeted governance action carries an empty target_did, which
+        // must project to None so consumers do not key facts on an empty
+        // subject.
+        let p = GovernanceActionExecutedPayload {
+            target_did: String::new(),
+            action_type: "ModifyPolicy".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_non_target_event_yields_none() {
+        // A variant that carries no target_did returns the default projection,
+        // even when handed bytes that would decode to a targeted payload.
+        let p = GovernanceActionExecutedPayload {
+            target_did: "did:key:carol".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::ContextCreated, &encoded);
+        assert_eq!(projection, EventPayloadProjection::default());
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_malformed_bytes_yields_none_without_panic() {
+        // Garbage bytes for a target-carrying variant must decode to None, not
+        // panic — a corrupt leaf cannot crash a query.
+        let malformed = EventPayload {
+            data: vec![0xff, 0x00, 0x13, 0x37],
+        };
+        let governance = project_payload(&EventType::GovernanceActionExecuted, &malformed);
+        assert_eq!(governance.target_did, None);
+        let revoked = project_payload(&EventType::AccessRevoked, &malformed);
+        assert_eq!(revoked.target_did, None);
+    }
+
+    #[test]
+    fn project_empty_payload_yields_none_without_panic() {
+        let empty = EventPayload::default();
+        let governance = project_payload(&EventType::GovernanceActionExecuted, &empty);
+        assert_eq!(governance.target_did, None);
+        let revoked = project_payload(&EventType::AccessRevoked, &empty);
+        assert_eq!(revoked.target_did, None);
     }
 }
