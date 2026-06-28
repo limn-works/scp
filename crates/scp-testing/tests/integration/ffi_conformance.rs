@@ -1335,6 +1335,29 @@ fn event_log_category_coverage() {
     assert_category_coverage("event_log", &event_log_ops);
 }
 
+/// Every bridge's `event_log_query` projection must route the typed payload
+/// through the single shared `scp_event_log::payload::project_payload` decoder
+/// so the surfaced `target_did` is byte-identical across all three native
+/// bridges (the cross-bridge parity contract). A bridge that open-codes its own
+/// payload decode — or silently drops the projection — would diverge; this
+/// positive presence check catches that. The byte-level value equality is
+/// pinned by the `project_payload` unit tests in `scp-event-log`
+/// (`crates/scp-event-log/src/payload.rs`).
+#[test]
+fn event_log_query_uses_shared_payload_projection() {
+    for (bridge, source) in [
+        ("PyO3", PYO3_EVENT_LOG),
+        ("NAPI", NAPI_EVENT_LOG),
+        ("UniFFI", UNIFFI_BRIDGE),
+    ] {
+        assert!(
+            source.contains("project_payload"),
+            "{bridge} event_log_query projection must call the shared \
+             scp_event_log::payload::project_payload decoder"
+        );
+    }
+}
+
 /// Verifies discovery and provenance operations are present across all bridges.
 /// Per-bridge exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
