@@ -13268,16 +13268,28 @@ impl Scp {
                                     code: codes::CTX_2000.to_owned(),
                                 }
                             })?;
+                            // Project the typed payload's bridge-facing fields
+                            // (e.g. `target_did` for governance/access-revocation
+                            // events) through the single shared decoder so all
+                            // four bridges surface byte-identical values. The key
+                            // is omitted when the projection yields `None`.
+                            let projection = scp_event_log::payload::project_payload(
+                                &entry.event_type,
+                                &entry.payload,
+                            );
+                            let mut payload_value = serde_json::json!({
+                                "hash": hex::encode(leaf_hash),
+                            });
+                            if let Some(target_did) = projection.target_did {
+                                payload_value["target_did"] = serde_json::Value::String(target_did);
+                            }
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,
                                 ),
                                 actor_did: entry.actor_did.0.clone(),
                                 timestamp: entry.timestamp,
-                                payload_json: serde_json::json!({
-                                    "hash": hex::encode(leaf_hash),
-                                })
-                                .to_string(),
+                                payload_json: payload_value.to_string(),
                                 sequence: seq,
                             });
                         }
@@ -13336,20 +13348,35 @@ impl Scp {
 
                                 // Try to interpret payload bytes as UTF-8 JSON; fall
                                 // back to hex encoding for binary payloads.
-                                let payload_json = std::str::from_utf8(&evt.payload.data)
-                                    .ok()
-                                    .filter(|s| {
-                                        serde_json::from_str::<serde_json::Value>(s).is_ok()
-                                    })
-                                    .map_or_else(
-                                        || {
+                                let mut payload_value: serde_json::Value =
+                                    std::str::from_utf8(&evt.payload.data)
+                                        .ok()
+                                        .and_then(|s| {
+                                            serde_json::from_str::<serde_json::Value>(s).ok()
+                                        })
+                                        .unwrap_or_else(|| {
                                             serde_json::json!({
                                                 "hex": hex::encode(&evt.payload.data),
                                             })
-                                            .to_string()
-                                        },
-                                        str::to_owned,
+                                        });
+                                // Project the typed payload's bridge-facing fields
+                                // through the single shared decoder, agreeing with
+                                // the manager-path projection above. The key is
+                                // injected only when the surfaced payload is a JSON
+                                // object and the projection yields a value.
+                                let projection = scp_event_log::payload::project_payload(
+                                    &evt.event_type,
+                                    &evt.payload,
+                                );
+                                if let (Some(obj), Some(target_did)) =
+                                    (payload_value.as_object_mut(), projection.target_did)
+                                {
+                                    obj.insert(
+                                        "target_did".to_owned(),
+                                        serde_json::Value::String(target_did),
                                     );
+                                }
+                                let payload_json = payload_value.to_string();
 
                                 results.push(Event {
                                     event_type: format!("{:?}", evt.event_type),
@@ -17248,6 +17275,57 @@ mod tests {
             ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
             other => panic!("expected ScpError::Context CTX-2040, got {other:?}"),
         }
+    }
+
+    /// `event_log_query` must project a `GovernanceActionExecuted` leaf's
+    /// `target_did` into the returned event's `payload_json`, decoded through the
+    /// shared `scp_event_log::payload::project_payload` so the value is
+    /// byte-identical across all four bridges.
+    #[tokio::test]
+    async fn event_log_query_projects_governance_target_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let target_did = "did:dht:z6MkTargetMember";
+
+        // Register UCAN state and append a GovernanceActionExecuted leaf to the
+        // per-context event log (the fallback path event_log_query reads).
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
+            let payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did.to_owned(),
+                    action_type: "RemoveMember".to_owned(),
+                },
+            )
+            .expect("governance payload encodes");
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::GovernanceActionExecuted,
+                actor_did: handle.creator_did.clone().into(),
+                timestamp: 1_700_000_000,
+                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
+                payload,
+                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+                signature: Vec::new(),
+            };
+            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
+                .expect("append succeeds");
+        });
+        assert!(append.is_some(), "ucan state must be registered for append");
+
+        let events = scp
+            .event_log_query(Arc::clone(&handle), None)
+            .await
+            .expect("query succeeds");
+        assert_eq!(events.len(), 1, "exactly one event was appended");
+
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
+        assert_eq!(
+            payload_json["target_did"].as_str(),
+            Some(target_did),
+            "GovernanceActionExecuted leaf projects its target_did"
+        );
     }
 
     /// `UniFFI` `tool_invoke` must reject `None` `ucan_token` with a
