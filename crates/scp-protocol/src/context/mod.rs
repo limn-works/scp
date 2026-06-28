@@ -373,6 +373,16 @@ pub enum ContextError {
         resource: String,
         /// Human-readable explanation of the bucket state.
         message: String,
+        /// Structured back-off hint: milliseconds until the limit admits the
+        /// next call, when the tripped limiter can compute it (the §6.2.0.2
+        /// sliding-window saga paths populate this from
+        /// `RateLimit::retry_after_secs`). `None` for the token-bucket hard
+        /// rate limit (`join` / `send` / `tool_invoke`), which has no exact
+        /// refill instant to surface. Carried so a typed caller (e.g. the §6.2.4 saga
+        /// boundary that lifts this into
+        /// `SagaAbortReason::RateLimited { retry_after_ms }`) reads the hint
+        /// structurally rather than parsing it out of `message`.
+        retry_after_ms: Option<u64>,
     },
 
     /// An imported snapshot attempted to regress a per-sender

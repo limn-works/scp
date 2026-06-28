@@ -141,6 +141,7 @@ pub use saga_prepared_state::{
 pub use supervisor::SagaSetReservation;
 pub use supervisor::{
     ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextToolInvocationRequest, DurableProviders,
-    MessageSigner, PendingSagaProjection, RestoredContexts, SagaDivergenceRepairRecord, SagaInput,
-    SagaOutput, SagaSigningKeys, Supervisor, SupervisorConfig,
+    MessageSigner, PendingSagaProjection, RestoredContexts, SagaAbortReason,
+    SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys, Supervisor,
+    SupervisorConfig,
 };

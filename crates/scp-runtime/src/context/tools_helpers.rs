@@ -541,6 +541,8 @@ pub async fn reserve_tool_economy(
             return Err(ContextError::RateLimited {
                 resource: "tool_invoke".to_owned(),
                 message: "hard rate limit exceeded for invoker".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
             });
         }
 

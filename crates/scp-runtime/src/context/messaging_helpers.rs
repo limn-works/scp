@@ -949,6 +949,8 @@ pub async fn send_message(
             return Err(ContextError::RateLimited {
                 resource: "send".to_owned(),
                 message: "hard rate limit exceeded for sender".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
             });
         }
         // M4: record velocity BEFORE economy enforcement.

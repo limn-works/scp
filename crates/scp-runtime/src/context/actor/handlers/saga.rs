@@ -701,6 +701,7 @@ fn consume_outbound_interface_rate_limit(
                 "SCP-SAGA-13023: per-interface §6.2.0.2 rate limit exceeded for tool \
                  '{tool_registration_id}' (retry after {retry_after_secs}s)"
             ),
+            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
         });
     }
 
@@ -716,6 +717,7 @@ fn consume_outbound_interface_rate_limit(
                  '{caller_did}' on tool '{tool_registration_id}' (retry after \
                  {retry_after_secs}s)"
             ),
+            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
         });
     }
 
@@ -809,6 +811,7 @@ fn consume_inbound_interface_rate_limit(
                 "SCP-SAGA-13026: per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B \
                  for tool '{tool_registration_id}' (retry after {retry_after_secs}s)"
             ),
+            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
         });
     }
 

@@ -117,9 +117,14 @@ pub(crate) fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        ContextError::RateLimited { resource, message } => ContextError::RateLimited {
+        ContextError::RateLimited {
+            resource,
+            message,
+            retry_after_ms,
+        } => ContextError::RateLimited {
             resource: resource.clone(),
             message: message.clone(),
+            retry_after_ms: *retry_after_ms,
         },
         other => ContextError::CryptoFailed(format!("{other}")),
     }
