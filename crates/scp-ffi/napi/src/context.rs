@@ -4877,6 +4877,50 @@ mod tests {
         assert_eq!(count, 2, "after join, context should have 2 members");
     }
 
+    /// The manager-path `event_log_query` projection runs through the shared
+    /// `scp_event_log::payload::project_payload` decoder. A non-target event
+    /// (the auto-emitted `ContextCreated` leaf) must omit the `target_did` key.
+    /// The `Some(target_did)` projection is byte-identical to the PyO3/UniFFI
+    /// manager paths (all three call the same decoder) and is asserted with a
+    /// real `GovernanceActionExecuted` leaf in those bridges' tests, the shared
+    /// decoder unit tests, and the cross-target `wasm_conformance` parity check.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_query_manager_path_omits_target_did_for_non_target_event() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-elog-projection-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiProjection";
+        let params = ContextParams {
+            ceiling: vec![Capability::new("role:assign")],
+            ..ContextParams::default()
+        };
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+
+        let handle =
+            super::NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator.to_owned());
+        let events = crate::event_log::event_log_query_on(&bi, &handle, None)
+            .await
+            .expect("manager-path query succeeds");
+        assert!(
+            !events.is_empty(),
+            "a created context emits at least one manager-path event"
+        );
+
+        // The manager-path payload_json is a JSON object string; the projection
+        // ran and correctly omitted target_did for the non-target ContextCreated
+        // leaf.
+        let payload_json: serde_json::Value = serde_json::from_str(&events[0].payload_json)
+            .expect("manager-path payload_json is a JSON object");
+        assert!(
+            payload_json.get("target_did").is_none(),
+            "a non-target event must omit target_did, got: {payload_json}"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
     /// Verifies roundtrip set / get for economic policy on `NapiContextHandle`.
     #[test]
     fn set_get_economic_policy_roundtrip() {
