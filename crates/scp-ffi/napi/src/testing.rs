@@ -301,18 +301,24 @@ pub(crate) fn fullstack_sync_sender_keys_on(
         })?;
 
     // Both pick up the other's key from the exchange.
-    node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        napi::Error::from(ScpNapiError::Crypto {
-            message: format!("failed to pick up sender keys for A: {e}"),
-            code: codes::CRYPTO_4058.to_owned(),
-        })
-    })?;
-    node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        napi::Error::from(ScpNapiError::Crypto {
-            message: format!("failed to pick up sender keys for B: {e}"),
-            code: codes::CRYPTO_4059.to_owned(),
-        })
-    })?;
+    node_a
+        .inner
+        .pickup_sender_keys(&context_id, &ctx_bytes)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Crypto {
+                message: format!("failed to pick up sender keys for A: {e}"),
+                code: codes::CRYPTO_4058.to_owned(),
+            })
+        })?;
+    node_b
+        .inner
+        .pickup_sender_keys(&context_id, &ctx_bytes)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Crypto {
+                message: format!("failed to pick up sender keys for B: {e}"),
+                code: codes::CRYPTO_4059.to_owned(),
+            })
+        })?;
 
     Ok(())
 }

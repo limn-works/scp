@@ -203,6 +203,7 @@ impl E2eCryptoProvider {
     /// processing fails.
     pub fn process_pending_commits(
         &self,
+        context_id_str: &str,
         context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::ContextError> {
         let commits = {
@@ -212,7 +213,7 @@ impl E2eCryptoProvider {
         for commit_bytes in commits {
             let wrapped =
                 super::node::wrap_raw_mls_message(&hex::encode(context_id), commit_bytes)?;
-            match self.provider.open(context_id, &wrapped)? {
+            match self.provider.open(context_id, context_id_str, &wrapped)? {
                 // A Commit advances the epoch and surfaces as a control
                 // message — no payload is produced.
                 scp_core::context::builder::OpenResult::Control => {}
@@ -282,6 +283,7 @@ impl E2eCryptoProvider {
     /// or sender-key processing fails.
     pub fn pickup_sender_key_messages(
         &self,
+        context_id_str: &str,
         context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::ContextError> {
         let messages = {
@@ -289,7 +291,7 @@ impl E2eCryptoProvider {
             exchange.take_sender_key_messages(context_id, self.local_did.as_ref())
         };
         for wrapped in messages {
-            match self.provider.open(context_id, &wrapped)? {
+            match self.provider.open(context_id, context_id_str, &wrapped)? {
                 scp_core::context::builder::OpenResult::Management {
                     sender_did,
                     payload,

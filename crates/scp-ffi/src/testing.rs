@@ -293,16 +293,22 @@ fn fullstack_sync_sender_keys_impl(
         })?;
 
     // Both pick up the other's key.
-    node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to pick up sender keys for A: {e}"
-        ))
-    })?;
-    node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to pick up sender keys for B: {e}"
-        ))
-    })?;
+    node_a
+        .inner
+        .pickup_sender_keys(&context_id, &ctx_bytes)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to pick up sender keys for A: {e}"
+            ))
+        })?;
+    node_b
+        .inner
+        .pickup_sender_keys(&context_id, &ctx_bytes)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to pick up sender keys for B: {e}"
+            ))
+        })?;
 
     Ok(())
 }
