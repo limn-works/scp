@@ -572,6 +572,73 @@ fn event_log_query_with_filter() {
 }
 
 #[test]
+fn event_log_query_projects_governance_target_did_from_storage() {
+    // Drives the storage-fallback path of `event_log_query`: register FFI state
+    // WITHOUT a supervisor `create_context` (so the manager path returns None),
+    // append one event to the per-context log so `event_count > 0`, then write a
+    // `GovernanceActionExecuted` event to storage. The query must project the
+    // event's `target_did` into `payload_json` via the shared `project_payload`
+    // decoder, agreeing byte-for-byte with the other three bridges.
+    use scp_platform::Storage as _;
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+        let did = create_test_identity(bi);
+        let ctx_id = random_context_id();
+        // FFI state only — no supervisor entry, so the manager path is empty.
+        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+
+        let target_did = "did:key:target-member";
+        let governance_event = scp_event_log::Event {
+            event_type: scp_event_log::EventType::GovernanceActionExecuted,
+            actor_did: scp_identity::DID(did),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did.to_owned(),
+                    action_type: "RemoveMember".to_owned(),
+                },
+            )
+            .unwrap(),
+            prev_hash: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Per-context log must be non-empty so the fallback does not early-return.
+        runtime::with_context(bi, &ctx_id, |rt| {
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &governance_event)
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Persist the full typed event under the ProtocolRepository key format.
+        let storage = runtime::get_storage(bi).unwrap();
+        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
+        let bytes = rmp_serde::to_vec(&governance_event).unwrap();
+        test_runtime()
+            .block_on(storage.store(&key, &bytes))
+            .unwrap();
+
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
+        assert_eq!(events.len(), 1, "the stored governance event is returned");
+
+        let payload = events[0].payload.bind(py);
+        let projected: String = payload
+            .get_item("target_did")
+            .expect("target_did key present in projected payload")
+            .extract()
+            .unwrap();
+        assert_eq!(
+            projected, target_did,
+            "GovernanceActionExecuted leaf projects its target_did"
+        );
+    });
+}
+
+#[test]
 fn event_log_verify_inclusion_proof_after_append() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
