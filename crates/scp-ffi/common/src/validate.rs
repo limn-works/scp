@@ -1,6 +1,6 @@
 //! Shared input validation for FFI bridge boundaries.
 //!
-//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`, WASM) validate string inputs before
+//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) validate string inputs before
 //! passing them to scp-core. This module provides the shared validation
 //! functions used across all bridge layers.
 //!
@@ -30,7 +30,6 @@ use std::fmt;
 /// - `PyO3`: `ScpPyError::ValidationError`
 /// - NAPI: `ScpNapiError::Validation`
 /// - `UniFFI`: `ScpError::Validation`
-/// - WASM: `ScpWasmError::Validation`
 #[derive(Debug, Clone)]
 pub struct ValidationError {
     /// Human-readable error message describing what failed and why.
@@ -551,8 +550,8 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ValidationError> {
 /// no bridge can silently truncate or zero-pad a malformed id into a
 /// well-formed-looking one.
 ///
-/// Returns the decoded `[u8; 32]` so callers that need the bytes (e.g. the
-/// WASM bridge's `GovernanceActionExecuted` leaf) decode exactly once. Callers
+/// Returns the decoded `[u8; 32]` so callers that need the bytes (e.g. a
+/// bridge's `GovernanceActionExecuted` leaf) decode exactly once. Callers
 /// that only need validation can `?` and discard the value.
 ///
 /// # Errors

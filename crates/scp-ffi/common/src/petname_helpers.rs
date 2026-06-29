@@ -1,4 +1,4 @@
-//! Shared petname/handle/address-resolution helpers for non-WASM FFI bridges.
+//! Shared petname/handle/address-resolution helpers for the FFI bridges.
 //!
 //! Extracts duplicated logic from `PyO3`, napi-rs, and `UniFFI` bridges:
 //!
@@ -13,8 +13,7 @@
 //! pass a `&CoreFields` (via `bi.core`) into these helpers rather than
 //! reaching through a process-global singleton.
 //!
-//! WASM bridge reimplements `PetnameMap` locally per ADR-034 and builds JSON
-//! manually, so these helpers are gated behind the `resolvers` feature.
+//! These helpers are gated behind the `resolvers` feature.
 //!
 //! See spec §22.3.1, §22.4, §22.8 and ADR-020.
 

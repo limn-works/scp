@@ -1,7 +1,7 @@
-//! Shared runtime helpers for non-WASM FFI bridges.
+//! Shared runtime helpers for the FFI bridges.
 //!
 //! Contains duplicated logic that was previously copy-pasted across the `PyO3`,
-//! NAPI, and `UniFFI` bridges. Each non-WASM bridge re-exports the relevant
+//! NAPI, and `UniFFI` bridges. Each bridge re-exports the relevant
 //! helpers via its own `runtime` module — this file is the single source of
 //! truth.
 //!
@@ -24,7 +24,7 @@
 //! - [`UcanContextStateCore`] — shared UCAN validation state fields common to
 //!   NAPI and `UniFFI` bridges.
 //!
-//! Gated behind the `resolvers` feature. Not available for WASM (ADR-034).
+//! Gated behind the `resolvers` feature.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ use crate::bridge_instance::CoreFields;
 /// log spam in governance-heavy contexts. The `KeyResolver` type signature
 /// does not support `Result`, so `None` is the only way to signal failure.
 ///
-/// This function is identical across all 3 non-WASM bridges.
+/// This function is identical across all 3 FFI bridges.
 #[must_use]
 pub fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     Arc::new(
@@ -432,7 +432,7 @@ impl ProtocolRepoVariant {
 // Shared UCAN validation state
 // ---------------------------------------------------------------------------
 
-/// Core per-context UCAN validation state shared by all non-WASM bridges.
+/// Core per-context UCAN validation state shared by all FFI bridges.
 ///
 /// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
 /// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`

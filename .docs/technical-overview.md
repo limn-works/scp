@@ -138,7 +138,7 @@ crates/
   scp-crypto/        — MLS (OpenMLS), UCAN (native impl), Merkle trees, HPKE, HKDF
   scp-transport/     — Transport adapter trait + SCP native relay adapter
   scp-relay/         — Reference relay implementation
-  scp-ffi/           — UniFFI bindings (Swift, Kotlin), PyO3 (Python), wasm-bindgen (TS)
+  scp-ffi/           — UniFFI bindings (Swift, Kotlin), PyO3 (Python), napi-rs (TS)
   scp-mcp/           — MCP server adapter (exposes SCP contexts as MCP tool surfaces)
 ```
 

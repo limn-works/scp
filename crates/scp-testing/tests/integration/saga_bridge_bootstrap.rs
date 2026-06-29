@@ -1,7 +1,7 @@
 //! Bridge-path startup recovery bootstrap (ADR-049, §17.16.4).
 //!
 //! This is the BEHAVIORAL enforcement that the shared bridge restore entry
-//! `CoreFields::restore_all_persisted_contexts`, which all three non-WASM
+//! `CoreFields::restore_all_persisted_contexts`, which all three FFI
 //! bridges (`PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance`)
 //! reach through the `BridgeInstanceCore::resume` default body — runs BOTH legs
 //! of the §17.16.4 restore-then-replay startup sweep:

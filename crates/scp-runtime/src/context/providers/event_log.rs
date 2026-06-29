@@ -2,9 +2,9 @@
 //!
 //! [`MerkleEventLogProvider`] maintains a per-context append-only Merkle tree
 //! using the canonical [`scp_event_log`] substrate — the same RFC 6962 tree
-//! (`tree::append_unsigned_event`, `tree::root`) the WASM bridge and the FFI
-//! UCAN-state log use. This is the native↔WASM event-log unification: both
-//! implementations now route every leaf through the identical preimage
+//! (`tree::append_unsigned_event`, `tree::root`) the FFI
+//! UCAN-state log uses. This is the event-log typed-event unification: every
+//! honest member now routes every leaf through the identical preimage
 //! (`SHA-256(0x00 ‖ rmp_serde(Event))`), so their Merkle roots converge and
 //! §9.9.3 equivocation detection cannot false-positive on encoding drift.
 //!
@@ -26,7 +26,7 @@
 //! ([`scp_event_log::tree::root`]) commits to the full leaf sequence. Events
 //! are appended with an empty signature (`signature: vec![]`): the runtime
 //! does not hold a per-event signing key at the provider boundary, matching the
-//! WASM `append_unsigned_event` security model documented in
+//! `append_unsigned_event` security model documented in
 //! `.docs/lessons/unsigned-event-mcp-bridge.md`.
 //!
 //! # Thread Safety
@@ -35,7 +35,7 @@
 //! [`ContextEventLogProvider`] trait methods are synchronous.
 //!
 //! See ADR-008 (context creation), spec section 9.9 (event log), and the
-//! ADR-011 native↔WASM unification amendment in `.docs/adrs/phase-2.md`.
+//! ADR-011 typed-event unification amendment in `.docs/adrs/phase-2.md`.
 
 use std::collections::HashMap;
 #[allow(

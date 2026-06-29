@@ -1887,7 +1887,7 @@ impl ContextRoleState {
     /// caller can fold this into a not-found guard; the other three drops are no-ops
     /// when the DID is absent.
     ///
-    /// Per-DID state owned OUTSIDE this struct — the runtime/WASM
+    /// Per-DID state owned OUTSIDE this struct — the runtime
     /// `read_exclusion_list`, the access-key store, MLS sequence counters, and
     /// pseudonym routing — is NOT touched here; each caller drops those inline.
     ///
@@ -4214,7 +4214,7 @@ mod tests {
             "payments",                // no colon
             "*:*",                     // stray wildcard resource
             "a:b:c",                   // multi-colon custom
-            "custom_payments:approve", // underscore-resource custom (the WASM-create bug spelling)
+            "custom_payments:approve", // underscore-resource custom (historical bug spelling)
             "tool:invoke:*",           // non-canonical COLON-form built-in
             "context:child:create",    // non-canonical COLON-form built-in
         ] {

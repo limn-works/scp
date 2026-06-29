@@ -1,6 +1,6 @@
 //! Bridge-agnostic core state for FFI bridges.
 //!
-//! [`CoreFields`] holds the state every non-WASM FFI bridge needs
+//! [`CoreFields`] holds the state every FFI bridge needs
 //! (`ContextManager`, transport, known contexts, rate limiters, economy
 //! trackers, bridge connector state, DID resolver, lifecycle flags,
 //! persistence, relay URL, shutdown hooks). Per-bridge concrete structs
@@ -165,7 +165,7 @@ pub struct KnownContext {
     pub last_seen: u64,
 }
 
-/// Bridge-agnostic core state shared by every non-WASM FFI bridge.
+/// Bridge-agnostic core state shared by every FFI bridge.
 ///
 /// Per-bridge concrete structs (`PyBridgeInstance`, `NapiBridgeInstance`,
 /// `UniffiBridgeInstance`) embed one `CoreFields` and expose their own

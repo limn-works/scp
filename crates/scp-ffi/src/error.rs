@@ -564,8 +564,8 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             // actually suspended for the member (and the member is not
             // read-excluded with read requested). Dedicated SCP-CTX-2137 instead
             // of the CTX_2001 catch-all so a caller can detect a no-op restore
-            // (the member already held the requested access). Mirrors the WASM
-            // bridge, which surfaces the same code for byte-identical
+            // (the member already held the requested access). The other
+            // bridges surface the same code for byte-identical
             // cross-bridge parity.
             CE::NothingToRestore(_) => Self::ContextError {
                 message: format!("{e}"),
@@ -698,7 +698,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
 impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
         // Canonical UCAN→error-code mapping lives in `scp_ffi_common::ucan_errors`
-        // so all four bridges (PyO3/NAPI/UniFFI/WASM) stay in lockstep.
+        // so all three FFI bridges (PyO3/NAPI/UniFFI) stay in lockstep.
         // The cross-bridge parity harness (`OP_UCAN_VALIDATE_MALFORMED`)
         // pins this code; changing it here requires updating the shared
         // mapping and the harness golden-code in the same PR.
@@ -1046,7 +1046,7 @@ mod tests {
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the
     /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
-    /// The same code is surfaced by the WASM bridge for cross-bridge parity.
+    /// The same code is surfaced by the other bridges for cross-bridge parity.
     #[test]
     fn nothing_to_restore_surfaces_ctx_2137() {
         let err: ScpPyError = scp_core::context::ContextError::NothingToRestore(

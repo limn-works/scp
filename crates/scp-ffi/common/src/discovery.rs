@@ -2,7 +2,7 @@
 //!
 //! Consolidates the `ContextDiscoverySource` → trust/resolution metadata
 //! mapping that was previously duplicated across the `PyO3`, NAPI, and `UniFFI`
-//! bridges. WASM is excluded (cannot depend on `scp-core` per ADR-034).
+//! bridges.
 //!
 //! See §22.2.1, §22.7, §22.11.3 in `.docs/specs/`.
 
@@ -13,7 +13,7 @@ use scp_core::discovery::{ContextDiscoveryResult, ContextDiscoverySource};
 /// Returns `(source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id)`.
 ///
 /// This is the single source of truth for the source-to-trust/layer mapping
-/// used by all non-WASM FFI bridges.
+/// used by all FFI bridges.
 #[must_use]
 pub const fn map_discovery_source(
     source: &ContextDiscoverySource,

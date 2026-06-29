@@ -1,7 +1,7 @@
 //! Phase 4 PR 3 — multi-URL relay tracking and auto-reconnect (#1678).
 //!
 //! These tests exercise the `CoreFields` multi-URL pending-set API that
-//! every non-WASM FFI bridge (`PyBridgeInstance`, `NapiBridgeInstance`,
+//! every FFI bridge (`PyBridgeInstance`, `NapiBridgeInstance`,
 //! `UniffiBridgeInstance`) shares, and the `reconnect_transport_if_pending`
 //! resume hook that replays the set against real relay servers.
 //!

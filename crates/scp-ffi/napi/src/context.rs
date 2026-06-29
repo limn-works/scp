@@ -2658,7 +2658,7 @@ pub(crate) async fn broadcast_handle_key_request_on(
     .map_err(|e| {
         // Serializing a just-constructed SealedBroadcastKey is an internal
         // failure, not caller-input validation — classify as Context (CTX_2023)
-        // to match the UniFFI/PyO3/WASM bridges.
+        // to match the UniFFI/PyO3 bridges.
         NapiError::from(ScpNapiError::Context {
             message: format!("serialize sealed broadcast key: {e}"),
             code: codes::CTX_2023.to_owned(),
@@ -2685,7 +2685,7 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
         |e| {
             // Malformed JSON / wrong-length secret are caller-input validation
             // errors; a failed HPKE open is a context/crypto error. Mirrors the
-            // PyO3/UniFFI/WASM classification so the error variant is consistent
+            // PyO3/UniFFI classification so the error variant is consistent
             // across every SDK.
             let scp_err = match &e {
                 OpenSealedKeyError::InvalidJson { .. } => ScpNapiError::Validation {
@@ -3026,7 +3026,7 @@ fn resolve_napi_export_signer(
 /// from the creator identity.
 ///
 /// Resolution order (local-custody-first, then DID resolver) is shared across
-/// all non-WASM bridges via
+/// all FFI bridges via
 /// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
 /// 1. **Local identity custody** — if the creator is a local identity (the
 ///    common self-export case: a device importing a context it exported), the

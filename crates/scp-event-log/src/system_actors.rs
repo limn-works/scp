@@ -24,13 +24,13 @@
 /// `actor_did` sentinel for a TTL-timer-driven `ContextExpired` leaf.
 ///
 /// Stamped by the timer-fire path when a context's TTL elapses. Must be
-/// byte-identical across native and WASM (§9.9.3).
+/// byte-identical across all honest members (§9.9.3).
 pub const SYSTEM_TIMER_ACTOR: &str = "system:timer";
 
 /// `actor_did` sentinel for a cooperative-close `ContextClosed` leaf.
 ///
 /// Stamped by the close-finalization path. Must be byte-identical across
-/// native and WASM (§9.9.3).
+/// all honest members (§9.9.3).
 pub const SYSTEM_CLOSE_ACTOR: &str = "system:close";
 
 /// `actor_did` sentinel for a saga `CrossContextDivergenceMarker` leaf.
@@ -42,6 +42,6 @@ pub const SYSTEM_SAGA_ACTOR: &str = "system:saga";
 /// `actor_did` sentinel for governance-consequence enforcement leaves.
 ///
 /// Stamped when an automated governance consequence (rate-limit, freeze, etc.)
-/// is enforced on a subject. Must be byte-identical across native and WASM
+/// is enforced on a subject. Must be byte-identical across all honest members
 /// (§9.9.3).
 pub const SYSTEM_CONSEQUENCE_ACTOR: &str = "system";

@@ -1,4 +1,4 @@
-//! Shared context-parameter builder for all non-WASM FFI bridges.
+//! Shared context-parameter builder for all FFI bridges.
 //!
 //! Each bridge (`PyO3`, napi-rs, `UniFFI`) converts its native input type
 //! (`PyDict`, JSON, `UniFFI` Record) into [`CommonContextParams`], then calls
@@ -304,7 +304,7 @@ fn build_tools(tools: &[String]) -> Vec<ToolRegistration> {
 }
 
 // ---------------------------------------------------------------------------
-// Template ID parsing (shared across all non-WASM bridges)
+// Template ID parsing (shared across all FFI bridges)
 // ---------------------------------------------------------------------------
 
 /// Parses a template ID string into the core `TemplateId` type.

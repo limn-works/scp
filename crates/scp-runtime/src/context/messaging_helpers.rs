@@ -470,8 +470,8 @@ pub fn deliver_plaintext_or_announcement(
             // suppresses any durable append, exactly as for received application
             // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
             // append cannot converge across honest members (late joiners miss
-            // earlier announcements; WASM never appends on receive), which would
-            // false-positive §9.9.3 equivocation detection.
+            // earlier announcements; honest members never append on receive),
+            // which would false-positive §9.9.3 equivocation detection.
             None
         }
         AnnouncementOutcome::Rejected(_reason) => None,
@@ -3033,8 +3033,8 @@ pub fn deliver_message_and_drain_buffered(
             // velocity, and consequence evaluation — is specific to the in-order
             // direct path and runs here only. There is NO durable Merkle append:
             // a received announcement is a §9.10.4 routing-bootstrap signal, not a
-            // convergent event (per-receiver arrival order; WASM never appends on
-            // receive), so appending it would false-positive §9.9.3 equivocation
+            // convergent event (per-receiver arrival order; honest members never
+            // append on receive), so appending it would false-positive §9.9.3 equivocation
             // detection — the same reason received application messages are
             // buffer-only.
             view.sequence_tracker_mut().advance(

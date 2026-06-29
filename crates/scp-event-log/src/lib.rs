@@ -95,7 +95,7 @@ pub trait EventLogSigner: Send + Sync {
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
-/// the 8 governance-specific event types. The native↔WASM event-log
+/// the 8 governance-specific event types. The event-log typed-event
 /// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
@@ -173,29 +173,29 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// A governance proposal was created (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY. Both native (`append_context_event`,
-    /// `EventPayload::default()`) and WASM append this leaf with no payload so
-    /// the leaf preimage is byte-identical across platforms (§9.9.3
-    /// native↔WASM parity). The associated data (`proposal_id`,
+    /// Durable leaf payload: EMPTY. Every honest member appends this leaf with
+    /// no payload (`EventPayload::default()`) so the leaf preimage is
+    /// byte-identical across implementations (§9.9.3
+    /// convergence). The associated data (`proposal_id`,
     /// `proposer_did`, `action`, `voting_deadline`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceProposalCreated,
     /// A vote was cast on a governance proposal (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `voter_did`, `vote`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteCast,
     /// A vote was withdrawn from a governance proposal (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `voter_did`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteWithdrawn,
     /// A governance proposal was resolved (approved, rejected, expired)
     /// (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `status`, `executor_did`,
     /// `resulting_epoch`) rides only on the buffer-only `ContextEvent`, never
     /// in the canonical Merkle leaf.
@@ -203,19 +203,19 @@ pub enum EventType {
     /// A governance conflict was detected (two proposals landed at the
     /// same event log sequence) (ADR-031 §7).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_a`, `proposal_b`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictDetected,
     /// A governance conflict was resolved (ADR-031 §7).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`winner_id`, `resolution`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictResolved,
     /// A deadlock recovery was performed (ADR-031 §10).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`justification`, `changes`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceDeadlockRecovery,
@@ -239,7 +239,7 @@ pub enum EventType {
     ProvenanceReceived,
 
     // -------------------------------------------------------------------
-    // Governance-action-coverage event types (native↔WASM unification;
+    // Governance-action-coverage event types (typed-event unification;
     // ADR-011 Amendment in `.docs/adrs/phase-2.md`). Each traces to a
     // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9
     // protocol action. Parameters live in [`EventPayload`], never in the

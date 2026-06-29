@@ -91,7 +91,7 @@ pub enum ConsequenceTrigger {
     ///
     /// # Currently dormant / non-functional
     ///
-    /// This trigger cannot fire today (native AND WASM). It keys on
+    /// This trigger cannot fire today. It keys on
     /// `EventType::ToolInvoked`, but per-author `ToolInvoked` is no longer
     /// durably logged and there is no corresponding `ContextEvent::ToolInvoked`
     /// variant, so no convergent tool-invocation signal exists in the interim.
@@ -154,7 +154,7 @@ pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
 /// trigger threshold.
 ///
 /// Because the evidence is drawn from the shared convergent event log, every
-/// honest member (native or WASM) derives the identical value, keeping the
+/// honest member derives the identical value, keeping the
 /// durable leaf byte-identical across members for the §9.9.3
 /// equal-count/equal-root equivocation test. Only convergent-trigger
 /// consequences reach a durable leaf ([`is_convergent_trigger`]), so the
@@ -173,8 +173,8 @@ pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u
 /// field of a durable consequence Merkle-leaf payload
 /// (`scp_event_log::payload::consequence_event_payload`).
 ///
-/// This is the single source of the label so that the native runtime and the
-/// WASM bridge produce byte-identical leaf payloads (§9.9.3 convergence). Note
+/// This is the single source of the label so that all honest members
+/// produce byte-identical leaf payloads (§9.9.3 convergence). Note
 /// the `Custom(key)` arm emits `"Custom:{key}"` — NOT the `{:?}` Debug form
 /// `Custom("{key}")` — because the durable leaf preimage must be a stable,
 /// implementation-independent string.
@@ -192,7 +192,7 @@ pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
 /// field of a durable consequence Merkle-leaf payload
 /// (`scp_event_log::payload::consequence_event_payload`).
 ///
-/// Shared by the native runtime and the WASM bridge so both produce
+/// Shared so all honest members produce
 /// byte-identical leaf payloads (§9.9.3 convergence). For an
 /// [`ConsequenceAction::Enforcement`] this delegates to
 /// [`EnforcementSeverity::variant_name`]; an [`ConsequenceAction::AssignRole`]
@@ -896,8 +896,8 @@ pub fn merge_consequence_events(
         // a buffer event is skipped (dedup / age / skew / non-`MessageSent`),
         // contradicting the contiguity the doc promises. The sequence is
         // evidence-only metadata — `matches_trigger` never reads it — so this is
-        // behavior-preserving and keeps the merged sets identical across the
-        // native runtime and the WASM bridge.
+        // behavior-preserving and keeps the merged sets identical across all
+        // honest members.
         events.push(Event {
             event_type,
             actor_did,
@@ -1087,11 +1087,11 @@ pub trait ConsequenceDispatcher {
     /// the shared labels from [`trigger_kind_str`] / [`consequence_action_type`].
     /// Implementations MUST build the leaf payload with
     /// `scp_event_log::payload::consequence_event_payload(subject_did, rule_index,
-    /// trigger_kind, action_type)` so native and WASM leaves are byte-identical.
+    /// trigger_kind, action_type)` so all honest members' leaves are byte-identical.
     ///
     /// The default body is a no-op: the native runtime mints these leaves in its
-    /// own enforcement loop and does not route through this trait, so only the
-    /// WASM bridge (which uses [`enforce_triggered`]) overrides it.
+    /// own enforcement loop and does not route through this trait. An
+    /// implementation that mints leaves via [`enforce_triggered`] overrides it.
     ///
     /// [`ConsequenceTriggered`]: scp_event_log::EventType::ConsequenceTriggered
     /// [`ConsequenceEnforced`]: scp_event_log::EventType::ConsequenceEnforced
@@ -1106,11 +1106,11 @@ pub trait ConsequenceDispatcher {
         action_type: &str,
         // Convergent leaf timestamp: the triggering event's `created_at` (see
         // [`convergent_consequence_timestamp`]), copied identically by every
-        // member so native and WASM leaves are byte-identical (§7.3.1, §9.9.3).
+        // honest member so the leaves are byte-identical (§7.3.1, §9.9.3).
         trigger_timestamp_secs: u64,
     ) {
         // Default: no durable leaf. See doc comment — native does not use this
-        // path; WASM overrides it.
+        // path; a leaf-minting implementation overrides it.
         let _ = (
             event_type,
             subject_did,
@@ -1125,8 +1125,8 @@ pub trait ConsequenceDispatcher {
 /// Enforces a pre-evaluated set of triggered consequences using a
 /// [`ConsequenceDispatcher`].
 ///
-/// This is the shared enforcement loop used by both the runtime and WASM
-/// bridges. Callers supply:
+/// This is the shared enforcement loop driving durable-leaf minting.
+/// Callers supply:
 ///
 /// - `dispatcher` — mutable reference to the per-context state (implements
 ///   [`ConsequenceDispatcher`]).
@@ -1242,7 +1242,7 @@ fn enforce_one_triggered<D: ConsequenceDispatcher>(
     // rule is treated as non-durable (fail-safe). The durable-leaf
     // `trigger_kind` label uses the wire-stable `trigger_kind_str` (`Custom:key`),
     // NOT the `{:?}` Debug `trigger_type` used for the local `ContextEvent`, so
-    // native and WASM leaf preimages match.
+    // all honest members' leaf preimages match.
     let leaf_trigger_kind =
         rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
     let leaf = LeafCtx {
@@ -2583,7 +2583,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // enforce_triggered — durable-leaf hook gating, ordering, per-branch
-    // EventType (the WASM-side leaf-minting path; native uses its own loop).
+    // EventType (the trait-driven leaf-minting path; native uses its own loop).
     // -----------------------------------------------------------------------
 
     /// Records every interaction so the test can assert the interleaving of

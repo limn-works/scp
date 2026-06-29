@@ -2402,7 +2402,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Generates a signed consistency checkpoint scoped to a member DID.
      *
      * Signs with the supplied `identity`'s key material and records `did` as
-     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI bridges, the
      * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
      * handle is passed explicitly for key material while `did` names the
      * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
@@ -3104,11 +3104,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * instance without requiring the caller to construct a
      * [`TransportManager`] handle first.
      *
-     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
-     * `Scp::transportStatus(undefined)`, and WASM's
-     * `transport_status()` so the cross-bridge parity harness
+     * Mirrors `PyO3`'s `Scp::transport_status()` and NAPI's
+     * `Scp::transportStatus(undefined)` so the cross-bridge parity harness
      * (ADR-046) can compare the disconnected-state shape across all
-     * four bridges without needing a relay fixture for the `UniFFI`
+     * bridges without needing a relay fixture for the `UniFFI`
      * runners (ADR-048 §7a).
      *
      * Returns `connected = has_transport()`, and always `None` for
@@ -4468,7 +4467,7 @@ open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: U
      * Generates a signed consistency checkpoint scoped to a member DID.
      *
      * Signs with the supplied `identity`'s key material and records `did` as
-     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI bridges, the
      * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
      * handle is passed explicitly for key material while `did` names the
      * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
@@ -6139,11 +6138,10 @@ open func transportDisconnect(manager: TransportManager)async throws   {
      * instance without requiring the caller to construct a
      * [`TransportManager`] handle first.
      *
-     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
-     * `Scp::transportStatus(undefined)`, and WASM's
-     * `transport_status()` so the cross-bridge parity harness
+     * Mirrors `PyO3`'s `Scp::transport_status()` and NAPI's
+     * `Scp::transportStatus(undefined)` so the cross-bridge parity harness
      * (ADR-046) can compare the disconnected-state shape across all
-     * four bridges without needing a relay fixture for the `UniFFI`
+     * bridges without needing a relay fixture for the `UniFFI`
      * runners (ADR-048 §7a).
      *
      * Returns `connected = has_transport()`, and always `None` for

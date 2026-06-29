@@ -16,8 +16,7 @@
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549).
 //!
-//! Gated behind the `server` feature on `scp-ffi-common`. Not available for
-//! WASM (ADR-034).
+//! Gated behind the `server` feature on `scp-ffi-common`.
 
 use std::sync::Arc;
 

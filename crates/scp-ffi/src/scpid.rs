@@ -49,7 +49,7 @@ use crate::runtime::with_identity;
 /// Raises `ValidationError` if `audience` is empty, exceeds 2048 bytes,
 /// or `ttl_seconds` is 0 or exceeds 300.
 // ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
-// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
+// The NAPI bridge uses u32 (idiomatic for JS; max valid TTL is 300s).
 #[pyfunction]
 pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String> {
     let challenge =

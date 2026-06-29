@@ -3,16 +3,15 @@
 //! Three module groups:
 //!
 //! - **`validate`** — Input validation (always available, no external deps).
-//!   Used by all bridges (`PyO3`, napi-rs, `UniFFI`, WASM).
+//!   Used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`).
 //!
 //! - **`petname_helpers`** (behind `resolvers` feature) — Shared petname/handle/
 //!   address-resolution helpers: JSON serialization, `HandleTarget` parsing,
 //!   `HandleEntry` conversion, `HandleQuerier` impl, global singletons.
-//!   Not available for WASM (ADR-034).
 //!
 //! - **Resolver adapters** (behind `resolvers` feature) — Bridge `scp-core`'s
 //!   validation traits to the FFI runtime. Requires scp-core, scp-identity,
-//!   tokio. Not available for WASM (ADR-034).
+//!   tokio.
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
@@ -25,7 +24,7 @@ pub mod validate;
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 
-// Canonical §18.4.1 context-ID generator — shared across all four
+// Canonical §18.4.1 context-ID generator — shared across all FFI
 // bridges so `Scp::context_create` cannot regress to non-hex shapes
 // (see ADR-048 §7a for the UniFFI regression that motivated the
 // extraction).
@@ -33,8 +32,8 @@ mod context_id;
 pub use context_id::generate_context_id;
 
 // Canonical handleless transport-status triple — shared across all
-// four bridges so the no-handle-supplied `transport_status()` probe
-// cannot diverge across `PyO3`, napi-rs, `UniFFI`, and wasm-bindgen
+// FFI bridges so the no-handle-supplied `transport_status()` probe
+// cannot diverge across `PyO3`, napi-rs, and `UniFFI`
 // (see ADR-048 §7a).
 mod transport_status;
 pub use transport_status::handleless_transport_status;
@@ -56,7 +55,7 @@ pub use transport_status::handleless_transport_status;
 /// - `"` → `&quot;`
 /// - `'` → `&#x27;`
 ///
-/// This function is used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`, WASM)
+/// This function is used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`)
 /// to sanitize event strings before returning them to callers.
 #[inline]
 #[must_use]
@@ -75,42 +74,21 @@ pub fn html_escape_event_string(s: &str) -> String {
     result
 }
 
-/// Escapes HTML-special characters in a JSON string using JSON unicode
-/// escapes.
-///
-/// This variant is for the WASM bridge where output is JSON. Using JSON
-/// unicode escapes (`\u003c` etc.) keeps the output valid JSON while
-/// preventing XSS when the JSON is inserted into HTML.
-///
-/// Replaces:
-/// - `<` → `\u003c`
-/// - `>` → `\u003e`
-/// - `&` → `\u0026`
-/// - `'` → `\u0027`
-#[inline]
-#[must_use]
-pub fn html_escape_json(json: &str) -> String {
-    json.replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
-        .replace('\'', "\\u0027")
-}
-
 // Shared callback-custody byte/string parsing helpers (behind the `custody`
 // feature). Requires scp-platform for the typed return values. Used by the
 // PyO3, napi-rs, and UniFFI CallbackKeyCustody adapters; NOT folded into
 // `resolvers` because these are pure byte/string ops far lighter than the
-// resolver stack, and WASM does not use callback custody (ADR-034). See ADR-006.
+// resolver stack. See ADR-006.
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
-// Shared attestation construction pipeline for all non-WASM bridges.
-// Requires scp-core + scp-identity (behind `resolvers` feature). Not available for WASM.
+// Shared attestation construction pipeline for all FFI bridges.
+// Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod attestation;
 
 // Self-contained bridge instance replacing process-global OnceLock singletons.
-// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+// Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod bridge_instance;
 
@@ -123,24 +101,24 @@ pub use bridge_instance::{
 };
 
 // Shared runtime helpers (key resolver, BridgeInMemoryStorage, event log provider).
-// Requires scp-core + scp-platform (behind `resolvers` feature). Not available for WASM.
+// Requires scp-core + scp-platform (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod bridge_runtime;
 
-// Shared context-parameter builder for all non-WASM bridges.
-// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+// Shared context-parameter builder for all FFI bridges.
+// Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod context_params;
 
 // Canonical event-log filter shared across PyO3, napi-rs, and UniFFI.
 // Pins `after_sequence` / `before_sequence` / `event_type` / `actor_did` /
 // `limit` semantics so the three bridges cannot drift. Requires scp-core
-// for `scp_event_log::Event` (behind `resolvers` feature). Not available for WASM.
+// for `scp_event_log::Event` (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod event_log;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
-// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+// Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 
@@ -156,21 +134,18 @@ pub mod saga_errors;
 // Shared broadcast key-distribution value-shape helpers (§5.14.2). The
 // Grant→sealed-JSON and sealed-JSON→raw-key seams are identical across PyO3,
 // napi-rs, and UniFFI; extracted here so the hand-populated author_did/context_id
-// echo cannot drift. Requires scp-core (behind `resolvers`). WASM keeps its own
-// inline copy (ADR-034).
+// echo cannot drift. Requires scp-core (behind `resolvers`).
 #[cfg(feature = "resolvers")]
 pub mod broadcast;
 
 // Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
 // Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based
 // so each bridge keeps its own custody accessor and error type. Requires
-// scp-core + ed25519-dalek (behind `resolvers` feature). Not available for WASM
-// (ADR-034) — the WASM bridge resolves keys via its own constrained path.
+// scp-core + ed25519-dalek (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod export_verify;
 
 // All resolver types below require the `resolvers` feature (scp-core, scp-identity, tokio).
-// WASM uses `default-features = false` to get only the `validate` module.
 #[cfg(feature = "resolvers")]
 mod resolvers;
 
@@ -178,7 +153,7 @@ mod resolvers;
 pub use resolvers::*;
 
 // Discovery result mapping (ContextDiscoverySource → trust/resolution metadata).
-// Requires scp-core types. Not available for WASM (ADR-034).
+// Requires scp-core types.
 #[cfg(feature = "resolvers")]
 pub mod discovery;
 
@@ -188,8 +163,7 @@ pub mod discovery;
 // retrieval) + Supervisor (actor-owned reconnection state). The driver
 // lives at the FFI/SDK layer because the actor's ContextTransportProvider
 // is send-only; buffered-message retrieval is owned by TransportManager.
-// Requires scp-core + scp-transport (behind `resolvers`). WASM reconnects
-// via its own constrained path (ADR-034).
+// Requires scp-core + scp-transport (behind `resolvers`).
 #[cfg(feature = "resolvers")]
 pub mod reconnect;
 
@@ -197,13 +171,11 @@ pub mod reconnect;
 // alongside the relay subscribe loop at the FFI/SDK boundary, where the signing
 // key lives; routes sends through Supervisor::send_heartbeat. Same layer and
 // rationale as the reconnection driver. Requires scp-core + scp-transport +
-// ed25519-dalek (behind `resolvers`). WASM has no native subscribe/custody loop
-// (ADR-034).
+// ed25519-dalek (behind `resolvers`).
 #[cfg(feature = "resolvers")]
 pub mod heartbeat_scheduler;
 
 // Shared petname/handle/address-resolution helpers (behind the `resolvers` feature).
-// WASM reimplements PetnameMap locally per ADR-034, so these are not available there.
 #[cfg(feature = "resolvers")]
 pub mod petname_helpers;
 
@@ -212,6 +184,6 @@ pub mod petname_helpers;
 pub mod test_helpers;
 
 // Shared relay/node startup code for FFI bridges that need to spawn servers.
-// Requires scp-transport, scp-node, scp-platform, tokio. Not available for WASM (ADR-034).
+// Requires scp-transport, scp-node, scp-platform, tokio.
 #[cfg(feature = "server")]
 pub mod server;

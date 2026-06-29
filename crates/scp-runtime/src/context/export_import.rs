@@ -67,16 +67,6 @@ use scp_protocol::context::ContextError;
 ///   it to `Full`; binding the scope byte makes that tamper fail signature
 ///   verification by construction. SCP is pre-release with no deployed exports,
 ///   so v3 is **not** accepted on import — the correct end state ships directly.
-///
-/// # Relationship to the WASM export version
-///
-/// This native version line (`MessagePack`-encoded `StoredValue` payload) is
-/// **intentionally independent** of the WASM bridge's `WASM_EXPORT_VERSION`
-/// (JSON envelope, currently 5). The two serializations are disjoint and
-/// mutually non-importable by construction (ADR-034): a WASM export fed to a
-/// native bridge is rejected at the version gate, never silently parsed. The
-/// two numbers are therefore **not** expected to match and must **not** be
-/// "reconciled" — only the signing construction converges, not the bytes.
 pub const CURRENT_EXPORT_VERSION: u32 = 4;
 
 /// Maximum accepted serialized byte length of an incoming `ContextExport`
@@ -275,8 +265,8 @@ impl ExportScope {
     ///
     /// The byte values are the shared
     /// [`scp_protocol::context::EXPORT_SCOPE_TAG_FULL`] /
-    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC`] constants, so the
-    /// native runtime and the WASM reference bridge use the identical mapping.
+    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC`] constants, so all
+    /// honest members use the identical mapping.
     ///
     /// **MUST NEVER change once shipped:** the byte is part of the signed
     /// preimage; altering it would silently invalidate every previously
@@ -2836,14 +2826,13 @@ mod tests {
     /// importer's local `now` (legitimate clock skew within the ±5-min tolerance,
     /// or a creator that stamped a slightly-future creation), the native importer
     /// consumes the field VERBATIM (it does NOT clamp to importer-`now`) and arms
-    /// `creation + ttl`. This mirrors the WASM importer's post-fix verbatim path
-    /// (`handle_ttl_expiry` stamps `creation.saturating_add(ttl)` with no `now`
-    /// clamp), so a mixed native/WASM context records the IDENTICAL
-    /// `ContextExpired` leaf and converges its event-log root at equal event
-    /// count. A residual importer-`now` clamp on either side would stamp the
-    /// SHORTER `now + ttl`, diverging the leaf (§7.3.1, §9.9.3).
+    /// `creation + ttl` (`handle_ttl_expiry` stamps `creation.saturating_add(ttl)`
+    /// with no `now` clamp), so every honest importer of the same snapshot records
+    /// the IDENTICAL `ContextExpired` leaf and converges its event-log root at
+    /// equal event count. A residual importer-`now` clamp on any side would stamp
+    /// the SHORTER `now + ttl`, diverging the leaf (§7.3.1, §9.9.3).
     #[test]
-    fn future_dated_creation_is_consumed_verbatim_and_matches_wasm() {
+    fn future_dated_creation_is_consumed_verbatim() {
         use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
 
         // Importer's local clock; the snapshot creation is 2 minutes in its
@@ -2874,13 +2863,13 @@ mod tests {
             "a clamp to importer_now would have produced this SHORTER deadline — the bug FIX 1 closes"
         );
 
-        // WASM importer math for the SAME field (mirrors `handle_ttl_expiry`'s
-        // `creation.saturating_add(ttl)` post-fix verbatim consumption).
-        let wasm_deadline = creation.saturating_add(ttl);
+        // Independent verbatim deadline math for the SAME field (mirrors
+        // `handle_ttl_expiry`'s `creation.saturating_add(ttl)` consumption).
+        let verbatim_deadline = creation.saturating_add(ttl);
         assert_eq!(
             native_deadline,
-            Some(wasm_deadline),
-            "native and WASM importers of the same future-dated signed snapshot \
+            Some(verbatim_deadline),
+            "every honest importer of the same future-dated signed snapshot \
              must derive the IDENTICAL TTL deadline"
         );
     }

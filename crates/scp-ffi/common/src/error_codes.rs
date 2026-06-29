@@ -21,7 +21,7 @@
 //! | `SCP-GOV-`    | 11000--11999|
 //! | `SCP-ECON-`   | 12000--12999|
 //!
-//! All bridges (`PyO3`, napi-rs, `UniFFI`, WASM) import these constants
+//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) import these constants
 //! instead of defining error code strings locally. This eliminates
 //! cross-bridge divergence and makes error code auditing trivial.
 
@@ -295,19 +295,19 @@ pub const CTX_2037: &str = "SCP-CTX-2037";
 pub const CTX_2038: &str = "SCP-CTX-2038";
 /// Context handle governance timeout.
 pub const CTX_2039: &str = "SCP-CTX-2039";
-/// WASM context operation error.
+/// Context operation error.
 pub const CTX_2040: &str = "SCP-CTX-2040";
-/// WASM context governance error.
+/// Context governance error.
 pub const CTX_2041: &str = "SCP-CTX-2041";
-/// WASM context TTL error.
+/// Context TTL error.
 pub const CTX_2042: &str = "SCP-CTX-2042";
-/// WASM context broadcast error.
+/// Context broadcast error.
 pub const CTX_2043: &str = "SCP-CTX-2043";
-/// WASM context member error.
+/// Context member error.
 pub const CTX_2044: &str = "SCP-CTX-2044";
-/// WASM context drain error.
+/// Context drain error.
 pub const CTX_2045: &str = "SCP-CTX-2045";
-/// WASM context query error.
+/// Context query error.
 pub const CTX_2046: &str = "SCP-CTX-2046";
 /// `UniFFI` context operation error.
 pub const CTX_2050: &str = "SCP-CTX-2050";
@@ -533,14 +533,6 @@ pub const CRYPTO_4010: &str = "SCP-CRYPTO-4010";
 pub const CRYPTO_4011: &str = "SCP-CRYPTO-4011";
 /// MLS commit error.
 pub const CRYPTO_4012: &str = "SCP-CRYPTO-4012";
-/// WASM MLS group create error.
-pub const CRYPTO_4020: &str = "SCP-CRYPTO-4020";
-/// WASM MLS proposal error.
-pub const CRYPTO_4021: &str = "SCP-CRYPTO-4021";
-/// WASM MLS commit error.
-pub const CRYPTO_4022: &str = "SCP-CRYPTO-4022";
-/// WASM sender key error.
-pub const CRYPTO_4023: &str = "SCP-CRYPTO-4023";
 /// `UniFFI` MLS group error.
 pub const CRYPTO_4050: &str = "SCP-CRYPTO-4050";
 /// `UniFFI` MLS encrypt error.

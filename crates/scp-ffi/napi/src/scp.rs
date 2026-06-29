@@ -3250,7 +3250,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `transport_status`.
     ///
     /// Accepts an optional transport manager handle. When `null`/`undefined`,
-    /// returns the bridge-scoped handleless probe (mirrors PyO3/WASM).
+    /// returns the bridge-scoped handleless probe (mirrors `PyO3`).
     #[napi(js_name = "transportStatus")]
     pub async fn transport_status(
         &self,
@@ -4652,8 +4652,7 @@ mod petname_validation_tests {
 
     /// Non-empty but syntactically invalid owner DIDs must be rejected by the
     /// pre-existing petname ops, matching the strict `validate_did` gate the
-    /// WASM bridge and the §4.7 ops already enforce. Without this the native
-    /// bridges would be looser than WASM on the same operation.
+    /// §4.7 ops already enforce.
     #[test]
     fn petname_malformed_owner_rejected() {
         let scp = Scp::new_in_memory_for_test();
@@ -4778,8 +4777,8 @@ mod identity_remove_validation_tests {
     /// `identity_remove` and `identity_remove_if_present` must reject a
     /// non-empty but syntactically invalid DID via the shared `validate_did`
     /// gate — matching the `PyO3` reference bridge — before touching the
-    /// registry. Without this the NAPI bridge would be looser than `PyO3` and
-    /// WASM on the same operation. Mirrors `petname_malformed_owner_rejected`.
+    /// registry. Without this the NAPI bridge would be looser than `PyO3`
+    /// on the same operation. Mirrors `petname_malformed_owner_rejected`.
     #[test]
     fn identity_remove_malformed_did_rejected() {
         let scp = Scp::new_in_memory_for_test();

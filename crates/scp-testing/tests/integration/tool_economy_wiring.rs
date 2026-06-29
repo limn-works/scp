@@ -14,7 +14,7 @@
 //! C4 (#1606) — Bridge tool-invoke economy wiring integration test.
 //!
 //! Verifies that `ContextManager::invoke_tool_with_economy` — the SINGLE
-//! entry point all 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) now route
+//! entry point all 3 FFI bridges (PyO3, NAPI, UniFFI) now route
 //! through after the C4 fix — actually deducts per-invocation cost from
 //! the per-DID budget tracker, increments the per-DID velocity counter,
 //! returns the executor output, and produces a `ToolInvokedEvent` with
@@ -465,7 +465,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
         .velocity_for_test(&context_id, &invoker, now_secs)
         .await;
 
-    // THE CRITICAL CALL — exactly the path the 3 non-WASM FFI bridges
+    // THE CRITICAL CALL — exactly the path the 3 FFI bridges
     // now route through after C4. The closure echoes the input back
     // so we can also verify the executor is invoked.
     let outcome = manager

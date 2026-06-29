@@ -1,7 +1,7 @@
 [package]
 name = "scp-ffi-common"
 version = "0.1.0"
-description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, UniFFI, WASM)"
+description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, UniFFI)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ publish = false
 [features]
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
-# Requires scp-core, scp-identity, tokio, scp-mcp. Disable for WASM (which only needs validate).
+# Requires scp-core, scp-identity, tokio, scp-mcp.
 resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
@@ -19,11 +19,11 @@ testing = ["resolvers"]
 # Requires only scp-platform for the typed return values (KeyHandle,
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
-# stack, and WASM does not use the callback-custody path (ADR-034).
+# stack.
 custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform
-# (in-memory testing backends), and tokio. Not available for WASM (ADR-034).
+# (in-memory testing backends), and tokio.
 server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/testing", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]

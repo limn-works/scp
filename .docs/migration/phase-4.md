@@ -20,7 +20,7 @@ namespace-static façade.
 stateful operations land as instance methods on `SCP` in every SDK, while
 pure protocol helpers' SDK shape is a per-language idiomatic choice (Python
 keeps them as module-level functions; Kotlin folds them onto `SCP`;
-TypeScript supports either; Swift and WASM follow their binding-tool
+TypeScript supports either; Swift follows its binding-tool
 constraints). Cross-language symmetry is not a goal where it would force
 one language's binding-tool constraints onto another.
 
@@ -129,7 +129,7 @@ still running at the deadline is forcibly cancelled via
 - **Kotlin** — `scp.shutdown(timeoutMillis = 5_000uL)` from inside a
   coroutine.
 
-All three non-WASM FFI bridges carry `shutdown(timeout)` as `u64`
+All three FFI bridges carry `shutdown(timeout)` as `u64`
 milliseconds uniformly (NAPI was widened from `u32` in #1692). The SDK
 wrappers clamp non-finite or out-of-range inputs to a safe cap at the
 boundary — TypeScript uses `Number.MAX_SAFE_INTEGER`, Swift uses a
@@ -140,7 +140,7 @@ bridges".
 ### 4. `StorageConfig::Sqlite { path, key }` (#1491, #1260)
 
 `StorageConfig` gained a `Sqlite { path: String, key: Vec<u8> }` variant
-across all three non-WASM bridges. The 32-byte SQLCipher key is validated
+across all three FFI bridges. The 32-byte SQLCipher key is validated
 at the FFI boundary; length mismatches return `ScpError::Validation`.
 
 - **Python** — `SCP(storage={"type": "sqlite", "path": str, "key": bytes})`.
@@ -208,7 +208,7 @@ the coercion. Pre-dates Phase 4 but listed for upgrade completeness.
 
 ### `SCP()` constructor
 
-The sole public entry point in all four non-WASM SDKs. Each call
+The sole public entry point in all three FFI SDKs. Each call
 allocates a fresh per-bridge instance (`PyBridgeInstance` /
 `NapiBridgeInstance` / `UniffiBridgeInstance`) with its own registries,
 ContextManager, transport manager, and monotonic `instance_id`.

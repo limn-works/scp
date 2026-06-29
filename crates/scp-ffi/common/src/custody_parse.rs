@@ -18,7 +18,6 @@
 //! Pure byte/string operations — no crypto, no I/O. Gated behind the `custody`
 //! feature (which pulls in `scp-platform` for the typed return values) rather
 //! than folded into `resolvers`, since the resolver stack is far heavier and
-//! WASM does not use the callback-custody path (ADR-034).
 //!
 //! See ADR-006 and the per-bridge `CallbackKeyCustody` adapters.
 

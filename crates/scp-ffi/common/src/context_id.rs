@@ -1,9 +1,9 @@
-//! Canonical context-ID generation shared across all four FFI bridges.
+//! Canonical context-ID generation shared across all FFI bridges.
 //!
 //! Spec §18.4.1 requires context IDs to be 64-character lowercase hex
 //! strings so they can be embedded directly in
 //! `scp://context/<context_id_hex>` URIs. Every `Scp::context_create`
-//! implementation (`PyO3`, napi-rs, `UniFFI`, wasm-bindgen) MUST
+//! implementation (`PyO3`, napi-rs, `UniFFI`) MUST
 //! produce a value that satisfies this invariant. Hand-rolled
 //! per-bridge implementations have twice regressed during
 //! cross-cutting merges — most recently the `UniFFI` regression to
@@ -15,15 +15,12 @@
 //!
 //! 32 cryptographically random bytes are drawn from [`rand_core::OsRng`]
 //! (the operating-system CSPRNG — `getrandom(2)` on Linux, `BCrypt`
-//! on Windows, `SecRandomCopyBytes` on Apple platforms, and
-//! `crypto.getRandomValues` in browsers via the `getrandom/js`
-//! feature on wasm32). The bytes are encoded via `hex::encode`,
-//! yielding a lowercase 64-character hex string with no separators.
+//! on Windows, `SecRandomCopyBytes` on Apple platforms). The bytes are
+//! encoded via `hex::encode`, yielding a lowercase 64-character hex
+//! string with no separators.
 //!
 //! `rand_core::OsRng` is used directly rather than `rand::thread_rng()`
-//! because the WASM bridge cannot depend on the full `rand` crate's
-//! thread-local RNG initialisation path (see ADR-034 — WASM compiles
-//! with a stripped-down dep set).
+//! so the helper needs only the minimal `rand_core` dependency.
 
 use rand_core::RngCore;
 

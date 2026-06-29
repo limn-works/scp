@@ -2022,7 +2022,7 @@ pub fn verify_self_certification(
 /// `ed25519_dalek::VerifyingKey::from_bytes`. This rejects non-curve
 /// payloads only (ZIP-215 rules) — low-order / small-subgroup points
 /// are NOT rejected here; they are caught at signature verification
-/// time via `verify_strict`. Matches the WASM bridge's `from_did`
+/// time via `verify_strict`. Matches the `from_did`
 /// curve-point gate so both decoding entry points behave consistently.
 ///
 /// # Errors
@@ -2046,7 +2046,7 @@ pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     // rejects byte strings that don't decompress to an Edwards-curve
     // point (ZIP-215 rules). Low-order / small-subgroup points are NOT
     // rejected here — they are caught at signature verification time
-    // via `verify_strict`. Matches the WASM `from_did_inner` gate so
+    // via `verify_strict`. Matches the `from_did_inner` gate so
     // both decoding entry points reject non-curve payloads early.
     ed25519_dalek::VerifyingKey::from_bytes(&decoded_array).map_err(|e| {
         IdentityError::InvalidDidFormat(format!(
@@ -3326,8 +3326,8 @@ mod tests {
     /// to a valid Ed25519 Edwards-curve point. ed25519-dalek's
     /// `from_bytes` enforces ZIP-215 curve-point decompression. About
     /// half of random 32-byte strings fail this check, so we search for
-    /// one rather than hardcoding a specific value. Matches the WASM
-    /// bridge's `from_did_rejects_non_ed25519_curve_point` guard so
+    /// one rather than hardcoding a specific value. Matches the
+    /// `from_did_rejects_non_ed25519_curve_point` guard so
     /// both decoding entry points reject non-curve payloads early.
     #[test]
     fn decode_multibase_key_rejects_non_curve_point() {

@@ -1211,7 +1211,7 @@ impl From<scp_core::context::ContextError> for ScpError {
             // actually suspended for the member (and the member is not
             // read-excluded with read requested). Dedicated SCP-CTX-2137
             // instead of the CTX_2001 catch-all so a Swift / Kotlin caller can
-            // detect a no-op restore. Mirrors the PyO3 and WASM bridges for
+            // detect a no-op restore. Mirrors the PyO3 bridge for
             // cross-bridge parity.
             CE::NothingToRestore(_) => Self::Context {
                 msg: format!("{e}"),
@@ -2215,10 +2215,9 @@ pub struct Identity {
     /// bytes. `None` for externally loaded identities without live key
     /// material.
     ///
-    /// Uses `identity_key` (not `#active`) because the WASM bridge has a
-    /// simplified single-key model; exposing the identity key gives
-    /// byte-exact cross-bridge parity under a deterministic `seed`
-    /// (ADR-046).
+    /// Uses `identity_key` (not `#active`): exposing the DID-deriving
+    /// identity key gives byte-exact cross-bridge parity under a
+    /// deterministic `seed` (ADR-046).
     pub(crate) verifying_key_hex: Option<String>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
@@ -5180,7 +5179,7 @@ async fn event_log_checkpoint_impl(
 ///
 /// The `UniFFI` bridge holds no DID-keyed identity registry — identities are
 /// opaque `Arc<Identity>` handles, not entries looked up by string. So unlike
-/// the PyO3/NAPI/WASM bridges (which resolve key material from a registry keyed
+/// the PyO3/NAPI bridges (which resolve key material from a registry keyed
 /// by DID), this variant takes the `Identity` handle for key material AND an
 /// explicit `did` string that is recorded as the checkpoint's `sender_did`.
 /// This honours the per-SDK idiom (ADR-048 §7): the no-registry constraint of
@@ -5621,7 +5620,7 @@ async fn sign_export_snapshot_via_custody(
 /// from the creator identity.
 ///
 /// Resolution order (local-custody-first, then DID resolver) is shared across
-/// all non-WASM bridges via
+/// all FFI bridges via
 /// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
 /// 1. **Local identity custody** — if the creator is a local identity (the
 ///    common self-export case: a device importing a context it exported), the
@@ -5696,7 +5695,7 @@ async fn resolve_local_custody_verifying_key(
 
     let public_key = custody.public_key(&key_handle).await.ok()?;
     // 32-byte length + canonical-point decode: the shared conversion tail in
-    // scp-ffi-common, identical across all non-WASM bridges.
+    // scp-ffi-common, identical across all FFI bridges.
     scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
 }
 
@@ -7843,7 +7842,7 @@ impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
 /// or `ttl_seconds` is 0 or exceeds 300.
 #[uniffi::export]
 // ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
-// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
+// The NAPI bridge uses u32 (idiomatic for JS; max valid TTL is 300s).
 pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, ScpError> {
     use scp_core::identity::scpid_challenge as core_challenge;
     use std::time::Duration;
@@ -13618,7 +13617,7 @@ impl Scp {
     /// Generates a signed consistency checkpoint scoped to a member DID.
     ///
     /// Signs with the supplied `identity`'s key material and records `did` as
-    /// the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+    /// the checkpoint's `sender_did`. Unlike the PyO3/NAPI bridges, the
     /// `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
     /// handle is passed explicitly for key material while `did` names the
     /// member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
@@ -13675,7 +13674,7 @@ impl Scp {
 
                 // Step 1: Parse the UCAN token. Route through the canonical
                 // `From<UcanError>` impl so parse failures surface the same
-                // error code as every other bridge (PyO3/NAPI/WASM all map
+                // error code as every other bridge (PyO3/NAPI both map
                 // through `scp_ffi_common::ucan_errors::ucan_error_code`).
                 // The prior ad-hoc `PERM_3002` mapping silently diverged
                 // from the shared classification, which the cross-bridge
@@ -14167,11 +14166,10 @@ impl Scp {
     /// instance without requiring the caller to construct a
     /// [`TransportManager`] handle first.
     ///
-    /// Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
-    /// `Scp::transportStatus(undefined)`, and WASM's
-    /// `transport_status()` so the cross-bridge parity harness
+    /// Mirrors `PyO3`'s `Scp::transport_status()` and NAPI's
+    /// `Scp::transportStatus(undefined)` so the cross-bridge parity harness
     /// (ADR-046) can compare the disconnected-state shape across all
-    /// four bridges without needing a relay fixture for the `UniFFI`
+    /// bridges without needing a relay fixture for the `UniFFI`
     /// runners (ADR-048 §7a).
     ///
     /// Returns `connected = has_transport()`, and always `None` for
@@ -18217,7 +18215,7 @@ mod tests {
     // Pre-rotation invariant — cross-bridge parity
     //
     // Mirrors the SHA-256(revealed_key) == commitment assertions in the
-    // PyO3, NAPI, and WASM bridges. Spec §9.7.4.1 §6 / ADR-003 §4b
+    // PyO3 and NAPI bridges. Spec §9.7.4.1 §6 / ADR-003 §4b
     // require that every `DidRotationEvent` carry a `PreRotationProof`
     // whose `revealed_key` hashes to the previous identity's
     // `pre_rotation_commitment`. Failing this invariant breaks
@@ -18227,7 +18225,7 @@ mod tests {
     /// Verifies that `identity_migrate` on the in-memory custody path
     /// produces a `DidRotationEvent` whose `PreRotationProof` satisfies
     /// `SHA-256(revealed_key) == commitment`. Cross-bridge parity with
-    /// the corresponding `PyO3`, NAPI, and WASM tests.
+    /// the corresponding `PyO3` and NAPI tests.
     #[tokio::test]
     #[cfg(feature = "allow_in_memory_custody")]
     async fn identity_migrate_pre_rotation_proof_satisfies_sha256_invariant() {
@@ -19128,7 +19126,7 @@ mod tests {
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the
     /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
-    /// The same code is surfaced by the `PyO3` and WASM bridges for
+    /// The same code is surfaced by the `PyO3` bridge for
     /// cross-bridge parity.
     #[test]
     fn nothing_to_restore_surfaces_ctx_2137() {
@@ -19420,7 +19418,7 @@ mod tests {
     fn petname_malformed_owner_rejected_uniffi() {
         // Non-empty but syntactically invalid owner DIDs must be rejected by
         // the pre-existing petname ops, matching the strict `validate_did`
-        // gate already enforced by the WASM bridge and the §4.7 ops.
+        // gate already enforced by the §4.7 ops.
         let scp = scp_test();
         let bad = "not-a-did".to_owned();
         assert!(

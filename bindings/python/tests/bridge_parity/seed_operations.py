@@ -20,8 +20,7 @@ Such ops use `OpContext.attached_scp()`, which calls
 seeds an encrypted in-memory store and attaches a local-transport
 supervisor in one shot. The alt-bridge runners need no equivalent explicit
 call: NAPI/UniFFI seed their in-memory `mls_storage` at CONSTRUCTION TIME
-(`new_napi` / `new_uniffi`), and WASM uses a self-initializing thread-local
-manager (ADR-034). Both sides therefore end up backed by an in-memory store
+(`new_napi` / `new_uniffi`). Both sides therefore end up backed by an in-memory store
 and emit identical canonical output. See `OpContext.attached_scp` for the
 full rationale. Non-context ops (identity_create, scpid_sign error paths,
 transport_status) need no supervisor and keep the bare `SCP({"type": "in_memory"})` constructor.
@@ -37,8 +36,8 @@ Crypto outputs compare byte-exactly: `identity_create_deterministic`
 pins DID + identity-key verifying bytes under a fixed seed, and
 `sign_message` pins the SCPID signature byte-exactly under the
 `signed_at_override` testing affordance (see `scp-runtime::scpid_sign`).
-The latter also derives a distinct `#active` key from `seed[32..64]` on
-WASM under the `testing` feature, matching scp-core's two-key
+The latter also derives a distinct `#active` key from `seed[32..64]`
+under the `testing` feature, matching scp-core's two-key
 `DidDht::create` sequence.
 
 Resolved divergences (previously xfail'd tripwires, now full parity):
@@ -58,7 +57,7 @@ Resolved divergences (previously xfail'd tripwires, now full parity):
     Ed25519 covers a wall-clock `signed_at`. Now byte-exact via the
     `signed_at_override` parameter on `scpid_sign`, wired across all
     three bridges + scp-core under the `testing` feature. Paired with a
-    distinct `#active` key on WASM (derived from `seed[32..64]` to
+    distinct `#active` key (derived from `seed[32..64]` to
     match scp-core's two-key sequence) so the signature hashes are
     identical across every bridge.
 
@@ -115,7 +114,7 @@ CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 # agree on the code.
 #
 # Note: the valid-challenge + unregistered-DID path historically diverged
-# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023, WASM SCP-IDENT-1010). All three
+# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023). The
 # bridges are now aligned on SCP-IDENT-1001 (identity-domain, identity-not-
 # found). The MVP op below exercises the malformed-challenge path per
 # ADR-046; the companion `unregistered_did_rejected` op locks the
@@ -178,8 +177,7 @@ class OpContext:
         constructors seed their in-memory `mls_storage` backend AT
         CONSTRUCTION TIME (see `new_napi` / `new_uniffi` in the respective
         `runtime.rs`), so their `context_create` auto-attaches a supervisor
-        with no explicit attach call. WASM uses a self-initializing
-        thread-local manager (ADR-034). PyO3 alone defers the dev
+        with no explicit attach call. PyO3 alone defers the dev
         affordance to `configure_local_transport`. This helper is the PyO3
         equivalent of those bridges' constructor-time seeding, so both
         sides of every parity comparison end up backed by an encrypted
@@ -364,9 +362,9 @@ OP_CONTEXT_CREATE = OpSpec(
 # attempt with a structured error code. The DID is unregistered (we
 # pass a syntactically valid but never-created DID).
 #
-# Real divergence caught by the harness: three bridges, three codes.
-# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023;
-# WASM returned SCP-IDENT-1010. Aligned across all three on
+# Real divergence caught by the harness: differing codes per bridge.
+# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023.
+# Aligned across the bridges on
 # SCP-IDENT-1001 for the unregistered-DID path; the op below exercises
 # the malformed-challenge path (SCP-IDENT-1038, shared), and
 # `OP_UNREGISTERED_DID_REJECTED` (op 11) locks in the IDENT-1001 path.
@@ -717,11 +715,11 @@ OP_UCAN_MINT = OpSpec(
 # ---------------------------------------------------------------------------
 # op 8: ucan_validate_malformed
 #
-# Validate a clearly-malformed UCAN token ("not.a.jwt"). All four bridges
+# Validate a clearly-malformed UCAN token ("not.a.jwt"). All bridges
 # share `scp_protocol::crypto::ucan::validate::parse_ucan` and now map its
 # `UcanError` outputs through each bridge's canonical `From<UcanError>`
-# mapping to SCP-PERM-3001 — matching the reference PyO3 behaviour. WASM
-# and UniFFI previously emitted SCP-PERM-3000 / SCP-PERM-3002 via inline
+# mapping to SCP-PERM-3001 — matching the reference PyO3 behaviour. UniFFI
+# previously emitted SCP-PERM-3002 via inline
 # ad-hoc error construction; that divergence was fixed in the same PR
 # that removed the xfail on this op.
 # ---------------------------------------------------------------------------
@@ -1026,8 +1024,8 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 # (SCP-IDENT-1038) — the challenge JSON fails shape validation before any
 # DID lookup happens. This op exercises the OTHER historically-divergent
 # path: a VALID challenge paired with a well-formed but unregistered
-# DID. Before alignment, PyO3 returned SCP-IDENT-1001, NAPI returned
-# SCP-PERM-3023, and WASM returned SCP-IDENT-1010. All four bridges
+# DID. Before alignment, PyO3 returned SCP-IDENT-1001 and NAPI returned
+# SCP-PERM-3023. All bridges
 # (PyO3, NAPI, UniFFI-Kotlin, UniFFI-Swift) now converge on
 # SCP-IDENT-1001 (identity-domain, identity-not-found) for this path.
 #

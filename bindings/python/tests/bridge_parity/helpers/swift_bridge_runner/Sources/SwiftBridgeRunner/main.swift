@@ -575,7 +575,7 @@ func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue]
     _ = req
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
     // alongside the handle-taking `transportStatus(manager:)`, matching the
-    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // PyO3 / NAPI probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
     let scp = try Scp.withStorage(config: .inMemory)
     let status = try await scp.transportManagerStatus()
@@ -595,7 +595,7 @@ func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JS
     _ = req
     // UniFFI `scpidSign` takes an opaque `Identity` handle rather than
     // a DID string, so we cannot reach the bridge-local registry-lookup
-    // path the PyO3/NAPI/WASM bridges expose. Instead we exercise the
+    // path the PyO3/NAPI bridges expose. Instead we exercise the
     // SAME error code via `identityResolve` on the fake DID: its 64-char
     // zbase32 suffix decodes to 40 bytes (not the 32 required by
     // did:dht), so `DidDht::extract_public_key` returns

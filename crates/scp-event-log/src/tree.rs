@@ -439,7 +439,7 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
-        // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
+        // Typed-event unification variants (ADR-011 Amendment). Tags 36..=75
         // are assigned in ADR declaration order, with tag 59 retired (see the
         // PseudonymAnnounced removal note below). Tags 76..=77 (below) are the
         // ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above are
@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Closed-taxonomy tag invariants (ADR-011 native↔WASM unification):
+    // Closed-taxonomy tag invariants (ADR-011 typed-event unification):
     //   - tags 0-35 are protocol constants and MUST NOT change;
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn unification_variant_tags_occupy_36_through_77() {
-        // The 39 native↔WASM unification variants occupy tags 36..=75 in ADR
+        // The 39 typed-event unification variants occupy tags 36..=75 in ADR
         // declaration order, with tag 59 retired (PseudonymAnnounced removed).
         // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
         // 76..=77.

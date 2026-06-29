@@ -714,12 +714,12 @@ The reference implementation is in Rust, organized as a cargo workspace:
 - **scp-identity:** DID management, DHT resolution, key rotation, document lifecycle.
 - **scp-transport:** Transport abstraction, adapter implementations, relay protocol.
 - **scp-platform:** Platform-specific integrations — key custody, push notifications, device attestation.
-- **scp-ffi:** FFI bridge layer — PyO3 (Python), UniFFI (Swift, Kotlin), napi-rs (TypeScript), wasm-bindgen (WASM).
+- **scp-ffi:** FFI bridge layer — PyO3 (Python), UniFFI (Swift, Kotlin), napi-rs (TypeScript).
 - **scp-node:** Full protocol node combining core, transport, and platform.
 
 The workspace includes six additional crates: scp-event-log (Merkle log), scp-media (media key derivation), scp-relay (standalone relay binary), scp-testing (conformance macros), scp-primitives (shared types), and scp-mcp (MCP integration).
 
-Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (wasm-bindgen and napi-rs), WASM (wasm-pack).
+Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (napi-rs).
 
 ### 13.2 Conformance Infrastructure
 

@@ -2,7 +2,6 @@
 //!
 //! These adapters bridge `scp-core`'s validation traits to the FFI runtime.
 //! Requires the `resolvers` feature (scp-core, scp-identity, tokio).
-//! NOT available for WASM (ADR-034).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,7 +38,7 @@ use scp_primitives::Clock;
 ///
 /// **Limitation:** This resolver does NOT validate the DID document (no BEP44
 /// signature verification, no self-certification check, no sequence number
-/// comparison). Use [`IdentityBackedDidResolver`] for production non-WASM
+/// comparison). Use [`IdentityBackedDidResolver`] for production
 /// contexts. See #311.
 pub struct BridgeDidResolver;
 
@@ -210,7 +209,7 @@ pub struct IdentityBackedDidResolver {
     /// sync `DidResolver`/`DidPublicKeyResolver` trait methods.
     ///
     /// This is a HOT, SHARED path: a single UCAN delegation-chain validation
-    /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every non-WASM bridge
+    /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every FFI bridge
     /// routes all DID resolution through here. Building a fresh tokio runtime
     /// per call (current-thread `Builder::...build()`) was a per-resolution
     /// allocation of an entire reactor + thread, amplified 32x per validation.
@@ -363,7 +362,7 @@ impl IdentityBackedDidResolver {
     /// tokio runtime — and the result is handed back through `join()`. There is
     /// NO per-call runtime construction: the reactor + worker threads are built
     /// exactly once across the whole process (this is a hot, shared path —
-    /// every non-WASM bridge resolves all DIDs here, and a single UCAN
+    /// every FFI bridge resolves all DIDs here, and a single UCAN
     /// delegation chain resolves up to `MAX_CHAIN_DEPTH` = 32 DIDs).
     ///
     /// Why drive from a spawned scoped thread rather than the calling thread:
@@ -846,7 +845,7 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
         };
 
         // Build payload via the shared producer so the leaf preimage is
-        // byte-identical to the WASM bridge's `ucan_revoke` (§9.9.3 cross-platform
+        // byte-identical across all honest members (§9.9.3 cross-platform
         // convergence). JSON object: {token_cid, revoker_did, context_id}.
         let payload_data = scp_core::crypto::ucan::revoke::token_revoked_payload(
             context_id,

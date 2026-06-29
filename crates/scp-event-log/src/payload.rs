@@ -5,7 +5,7 @@
 //! Several runtime call sites historically baked event parameters into the
 //! event *name* — either as `format!` strings
 //! (`"ContextTombstoned:{dest}:{pid}"`) or as an entire JSON blob used as the
-//! type tag (`{"event":"SpendApproved",…}`). The ADR-011 native↔WASM
+//! type tag (`{"event":"SpendApproved",…}`). The ADR-011 typed-event
 //! unification amendment (`.docs/adrs/phase-2.md`) identifies each as a defect:
 //! it makes the signed Merkle-leaf preimage non-convergent and un-enumerable.
 //! The correct end state is a typed [`EventType`](crate::EventType) variant
@@ -13,9 +13,9 @@
 //!
 //! This module is the **single source** of the payload bytes for those
 //! structured variants. As the emit sites are wired (in later phases of the
-//! native↔WASM unification — Phase 1 establishes the types; production callers
-//! land later), both the native runtime (`scp-runtime`) and the WASM bridge
-//! MUST route through these functions so that native↔WASM Merkle roots match:
+//! typed-event unification — Phase 1 establishes the types; production callers
+//! land later), every honest member MUST route through these functions so that
+//! their Merkle roots match:
 //! the leaf preimage is `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload`
 //! is `EventPayload { data: <bytes from this module> }`. If two implementations
 //! encoded the same logical payload differently, the leaf hashes would diverge
@@ -39,7 +39,7 @@ use crate::{EventLogError, EventPayload};
 /// Encodes a structured payload struct into [`EventPayload`] bytes using
 /// positional `MessagePack`.
 ///
-/// This is the single shared entry point that both native and WASM callers use
+/// This is the single shared entry point that all callers use
 /// to produce the leaf-preimage payload bytes.
 ///
 /// # Errors
@@ -226,7 +226,7 @@ pub struct GovernanceActionExecutedPayload {
 /// ```
 ///
 /// That sorted order is deterministic and implementation-independent (same
-/// `serde_json`, same default features on both native and WASM), which is exactly
+/// `serde_json`, same default features across all members), which is exactly
 /// why it converges. The JSON shape is also load-bearing because the consequence
 /// engine reads `target_did` back out of these bytes via
 /// `scp_protocol::trust::consequence::payload_target_is` to close the recursive

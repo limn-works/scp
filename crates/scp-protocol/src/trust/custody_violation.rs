@@ -94,7 +94,7 @@ const CATEGORY_A_RESOURCES: &[&str] = &[
 ///
 /// These are the UCAN capability resource types that modify the DID document
 /// and therefore require human (`#active`) signing. Exposed for conformance
-/// testing against mirror implementations (e.g. WASM).
+/// testing against mirror implementations.
 ///
 /// # Examples
 ///

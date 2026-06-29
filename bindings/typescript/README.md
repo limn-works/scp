@@ -2,7 +2,7 @@
 
 > `@limn-works/scp-ts` -- Shared Context Protocol for TypeScript
 
-Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Dual-target: browser (WASM) and Bun/Node (native addon).
+Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Runs on Bun/Node via a native addon; in the browser, the SDK is a remote thin client.
 
 ## Install
 
@@ -43,10 +43,9 @@ await ctx.close();
 
 | Target | FFI Bridge | Runtime |
 |--------|-----------|---------|
-| Browser | wasm-bindgen (WASM) | Any modern browser |
 | Server | napi-rs (native addon) | Bun >= 1.0, Node >= 22 |
 
-Bridge selection is automatic at import time. The public API is identical across targets.
+In the browser, the SDK operates as a remote thin client (the protocol engine runs server-side); there is no in-process browser engine.
 
 ## API Reference
 

@@ -10,8 +10,7 @@
 //! - `relay_start_in_memory` / `relay_start_local` -- relay startup.
 //! - `node_start_in_memory` / `node_start_local` -- node startup.
 //!
-//! Gated behind the `server` feature on `scp-ffi-common`. Not available for
-//! WASM (ADR-034).
+//! Gated behind the `server` feature on `scp-ffi-common`.
 
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;

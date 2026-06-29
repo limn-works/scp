@@ -1,6 +1,6 @@
 // Module-level allow — `dead_code` is allowed module-wide because this
 // module is the authoritative home for query-domain free functions
-// consumed by FFI bridges (PyO3 / NAPI / UniFFI / WASM) and by external
+// consumed by FFI bridges (PyO3 / NAPI / UniFFI) and by external
 // test crates behind `feature = "testing"`. Several of the actor-shape
 // helpers wired here have no in-tree caller until the supervisor's
 // `dispatch_query` shim is deleted in Phase 2A finalization; until then

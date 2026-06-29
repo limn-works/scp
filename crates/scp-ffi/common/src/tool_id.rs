@@ -1,6 +1,6 @@
 //! Canonical tool-ID derivation shared by all FFI bridges.
 //!
-//! Every bridge (`PyO3`, `napi-rs`, `UniFFI`, WASM) used to inline the same
+//! Every bridge (`PyO3`, `napi-rs`, `UniFFI`) used to inline the same
 //! `format!("tool-{}", name.replace(' ', "-").to_lowercase())` expression.
 //! The cross-bridge parity harness (`OP_TOOL_REGISTER` in
 //! `bindings/python/tests/bridge_parity/seed_operations.py`) pins the
