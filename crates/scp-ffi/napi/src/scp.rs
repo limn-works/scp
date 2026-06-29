@@ -2852,6 +2852,107 @@ impl Scp {
         .await
     }
 
+    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// (spec §6.2.4, ADR-049 §3a).
+    ///
+    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// single-context-side path), this drives the full §6.2.4 cross-context
+    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// (caller = `source_handle`, target = `target_handle`): Prepare-A /
+    /// Prepare-B authorize and stage both sides, the tool executes EXACTLY ONCE
+    /// supervisor-side at Commit-B, and each side records its own event-log
+    /// entry. Both contexts MUST be co-resident in this bridge instance.
+    ///
+    /// # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+    ///
+    /// `caller_did` is bound to the bridge-authenticated principal: it MUST be
+    /// an identity THIS bridge instance hosts (created here via identity
+    /// creation) AND a member of the caller (`source_handle`) context. A
+    /// mismatch rejects the Promise with a `SagaAborted` error BEFORE the saga
+    /// runs — the saga never observes an unauthenticated caller. The
+    /// `asserted_nonce_hex` / `timestamp_ms` / `chain_depth` REMAIN
+    /// caller-supplied freshness fields (the target validates them).
+    ///
+    /// # Arguments
+    ///
+    /// * `source_handle` — The initiating (caller) context handle.
+    /// * `target_handle` — The executing (target) context handle.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `tool_registration_id` — The tool to invoke across the interface.
+    /// * `input_json` — Tool input as a JSON string (schema-checked target-side).
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+    ///   hex string (the freshness/dedup token).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check),
+    ///   passed as a JS `BigInt`.
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory).
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B. `null` for an ungated tool.
+    ///
+    /// # Returns
+    ///
+    /// A [`NapiSagaResult`](crate::tools::NapiSagaResult) on the committed
+    /// terminal, carrying the supervisor-minted `saga_id`, the target's signed
+    /// receipt bytes, and the captured tool-output bytes. The `saga_id` is
+    /// supervisor-minted — it is never an input.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase
+    /// rejection — authorization, freshness, rate limit, or co-residency;
+    /// carries `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
+    /// carries the durable `saga_id`), or `SagaBusy` (the participant context
+    /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
+    /// error if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
+    /// decode to 16 bytes.
+    ///
+    /// See spec §6.2.4 and ADR-049 §3a.
+    #[napi(js_name = "toolInvokeCrossContextSaga")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tool_invoke_cross_context_saga(
+        &self,
+        source_handle: &NapiContextHandle,
+        target_handle: &NapiContextHandle,
+        caller_did: String,
+        tool_registration_id: String,
+        input_json: String,
+        asserted_nonce_hex: String,
+        timestamp_ms: napi::bindgen_prelude::BigInt,
+        chain_depth: u8,
+        ucan_proof_id: Option<String>,
+    ) -> napi::Result<crate::tools::NapiSagaResult> {
+        crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
+
+        // `timestamp_ms` crosses as a JS `BigInt`. `BigInt::get_u64` returns
+        // `(signed, value, lossless)` — reject a negative or non-lossless
+        // input so a malformed freshness field fails closed at the boundary
+        // rather than wrapping into a bogus skew.
+        let (signed, timestamp_ms_u64, lossless) = timestamp_ms.get_u64();
+        if signed || !lossless {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message:
+                    "timestamp_ms must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                        .to_owned(),
+                code: codes::VALID_7001.to_owned(),
+            }));
+        }
+
+        // Box the impl future: the multi-phase saga it drives is large enough
+        // to trip `clippy::large_futures` when inlined into this method.
+        Box::pin(crate::tools::tool_invoke_cross_context_saga_on(
+            &self.inner,
+            source_handle,
+            target_handle,
+            caller_did,
+            tool_registration_id,
+            input_json,
+            asserted_nonce_hex,
+            timestamp_ms_u64,
+            chain_depth,
+            ucan_proof_id,
+        ))
+        .await
+    }
+
     /// Per-instance equivalent of the free-function `tool_session_create`.
     #[napi(js_name = "toolSessionCreate")]
     pub async fn tool_session_create(
