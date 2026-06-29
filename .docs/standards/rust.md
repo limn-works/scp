@@ -258,7 +258,6 @@ Scheduled (nightly) or manual trigger. Uncapped duration. Failures create issues
 | proptest extended | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(proptest)'` |
 | N-party simulation (multi-seed) | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(preset_.*_all_seeds)'` |
 | persistent backend conformance | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(conformance.*sqlite\|conformance.*redb)'` |
-| wasm conformance | ubuntu-latest | `wasm-pack test --headless --chrome crates/scp-platform-web` (Phase 4+) |
 | load testing | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier3 -E 'test(load_test)'` (Phase 6) |
 
 `deny` also runs weekly on a schedule independent of all tiers.

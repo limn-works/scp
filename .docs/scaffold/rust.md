@@ -118,10 +118,6 @@ crates/
       src/
         lib.rs
       cbindgen.toml
-    wasm/                   # Browser TypeScript
-      Cargo.toml
-      src/
-        lib.rs
     napi/                   # Node/Bun TypeScript
       Cargo.toml
       src/
@@ -141,7 +137,6 @@ members = [
     "crates/scp-ffi/pyo3",
     "crates/scp-ffi/uniffi",
     "crates/scp-ffi/cbindgen",
-    "crates/scp-ffi/wasm",
     "crates/scp-ffi/napi",
     "crates/scp-testing",
 ]
@@ -200,7 +195,6 @@ redb = "2"
 | `pyo3` | 0.23+ | crates/scp-ffi/pyo3 | Python FFI |
 | `uniffi` | latest | crates/scp-ffi/uniffi | Swift/Kotlin FFI |
 | `cbindgen` | latest | crates/scp-ffi/cbindgen | C header generation |
-| `wasm-bindgen` | latest | crates/scp-ffi/wasm | Browser WASM FFI |
 | `napi` | latest | crates/scp-ffi/napi | Node/Bun native addon |
 
 ## Error Types

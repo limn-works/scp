@@ -1603,7 +1603,6 @@ Tier 2 includes all Tier 1 checks plus the `scp-testing` harness meta-tests and 
 | proptest extended | Phase 1+ | All property-based tests with extended case counts (crypto roundtrips, serialization, Merkle proofs, UCAN chains, bucket padding) |
 | Full N-party simulation | Phase 1+ | All preset scenarios (§16.11) × 10 seeds each. Exercises suppression detection, equivocation, partitions, blocking, TTL, reordering across varied random conditions |
 | Adapter conformance (persistent backends) | Phase 2+ | `storage_conformance!()` and `blob_store_conformance!()` against SqliteStorage, SqliteBlobStore, RedbBlobStore |
-| WasmSqliteStorage conformance | Phase 4+ | `storage_conformance!()` via `wasm-pack test` against WasmSqliteStorage |
 | Load testing | Phase 6 | 1000 `SimulatedIdentity` instances, stress-tests on context membership churn, relay throughput, MLS epoch management |
 
 ### 16.15.4 Test Marker Convention
@@ -1663,5 +1662,4 @@ Every §16.13 subsection is assigned to exactly one tier. No test is unassigned.
 | §16.13.10 Preset scenarios | 2 | `ci-tier2` |
 | Preset scenarios × 10 seeds | 3 | `ci-tier3` |
 | Persistent backend conformance | 3 | `ci-tier3` |
-| Wasm conformance | 3 | `ci-tier3` |
 | Load testing | 3 | `ci-tier3` |

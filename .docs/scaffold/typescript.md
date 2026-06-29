@@ -2,7 +2,7 @@
 
 > Source of truth: .docs/specs/, .docs/sketch.md, .docs/adrs/. This file is downstream of those documents.
 
-Build blueprint for the SCP TypeScript SDK: package structure, dual-target architecture, build configuration, and type definitions. See `.docs/standards/typescript.md` for coding standards (Biome config, style rules, testing, CI).
+Build blueprint for the SCP TypeScript SDK: package structure, the napi-rs in-process bridge, build configuration, and type definitions. See `.docs/standards/typescript.md` for coding standards (Biome config, style rules, testing, CI).
 
 ## Package Layout
 
@@ -26,8 +26,7 @@ bindings/typescript/
     mcp.ts                    # serveMcp(), McpClient
     internal/
       native.ts              # napi-rs native addon binding (Bun/Node)
-      wasm.ts                 # wasm-bindgen WASM binding (browser)
-      bridge.ts               # Unified bridge — selects native or WASM at runtime
+      bridge.ts               # Bridge module exposing the napi-rs backend
   tests/
     identity.test.ts
     context.test.ts
@@ -44,20 +43,19 @@ bindings/typescript/
     index.d.ts                # Type declarations
 ```
 
-## Dual Target Architecture
+## In-Process Architecture
 
-The TypeScript SDK supports two runtime environments via different FFI bridges:
+The TypeScript SDK runs the protocol engine in-process via a single FFI bridge:
 
 | Target | FFI bridge | Runtime | Use case |
 |--------|-----------|---------|----------|
-| **Browser** | wasm-bindgen (WASM) | Any browser | Web apps, browser extensions |
 | **Bun/Node** | napi-rs (native addon) | Bun, Node.js | Server-side agents, CLI tools, MCP servers |
 
-### Bridge selection
+Browser clients do **not** run the protocol engine in-process. Per ADR-055 (which supersedes ADR-034), a browser client is a remote thin client: it connects to a server-side `scp-node` over RPC/WebSocket and issues protocol operations remotely. The node holds MLS group state, the actor/supervisor runtime, custody, and the event log. There is no in-browser MLS or protocol execution and no second in-process engine.
 
-Bridge selection logic determines runtime at import time. Implementation must avoid top-level await for CJS compatibility.
+### Bridge module
 
-The public API is identical regardless of bridge. Application code never imports from `internal/`.
+The public API is identical for application code; application code never imports from `internal/`.
 
 ### napi-rs binding (Bun/Node)
 
@@ -68,17 +66,7 @@ crates/scp-ffi/napi/
   package.json              # napi-rs build output metadata
 ```
 
-Produces a `.node` native addon loaded at runtime. Zero WASM overhead, direct memory access.
-
-### wasm-bindgen binding (browser)
-
-```
-crates/scp-ffi/wasm/
-  Cargo.toml
-  src/lib.rs                # #[wasm_bindgen] annotated functions + structs
-```
-
-Built via `wasm-pack build --target bundler`. Produces `.wasm` + JS glue code. Async operations use `wasm-bindgen-futures` to bridge Rust futures to JS Promises.
+Produces a `.node` native addon loaded at runtime, with direct memory access.
 
 ## package.json
 
@@ -219,4 +207,3 @@ Published as `@limn-works/scp-ts` on npm. Package includes:
 - ESM + CJS bundles (via tsup)
 - Type declarations (`.d.ts`)
 - Pre-built native addon for Bun/Node (platform-specific optionalDependencies)
-- WASM bundle for browser (included in main package)

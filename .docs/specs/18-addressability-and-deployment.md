@@ -18,7 +18,7 @@ Every step in this chain is self-certifying or cryptographically verified. No HT
 
 `scp://` URIs are the direct-connection mechanism — a context ID plus relay URL, no HTTP intermediary. They are the canonical way to share a context reference out-of-band.
 
-`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (TypeScript/WASM in browser) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
+`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (a browser talking to a server-side `scp-node` as a remote thin client per ADR-055) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
 
 The agent workstation tier (§10.2) is the primary deployment target for addressability. A dedicated always-on machine running builder agents is the natural host for SCP infrastructure: relay, identity, contexts, and HTTP serving are marginal additional load on hardware that's already running 24/7. The `ApplicationNode` (§18.6) is the SDK type that makes this deployment trivial.
 

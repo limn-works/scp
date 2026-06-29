@@ -32,7 +32,7 @@
 │  │  │  Language bindings:                                     │ │  │
 │  │  │  • Python (PyO3)  — agent ecosystem                    │ │  │
 │  │  │  • Swift (UniFFI) — iOS/macOS                          │ │  │
-│  │  │  • TypeScript (wasm-bindgen/napi-rs) — web/Node        │ │  │
+│  │  │  • TypeScript (napi-rs) — Node/Bun; browser=remote     │ │  │
 │  │  │  • Kotlin (UniFFI) — Android                           │ │  │
 │  │  │  • Rust (native)  — direct                             │ │  │
 │  │  └──────────────────────┬──────────────────────────────────┘ │  │
@@ -334,8 +334,7 @@ scp/
 │   └── scp-ffi/               # Foreign function interface layer
 │       ├── src/               # PyO3 definitions → Python (the REFERENCE bridge)
 │       ├── uniffi/            # UniFFI definitions → Swift, Kotlin
-│       ├── napi/              # napi-rs → Node.js/Bun TypeScript
-│       └── wasm/              # wasm-bindgen → browser TypeScript (constrained per ADR-034)
+│       └── napi/              # napi-rs → Node.js/Bun TypeScript (browser=remote thin client per ADR-055)
 │
 ├── bindings/
 │   ├── python/                # python package (scp-python)
@@ -352,8 +351,7 @@ scp/
 │   │   ├── src/
 │   │   │   ├── index.ts
 │   │   │   ├── identity.ts
-│   │   │   ├── context.ts
-│   │   │   └── wasm.ts        # WASM bridge
+│   │   │   └── context.ts
 │   │   ├── package.json
 │   │   └── tsconfig.json
 │   │
@@ -572,7 +570,7 @@ State:
 ```
               ┌── scp-ffi ────────────┐
               │   (PyO3, UniFFI,      │
-              │    napi-rs, wasm)      │
+              │    napi-rs)            │
               └──────┬────────────────┘
                      │
                      ▼
@@ -675,7 +673,7 @@ Layer 2 ─ scp-transport             Transport abstraction + native relay adapt
            │                          All depend on scp-core (and transitively layers 0).
            │
 Layer 3 ─ scp-node                  Application deployment node (AGPL boundary).
-           │  scp-ffi                 Language bindings (PyO3, UniFFI, wasm-bindgen, napi-rs).
+           │  scp-ffi                 Language bindings (PyO3, UniFFI, napi-rs).
            │  scp-relay               Standalone relay binary.
            │                          Depend on layers 0-2 as needed.
            │
@@ -965,12 +963,13 @@ const ctx = await SCP.Context.create({
 });
 await ctx.send('Hello from TypeScript');
 
-// Browser (WASM)
-// Same API, backed by WebCrypto for keys, IndexedDB for storage
-const identity = await SCP.Identity.create({ custody: 'webcrypto' });
+// Browser
+// Same API, but the browser build is a remote thin client (ADR-055): it
+// connects to a server-side scp-node over RPC/WebSocket and issues protocol
+// operations remotely. There is no in-browser protocol engine.
 ```
 
-TypeScript uses wasm-bindgen for the browser (Rust → WASM) and napi-rs for Node.js (Rust → native addon). Same Rust core, different FFI paths.
+TypeScript uses napi-rs for in-process use on Node.js/Bun (Rust → native addon). The browser target is a remote thin client to a server-side `scp-node` (ADR-055) — it runs no protocol engine in-process.
 
 ### 3.3 Swift SDK (iOS/macOS)
 
@@ -1122,7 +1121,7 @@ Build:
   • scp-core/discovery/scope.rs — scope registration tools: ScopeRegistry, validate_scope_name, scope_register/lookup/deregister (§22.3.5, ADR-043)
   • scp-core/provenance/ — data provenance tagging
   • crates/scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
-  • bindings/typescript/ — TypeScript SDK (wasm-bindgen for browser, napi-rs for Node)
+  • bindings/typescript/ — TypeScript SDK (napi-rs for Node/Bun; browser = remote thin client per ADR-055)
 
 Test:
   • Key destruction: SimulatedClock advance triggers context expiry (§16.3),
@@ -1134,8 +1133,6 @@ Test:
   • Discovery: tool-interface discovery (§6.2.2) returns correct results across
     contexts with different capability ceilings
   • TypeScript: same test suite as Python, in TypeScript
-  • WASM conformance: WasmSqliteStorage (§17.6) passes storage_conformance!()
-    through wasm-bindgen bridge
 
 Ship:
   • PyPI: scp-python v0.2.0 (with trust model)
@@ -1269,7 +1266,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | OpenMLS immaturity | Medium | High | OpenMLS is the most mature MLS library in Rust but may have edge cases. Fallback: mls-rs. Both are active. |
 | PyO3 async complexity | Medium | Medium | Rust async (tokio) ↔ Python async (asyncio) bridging is tricky. Mitigate with synchronous Python API as fallback. |
 | did:dht library gaps | Medium | Medium | did:dht is the primary method. If libraries hit a wall, did:web is the contingency fallback (not a planned path). SDK abstracts the DID method so the fallback is transparent to apps. |
-| WASM limitations | Low | Medium | Browser WASM can't access Secure Enclave. Web SDK uses WebCrypto (software keys). Acceptable for web; native is stronger. |
+| Browser key custody | Low | Medium | Browser clients are remote thin clients (ADR-055): the server-side `scp-node` holds keys, MLS state, and the event log. The browser performs no in-process protocol execution, so Secure Enclave / platform-custody access is a node concern, not a browser one. |
 | Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
 | MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
 
@@ -1281,7 +1278,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 |---|---|---|
 | Ship order | SDK before app | Agents are the killer app. Demand is proven (Moltbook 2.6M). |
 | First binding | Python (PyO3) | Agent ecosystem is overwhelmingly Python. |
-| Second binding | TypeScript (wasm-bindgen/napi-rs) | Web + Node coverage. |
+| Second binding | TypeScript (napi-rs) | Node/Bun in-process; browser via remote thin client (ADR-055). |
 | Third binding | Swift (UniFFI) | iOS/macOS apps. |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
 | DID method (primary) | did:dht | Self-certifying, decentralized, key rotation, no server dependency. No migration path. |

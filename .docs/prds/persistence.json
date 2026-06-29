@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, WASM, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
+  "description": "Persistence and storage layer for SCP. Covers serialization prerequisites, ProtocolRepository modules (event_log, nonce refactor, transport, sender keys, DID cache/TOFU, economic governance), Migratable trait and schema versioning, ContextPersistence trait and manager wiring, storage conformance macros, production storage adapters (SQLite, Filesystem), BlobStore adapters (SQLite, redb, PostgreSQL, S3-compatible), MLS StorageProvider bridge, platform-specific adapters (Android, iOS, CombinedNode, SyncableStorage, LocalBlobCache, relay state), and end-to-end integration tests. SyncableStorage and LocalBlobCache are PRD-originated designs implementing the deployment patterns described in section 17.1, not directly specified in a dedicated spec section.",
   "gates": [
     {
       "id": "gate-persist-0",
@@ -82,7 +82,6 @@
       "stories": [
         "SCP-PERSIST-060",
         "SCP-PERSIST-061",
-        "SCP-PERSIST-062",
         "SCP-PERSIST-063",
         "SCP-PERSIST-064",
         "SCP-PERSIST-065",
@@ -1250,50 +1249,6 @@
       "details": {
         "phase": 5,
         "crate": "scp-platform"
-      }
-    },
-    {
-      "id": "SCP-PERSIST-062",
-      "title": "WasmSqliteStorage browser adapter (TypeScript)",
-      "gate": "gate-persist-6",
-      "priority": "P1",
-      "severity": "major",
-      "status": "done",
-      "files": [
-        "bindings/typescript/src/storage/wasm-sqlite.ts",
-        "bindings/typescript/package.json"
-      ],
-      "description": "Implement browser storage adapter per section 17.6. Uses wa-sqlite with OriginPrivateFileSystemVFS (primary) and IDBBatchAtomicVFS (Safari incognito fallback). Per section 17.5, SQLCipher is unavailable in WASM — each value is encrypted with AES-GCM using a key derived from the identity's WebCrypto key before writing. TypeScript implementation of Storage interface, communicates with Rust WASM core via binding layer.",
-      "acceptanceCriteria": [
-        "`WasmSqliteStorage` TypeScript class using wa-sqlite with OriginPrivateFileSystemVFS (IDBBatchAtomicVFS fallback for Safari incognito)",
-        "Each value encrypted with AES-GCM using key derived from identity WebCrypto key before writing to wa-sqlite per section 17.5",
-        "Implements all 6 Storage interface methods; all data scoped to OPFS origin",
-        "OPFS fallback is unit-tested indirectly: `InMemorySqliteStorage` exercises the same SQL paths; browser-specific VFS detection requires a browser environment and is validated by the `detectVfs()` function returning `\"opfs\"` or `\"idb\"`",
-        "Passes storage conformance tests (TypeScript port via `InMemorySqliteStorage` in `tests/storage.test.ts`)",
-        "`bun test` and `bun run check` pass"
-      ],
-      "actionItems": [
-        "Add `wa-sqlite` dependency to `bindings/typescript/package.json`",
-        "Create `WasmSqliteStorage` class with VFS detection and fallback",
-        "Implement all 6 Storage methods matching Rust SqliteStorage patterns",
-        "Port storage conformance tests to TypeScript"
-      ],
-      "blockedBy": [
-        "SCP-PERSIST-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
-        },
-        {
-          "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### Browser: The One Exception"
-        }
-      ],
-      "details": {
-        "phase": 4,
-        "crate": "bindings/typescript"
       }
     },
     {

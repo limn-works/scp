@@ -433,7 +433,7 @@
         ".docs/adrs/phase-5.md",
         ".docs/adrs/phase-6.md"
       ],
-      "description": "Audit and update all ADR phase files for consistency with ADR-039. Phase 1: ADR-001 (MLS) references to identity/credentials must note signing_key_id; ADR-002 (Envelope) must note signing_key_id in inner envelope; ADR-003 (DID Creation) must note optional #agent VM generation; ADR-007 (Sender Keys) must note signer_key_ref. Phase 2: ADR-008 (Context Lifecycle) must note shared-DID membership model. Phase 3: ADR-013/014 (Python bridges) must note agent key exposure; ADR-016 (UCAN Validation) must note step 5b and key_scope. Phase 4: ADR-021 (UniFFI), ADR-022 (TypeScript), ADR-034 (WASM) must note agent key bridge updates. Phase 5: ADR-026 (Swift) must note agent key. Phase 6: ADR-028 (Kotlin) must note agent key; ADR-029 (Offline/Sync) must address agent key rotation sync; ADR-031 (Governance) must note one-DID-one-vote.",
+      "description": "Audit and update all ADR phase files for consistency with ADR-039. Phase 1: ADR-001 (MLS) references to identity/credentials must note signing_key_id; ADR-002 (Envelope) must note signing_key_id in inner envelope; ADR-003 (DID Creation) must note optional #agent VM generation; ADR-007 (Sender Keys) must note signer_key_ref. Phase 2: ADR-008 (Context Lifecycle) must note shared-DID membership model. Phase 3: ADR-013/014 (Python bridges) must note agent key exposure; ADR-016 (UCAN Validation) must note step 5b and key_scope. Phase 4: ADR-021 (UniFFI), ADR-022 (TypeScript) must note agent key bridge updates. Phase 5: ADR-026 (Swift) must note agent key. Phase 6: ADR-028 (Kotlin) must note agent key; ADR-029 (Offline/Sync) must address agent key rotation sync; ADR-031 (Governance) must note one-DID-one-vote.",
       "acceptanceCriteria": [
         "ADR-001 (MLS) references signing_key_id in ScpCredential",
         "ADR-002 (Envelope) references signing_key_id in InnerEnvelope",
@@ -442,7 +442,7 @@
         "ADR-008 (Context Lifecycle) notes shared-DID membership",
         "ADR-013/014 (Python) note agent key bridge methods",
         "ADR-016 (UCAN) documents validation step 5b and scp_key_scope",
-        "ADR-021/022/034 (UniFFI/TypeScript/WASM) note agent key bridge updates",
+        "ADR-021/022 (UniFFI/TypeScript) note agent key bridge updates",
         "ADR-026 (Swift) notes agent key bridge",
         "ADR-028 (Kotlin) notes agent key bridge",
         "ADR-029 (Offline/Sync) addresses agent key rotation sync",
@@ -920,34 +920,29 @@
     },
     {
       "id": "SCP-AB-017",
-      "title": "Update UniFFI and WASM bridges for agent key",
+      "title": "Update UniFFI bridge for agent key",
       "gate": "gate-ffi-bridges",
       "priority": "P1",
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/wasm/src/identity.rs"
+        "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "Update UniFFI (Swift/Kotlin) and WASM (TypeScript) FFI bridges to expose agent key creation, rotation, removal, and status per ADR-039 acceptance criterion 19. UniFFI bridge (scp-ffi/uniffi/src/bridge.rs): add agent key methods to UDL interface and implement in bridge.rs. WASM bridge (scp-ffi/wasm/src/identity.rs): expose wasm-bindgen methods. UniFFI generates Swift and Kotlin bindings automatically from the UDL. WASM bridge must re-implement agent key operations locally (cannot depend on scp-core per ADR-034).",
+      "description": "Update the UniFFI (Swift/Kotlin) FFI bridge to expose agent key creation, rotation, removal, and status per ADR-039 acceptance criterion 19. UniFFI bridge (scp-ffi/uniffi/src/bridge.rs): add agent key methods to the UDL interface and implement in bridge.rs. UniFFI generates Swift and Kotlin bindings automatically from the UDL.",
       "acceptanceCriteria": [
         "UniFFI bridge.rs exposes add_agent_key, remove_agent_key, rotate_agent_key, has_agent_key, get_agent_public_key",
         "UniFFI UDL file (scp.udl) includes agent key method signatures",
         "Generated Swift bindings include agent key methods",
         "Generated Kotlin bindings include agent key methods",
-        "WASM bridge exposes addAgentKey, removeAgentKey, rotateAgentKey, hasAgentKey, getAgentPublicKey via wasm-bindgen",
-        "WASM implementation re-implements agent key logic locally (not via scp-core, per ADR-034)",
-        "Error propagation works correctly in all four target languages",
-        "Tests verify UniFFI agent key lifecycle",
-        "Tests verify WASM agent key lifecycle"
+        "Error propagation works correctly in the generated Swift and Kotlin bindings",
+        "Tests verify UniFFI agent key lifecycle"
       ],
       "actionItems": [
         "Add agent key methods to UniFFI bridge.rs",
         "Update scp.udl with agent key method signatures",
-        "Add agent key methods to WASM identity.rs (local implementation)",
         "Wire UniFFI through to ScpIdentity/DidDocument operations",
-        "Add error handling for all bridges",
-        "Add tests for UniFFI and WASM bridges"
+        "Add error handling for the bridge",
+        "Add tests for the UniFFI bridge"
       ],
       "blockedBy": [
         "SCP-AB-008",
@@ -961,10 +956,6 @@
         {
           "file": ".docs/adrs/phase-4.md",
           "section": "## ADR-021: UniFFI Bridge Definitions"
-        },
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-034: WASM Bridge Re-Implementation Strategy"
         }
       ],
       "details": {}

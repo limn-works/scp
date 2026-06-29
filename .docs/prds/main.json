@@ -129,7 +129,6 @@
         "SCP-076",
         "SCP-077",
         "SCP-078",
-        "SCP-079",
         "SCP-080",
         "SCP-081",
         "SCP-134"
@@ -269,7 +268,6 @@
       "priority": "P1",
       "status": "pending",
       "stories": [
-        "SCP-218",
         "SCP-219",
         "SCP-220",
         "SCP-221",
@@ -4474,68 +4472,6 @@
       "completedAt": "2026-02-27T02:55:57Z"
     },
     {
-      "id": "SCP-079",
-      "title": "Implement WASM bridge via wasm-bindgen",
-      "gate": "gate-4",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-ffi-wasm/src/lib.rs",
-        "crates/scp-ffi-wasm/Cargo.toml"
-      ],
-      "description": "Implement the WASM bridge using wasm-bindgen for browser target. WASM-specific constraints (no filesystem, no threads in main thread) may require API adjustments. Browser-specific: WebCrypto for key operations, wa-sqlite for storage (OPFSCoopSyncVFS from §17.6), IndexedDB fallback. Build WASM bridge first (narrower API surface due to WASM constraints).",
-      "acceptanceCriteria": [
-        "wasm-bindgen bridge exposes all scp-core public API types that are WASM-compatible",
-        "Async operations bridged via wasm-bindgen-futures",
-        "Error mapping: Rust Result maps to typed JavaScript exceptions",
-        "WebCrypto integration for key operations in browser context",
-        "wa-sqlite + OPFSCoopSyncVFS (§17.6) for browser storage",
-        "IndexedDB fallback when OPFS unavailable",
-        "wasm-pack build produces valid npm package"
-      ],
-      "actionItems": [
-        "Create crates/scp-ffi-wasm/Cargo.toml with wasm-bindgen, wasm-bindgen-futures, js-sys, web-sys dependencies",
-        "Create crates/scp-ffi-wasm/src/lib.rs with #[wasm_bindgen] annotated public API",
-        "Implement type conversions between Rust types and JsValue",
-        "Implement async bridging via wasm-bindgen-futures",
-        "Implement error mapping to JavaScript exceptions with ScpError hierarchy",
-        "Implement WebCrypto adapter for key operations",
-        "Implement wa-sqlite + OPFSCoopSyncVFS storage adapter (§17.6)",
-        "Implement IndexedDB fallback storage adapter",
-        "Configure wasm-pack build for npm package output",
-        "Write browser integration tests"
-      ],
-      "blockedBy": [
-        "SCP-036",
-        "SCP-061",
-        "SCP-066",
-        "SCP-070",
-        "SCP-073",
-        "SCP-060"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
-        }
-      ],
-      "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected decisions and optimal approach",
-        "module": "scp-ffi-wasm/",
-        "references": [
-          "scaffold/typescript.md",
-          "standards/typescript.md",
-          "scaffold/shared.md"
-        ],
-        "browserStorage": "wa-sqlite + OPFSCoopSyncVFS (§17.6), IndexedDB fallback",
-        "browserCrypto": "WebCrypto"
-      },
-      "result": "WASM bridge crate created at crates/scp-ffi/wasm/ with wasm-bindgen. Full type/function surface mirroring UniFFI. No scp-core dep (tokio wasm32 incompatibility). All workspace tests pass.",
-      "completedAt": "2026-02-27T02:55:57Z"
-    },
-    {
       "id": "SCP-080",
       "title": "Implement napi-rs bridge for Node.js/Bun",
       "gate": "gate-4",
@@ -4546,13 +4482,13 @@
         "crates/scp-ffi-napi/src/lib.rs",
         "crates/scp-ffi-napi/Cargo.toml"
       ],
-      "description": "Implement the Node.js native addon via napi-rs for Bun/Node runtime target. napi-rs async bridging via ThreadsafeFunction and AsyncTask. Can expose fuller API than WASM bridge (no WASM constraints). Build napi bridge after WASM bridge.",
+      "description": "Implement the Node.js native addon via napi-rs for Bun/Node runtime target. napi-rs async bridging via ThreadsafeFunction and AsyncTask. The napi bridge is the in-process TypeScript bridge; browser clients are remote thin clients to a server-side scp-node (ADR-055).",
       "acceptanceCriteria": [
         "napi-rs bridge exposes full scp-core public API",
         "Async operations bridged via ThreadsafeFunction and AsyncTask",
         "Error mapping: Rust Result maps to typed TypeScript exceptions (ScpError hierarchy)",
         "Streaming via napi-rs callback patterns for message streams",
-        "Native filesystem and threading available (no WASM constraints)",
+        "Native filesystem and threading available",
         "napi build produces valid npm native addon",
         "Shutdown ordering: Node.js/Bun process exit handlers complete cleanup of JavaScript references before the Rust runtime is dropped. napi-rs registered cleanup hooks block runtime drop until all outstanding handles are released (with a configurable timeout, default 5 seconds)."
       ],
@@ -4570,7 +4506,6 @@
       ],
       "blockedBy": [
         "SCP-036",
-        "SCP-079",
         "SCP-060"
       ],
       "sources": [
@@ -4600,7 +4535,7 @@
     },
     {
       "id": "SCP-081",
-      "title": "Implement TypeScript SDK with dual-target bridge selection",
+      "title": "Implement TypeScript SDK over the napi-rs in-process bridge",
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
@@ -4611,14 +4546,13 @@
         "bindings/typescript/package.json",
         "bindings/typescript/tsup.config.ts"
       ],
-      "description": "Implement the TypeScript SDK (@limn-works/scp-ts) with dual-target architecture: browser (WASM) and Bun/Node (napi-rs native addon). Internal bridge module selects the correct backend at runtime. Public API surface covers Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules. Build pipeline: tsup config for dual ESM/CJS output. Streaming via AsyncIterable for message streams, disposal via Symbol.asyncDispose.",
+      "description": "Implement the TypeScript SDK (@limn-works/scp-ts) over the napi-rs native addon for Bun/Node in-process use. Internal bridge module exposes the napi backend. Browser clients are remote thin clients to a server-side scp-node (ADR-055, which supersedes ADR-034) — there is no in-process browser engine. Public API surface covers Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules. Build pipeline: tsup config for dual ESM/CJS output. Streaming via AsyncIterable for message streams, disposal via Symbol.asyncDispose.",
       "acceptanceCriteria": [
-        "Bridge selection logic: runtime detection (browser vs Bun vs Node) with fallback behavior",
+        "Bridge module exposes the napi-rs backend for Bun/Node runtimes",
         "Public API surface exposes: Identity, Context, Tools, Trust, EventLog, Transport, UCAN, MCP modules",
         "Error mapping: Rust Result maps to typed TypeScript exceptions (ScpError hierarchy from scaffold)",
         "Streaming: AsyncIterable for message streams, disposal via Symbol.asyncDispose",
         "Build pipeline: tsup config for dual ESM/CJS output",
-        "Browser target uses WASM bridge (SCP-079)",
         "Node/Bun target uses napi bridge (SCP-080)",
         "Package published as @limn-works/scp-ts on npm",
         "All conformance tests from scaffold/shared.md pass"
@@ -4626,8 +4560,7 @@
       "actionItems": [
         "Create bindings/typescript/package.json with @limn-works/scp-ts package configuration",
         "Create bindings/typescript/tsup.config.ts for dual ESM/CJS output",
-        "Create bindings/typescript/src/bridge.ts with runtime detection (browser vs Bun vs Node) and backend selection",
-        "Implement fallback behavior when preferred backend unavailable",
+        "Create bindings/typescript/src/bridge.ts exposing the napi backend",
         "Create bindings/typescript/src/index.ts with public API re-exports",
         "Implement Identity module wrapping bridge calls",
         "Implement Context module wrapping bridge calls",
@@ -4641,11 +4574,9 @@
         "Implement Symbol.asyncDispose for resource cleanup",
         "Implement typed ScpError hierarchy per scaffold/typescript.md",
         "Configure Biome linter per standards/typescript.md",
-        "Write conformance tests per scaffold/shared.md using bun:test",
-        "Write unit tests for bridge selection logic across runtimes"
+        "Write conformance tests per scaffold/shared.md using bun:test"
       ],
       "blockedBy": [
-        "SCP-079",
         "SCP-080",
         "SCP-060"
       ],
@@ -4683,7 +4614,7 @@
           "MCP"
         ]
       },
-      "result": "TypeScript SDK @limn-works/scp-ts implemented with dual-target bridge (WASM + napi-rs), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 bun:test tests pass."
+      "result": "TypeScript SDK @limn-works/scp-ts implemented over the napi-rs in-process bridge (browser = remote thin client per ADR-055), 8 public modules, ScpError hierarchy, AsyncIterable streaming, AsyncDisposable, tsup ESM+CJS build. 40 bun:test tests pass."
     },
     {
       "id": "SCP-082",
@@ -7615,7 +7546,7 @@
       "description": "Implement the binary artifact build, sign, and distribute workflow for all SDK packages. The conformance gate (100% pass) is a prerequisite — no release without it. Covers: build matrix (Linux x86_64/aarch64, macOS universal2, Windows x86_64), artifact signing per platform, distribution to all 8 package registries, version pinning to scp-core, and the 7-step release checklist.",
       "acceptanceCriteria": [
         "Build matrix: Linux (x86_64, aarch64) produces manylinux2014 wheels and .so; macOS (universal2) produces wheels, .dylib, .xcframework; Windows (x86_64) produces wheels and .dll",
-        "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript browser (@limn-works/scp-ts npm WASM bundle), TypeScript Node/Bun (@limn-works/scp-ts-node npm napi-rs addon), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
+        "Distribution channels: Rust (crates.io source crate), Python (PyPI maturin wheel), TypeScript Node/Bun (@limn-works/scp-ts npm napi-rs addon; browser clients are remote thin clients to a node per ADR-055), Swift (SPM XCFramework), Kotlin (Maven Central AAR), Go (Go modules source + .so), C# (NuGet native runtime pack), Java (Maven Central JAR with natives)",
         "All SDK packages pin to the exact scp-core version they were built against. Core version encoded in package metadata (Python wheel metadata, npm engines, Swift Package.swift)",
         "Signing: Rust crates verified by crates.io checksums; platform packages use native signing (Apple codesigning for .xcframework, Authenticode for .dll, GPG for Maven); PyPI uses Trusted Publishers (GitHub Actions OIDC)",
         "Release checklist enforced by CI: (1) 100% conformance tests pass, (2) changelog updated, (3) version tags created, (4) artifacts built, (5) artifacts signed, (6) published to registries, (7) GitHub Release created",
@@ -7630,7 +7561,6 @@
         "Create `.github/workflows/release.yml` with the 7-step release workflow: conformance gate, changelog check, version tag, build, sign, publish, GitHub Release",
         "Configure maturin-action for Python wheel builds (manylinux2014, macOS universal2, Windows)",
         "Configure napi-rs build for npm native addon",
-        "Configure wasm-pack build for npm WASM bundle",
         "Configure XCFramework build for Swift Package Manager",
         "Configure Maven publishing for Kotlin and Java",
         "Configure NuGet publishing for C#",
@@ -9688,21 +9618,18 @@
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/napi/src/identity.rs",
         "crates/scp-ffi/napi/src/context.rs",
-        "crates/scp-ffi/wasm/src/custody.rs",
-        "crates/scp-ffi/wasm/src/context.rs",
-        "crates/scp-ffi/wasm/src/identity.rs",
         "crates/scp-platform/src/traits.rs",
         "crates/scp-platform/src/testing/key_custody.rs",
         "crates/scp-ffi/src/runtime.rs",
         ".docs/specs/09-security-model.md"
       ],
-      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, WASM/NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody (Secure Enclave, Android Keystore) is implemented (SCP-093, SCP-110) but unreachable from Rust. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: DidMethod::create, DidMethod::rotate (trait methods called by FFI bridges)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 5 internal functions (DidDht::make_sign_fn, rotate_active_key, create_new_identity_keys, build_migration_proof, generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. One more public function, DidDht::migrate_identity, has no FFI bridge function yet and should be added in this story.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the Ed25519 private seed) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate or py_identity_migrate bridge functions exist despite scp-core implementations being complete (SCP-056, SCP-008)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the Ed25519 private seed) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Platform adapters are implemented. Only the wiring is missing.",
+      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody (Secure Enclave, Android Keystore) is implemented (SCP-093, SCP-110) but unreachable from Rust. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: DidMethod::create, DidMethod::rotate (trait methods called by FFI bridges)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 5 internal functions (DidDht::make_sign_fn, rotate_active_key, create_new_identity_keys, build_migration_proof, generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. One more public function, DidDht::migrate_identity, has no FFI bridge function yet and should be added in this story.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the Ed25519 private seed) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate or py_identity_migrate bridge functions exist despite scp-core implementations being complete (SCP-056, SCP-008)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the Ed25519 private seed) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Platform adapters are implemented. Only the wiring is missing.",
       "acceptanceCriteria": [
         "UniFFI KeyCustodyProvider callback interface includes all 7 KeyCustody trait methods: generate_keypair, sign, get_public_key, destroy_key, dh_agree, derive_pseudonym, custody_type",
         "UniFFI identity_create with CustodyMethod::Platform accepts an injected KeyCustodyProvider and creates identity using it",
         "Identity handle retains Arc<dyn KeyCustody> (or adapter wrapper) and KeyHandle references so all subsequent crypto operations use the same provider",
         "py_context_create routing ID derivation calls KeyCustody::derive_pseudonym with real key material instead of HMAC-SHA256(random_secret, ...)",
-        "UniFFI and NAPI/WASM context creation derive routing IDs via the injected KeyCustodyProvider",
+        "UniFFI and NAPI context creation derive routing IDs via the injected KeyCustodyProvider",
         "create_inner_envelope called from FFI bridges uses the retained KeyCustody for message signing",
         "py_ucan_mint replaced with real scp-core::mint_ucan call using retained KeyCustody for token signing",
         "New py_ucan_delegate bridge function added, calling scp-core::delegate_ucan with retained KeyCustody",
@@ -9713,7 +9640,7 @@
         "Golden vector test for InMemoryKeyCustody::derive_pseudonym asserts the private-seed-HKDF derivation (HMAC-SHA256(pseudonym_secret, context_id || \"scp-pseudonym\")) per §9.10.4.A, not a public-key-based HMAC",
         "Private key material never crosses any FFI boundary (invariant from ADR-006)",
         "All existing tests pass (cargo test --workspace --exclude scp-ffi)",
-        "Cross-platform pseudonym derivation test: same identity key + same context_id produces identical routing_id across PyO3, UniFFI, WASM bridges and across InMemoryKeyCustody / AndroidKeyCustody / AppleKeyCustody",
+        "Cross-platform pseudonym derivation test: same identity key + same context_id produces identical routing_id across PyO3, UniFFI, NAPI bridges and across InMemoryKeyCustody / AndroidKeyCustody / AppleKeyCustody",
         "runtime.rs get_or_create_routing_secret() and IDENTITY_ROUTING_SECRETS static removed (replaced by real KeyCustody::derive_pseudonym calls)"
       ],
       "actionItems": [
@@ -9725,7 +9652,7 @@
         "Update UniFFI Identity handle to wire injected KeyCustodyProvider into Platform/Software custody paths (currently errors at bridge.rs:953)",
         "Update NAPI identity_create to wire JsKeyCustody into scp-core identity creation",
         "Replace HMAC-SHA256(random_secret, ...) stub in PyO3 context.rs:462-486 with KeyCustody::derive_pseudonym using retained identity KeyHandle; remove get_or_create_routing_secret and IDENTITY_ROUTING_SECRETS from runtime.rs",
-        "Wire pseudonym derivation into UniFFI and NAPI/WASM context creation paths",
+        "Wire pseudonym derivation into UniFFI and NAPI context creation paths",
         "Wire create_inner_envelope signing through retained KeyCustody in all bridge send paths",
         "Replace py_ucan_mint stub (ucan.rs:320) with real scp_core::mint_ucan call using retained KeyCustody",
         "Add py_ucan_delegate bridge function (new) calling scp_core::delegate_ucan with retained KeyCustody — no bridge function exists today despite SCP-056/SCP-057 implementing scp-core and Python wrapper",
@@ -9817,8 +9744,6 @@
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/wasm/src/identity.rs",
-        "crates/scp-ffi/wasm/src/context.rs",
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Types.kt",
         ".docs/adrs/phase-5.md",
         ".docs/adrs/phase-6.md"
@@ -9964,56 +9889,6 @@
         "currentStub": "py_identity_load at identity.rs:278-299 validates DID format (did:dht: prefix) then returns PyIdentity { did, custody: \"in_memory\" } without any storage interaction. The inline comment says \"See ADR-013 acceptance criterion 2\" — the criterion exists but was never wired.",
         "relationship": "This is the Storage analog of SCP-214 (KeyCustody wiring). SCP-214 wires KeyCustodyProvider for crypto operations; SCP-217 wires StorageProvider for identity persistence. Both are required for a production-ready Python FFI bridge."
       }
-    },
-    {
-      "id": "SCP-218",
-      "title": "Wire WASM bridge to scp-core for tools, UCAN, and event log",
-      "gate": "gate-audit",
-      "status": "pending",
-      "blockedBy": [
-        "SCP-079"
-      ],
-      "files": [
-        "crates/scp-ffi/wasm/src/tools.rs",
-        "crates/scp-ffi/wasm/src/ucan.rs",
-        "crates/scp-ffi/wasm/src/event_log.rs"
-      ],
-      "description": "The WASM bridge (SCP-079) provides typed function signatures and error types but tool, UCAN, and event log functions return 'not yet connected to runtime' errors. Wire these to scp-core implementations using the same patterns as the PyO3 bridge (SCP-163). Scope: tool_register/invoke/verify, ucan_validate/mint/revoke, event_log_query/verify. Identity and KeyCustody wiring is covered separately by SCP-214.",
-      "acceptanceCriteria": [
-        "tool_register calls scp-core ToolRegistry::register with schema validation",
-        "tool_invoke calls scp-core tool invocation pipeline and returns structured result",
-        "tool_verify calls scp-core schema verification and returns pass/fail with diagnostics",
-        "ucan_validate calls scp-core 11-step UCAN validation pipeline (verify_ucan_chain)",
-        "ucan_mint calls scp-core mint_ucan (signing deferred to KeyCustody wiring in SCP-214)",
-        "ucan_revoke calls scp-core UCAN revocation",
-        "event_log_query calls scp-core EventLog query with filter parameters",
-        "event_log_verify calls scp-core Merkle verification",
-        "wasm-pack build compiles without errors",
-        "No 'not yet connected to runtime' errors remain in tools.rs, ucan.rs, event_log.rs"
-      ],
-      "priority": "P1",
-      "severity": "major",
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
-        }
-      ],
-      "actionItems": [
-        "Wire tool_register in wasm/src/tools.rs to ToolRegistry::register with schema validation",
-        "Wire tool_invoke in wasm/src/tools.rs to scp-core tool invocation pipeline",
-        "Wire tool_verify in wasm/src/tools.rs to scp-core schema verification",
-        "Wire ucan_validate in wasm/src/ucan.rs to scp-core verify_ucan_chain",
-        "Wire ucan_mint in wasm/src/ucan.rs to scp-core mint_ucan (KeyCustody signing deferred to SCP-214)",
-        "Wire ucan_revoke in wasm/src/ucan.rs to scp-core UCAN revocation",
-        "Wire event_log_query in wasm/src/event_log.rs to scp-core EventLog query",
-        "Wire event_log_verify in wasm/src/event_log.rs to scp-core Merkle verification",
-        "Verify wasm-pack build compiles without errors after wiring"
-      ],
-      "details": {},
-      "blockedByIssues": [
-        306
-      ]
     },
     {
       "id": "SCP-219",

@@ -727,11 +727,10 @@
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/wasm/src/context.rs",
         "bindings/typescript/src/context.ts",
         "bindings/python/scp_sdk/context.py"
       ],
-      "description": "Add broadcastPublishAsset (single asset) and broadcastPublishAssets (batch) convenience methods to all FFI bridges and SDK bindings per §18.11.8 (amended) and ADR-042. Each method accepts a typed AssetEntry parameter (path: ContentPath, content_type: MimeType, body: bytes) — typed parameter prevents positional transposition. deploy_id is a separate parameter on broadcastPublishAssets. Returns { blobId, etag } where etag is SHA-256(body) hex-encoded. broadcastPublishAssets accepts a Vec<AssetEntry>, publishes all assets, then commits the deploy atomically. Content-hash dedup: if a blob with the same SHA-256(body) already exists in the current deploy_id, skip re-upload and return existing blobId. PyO3 bridge is the reference implementation; NAPI, UniFFI, and WASM bridges follow. WASM bridge reimplements ContentPath/MimeType validation locally per ADR-034. TypeScript and Python SDK wrappers provide idiomatic APIs over their respective bridges.",
+      "description": "Add broadcastPublishAsset (single asset) and broadcastPublishAssets (batch) convenience methods to all FFI bridges and SDK bindings per §18.11.8 (amended) and ADR-042. Each method accepts a typed AssetEntry parameter (path: ContentPath, content_type: MimeType, body: bytes) — typed parameter prevents positional transposition. deploy_id is a separate parameter on broadcastPublishAssets. Returns { blobId, etag } where etag is SHA-256(body) hex-encoded. broadcastPublishAssets accepts a Vec<AssetEntry>, publishes all assets, then commits the deploy atomically. Content-hash dedup: if a blob with the same SHA-256(body) already exists in the current deploy_id, skip re-upload and return existing blobId. PyO3 bridge is the reference implementation; NAPI and UniFFI bridges follow. TypeScript and Python SDK wrappers provide idiomatic APIs over their respective bridges.",
       "acceptanceCriteria": [
         "AssetEntry type defined with path: ContentPath, content_type: MimeType, body: Vec<u8> fields (deploy_id is a separate parameter on broadcastPublishAssets, not part of AssetEntry)",
         "broadcastPublishAsset() accepts AssetEntry, returns { blob_id: String, etag: String }",
@@ -740,7 +739,6 @@
         "PyO3 bridge exports broadcast_publish_asset and broadcast_publish_assets",
         "NAPI bridge exports broadcastPublishAsset and broadcastPublishAssets",
         "UniFFI bridge exports broadcast_publish_asset and broadcast_publish_assets",
-        "WASM bridge exports broadcastPublishAsset and broadcastPublishAssets with local ContentPath/MimeType validation per ADR-034",
         "Python SDK wraps PyO3 bridge with broadcast_publish_asset() and broadcast_publish_assets() methods",
         "TypeScript SDK wraps NAPI bridge with broadcastPublishAsset() and broadcastPublishAssets() methods",
         "All bridge methods propagate errors (invalid path, invalid MIME type, resource limit exceeded) as typed errors",
@@ -754,7 +752,6 @@
         "Export broadcast_publish_asset and broadcast_publish_assets from PyO3 bridge (reference)",
         "Export broadcastPublishAsset and broadcastPublishAssets from NAPI bridge",
         "Export broadcast_publish_asset and broadcast_publish_assets from UniFFI bridge",
-        "Export broadcastPublishAsset and broadcastPublishAssets from WASM bridge with local validation",
         "Add broadcast_publish_asset() and broadcast_publish_assets() to Python SDK context.py",
         "Add broadcastPublishAsset() and broadcastPublishAssets() to TypeScript SDK context.ts",
         "Implement content-hash dedup logic (check existing blob_id by SHA-256 within deploy_id)",
@@ -780,7 +777,7 @@
       ],
       "details": {
         "phase": 2,
-        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi", "scp-ffi-wasm"],
+        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi"],
         "bindings": ["typescript", "python"]
       }
     },
@@ -795,13 +792,10 @@
         "crates/scp-ffi/src/context.rs",
         "crates/scp-ffi/napi/src/context.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/wasm/src/context.rs",
-        "crates/scp-ffi/wasm/src/manager.rs",
         "bindings/typescript/src/types.ts",
         "bindings/typescript/src/context.ts",
         "bindings/typescript/src/internal/bridge.ts",
         "bindings/typescript/src/internal/native.ts",
-        "bindings/typescript/src/internal/wasm.ts",
         "bindings/python/scp_sdk/context.py",
         "bindings/swift/Sources/SCP/Governance.swift",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
@@ -809,8 +803,8 @@
       ],
       "description": "The FFI bridges already auto-generate deploy_id (SHA-256(context_id ++ author_did ++ timestamp)[..16]) but discard it. Add deploy_id to PublishResult for single-asset publish. Create BatchPublishResult { results: Vec<PublishResult>, deploy_id: String } for batch publish. No Rust core changes needed — bridges already have the value, they just need to include it in the return type. Update all 4 SDK wrappers to expose the new field. Per §18.11.8 and ADR-042.",
       "acceptanceCriteria": [
-        "PublishResult includes deploy_id: String field in all 4 FFI bridges",
-        "BatchPublishResult type exists with results: Vec<PublishResult> and deploy_id: String fields in all 4 FFI bridges",
+        "PublishResult includes deploy_id: String field in all 3 FFI bridges",
+        "BatchPublishResult type exists with results: Vec<PublishResult> and deploy_id: String fields in all 3 FFI bridges",
         "broadcastPublishAsset returns PublishResult with deploy_id populated in all bridges",
         "broadcastPublishAssets returns BatchPublishResult with deploy_id populated in all bridges",
         "Auto-generated deploy_id is 32 lowercase hex characters",
@@ -825,7 +819,6 @@
         "Update PyO3 bridge PublishResult dict to include deploy_id",
         "Create NapiBatchPublishResult in NAPI bridge, update NapiPublishResult",
         "Update UniFFI bridge PublishResult record, add BatchPublishResult record",
-        "Update WASM bridge JS return object to include deploy_id",
         "Update TypeScript PublishResult interface and add BatchPublishResult interface in types.ts",
         "Update TypeScript context.ts broadcastPublishAssets return type",
         "Update Python context.py return types and add BatchPublishResult dataclass",
@@ -848,7 +841,7 @@
       ],
       "details": {
         "phase": 2,
-        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi", "scp-ffi-wasm"],
+        "crates": ["scp-ffi", "scp-ffi-napi", "scp-ffi-uniffi"],
         "bindings": ["typescript", "python", "swift", "kotlin"]
       }
     },
@@ -973,7 +966,7 @@
     },
     {
       "id": "SCP-295",
-      "title": "Add lifecycle FFI methods to NodeHandle in all 3 non-WASM bridges",
+      "title": "Add lifecycle FFI methods to NodeHandle in all 3 bridges",
       "gate": "gate-http-3",
       "priority": "P1",
       "severity": "major",
@@ -983,7 +976,7 @@
         "crates/scp-ffi/napi/src/server.rs",
         "crates/scp-ffi/uniffi/src/server.rs"
       ],
-      "description": "Extend NodeInner impl in each of the 3 non-WASM FFI bridges with 4 async lifecycle methods: enable_site_projection(context_id, broadcast_key, admission, site_config), commit_deploy(context_id, deploy_id) returning asset count, rollback_deploy(context_id, deploy_id), and disable_site_projection(context_id). Each method dispatches through NodeInner to the underlying ApplicationNode. PyO3 bridge (server.rs) is the reference implementation; NAPI and UniFFI follow. Error propagation: Rust NodeError mapped to bridge-specific error types. WASM excluded — browsers cannot host HTTP servers. Per §18.11.8 and ADR-042.",
+      "description": "Extend NodeInner impl in each of the 3 FFI bridges with 4 async lifecycle methods: enable_site_projection(context_id, broadcast_key, admission, site_config), commit_deploy(context_id, deploy_id) returning asset count, rollback_deploy(context_id, deploy_id), and disable_site_projection(context_id). Each method dispatches through NodeInner to the underlying ApplicationNode. PyO3 bridge (server.rs) is the reference implementation; NAPI and UniFFI follow. Error propagation: Rust NodeError mapped to bridge-specific error types. Browser clients are remote thin clients to a node (ADR-055) and do not host HTTP servers. Per §18.11.8 and ADR-042.",
       "acceptanceCriteria": [
         "PyO3 PyNodeHandle has enable_site_projection(context_id, hostname, config_json=None) method",
         "PyO3 PyNodeHandle has commit_deploy(context_id, deploy_id) -> int method",
@@ -1051,7 +1044,7 @@
         "bindings/swift/Sources/SCP/Node.swift",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Node.kt"
       ],
-      "description": "Create Node class in all 4 SDKs wrapping the FFI lifecycle methods from SCP-295. Each class exposes 4 methods: enableSiteProjection, commitDeploy (returns asset count), rollbackDeploy, disableSiteProjection. Python wraps PyNodeHandle calls in asyncio.to_thread(). TypeScript adds Node to bridge interface, native adapter delegates to NAPI, WASM adapter throws 'not supported in browser'. Swift uses injectable bridge pattern matching existing Context. Kotlin uses CoroutineBridge suspend functions. Per §18.11.8 and ADR-042.",
+      "description": "Create Node class in all 4 SDKs wrapping the FFI lifecycle methods from SCP-295. Each class exposes 4 methods: enableSiteProjection, commitDeploy (returns asset count), rollbackDeploy, disableSiteProjection. Python wraps PyNodeHandle calls in asyncio.to_thread(). TypeScript adds Node to the bridge interface and the native adapter delegates to NAPI; browser clients are remote thin clients to a node (ADR-055) and do not host the Node lifecycle in-process. Swift uses injectable bridge pattern matching existing Context. Kotlin uses CoroutineBridge suspend functions. Per §18.11.8 and ADR-042.",
       "acceptanceCriteria": [
         "Python Node class exists in bindings/python/scp_sdk/node.py with 4 async methods",
         "Python Node exported from __init__.py",
@@ -1060,14 +1053,12 @@
         "TypeScript Node class exists in bindings/typescript/src/node.ts with 4 async methods",
         "TypeScript Node added to bridge interface in internal/bridge.ts",
         "TypeScript native adapter delegates to NAPI NodeHandle",
-        "TypeScript WASM adapter throws Error('Node lifecycle not supported in browser')",
         "TypeScript Node exported from index.ts",
         "Swift Node actor exists in bindings/swift/Sources/SCP/Node.swift with 4 async methods",
         "Swift Node uses injectable bridge pattern",
         "Kotlin Node class exists with 4 suspend functions",
         "Kotlin Node delegates to CoroutineBridge",
-        "Unit test per SDK: all 4 methods callable (mock/stub bridge)",
-        "Unit test: TypeScript WASM path throws 'not supported in browser'"
+        "Unit test per SDK: all 4 methods callable (mock/stub bridge)"
       ],
       "actionItems": [
         "Create bindings/python/scp_sdk/node.py with Node class and 4 async methods",
@@ -1075,11 +1066,10 @@
         "Create bindings/typescript/src/node.ts with Node class and 4 async methods",
         "Add Node lifecycle methods to bridge interface in internal/bridge.ts",
         "Implement native adapter delegation in internal/native.ts",
-        "Add WASM adapter throwing 'not supported in browser'",
         "Export Node from bindings/typescript/src/index.ts",
         "Create bindings/swift/Sources/SCP/Node.swift with Node actor",
         "Create bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Node.kt",
-        "Add unit tests for each SDK including WASM not-supported test"
+        "Add unit tests for each SDK"
       ],
       "blockedBy": [
         "SCP-293",
