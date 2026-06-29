@@ -559,6 +559,64 @@ class TestSagaAbortedTranslation:
         assert exc_info.value.code == "SCP-SAGA-13067"
         assert exc_info.value.message == "aborted"
 
+    async def test_abort_non_string_code_arg_falls_back_to_generic_default(self) -> None:
+        """A bridge terminal whose ``args[1]`` is a non-string (a 2-tuple
+        ``(message, datum)`` with no code slot) MUST NOT surface that value as
+        the error ``code`` — it falls back to the ``SCP-SAGA-13067`` default.
+
+        The translator guards the code read with ``isinstance(args[1], str)``;
+        without it the int ``1500`` (a datum, not a code) would become the
+        ``code``. The production bridge always sends a string code, so this
+        pins the defensive guard against a malformed-arity bridge terminal.
+        """
+        from scp_sdk.errors import SagaAbortedError
+
+        scp = _make_scp(_native_raising(_BridgeSagaAborted("rate limited", 1500)))
+
+        with pytest.raises(SagaAbortedError) as exc_info:
+            await _invoke_saga(scp)
+
+        # ``1500`` sits at args[1] (the code slot) but is not a string, so it is
+        # neither read as the code nor (being absent from args[2]) as a back-off.
+        assert exc_info.value.code == "SCP-SAGA-13067"
+        assert exc_info.value.retry_after_ms is None
+
+    async def test_abort_empty_args_falls_back_without_index_error(self) -> None:
+        """A bridge terminal raised with NO args translates cleanly: the
+        message read is guarded by ``if args else str(exc)`` so it never
+        indexes ``args[0]`` out of range, and the code/back-off fall back.
+
+        Dropping the ``if args`` guard would raise ``IndexError`` on the empty
+        tuple instead of producing a typed SDK terminal; this pins it.
+        """
+        from scp_sdk.errors import SagaAbortedError
+
+        scp = _make_scp(_native_raising(_BridgeSagaAborted()))
+
+        with pytest.raises(SagaAbortedError) as exc_info:
+            await _invoke_saga(scp)
+
+        assert exc_info.value.code == "SCP-SAGA-13067"
+        assert exc_info.value.retry_after_ms is None
+
+    async def test_translated_saga_error_chains_original_bridge_cause(self) -> None:
+        """The wrapper re-raises the typed SDK terminal ``from`` the bridge
+        exception, so ``__cause__`` preserves the original for debugging.
+
+        Dropping the ``from exc`` clause would leave ``__cause__`` as ``None``
+        (only the implicit ``__context__`` would be set); this pins the
+        explicit cause chain.
+        """
+        from scp_sdk.errors import SagaAbortedError
+
+        bridge_exc = _BridgeSagaAborted("rate limited", "SCP-SAGA-13067", 1500)
+        scp = _make_scp(_native_raising(bridge_exc))
+
+        with pytest.raises(SagaAbortedError) as exc_info:
+            await _invoke_saga(scp)
+
+        assert exc_info.value.__cause__ is bridge_exc
+
 
 class TestSagaNeedsRepairTranslation:
     """Commit-retry exhaustion → SDK SagaNeedsRepairError, saga_id preserved."""
