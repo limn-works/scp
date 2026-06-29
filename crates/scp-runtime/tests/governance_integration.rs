@@ -558,7 +558,7 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
     assert_ne!(
         executed_leaf.actor_did.as_ref(),
         alice().as_ref(),
-        "stamping the proposer would diverge from the committing voter every honest member stamps"
+        "stamping the proposer would diverge from the committing voter that every honest member stamps"
     );
 }
 

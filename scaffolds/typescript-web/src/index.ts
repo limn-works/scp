@@ -1,8 +1,9 @@
 /**
- * Minimal SCP browser app with WASM binding.
+ * Minimal SCP browser app (remote thin client).
  *
  * Creates a DID identity, opens an encrypted context, and sends a message.
- * Uses the WASM backend for browser environments.
+ * In the browser the SDK is a remote thin client: it drives a server-side
+ * scp-node that runs the protocol engine.
  *
  * Usage:
  *   bun install && bun run build

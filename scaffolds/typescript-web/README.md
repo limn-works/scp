@@ -1,6 +1,6 @@
 # SCP TypeScript Web Scaffold
 
-Minimal browser app using the SCP TypeScript SDK with WASM binding. Creates a DID identity, opens an encrypted context, and sends a message — all in the browser.
+Minimal browser app using the SCP TypeScript SDK as a remote thin client. The protocol engine runs server-side (an scp-node); the browser app drives it over the network. Creates a DID identity, opens an encrypted context, and sends a message.
 
 ## Prerequisites
 
@@ -17,14 +17,14 @@ bun run start
 
 ## What This Does
 
-1. Loads the SCP WASM module in the browser
+1. Connects to a server-side scp-node as a remote thin client
 2. Creates a `did:dht` identity with in-memory key custody
 3. Opens an encrypted context with messaging capabilities
 4. Sends a message and displays the result
 
 ## Next Steps
 
-- Add IndexedDB-backed storage with `WasmSqliteStorage` for persistent identity
+- Persist identity server-side via the scp-node's storage backend
 - Connect to a relay via WebSocket/WebTransport for real networking
 - Add a second participant and implement real-time message display
 - See `docs/examples/typescript/` for more detailed examples

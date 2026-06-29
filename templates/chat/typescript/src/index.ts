@@ -2,7 +2,8 @@
  * Two-party encrypted chat in the browser over SCP.
  *
  * Creates or joins an encrypted context and exchanges messages via a
- * minimal web UI.  Uses the WASM backend for browser environments.
+ * minimal web UI.  In the browser the SDK is a remote thin client: it
+ * connects to a server-side scp-node that runs the protocol engine.
  *
  * Usage:
  *   bun install && bun run build

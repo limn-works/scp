@@ -47,8 +47,9 @@ ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 # `rand_core` with `getrandom` is used by the always-on
 # `generate_context_id` helper (spec §18.4.1). Compiles on every target
-# the four FFI bridges support, including `wasm32-unknown-unknown` via
-# `getrandom/js` pulled in by WASM's own dep set.
+# the three FFI bridges (PyO3, UniFFI, napi-rs) support, plus the
+# `wasm32-unknown-unknown` compile-target compat that `scp-protocol`
+# requires (native uses the OS RNG; the wasm32 target pulls `getrandom/js`).
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
