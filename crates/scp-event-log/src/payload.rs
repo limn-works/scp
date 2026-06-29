@@ -206,12 +206,12 @@ pub struct GovernanceActionExecutedPayload {
 ///
 /// # Why this is the single source
 ///
-/// Both the native runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`)
-/// mint these leaves for convergent-trigger consequences. The leaf preimage is
+/// The native runtime (`scp-runtime`) mints these leaves for convergent-trigger
+/// consequences. The leaf preimage is
 /// `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload` is
 /// `EventPayload { data }` — so the `data` bytes MUST be byte-identical across
-/// platforms or §9.9.3 equivocation detection produces false positives. This
-/// function is the shared producer of those bytes.
+/// all honest members or §9.9.3 equivocation detection produces false
+/// positives. This function is the shared producer of those bytes.
 ///
 /// # Encoding — JSON, NOT positional `MessagePack`
 ///

@@ -67,10 +67,9 @@ impl ContextLog {
     /// Appends a new typed event, computing the sequence + `prev_hash` chain
     /// link and delegating to [`scp_event_log::tree::append_unsigned_event`].
     ///
-    /// Mirrors the WASM bridge's `append_log_event`
-    /// (`crates/scp-ffi/wasm/src/manager.rs`): the event carries an empty
-    /// signature, and sequence/`prev_hash` are derived from the current log
-    /// state so `append_unsigned_event`'s validation always passes.
+    /// The event carries an empty signature, and sequence/`prev_hash` are
+    /// derived from the current log state so `append_unsigned_event`'s
+    /// validation always passes.
     fn append(
         &mut self,
         event_type: EventType,

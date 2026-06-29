@@ -23,7 +23,7 @@
 # ─── Modes ────────────────────────────────────────────────────────────────
 #
 # CI mode (no args or `--ci`):
-#   • Scan every canonical operation in bridge-aliases.json across all four
+#   • Scan every canonical operation in bridge-aliases.json across all three
 #     bridges. Emit a finding for any required bridge missing the operation
 #     (unless it has a documented exemption in bridge-aliases.json).
 #   • Exit 1 if any findings, else 0.

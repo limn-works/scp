@@ -502,8 +502,8 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
 ///
 /// RFC 6962 structure: odd nodes are promoted (not duplicated).
 ///
-/// Algorithm ported from `WasmEventLog::incremental_update` in
-/// `crates/scp-ffi/wasm/src/runtime.rs` (M1 performance fix).
+/// Incremental path-only recompute (M1 performance fix) rather than a full
+/// O(n) tree rebuild on every append.
 fn incremental_update(log: &mut EventLog) {
     let n = log.leaves.len();
 

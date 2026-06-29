@@ -110,9 +110,8 @@ pub(super) const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 /// `now + MAX_COOLDOWN_SECS`. Both events emit a warning so anomalies
 /// are visible at runtime.
 ///
-/// Mirrors the WASM bridge `validate_imported_snapshot` policy
-/// (`crates/scp-ffi/wasm/src/manager.rs`), but applied to the runtime
-/// `ContextManager` paths that the WASM bridge does not exercise.
+/// Part of the imported-snapshot validation policy applied to the runtime
+/// `ContextManager` import paths.
 pub fn sanitize_cooldown_until(
     cooldown_until: &mut HashMap<usize, u64>,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],

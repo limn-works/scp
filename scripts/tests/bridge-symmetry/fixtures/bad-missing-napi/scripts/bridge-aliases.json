@@ -4,18 +4,21 @@
     {
       "canonical": "widget_create",
       "category": "widgets",
-      "wasm_required": true,
-      "pyo3": ["py_widget_create"],
-      "uniffi": ["widget_create"],
-      "napi": ["widget_create"],
-      "wasm": ["widget_create"]
+      "pyo3": [
+        "py_widget_create"
+      ],
+      "uniffi": [
+        "widget_create"
+      ],
+      "napi": [
+        "widget_create"
+      ]
     }
   ],
   "call_ordering_rules": [],
   "exemptions": {
     "pyo3": [],
     "uniffi": [],
-    "napi": [],
-    "wasm": []
+    "napi": []
   }
 }

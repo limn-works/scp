@@ -708,15 +708,14 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// single event history that [`evaluate_consequence_rules`] (and participation
 /// record computation, ADR-017) reads.
 ///
-/// This is the **single** convergence-critical merge shared by the native
-/// runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`). The §9.9.3
-/// equivocation-detection guarantee depends on native and WASM producing
-/// byte-identical merged event sets from identical inputs, so both bridges MUST
-/// route through this function rather than re-implementing the projection and
-/// buffer-gate logic. Each caller supplies its own already-acquired sources as
-/// borrowed slices — native reads Source 1 from its `ContextEventLogProvider`,
-/// WASM from its in-memory `EventLog` — so this function is agnostic to how the
-/// sources were obtained.
+/// This is the **single** convergence-critical merge used by the native
+/// runtime (`scp-runtime`). The §9.9.3 equivocation-detection guarantee depends
+/// on all honest members producing byte-identical merged event sets from
+/// identical inputs, so every consumer MUST route through this function rather
+/// than re-implementing the projection and buffer-gate logic. Each caller
+/// supplies its own already-acquired sources as borrowed slices — native reads
+/// Source 1 from its `ContextEventLogProvider` — so this function is agnostic to
+/// how the sources were obtained.
 ///
 /// Combines two sources:
 /// 1. **Event log history** (`log_entries`) — full persisted history with real
@@ -735,16 +734,16 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 ///    [`MAX_FUTURE_TOLERANCE_SECS`], and [`MAX_BUFFER_EVENTS_FOR_EVAL`].
 ///
 /// The merged set is numbered with a single dense, contiguous `sequence`
-/// counter (Source-1 entries first, then accepted Source-2 entries), so the two
-/// bridges agree on every field of every emitted [`Event`]. The `sequence`
+/// counter (Source-1 entries first, then accepted Source-2 entries), so every
+/// member agrees on every field of every emitted [`Event`]. The `sequence`
 /// itself is not consulted by [`matches_trigger`] (which keys on
 /// `event_type` / `actor_did` / `timestamp` / `payload`), but pinning it
 /// deterministically keeps the merged sets identical across implementations.
 ///
-/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
-/// FFI bridge (`crates/scp-ffi/wasm`) reimplements the convergent consequence
-/// path and delegates to this shared function across the crate boundary. It is
-/// not part of the SDK surface (see the cross-layer exemption registry).
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the
+/// native runtime (`scp-runtime`) drives the convergent consequence path and
+/// delegates to this shared function across the crate boundary. It is not part
+/// of the SDK surface (see the cross-layer exemption registry).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn merge_consequence_events(
@@ -1021,21 +1020,18 @@ pub fn evaluate_consequence_rules(
 // ---------------------------------------------------------------------------
 
 /// Abstracts over the mutable context state needed to enforce triggered
-/// consequences, enabling a single shared loop body for both the runtime
-/// (`scp-runtime`) and WASM (`scp-ffi-wasm`) implementations.
+/// consequences, providing a single shared loop body that the native runtime
+/// (`scp-runtime`) drives.
 ///
-/// Each implementation mutates its own per-context state structure:
+/// The implementor mutates its own per-context state structure:
 ///
 /// - **Runtime**: `ContextManager`'s `PerContextState` (uses `ContextRoleState`
 ///   for capability suspension, `ReceiveBuffer` for events, and the governance
 ///   `cooldown_until` map).
-/// - **WASM**: `WasmContextManager`'s `PerContextState` (uses a flat
-///   `suspended_capabilities` hash map, an in-memory event ring, and a
-///   flat `cooldown_until` map).
 ///
 /// The methods use `&str` for DIDs to avoid cross-crate type dependencies,
-/// and `ContextEvent` from `scp_protocol::context::membership` (which both
-/// implementations already construct).
+/// and `ContextEvent` from `scp_protocol::context::membership` (which the
+/// implementor already constructs).
 ///
 /// See Simp-2, ADR-017.
 pub trait ConsequenceDispatcher {

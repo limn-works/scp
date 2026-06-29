@@ -172,7 +172,7 @@ pub async fn scpid_sign(
     // client scaffolds) cannot supply it in production builds. The FFI
     // bridges layer their own rejection for defence-in-depth (see
     // `scp-ffi/src/scpid.rs`, `scp-ffi/napi/src/scpid.rs`,
-    // `scp-ffi/uniffi/src/bridge.rs`, `scp-ffi/wasm/src/scpid.rs`).
+    // `scp-ffi/uniffi/src/bridge.rs`).
     #[cfg(not(feature = "testing"))]
     if signed_at_override.is_some() {
         return Err(ScpIdError::InvalidInput(

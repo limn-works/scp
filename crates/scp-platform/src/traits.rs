@@ -639,10 +639,9 @@ pub enum PreRotationCustodyKind {
     /// operational custody, Android Keystore alias with separate
     /// authentication flow, FIDO2/PRF, encrypted backup, etc.).
     Callback,
-    /// WASM in-process retention. **DOCUMENTED degraded mode** — the
-    /// pre-rotation key co-resides in WASM linear memory with operational
-    /// keys (acknowledged in `crates/scp-ffi/wasm/src/identity.rs`). Pending
-    /// passkey-PRF cold storage as a follow-up workstream.
+    /// In-process linear-memory retention. **DOCUMENTED degraded mode** — the
+    /// pre-rotation key co-resides in process memory with operational keys.
+    /// Pending passkey-PRF cold storage as a follow-up workstream.
     WasmLocalRetention,
 }
 

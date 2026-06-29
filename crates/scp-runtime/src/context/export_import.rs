@@ -126,8 +126,7 @@ pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
 ///
 /// Registered in spec §9.18.2 and used by [`ContextExport::canonical_snapshot_hash`]:
 /// prefixed (no separator byte) to the JCS bytes of the snapshot before the
-/// SHA-256 digest. This is the single source of truth for the literal; the WASM
-/// reference bridge (`crates/scp-ffi/wasm/src/manager.rs`) uses the same literal.
+/// SHA-256 digest. This is the single source of truth for the literal.
 ///
 /// This is deliberately DISTINCT from [`CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR`] (the
 /// §23.16.4 sync-delta separator). Both the signed-export digest and the
@@ -312,8 +311,6 @@ impl ContextExport {
     /// Scheme) canonical-JSON serialization of the **entire** embedded
     /// [`ContextSnapshot`] — every field, not a subset (ADR-050). The domain
     /// separator is prefixed to the snapshot bytes with no separator byte.
-    /// This is the construction shared with the WASM reference bridge
-    /// (`crates/scp-ffi/wasm/src/manager.rs`).
     ///
     /// Signing the whole snapshot is total by construction: every field the
     /// importer restores verbatim — membership, role definitions, ceiling,
