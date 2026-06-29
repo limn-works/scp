@@ -642,16 +642,14 @@
         },
         {
           "name": "participation_record",
-          "python": false,
-          "typescript": false,
+          "python": true,
+          "typescript": true,
           "kotlin": false,
           "swift": false,
-          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. SDK wrappers land in Phase 2C-2 (tracked in GitHub issue #1943); until then all four SDK cells are exempted. WASM bridge is native-only here (see scripts/bridge-aliases.json: wasm empty, wasm_required false).",
+          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. The Python and TypeScript SDKs expose idiomatic wrappers (scp_sdk participation_record / SCP.participationRecord) and feed evaluate_trust/evaluateTrust Layer 2 from the Rust-computed record. WASM bridge is native-only here (see scripts/bridge-aliases.json: wasm empty, wasm_required false).",
           "exemptions": {
-            "python": "PyO3 bridge exports participation_record (PyParticipationRecord); the Python SDK idiomatic wrapper lands in Phase 2C-2 (GitHub issue #1943).",
-            "typescript": "NAPI bridge exports participationRecord (NapiParticipationRecord); the TypeScript SDK idiomatic wrapper lands in Phase 2C-2 (GitHub issue #1943).",
-            "kotlin": "UniFFI bridge exports participation_record (ParticipationRecordView); the Kotlin SDK idiomatic wrapper lands in Phase 2C-2 (GitHub issue #1943).",
-            "swift": "UniFFI bridge exports participation_record (ParticipationRecordView); the Swift SDK idiomatic wrapper lands in Phase 2C-2 (GitHub issue #1943)."
+            "kotlin": "UniFFI bridge exports participation_record (ParticipationRecordView); Kotlin SDK has no idiomatic wrapper exposing it yet",
+            "swift": "UniFFI bridge exports participation_record (ParticipationRecordView); no public SDK wrapper written yet"
           }
         },
         {
