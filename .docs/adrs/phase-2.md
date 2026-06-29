@@ -888,6 +888,28 @@ pub enum EventType {
    events; per-member-observed emissions are kept out of it (see the convergence
    model and exclusion taxonomy below).
 
+   **Subject-bearing leaf payloads (participation-fact attribution).** The
+   participation facts derived from convergent events (§7.3.2) attribute role
+   progression and participation duration to the *affected member*, not to the
+   governance actor who executed the change. The affected member is therefore
+   carried in the leaf `EventPayload`, not inferred from `actor_did` (which, for
+   admin-driven joins/removals/assignments, is the admin):
+
+   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: DID, role: RoleName }`.
+   - `MemberJoined` / `MemberLeft` carry a membership-change payload
+     `{ subject_did: DID, role_name: RoleName }`.
+
+   These three leaves were previously empty-payload leaves. Adding the payload
+   changes their leaf preimage (`SHA-256(0x00 ‖ rmp_serde(Event))`) and therefore
+   their leaf hash and the resulting Merkle root. This is a **one-way pre-release
+   protocol bump** — SCP has no deployed data, so there is no migration: the
+   correct end state (subject-bearing payloads) is the only state. The
+   `project_payload` projection (in `scp-event-log`) is extended to surface
+   `subject_did` from these payloads; any historical empty-payload leaf projects
+   `subject_did = None`. No `EventType` variant is added or removed by this change —
+   the variant count is unchanged; only the payload contents of three existing
+   variants gain a subject DID.
+
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
    > provider MUST construct `scp_event_log::Event` values with a typed
@@ -904,9 +926,12 @@ pub enum EventType {
    > DAG-ordered application leaves, per ADR-051 §5). The log therefore
    > MUST contain **only convergent events** — those every honest member appends
    > identically and in the same order, i.e. the MLS-commit-ordered stream
-   > (governance, membership, lifecycle, role, access, attestation, provenance,
+   > (governance, membership, lifecycle, role, access, provenance,
    > economic *governance actions* — policy changes, spending-UCAN grants/revocations,
-   > compromise recovery, app-binding). Per-member-observed
+   > compromise recovery, app-binding). Attestations are NOT in this stream — they
+   > are credential-layer artifacts (§7.4), not context-log leaves, and there is no
+   > `AttestationPublished`/`AttestationRevoked` `EventType` variant.
+   > Per-member-observed
    > emissions do not converge and are excluded. The governing rule for the whole
    > trust subsystem: **a derived record is automatic *and* convergent iff its
    > trigger input is convergent.**
