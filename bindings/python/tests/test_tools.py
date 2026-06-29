@@ -555,6 +555,25 @@ class TestSagaNeedsRepairTranslation:
         assert exc_info.value.saga_id == "saga-repair-abc"
         assert exc_info.value.code == "SCP-SAGA-13065"
 
+    async def test_needs_repair_without_code_falls_back_to_generic_default(self) -> None:
+        """A bridge needs-repair that omits the code (1-tuple ``args``) surfaces
+        the ``SCP-SAGA-13065`` class default, and a missing datum yields ``""``.
+
+        The bridge always supplies an explicit code; this exercises the
+        ``code is None`` translation branch so the class default stays
+        load-bearing (a typo in ``_default_code`` would otherwise pass).
+        """
+        from scp_sdk.errors import SagaNeedsRepairError
+
+        scp = _make_scp(_native_raising(_BridgeSagaNeedsRepair("needs repair")))
+
+        with pytest.raises(SagaNeedsRepairError) as exc_info:
+            await _invoke_saga(scp)
+
+        assert exc_info.value.code == "SCP-SAGA-13065"
+        assert exc_info.value.saga_id == ""
+        assert exc_info.value.message == "needs repair"
+
 
 class TestSagaBusyTranslation:
     """Participant-set overlap → SDK SagaBusyError, contended_context preserved."""
@@ -571,6 +590,25 @@ class TestSagaBusyTranslation:
 
         assert exc_info.value.contended_context == "ctx-shared-xyz"
         assert exc_info.value.code == "SCP-SAGA-13066"
+
+    async def test_busy_without_code_falls_back_to_generic_default(self) -> None:
+        """A bridge busy that omits the code (1-tuple ``args``) surfaces the
+        ``SCP-SAGA-13066`` class default, and a missing datum yields ``""``.
+
+        The bridge always supplies an explicit code; this exercises the
+        ``code is None`` translation branch so the class default stays
+        load-bearing (a typo in ``_default_code`` would otherwise pass).
+        """
+        from scp_sdk.errors import SagaBusyError
+
+        scp = _make_scp(_native_raising(_BridgeSagaBusy("busy")))
+
+        with pytest.raises(SagaBusyError) as exc_info:
+            await _invoke_saga(scp)
+
+        assert exc_info.value.code == "SCP-SAGA-13066"
+        assert exc_info.value.contended_context == ""
+        assert exc_info.value.message == "busy"
 
 
 class TestSagaNonSagaErrorPassthrough:
