@@ -905,32 +905,13 @@ pub struct SignedVote {
 /// [`Resolved`](PrecheckOutcome::Resolved) so the caller returns the resolution
 /// directly.
 pub(super) enum PrecheckOutcome {
-    /// Guards passed; the caller should build the vote (for the signed path),
-    /// sign and verify it, then call `push_and_resolve`.
+    /// Guards passed; the caller should build, sign, and verify the vote,
+    /// then call `push_and_resolve`.
     Proceed,
     /// The proposal was auto-resolved during precheck (majority past-deadline).
     /// The caller returns this status and its events directly, recording no
     /// vote and performing no signing or verification.
     Resolved((ProposalStatus, Vec<GovernanceEvent>)),
-}
-
-/// Build an unsigned (empty-signature) [`SignedVote`] for the keyless
-/// [`TrustedVoteIngest`] path.
-///
-/// Used by every engine's `ingest_approve` / `ingest_reject` implementation to
-/// construct the vote that is fed through the shared post-verify tally. The
-/// signature is deliberately empty (`Vec::new()`): the keyless path performs no
-/// signing and no verification — the caller is responsible for authenticating
-/// the vote out-of-band (see [`TrustedVoteIngest`]). The `now` argument is read
-/// from [`GovernanceContext::now`], the same clock the signed path uses, so no
-/// independent clock is introduced.
-pub(super) fn build_unsigned_vote(voter: &DID, vote: VoteType, now: u64) -> SignedVote {
-    SignedVote {
-        voter_did: voter.clone(),
-        vote,
-        timestamp: now,
-        signature: Vec::new(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,20 +1006,12 @@ pub struct GovernanceProposal {
     pub action: GovernanceAction,
     /// Current lifecycle status.
     ///
-    /// **Invariant (signed path only):** When a proposal is resolved through
-    /// the signed [`GovernanceEngine::approve`] / [`GovernanceEngine::reject`]
-    /// path and reaches [`ProposalStatus::Approved`], all vote signatures in
-    /// [`approvals`](Self::approvals) have been cryptographically verified
-    /// against the voter's DID-resolved public key via the engine's
-    /// [`KeyResolver`]. Code that receives such an `Approved` proposal can trust
-    /// that every approval vote is authentic — no further signature checks are
-    /// needed.
-    ///
-    /// **This invariant does NOT hold** for proposals resolved via the keyless
-    /// [`TrustedVoteIngest`] path (the WASM bridge, ADR-034). That path performs
-    /// no signature verification and records votes with an empty signature; the
-    /// caller is responsible for authenticating votes out-of-band. See
-    /// [`TrustedVoteIngest`] for the full security contract.
+    /// **Invariant:** When `status` is [`ProposalStatus::Approved`], all vote
+    /// signatures in [`approvals`](Self::approvals) have been cryptographically
+    /// verified against the voter's DID-resolved public key via the engine's
+    /// [`KeyResolver`]. Code that receives an `Approved` proposal can trust
+    /// that every approval vote is authentic — no further signature checks
+    /// are needed.
     pub status: ProposalStatus,
     /// Unix timestamp (seconds) when the proposal was created.
     pub created_at: u64,
@@ -1538,170 +1511,6 @@ pub trait GovernanceEngine: Send + Sync {
         cosignatures: &[CosignedCheckpoint],
         checkpoint_hash: &[u8; 32],
     ) -> Result<CheckpointAttestationStatus, GovernanceError>;
-}
-
-// ---------------------------------------------------------------------------
-// TrustedVoteIngest trait
-// ---------------------------------------------------------------------------
-
-/// Keyless, caller-trusted vote ingestion for FFI bridges that hold no signing
-/// key and no [`KeyResolver`] (the WASM bridge, ADR-034).
-///
-/// # Purpose
-///
-/// The WASM bridge runs with no-key custody (ADR-034): it cannot sign votes and
-/// has no resolver to verify signatures against. To let WASM reuse the *exact*
-/// quorum-tally logic of the signed governance engines — rather than
-/// maintaining a divergent re-implementation that could disagree with native on
-/// when a proposal reaches `Approved`/`Rejected` — this trait exposes a keyless
-/// ingestion path that runs the identical tally after the caller has already
-/// authenticated the vote out-of-band.
-///
-/// This trait is deliberately **separate** from [`GovernanceEngine`] and is
-/// **not** a method on it. Native code accesses engines via
-/// `Box<dyn GovernanceEngine>`, which does not have `ingest_*` in scope, so the
-/// native signed path cannot be bypassed: native always runs
-/// `approve`/`reject`, which verify every signature before counting it.
-///
-/// # Caller contract (MUST hold before calling)
-///
-/// The caller is trusted to assert *which eligible member* voted. It is **not**
-/// trusted to bypass eligibility, dedup, or finality (those are still enforced
-/// by the shared tally — see below). Before invoking `ingest_approve` /
-/// `ingest_reject`, the caller MUST have authenticated:
-///
-/// 1. **Caller identity == `voter`.** The process invoking ingestion is acting
-///    on behalf of exactly the DID passed as `voter`.
-/// 2. **`voter` holds `governance:vote` in THIS context.** The voter is
-///    authorized to vote on proposals in `context`'s context (UCAN-validated by
-///    the caller).
-/// 3. **`proposal_id` scoping.** The `proposal_id` belongs to this context and
-///    this engine instance.
-///
-/// # Security properties
-///
-/// This path performs **NO signature verification** and records a vote with an
-/// **empty signature** (`signature: Vec::new()`). Consequently, the
-/// [`GovernanceProposal::status`] `== Approved ⟹ all vote signatures verified`
-/// invariant does **NOT** hold for any proposal resolved via this path.
-///
-/// The shared tally still enforces eligibility (`NotEligible`), single-vote
-/// dedup (`AlreadyVoted`), the voting deadline (`VotingWindowExpired`), and
-/// terminal-state finality (`ProposalNotPending`). "Caller-trusted" means
-/// trusted only to assert *which* eligible member voted — never to bypass these
-/// invariants.
-///
-/// # Residual risk and compensating control
-///
-/// A malicious same-origin caller can assert a vote for any eligible member
-/// without that member's signature. This is an inherent property of ADR-034
-/// no-key custody: a host that can fabricate ingestion calls is already inside
-/// the trust boundary of its own browser origin. The compensating control is
-/// §9.9.3 equivocation / Merkle-root convergence: a native participant running
-/// the genuine signed path would reject the unverifiable vote and never reach
-/// `Approved` on it, so the event-log roots of the keyless caller and any
-/// honest signed participant diverge and the equivocation is detectable.
-///
-/// The timestamp recorded on the ingested vote is read from
-/// [`GovernanceContext::now`] — the same clock the signed path uses — so no
-/// independent clock is introduced.
-pub trait TrustedVoteIngest {
-    /// Ingest a caller-authenticated approval vote without signature
-    /// verification, then run the shared tally.
-    ///
-    /// Builds a [`SignedVote`] with an empty signature for `voter` and feeds it
-    /// through the identical record-and-resolve path used by the signed
-    /// `approve` flow (minus signing and verification). Returns the resulting
-    /// status and events.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GovernanceError`] under the same conditions the signed path
-    /// would after verification succeeds: `NotEligible` if `voter` is not in
-    /// the engine's frozen eligible set, `ProposalNotFound` if `proposal_id` is
-    /// unknown, `ProposalNotPending` if the proposal is terminal,
-    /// `VotingWindowExpired` past the deadline, or `AlreadyVoted` on a repeat
-    /// vote.
-    fn ingest_approve(
-        &mut self,
-        proposal_id: &ProposalId,
-        voter: &DID,
-        context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
-
-    /// Ingest a caller-authenticated rejection vote without signature
-    /// verification, then run the shared tally.
-    ///
-    /// Builds a [`SignedVote`] with an empty signature for `voter` and feeds it
-    /// through the identical record-and-resolve path used by the signed
-    /// `reject` flow (minus signing and verification). Returns the resulting
-    /// status and events.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GovernanceError`] under the same conditions as
-    /// [`ingest_approve`](Self::ingest_approve).
-    fn ingest_reject(
-        &mut self,
-        proposal_id: &ProposalId,
-        voter: &DID,
-        context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
-
-    /// Seed a caller-built (empty-signature) proposal into the engine VERBATIM,
-    /// preserving its status, for the keyless WASM bridge (ADR-034) to rebuild a
-    /// transient engine from its own stored state before
-    /// [`ingest_approve`](Self::ingest_approve) /
-    /// [`ingest_reject`](Self::ingest_reject).
-    ///
-    /// # Purpose
-    ///
-    /// The signed [`GovernanceEngine::propose`] path is the only way to create a
-    /// proposal inside an engine, and it requires a signing key plus a
-    /// [`KeyResolver`] — neither of which the no-key WASM bridge has (ADR-034).
-    /// The engine is also neither `Clone` nor `Serialize` (the resolver is an
-    /// `Arc<dyn Fn>`), so WASM cannot persist a live engine; it rebuilds a
-    /// transient engine per governance op and must re-seed it with the proposal
-    /// it already tracks in its own state before re-running the shared tally via
-    /// `ingest_approve` / `ingest_reject`. This method is that seed.
-    ///
-    /// # Caller contract (keyless, NO verification)
-    ///
-    /// Like the rest of [`TrustedVoteIngest`], this performs **NO signature
-    /// verification**. The caller is trusted to assert that `proposal` is a
-    /// faithful copy of state it already authenticated out-of-band (the same
-    /// trust boundary as `ingest_approve` / `ingest_reject` — see the trait-level
-    /// contract). It is **not** trusted to bypass the eligibility and uniqueness
-    /// invariants enforced here:
-    ///
-    /// 1. `proposal.proposer_did` MUST be in the engine's frozen signer / voter
-    ///    set, else [`GovernanceError::NotEligible`]. This is the same frozen set
-    ///    the tally enforces, so a proposal whose proposer is not eligible can
-    ///    never be seeded (and therefore never tallied).
-    /// 2. `proposal.proposal_id` MUST NOT already be present, else
-    ///    [`GovernanceError::DuplicateProposal`]. This prevents a second seed from
-    ///    silently overwriting an in-flight proposal's accumulated votes.
-    ///
-    /// # Status is preserved VERBATIM
-    ///
-    /// The proposal is inserted **as-is**: its [`status`](GovernanceProposal::status),
-    /// [`approvals`](GovernanceProposal::approvals), and
-    /// [`rejections`](GovernanceProposal::rejections) are stored unchanged. This
-    /// method performs **NO re-tally and NO re-resolution** — the WASM caller owns
-    /// that state and re-runs the tally itself via the subsequent `ingest_*` call.
-    /// In particular, a **terminal** proposal (e.g. already `Approved` or
-    /// `Rejected`) stays terminal: a later `ingest_approve` / `ingest_reject` on
-    /// the seeded engine then returns [`GovernanceError::ProposalNotPending`],
-    /// exactly as it would for a natively-resolved proposal. Seeding therefore
-    /// never resurrects, re-opens, or re-executes a finished proposal.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GovernanceError::NotEligible`] if `proposal.proposer_did` is not
-    /// in the frozen signer / voter set, or
-    /// [`GovernanceError::DuplicateProposal`] if a proposal with the same
-    /// `proposal_id` is already tracked by this engine.
-    fn ingest_proposal(&mut self, proposal: GovernanceProposal) -> Result<(), GovernanceError>;
 }
 
 // ---------------------------------------------------------------------------
