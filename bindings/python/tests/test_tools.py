@@ -538,6 +538,27 @@ class TestSagaAbortedTranslation:
         assert exc_info.value.retry_after_ms is None
         assert exc_info.value.message == "rejected"
 
+    async def test_abort_bool_datum_is_not_coerced_to_retry(self) -> None:
+        """A bridge abort whose datum is a ``bool`` MUST NOT be read as a
+        back-off hint — ``retry_after_ms`` stays ``None``.
+
+        ``bool`` is a subclass of ``int`` in Python, so ``isinstance(True, int)``
+        is ``True``; without the ``and not isinstance(datum, bool)`` guard the
+        translation would coerce ``True`` into the int ``1`` and surface a
+        bogus 1 ms back-off. This pins that guard load-bearing.
+        """
+        from scp_sdk.errors import SagaAbortedError
+
+        scp = _make_scp(_native_raising(_BridgeSagaAborted("aborted", "SCP-SAGA-13067", True)))
+
+        with pytest.raises(SagaAbortedError) as exc_info:
+            await _invoke_saga(scp)
+
+        # The bool datum is rejected structurally: not ``True``, not ``1``.
+        assert exc_info.value.retry_after_ms is None
+        assert exc_info.value.code == "SCP-SAGA-13067"
+        assert exc_info.value.message == "aborted"
+
 
 class TestSagaNeedsRepairTranslation:
     """Commit-retry exhaustion → SDK SagaNeedsRepairError, saga_id preserved."""
@@ -712,3 +733,24 @@ class TestSagaTimestampValidation:
             await _invoke_saga(scp, timestamp_ms=False)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
         scp._native.tool_invoke_cross_context_saga.assert_not_called()
+
+
+class TestSagaErrorTaxonomy:
+    """The three §6.2.4 saga terminals are ``ToolError`` subclasses.
+
+    Cross-context tool invocation is a TOOL operation, so its terminal
+    failures live under :class:`ToolError` — a caller that catches
+    ``ToolError`` catches all three. Re-parenting any of them (e.g. to a
+    bare ``ScpError``) would silently break that contract; these pin it.
+    """
+
+    def test_saga_errors_are_tool_errors(self) -> None:
+        from scp_sdk.errors import (
+            SagaAbortedError,
+            SagaBusyError,
+            SagaNeedsRepairError,
+        )
+
+        assert issubclass(SagaAbortedError, ToolError)
+        assert issubclass(SagaNeedsRepairError, ToolError)
+        assert issubclass(SagaBusyError, ToolError)
