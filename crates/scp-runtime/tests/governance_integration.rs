@@ -1291,6 +1291,292 @@ async fn ac10_remove_member_action() {
     assert_eq!(remove_proposal.status, ProposalStatus::Approved);
 }
 
+// -------------------------------------------------------------------------
+// Member-removal clean teardown (spec §5.6.1): removing a member clears the
+// removed DID's suspended_capabilities and read_exclusion_list, and a
+// re-admitted same-DID member inherits no phantom suspension/exclusion.
+// -------------------------------------------------------------------------
+
+/// Helper: create a `SingleAdmin` context with alice as admin and add bob as a
+/// member. Returns the supervisor and context id.
+async fn ctx_with_alice_admin_bob_member(ctx_id: &str) -> std::sync::Arc<Supervisor> {
+    let manager = new_manager();
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (add_proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(add_proposal.status, ProposalStatus::Approved);
+    manager
+}
+
+#[tokio::test]
+async fn execute_remove_member_clears_suspension() {
+    let ctx_id = "ctx-remove-clears-suspension";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Suspend a capability bob's `member` role grants.
+    let (susp, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(susp.status, ProposalStatus::Approved);
+
+    // Precondition: the suspension is present in role state.
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_some(),
+        "bob should have a suspended_capabilities entry before removal"
+    );
+
+    // Remove bob.
+    let (rm, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rm.status, ProposalStatus::Approved);
+
+    // Postcondition: the suspension entry is gone (spec §5.6.1).
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_none(),
+        "execute_remove_member MUST clear the removed member's suspended_capabilities (spec §5.6.1)"
+    );
+    assert!(!rs.members.contains(bob().as_ref()));
+    assert!(!rs.assignments.contains_key(bob().as_ref()));
+    assert!(!rs.member_capabilities.contains_key(bob().as_ref()));
+}
+
+#[tokio::test]
+async fn execute_remove_member_clears_read_exclusion() {
+    let ctx_id = "ctx-remove-clears-read-exclusion";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Revoke bob's read access -> populates read_exclusion_list.
+    let (rev, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: bob(),
+                access: AccessScope::Read,
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rev.status, ProposalStatus::Approved);
+
+    // Precondition: bob is in the read_exclusion_list (observed via export).
+    let export = manager
+        .export_context(ctx_id, alice(), |digest| {
+            use ed25519_dalek::Signer;
+            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+        })
+        .await
+        .unwrap();
+    assert!(
+        export.snapshot.read_exclusion_list.contains(&bob()),
+        "bob should be read-excluded before removal"
+    );
+
+    // Remove bob.
+    let (rm, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rm.status, ProposalStatus::Approved);
+
+    // Postcondition: bob's read-exclusion entry is gone (spec §5.6.1).
+    let export = manager
+        .export_context(ctx_id, alice(), |digest| {
+            use ed25519_dalek::Signer;
+            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+        })
+        .await
+        .unwrap();
+    assert!(
+        !export.snapshot.read_exclusion_list.contains(&bob()),
+        "execute_remove_member MUST drop the removed member's read_exclusion_list entry (spec §5.6.1)"
+    );
+}
+
+#[tokio::test]
+async fn execute_remove_then_readmit_regression() {
+    // Core regression (spec §5.6.1): suspend a granted cap, remove, re-add the
+    // SAME DID, and the re-admitted member must hold the capability their role
+    // grants (no phantom suspension).
+    let ctx_id = "ctx-remove-readmit-regression";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+
+    // During suspension bob is denied messages:write.
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(!rs.member_has_capability(bob().as_ref(), &Capability::new("messages:write")));
+
+    // Remove.
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+
+    // Re-add the SAME DID with the SAME role. The proposal ID is derived in part
+    // from a seconds-granularity timestamp (compute_proposal_id), so advance the
+    // wall clock past the original AddMember's second to avoid a benign
+    // duplicate-proposal rejection (§5.9 replay protection) — this is a
+    // test-harness clock artifact, not part of the behavior under test.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (re_add, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(re_add.status, ProposalStatus::Approved);
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.member_has_capability(bob().as_ref(), &Capability::new("messages:write")),
+        "re-admitted same-DID member MUST hold the capability their role grants (spec §5.6.1)"
+    );
+}
+
+#[tokio::test]
+async fn leave_context_clears_suspension() {
+    // Spec §5.6.1: a self-leave is also a clean teardown — a suspended member who
+    // leaves must not leave a dangling suspended_capabilities entry behind.
+    let ctx_id = "ctx-leave-clears-suspension";
+    let manager = new_manager();
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (add, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status, ProposalStatus::Approved);
+
+    // Suspend a granted capability for bob.
+    let (susp, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(susp.status, ProposalStatus::Approved);
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(rs.suspended_for(bob().as_ref()).is_some());
+
+    // Bob self-leaves.
+    manager
+        .leave_context(&handle, &bob(), &bob())
+        .await
+        .unwrap();
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_none(),
+        "leave_context MUST clear the departing member's suspended_capabilities (spec §5.6.1)"
+    );
+    assert!(!rs.members.contains(bob().as_ref()));
+    assert!(!rs.assignments.contains_key(bob().as_ref()));
+    assert!(!rs.member_capabilities.contains_key(bob().as_ref()));
+}
+
 #[tokio::test]
 async fn ac10_change_role_action() {
     let manager = new_manager();

@@ -2367,25 +2367,20 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if !ctx.role_state.members.remove(member_did) {
+        // Clean teardown of ALL per-DID role state (spec §5.6.1): the shared
+        // `ContextRoleState::remove_member` drops members, assignments,
+        // member_capabilities, AND suspended_capabilities in one call, returning
+        // `false` when the DID was not a member (the not-found guard). A
+        // re-admitted same-DID member thus never inherits a phantom suspension.
+        if !ctx.role_state.remove_member(member_did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{member_did}' not found in context '{context_id}'"),
                 code: codes::CTX_2015.to_owned(),
             });
         }
-        // Drop all per-member state the leaving member left behind: role
-        // assignment, granted capabilities, suspensions, and the MLS sequence
-        // counter. Clearing suspensions via `restore_capabilities` over the
-        // member's current suspended set keeps the shared map free of dangling
-        // entries (a re-admitted same-DID member must not inherit a phantom
-        // suspension).
-        ctx.role_state.assignments.remove(member_did);
-        ctx.role_state.member_capabilities.remove(member_did);
-        // Clears the member's suspensions on removal — see the RemoveMember handler for the known native↔WASM divergence + deferred shared-removal convergence.
-        if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
-            let caps: Vec<Capability> = suspended.iter().cloned().collect();
-            ctx.role_state.restore_capabilities(member_did, &caps);
-        }
+        // CEK-exclusion state and the MLS sequence counter are owned outside the
+        // role state (spec §5.6.1) and dropped inline; no-ops if absent.
+        ctx.read_exclusion_list.remove(member_did);
         ctx.member_sequence_numbers.remove(member_did);
 
         // Unsubscribe from broadcast if applicable.
@@ -2814,14 +2809,15 @@ impl WasmContextManager {
                     // to destroy. `require_active_context_mut` is reused because
                     // the membership helper may have re-borrowed `self`.
                     let ctx = self.require_active_context_mut(context_id)?;
-                    ctx.role_state.members.remove(member_did);
-                    ctx.role_state.assignments.remove(member_did);
-                    ctx.role_state.member_capabilities.remove(member_did);
-                    // Clears the member's suspensions on removal — see the RemoveMember handler for the known native↔WASM divergence + deferred shared-removal convergence.
-                    if let Some(suspended) = ctx.role_state.suspended_for(member_did) {
-                        let caps: Vec<Capability> = suspended.iter().cloned().collect();
-                        ctx.role_state.restore_capabilities(member_did, &caps);
-                    }
+                    // Clean teardown of ALL per-DID role state (spec §5.6.1): the
+                    // shared `ContextRoleState::remove_member` drops members,
+                    // assignments, member_capabilities, AND suspended_capabilities
+                    // in one call (no-op on absent fields). The `-> bool` return is
+                    // unused: this is an as-if-never-joined rollback, not a
+                    // membership query. CEK-exclusion and the MLS sequence counter
+                    // are owned outside the role state and dropped inline.
+                    ctx.role_state.remove_member(member_did);
+                    ctx.read_exclusion_list.remove(member_did);
                     ctx.member_sequence_numbers.remove(member_did);
                     return Err(ScpWasmError::Crypto {
                         message: format!("MLS welcome processing failed: {e}"),
@@ -4513,31 +4509,17 @@ impl WasmContextManager {
             .assignments
             .get(did)
             .map(|a| a.role_name.clone());
-        ctx.role_state.members.remove(did);
 
-        // Drop all per-DID state the removed member left behind. Native
-        // `execute_remove_member` (governance_helpers.rs) leaves the removed
-        // member's `suspended_capabilities` entry in place — it strips
-        // members/assignments/member_capabilities (plus the access key store
-        // entry and the pseudonym routing entry) but has no removal primitive
-        // that clears the suspension. WASM clears it here (via
-        // `restore_capabilities`) as the safer behavior: a re-admitted same-DID
-        // member must not inherit a phantom suspension, assignment,
-        // read-exclusion, or sequence number. The CEK-exclusion state is
-        // `read_exclusion_list` and the MLS sequence counter is
-        // `member_sequence_numbers`. All removals are no-ops if absent.
-        //
-        // This is a KNOWN native↔WASM divergence where native should converge
-        // TO WASM; the convergence — a shared `ContextRoleState::remove_member`
-        // primitive in scp-protocol with a spec-decided canonical
-        // suspension-on-removal policy — is deferred to the MembershipState /
-        // shared-removal slice.
-        ctx.role_state.assignments.remove(did);
-        ctx.role_state.member_capabilities.remove(did);
-        if let Some(suspended) = ctx.role_state.suspended_for(did) {
-            let caps: Vec<Capability> = suspended.iter().cloned().collect();
-            ctx.role_state.restore_capabilities(did, &caps);
-        }
+        // Clean teardown of ALL per-DID role state (spec §5.6.1): the shared
+        // `ContextRoleState::remove_member` drops members, assignments,
+        // member_capabilities, AND suspended_capabilities in one call, so a
+        // re-admitted same-DID member never inherits a phantom suspension. The
+        // role (captured above) is read before this call because `remove_member`
+        // also drops the assignment. The CEK-exclusion state
+        // (`read_exclusion_list`) and the MLS sequence counter
+        // (`member_sequence_numbers`) are owned outside the role state and
+        // dropped inline. All removals are no-ops if absent.
+        ctx.role_state.remove_member(did);
         ctx.member_sequence_numbers.remove(did);
         ctx.read_exclusion_list.remove(did);
 
@@ -11081,6 +11063,80 @@ mod tests {
                 .is_none(),
             "after restore, the suspended set must be cleared"
         );
+    }
+
+    /// Spec §5.6.1 clean teardown + native↔WASM parity: removing a member via
+    /// `RemoveMember` drops the removed DID's `suspended_capabilities`, and a
+    /// re-admitted same-DID member inherits NO phantom suspension — it holds the
+    /// capability its new role grants. Mirrors the native
+    /// `execute_remove_then_readmit_regression` integration test.
+    #[test]
+    fn remove_then_readmit_same_did_has_no_stale_suspension_wasm() {
+        let mut mgr = manager_with_governed_context(
+            "ctx-readmit",
+            "did:dht:zcreator",
+            &["messages:read", "messages:write", "member:ban"],
+        );
+        let bob = "did:dht:zbob";
+
+        // Add bob as a member and suspend a capability his role grants.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-readmit").unwrap();
+            ctx.test_insert_member(bob, "member");
+        }
+        mgr.dispatch_governance_action(
+            "ctx-readmit",
+            &GovernanceAction::SuspendCapability {
+                did: DID(bob.to_owned()),
+                capabilities: vec![Capability::MessagesWrite],
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("SuspendCapability must succeed");
+        assert!(
+            !mgr.contexts
+                .get("ctx-readmit")
+                .unwrap()
+                .member_has_capability(bob, "messages:write"),
+            "precondition: suspension denies messages:write during first tenure"
+        );
+
+        // Remove bob.
+        mgr.dispatch_governance_action(
+            "ctx-readmit",
+            &GovernanceAction::RemoveMember {
+                did: DID(bob.to_owned()),
+                reason: Some("test".to_owned()),
+            },
+            "did:dht:zcreator",
+            0,
+        )
+        .expect("RemoveMember must succeed");
+
+        // Postcondition: bob is gone from every per-DID role field, including the
+        // suspended set (spec §5.6.1 — the dangling-suspension fix).
+        {
+            let ctx = mgr.contexts.get("ctx-readmit").unwrap();
+            assert!(!ctx.role_state.members.contains(bob));
+            assert!(!ctx.role_state.assignments.contains_key(bob));
+            assert!(!ctx.role_state.member_capabilities.contains_key(bob));
+            assert!(
+                ctx.test_suspended_capabilities(bob).is_none(),
+                "RemoveMember MUST clear the removed member's suspended_capabilities (spec §5.6.1)"
+            );
+        }
+
+        // Re-admit the SAME DID with the SAME role; it must hold the capability
+        // the role grants — no phantom suspension survived removal.
+        {
+            let ctx = mgr.contexts.get_mut("ctx-readmit").unwrap();
+            ctx.test_insert_member(bob, "member");
+            assert!(
+                ctx.member_has_capability(bob, "messages:write"),
+                "re-admitted same-DID member MUST hold messages:write — no phantom suspension (spec §5.6.1)"
+            );
+        }
     }
 
     /// §5.9 / native parity carve-out (`!(read_requested && read_excluded)`): a
