@@ -76,10 +76,9 @@ tempfile = "3"
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
-# `testing` enables the `scp-runtime/testing` saga-gating helpers
-# (`test_reserve_saga_context_set`) the cross-context saga `SagaBusy` test
-# exercises to hold a participant-context-set reservation in flight.
-required-features = ["allow_in_memory_custody", "testing"]
+# Needs `allow_in_memory_custody` for the in-memory custody/storage test
+# harness (`new_in_memory_for_test`, `scp-platform/testing`).
+required-features = ["allow_in_memory_custody"]
 
 [lints]
 workspace = true
