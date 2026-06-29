@@ -16,7 +16,7 @@ pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
 use super::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
-// RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
+// Consequence enforcement — synthetic actor DID + shared wire-stable labels
 // ---------------------------------------------------------------------------
 //
 // The `CommitRetryOutcome` / `CommitRetryOutcomeKind` types that previously
