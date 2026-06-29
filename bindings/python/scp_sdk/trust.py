@@ -125,29 +125,63 @@ class CapabilityValidation:
 
 @dataclass
 class BehavioralRecord:
-    """Layer 2: Behavioral validation (verified facts from event log)."""
+    """Layer 2: the participation facts (§7.3.2) for a subject in a context.
 
-    #: Number of contexts the subject has participated in.
-    contexts_participated: int = 0
+    The scalar projection of scp-core's ``ParticipationRecord``, computed
+    ONCE in the shared Rust core and surfaced through the PyO3
+    ``participation_record`` op (``_scp_core.SCP.participation_record`` →
+    ``PyParticipationRecord``). The SDK RECEIVES these facts rather than
+    re-aggregating event-log collections client-side — eliminating
+    cross-binding divergence by construction. Mirrors the TypeScript SDK
+    ``BehavioralRecord`` interface and the Rust ``ParticipationFacts`` 1:1.
 
-    #: Total participation duration in seconds.
-    total_duration: float = 0.0
+    The six leaf-derived facts (participation duration, governance actions
+    against/by, context creation, role progression, tool invocation count)
+    come from the context's convergent Merkle event log.
+    ``attestation_count`` is the one exception: it is a credential-layer fact
+    (§7.4), NOT event-log-derived and NOT covered by ``event_log_root``, and
+    is **verifier-relative** (two agents may compute different counts from
+    different accessible attestation sets). ``tool_invocation_count_anchored``
+    stays ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf.
+    """
 
-    #: Number of governance actions taken against the subject.
+    #: The DID whose participation is summarized.
+    subject_did: str = ""
+
+    #: Total seconds of context participation (§7.3.2).
+    participation_duration_secs: int = 0
+
+    #: Count of governance actions taken against this identity (the subject is
+    #: the projected target).
     governance_actions_against: int = 0
 
-    #: Tool invocations as a map keyed by tool type whose values are counts
-    #: (spec §7.2.4: ``ToolInvocationCount = tool_invocations.values().sum()``).
-    #: Until ADR-051 makes ``ToolInvoked`` a convergent leaf with a richer
-    #: payload, every ``ToolInvoked`` event buckets under the literal
-    #: ``"ToolInvoked"`` key — matching the TypeScript SDK exactly.
-    tool_invocations: dict[str, int] = field(default_factory=dict)
+    #: Count of governance actions initiated by this identity.
+    governance_actions_by: int = 0
 
-    #: Role change history.
-    role_history: list[dict[str, Any]] = field(default_factory=list)
+    #: Total tool invocations across all tool types.
+    tool_invocation_count: int = 0
 
-    #: Endorsement accuracy score (0.0--1.0), if available.
-    endorsement_accuracy: float | None = None
+    #: Whether ``tool_invocation_count`` is anchored in the canonical Merkle
+    #: log. ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf —
+    #: consumers MUST NOT treat the count as Merkle-proven while this is
+    #: ``False``.
+    tool_invocation_count_anchored: bool = False
+
+    #: Number of contexts created by the subject (``ChildContextCreated``).
+    context_creation_count: int = 0
+
+    #: Number of role transitions for the subject (``RoleAssigned``).
+    role_progression_count: int = 0
+
+    #: Number of accessible, currently-valid credential-layer attestations
+    #: (§7.4) for the subject. Verifier-relative; NOT a context-event count.
+    attestation_count: int = 0
+
+    #: Unix timestamp (seconds) when the record was computed.
+    computed_at: int = 0
+
+    #: Merkle root (hex) of the event log at computation time.
+    event_log_root: str = ""
 
 
 @dataclass
@@ -588,9 +622,9 @@ async def evaluate_trust(
     characters), which propagate to the caller.
 
     This module-level function consumes the :class:`SCP` instance to
-    dispatch ``ucan_evaluate`` and ``event_log_query`` bridge calls. The
-    callers already receive the :class:`SCP` instance by value (matching
-    the ADR-048 explicit-instance pattern).
+    dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``
+    (Layer 2) bridge calls. The callers already receive the :class:`SCP`
+    instance by value (matching the ADR-048 explicit-instance pattern).
 
     Args:
         scp: The :class:`~scp_sdk.SCP` instance to dispatch bridge calls on.
@@ -611,7 +645,7 @@ async def evaluate_trust(
     bridge = _bridge()
     # `_bridge()` is the seam tests use to inject a mock — patching
     # `scp_sdk.trust._bridge` returns a mock whose `ucan_evaluate` /
-    # `event_log_query` attributes stand in for the live bridge. In
+    # `participation_record` attributes stand in for the live bridge. In
     # production `_bridge()` returns the real `_scp_core` module (which no
     # longer exposes those free functions after Phase 4 PR 4), so we route
     # through the :class:`SCP` instance.
@@ -668,24 +702,25 @@ async def evaluate_trust(
             cap_validation.not_revoked &= per_token.not_revoked
             cap_validation.time_bounds_valid &= per_token.time_bounds_valid
 
-    # Layer 2: query behavioral record from the event log.
+    # Layer 2: RECEIVE the behavioral record from the shared Rust core. The
+    # core gathers the FULL event log and flattens the participation facts
+    # (§7.3.2) ONCE in `Supervisor::participation_record`; the SDK never
+    # re-aggregates event-log collections, so every binding observes identical
+    # facts for the same context/subject (the divergence the old client-side
+    # classify suffered).
+    #
+    # No cached attestations are supplied: `evaluate_trust` takes no attestation
+    # set, so `attestation_count` reflects only what the bridge can source from
+    # its own persistent trust store (verifier-relative, §7.3.2). This honestly
+    # passes nothing rather than fabricating attestations.
+    #
+    # A context with no convergent events yet makes the core surface
+    # `EmptyEventLog` as a `ContextError`; that is not a failure for a trust
+    # evaluation (it means "no recorded facts"), so the behavioral record is
+    # left `None` — preserving the prior graceful-degradation behavior.
     behavioral: BehavioralRecord | None = None
     try:
-        events = await asyncio.to_thread(
-            instance.event_log_query,
-            context_id,
-            {"actor_did": subject_did},
-        )
-        # `tool_invocations` is a MAP keyed by tool type whose values are counts
-        # (spec §7.2.4). The queryable event data does not carry a tool id, so
-        # every ToolInvoked event buckets under the literal "ToolInvoked" key —
-        # identical to the TypeScript SDK. Per-tool-type keying awaits ADR-051's
-        # richer ToolInvoked payload.
-        tool_invoked_count = sum(1 for e in events if e.event_type == "ToolInvoked")
-        behavioral = BehavioralRecord(
-            contexts_participated=1,
-            tool_invocations={"ToolInvoked": tool_invoked_count} if tool_invoked_count else {},
-        )
+        behavioral = _participation_record_from(instance, context_id, subject_did, "[]")
     except ContextError:
         logger.debug(
             "Could not retrieve behavioral record for %s",
@@ -698,6 +733,78 @@ async def evaluate_trust(
         capability_validation=cap_validation,
         behavioral_record=behavioral,
     )
+
+
+def _participation_record_from(
+    instance: Any,
+    context_id: str,
+    subject_did: str,
+    cached_attestations_json: str,
+) -> BehavioralRecord:
+    """Call the bridge ``participation_record`` op and project the typed result.
+
+    Shared by :func:`participation_record` and :func:`evaluate_trust` so the
+    PyParticipationRecord → :class:`BehavioralRecord` projection lives in ONE
+    place. ``instance`` is the resolved bridge handle (the mock seam in tests
+    or ``scp._native`` in production).
+    """
+    record = instance.participation_record(context_id, subject_did, cached_attestations_json)
+    return BehavioralRecord(
+        subject_did=record.subject_did,
+        participation_duration_secs=record.participation_duration_secs,
+        governance_actions_against=record.governance_actions_against,
+        governance_actions_by=record.governance_actions_by,
+        tool_invocation_count=record.tool_invocation_count,
+        tool_invocation_count_anchored=record.tool_invocation_count_anchored,
+        context_creation_count=record.context_creation_count,
+        role_progression_count=record.role_progression_count,
+        attestation_count=record.attestation_count,
+        computed_at=record.computed_at,
+        event_log_root=record.event_log_root,
+    )
+
+
+def participation_record(
+    scp: SCP,
+    context_id: str,
+    subject_did: str,
+    cached_attestations: list[dict[str, Any]] | None = None,
+) -> BehavioralRecord:
+    """Compute the participation record (§7.3.2) for a subject in a context.
+
+    The shared Rust core gathers the FULL context event log and flattens the
+    participation facts ONCE (``Supervisor::participation_record``), and the
+    PyO3 bridge sources the subject's accessible, currently-valid attestations
+    from its own persistent trust store (seeded by ``cached_attestations``).
+    The SDK RECEIVES the flattened :class:`BehavioralRecord` — it never
+    re-aggregates event-log collections, so every binding observes identical
+    facts for the same context/subject.
+
+    ``attestation_count`` is a credential-layer fact (§7.4): it is NOT a
+    context-event count and NOT Merkle-anchored, and is verifier-relative
+    (computed from the attestations the bridge can access). Pass the subject's
+    accessible attestations as ``cached_attestations`` to populate it; the
+    default (``None`` → ``"[]"``) honestly reports only what the bridge's trust
+    store already holds — it never fabricates attestations.
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch the bridge call on.
+        context_id: The context the participation is scoped to.
+        subject_did: The DID whose participation facts are computed.
+        cached_attestations: Optional list of cached-attestation dicts to seed
+            the bridge's trust store before sourcing the subject's verified set.
+
+    Returns:
+        The flattened participation facts as a :class:`BehavioralRecord`.
+
+    Raises:
+        ScpError: On malformed FFI input or a behavioral compute failure (e.g.
+            an empty event log, surfaced as a :class:`ContextError`).
+    """
+    bridge = _bridge()
+    instance: Any = bridge if hasattr(bridge, "_mock_name") else scp._native
+    cached_json = json.dumps(cached_attestations if cached_attestations is not None else [])
+    return _participation_record_from(instance, context_id, subject_did, cached_json)
 
 
 def aggregate_trust_input(
@@ -843,5 +950,6 @@ __all__ = [
     "TrustEvaluation",
     "aggregate_trust_input",
     "evaluate_trust",
+    "participation_record",
     "verify_participation_requirements",
 ]

@@ -932,6 +932,149 @@ class TestTrust:
         except Exception:
             pass  # Expected without attestation infrastructure
 
+    async def test_participation_record_reflects_governance_real_ffi(self, scp: SCP):
+        """The typed participation record (§7.3.2) RECEIVES real leaf-derived facts.
+
+        A ``single_admin`` context whose ceiling carries the governance +
+        child-creation capabilities auto-executes each proposal on
+        ``governance_propose`` (ADR-031), appending convergent
+        ``GovernanceActionExecuted`` / ``RoleAssigned`` / ``ChildContextCreated``
+        leaves to the supervisor's Merkle log. The typed ``participation_record``
+        then RECEIVES non-zero counts attributed by the subject-bearing payloads
+        (ADR-011 amendment): the actor for ``governance_actions_by`` /
+        ``context_creation_count``, the projected member for
+        ``role_progression_count`` / ``governance_actions_against``. This proves
+        the SDK consumes the Rust-computed record instead of recomputing Layer 2,
+        and is the Python sibling of the TS ``real-napi`` governance test — both
+        assert the identical field values (the cross-SDK divergence-killer).
+        """
+        from scp_sdk.trust import participation_record
+
+        admin = await scp.identity_create(CustodyType.IN_MEMORY)
+        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        # The ceiling MUST carry the governance + child-creation capabilities, or
+        # the proposer (creator) lacks governance:propose / the child-creation
+        # capability and the proposal is permission-denied.
+        handle = scp._native.context_create(
+            admin.did,
+            {
+                "ceiling": [
+                    "messages:read",
+                    "messages:write",
+                    "role:assign",
+                    "governance:propose",
+                    "governance:vote",
+                    "context:close",
+                    "context:child:create",
+                ],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        context_id = handle.context_id
+        scp._native.context_join(handle, member.did)
+
+        # 1. ChangeRole(member -> moderator): a RoleAssigned leaf projected to the
+        #    member + a GovernanceActionExecuted leaf actored by the admin.
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"ChangeRole": {"did": member.did, "new_role": "moderator"}}),
+        )
+        # 2. RemoveMember(member): an adverse action -> governance_actions_against
+        #    the member + another GovernanceActionExecuted by the admin.
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"RemoveMember": {"did": member.did, "reason": "participation-test"}}),
+        )
+        # 3. CreateChildContext: a ChildContextCreated leaf actored by the admin ->
+        #    the admin's context_creation_count increments by one.
+        child_params = {
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": None,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": None,
+        }
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"CreateChildContext": {"params": child_params}}),
+        )
+
+        admin_record = participation_record(scp, context_id, admin.did)
+        member_record = participation_record(scp, context_id, member.did)
+
+        # Admin INITIATED all three governance actions and created one child.
+        assert admin_record.governance_actions_by == 3
+        assert admin_record.governance_actions_against == 0
+        assert admin_record.context_creation_count == 1
+        assert admin_record.role_progression_count == 0
+        # Member was the TARGET of one role change and one (adverse) removal.
+        assert member_record.role_progression_count == 1
+        assert member_record.governance_actions_against == 1
+        assert member_record.governance_actions_by == 0
+        assert member_record.context_creation_count == 0
+        # Credential-layer / anchoring invariants hold for both subjects.
+        assert admin_record.attestation_count == 0
+        assert member_record.attestation_count == 0
+        assert admin_record.tool_invocation_count_anchored is False
+        assert member_record.tool_invocation_count_anchored is False
+        # Real Merkle root over the convergent governance leaves (64 hex chars).
+        assert len(admin_record.event_log_root) == 64
+        assert admin_record.event_log_root != "0" * 64
+
+        # evaluate_trust RECEIVES the SAME record the direct op returns — no
+        # client-side recomputation, no divergence.
+        from scp_sdk.trust import evaluate_trust
+
+        evaluation = await evaluate_trust(scp=scp, subject_did=admin.did, context_id=context_id)
+        assert evaluation.behavioral_record == admin_record
+
+    async def test_evaluate_trust_no_attestations_zero_count_real_ffi(self, scp: SCP):
+        """``evaluate_trust`` passes no cached attestations -> attestation_count 0.
+
+        ``attestation_count`` is a credential-layer fact (§7.4), verifier-
+        relative. ``evaluate_trust`` has no attestation set in its inputs, so it
+        honestly passes an empty set — the SDK never fabricates attestations.
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        admin = await scp.identity_create(CustodyType.IN_MEMORY)
+        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            admin.did,
+            {
+                "ceiling": [
+                    "messages:read",
+                    "role:assign",
+                    "governance:propose",
+                    "governance:vote",
+                ],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        scp._native.context_join(handle, member.did)
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"ChangeRole": {"did": member.did, "new_role": "moderator"}}),
+        )
+
+        evaluation = await evaluate_trust(
+            scp=scp, subject_did=member.did, context_id=handle.context_id
+        )
+        assert evaluation.behavioral_record is not None
+        assert evaluation.behavioral_record.attestation_count == 0
+        assert evaluation.behavioral_record.role_progression_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Broadcast key distribution (spec §5.14.2)

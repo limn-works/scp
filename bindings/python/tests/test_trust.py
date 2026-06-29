@@ -33,6 +33,7 @@ from scp_sdk.trust import (
     RequireParticipation,
     TrustEvaluation,
     evaluate_trust,
+    participation_record,
     verify_participation_requirements,
 )
 
@@ -438,16 +439,127 @@ class TestCapabilityValidation:
 
 
 class TestBehavioralRecord:
-    """Tests for the BehavioralRecord dataclass."""
+    """Tests for the BehavioralRecord dataclass (the typed §7.3.2 facts)."""
 
     def test_default_construction(self) -> None:
         br = BehavioralRecord()
-        assert br.contexts_participated == 0
-        assert br.total_duration == 0.0
+        # The eleven typed participation facts, all defaulted.
+        assert br.subject_did == ""
+        assert br.participation_duration_secs == 0
         assert br.governance_actions_against == 0
-        assert br.tool_invocations == {}
-        assert br.role_history == []
-        assert br.endorsement_accuracy is None
+        assert br.governance_actions_by == 0
+        assert br.tool_invocation_count == 0
+        assert br.tool_invocation_count_anchored is False
+        assert br.context_creation_count == 0
+        assert br.role_progression_count == 0
+        assert br.attestation_count == 0
+        assert br.computed_at == 0
+        assert br.event_log_root == ""
+
+    def test_obsolete_fields_removed(self) -> None:
+        # The client-side-computation fields are gone from the typed shape.
+        br = BehavioralRecord()
+        for obsolete in (
+            "contexts_participated",
+            "total_duration",
+            "tool_invocations",
+            "role_history",
+            "endorsement_accuracy",
+        ):
+            assert not hasattr(br, obsolete), f"obsolete field {obsolete} must be removed"
+
+
+class _FakeParticipationRecord:
+    """A fake PyParticipationRecord with the eleven typed fields."""
+
+    def __init__(self, **overrides: object) -> None:
+        self.subject_did = "did:dht:zsubject"
+        self.participation_duration_secs = 0
+        self.governance_actions_against = 0
+        self.governance_actions_by = 0
+        self.tool_invocation_count = 0
+        self.tool_invocation_count_anchored = False
+        self.context_creation_count = 0
+        self.role_progression_count = 0
+        self.attestation_count = 0
+        self.computed_at = 1
+        self.event_log_root = "00"
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+class TestParticipationRecordWrapper:
+    """The participation_record SDK wrapper projects the typed bridge record."""
+
+    def test_projects_all_eleven_fields(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord(
+            subject_did="did:dht:zalice",
+            participation_duration_secs=300,
+            governance_actions_against=2,
+            governance_actions_by=3,
+            tool_invocation_count=4,
+            tool_invocation_count_anchored=False,
+            context_creation_count=1,
+            role_progression_count=5,
+            attestation_count=0,
+            computed_at=42,
+            event_log_root="deadbeef",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            record = participation_record(mock_scp, "ctx-1", "did:dht:zalice")
+
+        assert isinstance(record, BehavioralRecord)
+        assert record.subject_did == "did:dht:zalice"
+        assert record.participation_duration_secs == 300
+        assert record.governance_actions_against == 2
+        assert record.governance_actions_by == 3
+        assert record.tool_invocation_count == 4
+        assert record.tool_invocation_count_anchored is False
+        assert record.context_creation_count == 1
+        assert record.role_progression_count == 5
+        assert record.attestation_count == 0
+        assert record.computed_at == 42
+        assert record.event_log_root == "deadbeef"
+
+    def test_defaults_to_empty_cached_attestations(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord()
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+
+        # No cached attestations supplied → the bridge receives an empty JSON
+        # array (honest, verifier-relative; the SDK fabricates none).
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zsubject", "[]")
+
+    def test_evaluate_trust_layer2_consumes_participation_record(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord(
+            subject_did="did:dht:zbob",
+            governance_actions_by=7,
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=mock_scp,
+                    subject_did="did:dht:zbob",
+                    context_id="ctx-1",
+                )
+            )
+
+        # Layer 2 is the typed record received from the bridge op — NOT a
+        # client-side event-log classification. evaluate_trust never queries the
+        # event log itself.
+        mock_bridge.event_log_query.assert_not_called()
+        assert evaluation.behavioral_record is not None
+        assert evaluation.behavioral_record.governance_actions_by == 7
+        # evaluate_trust supplies no cached attestations.
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zbob", "[]")
 
 
 class TestAttestation:
