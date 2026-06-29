@@ -9,10 +9,10 @@
 
 //! B15: FFI Bridge API Surface Conformance
 //!
-//! Verifies that the 4 FFI bridges (PyO3, UniFFI, NAPI, WASM) export
+//! Verifies that the 3 FFI bridges (PyO3, UniFFI, NAPI) export
 //! consistent operation sets. PyO3 is the reference bridge (100% coverage
 //! target). Other bridges should match except where architecture constraints
-//! apply (e.g. WASM cannot depend on scp-core per ADR-034).
+//! apply (documented per-bridge exemptions in `scripts/bridge-aliases.json`).
 //!
 //! Implementation: reads bridge source files at compile time via `include_str!`
 //! and searches for exported function name patterns. The per-bridge alias
@@ -20,7 +20,7 @@
 //! `scripts/check-bridge-symmetry.sh`, so the Rust test and the shell
 //! enforcement cannot silently drift apart. The test
 //! `aliases_json_is_in_sync_with_parity_operations` asserts the JSON matches
-//! the local ratchet constants (total op count and WASM-required named set).
+//! the local ratchet constant (total op count).
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::OnceLock;
@@ -95,22 +95,6 @@ const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs"
 // methods on the `Server` type — added in Batch 2 (#1543).
 const NAPI_SERVER: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
 
-// WASM bridge sources
-const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
-const WASM_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
-const WASM_TOOLS: &str = include_str!("../../../../crates/scp-ffi/wasm/src/tools.rs");
-const WASM_UCAN: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
-const WASM_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/wasm/src/event_log.rs");
-const WASM_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/transport.rs");
-const WASM_SYNC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/sync.rs");
-const WASM_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/wasm/src/provenance.rs");
-const WASM_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/discovery.rs");
-const WASM_TRUST: &str = include_str!("../../../../crates/scp-ffi/wasm/src/trust.rs");
-const WASM_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/economy.rs");
-// WASM SCPID module hosts `scpid_challenge` / `scpid_sign` (verify is exempt
-// per ADR-034 — see crates/scp-ffi/wasm/src/scpid.rs:11). Added in Batch 2 (#1543).
-const WASM_SCPID: &str = include_str!("../../../../crates/scp-ffi/wasm/src/scpid.rs");
-
 // ---------------------------------------------------------------------------
 // Shared alias table — compiled in at build time from scripts/bridge-aliases.json
 // ---------------------------------------------------------------------------
@@ -118,7 +102,7 @@ const WASM_SCPID: &str = include_str!("../../../../crates/scp-ffi/wasm/src/scpid
 /// Raw JSON bytes of the shared alias table. Both this test and the shell
 /// script `scripts/check-bridge-symmetry.sh` read the same file, so drift is
 /// impossible — the test `aliases_json_is_in_sync_with_parity_operations`
-/// asserts the JSON matches the ratchet constants below.
+/// asserts the JSON matches the ratchet constant below.
 const BRIDGE_ALIASES_JSON: &str = include_str!("../../../../scripts/bridge-aliases.json");
 
 #[derive(Debug, Deserialize)]
@@ -136,8 +120,6 @@ struct BridgeExemptions {
     uniffi: Vec<ExemptionEntry>,
     #[serde(default)]
     napi: Vec<ExemptionEntry>,
-    #[serde(default)]
-    wasm: Vec<ExemptionEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,11 +133,9 @@ struct ExemptionEntry {
 struct AliasOp {
     canonical: String,
     category: String,
-    wasm_required: bool,
     pyo3: Vec<String>,
     uniffi: Vec<String>,
     napi: Vec<String>,
-    wasm: Vec<String>,
 }
 
 fn aliases() -> &'static BridgeAliasesFile {
@@ -165,21 +145,15 @@ fn aliases() -> &'static BridgeAliasesFile {
     })
 }
 
-/// Returns the list of (category, canonical, wasm_required) tuples, built
-/// dynamically from the alias JSON. Replaces the old hand-maintained
-/// `PARITY_OPERATIONS` constant. Each &'static str is a borrow into the
-/// process-lifetime `OnceLock<BridgeAliasesFile>` backing the alias data.
-fn parity_operations() -> Vec<(&'static str, &'static str, bool)> {
+/// Returns the list of (category, canonical) tuples, built dynamically from
+/// the alias JSON. Replaces the old hand-maintained `PARITY_OPERATIONS`
+/// constant. Each &'static str is a borrow into the process-lifetime
+/// `OnceLock<BridgeAliasesFile>` backing the alias data.
+fn parity_operations() -> Vec<(&'static str, &'static str)> {
     let file: &'static BridgeAliasesFile = aliases();
     file.operations
         .iter()
-        .map(|op| {
-            (
-                op.category.as_str(),
-                op.canonical.as_str(),
-                op.wasm_required,
-            )
-        })
+        .map(|op| (op.category.as_str(), op.canonical.as_str()))
         .collect()
 }
 
@@ -207,10 +181,6 @@ fn napi_names(canonical: &str) -> &'static [String] {
     lookup_op(canonical).napi.as_slice()
 }
 
-fn wasm_names(canonical: &str) -> &'static [String] {
-    lookup_op(canonical).wasm.as_slice()
-}
-
 /// Returns the set of canonical operations explicitly exempted for the given
 /// bridge in `bridge-aliases.json`. The sole source of truth: no hand-rolled
 /// `known_exclusions` arrays anywhere in this file.
@@ -220,7 +190,6 @@ fn exemptions_for(bridge: &str) -> BTreeSet<&'static str> {
         "pyo3" => &file.exemptions.pyo3,
         "uniffi" => &file.exemptions.uniffi,
         "napi" => &file.exemptions.napi,
-        "wasm" => &file.exemptions.wasm,
         other => panic!("exemptions_for: unknown bridge '{other}'"),
     };
     entries.iter().map(|e| e.canonical.as_str()).collect()
@@ -465,11 +434,9 @@ impl<'ast> Visit<'ast> for FnCollector {
 //            method inside `#[napi] impl <T> { ... }` (or `#[napi(...)]`).
 //   • UniFFI: free `pub fn` decorated `#[uniffi::export]` / `#[uniffi::export(...)]`,
 //             method inside `#[uniffi::export] impl <T> { ... }` (or `#[uniffi::export(...)]`).
-//   • WASM:   free `pub fn` decorated `#[wasm_bindgen]` / `#[wasm_bindgen(...)]`,
-//             method inside `#[wasm_bindgen] impl <T> { ... }` (or `#[wasm_bindgen(...)]`).
 //
 // Visibility rule: NOT enforced. The FFI macro is the export marker — every
-// SCP bridge tool (PyO3, NAPI, UniFFI, wasm-bindgen) accepts the macro on
+// SCP bridge tool (PyO3, NAPI, UniFFI) accepts the macro on
 // any visibility (pub, pub(crate), naked fn). PyO3 even has many real
 // examples of `#[pyfunction] fn name(...)` without `pub` — see
 // `runtime_is_initialized` / `version` / `shutdown_runtime` in
@@ -482,16 +449,13 @@ impl<'ast> Visit<'ast> for FnCollector {
 // ---------------------------------------------------------------------------
 
 /// Returns true if `attrs` carries a free-fn-level FFI export macro
-/// (`#[pyfunction]`, `#[napi]`, `#[wasm_bindgen]`, `#[uniffi::export]`,
+/// (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`,
 /// or any of those with parenthesized arguments).
 fn attrs_have_free_fn_ffi_export(attrs: &[syn::Attribute]) -> bool {
     for attr in attrs {
         let path = attr.path();
         if let Some(ident) = path.get_ident()
-            && matches!(
-                ident.to_string().as_str(),
-                "pyfunction" | "napi" | "wasm_bindgen"
-            )
+            && matches!(ident.to_string().as_str(), "pyfunction" | "napi")
         {
             return true;
         }
@@ -506,16 +470,13 @@ fn attrs_have_free_fn_ffi_export(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Returns true if `attrs` carries an impl-block-level FFI export macro
-/// (`#[pymethods]`, `#[napi]`, `#[wasm_bindgen]`, `#[uniffi::export]`).
+/// (`#[pymethods]`, `#[napi]`, `#[uniffi::export]`).
 /// Matches `#[napi]`, `#[napi(...)]`, etc. uniformly.
 fn attrs_have_impl_block_ffi_export(attrs: &[syn::Attribute]) -> bool {
     for attr in attrs {
         let path = attr.path();
         if let Some(ident) = path.get_ident()
-            && matches!(
-                ident.to_string().as_str(),
-                "pymethods" | "napi" | "wasm_bindgen"
-            )
+            && matches!(ident.to_string().as_str(), "pymethods" | "napi")
         {
             return true;
         }
@@ -653,8 +614,7 @@ fn fns_of_source(source: &'static str) -> &'static HashSet<String> {
 /// Resolves an alias name against a single bridge source — STRICT semantics.
 /// Returns true iff `source` defines `name` AS AN FFI-EXPORTED FUNCTION:
 /// `pub fn` decorated with the bridge's export macro (free-fn form), OR a
-/// method inside a `#[pymethods]` / `#[napi]` / `#[uniffi::export]` /
-/// `#[wasm_bindgen]` impl block.
+/// method inside a `#[pymethods]` / `#[napi]` / `#[uniffi::export]` impl block.
 fn source_has_fn(source: &'static str, name: &str) -> bool {
     fns_of_source(source).contains(name)
 }
@@ -689,12 +649,6 @@ fn uniffi_has_operation(canonical: &str) -> bool {
 
 fn napi_has_operation(sources: &[&'static str], canonical: &str) -> bool {
     napi_names(canonical)
-        .iter()
-        .any(|name| any_source_has_fn(sources, name))
-}
-
-fn wasm_has_operation(sources: &[&'static str], canonical: &str) -> bool {
-    wasm_names(canonical)
         .iter()
         .any(|name| any_source_has_fn(sources, name))
 }
@@ -746,45 +700,26 @@ fn napi_sources() -> Vec<&'static str> {
     ]
 }
 
-fn wasm_sources() -> Vec<&'static str> {
-    vec![
-        WASM_IDENTITY,
-        WASM_CONTEXT,
-        WASM_TOOLS,
-        WASM_UCAN,
-        WASM_EVENT_LOG,
-        WASM_TRANSPORT,
-        WASM_SYNC,
-        WASM_PROVENANCE,
-        WASM_DISCOVERY,
-        WASM_TRUST,
-        WASM_ECONOMY,
-        WASM_SCPID,
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // Category coverage helper
 // ---------------------------------------------------------------------------
 
-/// Asserts that every op in `ops` (a slice of `(category, canonical, wasm_required)`
+/// Asserts that every op in `ops` (a slice of `(category, canonical)`
 /// tuples — typically produced by filtering `parity_operations()` to a single
-/// category) is present in all four bridges, modulo `bridge-aliases.json`
+/// category) is present in all three bridges, modulo `bridge-aliases.json`
 /// exemptions. The `label` parameter controls the category name printed in
 /// failure messages — this is decoupled from the category in the tuple so
 /// callers can preserve historical wording (e.g. "UCAN" rather than "ucan",
 /// "tool" rather than "tools").
-fn assert_category_coverage(label: &str, ops: &[&(&'static str, &'static str, bool)]) {
+fn assert_category_coverage(label: &str, ops: &[&(&'static str, &'static str)]) {
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
 
     let pyo3_exempt = exemptions_for("pyo3");
     let uniffi_exempt = exemptions_for("uniffi");
     let napi_exempt = exemptions_for("napi");
-    let wasm_exempt = exemptions_for("wasm");
 
-    for (_, op, _) in ops {
+    for (_, op) in ops {
         if !pyo3_exempt.contains(*op) {
             assert!(
                 pyo3_has_operation(&pyo3_srcs, op),
@@ -798,12 +733,6 @@ fn assert_category_coverage(label: &str, ops: &[&(&'static str, &'static str, bo
             assert!(
                 napi_has_operation(&napi_srcs, op),
                 "NAPI missing {label} op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing {label} op: {op}"
             );
         }
     }
@@ -837,7 +766,7 @@ where
     let mut present = Vec::new();
     let mut missing = Vec::new();
 
-    for (category, op, _) in parity_operations() {
+    for (category, op) in parity_operations() {
         if detect(op) {
             present.push((category, op));
         } else {
@@ -866,11 +795,6 @@ fn compute_uniffi_coverage() -> BridgeCoverage {
 fn compute_napi_coverage() -> BridgeCoverage {
     let sources = napi_sources();
     compute_coverage("NAPI", |op| napi_has_operation(&sources, op))
-}
-
-fn compute_wasm_coverage() -> BridgeCoverage {
-    let sources = wasm_sources();
-    compute_coverage("WASM", |op| wasm_has_operation(&sources, op))
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1019,6 @@ fn every_exemption_reason_cites_durable_provenance() {
         ("pyo3", &file.exemptions.pyo3),
         ("uniffi", &file.exemptions.uniffi),
         ("napi", &file.exemptions.napi),
-        ("wasm", &file.exemptions.wasm),
     ] {
         for entry in entries {
             if !cites_durable_provenance(&entry.reason) {
@@ -1192,8 +1115,8 @@ fn cited_tokens_extracts_maximal_digit_runs() {
 #[test]
 fn provenance_existence_distinguishes_real_from_fabricated() {
     let adrs = adrs_in_repo();
-    // ADR-048 is this very document; ADR-034 governs WASM constraints and is
-    // cited by every current wasm exemption — both must be present.
+    // ADR-048 is this very document; ADR-034 is a real (superseded) ADR still
+    // present in the corpus — both must be found by the existence check.
     assert!(adrs.contains("ADR-048"), "ADR-048 should exist in corpus");
     assert!(adrs.contains("ADR-034"), "ADR-034 should exist in corpus");
     // A fabricated ADR must NOT be present (the prefix `ADR-9` of a real ADR
@@ -1208,122 +1131,61 @@ fn provenance_existence_distinguishes_real_from_fabricated() {
     assert!(!stories.contains("SCP-9999"), "SCP-9999 must not exist");
 }
 
-/// WASM bridge has intentionally fewer operations per ADR-034.
-/// This test verifies all wasm_required operations are present and reports
-/// optional gaps without failing.
-#[test]
-fn wasm_bridge_covers_core_operations() {
-    let coverage = compute_wasm_coverage();
-    print_coverage(&coverage);
-
-    let ops = parity_operations();
-
-    // Separate required vs optional gaps
-    let required_missing: Vec<_> = coverage
-        .missing
-        .iter()
-        .filter(|(cat, op)| ops.iter().any(|(c, o, req)| c == cat && o == op && *req))
-        .collect();
-
-    let optional_missing: Vec<_> = coverage
-        .missing
-        .iter()
-        .filter(|(cat, op)| ops.iter().any(|(c, o, req)| c == cat && o == op && !*req))
-        .collect();
-
-    if !optional_missing.is_empty() {
-        eprintln!("WASM intentionally omitted operations (ADR-034, not failures):");
-        for (cat, op) in &optional_missing {
-            eprintln!("  {cat}/{op}");
-        }
-    }
-
-    assert!(
-        required_missing.is_empty(),
-        "WASM is missing {} required operations: {:?}",
-        required_missing.len(),
-        required_missing
-    );
-
-    // Stale-exemptions guard (parity with uniffi/napi covers-core tests):
-    // an exemption for an operation that IS implemented is stale and should
-    // be removed from the JSON. WASM lacked this check, so a WASM op could be
-    // wired up while its exemption silently lingered, masking future drift.
-    let exempt = exemptions_for("wasm");
-    let missing_ops: BTreeSet<&str> = coverage.missing.iter().map(|(_, op)| *op).collect();
-    let stale_exemptions: Vec<&str> = exempt
-        .iter()
-        .copied()
-        .filter(|e| !missing_ops.contains(e))
-        .collect();
-    assert!(
-        stale_exemptions.is_empty(),
-        "WASM has stale exemption(s) in bridge-aliases.json (operation is \
-         implemented but still listed as exempt): {stale_exemptions:?}. \
-         Remove them from exemptions.wasm."
-    );
-}
-
 /// Cross-bridge parity matrix: builds and prints a matrix of all operations
-/// across all 4 bridges. Documents the current state of parity.
+/// across all 3 bridges. Documents the current state of parity.
 ///
 /// Assertions:
 /// 1. PyO3 (reference) must be 100%.
-/// 2. Every bridge must cover all operations marked wasm_required=true
-///    (with documented exclusions per bridge).
+/// 2. UniFFI and NAPI must meet their coverage thresholds (with documented
+///    per-bridge exclusions in `bridge-aliases.json`).
 #[test]
 fn cross_bridge_parity_matrix() {
     let pyo3 = compute_pyo3_coverage();
     let uniffi = compute_uniffi_coverage();
     let napi = compute_napi_coverage();
-    let wasm = compute_wasm_coverage();
 
     // Print matrix header
     eprintln!();
     eprintln!(
-        "{:<15} {:<40} {:>5} {:>6} {:>5} {:>5}",
-        "Category", "Operation", "PyO3", "UniFFI", "NAPI", "WASM"
+        "{:<15} {:<40} {:>5} {:>6} {:>5}",
+        "Category", "Operation", "PyO3", "UniFFI", "NAPI"
     );
-    eprintln!("{}", "-".repeat(82));
+    eprintln!("{}", "-".repeat(76));
 
-    for (category, op, _wasm_required) in parity_operations() {
+    for (category, op) in parity_operations() {
         let p = pyo3.present.iter().any(|(_, o)| *o == op);
         let u = uniffi.present.iter().any(|(_, o)| *o == op);
         let n = napi.present.iter().any(|(_, o)| *o == op);
-        let w = wasm.present.iter().any(|(_, o)| *o == op);
 
         let mark = |present: bool| if present { "Y" } else { "-" };
 
         eprintln!(
-            "{:<15} {:<40} {:>5} {:>6} {:>5} {:>5}",
+            "{:<15} {:<40} {:>5} {:>6} {:>5}",
             category,
             op,
             mark(p),
             mark(u),
-            mark(n),
-            mark(w)
+            mark(n)
         );
     }
 
     // Summary
-    eprintln!("{}", "-".repeat(82));
+    eprintln!("{}", "-".repeat(76));
     eprintln!(
-        "{:<15} {:<40} {:>5} {:>6} {:>5} {:>5}",
+        "{:<15} {:<40} {:>5} {:>6} {:>5}",
         "TOTAL",
         "",
         pyo3.present.len(),
         uniffi.present.len(),
-        napi.present.len(),
-        wasm.present.len()
+        napi.present.len()
     );
     eprintln!(
-        "{:<15} {:<40} {:>4.1}% {:>5.1}% {:>4.1}% {:>4.1}%",
+        "{:<15} {:<40} {:>4.1}% {:>5.1}% {:>4.1}%",
         "COVERAGE",
         "",
         pyo3.coverage_pct(),
         uniffi.coverage_pct(),
-        napi.coverage_pct(),
-        wasm.coverage_pct()
+        napi.coverage_pct()
     );
     eprintln!();
 
@@ -1335,7 +1197,7 @@ fn cross_bridge_parity_matrix() {
     );
 
     // Count total unique operations across all non-reference bridges
-    let all_gaps: usize = uniffi.missing.len() + napi.missing.len() + wasm.missing.len();
+    let all_gaps: usize = uniffi.missing.len() + napi.missing.len();
     eprintln!("Total parity gaps across non-reference bridges: {all_gaps}");
 
     // Verify minimum coverage thresholds
@@ -1348,33 +1210,6 @@ fn cross_bridge_parity_matrix() {
         napi.coverage_pct() >= 95.0,
         "NAPI coverage {:.1}% below 95% threshold",
         napi.coverage_pct()
-    );
-    // WASM legitimately omits ADR-034-exempt operations (it cannot depend on
-    // scp-runtime). Measuring coverage over the FULL parity set would
-    // mechanically drift this floor down every time an exempt op is added —
-    // the metric would punish WASM for ops it is correctly NOT expected to
-    // implement. So coverage is computed over the NON-EXEMPT operations WASM
-    // is actually expected to cover (present / (total - wasm-exempt)). This is
-    // drift-immune: adding an exempt op increases both the exempt count and
-    // the total by one, leaving the non-exempt denominator unchanged. The hard
-    // requirement (every `wasm_required` op present) is enforced separately by
-    // `wasm_bridge_covers_core_operations`, and exemption legitimacy by
-    // `every_exemption_reason_cites_durable_provenance`.
-    let wasm_exempt = exemptions_for("wasm").len();
-    let wasm_non_exempt_total = wasm.total.saturating_sub(wasm_exempt);
-    let wasm_non_exempt_pct = if wasm_non_exempt_total == 0 {
-        100.0
-    } else {
-        (wasm.present.len() as f64 / wasm_non_exempt_total as f64) * 100.0
-    };
-    assert!(
-        wasm_non_exempt_pct >= 70.0,
-        "WASM coverage of non-exempt operations {:.1}% below 70% threshold \
-         ({} present / {} non-exempt total; {} exempt)",
-        wasm_non_exempt_pct,
-        wasm.present.len(),
-        wasm_non_exempt_total,
-        wasm_exempt
     );
 }
 
@@ -1429,22 +1264,6 @@ fn napi_sources_contain_napi_markers() {
     );
 }
 
-/// Verifies WASM source files actually contain `#[wasm_bindgen]` markers.
-#[test]
-fn wasm_sources_contain_wasm_bindgen_markers() {
-    let sources = wasm_sources();
-    let marker_count: usize = sources
-        .iter()
-        .map(|s| s.matches("#[wasm_bindgen]").count())
-        .sum();
-
-    eprintln!("WASM #[wasm_bindgen] count: {marker_count}");
-    assert!(
-        marker_count >= 30,
-        "Expected at least 30 #[wasm_bindgen] markers, found {marker_count}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Per-category coverage depth tests
 // ---------------------------------------------------------------------------
@@ -1456,10 +1275,7 @@ fn wasm_sources_contain_wasm_bindgen_markers() {
 #[test]
 fn identity_category_coverage() {
     let ops = parity_operations();
-    let identity_ops: Vec<_> = ops
-        .iter()
-        .filter(|(cat, _, _)| *cat == "identity")
-        .collect();
+    let identity_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "identity").collect();
     assert_category_coverage("identity", &identity_ops);
 }
 
@@ -1469,7 +1285,7 @@ fn identity_category_coverage() {
 #[test]
 fn context_category_coverage() {
     let ops = parity_operations();
-    let context_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "context").collect();
+    let context_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "context").collect();
     assert_category_coverage("context", &context_ops);
 }
 
@@ -1478,7 +1294,7 @@ fn context_category_coverage() {
 #[test]
 fn ucan_category_coverage() {
     let ops = parity_operations();
-    let ucan_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "ucan").collect();
+    let ucan_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "ucan").collect();
     assert_category_coverage("UCAN", &ucan_ops);
 }
 
@@ -1487,7 +1303,7 @@ fn ucan_category_coverage() {
 #[test]
 fn tools_category_coverage() {
     let ops = parity_operations();
-    let tool_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "tools").collect();
+    let tool_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "tools").collect();
     assert_category_coverage("tool", &tool_ops);
 }
 
@@ -1497,10 +1313,7 @@ fn tools_category_coverage() {
 #[test]
 fn broadcast_category_coverage() {
     let ops = parity_operations();
-    let broadcast_ops: Vec<_> = ops
-        .iter()
-        .filter(|(cat, _, _)| *cat == "broadcast")
-        .collect();
+    let broadcast_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "broadcast").collect();
     assert_category_coverage("broadcast", &broadcast_ops);
 }
 
@@ -1509,7 +1322,7 @@ fn broadcast_category_coverage() {
 #[test]
 fn trust_category_coverage() {
     let ops = parity_operations();
-    let trust_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "trust").collect();
+    let trust_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "trust").collect();
     assert_category_coverage("trust", &trust_ops);
 }
 
@@ -1518,10 +1331,7 @@ fn trust_category_coverage() {
 #[test]
 fn event_log_category_coverage() {
     let ops = parity_operations();
-    let event_log_ops: Vec<_> = ops
-        .iter()
-        .filter(|(cat, _, _)| *cat == "event_log")
-        .collect();
+    let event_log_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "event_log").collect();
     assert_category_coverage("event_log", &event_log_ops);
 }
 
@@ -1530,14 +1340,8 @@ fn event_log_category_coverage() {
 #[test]
 fn discovery_and_provenance_coverage() {
     let ops = parity_operations();
-    let discovery_ops: Vec<_> = ops
-        .iter()
-        .filter(|(cat, _, _)| *cat == "discovery")
-        .collect();
-    let provenance_ops: Vec<_> = ops
-        .iter()
-        .filter(|(cat, _, _)| *cat == "provenance")
-        .collect();
+    let discovery_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "discovery").collect();
+    let provenance_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "provenance").collect();
     assert_category_coverage("discovery", &discovery_ops);
     assert_category_coverage("provenance", &provenance_ops);
 }
@@ -1551,7 +1355,7 @@ fn discovery_and_provenance_coverage() {
 // the non-spec EIP-1559-style relay base-price adjustment operation
 // (`economy_adjust_relay_price` / `py_economy_adjust_relay_price` /
 // `napi_economy_adjust_relay_price` / `economy_adjust_relay_price` in
-// UniFFI / `wasm_economy_adjust_relay_price`) was deleted across all FFI
+// UniFFI) was deleted across all FFI
 // bridges + language SDK wrappers. `adjust_relay_price` implemented
 // Matrix-style aggregate pricing adjustment; the authoritative per-DID
 // escalation mechanism (spec §19.7) replaces it and is wired through
@@ -1565,175 +1369,19 @@ fn discovery_and_provenance_coverage() {
 // hide-by-omission class). They are now registered, expanding coverage. The
 // seven: `metadata_record_to_json` (spec §5.7.2, the to_json counterpart of
 // the already-registered `metadata_record_from_json`); `commit_deploy` /
-// `rollback_deploy` (ADR-037; spec §10.14.3 site-projection deploy, wasm-exempt
-// server ops); and the four transport relay-management ops
+// `rollback_deploy` (ADR-037; spec §10.14.3 site-projection deploy server
+// ops); and the four transport relay-management ops
 // `transport_add_relay` / `transport_assign_relay_set` /
 // `transport_adapter_count` / `transport_reliability` (ADR-013 transport
-// adapter set, wasm-exempt — WASM has no scp-platform per ADR-034). This is a
+// adapter set). This is a
 // pure coverage expansion, not a swap for the removed `economy_adjust_relay_price`.
 //
 // Subsequently RAISED 104 -> 105 by the structured `ucan_evaluate` op: the new
 // read-only diagnostic counterpart to `ucan_validate` (consumes core
 // `evaluate_ucan`, returns a structured CapabilityValidation; never records the
-// nonce) is exposed across all four bridges (wasm_required). Pure coverage
+// nonce) is exposed across all three bridges. Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
 const MIN_PARITY_OPERATIONS: usize = 105;
-
-/// Named set of operations that must have `wasm_required=true`.
-/// This is a named set, not a count — swapping one operation for another is
-/// caught. Operations can be added but never removed or weakened.
-const WASM_REQUIRED_OPERATIONS: &[&str] = &[
-    // Identity
-    "identity_create",
-    "identity_load",
-    "identity_resolve",
-    "identity_remove",
-    "identity_remove_if_present",
-    "identity_migrate",
-    "identity_attest_device",
-    "identity_verify_device_attestation",
-    "identity_verify_link_attestation",
-    // Context lifecycle
-    "context_create",
-    "context_join",
-    "context_leave",
-    "context_close",
-    "context_send",
-    "context_subscribe",
-    "context_export",
-    "context_import",
-    // Membership
-    "context_member_count",
-    "context_is_member",
-    "context_member_dids",
-    "context_member_role",
-    // Events
-    "context_drain_events",
-    // Governance
-    "governance_execute",
-    // Tools (core only — sessions and cross-context are optional)
-    "tool_register",
-    "tool_invoke",
-    "tool_verify",
-    "tool_interface_expose",
-    "tool_interface_accept",
-    "tool_interface_revoke",
-    // UCAN
-    "ucan_validate",
-    "ucan_evaluate",
-    "ucan_mint",
-    "ucan_revoke",
-    "ucan_delegate",
-    // Event Log
-    "event_log_query",
-    "event_log_verify",
-    "event_log_checkpoint",
-    "event_log_checkpoint_by_did",
-    // Broadcast
-    "broadcast_subscribe",
-    "broadcast_unsubscribe",
-    "broadcast_publish",
-    "broadcast_block",
-    "broadcast_subscriber_count",
-    "broadcast_is_subscriber",
-    "broadcast_admission",
-    // Trust
-    "trust_query_score",
-    "trust_verify_attestation",
-    "trust_create_challenge",
-    "trust_verify_response",
-    "verify_participation_requirements",
-    // Sync
-    "sync_classify_offline",
-    "sync_classify_offline_custom",
-    "sync_get_policy",
-    // Discovery
-    "discovery_parse_address",
-    "discovery_normalize_address",
-    // Provenance
-    "provenance_check_chain_depth",
-    "evaluate_provenance_quality",
-    "provenance_attach",
-    // Petname
-    "petname_set",
-    "petname_remove",
-    "petname_set_context",
-    "petname_remove_context",
-    "petname_resolve_did",
-    "petname_resolve_context",
-    "petname_get_for_did",
-    "petname_get_for_context",
-    // Petname event-replay + count queries
-    // promoted from WASM-only to cross-bridge parity. Backed by
-    // scp_protocol::discovery::petnames::PetnameMap apply_event / did_petname_count
-    // / context_petname_count (the same shared type the other petname ops use).
-    "petname_apply_event",
-    "petname_did_count",
-    "petname_context_count",
-    // Handle/Scope
-    "handle_register",
-    "handle_lookup",
-    "handle_deregister",
-    "scope_register",
-    "scope_lookup",
-    "scope_deregister",
-    // Governance checkpoints
-    "context_create_governance_checkpoint",
-    "context_add_checkpoint_cosignature",
-    // Batch 2 (#1543) — 31 Batch-1 ops promoted from optional to required after
-    // matrix hygiene confirmed each is implemented across all four bridges with
-    // a real `fn` definition (verified by every_alias_resolves_to_a_real_fn_or_exemption).
-    // Governance lifecycle (4)
-    "context_governance_propose",
-    "context_governance_approve",
-    "context_governance_reject",
-    "context_governance_withdraw",
-    "context_governance_get_proposal",
-    "context_governance_list_proposals",
-    // Sandbox / capability checking (Batch 3f)
-    "sandbox_check_capability",
-    "sandbox_validate_declaration",
-    // Context lifecycle (6)
-    "context_finalize_close",
-    "context_apply_pending_ceiling_modification",
-    "context_get_economic_policy",
-    "context_set_economic_policy",
-    "context_restore",
-    "context_restore_all",
-    // TTL (3)
-    "context_handle_ttl_expiry",
-    "context_propose_ttl_extension",
-    "context_reset_ttl_timer",
-    // Broadcast (5)
-    "broadcast_publish_asset",
-    "broadcast_publish_assets",
-    "broadcast_handle_key_request",
-    "broadcast_open_key",
-    "broadcast_unblock",
-    // Identity (7)
-    "identity_link_attestations",
-    "identity_create_link_attestation",
-    "identity_create_with_agent_key",
-    "identity_execute_recovery",
-    "identity_execute_custody_migration",
-    "identity_add_agent_key",
-    "identity_remove_agent_key",
-    "identity_rotate_agent_key",
-    "identity_rotate_key",
-    // Stateless utility ops (4)
-    "address_resolve",
-    "aggregate_trust_input",
-    "evaluate_invitation",
-    "transport_disconnect",
-    // Provenance (3)
-    "provenance_redact_counterparties",
-    "provenance_pseudonymize_counterparties",
-    "provenance_update_source_type",
-    // Batch 2 — newly registered SCPID ops promoted alongside the 31 Batch-1
-    // ops. `scpid_verify` stays optional (WASM-exempt: needs network DID resolver).
-    "scpid_challenge",
-    "scpid_sign",
-];
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement
@@ -1751,38 +1399,6 @@ fn parity_operation_count_never_decreases() {
         ops.len(),
         MIN_PARITY_OPERATIONS
     );
-}
-
-/// Every operation in `WASM_REQUIRED_OPERATIONS` must remain in
-/// parity operations with `wasm_required=true`. Changing an operation
-/// from required to optional (or removing it) is caught.
-#[test]
-fn wasm_required_set_not_weakened() {
-    let ops = parity_operations();
-    for op_name in WASM_REQUIRED_OPERATIONS {
-        let entry = ops.iter().find(|(_, name, _)| name == op_name);
-        assert!(entry.is_some(), "{op_name} removed from parity operations");
-        assert!(
-            entry.unwrap().2,
-            "{op_name} changed from wasm_required=true to false"
-        );
-    }
-}
-
-/// Verify that WASM_REQUIRED_OPERATIONS is consistent with the parity table.
-/// Every operation marked `wasm_required=true` in the table must
-/// appear in the named set.
-#[test]
-fn wasm_required_set_is_complete() {
-    for (_, op, required) in parity_operations() {
-        if required {
-            assert!(
-                WASM_REQUIRED_OPERATIONS.contains(&op),
-                "Operation {op} has wasm_required=true but is not in WASM_REQUIRED_OPERATIONS. \
-                 Add it to the named set."
-            );
-        }
-    }
 }
 
 /// F10 meta-test: ensures the MIN_PARITY_OPERATIONS ratchet comment cites
@@ -1818,9 +1434,9 @@ fn min_parity_operations_comment_references_real_deletion() {
 // ---------------------------------------------------------------------------
 
 /// Ensures the shell-side enforcement source of truth (bridge-aliases.json)
-/// and the Rust-side ratchet constants stay in lockstep. Without this test,
-/// someone could add a canonical operation to the JSON without surfacing it
-/// in the named WASM_REQUIRED_OPERATIONS set (and vice versa).
+/// and the Rust-side ratchet constant stay in lockstep. Without this test,
+/// someone could add a canonical operation to the JSON or shrink the table
+/// below the ratchet floor without surfacing it here.
 #[test]
 fn aliases_json_is_in_sync_with_parity_operations() {
     let file = aliases();
@@ -1849,7 +1465,6 @@ fn aliases_json_is_in_sync_with_parity_operations() {
             ("pyo3", &op.pyo3),
             ("uniffi", &op.uniffi),
             ("napi", &op.napi),
-            ("wasm", &op.wasm),
         ] {
             let mut seen = HashSet::new();
             for alias in aliases {
@@ -1867,29 +1482,7 @@ fn aliases_json_is_in_sync_with_parity_operations() {
         }
     }
 
-    // 4. wasm_required=true set must equal the named WASM_REQUIRED_OPERATIONS
-    //    set (catches drift in either direction).
-    let json_wasm_required: BTreeSet<&str> = file
-        .operations
-        .iter()
-        .filter(|op| op.wasm_required)
-        .map(|op| op.canonical.as_str())
-        .collect();
-    let rust_wasm_required: BTreeSet<&str> = WASM_REQUIRED_OPERATIONS.iter().copied().collect();
-    assert_eq!(
-        json_wasm_required,
-        rust_wasm_required,
-        "bridge-aliases.json wasm_required set diverges from Rust \
-         WASM_REQUIRED_OPERATIONS: json_only={:?} rust_only={:?}",
-        json_wasm_required
-            .difference(&rust_wasm_required)
-            .collect::<Vec<_>>(),
-        rust_wasm_required
-            .difference(&json_wasm_required)
-            .collect::<Vec<_>>()
-    );
-
-    // 5. Every canonical op's per-bridge alias array is either non-empty
+    // 4. Every canonical op's per-bridge alias array is either non-empty
     //    (the alias the script searches for) OR the canonical is in the
     //    bridge's exemption list with a documented reason. The combined
     //    invariant is enforced by `every_bridge_alias_array_is_non_empty_or_exempt`,
@@ -1912,12 +1505,10 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
     let file = aliases();
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
 
     let pyo3_exempt = exemptions_for("pyo3");
     let uniffi_exempt = exemptions_for("uniffi");
     let napi_exempt = exemptions_for("napi");
-    let wasm_exempt = exemptions_for("wasm");
 
     let mut phantom: Vec<String> = Vec::new();
 
@@ -1962,19 +1553,6 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
                 ));
             }
         }
-        // --- wasm --- (only when required, mirroring CI script behavior)
-        if op.wasm_required && !wasm_exempt.contains(op.canonical.as_str()) {
-            let any_resolves = op
-                .wasm
-                .iter()
-                .any(|name| any_source_has_fn(&wasm_srcs, name));
-            if !any_resolves {
-                phantom.push(format!(
-                    "wasm:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/wasm/src/",
-                    op.canonical, op.wasm
-                ));
-            }
-        }
     }
 
     assert!(
@@ -2012,18 +1590,16 @@ fn every_bridge_alias_array_is_non_empty_or_exempt() {
     let pyo3_exempt = exemptions_for("pyo3");
     let uniffi_exempt = exemptions_for("uniffi");
     let napi_exempt = exemptions_for("napi");
-    let wasm_exempt = exemptions_for("wasm");
 
     let mut violations: Vec<String> = Vec::new();
     let mut redundant: Vec<String> = Vec::new();
 
     for op in &file.operations {
         // (bridge, alias_array, exempt_set)
-        let cells: [(&str, &[String], &BTreeSet<&'static str>); 4] = [
+        let cells: [(&str, &[String], &BTreeSet<&'static str>); 3] = [
             ("pyo3", op.pyo3.as_slice(), &pyo3_exempt),
             ("uniffi", op.uniffi.as_slice(), &uniffi_exempt),
             ("napi", op.napi.as_slice(), &napi_exempt),
-            ("wasm", op.wasm.as_slice(), &wasm_exempt),
         ];
         for (bridge, aliases, exempt) in cells {
             let is_exempt = exempt.contains(op.canonical.as_str());
@@ -2415,21 +1991,6 @@ fn ffi_scanner_recognizes_all_bridge_macros() {
         impl UniffiScp {
             pub fn uniffi_method(&self) {}
         }
-
-        // WASM free fn
-        #[wasm_bindgen]
-        pub fn wasm_free_fn() {}
-
-        // WASM free fn with args
-        #[wasm_bindgen(js_name = "wasmNamed")]
-        pub fn wasm_named_fn() {}
-
-        // WASM impl
-        struct WasmScp;
-        #[wasm_bindgen]
-        impl WasmScp {
-            pub fn wasm_method(&self) {}
-        }
     "#;
     let fns = collect_ffi_exported_fns(SRC);
     let expected = [
@@ -2442,9 +2003,6 @@ fn ffi_scanner_recognizes_all_bridge_macros() {
         "uniffi_free_fn",
         "uniffi_async_fn",
         "uniffi_method",
-        "wasm_free_fn",
-        "wasm_named_fn",
-        "wasm_method",
     ];
     for name in expected {
         assert!(
@@ -2492,7 +2050,7 @@ fn ffi_scanner_rejects_undecorated_fixture() {
 // generate per-instance method bindings instead of free-function bindings.
 //
 // Before PR-E this rule lived only in review. This test mechanizes it: scan
-// every `crates/scp-ffi/{src,napi/src,uniffi/src,wasm/src}/**/*.rs` impl
+// every `crates/scp-ffi/{src,napi/src,uniffi/src}/**/*.rs` impl
 // block; for each `&self` (or `&mut self` / `self`) method, walk the body
 // and the non-receiver signature parts. If the method body, its non-receiver
 // args, return type, generics, and where-clause never reference `self` or
@@ -2507,7 +2065,7 @@ fn ffi_scanner_rejects_undecorated_fixture() {
 //
 // Tests:
 //   * `pure_helpers_stay_free_fns_at_ffi_layer` — the production gate, scans
-//     all four bridges. Default policy: fail on any flagged method.
+//     all three bridges. Default policy: fail on any flagged method.
 //   * `pure_helpers_detector_recognizes_genuinely_bound_method` — positive
 //     test against a `self.field` example. Locks the detector.
 //   * `pure_helpers_detector_flags_genuinely_pure_method` — negative test
@@ -2547,7 +2105,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Returns the absolute paths of the four FFI bridge source roots that
+/// Returns the absolute paths of the three FFI bridge source roots that
 /// ADR-048 §1 governs. `crates/scp-ffi/common/src/` is intentionally not
 /// included: it hosts shared bridge plumbing (BridgeInstance, validators),
 /// not bridge-exported surface, and its impl methods serve a different role
@@ -2559,7 +2117,6 @@ fn ffi_bridge_roots() -> Vec<PathBuf> {
         root.join("crates/scp-ffi/src"),
         root.join("crates/scp-ffi/napi/src"),
         root.join("crates/scp-ffi/uniffi/src"),
-        root.join("crates/scp-ffi/wasm/src"),
     ]
 }
 
@@ -2804,16 +2361,16 @@ fn scan_items_for_pure_helpers(
                 }
                 // §1 applies to methods the FFI binding tooling actually
                 // EXPORTS. A method is exported when the impl block carries the
-                // macro (`#[pymethods]` / `#[napi]` / `#[uniffi::export]` /
-                // `#[wasm_bindgen]` — the dominant pattern) OR the method itself
+                // macro (`#[pymethods]` / `#[napi]` / `#[uniffi::export]`
+                // — the dominant pattern) OR the method itself
                 // carries it (rare but legal — e.g. an individual
                 // `#[uniffi::export]` / `#[napi]` method inside an
                 // otherwise-undecorated impl). A method in a FULLY undecorated
                 // impl produces no export, so "should this be a free fn?" is
-                // internal coding style, not an enforcement matter — real
-                // instance: `impl WasmContextManager { ... }` hosts internal
-                // helpers called from `#[wasm_bindgen] pub fn context_*` free
-                // fns, not exposed as JS methods. This mirrors the strict alias
+                // internal coding style, not an enforcement matter — a real
+                // instance is an internal helper impl whose methods are called
+                // from decorated free fns, not exposed to the host language.
+                // This mirrors the strict alias
                 // scanner's `visit_impl_item_fn` exactly (block-decorated OR
                 // fn-decorated), closing the gap where a pure `&self` helper
                 // decorated per-method in an undecorated impl would evade the
@@ -3107,8 +2664,6 @@ struct FfiExportAllowlistFile {
     #[serde(default)]
     napi: Vec<AllowlistEntry>,
     #[serde(default)]
-    wasm: Vec<AllowlistEntry>,
-    #[serde(default)]
     pending_registration: PendingRegistration,
 }
 
@@ -3120,8 +2675,6 @@ struct PendingRegistration {
     uniffi: Vec<AllowlistEntry>,
     #[serde(default)]
     napi: Vec<AllowlistEntry>,
-    #[serde(default)]
-    wasm: Vec<AllowlistEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3157,7 +2710,7 @@ fn ffi_export_allowlist() -> &'static FfiExportAllowlistFile {
     })
 }
 
-/// The four bridges, paired with the `src/` root each one's exports live under
+/// The three bridges, paired with the `src/` root each one's exports live under
 /// and the closure that selects that bridge's Rust names from an alias op.
 /// Order mirrors `ffi_bridge_roots()`.
 fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
@@ -3166,7 +2719,6 @@ fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
         ("pyo3", root.join("crates/scp-ffi/src")),
         ("uniffi", root.join("crates/scp-ffi/uniffi/src")),
         ("napi", root.join("crates/scp-ffi/napi/src")),
-        ("wasm", root.join("crates/scp-ffi/wasm/src")),
     ]
 }
 
@@ -3175,12 +2727,11 @@ fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
 /// "registered" set the reverse gate measures exported fns against.
 fn registered_names_for(bridge: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for (_, canonical, _) in parity_operations() {
+    for (_, canonical) in parity_operations() {
         let names: &[String] = match bridge {
             "pyo3" => pyo3_names(canonical),
             "uniffi" => uniffi_names(canonical),
             "napi" => napi_names(canonical),
-            "wasm" => wasm_names(canonical),
             other => panic!("registered_names_for: unknown bridge '{other}'"),
         };
         for n in names {
@@ -3197,7 +2748,6 @@ fn per_bridge_entries(bridge: &str) -> &'static [AllowlistEntry] {
         "pyo3" => &file.pyo3,
         "uniffi" => &file.uniffi,
         "napi" => &file.napi,
-        "wasm" => &file.wasm,
         other => panic!("per_bridge_entries: unknown bridge '{other}'"),
     }
 }
@@ -3209,7 +2759,6 @@ fn pending_entries(bridge: &str) -> &'static [AllowlistEntry] {
         "pyo3" => &file.pending_registration.pyo3,
         "uniffi" => &file.pending_registration.uniffi,
         "napi" => &file.pending_registration.napi,
-        "wasm" => &file.pending_registration.wasm,
         other => panic!("pending_entries: unknown bridge '{other}'"),
     }
 }
@@ -3493,13 +3042,6 @@ const CAPABILITY_MATRIX_REF: &str = "sdk-capability-matrix.json";
 //     paraphrases the op name evades the matrix-contradiction check.
 //     Mitigation: the registration/forward gates still require the genuine op
 //     to exist, so a paraphrase cannot conjure coverage it doesn't have.
-//
-//   • napi/wasm SDK-column collapse. `bridge_to_sdks` maps BOTH `napi` and
-//     `wasm` to `typescript`, so a genuine napi+wasm two-bridge op declared
-//     `bridge-specific` on only one of them is not flagged by the matrix check
-//     alone (the other TS bridge looks "inside" the same SDK set). Backstopped
-//     by the OTHER bridge's own reverse gate: the second bridge's export must
-//     still be registered or carry its own justified allowlist entry.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -3595,7 +3137,6 @@ fn capability_matrix_ops() -> &'static std::collections::BTreeMap<String, BTreeS
 /// matrix op it names is available ONLY within this set.
 ///   • pyo3   → python
 ///   • napi   → typescript (the Node/Bun NAPI path)
-///   • wasm   → typescript (the browser WASM path; shares the TS SDK with napi)
 ///   • uniffi → kotlin + swift
 fn bridge_to_sdks(bridge: &str) -> BTreeSet<&'static str> {
     let mut s = BTreeSet::new();
@@ -3603,7 +3144,7 @@ fn bridge_to_sdks(bridge: &str) -> BTreeSet<&'static str> {
         "pyo3" => {
             s.insert("python");
         }
-        "napi" | "wasm" => {
+        "napi" => {
             s.insert("typescript");
         }
         "uniffi" => {
@@ -3707,7 +3248,7 @@ fn fabricated_provenance_in(reason: &str) -> Vec<String> {
 /// non-empty.
 ///
 /// Per Finding 2 the reason is EXISTENCE-checked, not merely shape-checked:
-///   • `wasm-only` and `pending-registration` must cite a durable artifact
+///   • `pending-registration` must cite a durable artifact
 ///     (ADR / §spec / SCP story) AND every cited ADR/SCP token must actually
 ///     EXIST in the repo corpus — a fabricated `ADR-999` no longer passes.
 ///   • `bridge-specific` must reference the capability-matrix justification
@@ -3725,7 +3266,6 @@ fn ffi_export_allowlist_reasons_are_justified() {
         "getter",
         "lifecycle",
         "dunder",
-        "wasm-only",
         "test-fixture",
         "introspection",
         "constructor",
@@ -3796,8 +3336,7 @@ fn ffi_export_allowlist_reasons_are_justified() {
             }
             return;
         }
-        let needs_provenance =
-            force_provenance || entry.kind == "wasm-only" || entry.kind == "pending-registration";
+        let needs_provenance = force_provenance || entry.kind == "pending-registration";
         if needs_provenance {
             if !cites_durable_provenance(&entry.reason) {
                 offenders.push(format!(
@@ -3823,7 +3362,6 @@ fn ffi_export_allowlist_reasons_are_justified() {
         ("pyo3", &file.pyo3),
         ("uniffi", &file.uniffi),
         ("napi", &file.napi),
-        ("wasm", &file.wasm),
     ] {
         for entry in entries {
             check(bridge, entry, false);
@@ -3836,7 +3374,6 @@ fn ffi_export_allowlist_reasons_are_justified() {
         ("pyo3", &file.pending_registration.pyo3),
         ("uniffi", &file.pending_registration.uniffi),
         ("napi", &file.pending_registration.napi),
-        ("wasm", &file.pending_registration.wasm),
     ] {
         for entry in entries {
             check(bridge, entry, true);

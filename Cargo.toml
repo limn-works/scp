@@ -17,7 +17,6 @@ members = [
     "crates/scp-ffi",
     "crates/scp-ffi/common",
     "crates/scp-ffi/uniffi",
-    "crates/scp-ffi/wasm",
     "crates/scp-ffi/napi",
     "crates/scp-ffi/napi-test-stubs",
 ]

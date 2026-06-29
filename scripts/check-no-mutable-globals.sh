@@ -155,7 +155,6 @@ EXCLUDE_DIRS=(
     crates/scp-ffi/common/src
     crates/scp-ffi/napi/src
     crates/scp-ffi/uniffi/src
-    crates/scp-ffi/wasm/src
 )
 
 # Directories to scan. Every crate under `crates/` except the excluded FFI

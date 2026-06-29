@@ -56,14 +56,7 @@ const PROVIDER_SRC: &str =
 const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
-// WASM bridge sources. Bridge has its own consequence-dispatch path and is
-// asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
-// implementations of the same protocol and both must honor the wiring.
-const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
-const WASM_CONSEQUENCE_SRC: &str =
-    include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
-
-// Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
+// FFI bridge sources. PR #1606 / C4 wired all 3 of these to
 // `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
 // rate limit are enforced for Python / Node / Swift / Kotlin clients.
@@ -148,28 +141,30 @@ const UCAN_VALIDATE_SRC: &str =
 // the diagnostic and the enforcing `validate_ucan` gate silently diverge).
 const PYO3_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 
-// The other three FFI bridges' UCAN sources. Each owns its own `ucan_evaluate`
+// The other two FFI bridges' UCAN sources. Each owns its own `ucan_evaluate`
 // entry point and MUST route to the shared core `evaluate_ucan` pipeline rather
 // than re-implementing capability evaluation locally (which would let the
 // read-only diagnostic and the enforcing `validate_ucan` gate silently diverge).
-// NAPI's body lives in the `ucan_evaluate_on` per-instance helper; WASM's lives
-// in the `run_evaluate_ucan` free function; UniFFI's lives in the
-// `ucan_evaluate` bridge method.
+// NAPI's body lives in the `ucan_evaluate_on` per-instance helper; UniFFI's
+// lives in the `ucan_evaluate` bridge method.
 const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
-const WASM_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
 // Raised 46 -> 49 when the `ucan_evaluate` routing assertion was extended from
-// PyO3-only to all four bridges (PyO3 + NAPI + WASM + UniFFI), adding three new
-// per-bridge routing tests.
+// PyO3-only to the bridges, adding per-bridge routing tests.
 // Raised 49 -> 50 when the production saga-journal swap added
 // `prod_supervisor_construction_wires_durable_saga_journal` — pinning that every
 // production seam constructs the durable `ProtocolRepositorySagaJournal` rather
 // than `NoopSagaJournal` — locking that assertion into the ratchet floor.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 50;
+// Lowered 50 -> 41 when the WASM bridge was deleted (ADR-055): the 9 WASM-bridge
+// structural assertions (consequence dispatch, governance trust boundary,
+// C2 economy fail-closed gate, ucan_evaluate routing) lost their subject and
+// were removed. This is a deleted-target cleanup, not a weakening of the
+// remaining native/PyO3/NAPI/UniFFI assertions.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 41;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1445,51 +1440,13 @@ fn rotate_content_keys_calls_propose_update() {
 }
 
 // ---------------------------------------------------------------------------
-// WASM bridge: consequence dispatch wiring
-//
-// The WASM bridge (scp-ffi-wasm) is a parallel implementation of consequence
-// rule enforcement to the scp-runtime path. Both must dispatch consequences at
-// every mutation site the plan identifies so rate- and participation-based
-// rules fire on either bridge. These assertions catch the wiring regression
-// (observed historically as "consequence rules declared but never enforced in
-// WASM") by structurally verifying the dispatch call sites on the WASM manager
-// and the delegation from the dispatcher to the shared scp-protocol evaluator.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn wasm_send_message_dispatches_consequences() {
-    assert!(
-        fn_body_contains(
-            WASM_MANAGER_SRC,
-            "send_message",
-            "dispatch_consequences_for_subject",
-        ),
-        "WASM send_message body must call dispatch_consequences_for_subject \
-         after appending MessageSent so rate-based rules fire on the sender"
-    );
-}
-
-#[test]
-fn wasm_execute_governance_action_dispatches_consequences() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM execute_governance_action body must exist");
-    let call_count = body.matches("dispatch_consequences_for_subject").count();
-    assert!(
-        call_count >= 2,
-        "WASM execute_governance_action must call dispatch_consequences_for_subject \
-         at least twice (once for the executor DID, once for the action's target \
-         DID); found {call_count}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Direct-execute governance trust boundary (quorum-bypass fix)
 //
 // `execute_governance_action` must dispatch the action the *engine* tracked for
 // a proposal id — never a caller-supplied proposal/action/status. These
 // positive (closed-by-construction) assertions pin the trust boundary at the
-// AST level on BOTH the native runtime and the WASM bridge so a future refactor
-// cannot reintroduce the bypass by re-accepting caller-trusted governance data.
+// AST level on the native runtime so a future refactor cannot reintroduce the
+// bypass by re-accepting caller-trusted governance data.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1537,123 +1494,9 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
     );
 }
 
-#[test]
-fn wasm_execute_governance_action_resolves_action_from_tracked_proposal() {
-    // The WASM bridge entry (`context_execute_governance`) takes no caller
-    // action and no caller identity/subject: the public `#[wasm_bindgen]`
-    // surface carries ONLY (handle, proposal_id_hex). No `action_json` parameter
-    // exists for a caller to populate (action substitution is structurally
-    // impossible), and no `identity_did` parameter exists for a caller to supply
-    // a consequence subject / executor — both are resolved from the tracked
-    // proposal's proposer inside the manager.
-    let wasm_ctx_src: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
-    let entry_sig = extract_fn_signature(wasm_ctx_src, "context_execute_governance")
-        .expect("WASM context_execute_governance signature must exist");
-    assert!(
-        !entry_sig.contains("action_json"),
-        "WASM context_execute_governance must NOT take an action_json parameter — \
-         a caller cannot supply an action to substitute; signature was: {entry_sig}"
-    );
-    assert!(
-        !entry_sig.contains("identity_did"),
-        "WASM context_execute_governance must NOT take an identity_did parameter — \
-         the executor and consequence subject are resolved from the tracked \
-         proposal's proposer, never a caller-supplied DID; signature was: {entry_sig}"
-    );
-    assert!(
-        entry_sig.contains("proposal_id_hex"),
-        "WASM context_execute_governance must take the tracked proposal id \
-         (proposal_id_hex); signature was: {entry_sig}"
-    );
-
-    // The WASM manager resolves BOTH the convergent timestamp AND the action to
-    // dispatch from the manager's own tracked proposal state
-    // (pending_proposals / resolved_proposals) — never a caller action.
-    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM execute_governance_action body must exist");
-    assert!(
-        body.contains("pending_proposals") && body.contains("resolved_proposals"),
-        "WASM execute_governance_action must resolve the action from its own \
-         tracked proposal state (pending_proposals / resolved_proposals)"
-    );
-    assert!(
-        body.contains("tracked_action") || body.contains("tracked.action"),
-        "WASM execute_governance_action must dispatch the TRACKED proposal's \
-         action, not a caller-supplied one"
-    );
-    let mgr_sig = extract_fn_signature(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM manager execute_governance_action signature must exist");
-    assert!(
-        !mgr_sig.contains("action: &GovernanceAction"),
-        "WASM manager execute_governance_action must NOT accept a caller-supplied \
-         action: &GovernanceAction; signature was: {mgr_sig}"
-    );
-}
-
-#[test]
-fn wasm_dispatch_consequences_calls_evaluate_consequence_rules() {
-    assert!(
-        fn_body_contains(
-            WASM_CONSEQUENCE_SRC,
-            "dispatch_consequences_for_subject",
-            "evaluate_consequence_rules",
-        ),
-        "WASM dispatch_consequences_for_subject must delegate to the shared \
-         scp-protocol evaluate_consequence_rules function so rule-matching \
-         logic stays consistent between bridges"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// C2 — WASM economy fail-closed gate (PR #1606 follow-up)
-//
-// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline (no
-// payment adapter, no budget tracker, no velocity tracker, no hard rate
-// limit token bucket — see ADR-034). Without a fail-closed gate, paid
-// contexts would silently bypass economic enforcement on every send / join.
-//
-// These assertions verify the gate exists at the AST level so a future
-// refactor cannot silently delete the spending_ucan_jwt parameter wiring
-// or the economic_policy inspection branch.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "send_message")
-        .expect("WASM send_message body must exist");
-
-    // The parameter must NOT be underscore-prefixed: that name silently
-    // discards the JWT and was the original C2 bug. The C2 fix renames
-    // it to `spending_ucan_jwt` and references it in the rejection
-    // branch so the parameter is no longer dropped.
-    assert!(
-        body.contains("spending_ucan_jwt"),
-        "WASM send_message body must reference `spending_ucan_jwt` so the \
-         parameter is no longer silently discarded (C2 fail-closed gate)"
-    );
-
-    // The body must inspect the context's economic_policy to drive the
-    // fail-closed rejection branch.
-    assert!(
-        body.contains("economic_policy"),
-        "WASM send_message body must reference `economic_policy` to drive \
-         the fail-closed rejection (C2 — paid policies cannot be enforced \
-         on the WASM bridge per ADR-034)"
-    );
-
-    // The reject branch must surface the SCP-ECON-12096 code so the SDK
-    // layer can convert it to a typed `WasmCannotValidateSpendingUcan`
-    // error.
-    assert!(
-        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
-            || body.contains("SCP-ECON-12096"),
-        "WASM send_message must emit SCP-ECON-12096 in the C2 rejection branch"
-    );
-}
-
 // C4 (#1606) — Bridge tool-invoke economy wiring
 //
-// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
+// All 3 FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
 // invocation through `ContextManager::invoke_tool_with_economy`. The
 // previous bypass path called `try_consume_hard_rate_limit_*` directly
 // against the bridge-owned tool registry, which disabled per-invocation
@@ -1740,84 +1583,6 @@ fn c4_napi_tool_invoke_accepts_spending_ucan() {
         body.contains("parse_ucan"),
         "NAPI tool_invoke_on must parse the spending UCAN JWT into a UcanToken \
          before passing it to invoke_tool_with_economy."
-    );
-}
-
-// The C2 fail-closed economy gate (reject paid-context joins the WASM bridge
-// cannot cryptographically validate, ADR-034) is centralized in the shared
-// `join_context_membership_only` helper, which BOTH `join_context` (unencrypted)
-// and `join_context_encrypted` call before committing membership. Asserting
-// against the helper enforces the gate on both join paths through a single
-// chokepoint — strictly stronger than the prior per-`join_context` check.
-#[test]
-fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context_membership_only")
-        .expect("WASM join_context_membership_only body must exist");
-
-    assert!(
-        body.contains("spending_ucan_jwt"),
-        "WASM join_context_membership_only body must reference `spending_ucan_jwt` so the \
-         parameter is no longer silently discarded (C2 fail-closed gate)"
-    );
-
-    assert!(
-        body.contains("economic_policy"),
-        "WASM join_context_membership_only body must reference `economic_policy` to drive \
-         the fail-closed rejection (C2 — paid policies cannot be enforced \
-         on the WASM bridge per ADR-034)"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
-            || body.contains("SCP-ECON-12096"),
-        "WASM join_context_membership_only must emit SCP-ECON-12096 in the C2 rejection branch"
-    );
-}
-
-#[test]
-fn wasm_create_context_rejects_paid_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "create_context")
-        .expect("WASM create_context body must exist");
-
-    // The gate is implemented via the `stored_policy_requires_payment`
-    // helper so the gate logic can be unit-tested independently. The
-    // create-time gate ALSO references `economic_policy` (because that
-    // is the field whose paid-ness is being checked) and surfaces the
-    // SCP-ECON-12095 code in the rejection.
-    assert!(
-        body.contains("stored_policy_requires_payment"),
-        "WASM create_context must call `stored_policy_requires_payment` to \
-         drive the C2 fail-closed rejection of paid economic policies"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
-            || body.contains("SCP-ECON-12095"),
-        "WASM create_context must emit SCP-ECON-12095 in the C2 rejection branch"
-    );
-}
-
-#[test]
-fn wasm_set_economic_policy_governance_rejects_paid_policy() {
-    // The C2 gate also fires through governance dispatch so a paid
-    // policy cannot enter WASM state via the back door. The dispatch
-    // path was extracted to `dispatch_set_economic_policy` to keep the
-    // parent match arm under `clippy::too_many_lines`.
-    let body = extract_fn_body(WASM_MANAGER_SRC, "dispatch_set_economic_policy")
-        .expect("WASM dispatch_set_economic_policy body must exist");
-
-    assert!(
-        body.contains("policy_requires_payment"),
-        "WASM dispatch_set_economic_policy must call `policy_requires_payment` \
-         to drive the C2 fail-closed rejection of paid economic policies via \
-         governance"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
-            || body.contains("SCP-ECON-12095"),
-        "WASM dispatch_set_economic_policy must emit SCP-ECON-12095 in the \
-         C2 rejection branch"
     );
 }
 
@@ -2240,7 +2005,7 @@ fn b3_webhook_dispatch_wired() {
          consumer can subscribe (otherwise no events are dispatched)"
     );
 
-    // Every non-WASM bridge (PyO3 reference, NAPI, UniFFI) must independently
+    // Every bridge (PyO3 reference, NAPI, UniFFI) must independently
     // (a) enable the Supervisor event channel at supervisor construction and
     // (b) wire the consumer into the dispatcher at node startup. The original
     // wiring was first fixed only on PyO3; NAPI/UniFFI had structurally
@@ -2321,9 +2086,6 @@ fn b3_webhook_dispatch_wired() {
 /// that feeds `mls_storage` — NOT the bare `with_providers` (which hardcodes
 /// `NoopSagaJournal`). Without this, a process restart loads no journal and the
 /// §17.16.4 crash-recovery replay can never reconcile a crash-orphaned saga.
-///
-/// WASM is N/A: ADR-034 forbids the tokio-backed `Supervisor` in the wasm32
-/// bridge, so there is no `with_providers*` call to wire (no cell to fill).
 ///
 /// This is a source-text presence gate (defense-in-depth, NOT the primary
 /// guarantee — the type system already forces a journal argument on
@@ -2505,19 +2267,6 @@ fn napi_ucan_evaluate_routes_to_core_evaluate_ucan() {
     assert!(
         fn_body_contains(NAPI_UCAN_SRC, "ucan_evaluate_on", "evaluate_ucan("),
         "NAPI ucan_evaluate (ucan_evaluate_on helper) must call the shared core \
-         evaluate_ucan pipeline, not re-implement capability evaluation locally"
-    );
-}
-
-/// WASM's `ucan_evaluate` body lives in the `run_evaluate_ucan` free function;
-/// it must route to the shared core `evaluate_ucan` pipeline. WASM re-uses the
-/// scp-protocol algorithms directly (ADR-034), so this pins that the diagnostic
-/// is the same pipeline, not a wasm-local fork.
-#[test]
-fn wasm_ucan_evaluate_routes_to_core_evaluate_ucan() {
-    assert!(
-        fn_body_contains(WASM_UCAN_SRC, "run_evaluate_ucan", "evaluate_ucan("),
-        "WASM ucan_evaluate (run_evaluate_ucan helper) must call the shared core \
          evaluate_ucan pipeline, not re-implement capability evaluation locally"
     );
 }

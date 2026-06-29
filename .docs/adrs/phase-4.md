@@ -1410,7 +1410,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 ## ADR-034: WASM Bridge Re-Implementation Strategy
 
-**Status:** Decided
+**Status:** Superseded by ADR-055 (2026-06-29). The WASM bridge and its re-implementation strategy are removed; browser clients are remote thin clients to a server-side `scp-node`. The Context/Risk/Mitigation analysis below is retained as the historical record that motivated the supersession — every mitigation it proposed (drift conformance harness, new-feature checklist) proved to be the unbounded maintenance tax ADR-055 eliminates.
 
 ### Context
 
@@ -1462,6 +1462,66 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 - **ADR-022 (TypeScript SDK):** Defines the TypeScript wrapper layer that consumes both bridges.
 - **ADR-006 (Platform Adapter):** The WASM bridge implements the `Storage` and `KeyCustody` traits using browser-native APIs (wa-sqlite, WebCrypto).
+
+---
+
+## ADR-055: Remove the WASM Bridge; Browser Clients Are Remote Thin Clients
+
+> **Note:** ADR-055 is numbered sequentially but lives in the Phase 4 document by *subject*, not by number: it supersedes ADR-034 (WASM bridge re-implementation), which lives here. Its scope is the protocol's browser story and the FFI bridge set.
+
+**Status:** Decided. **Supersedes:** ADR-034.
+
+### Context
+
+ADR-034 committed SCP to a fourth FFI bridge (`crates/scp-ffi/wasm/`) built by **verbatim re-implementation** of the protocol surface in WASM-compatible Rust, because the real engine cannot compile to `wasm32-unknown-unknown`. The blocking constraint ADR-034 identified is unchanged and structural: `scp-runtime` is built on a multi-thread `tokio` runtime and the ADR-049 actor/supervisor model (`tokio::runtime::Builder::new_multi_thread()`, `std::thread`), neither of which exists on `wasm32-unknown-unknown`. The WASM bridge therefore never shared a line of engine code with the other three bridges — it was a second, independent implementation of the same specification.
+
+Two years of operating that decision exposed costs ADR-034's risk section named but underweighted:
+
+1. **An unbounded convergence tax.** Every protocol feature had to be built twice — once in `scp-runtime`/`scp-protocol` and again, by hand, in the WASM re-implementation — and the two had to remain **byte-identical** wherever the protocol requires cross-implementation agreement (e.g. §9.9.3 Merkle convergence, revocation-CID golden values, export-snapshot signing). The mitigations ADR-034 proposed to hold the line — a dedicated `wasm_conformance.rs` parity harness, a cross-bridge runtime parity harness (ADR-046), a per-PR "new feature checklist" — were themselves the tax: a permanent second implementation plus the machinery to police its drift, paid on every protocol change forever. This is the "No DOA decisions" failure mode: a structure that must be replaced later was the wrong structure to commit to.
+
+2. **A recurring security-divergence source.** Because the two implementations diverge by default and converge only by hand, the WASM bridge repeatedly became the weaker surface — partial UCAN validation, CID-consistency gaps, and in-bridge custody shortcuts that the native engine did not have. Each was a real or latent divergence the harness existed to catch *after the fact*, not prevent.
+
+3. **Convergence that is partly structurally unreachable.** Whole classes of protocol behavior have no WASM analogue at all: timer-driven event-log leaves (TTL, freeze, deferred-change), cross-context sagas, and recovery/pre-rotation epochs all depend on the Supervisor/actor runtime that cannot exist on `wasm32`. For these, "keep the bridges in parity" was never even a well-defined goal — the WASM bridge could only ever stub or omit them, which the conformance harness then had to carve out as documented exemptions, growing the denylist rather than closing the gap.
+
+SCP is pre-release: there are no deployed browser clients and no migration surface. This is the right time — and the cheapest time — to cut.
+
+### Decision
+
+**Delete the WASM bridge.** Remove `crates/scp-ffi/wasm/` in its entirety, along with its build, test, CI, and enforcement references. The FFI bridge set is now **three** bridges, all of which share the real engine: PyO3 (Python, reference), UniFFI (Swift, Kotlin), and NAPI (Node.js/Bun → TypeScript).
+
+**The browser story is a remote thin client.** A browser client does not run the protocol engine in-process. It connects to a server-side `scp-node` over an RPC/WebSocket boundary and issues protocol operations remotely; the node holds the MLS group state, the actor/supervisor runtime, custody, and the event log. There is **no in-browser client-side MLS or protocol execution**. The TypeScript SDK's browser build is a remote-client transport to a node, not a second in-process engine; the in-process TypeScript path remains NAPI-only (server/Node.js/Bun runtimes).
+
+This is the only structural shape that respects the "one implementation" invariant for the protocol engine: rather than re-implementing the engine for the constrained target, the constrained target talks to the engine over the network.
+
+### Rationale
+
+- **Eliminates the convergence tax at the root.** A protocol feature is now built once. There is no second implementation to mirror, and no drift to police, because there is no second implementation.
+- **Closes the security-divergence class by construction.** A browser client cannot present a weaker validation surface than the node, because it performs no validation locally — the node is the single enforcement point. The recurring "WASM is the weaker bridge" finding cannot recur.
+- **"No DOA decisions" (CLAUDE.md).** ADR-034 was a structure that needed replacing; the remote-thin-client model is the permanent commitment, because it has no per-feature recurring cost and no structurally-unreachable corners.
+- **"Simple over complex" without sacrificing capability.** Browser clients reach the full protocol surface — including the timer-, saga-, and recovery-driven behavior that had *no* WASM analogue — by talking to a node that has all of it. The constrained target gains capability by going remote, not loses it.
+- **Pre-release timing.** No deployed clients, no data, no migration: the cut is purely additive-by-subtraction with no compatibility surface (CLAUDE.md pre-release tenet).
+
+### Alternatives Considered
+
+1. **Keep the WASM bridge and keep paying the convergence tax (status quo / ADR-034).** Rejected. The tax is unbounded and recurring, the divergence class is recurring, and the structurally-unreachable behaviors mean parity was never fully achievable. Retaining it entrenches the worst case.
+
+2. **Feature-gate `tokio` to `current_thread` and compile the real engine to WASM.** Rejected for the same reason ADR-034 rejected it, now stronger: the ADR-049 actor/supervisor model deepened the multi-thread dependency throughout `scp-runtime`. Pervasive `#[cfg(target_arch = "wasm32")]` annotations and dual-testing every async path would re-create the two-implementation problem inside one crate.
+
+3. **In-browser engine via a single-threaded actor runtime.** Rejected. Even granting a single-threaded executor, the relay-retrieval, timer-firing, and saga-coordination surfaces the engine needs are not available in-browser, so the in-browser engine would still be a partial re-implementation — the exact thing being removed.
+
+### Consequences
+
+- **FFI is three bridges (PyO3, UniFFI, NAPI).** Bridge-symmetry enforcement (ADR-047), the bridge alias table, the FFI conformance test, the export allowlist, the SDK capability matrix, and the cross-bridge parity harness (ADR-046) drop the WASM column; symmetry is now a three-bridge invariant. These are deleted-target cleanups, not weakenings of the remaining checks.
+- **The convergence program is closed won't-do.** The cross-implementation convergence effort whose purpose was to keep the WASM re-implementation byte-identical to the native engine (event-log unification feeding native↔WASM equivocation parity, the `wasm_conformance.rs` golden-value harness, and the per-feature parity checklist) has no remaining subject and is closed without further work. The native event-log unification stands on its own merits where it serves the live engine; only its WASM-parity motivation is retired.
+- **`scp-protocol` retains its `wasm32` compatibility for now.** `scp-protocol` is the pure-sync, no-tokio crate (it compiles to `wasm32-unknown-unknown` independent of the bridge). Removing the bridge does not by itself remove `scp-protocol`'s `wasm32` build check or any `scp-protocol` WASM-only surface; those are evaluated separately.
+- **The TypeScript SDK becomes NAPI-only for in-process use.** The browser target is the remote-client transport described above. The dual-target (`napi` + `wasm`) architecture of ADR-022 collapses to a single in-process bridge plus a remote client.
+
+### Dependencies
+
+- **ADR-034 (WASM Bridge Re-Implementation Strategy):** superseded in full by this ADR.
+- **ADR-022 (TypeScript SDK):** the dual-target (NAPI + WASM) architecture collapses to NAPI-in-process plus a remote browser client.
+- **ADR-046 (Bridge Parity Harness) / ADR-047 (Bridge Symmetry Enforcement):** the WASM bridge is removed from both; parity and symmetry become three-bridge invariants.
+- **ADR-049 (Actor-Per-Context):** the multi-thread actor/supervisor model is the structural reason the engine cannot run in-browser, motivating the remote-thin-client shape.
 
 ---
 

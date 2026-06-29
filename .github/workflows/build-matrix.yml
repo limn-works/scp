@@ -167,38 +167,6 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # TypeScript (browser) — wasm-pack WASM bundle for @limn-works/scp-ts
-  # ---------------------------------------------------------------------------
-  typescript-wasm:
-    name: TypeScript WASM (@limn-works/scp-ts)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Build WASM bundle
-        run: |
-          wasm-pack build crates/scp-ffi/wasm \
-            --target bundler \
-            --out-dir ../../../bindings/typescript/pkg \
-            --release
-
-      - name: Upload WASM artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: typescript-wasm
-          path: bindings/typescript/pkg/
-          retention-days: 7
-
-  # ---------------------------------------------------------------------------
   # TypeScript (Node/Bun) — napi-rs native addon for @limn-works/scp-ts-napi-*
   # One artifact per platform; release workflow publishes each as a separate
   # optional dependency package consumed by @limn-works/scp-ts.
@@ -518,7 +486,6 @@ jobs:
       - rust
       - python-wheels
       - python-sdist
-      - typescript-wasm
       - typescript-napi
       - swift-xcframework
       - kotlin-aar

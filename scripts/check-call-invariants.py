@@ -106,16 +106,14 @@ BRIDGE_ROOTS: dict[str, str] = {
     "pyo3": "crates/scp-ffi/src",
     "napi": "crates/scp-ffi/napi/src",
     "uniffi": "crates/scp-ffi/uniffi/src",
-    "wasm": "crates/scp-ffi/wasm/src",
     "runtime": "crates/scp-runtime/src",
 }
 
 VALID_SCOPES = {"same-function", "same-function-or-direct-callee"}
 
-# Known-benign tree-sitter-rust parse-error files. Tree-sitter-rust cannot
-# parse ``extern "C" { pub type X; }`` opaque-type declarations used by
-# wasm-bindgen — but ``cargo check`` accepts them as valid Rust. Each entry
-# here MUST:
+# Known-benign tree-sitter-rust parse-error files. Currently empty: the only
+# historical members were three wasm-bindgen `extern "C" { pub type X; }`
+# opaque-type files, removed with the WASM bridge (ADR-055). Each entry MUST:
 #
 #  1. Be a path under a bridge root (BRIDGE_ROOTS), relative to REPO_ROOT.
 #  2. Come with a short comment explaining *why* tree-sitter fails on it,
@@ -125,14 +123,7 @@ VALID_SCOPES = {"same-function", "same-function-or-direct-callee"}
 # adversary could otherwise commit a subtle syntax error near a rule's
 # critical callee site to silently disable enforcement. Adding to this
 # allowlist is a real waiver and should be caught in code review.
-KNOWN_PARSE_ERROR_FILES: frozenset[str] = frozenset(
-    {
-        # wasm-bindgen extern "C" opaque types (pub type JsMessageCallback;)
-        "crates/scp-ffi/wasm/src/context.rs",
-        "crates/scp-ffi/wasm/src/custody.rs",
-        "crates/scp-ffi/wasm/src/storage.rs",
-    }
-)
+KNOWN_PARSE_ERROR_FILES: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -627,25 +618,25 @@ def _validate_code_sites_vs_parse_blindspots(
 ) -> list[str]:
     """Fail if any cited code_site lands in `KNOWN_PARSE_ERROR_FILES`.
 
-    The parse-error allowlist is load-bearing — tree-sitter-rust can't
-    parse three wasm-bindgen extern "C" opaque-type files, so the call
-    walker treats them as empty. That's fine when no rule's enforcement
-    target falls in one of those files, but an author who adds a wasm
-    rule pointing at `context.rs` / `custody.rs` / `storage.rs` would
-    silently short-circuit enforcement — the walker would never observe
-    the call, and the rule would report "required_callee not found"
-    as expected for every other file while happily accepting the
-    parse-blind file as "compliant by inability to read".
+    The parse-error allowlist is load-bearing — when tree-sitter-rust
+    cannot parse a file (e.g. an `extern "C"` opaque-type declaration),
+    the call walker treats it as empty. That's fine when no rule's
+    enforcement target falls in one of those files, but an author who
+    adds a rule pointing at a parse-blind file would silently
+    short-circuit enforcement — the walker would never observe the call,
+    and the rule would report "required_callee not found" as expected
+    for every other file while happily accepting the parse-blind file as
+    "compliant by inability to read".
 
-    This check runs per-rule: if `applies_to` includes `wasm` AND any
-    `code_sites` entry's path is in the allowlist, refuse to load the
-    rule. The allowlist still exists for the walker (the other rules'
-    code lookups in unrelated files keep working); the cross-check
-    only fires when a rule *targets* a parse-blind file.
+    This check runs per-rule: if any `code_sites` entry's path is in the
+    allowlist, refuse to load the rule. The allowlist still exists for
+    the walker (the other rules' code lookups in unrelated files keep
+    working); the cross-check only fires when a rule *targets* a
+    parse-blind file. `KNOWN_PARSE_ERROR_FILES` is currently empty, so
+    this is a no-op until a future parse-blind file is allowlisted.
     """
     errors: list[str] = []
-    if "wasm" not in applies_to:
-        return errors
+    _ = applies_to  # retained for signature stability; no longer bridge-gated
     for entry in sites:
         site = _parse_code_site(entry)
         if site is None:
@@ -658,7 +649,7 @@ def _validate_code_sites_vs_parse_blindspots(
             errors.append(
                 f"{rule_id}: code_sites entry '{site.raw}' points at "
                 f"'{rel}', which is in KNOWN_PARSE_ERROR_FILES — the "
-                f"call walker cannot parse this file, so any wasm rule "
+                f"call walker cannot parse this file, so any rule "
                 f"targeting it silently skips enforcement. Move the "
                 f"enforcement target to a parseable site, or remove "
                 f"the file from the allowlist."
@@ -767,7 +758,7 @@ def _validate_rule_shape(rule: dict, index: int) -> list[str]:
         # Validate that each code_sites entry resolves to a real file/line.
         if isinstance(code_sites, list) and code_sites:
             errors.extend(_validate_code_sites(rid, code_sites))
-            # Additionally: a wasm rule whose enforcement target lands in a
+            # Additionally: a rule whose enforcement target lands in a
             # tree-sitter-parse-blind file silently skips enforcement.
             if isinstance(applies_to, list):
                 errors.extend(
@@ -813,9 +804,9 @@ class BridgeParseError(Exception):
     We refuse to silently WARN on parse errors: an adversary could
     otherwise commit a subtle syntax error near a rule's critical callee
     site and the rule would pass with 0 violations. Known-benign cases
-    (e.g. wasm-bindgen extern "C" opaque types) are explicitly allowlisted
-    in ``KNOWN_PARSE_ERROR_FILES`` with comments; everything else is a
-    hard fail that the caller must diagnose with ``cargo check``.
+    (e.g. ``extern "C"`` opaque-type declarations) may be explicitly
+    allowlisted in ``KNOWN_PARSE_ERROR_FILES`` with comments; everything
+    else is a hard fail that the caller must diagnose with ``cargo check``.
     """
 
     def __init__(self, unexpected: list[str]) -> None:

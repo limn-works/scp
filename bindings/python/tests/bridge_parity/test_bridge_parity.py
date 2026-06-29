@@ -14,11 +14,11 @@ unexpected pass is also a failure. That way the xfail list stays a live
 snapshot of what's broken; when a bridge is fixed upstream, removing
 the xfail tag is the forcing function.
 
-The bridge matrix currently covers NAPI, WASM, UniFFI-Kotlin, and
+The bridge matrix currently covers NAPI, UniFFI-Kotlin, and
 UniFFI-Swift as alt bridges against the PyO3 reference. Each alt
 bridge is served by its own long-lived runner subprocess:
 
-  - napi / wasm     → `bun_runner` (Bun, `node_bridge_runner.ts`)
+  - napi            → `bun_runner` (Bun, `node_bridge_runner.ts`)
   - uniffi-kotlin   → `kotlin_runner` (JVM, `kotlin_bridge_runner/`)
   - uniffi-swift    → `swift_runner` (executable, `swift_bridge_runner/`)
 
@@ -48,7 +48,6 @@ pytestmark = pytest.mark.parity
 # conftest.py, one runner binary.
 _BRIDGE_MATRIX: tuple[tuple[BridgeMode, str], ...] = (
     ("napi", "bun_runner"),
-    ("wasm", "bun_runner"),
     ("uniffi-kotlin", "kotlin_runner"),
     ("uniffi-swift", "swift_runner"),
 )

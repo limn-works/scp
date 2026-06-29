@@ -40,7 +40,7 @@ from typing import Literal
 # `conftest.py`, and the wire protocol in the three runners all refer
 # back to this tuple. Adding a new bridge = add one entry here + one
 # runner spawn fixture + one runner binary.
-BridgeMode = Literal["napi", "wasm", "uniffi-kotlin", "uniffi-swift"]
+BridgeMode = Literal["napi", "uniffi-kotlin", "uniffi-swift"]
 
 DEFAULT_TIMEOUT_SECS = 30.0
 
