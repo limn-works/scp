@@ -193,6 +193,41 @@ pub struct GovernanceActionExecutedPayload {
     pub action_type: String,
 }
 
+/// Payload for [`EventType::RoleAssigned`](crate::EventType::RoleAssigned)
+/// (`ChangeRole` governance action, §5; ADR-011 amendment subject-bearing
+/// leaves).
+///
+/// `subject_did` is the member whose role was assigned/changed — the *affected
+/// member*, NOT the governance actor who executed the change (for admin-driven
+/// assignments the leaf `actor_did` is the admin). The participation-record
+/// `role_progression_count` fact (§7.3.2) attributes the role transition to
+/// this `subject_did`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleAssignedPayload {
+    /// The DID of the member whose role was assigned/changed.
+    pub subject_did: String,
+    /// The role name assigned to the subject.
+    pub role: String,
+}
+
+/// Payload for [`EventType::MemberJoined`](crate::EventType::MemberJoined) and
+/// [`EventType::MemberLeft`](crate::EventType::MemberLeft) (§5 membership
+/// changes; ADR-011 amendment subject-bearing leaves).
+///
+/// `subject_did` is the member who joined/left — the *affected member*, NOT the
+/// governance actor (for admin-driven joins/removals the leaf `actor_did` is the
+/// admin; on self-join/leave and broadcast subscribe/unsubscribe the two
+/// coincide, but the payload still carries the member so the leaf shape is
+/// uniform). The participation-record `participation_duration_secs` fact
+/// (§7.3.2) attributes the join/leave interval to this `subject_did`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipChangePayload {
+    /// The DID of the member who joined or left.
+    pub subject_did: String,
+    /// The role name held by the member at the time of the membership change.
+    pub role_name: String,
+}
+
 /// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
 /// event.
 ///
@@ -284,6 +319,18 @@ pub struct EventPayloadProjection {
     /// payload (e.g. an untargeted, context-wide governance action) projects to
     /// `None` so consumers do not key participation facts on an empty subject.
     pub target_did: Option<String>,
+    /// The subject DID for role/membership events that carry one
+    /// (`RoleAssigned`, `MemberJoined`, `MemberLeft`) — the *affected member*,
+    /// not the governance actor; `None` otherwise. An empty `subject_did` in the
+    /// underlying payload (e.g. a historical empty-payload leaf) projects to
+    /// `None` so consumers do not key participation facts on an empty subject.
+    ///
+    /// This is a separate field from [`target_did`](Self::target_did) by design:
+    /// governance/access events project the targeted member into `target_did`,
+    /// while role/membership events project the affected member into
+    /// `subject_did`. Two precise fields keep participation-fact attribution
+    /// (§7.3.2) unambiguous about which leaf class a DID came from.
+    pub subject_did: Option<String>,
 }
 
 /// Decodes the bridge-facing projection fields from a typed event payload.
@@ -309,11 +356,25 @@ pub fn project_payload(event_type: &EventType, payload: &EventPayload) -> EventP
             target_did: decode_payload::<GovernanceActionExecutedPayload>(payload)
                 .ok()
                 .and_then(|p| non_empty(p.target_did)),
+            ..EventPayloadProjection::default()
         },
         EventType::AccessRevoked => EventPayloadProjection {
             target_did: decode_payload::<AccessRevokedPayload>(payload)
                 .ok()
                 .and_then(|p| non_empty(p.target_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::RoleAssigned => EventPayloadProjection {
+            subject_did: decode_payload::<RoleAssignedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.subject_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::MemberJoined | EventType::MemberLeft => EventPayloadProjection {
+            subject_did: decode_payload::<MembershipChangePayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.subject_did)),
+            ..EventPayloadProjection::default()
         },
         _ => EventPayloadProjection::default(),
     }
@@ -480,6 +541,30 @@ mod tests {
     }
 
     #[test]
+    fn role_assigned_round_trip() {
+        let p = RoleAssignedPayload {
+            subject_did: "did:key:carol".to_owned(),
+            role: "admin".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: RoleAssignedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn membership_change_round_trip() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:dave".to_owned(),
+            role_name: "member".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: MembershipChangePayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
     fn empty_collections_round_trip() {
         // Boundary: empty consenting/rejecting/capability vectors must survive
         // the round trip and still produce a fixarray of the struct's field
@@ -546,6 +631,73 @@ mod tests {
     }
 
     #[test]
+    fn project_role_assigned_round_trips_subject_did() {
+        let p = RoleAssignedPayload {
+            subject_did: "did:key:carol".to_owned(),
+            role: "admin".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::RoleAssigned, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:carol"));
+        // RoleAssigned carries a subject, never a target.
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_member_joined_round_trips_subject_did() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:dave".to_owned(),
+            role_name: "member".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::MemberJoined, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:dave"));
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_member_left_round_trips_subject_did() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:erin".to_owned(),
+            role_name: "subscriber".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::MemberLeft, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:erin"));
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_empty_subject_role_membership_yields_none() {
+        // A role/membership leaf with an empty subject_did (e.g. a historical
+        // empty-payload leaf reconstructed with a blank subject) must project to
+        // None so consumers do not key facts on an empty subject.
+        let role = RoleAssignedPayload {
+            subject_did: String::new(),
+            role: "admin".to_owned(),
+        };
+        let role_enc = encode_payload(&role).unwrap();
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &role_enc).subject_did,
+            None
+        );
+
+        let membership = MembershipChangePayload {
+            subject_did: String::new(),
+            role_name: "member".to_owned(),
+        };
+        let membership_enc = encode_payload(&membership).unwrap();
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &membership_enc).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &membership_enc).subject_did,
+            None
+        );
+    }
+
+    #[test]
     fn project_malformed_bytes_yields_none_without_panic() {
         // Garbage bytes for a target-carrying variant must decode to None, not
         // panic — a corrupt leaf cannot crash a query.
@@ -556,6 +708,19 @@ mod tests {
         assert_eq!(governance.target_did, None);
         let revoked = project_payload(&EventType::AccessRevoked, &malformed);
         assert_eq!(revoked.target_did, None);
+        // Subject-bearing variants must also tolerate garbage without panic.
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &malformed).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &malformed).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &malformed).subject_did,
+            None
+        );
     }
 
     #[test]
@@ -565,5 +730,18 @@ mod tests {
         assert_eq!(governance.target_did, None);
         let revoked = project_payload(&EventType::AccessRevoked, &empty);
         assert_eq!(revoked.target_did, None);
+        // Subject-bearing variants project None from an empty payload, never panic.
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &empty).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &empty).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &empty).subject_did,
+            None
+        );
     }
 }
