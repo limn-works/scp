@@ -18,12 +18,13 @@ pub mod sybil;
 // Re-exports for backward compatibility.
 pub use attestation::{
     Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
-    RevocationStatus, verify_attestation, verify_attestation_with_revocation,
+    RevocationStatus, canonical_attestation_bytes, verify_attestation,
+    verify_attestation_with_revocation,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-    issue_challenge, verify_challenge_response,
+    issue_challenge, verify_challenge_response, verify_challenge_verification,
 };
 pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
@@ -214,6 +215,19 @@ pub enum TrustError {
     /// `subject_did`).
     #[error("challenge request signature invalid: {reason}")]
     ChallengeRequestSignatureInvalid {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// The challenge verification record's verifier Ed25519 signature is
+    /// invalid, indicating a forged or tampered `passed`/`score` trust signal.
+    /// The verifier signature binds every consumed field (`passed`, `score`,
+    /// `expires_at`, `subject_did`, `verifier_did`, `capability_uri`), so a
+    /// failure here means the record cannot be trusted as a verifier's claim.
+    #[error("challenge verification {verification_id}: verifier signature invalid: {reason}")]
+    ChallengeVerificationSignatureInvalid {
+        /// The verification record ID.
+        verification_id: String,
         /// Human-readable description of the failure.
         reason: String,
     },

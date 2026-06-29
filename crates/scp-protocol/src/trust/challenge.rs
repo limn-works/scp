@@ -759,6 +759,45 @@ pub fn verify_challenge_response(
 }
 
 // ---------------------------------------------------------------------------
+// verify_challenge_verification
+// ---------------------------------------------------------------------------
+
+/// Verifies the verifier's Ed25519 signature over a [`ChallengeVerification`]
+/// record.
+///
+/// A `ChallengeVerification` carries a caller-controlled `passed`/`score` trust
+/// signal that is only trustworthy because the verifier signs it (spec
+/// §7.3.4.2). The signature, produced by [`verify_challenge_response`], binds
+/// every consumed field (`passed`, `score`, `expires_at`, `subject_did`,
+/// `verifier_did`, `capability_uri`, `challenge_type`, `verified_at`,
+/// `test_count`, `pass_count`, `context_id`) via
+/// [`canonical_challenge_verification_bytes`], so a valid signature proves the
+/// record was not forged or post-signing modified. This is the verify-on-ingest
+/// gate for caller-supplied challenge results crossing the FFI boundary: the
+/// verifier's public key is resolved from `verifier_did` and the signature is
+/// checked before `passed`/`score` may be consumed as an admission/trust signal.
+///
+/// # Errors
+///
+/// - [`TrustError`] from the resolver if the verifier's public key cannot be
+///   resolved from `verifier_did`.
+/// - [`TrustError::ChallengeVerificationSignatureInvalid`] if the signature does
+///   not verify against the resolved verifier key.
+pub fn verify_challenge_verification(
+    verification: &ChallengeVerification,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+) -> Result<(), TrustError> {
+    let verifier_pk = resolver.resolve_public_key(&verification.verifier_did)?;
+    let canonical = canonical_challenge_verification_bytes(verification)?;
+    verify_ed25519_signature(&verifier_pk, &canonical, &verification.verifier_signature).map_err(
+        |reason| TrustError::ChallengeVerificationSignatureInvalid {
+            verification_id: verification.verification_id.clone(),
+            reason,
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

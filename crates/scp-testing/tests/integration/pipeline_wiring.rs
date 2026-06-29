@@ -156,7 +156,7 @@ const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/uc
 // is the whole point of the typed op: SDKs RECEIVE the facts, never recompute
 // them. PyO3's body lives in `participation_record_impl`, NAPI's in
 // `participation_record_on`, UniFFI's in the `participation_record` bridge
-// method. WASM is native-only here (no scp-runtime Supervisor; ADR-034).
+// method.
 const PYO3_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs");
 const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust.rs");
 
