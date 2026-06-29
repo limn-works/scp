@@ -839,6 +839,11 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
             context_id,
             [0u8; 32],
             now,
+            // attestation_count is a credential-layer, verifier-relative fact
+            // (§7.3.2); this tool-invoke path gates only on participation_count
+            // and has no attestation-cache access, so it passes an empty
+            // accessible-attestation set (count 0) by design — NOT a stub.
+            &[],
         )
     {
         participation_cache.insert(invoker_did.to_string(), record);

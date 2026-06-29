@@ -129,6 +129,18 @@ fn make_event(
     }
 }
 
+/// Encodes a canonical `MembershipChangePayload` (subject-bearing membership
+/// leaf) so participation-duration intervals are attributable to the member
+/// (§7.3.2).
+fn membership_payload(subject_did: &str, role_name: &str) -> Vec<u8> {
+    scp_event_log::payload::encode_payload(&scp_event_log::payload::MembershipChangePayload {
+        subject_did: subject_did.to_owned(),
+        role_name: role_name.to_owned(),
+    })
+    .expect("membership payload encodes")
+    .data
+}
+
 /// Creates a signed attestation using the given signing key.
 fn make_signed_attestation(
     id: &str,
@@ -223,7 +235,13 @@ fn make_trust_signal(
 async fn behavioral_record_computation() {
     let alice = "did:dht:z6MkAlice";
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 1100, 1, vec![]),
         make_event(
             EventType::ToolInvoked,
@@ -232,15 +250,20 @@ async fn behavioral_record_computation() {
             2,
             b"my-tool\0".to_vec(),
         ),
-        make_event(EventType::ContextCreated, alice, 1300, 3, vec![]),
+        make_event(EventType::ChildContextCreated, alice, 1300, 3, vec![]),
     ];
 
-    let record = compute_participation_record(&events, alice, "ctx-test", [0u8; 32], 2000).unwrap();
+    // No attestation-cache access ⇒ empty accessible-attestation set (§7.3.2).
+    let record =
+        compute_participation_record(&events, alice, "ctx-test", [0u8; 32], 2000, &[]).unwrap();
 
     assert_eq!(record.subject_did, did(alice));
     assert_eq!(record.context_id, "ctx-test");
+    // MemberJoined + MessageSent + ToolInvoked + ChildContextCreated = 4 events.
     assert_eq!(record.participation_count, 4);
-    assert_eq!(record.participation_duration_seconds, 300); // 1300 - 1000
+    // Membership-interval duration: open MemberJoined (1000) → latest event
+    // ts (1300) = 300 seconds.
+    assert_eq!(record.participation_duration_seconds, 300);
     assert_eq!(*record.tool_invocations.get("my-tool").unwrap_or(&0), 1);
     assert_eq!(record.context_creation_count, 1);
     assert_eq!(record.computed_at, 2000);
@@ -910,7 +933,13 @@ async fn participation_profile_produce_verify() {
     let merkle_root = [0u8; 32];
 
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 2000, 1, vec![]),
         make_event(EventType::ToolInvoked, alice, 3000, 2, b"tool-x\0".to_vec()),
     ];
@@ -925,12 +954,15 @@ async fn participation_profile_produce_verify() {
             is_member: true,
             is_opted_in: true,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
 
     assert_eq!(profile.subject_did, did(alice));
-    assert_eq!(profile.participation_duration_secs, 2000); // 3000 - 1000
+    // Membership-interval duration: open MemberJoined (1000) → latest event
+    // ts (3000) = 2000 seconds.
+    assert_eq!(profile.participation_duration_secs, 2000);
     assert_eq!(profile.tool_invocation_count, 1);
     assert_eq!(profile.updated_at, 4000);
     assert_ne!(profile.signature, [0u8; 64]);
@@ -953,6 +985,7 @@ async fn participation_profile_produce_verify() {
             is_member: false,
             is_opted_in: true,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap_err();
@@ -969,6 +1002,7 @@ async fn participation_profile_produce_verify() {
             is_member: true,
             is_opted_in: false,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap_err();
@@ -987,9 +1021,17 @@ async fn participation_requirements_check() {
     let merkle_root = [0u8; 32];
     let current_time: u64 = 5000;
 
-    // Create events that will produce a profile with some participation.
+    // Create events that will produce a profile with some participation. A
+    // subject-bearing MemberJoined anchors the participation-duration interval
+    // (§7.3.2).
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 3000, 1, vec![]),
     ];
 
@@ -1003,6 +1045,7 @@ async fn participation_requirements_check() {
             is_member: true,
             is_opted_in: true,
             current_time: 4500,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1017,6 +1060,7 @@ async fn participation_requirements_check() {
             is_member: true,
             is_opted_in: true,
             current_time: 4500,
+            accessible_attestations: &[],
         },
     )
     .unwrap();

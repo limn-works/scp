@@ -339,21 +339,26 @@ where
     R: DidPublicKeyResolver,
     C: Clock,
 {
-    // 1. Compute participation record from event log.
+    // 1. Collect and verify attestations from cache. Computed BEFORE the
+    //    participation record because `attestation_count` is a credential-layer
+    //    fact (§7.4) sourced from these — the record needs the subject's
+    //    accessible, currently-valid attestations as input.
+    let verified_attestations = ctx.cache.get_verified_attestations(
+        ctx.context_id,
+        ctx.subject_did,
+        ctx.resolver,
+        ctx.clock,
+    )?;
+
+    // 2. Compute participation record from the event log, threading the
+    //    verified attestations in for the credential-layer `attestation_count`.
     let participation_record = compute_participation_record(
         ctx.events,
         ctx.subject_did,
         ctx.context_id,
         ctx.merkle_root,
         ctx.clock.now_secs(),
-    )?;
-
-    // 2. Collect and verify attestations from cache.
-    let verified_attestations = ctx.cache.get_verified_attestations(
-        ctx.context_id,
-        ctx.subject_did,
-        ctx.resolver,
-        ctx.clock,
+        &verified_attestations,
     )?;
 
     // 3. Collect challenge results with timestamps from the store.

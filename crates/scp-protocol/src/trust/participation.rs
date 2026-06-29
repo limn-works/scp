@@ -21,9 +21,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use scp_event_log::payload::{GovernanceActionExecutedPayload, decode_payload, project_payload};
 use scp_event_log::{ContextId, Event, EventType};
 use scp_primitives::DID;
 
+use super::attestation::{Attestation, RevocationStatus};
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
 
 // ---------------------------------------------------------------------------
@@ -49,7 +51,13 @@ pub struct ParticipationRecord {
     /// Total number of events produced by the subject in this context.
     pub participation_count: u64,
 
-    /// Duration (seconds) between the subject's first and last event.
+    /// Total seconds of context participation, summed over the subject's
+    /// `MemberJoined`→`MemberLeft` intervals (§7.3.2). Membership leaves carry
+    /// the affected member's `subject_did` (ADR-011), so admin-driven
+    /// joins/removals are attributed to the affected member, not the executing
+    /// admin. If the member is still joined at the end of the slice, the open
+    /// interval runs to the latest event timestamp across all events. Re-joins
+    /// sum multiple intervals.
     pub participation_duration_seconds: u64,
 
     /// Tool invocations by tool ID. The tool ID is extracted from the event
@@ -65,7 +73,13 @@ pub struct ParticipationRecord {
     /// Role assignment history for the subject.
     pub role_history: Vec<RoleTransition>,
 
-    /// Attestation events related to the subject.
+    /// Credential-layer attestations for the subject (§7.4), the explicit
+    /// exception to the event-log-derived facts: this is populated from the
+    /// `accessible_attestations` passed to [`compute_participation_record`]
+    /// (the subject's accessible, currently-valid, non-revoked attestations),
+    /// NOT from any event-log event. There is no attestation event type; the
+    /// count is verifier-relative (§7.3.2) — a caller with no attestation-cache
+    /// access honestly passes an empty set, yielding an empty history.
     pub attestation_history: Vec<AttestationReference>,
 
     /// Number of `ContextCreated` events by the subject.
@@ -88,6 +102,12 @@ pub struct ParticipationRecord {
 /// all events in the provided slice and extracts participation facts for the
 /// given `subject_did`.
 ///
+/// Facts are keyed on the canonical subject-bearing leaves the runtime emits
+/// (ADR-011 amendment, §7.3.2): governance/access facts on the projected
+/// `target_did`, role/membership facts on the projected `subject_did`. The
+/// `attestation_count` fact is the explicit exception — it is a credential-layer
+/// fact (§7.4) sourced from `accessible_attestations`, never the event log.
+///
 /// # Parameters
 ///
 /// - `events` -- The events to scan. Typically obtained from the event log.
@@ -97,6 +117,13 @@ pub struct ParticipationRecord {
 /// - `context_id` -- The context these events belong to.
 /// - `merkle_root` -- The Merkle root at computation time, for verifiability.
 /// - `computed_at` -- Unix timestamp (seconds) for when the computation occurs.
+/// - `accessible_attestations` -- The subject's accessible, currently-valid
+///   attestations from the credential layer (§7.4). `attestation_history` is
+///   populated from these, filtered to the subject and non-revoked entries.
+///   Callers without attestation-cache access (e.g. proposer-eligibility /
+///   lifecycle paths) honestly pass an empty slice — yielding an
+///   `attestation_count` of 0, which is correct and verifier-relative per
+///   §7.3.2, NOT a stub.
 ///
 /// # Errors
 ///
@@ -109,37 +136,35 @@ pub fn compute_participation_record(
     context_id: &str,
     merkle_root: [u8; 32],
     computed_at: u64,
+    accessible_attestations: &[Attestation],
 ) -> Result<ParticipationRecord, TrustError> {
     if events.is_empty() {
         return Err(TrustError::EmptyEventLog);
     }
 
     let mut participation_count: u64 = 0;
-    let mut first_timestamp: Option<u64> = None;
-    let mut last_timestamp: Option<u64> = None;
     let mut tool_invocations: HashMap<ToolId, u64> = HashMap::new();
     let mut governance_actions_by: Vec<GovernanceActionSummary> = Vec::new();
     let mut governance_actions_against: Vec<GovernanceActionSummary> = Vec::new();
     let mut role_history: Vec<RoleTransition> = Vec::new();
-    let mut attestation_history: Vec<AttestationReference> = Vec::new();
     let mut context_creation_count: u64 = 0;
+
+    // Membership-interval accounting for participation duration (§7.3.2): walk
+    // events in order, keyed on the affected member's projected `subject_did`,
+    // tracking the currently-open join timestamp. `MemberLeft` closes the
+    // interval; a still-open interval at the end runs to the latest event
+    // timestamp across the whole slice. Re-joins sum multiple intervals.
+    let mut duration_secs: u64 = 0;
+    let mut open_join_ts: Option<u64> = None;
+    let mut latest_event_ts: u64 = 0;
 
     for event in events {
         let is_subject = event.actor_did == subject_did;
 
+        latest_event_ts = latest_event_ts.max(event.timestamp);
+
         if is_subject {
             participation_count += 1;
-
-            // Track first and last timestamps for duration.
-            match first_timestamp {
-                None => {
-                    first_timestamp = Some(event.timestamp);
-                    last_timestamp = Some(event.timestamp);
-                }
-                Some(_) => {
-                    last_timestamp = Some(event.timestamp);
-                }
-            }
         }
 
         match event.event_type {
@@ -148,28 +173,30 @@ pub fn compute_participation_record(
                 *tool_invocations.entry(tool_id).or_insert(0) += 1;
             }
 
-            EventType::GovernanceAction => {
+            EventType::GovernanceActionExecuted => {
                 if is_subject {
-                    // Subject performed a governance action.
+                    // Subject performed a governance action — keyed on actor_did.
                     governance_actions_by.push(GovernanceActionSummary {
                         timestamp: event.timestamp,
                         actor_did: event.actor_did.clone(),
-                        target_did: extract_target_did_from_payload(&event.payload.data),
+                        target_did: project_payload(&event.event_type, &event.payload)
+                            .target_did
+                            .map(Into::into),
                         event_sequence: event.sequence,
                     });
                 } else {
-                    // Check if the subject is the target of this governance action
-                    // AND the action is adverse (H18: filter out beneficial actions
-                    // such as RestoreAccess that could otherwise be used to deflate
-                    // the target's standing score).
-                    let target = extract_target_did_from_payload(&event.payload.data);
+                    // Check if the subject is the projected target of this
+                    // governance action AND the action is adverse (H18: filter
+                    // out beneficial actions such as RestoreAccess that could
+                    // otherwise be used to deflate the target's standing score).
+                    let target = project_payload(&event.event_type, &event.payload).target_did;
                     if target.as_deref() == Some(subject_did)
-                        && is_adverse_governance_action(&event.payload.data)
+                        && is_adverse_governance_action(&event.payload)
                     {
                         governance_actions_against.push(GovernanceActionSummary {
                             timestamp: event.timestamp,
                             actor_did: event.actor_did.clone(),
-                            target_did: target,
+                            target_did: target.map(Into::into),
                             event_sequence: event.sequence,
                         });
                     }
@@ -177,9 +204,11 @@ pub fn compute_participation_record(
             }
 
             EventType::RoleAssigned => {
-                // Role assignments where the target is the subject.
-                let target = extract_target_did_from_payload(&event.payload.data);
-                if target.as_deref() == Some(subject_did) {
+                // Role assignments where the projected subject is the subject.
+                // Keyed on `subject_did` (the affected member), NOT the assigning
+                // governance actor.
+                let projected = project_payload(&event.event_type, &event.payload).subject_did;
+                if projected.as_deref() == Some(subject_did) {
                     role_history.push(RoleTransition {
                         timestamp: event.timestamp,
                         event_sequence: event.sequence,
@@ -188,36 +217,55 @@ pub fn compute_participation_record(
                 }
             }
 
-            EventType::ContextCreated if is_subject => {
+            EventType::ChildContextCreated if is_subject => {
                 context_creation_count += 1;
             }
 
-            // Events that could be attestation-related activity by the subject.
-            // In the current event model, there is no dedicated attestation event
-            // type. We track any ToolVerified events as attestation-adjacent
-            // activity for the subject.
-            EventType::ToolVerified if is_subject => {
-                attestation_history.push(AttestationReference {
-                    timestamp: event.timestamp,
-                    event_sequence: event.sequence,
-                    actor_did: event.actor_did.clone(),
-                });
+            EventType::MemberJoined => {
+                // Open a membership interval for the affected member (projected
+                // subject_did), if this leaf concerns the subject.
+                let projected = project_payload(&event.event_type, &event.payload).subject_did;
+                if projected.as_deref() == Some(subject_did) {
+                    // Re-join: a prior open interval that never saw a MemberLeft
+                    // is closed at this join's timestamp before opening anew.
+                    if let Some(joined) = open_join_ts {
+                        duration_secs =
+                            duration_secs.saturating_add(event.timestamp.saturating_sub(joined));
+                    }
+                    open_join_ts = Some(event.timestamp);
+                }
+            }
+
+            EventType::MemberLeft => {
+                // Close the open membership interval for the affected member.
+                let projected = project_payload(&event.event_type, &event.payload).subject_did;
+                if projected.as_deref() == Some(subject_did)
+                    && let Some(joined) = open_join_ts.take()
+                {
+                    duration_secs =
+                        duration_secs.saturating_add(event.timestamp.saturating_sub(joined));
+                }
             }
 
             _ => {}
         }
     }
 
-    let participation_duration_seconds = match (first_timestamp, last_timestamp) {
-        (Some(first), Some(last)) => last.saturating_sub(first),
-        _ => 0,
-    };
+    // An interval still open at the end of the slice runs to the latest event
+    // timestamp across ALL events (§7.3.2).
+    if let Some(joined) = open_join_ts {
+        duration_secs = duration_secs.saturating_add(latest_event_ts.saturating_sub(joined));
+    }
+
+    // Attestation history is a credential-layer fact (§7.4), built from the
+    // caller-supplied accessible attestations, NOT the event log.
+    let attestation_history = credential_attestation_history(accessible_attestations, subject_did);
 
     Ok(ParticipationRecord {
         subject_did: subject_did.into(),
         context_id: context_id.to_owned(),
         participation_count,
-        participation_duration_seconds,
+        participation_duration_seconds: duration_secs,
         tool_invocations,
         governance_actions_by,
         governance_actions_against,
@@ -227,6 +275,33 @@ pub fn compute_participation_record(
         computed_at,
         event_log_root: merkle_root,
     })
+}
+
+/// Builds the credential-layer attestation history (§7.4) for a subject from a
+/// set of accessible attestations.
+///
+/// Defensively filters to attestations whose `subject` matches `subject_did` and
+/// whose `revocation_status` is [`RevocationStatus::Active`]
+/// (`get_verified_attestations` already drops revoked-on-reverify, but a broader
+/// caller-supplied set is handled correctly here). Each kept attestation maps to
+/// an [`AttestationReference`] whose `timestamp` is the last renewal if
+/// renewable, else issuance; `event_sequence` is `0` because credential-layer
+/// attestations carry no context-log sequence (the field is only ever read as
+/// part of the history count).
+fn credential_attestation_history(
+    accessible_attestations: &[Attestation],
+    subject_did: &str,
+) -> Vec<AttestationReference> {
+    accessible_attestations
+        .iter()
+        .filter(|att| att.subject == subject_did)
+        .filter(|att| matches!(att.revocation_status, RevocationStatus::Active))
+        .map(|att| AttestationReference {
+            timestamp: att.renewed_at.unwrap_or(att.issued_at),
+            event_sequence: 0,
+            actor_did: att.issuer.clone(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -290,65 +365,24 @@ const ADVERSE_ACTION_TYPES: &[&str] = &[
     "ResetMember",
 ];
 
-/// Returns `true` if the governance action described by `payload` is adverse
+/// Returns `true` if the governance action carried by `payload` is adverse
 /// toward its target and should therefore be counted in
 /// `governance_actions_against`.
 ///
-/// An action is adverse if its `action_type` field matches one of the
-/// [`ADVERSE_ACTION_TYPES`]. Actions with no `action_type` in the payload
-/// (legacy entries) are conservatively treated as adverse.
-fn is_adverse_governance_action(data: &[u8]) -> bool {
-    let action_type = extract_action_type_from_payload(data);
-    // No action_type present — legacy event, treat conservatively as adverse.
+/// The payload is the canonical [`GovernanceActionExecutedPayload`] (positional
+/// `MessagePack`, ADR-011 amendment). An action is adverse if its `action_type`
+/// matches one of the [`ADVERSE_ACTION_TYPES`]. An absent or empty `action_type`
+/// — a payload that does not decode, or an empty `action_type` string — is
+/// conservatively treated as adverse (preserving the pre-H18 behavior).
+fn is_adverse_governance_action(payload: &scp_event_log::EventPayload) -> bool {
+    let action_type = decode_payload::<GovernanceActionExecutedPayload>(payload)
+        .ok()
+        .map(|p| p.action_type)
+        .filter(|t| !t.is_empty());
+    // No (or empty) action_type — treat conservatively as adverse.
     action_type
         .as_deref()
         .is_none_or(|t| ADVERSE_ACTION_TYPES.contains(&t))
-}
-
-/// Extracts the `action_type` string from a governance action payload.
-///
-/// The payload is a JSON object with an optional `"action_type"` field
-/// introduced by H18. Returns `None` if absent (legacy payloads).
-fn extract_action_type_from_payload(data: &[u8]) -> Option<String> {
-    if data.is_empty() {
-        return None;
-    }
-    let val = serde_json::from_slice::<serde_json::Value>(data).ok()?;
-    val.get("action_type")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-/// Extracts a target DID from a governance action or role assignment payload.
-///
-/// The payload data is a JSON object with an optional `"target_did"` field.
-/// Falls back to the legacy null-terminated string convention for backward
-/// compatibility with entries created before structured payloads were
-/// introduced. Returns `None` if the payload is empty or has no target.
-fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
-    if data.is_empty() {
-        return None;
-    }
-    // Try structured JSON first.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-        if let Some(did_str) = val
-            .get("target_did")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(did_str.into());
-        }
-        // JSON parsed but no target_did field — no target.
-        return None;
-    }
-    // Legacy fallback: null-terminated UTF-8 string.
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    let s = std::str::from_utf8(&data[..end]).ok()?;
-    if s.is_empty() {
-        return None;
-    }
-    Some(s.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +885,11 @@ pub struct ParticipationInput<'a> {
     pub is_opted_in: bool,
     /// Unix timestamp (seconds) for `updated_at`.
     pub current_time: u64,
+    /// The member's accessible, currently-valid credential-layer attestations
+    /// (§7.4). Threaded into [`compute_participation_record`] to populate the
+    /// `attestation_count` fact. A producer without attestation-cache access
+    /// passes an empty slice (count 0, verifier-relative per §7.3.2).
+    pub accessible_attestations: &'a [Attestation],
 }
 
 /// - **Context-controlled:** Only contexts produce profiles; agents cannot
@@ -908,6 +947,7 @@ pub fn produce_participation_profile(
         "_internal",
         input.merkle_root,
         input.current_time,
+        input.accessible_attestations,
     )?;
 
     // Derive the context-specific signing key using the unified public API.
@@ -992,7 +1032,8 @@ mod tests {
 
     #[test]
     fn compute_returns_error_for_empty_events() {
-        let result = compute_participation_record(&[], "did:key:alice", "ctx-1", [0u8; 32], 100);
+        let result =
+            compute_participation_record(&[], "did:key:alice", "ctx-1", [0u8; 32], 100, &[]);
         assert!(result.is_err());
         match result {
             Err(TrustError::EmptyEventLog) => {}
@@ -1002,21 +1043,32 @@ mod tests {
 
     #[test]
     fn compute_counts_participation() {
+        // participation_count counts ALL of the subject's events; duration is
+        // membership-interval based (§7.3.2): the open MemberJoined interval runs
+        // to the latest event timestamp across the slice.
         let events = vec![
-            make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
+            make_event(
+                EventType::MemberJoined,
+                "did:key:alice",
+                1000,
+                0,
+                make_membership_payload("did:key:alice", "member"),
+            ),
             make_event(EventType::MessageSent, "did:key:alice", 1001, 1, vec![]),
             make_event(EventType::MessageSent, "did:key:bob", 1002, 2, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 1005, 3, vec![]),
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.subject_did, "did:key:alice");
         assert_eq!(record.context_id, "ctx-1");
+        // MemberJoined + 2 MessageSent by alice.
         assert_eq!(record.participation_count, 3);
-        assert_eq!(record.participation_duration_seconds, 5); // 1005 - 1000
+        // Open interval: latest_event_ts (1005) - MemberJoined ts (1000).
+        assert_eq!(record.participation_duration_seconds, 5);
         assert_eq!(record.computed_at, 2000);
         assert_eq!(record.event_log_root, [1u8; 32]);
     }
@@ -1055,7 +1107,7 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.tool_invocations.len(), 2);
@@ -1067,23 +1119,25 @@ mod tests {
     fn compute_tracks_governance_actions_by_subject() {
         let events = vec![
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:alice",
                 1000,
                 0,
-                b"did:key:bob".to_vec(),
+                make_gov_payload("did:key:bob", "RemoveMember"),
             ),
+            // Untargeted action (empty target_did) — still counts as an action
+            // BY the subject, but projects no target.
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:alice",
                 1001,
                 1,
-                vec![],
+                make_gov_payload("", "ModifyPolicy"),
             ),
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.governance_actions_by.len(), 2);
@@ -1092,7 +1146,7 @@ mod tests {
             record.governance_actions_by[0].target_did,
             Some("did:key:bob".into())
         );
-        // Second action has empty payload -> no target.
+        // Second action has empty target_did -> projects to no target.
         assert_eq!(record.governance_actions_by[1].target_did, None);
     }
 
@@ -1100,23 +1154,23 @@ mod tests {
     fn compute_tracks_governance_actions_against_subject() {
         let events = vec![
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1000,
                 0,
-                b"did:key:alice".to_vec(),
+                make_gov_payload("did:key:alice", "RemoveMember"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1001,
                 1,
-                b"did:key:bob".to_vec(),
+                make_gov_payload("did:key:bob", "RemoveMember"),
             ),
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         // Only the first governance action targets alice.
@@ -1128,14 +1182,40 @@ mod tests {
         assert_eq!(record.governance_actions_against[0].event_sequence, 0);
     }
 
-    /// Helper: create a governance action event payload with both `target_did`
-    /// and `action_type` encoded as JSON (the H18 structured format).
+    /// Helper: create a canonical `GovernanceActionExecutedPayload` (positional
+    /// `MessagePack`, ADR-011 amendment) carrying both `target_did` and
+    /// `action_type`.
     fn make_gov_payload(target_did: &str, action_type: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "target_did": target_did,
-            "action_type": action_type,
-        }))
+        scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did: target_did.to_owned(),
+                action_type: action_type.to_owned(),
+            },
+        )
         .unwrap()
+        .data
+    }
+
+    /// Helper: create a canonical `RoleAssignedPayload` carrying the affected
+    /// member's `subject_did`.
+    fn make_role_payload(subject_did: &str, role: &str) -> Vec<u8> {
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+            subject_did: subject_did.to_owned(),
+            role: role.to_owned(),
+        })
+        .unwrap()
+        .data
+    }
+
+    /// Helper: create a canonical `MembershipChangePayload` (for `MemberJoined`/
+    /// `MemberLeft`) carrying the affected member's `subject_did`.
+    fn make_membership_payload(subject_did: &str, role_name: &str) -> Vec<u8> {
+        scp_event_log::payload::encode_payload(&scp_event_log::payload::MembershipChangePayload {
+            subject_did: subject_did.to_owned(),
+            role_name: role_name.to_owned(),
+        })
+        .unwrap()
+        .data
     }
 
     // --- H18: standing-deflation filter tests ---
@@ -1148,7 +1228,7 @@ mod tests {
         let events: Vec<Event> = (0..5)
             .map(|i| {
                 make_event(
-                    EventType::GovernanceAction,
+                    EventType::GovernanceActionExecuted,
                     "did:key:admin",
                     1000 + i,
                     i,
@@ -1158,7 +1238,7 @@ mod tests {
             .collect();
 
         let record =
-            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000, &[]).unwrap();
 
         assert_eq!(
             record.governance_actions_against.len(),
@@ -1173,7 +1253,7 @@ mod tests {
         // be counted.
         let victim = "did:key:victim";
         let events = vec![make_event(
-            EventType::GovernanceAction,
+            EventType::GovernanceActionExecuted,
             "did:key:admin",
             1000,
             0,
@@ -1181,7 +1261,7 @@ mod tests {
         )];
 
         let record =
-            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000, &[]).unwrap();
 
         assert_eq!(
             record.governance_actions_against.len(),
@@ -1197,42 +1277,42 @@ mod tests {
         let victim = "did:key:victim";
         let events = vec![
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1000,
                 0,
                 make_gov_payload(victim, "RestoreAccess"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1001,
                 1,
                 make_gov_payload(victim, "RestoreAccess"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1002,
                 2,
                 make_gov_payload(victim, "RestoreAccess"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1003,
                 3,
                 make_gov_payload(victim, "SuspendCapability"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1004,
                 4,
                 make_gov_payload(victim, "SuspendCapability"),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1005,
                 5,
@@ -1241,7 +1321,7 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000, &[]).unwrap();
 
         assert_eq!(
             record.governance_actions_against.len(),
@@ -1256,7 +1336,7 @@ mod tests {
         // it must not count against them.
         let victim = "did:key:victim";
         let events = vec![make_event(
-            EventType::GovernanceAction,
+            EventType::GovernanceActionExecuted,
             "did:key:admin",
             1000,
             0,
@@ -1264,7 +1344,7 @@ mod tests {
         )];
 
         let record =
-            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000, &[]).unwrap();
 
         assert_eq!(
             record.governance_actions_against.len(),
@@ -1281,26 +1361,28 @@ mod tests {
                 "did:key:admin",
                 1000,
                 0,
-                b"did:key:alice".to_vec(),
+                make_role_payload("did:key:alice", "moderator"),
             ),
             make_event(
                 EventType::RoleAssigned,
                 "did:key:admin",
                 1005,
                 1,
-                b"did:key:alice".to_vec(),
+                make_role_payload("did:key:alice", "admin"),
             ),
             make_event(
                 EventType::RoleAssigned,
                 "did:key:admin",
                 1010,
                 2,
-                b"did:key:bob".to_vec(),
+                make_role_payload("did:key:bob", "moderator"),
             ),
         ];
 
+        // RoleAssigned keys on the projected subject_did (affected member), not
+        // the assigning admin actor.
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.role_history.len(), 2);
@@ -1312,32 +1394,118 @@ mod tests {
     #[test]
     fn compute_tracks_context_creation() {
         let events = vec![
-            make_event(EventType::ContextCreated, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::ContextCreated, "did:key:bob", 1001, 1, vec![]),
-            make_event(EventType::ContextCreated, "did:key:alice", 1002, 2, vec![]),
+            make_event(
+                EventType::ChildContextCreated,
+                "did:key:alice",
+                1000,
+                0,
+                vec![],
+            ),
+            make_event(
+                EventType::ChildContextCreated,
+                "did:key:bob",
+                1001,
+                1,
+                vec![],
+            ),
+            make_event(
+                EventType::ChildContextCreated,
+                "did:key:alice",
+                1002,
+                2,
+                vec![],
+            ),
         ];
 
+        // context_creation_count derives from ChildContextCreated (§7.3.2).
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.context_creation_count, 2);
     }
 
+    /// Builds a credential-layer [`Attestation`] fixture. The signature is a
+    /// dummy — `compute_participation_record` does NOT verify signatures; it only
+    /// counts/filters by `subject` and `revocation_status`.
+    fn make_attestation(
+        id: &str,
+        issuer: &str,
+        subject: &str,
+        issued_at: u64,
+        revocation_status: RevocationStatus,
+    ) -> Attestation {
+        Attestation {
+            id: id.to_owned(),
+            attestation_type: crate::trust::AttestationType::Endorsement,
+            issuer: issuer.into(),
+            subject: subject.into(),
+            claim: serde_json::Value::Null,
+            evidence: None,
+            issued_at,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status,
+            signature: vec![0u8; 64],
+        }
+    }
+
     #[test]
     fn compute_tracks_attestation_history() {
-        let events = vec![
-            make_event(EventType::ToolVerified, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::ToolVerified, "did:key:bob", 1001, 1, vec![]),
+        // attestation_history is sourced from the credential-layer
+        // `accessible_attestations` arg (§7.4), NOT the event log. Filtered to
+        // the subject and to non-revoked entries.
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            1000,
+            0,
+            vec![],
+        )];
+        let attestations = vec![
+            make_attestation(
+                "att-alice-1",
+                "did:key:issuer",
+                "did:key:alice",
+                1000,
+                RevocationStatus::Active,
+            ),
+            // Different subject — must NOT count for alice.
+            make_attestation(
+                "att-bob-1",
+                "did:key:issuer",
+                "did:key:bob",
+                1001,
+                RevocationStatus::Active,
+            ),
+            // Revoked — must NOT count even though subject matches.
+            make_attestation(
+                "att-alice-revoked",
+                "did:key:issuer",
+                "did:key:alice",
+                1002,
+                RevocationStatus::Revoked {
+                    revoked_at: 1003,
+                    reason: String::new(),
+                    revoked_by: "did:key:issuer".into(),
+                },
+            ),
         ];
 
-        let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
-                .unwrap();
+        let record = compute_participation_record(
+            &events,
+            "did:key:alice",
+            "ctx-1",
+            [0u8; 32],
+            2000,
+            &attestations,
+        )
+        .unwrap();
 
         assert_eq!(record.attestation_history.len(), 1);
         assert_eq!(record.attestation_history[0].timestamp, 1000);
-        assert_eq!(record.attestation_history[0].actor_did, "did:key:alice");
+        assert_eq!(record.attestation_history[0].actor_did, "did:key:issuer");
     }
 
     #[test]
@@ -1351,7 +1519,7 @@ mod tests {
         )];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(record.participation_count, 1);
@@ -1366,7 +1534,7 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         // Record is valid but all counts are zero.
@@ -1392,7 +1560,7 @@ mod tests {
 
         let merkle_root = [42u8; 32];
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", merkle_root, 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", merkle_root, 2000, &[])
                 .unwrap();
 
         assert_eq!(record.event_log_root, merkle_root);
@@ -1400,17 +1568,37 @@ mod tests {
 
     #[test]
     fn compute_full_scenario() {
-        // Simulate a realistic event sequence.
+        // Simulate a realistic event sequence using the canonical subject-bearing
+        // leaves. attestation_history is sourced from the credential layer; here
+        // a single Active attestation for alice is supplied.
         let events = vec![
-            make_event(EventType::ContextCreated, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::MemberJoined, "did:key:alice", 1001, 1, vec![]),
-            make_event(EventType::MemberJoined, "did:key:bob", 1002, 2, vec![]),
+            make_event(
+                EventType::ChildContextCreated,
+                "did:key:alice",
+                1000,
+                0,
+                vec![],
+            ),
+            make_event(
+                EventType::MemberJoined,
+                "did:key:alice",
+                1001,
+                1,
+                make_membership_payload("did:key:alice", "admin"),
+            ),
+            make_event(
+                EventType::MemberJoined,
+                "did:key:bob",
+                1002,
+                2,
+                make_membership_payload("did:key:bob", "member"),
+            ),
             make_event(
                 EventType::RoleAssigned,
                 "did:key:alice",
                 1003,
                 3,
-                b"did:key:bob".to_vec(),
+                make_role_payload("did:key:bob", "moderator"),
             ),
             make_event(
                 EventType::MessageSent,
@@ -1441,25 +1629,42 @@ mod tests {
                 b"search-tool".to_vec(),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:alice",
                 1008,
                 8,
-                b"did:key:bob".to_vec(),
+                make_gov_payload("did:key:bob", "RemoveMember"),
             ),
-            make_event(EventType::ToolVerified, "did:key:alice", 1009, 9, vec![]),
         ];
+        let attestations = vec![make_attestation(
+            "att-alice",
+            "did:key:issuer",
+            "did:key:alice",
+            900,
+            RevocationStatus::Active,
+        )];
 
-        let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [99u8; 32], 5000)
-                .unwrap();
+        let record = compute_participation_record(
+            &events,
+            "did:key:alice",
+            "ctx-1",
+            [99u8; 32],
+            5000,
+            &attestations,
+        )
+        .unwrap();
 
-        assert_eq!(record.participation_count, 8); // All events except bob's
-        assert_eq!(record.participation_duration_seconds, 9); // 1009 - 1000
+        // Alice's events: ChildContextCreated, MemberJoined, RoleAssigned (actor),
+        // MessageSent, 2x ToolInvoked, GovernanceActionExecuted = 7.
+        assert_eq!(record.participation_count, 7);
+        // Open MemberJoined interval (1001) → latest event ts (1008) = 7.
+        assert_eq!(record.participation_duration_seconds, 7);
         assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
         assert_eq!(record.governance_actions_by.len(), 1);
         assert_eq!(record.governance_actions_against.len(), 0);
-        assert_eq!(record.role_history.len(), 0); // Alice assigned bob, not herself
+        // Alice assigned bob's role — subject is bob, not alice.
+        assert_eq!(record.role_history.len(), 0);
+        // Credential-layer attestation for alice.
         assert_eq!(record.attestation_history.len(), 1);
         assert_eq!(record.context_creation_count, 1);
         assert_eq!(record.computed_at, 5000);
@@ -1482,27 +1687,6 @@ mod tests {
     #[test]
     fn extract_tool_id_handles_empty() {
         assert_eq!(extract_tool_id_from_payload(b""), "");
-    }
-
-    #[test]
-    fn extract_target_did_handles_empty_payload() {
-        assert_eq!(extract_target_did_from_payload(b""), None);
-    }
-
-    #[test]
-    fn extract_target_did_handles_valid_did() {
-        assert_eq!(
-            extract_target_did_from_payload(b"did:key:alice"),
-            Some("did:key:alice".into())
-        );
-    }
-
-    #[test]
-    fn extract_target_did_handles_null_terminated() {
-        assert_eq!(
-            extract_target_did_from_payload(b"did:key:alice\0extra"),
-            Some("did:key:alice".into())
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -2208,8 +2392,14 @@ mod tests {
 
     fn make_member_events(actor_did: &str) -> Vec<Event> {
         vec![
-            make_event(EventType::ContextCreated, actor_did, 1000, 0, vec![]),
-            make_event(EventType::MemberJoined, actor_did, 1001, 1, vec![]),
+            make_event(EventType::ChildContextCreated, actor_did, 1000, 0, vec![]),
+            make_event(
+                EventType::MemberJoined,
+                actor_did,
+                1001,
+                1,
+                make_membership_payload(actor_did, "member"),
+            ),
             make_event(
                 EventType::ToolInvoked,
                 actor_did,
@@ -2231,28 +2421,30 @@ mod tests {
                 4,
                 b"tool-a".to_vec(),
             ),
+            // Governance action BY the member (targets someone else).
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 actor_did,
                 1005,
                 5,
-                b"did:key:target".to_vec(),
+                make_gov_payload("did:key:target", "RemoveMember"),
             ),
+            // Adverse governance action AGAINST the member (by an admin).
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1006,
                 6,
-                actor_did.as_bytes().to_vec(),
+                make_gov_payload(actor_did, "RemoveMember"),
             ),
+            // Role assignment whose subject is the member.
             make_event(
                 EventType::RoleAssigned,
                 "did:key:admin",
                 1007,
                 7,
-                actor_did.as_bytes().to_vec(),
+                make_role_payload(actor_did, "moderator"),
             ),
-            make_event(EventType::ToolVerified, actor_did, 1008, 8, vec![]),
             make_event(EventType::MessageSent, actor_did, 1100, 9, vec![]),
         ]
     }
@@ -2262,6 +2454,15 @@ mod tests {
         let key_material = [42u8; 32];
         let events = make_member_events("did:key:alice");
         let merkle_root = [0xAA; 32];
+        // A single Active credential-layer attestation for the member, to
+        // exercise the attestation_count path end-to-end.
+        let attestations = vec![make_attestation(
+            "att-alice",
+            "did:key:issuer",
+            "did:key:alice",
+            900,
+            RevocationStatus::Active,
+        )];
 
         let profile = produce_participation_profile(
             &key_material,
@@ -2273,17 +2474,20 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &attestations,
             },
         )
         .unwrap();
 
         assert_eq!(profile.subject_did, "did:key:alice");
-        assert_eq!(profile.participation_duration_secs, 100); // 1100 - 1000
+        // Membership-interval duration: latest event ts (1100) - MemberJoined (1001).
+        assert_eq!(profile.participation_duration_secs, 99);
         assert_eq!(profile.governance_actions_by, 1);
         assert_eq!(profile.governance_actions_against, 1);
         assert_eq!(profile.tool_invocation_count, 3); // tool-a x2 + tool-b x1
         assert_eq!(profile.context_creation_count, 1);
         assert_eq!(profile.role_progression_count, 1);
+        // attestation_count from the supplied credential-layer attestation set.
         assert_eq!(profile.attestation_count, 1);
         assert_eq!(profile.updated_at, 5000);
         assert_eq!(profile.event_log_root, merkle_root);
@@ -2306,6 +2510,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2329,6 +2534,7 @@ mod tests {
                 is_member: false, // not a member
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         );
         match result {
@@ -2350,6 +2556,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: false, // not opted in
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         );
         match result {
@@ -2373,6 +2580,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2387,6 +2595,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2412,6 +2621,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2426,6 +2636,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 6000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2451,6 +2662,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2474,6 +2686,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 6000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2503,6 +2716,7 @@ mod tests {
                 is_member: true,
                 is_opted_in: true,
                 current_time: 5000,
+                accessible_attestations: &[],
             },
         )
         .unwrap();
@@ -2518,26 +2732,26 @@ mod tests {
     // depend on scp_identity::document::DidDocument).
 
     // -----------------------------------------------------------------------
-    // Structured JSON payload tests (H11-H12)
+    // Canonical subject-bearing payload tests
     // -----------------------------------------------------------------------
 
-    /// `governance_actions_against` is populated when structured JSON payloads
-    /// carry `target_did` matching the subject.
+    /// `governance_actions_against` is populated when canonical
+    /// `GovernanceActionExecuted` leaves carry an adverse `target_did` matching
+    /// the subject.
     #[test]
     fn test_participation_actions_against_populated() {
-        let payload =
-            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+        let payload = make_gov_payload("did:key:alice", "RemoveMember");
 
         let events = vec![
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1000,
                 0,
                 payload.clone(),
             ),
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:moderator",
                 1001,
                 1,
@@ -2545,16 +2759,16 @@ mod tests {
             ),
             // Action targeting bob — should not count against alice.
             make_event(
-                EventType::GovernanceAction,
+                EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 1002,
                 2,
-                serde_json::to_vec(&serde_json::json!({"target_did": "did:key:bob"})).unwrap(),
+                make_gov_payload("did:key:bob", "RemoveMember"),
             ),
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
         assert_eq!(
@@ -2574,5 +2788,71 @@ mod tests {
             record.governance_actions_against[1].actor_did,
             "did:key:moderator"
         );
+    }
+
+    /// A membership re-join (`MemberJoined` → `MemberLeft` → `MemberJoined`) sums
+    /// two intervals, with the final open interval running to the latest event.
+    #[test]
+    fn compute_sums_membership_rejoin_intervals() {
+        let subject = "did:key:alice";
+        let events = vec![
+            make_event(
+                EventType::MemberJoined,
+                subject,
+                1000,
+                0,
+                make_membership_payload(subject, "member"),
+            ),
+            make_event(
+                EventType::MemberLeft,
+                subject,
+                1010,
+                1,
+                make_membership_payload(subject, "member"),
+            ),
+            make_event(
+                EventType::MemberJoined,
+                subject,
+                1020,
+                2,
+                make_membership_payload(subject, "member"),
+            ),
+            make_event(EventType::MessageSent, subject, 1025, 3, vec![]),
+        ];
+
+        let record =
+            compute_participation_record(&events, subject, "ctx-1", [0u8; 32], 2000, &[]).unwrap();
+
+        // First interval 1010-1000 = 10; open interval 1025 (latest) - 1020 = 5.
+        assert_eq!(record.participation_duration_seconds, 15);
+    }
+
+    /// An admin-driven `MemberJoined` leaf attributes the interval to the
+    /// affected member (projected `subject_did`), NOT to the executing admin
+    /// actor.
+    #[test]
+    fn compute_attributes_admin_driven_join_to_affected_member() {
+        let member = "did:key:alice";
+        let events = vec![
+            make_event(
+                EventType::MemberJoined,
+                "did:key:admin", // actor is the admin
+                1000,
+                0,
+                make_membership_payload(member, "member"), // subject is the member
+            ),
+            make_event(EventType::MessageSent, member, 1050, 1, vec![]),
+        ];
+
+        let member_record =
+            compute_participation_record(&events, member, "ctx-1", [0u8; 32], 2000, &[]).unwrap();
+        // Member's interval: 1050 (latest) - 1000 (join) = 50.
+        assert_eq!(member_record.participation_duration_seconds, 50);
+
+        let admin_record =
+            compute_participation_record(&events, "did:key:admin", "ctx-1", [0u8; 32], 2000, &[])
+                .unwrap();
+        // The admin executed the join but is not the affected member — no interval.
+        assert_eq!(admin_record.participation_duration_seconds, 0);
     }
 }

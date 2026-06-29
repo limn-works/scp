@@ -1279,6 +1279,7 @@ async fn forged_participation_profile_signature_rejected() {
             is_member: true,
             is_opted_in: true,
             current_time: 3000,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1331,6 +1332,7 @@ async fn stale_participation_profile_rejected() {
             is_member: true,
             is_opted_in: true,
             current_time: 3000, // profile created at time 3000
+            accessible_attestations: &[],
         },
     )
     .unwrap();
