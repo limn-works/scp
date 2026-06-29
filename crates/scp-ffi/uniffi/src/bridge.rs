@@ -21378,6 +21378,12 @@ mod tests {
     /// custody registry. The test therefore fails closed iff the bridge's
     /// `identity_custody_registry.contains_key` axis (a) check is removed, and is
     /// INDEPENDENT of axis (b) by construction.
+    ///
+    /// Gated on `allow_in_memory_custody`: that feature is what enables
+    /// `scp-core/testing` (hence `scp-runtime/testing`), which provides
+    /// `Supervisor::test_insert_member`. Mirrors the NAPI sibling
+    /// `xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis`.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test]
     async fn xctx_saga_member_but_unhosted_caller_is_rejected_axis_a() {
         let scp = scp_test();

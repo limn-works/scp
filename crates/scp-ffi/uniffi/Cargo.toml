@@ -22,7 +22,14 @@ default = ["server"]
 # material in unprotected heap memory — suitable for testing, CLI, and desktop
 # contexts but NOT for production mobile builds (iOS/Android). Mobile CI MUST
 # NOT enable this feature. See GitHub issue #88 and ADR-006.
-allow_in_memory_custody = ["scp-platform/testing"]
+# `scp-core/testing` (→ `scp-runtime/testing`) mirrors the NAPI bridge, where
+# `allow_in_memory_custody` pulls `dep:scp-testing` → `scp-core/testing`. It
+# makes test-only actor affordances (e.g. `Supervisor::test_insert_member`,
+# used by the member-but-unhosted axis-a saga test) available whenever this
+# feature is on, so per-test `#[cfg(feature = "allow_in_memory_custody")]`
+# gating compiles AND runs under the documented per-crate test invocation
+# (`cargo test -p scp-ffi-uniffi --features allow_in_memory_custody`).
+allow_in_memory_custody = ["scp-platform/testing", "scp-core/testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
