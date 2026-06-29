@@ -23,10 +23,10 @@
  * deleted — callers construct an explicit `new SCP()` and invoke methods
  * directly (e.g. `scp.identityCreate("in_memory")`).
  *
- * NOTE: `SCP` is a NAPI-only feature. The WASM bridge
- * does not expose a multi-instance class surface; attempting to
- * construct `SCP` in a browser environment throws `ValidationError`
- * with `SCP-VALID-7005`.
+ * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
+ * Browser clients connect to a node as remote thin clients over the
+ * network (ADR-055); constructing `SCP` outside a Node.js/Bun runtime
+ * throws `ValidationError` with `SCP-VALID-7005`.
  */
 
 // Deferred imports of opaque classes. The classes import `SCP` for
@@ -106,7 +106,7 @@ interface NativeScpInstance {
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
  * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
- * load failure; this wrapper layers an additional WASM-runtime check
+ * load failure; this wrapper layers an additional runtime check
  * and a stale-addon (no `SCP` class) check, both surfaced as
  * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
  * SDK consumers see when they call `new SCP(...)`.
@@ -114,9 +114,9 @@ interface NativeScpInstance {
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
     throw new ValidationError(
-      "SCP class is not available in WASM runtime — the browser build of " +
-        "@limn-works/scp-ts does not expose a multi-instance class (ADR-034 / " +
-        "ADR-048). Use @limn-works/scp-sdk-napi in a Node.js or Bun process.",
+      "SCP class requires a Node.js or Bun runtime — @limn-works/scp-ts is a " +
+        "native (napi-rs) SDK (ADR-055). Browser clients connect to a node as " +
+        "remote thin clients over the network.",
       "SCP-VALID-7005",
     );
   }
@@ -393,8 +393,8 @@ export interface ReconnectReport {
  * your implementation assigns in {@link generateKeypair}. Byte values are
  * passed and returned as `Uint8Array`.
  *
- * Only available on the NAPI (Node.js / Bun) backend — the browser/WASM build
- * does not expose the multi-instance `SCP` class (ADR-034 / ADR-048).
+ * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
+ * native addon (ADR-048 / ADR-055).
  */
 export interface KeyCustodyProvider {
   /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
@@ -629,9 +629,9 @@ export class SCP {
    * private key material never crosses into the native core (ADR-006). Use this
    * to back a DID with an OS keychain, hardware token, or HSM wrapper.
    *
-   * Node.js / Bun only: the browser (WASM) build of `@limn-works/scp-ts` does
-   * not expose the `SCP` class (ADR-034 / ADR-048), so calling `new SCP(...)`
-   * there already throws before this method is reachable.
+   * Node.js / Bun only: the SDK requires the native addon (ADR-048 / ADR-055),
+   * so calling `new SCP(...)` outside a Node.js/Bun runtime already throws
+   * before this method is reachable.
    *
    * @throws ValidationError if the provider is missing required methods, or
    *   IdentityError if key/DID creation fails inside the provider.
@@ -1362,18 +1362,11 @@ export class SCP {
    * actions (`RemoveMember`) the JSON includes a `commit` field: a hex-encoded
    * MLS Commit that evicts the removed member from the group key schedule.
    *
-   * Commit distribution differs by backend:
-   * - **Native (NAPI) backend — this method.** This call routes through the
-   *   native addon, which has an internal transport and **auto-broadcasts** the
-   *   eviction `commit` to the other context members. The caller does not need
-   *   to relay it.
-   * - **Browser (WASM) backend.** The WASM bridge has no internal transport
-   *   (ADR-034) and performs no automatic broadcast or retry, so a WASM caller
-   *   **MUST relay the `commit`** it receives to the other context members. If
-   *   it does not, the MLS group silently forks: the remaining members never
-   *   advance their epoch and never learn of the eviction.
+   * This call routes through the native addon, which has an internal
+   * transport and **auto-broadcasts** the eviction `commit` to the other
+   * context members. The caller does not need to relay it.
    *
-   * Either way, an empty `commit` string means no MLS commit was produced
+   * An empty `commit` string means no MLS commit was produced
    * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
    * there is nothing to distribute.
    */
@@ -2079,10 +2072,6 @@ export class SCP {
    * "result": <structured VerificationResult>}` on success or
    * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
    * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
-   *
-   * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
-   *   verification requires a native client whose bridge runs the payment
-   *   adapter (ADR-034).
    */
   economyVerifyPaymentReceipts(receiptsJson: string): string {
     return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
@@ -2623,9 +2612,7 @@ export class SCP {
   //
   // Per-instance credential store ops. Each routes through `this.#native`
   // (the NAPI SCP handle) — credentials are isolated to THIS instance's
-  // store (ADR-048 §1). The SCP class is native-only by construction (the
-  // WASM build throws at `new SCP(...)`), so there is no WASM path here;
-  // the credential store lives only in scp-runtime (ADR-034).
+  // store (ADR-048 §1). The credential store lives only in scp-runtime.
   // ───────────────────────────────────────────────────────────────────────
 
   /** Provisions (stores) an encrypted credential for a bridge instance. */
@@ -2786,8 +2773,8 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
  * honoured React/Node build-flag. Apps that ship with
  * `NODE_ENV=production` get the guard; tests run with `NODE_ENV=test`
  * or unset, which passes through. `process` may be undefined in
- * browser/Deno contexts — we treat that as "not production" since the
- * WASM bridge has no `SCP` class at all.
+ * non-Node contexts — we treat that as "not production" since the
+ * `SCP` class is unavailable outside a Node.js/Bun runtime anyway.
  */
 function assertTestHookAllowed(hookName: string): void {
   const env: string | undefined = (() => {

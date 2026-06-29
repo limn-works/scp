@@ -77,7 +77,7 @@ function resolveNapiPackage(): string {
   if (pkg === undefined) {
     throw new TransportError(
       `No native addon available for platform ${key}. ` +
-        "Install the appropriate @limn-works/scp-ts-napi-* package or use the WASM bridge in a browser environment.",
+        "Install the appropriate @limn-works/scp-ts-napi-* package for this platform.",
       "SCP-TRANS-5001",
     );
   }
@@ -679,18 +679,6 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // TTL operations
-    async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
-      // The NAPI bridge does not export contextTtlRemaining — scp-core's
-      // ContextManager tracks TTL internally and does not expose a "remaining"
-      // query. Use contextProposeTtlExtension or contextResetTtlTimer instead.
-      throw new TransportError(
-        "contextTtlRemaining is not available in the native (NAPI) bridge. " +
-          "TTL remaining is a WASM-only concept. Use contextProposeTtlExtension " +
-          "or contextResetTtlTimer for TTL management in native environments.",
-        "SCP-TRANS-5004",
-      );
-    },
-
     async contextExtendTtl(
       _handle: BridgeContextHandle,
       _additionalSecs: number,
@@ -1173,8 +1161,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         epoch: raw.epoch ?? undefined,
         timestamp: raw.timestamp,
         // The NAPI bridge signs the checkpoint in-process; surface the Ed25519
-        // signature (hex). WASM signs the same way (see the `Checkpoint` type
-        // doc and `internal/wasm.ts`).
+        // signature (hex). See the `Checkpoint` type doc.
         signature: raw.signature,
       };
     },
@@ -1985,11 +1972,11 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     async shutdown(timeoutMillis: number): Promise<void> {
-      // #1692: NAPI `shutdown(timeoutMillis: u64)` — napi-rs exposes `u64`
+      // NAPI `shutdown(timeoutMillis: u64)` — napi-rs exposes `u64`
       // as JS `BigInt` on the wire, so the `number` at this layer is
       // coerced to `bigint` before hitting the native binding. The SDK
       // public surface (`BridgeApi.shutdown`, `SCP.shutdown`) keeps
-      // `number` so the WASM / mock paths stay uniform.
+      // `number` so the mock path stays uniform.
       const millis = BigInt(Math.max(0, Math.trunc(timeoutMillis)));
       await (native.shutdown as (t: bigint) => Promise<void>)(millis);
     },

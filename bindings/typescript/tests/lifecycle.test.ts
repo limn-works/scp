@@ -5,13 +5,9 @@
  * - suspend without initialization is a no-op
  * - resume without initialization is a no-op (uninitialized); rejects if shut down
  *
- * The WASM bridge path is covered by the wasm.ts no-op implementation;
- * because the test target is always "native" (see bridge.test.ts), the
- * WASM no-op is exercised indirectly.
- *
  * Skipped at file level when the native NAPI addon is unavailable
- * (browser runtime, missing platform binary for this OS/arch). Same
- * pattern as `persistence.test.ts` and `scp-class.test.ts`.
+ * (missing platform binary for this OS/arch). Same pattern as
+ * `persistence.test.ts` and `scp-class.test.ts`.
  *
  * Phase 4 PR 4 (#1549) deleted the free-function `scpSuspend` / `scpResume`
  * delegates; suspend/resume live only as methods on {@link SCP}.

@@ -196,29 +196,30 @@ describe("scpid roundtrip", () => {
 });
 
 // ---------------------------------------------------------------------------
-// WASM fallback simulation
+// scpidVerify error propagation
 // ---------------------------------------------------------------------------
 
-describe("scp.scpidVerify WASM fallback", () => {
-  it("propagates IdentityError when the bridge lacks verify", async () => {
-    // Simulate the WASM bridge behaviour: scpidVerify throws an
-    // SCP-IDENT-1033 error that the SDK surfaces through mapBridgeError.
-    const wasmLikeNative = createMockNativeScp();
-    installScpidStubs(wasmLikeNative);
-    wasmLikeNative.__stub("scpidVerify", () => {
-      throw new Error("[SCP-IDENT-1033] SCPID verification is not available in the WASM bridge");
+describe("scp.scpidVerify error propagation", () => {
+  it("propagates IdentityError when the bridge rejects verify", async () => {
+    // Simulate a bridge verify failure (e.g. DID resolution failed):
+    // scpidVerify throws an SCP-IDENT-1033 error that the SDK surfaces
+    // through mapBridgeError.
+    const mockNative = createMockNativeScp();
+    installScpidStubs(mockNative);
+    mockNative.__stub("scpidVerify", () => {
+      throw new Error("[SCP-IDENT-1033] SCPID verification failed: DID resolution failed");
     });
-    const { scp: wasmScp } = mountMockScp(wasmLikeNative);
+    const { scp } = mountMockScp(mockNative);
 
     try {
-      const identity = await wasmScp.identityCreate("in_memory");
-      const challengeJson = wasmScp.scpidChallenge("https://example.com", 60);
-      const responseJson = wasmScp.scpidSign(identity.did, "#active", challengeJson);
+      const identity = await scp.identityCreate("in_memory");
+      const challengeJson = scp.scpidChallenge("https://example.com", 60);
+      const responseJson = scp.scpidSign(identity.did, "#active", challengeJson);
 
       // `scp.scpidVerify` is synchronous, so catch through try/catch.
-      expect(() => wasmScp.scpidVerify(responseJson, challengeJson)).toThrow();
+      expect(() => scp.scpidVerify(responseJson, challengeJson)).toThrow();
       try {
-        wasmScp.scpidVerify(responseJson, challengeJson);
+        scp.scpidVerify(responseJson, challengeJson);
       } catch (err) {
         // The raw error surfaces as a plain Error; IdentityError mapping
         // lives on the SDK-facing code paths that go through
@@ -230,13 +231,13 @@ describe("scp.scpidVerify WASM fallback", () => {
       // Exercise the typed IdentityError constructor to anchor the
       // spec-level guarantee that callers can `instanceof`-check.
       const typed = new IdentityError(
-        "[SCP-IDENT-1033] WASM bridge does not support scpid verify",
+        "[SCP-IDENT-1033] SCPID verification failed: DID resolution failed",
         "SCP-IDENT-1033",
       );
       expect(typed).toBeInstanceOf(IdentityError);
       expect(typed.code).toBe("SCP-IDENT-1033");
     } finally {
-      await wasmScp.shutdown(1);
+      await scp.shutdown(1);
     }
   });
 });

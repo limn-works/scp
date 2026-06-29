@@ -13,8 +13,7 @@
  * contract (generateKeypair → getPublicKey → sign), not just argument plumbing.
  *
  * Skips when the platform NAPI addon is not built/installed (the `SCP` class
- * probe fails), matching `real-napi.test.ts`. The browser/WASM build does not
- * expose the `SCP` class at all (ADR-034 / ADR-048).
+ * probe fails), matching `real-napi.test.ts`.
  */
 
 import { describe, expect, test } from "bun:test";

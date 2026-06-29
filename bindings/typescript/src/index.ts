@@ -1,8 +1,8 @@
 /**
  * @limn-works/scp-ts — Shared Context Protocol TypeScript SDK.
  *
- * Dual-target architecture: browser (WASM) and Bun/Node (napi-rs native
- * addon). The correct backend is selected automatically at runtime.
+ * Runs on Bun/Node.js via the napi-rs native addon. Browser clients connect
+ * to a node as remote thin clients over the network (ADR-055).
  *
  * ## Quick start
  *
@@ -210,7 +210,6 @@ export {
   AttestationError,
   ContextError,
   CryptoError,
-  EconomicPolicyUnsupportedOnWasm,
   EconomyError,
   GovernanceError,
   IdentityError,
@@ -223,7 +222,6 @@ export {
   TransportError,
   UcanPermissionError,
   ValidationError,
-  WasmCannotValidateSpendingUcan,
 } from "./errors";
 
 // ---------------------------------------------------------------------------
@@ -275,13 +273,6 @@ export type {
 } from "./types";
 
 export { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
-
-// ---------------------------------------------------------------------------
-// Storage
-// ---------------------------------------------------------------------------
-
-export type { StorageInterface, VfsType } from "./storage/index";
-export { InMemorySqliteStorage, prefixSuccessor, WasmSqliteStorage } from "./storage/index";
 
 // ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)
