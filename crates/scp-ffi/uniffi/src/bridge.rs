@@ -13274,6 +13274,13 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `ucan_validate`.
     ///
+    /// FAIL CLOSED: `presenting_agent_did` is required (no silent security
+    /// default). When it is `None` or empty this returns a validation error
+    /// rather than defaulting to the token's own `aud` — defaulting would make
+    /// the step-5 audience check a tautological self-check (`aud == aud`) that
+    /// does NOT bind the token to any external subject (trust inflation). Mirrors
+    /// the diagnostic `ucan_evaluate` gate.
+    ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     pub async fn ucan_validate(
@@ -13294,6 +13301,22 @@ impl Scp {
                 validate_ucan_token(&token)?;
                 validate_capability_uri(&capability)?;
 
+                // FAIL CLOSED (no silent security default): require an explicit
+                // presenting agent DID instead of defaulting to the token's own
+                // `aud` (which would make the step-5 audience check tautological
+                // and inflate trust). Validated as a pure input before token
+                // parse — mirrors `ucan_evaluate`.
+                let agent_did = presenting_agent_did
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|did| !did.is_empty())
+                    .ok_or_else(|| ScpError::Validation {
+                        msg: "presenting_agent_did is required: ucan_validate will not default \
+                              to the token's audience"
+                            .to_owned(),
+                        code: codes::VALID_7010.to_owned(),
+                    })?;
+
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
                     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
@@ -13313,11 +13336,6 @@ impl Scp {
                 let required_cap: CapabilityUri = capability
                     .parse()
                     .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
-
-                // Determine the presenting agent DID: explicit parameter or token audience.
-                let agent_did = presenting_agent_did
-                    .as_deref()
-                    .unwrap_or(&parsed_token.payload.aud);
 
                 // Build proof resolver from optional proof tokens. Parse errors
                 // use the same shared classification as the root token above.
@@ -16931,6 +16949,44 @@ mod tests {
         assert!(
             empty.is_err(),
             "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
+    /// MUST reject an omitted or empty `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. Pure-input gate before token parse,
+    /// so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_requires_presenting_agent_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        let omitted = scp
+            .ucan_validate(
+                Arc::clone(&handle),
+                "header.payload.sig".to_owned(),
+                "messages:write".to_owned(),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = scp
+            .ucan_validate(
+                handle,
+                "header.payload.sig".to_owned(),
+                "messages:write".to_owned(),
+                Some("   ".to_owned()),
+                None,
+            )
+            .await;
+        assert!(
+            empty.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is empty"
         );
     }
 

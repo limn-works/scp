@@ -258,6 +258,24 @@ pub(crate) async fn ucan_validate_on(
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // FAIL CLOSED (no silent security default): require an explicit presenting
+    // agent DID instead of defaulting to the token's own `aud` (which would make
+    // the step-5 audience check tautological and inflate trust). Validated as a
+    // pure input before any state lookup / token parse — mirrors
+    // `ucan_evaluate_on`.
+    let agent_did = presenting_agent_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: "presenting_agent_did is required: ucan_validate will not default to \
+                          the token's audience"
+                    .to_owned(),
+                code: codes::VALID_7010.to_owned(),
+            })
+        })?;
+
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
     crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
@@ -273,11 +291,6 @@ pub(crate) async fn ucan_validate_on(
                 message: format!("invalid capability URI '{capability}': {e}"),
                 code: codes::PERM_3001.to_owned(),
             })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
 
     // Build proof resolver from optional proof tokens.
     // Uses compute_cid (SHA-256 of encoded JWT) — NOT compute_revocation_cid
@@ -1518,6 +1531,48 @@ mod tests {
         assert!(
             empty.is_err(),
             "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
+    /// MUST reject an omitted / empty `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. Pure-input gate before context
+    /// lookup / token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_requires_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-validate-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let omitted = ucan_validate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            "messages:write".to_owned(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = ucan_validate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            "messages:write".to_owned(),
+            Some("   ".to_owned()),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is empty"
         );
     }
 }
