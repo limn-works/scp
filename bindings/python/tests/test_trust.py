@@ -7,7 +7,7 @@ Covers:
 - Dataclass construction for all trust types
 - Participation requirement verification
 
-See ``.docs/adrs/phase-2.md`` ADR-055 and ``.docs/specs/07-trust-validation-and-capabilities.md``
+See ``.docs/adrs/phase-2.md`` ADR-057 and ``.docs/specs/07-trust-validation-and-capabilities.md``
 §7.2.4 (structured capability evaluation: gate vs. diagnostic), and ADR-017 /
 spec section 9.3 for the four-layer trust model.
 """
@@ -48,7 +48,7 @@ class _FakeStructuredResult:
 
     The structured diagnostic returns this; evaluate_trust reads the six
     attributes directly. Tests construct it to model per-stage outcomes
-    instead of emitting error prose (ADR-055).
+    instead of emitting error prose (ADR-057).
     """
 
     tokens_valid: bool = True
@@ -259,7 +259,7 @@ class TestMultiTokenAndAggregation:
         Trust evaluation assesses each token's GENERAL (intrinsic) validity, so
         it must NOT impose an invoked-capability grant-match. The historical
         bug passed a ``"*"`` sentinel the real bridge rejects; the fix is to
-        pass no capability at all (intrinsic-validity mode, ADR-055 / §7.2.4).
+        pass no capability at all (intrinsic-validity mode, ADR-057 / §7.2.4).
         This pins the call shape so the mock cannot diverge from the real
         None-accepting contract.
         """
@@ -319,7 +319,7 @@ class TestMultiTokenAndAggregation:
 class TestDiagnosticDoesNotRecordNonce:
     """The structured diagnostic probes the nonce read-only and records nothing.
 
-    This is the class of bug ADR-055 surfaces: the OLD prose mocks emitted
+    This is the class of bug ADR-057 surfaces: the OLD prose mocks emitted
     a nonce string unconditionally and never modeled nonce *state*, so a
     repeated-evaluation nonce defect could hide. Here the fakes model state:
 

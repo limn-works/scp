@@ -1118,7 +1118,7 @@ class SCP:
 
         Delegate to ``_scp_core.SCP.ucan_evaluate``, the read-only,
         side-effect-free diagnostic counterpart to :meth:`ucan_validate`
-        (spec §7.2.4, ADR-055). It runs the same 11-step ADR-016 pipeline
+        (spec §7.2.4, ADR-057). It runs the same 11-step ADR-016 pipeline
         but returns a :class:`~scp_sdk.trust.CapabilityValidation` of six
         per-stage booleans instead of throwing at the first failure, and
         probes the nonce read-only (never recording it), so it is safe to
