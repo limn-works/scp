@@ -27,15 +27,46 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ContextError, ScpError
+from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ScpError
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
+
+#: Stable error code (spec §7.3.2) the core surfaces when a context has no
+#: recorded participation facts yet (an empty event log). :func:`evaluate_trust`
+#: branches Layer 2 on this STRUCTURED code — never on error prose — folding
+#: "no facts yet" into a zeroed behavioral record while letting every other
+#: failure propagate. Maps from ``ContextError::NoParticipationFacts``.
+NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
+
+#: Extracts a ``[SCP-CAT-NNNN]`` code from a bridge exception's string form. The
+#: PyO3 bridge formats native exceptions as ``[{code}] {category} error: ...``.
+_SCP_CODE_RE = re.compile(r"\[(SCP-[A-Z]+-\d+)\]")
+
+
+def _coded_bridge_error(exc: Exception) -> ScpError:
+    """Translate a native ``_scp_core`` exception into a coded SDK exception.
+
+    Looks up the SDK class by the bridge exception's class name (via
+    :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP`, defaulting to
+    :class:`~scp_sdk.errors.ContextError`) and recovers the structured
+    ``SCP-CAT-NNNN`` code from the message so callers can branch on
+    ``exc.code`` rather than parsing prose. An already-typed
+    :class:`~scp_sdk.errors.ScpError` is returned unchanged.
+    """
+    if isinstance(exc, ScpError):
+        return exc
+    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
+    match = _SCP_CODE_RE.search(str(exc))
+    code = match.group(1) if match else None
+    return sdk_cls(str(exc), code=code)
+
 
 # ---------------------------------------------------------------------------
 # Lazy bridge import helper
@@ -177,6 +208,13 @@ class BehavioralRecord:
     #: (§7.4) for the subject. Verifier-relative; NOT a context-event count.
     attestation_count: int = 0
 
+    #: Whether ``attestation_count`` is anchored in / verifiable against a
+    #: context Merkle root. Always ``False``: it is a credential-layer,
+    #: verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
+    #: The parallel of ``tool_invocation_count_anchored`` — consumers MUST NOT
+    #: treat the count as Merkle-proven while this is ``False``.
+    attestation_count_anchored: bool = False
+
     #: Unix timestamp (seconds) when the record was computed.
     computed_at: int = 0
 
@@ -258,8 +296,12 @@ class TrustEvaluation:
         default_factory=CapabilityValidation,
     )
 
-    #: Layer 2: Behavioral validation (verified facts).
-    behavioral_record: BehavioralRecord | None = None
+    #: Layer 2: Behavioral validation (verified facts). Always a record, never
+    #: ``None`` — a context with no recorded participation facts yet (an empty
+    #: event log) yields a zeroed :class:`BehavioralRecord` (all counts 0,
+    #: ``*_anchored`` ``False``), so this field is non-null and identical in
+    #: shape to the TypeScript SDK's ``behavioralRecord``.
+    behavioral_record: BehavioralRecord = field(default_factory=BehavioralRecord)
 
     #: Layer 3: Attestation authenticity (verified signatures).
     attestations: list[Attestation] = field(default_factory=list)
@@ -715,17 +757,22 @@ async def evaluate_trust(
     # passes nothing rather than fabricating attestations.
     #
     # A context with no convergent events yet makes the core surface
-    # `EmptyEventLog` as a `ContextError`; that is not a failure for a trust
-    # evaluation (it means "no recorded facts"), so the behavioral record is
-    # left `None` — preserving the prior graceful-degradation behavior.
-    behavioral: BehavioralRecord | None = None
+    # `NoParticipationFacts` as a `ContextError` carrying the dedicated
+    # `SCP-CTX-2076` code. That is not a failure for a trust evaluation (it means
+    # "no recorded facts"), so it is folded into a ZEROED behavioral record —
+    # branching on the STRUCTURED code, never on error prose (ADR-057). Any other
+    # error (NotInitialized, a provider failure, malformed input) is genuine and
+    # MUST propagate — the prior blanket `except ContextError` masked them.
     try:
         behavioral = _participation_record_from(instance, context_id, subject_did, "[]")
-    except ContextError:
+    except ContextError as exc:
+        if exc.code != NO_PARTICIPATION_FACTS_CODE:
+            raise
         logger.debug(
-            "Could not retrieve behavioral record for %s",
+            "No recorded participation facts for %s; using a zeroed behavioral record",
             subject_did,
         )
+        behavioral = BehavioralRecord(subject_did=subject_did)
 
     return TrustEvaluation(
         subject_did=subject_did,
@@ -748,7 +795,13 @@ def _participation_record_from(
     place. ``instance`` is the resolved bridge handle (the mock seam in tests
     or ``scp._native`` in production).
     """
-    record = instance.participation_record(context_id, subject_did, cached_attestations_json)
+    try:
+        record = instance.participation_record(context_id, subject_did, cached_attestations_json)
+    except Exception as exc:  # PyO3 raises native Scp*Error; mock seam may raise SDK errors
+        # Re-raise as a coded SDK exception so callers (and :func:`evaluate_trust`)
+        # branch on the STRUCTURED ``.code`` — e.g. the empty-log
+        # ``SCP-CTX-2076`` — never on error prose.
+        raise _coded_bridge_error(exc) from exc
     return BehavioralRecord(
         subject_did=record.subject_did,
         participation_duration_secs=record.participation_duration_secs,
@@ -759,6 +812,7 @@ def _participation_record_from(
         context_creation_count=record.context_creation_count,
         role_progression_count=record.role_progression_count,
         attestation_count=record.attestation_count,
+        attestation_count_anchored=record.attestation_count_anchored,
         computed_at=record.computed_at,
         event_log_root=record.event_log_root,
     )

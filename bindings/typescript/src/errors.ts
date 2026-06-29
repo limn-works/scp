@@ -202,10 +202,10 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
  * @returns A typed `ScpError` subclass instance.
  */
 export function mapBridgeError(error: unknown): ScpError {
-  // Pass already-typed SDK errors through untouched. The TS guard layer (e.g.
-  // the WASM unsupported-op guards in `internal/wasm.ts`) throws fully-formed
-  // `ScpError` subclasses whose stable `.code` is the constructor argument, not
-  // embedded in the message text. Re-deriving the code from the message via the
+  // Pass already-typed SDK errors through untouched. SDK guard layers throw
+  // fully-formed `ScpError` subclasses whose stable `.code` is the constructor
+  // argument, not embedded in the message text. Re-deriving the code from the
+  // message via the
   // bracket regex below cannot find a `[SCP-CAT-NNNN]` token in those messages,
   // so it would fall back to `SCP-UNKNOWN-0000` and downgrade a precise typed
   // error (e.g. `TransportError` → generic `ScpError`). An already-typed error

@@ -1186,8 +1186,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const fullCap = token.capabilities[0];
       expect(fullCap).toBeDefined();
-      // Must not throw.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string);
+      // Must not throw. The enforcing gate requires the presenting agent (the
+      // token's audience).
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string, member.did);
     });
 
     it("scp.ucanValidate rejects a capability that was not granted", async () => {
@@ -1198,7 +1199,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         encoded: string;
       };
       await expect(
-        scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write"),
+        scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write", member.did),
       ).rejects.toThrow();
     });
 
@@ -1212,9 +1213,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       // First validation succeeds — nonce consumed.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       // Second presentation of the same token must be rejected.
-      await expect(scp.ucanValidate(ctx._rawHandle, token.encoded, cap)).rejects.toThrow();
+      await expect(
+        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
+      ).rejects.toThrow();
     });
 
     it("scp.ucanRevoke causes subsequent validation to fail", async () => {
@@ -1227,7 +1230,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      await expect(scp.ucanValidate(ctx._rawHandle, token.encoded, cap)).rejects.toThrow();
+      await expect(
+        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
+      ).rejects.toThrow();
     });
 
     it("scp.ucanDelegate scopes a minted token down to a subset audience", async () => {
@@ -1978,9 +1983,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      await expect(scp.ucanValidate(ctx._rawHandle, token.encoded, cap)).rejects.toThrow();
+      await expect(
+        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
+      ).rejects.toThrow();
     });
 
     it("E2E broadcast lifecycle: create -> subscribe -> publish -> unsubscribe", async () => {

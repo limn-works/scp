@@ -742,8 +742,12 @@ def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
             handle.context_id,
             _MALFORMED_UCAN,
             # Any well-formed capability string — the malformed-JWT
-            # rejection happens before capability matching.
+            # rejection happens at parse, before capability matching.
             "scp:ctx:any/messages:read",
+            # The enforcing gate fails closed without a presenting agent; supply
+            # one so the malformed JWT is still rejected at PARSE (the behavior
+            # under test), not short-circuited by the fail-closed audience gate.
+            identity.did,
         )
     except Exception as err:
         err_type = type(err).__name__
@@ -803,6 +807,9 @@ def _py_ucan_evaluate_malformed(ctx: OpContext) -> dict[str, Any]:
             handle.context_id,
             _MALFORMED_UCAN,
             "scp:ctx:any/messages:read",
+            # Fail-closed presenting-agent gate: supply one so the malformed JWT
+            # is rejected at PARSE (the behavior under test), not short-circuited.
+            identity.did,
         )
     except Exception as err:
         err_type = type(err).__name__

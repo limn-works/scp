@@ -612,7 +612,9 @@ async function opUcanValidateMalformed(
       identity,
       JSON.stringify(params),
     );
-    await scp.ucanValidate(handle, badToken, capability);
+    // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+    // rejected at PARSE (the behavior under test), not short-circuited.
+    await scp.ucanValidate(handle, badToken, capability, identity.did);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -643,7 +645,9 @@ async function opUcanEvaluateMalformed(
       identity,
       JSON.stringify(params),
     );
-    await scp.ucanEvaluate(handle, badToken, capability);
+    // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+    // rejected at PARSE (the behavior under test), not short-circuited.
+    await scp.ucanEvaluate(handle, badToken, capability, identity.did);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);

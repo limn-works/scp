@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scp_sdk.errors import ContextError
 from scp_sdk.trust import (
     Attestation,
     BehavioralRecord,
@@ -453,6 +454,7 @@ class TestBehavioralRecord:
         assert br.context_creation_count == 0
         assert br.role_progression_count == 0
         assert br.attestation_count == 0
+        assert br.attestation_count_anchored is False
         assert br.computed_at == 0
         assert br.event_log_root == ""
 
@@ -482,6 +484,7 @@ class _FakeParticipationRecord:
         self.context_creation_count = 0
         self.role_progression_count = 0
         self.attestation_count = 0
+        self.attestation_count_anchored = False
         self.computed_at = 1
         self.event_log_root = "00"
         for key, value in overrides.items():
@@ -520,6 +523,8 @@ class TestParticipationRecordWrapper:
         assert record.context_creation_count == 1
         assert record.role_progression_count == 5
         assert record.attestation_count == 0
+        # attestation_count is credential-layer, never Merkle-anchored.
+        assert record.attestation_count_anchored is False
         assert record.computed_at == 42
         assert record.event_log_root == "deadbeef"
 
@@ -557,9 +562,85 @@ class TestParticipationRecordWrapper:
         mock_bridge.event_log_query.assert_not_called()
         assert evaluation.behavioral_record is not None
         assert evaluation.behavioral_record.governance_actions_by == 7
+        assert evaluation.behavioral_record.attestation_count_anchored is False
         # evaluate_trust supplies no cached attestations.
         call = mock_bridge.participation_record.call_args
         assert call.args == ("ctx-1", "did:dht:zbob", "[]")
+
+    def test_evaluate_trust_empty_log_folds_into_zeroed_record(self) -> None:
+        """An empty event log (SCP-CTX-2076) folds into a ZEROED record.
+
+        The branch keys on the STRUCTURED code, not error prose, and the record
+        is non-null (all counts 0) — identical in shape to the populated case.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.side_effect = ContextError(
+            "no recorded participation facts for did:dht:zsubject",
+            code="SCP-CTX-2076",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=mock_scp,
+                    subject_did="did:dht:zsubject",
+                    context_id="ctx-1",
+                )
+            )
+
+        record = evaluation.behavioral_record
+        assert isinstance(record, BehavioralRecord)
+        assert record.subject_did == "did:dht:zsubject"
+        assert record.participation_duration_secs == 0
+        assert record.tool_invocation_count == 0
+        assert record.tool_invocation_count_anchored is False
+        assert record.attestation_count == 0
+        assert record.attestation_count_anchored is False
+        assert record.event_log_root == ""
+
+    def test_evaluate_trust_propagates_non_empty_log_context_error(self) -> None:
+        """A genuine ContextError (NOT SCP-CTX-2076) propagates, never swallowed.
+
+        The prior blanket ``except ContextError`` masked real failures such as
+        NotInitialized; only the dedicated empty-log code is folded gracefully.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.side_effect = ContextError(
+            "context not initialized",
+            code="SCP-CTX-2000",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError, match="not initialized"):
+                asyncio.run(
+                    evaluate_trust(
+                        scp=mock_scp,
+                        subject_did="did:dht:zsubject",
+                        context_id="ctx-1",
+                    )
+                )
+
+    def test_participation_record_translates_native_error_with_code(self) -> None:
+        """The public wrapper re-raises native bridge errors as coded SDK errors.
+
+        A native exception whose string carries ``[SCP-CTX-2076]`` becomes a
+        typed :class:`ContextError` exposing ``.code`` so callers branch on the
+        structured code, not prose.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+
+        class _NativeContextError(Exception):
+            pass
+
+        _NativeContextError.__name__ = "ContextError"  # mimic the PyO3 class name
+        mock_bridge.participation_record.side_effect = _NativeContextError(
+            "[SCP-CTX-2076] context error: no recorded participation facts"
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError) as excinfo:
+                participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+        assert excinfo.value.code == "SCP-CTX-2076"
 
 
 class TestAttestation:
@@ -606,7 +687,12 @@ class TestTrustEvaluation:
         assert te.subject_did == "did:dht:zBob"
         assert te.context_id == "ctx-123"
         assert te.capability_validation.tokens_valid is False
-        assert te.behavioral_record is None
+        # behavioral_record is non-null (a zeroed default), identical in shape to
+        # the TypeScript SDK — never `None`.
+        assert isinstance(te.behavioral_record, BehavioralRecord)
+        assert te.behavioral_record.subject_did == ""
+        assert te.behavioral_record.participation_duration_secs == 0
+        assert te.behavioral_record.attestation_count_anchored is False
         assert te.attestations == []
         assert te.endorsements == []
         assert te.challenge_results == []

@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
+import { ContextError } from "../src/errors";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord } from "../src/types";
@@ -625,7 +626,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // NAPI bridge requires full capability URI with scp:ctx:{contextId}/ prefix.
       const fullUri = token.capabilities[0];
       expect(fullUri).toBeDefined();
-      await napi.ucanValidate(ctx, token.encoded, fullUri as string);
+      // The enforcing gate fails closed without a presenting agent — pass the
+      // subject the token was minted for (its `aud`).
+      await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
     test("rejects validation for an ungranted capability", async () => {
@@ -634,7 +637,27 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      await expect(napi.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, token.encoded, "messages:write", member.did),
+      ).rejects.toThrow();
+    });
+
+    test("ucanValidate fails closed when no presenting agent is supplied", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // No presenting agent → the gate MUST reject rather than default the
+      // audience check to the token's own `aud` (which would be a tautology that
+      // inflates trust). The fail-closed check fires before nonce recording, so
+      // the token's nonce is NOT consumed and the control call below still works.
+      await expect(napi.ucanValidate(ctx, token.encoded, fullUri)).rejects.toThrow();
+
+      // Control: supplying the subject (the token's audience) passes.
+      await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);
     });
 
     test("revokes a token", async () => {
@@ -1059,10 +1082,17 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // A handle whose resolved contextId is a never-created label → empty log.
       const emptyHandle = { contextId: "ctx-never-created-empty-log" };
 
-      // Direct record request on the empty context → typed ContextError.
-      await expect(
-        scpInstance.participationRecord(emptyHandle.contextId, member.did),
-      ).rejects.toThrow(/event log is empty/i);
+      // Direct record request on the empty context → typed ContextError keyed
+      // on the dedicated, machine-detectable SCP-CTX-2076 code (the SDK branches
+      // on the code, not error prose).
+      const directError = await scpInstance
+        .participationRecord(emptyHandle.contextId, member.did)
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+      expect(directError).toBeInstanceOf(ContextError);
+      expect((directError as ContextError).code).toBe("SCP-CTX-2076");
 
       // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
       // Layer-2 empty-log fold is exercised) → graceful zeroed record.
@@ -1077,6 +1107,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(record.contextCreationCount).toBe(0);
       expect(record.roleProgressionCount).toBe(0);
       expect(record.attestationCount).toBe(0);
+      // attestationCount is credential-layer, never Merkle-anchored.
+      expect(record.attestationCountAnchored).toBe(false);
       // Empty-log fold uses the all-zero root placeholder, not a real hash.
       expect(record.eventLogRoot).toBe("");
     });
@@ -1727,15 +1759,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const writeCap = writeToken.capabilities[0] as string;
       expect(writeCap).toBeDefined();
 
-      // Validate both capabilities (separate tokens, separate nonces).
-      await napi.ucanValidate(ctx, readToken.encoded, readCap);
-      await napi.ucanValidate(ctx, writeToken.encoded, writeCap);
+      // Validate both capabilities (separate tokens, separate nonces). The
+      // enforcing gate requires the presenting agent (the token's audience).
+      await napi.ucanValidate(ctx, readToken.encoded, readCap, member.did);
+      await napi.ucanValidate(ctx, writeToken.encoded, writeCap, member.did);
 
       // Revoke the read token (revoker is the admin/context creator).
       await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
 
       // Verify the revoked token is rejected.
-      await expect(napi.ucanValidate(ctx, readToken.encoded, readCap)).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, readToken.encoded, readCap, member.did),
+      ).rejects.toThrow();
 
       // Mint a fresh write token to verify non-revoked capabilities still work.
       // The original writeToken's nonce was already consumed at line 927, so
@@ -1743,7 +1778,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // the revocation check is reached.
       const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
       const freshWriteCap = freshWriteToken.capabilities[0] as string;
-      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap);
+      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap, member.did);
     });
   });
 
