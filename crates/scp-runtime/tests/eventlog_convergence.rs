@@ -23,6 +23,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use scp_event_log::payload::{MembershipChangePayload, encode_payload};
 use scp_event_log::{EventPayload, EventType};
 use scp_runtime::context::builder::ContextEventLogProvider;
 use scp_runtime::context::providers::MerkleEventLogProvider;
@@ -39,6 +40,18 @@ const TS_CREATED: u64 = 1_700_000_000;
 const TS_JOIN_ALICE: u64 = 1_700_000_060;
 const TS_JOIN_BOB: u64 = 1_700_000_120;
 const TS_GOV: u64 = 1_700_000_180;
+
+/// Builds the subject-bearing `MemberJoined` payload (ADR-011 amendment): the
+/// affected member's DID plus the default "member" role. Convergent by
+/// construction — every honest member appends the identical payload bytes for
+/// the same join, so it does not perturb the equal-stream/equal-root property.
+fn join_payload(subject_did: &str) -> EventPayload {
+    encode_payload(&MembershipChangePayload {
+        subject_did: subject_did.to_owned(),
+        role_name: "member".to_owned(),
+    })
+    .expect("encode membership-change payload")
+}
 
 /// The convergent stream every honest member appends identically and in the
 /// same order: context creation + two joins + a governance action. These are
@@ -60,10 +73,22 @@ fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u6
     let _ = local_clock_offset;
     log.append_context_event(&CTX, EventType::ContextCreated, ALICE, TS_CREATED)
         .unwrap();
-    log.append_context_event(&CTX, EventType::MemberJoined, ALICE, TS_JOIN_ALICE)
-        .unwrap();
-    log.append_context_event(&CTX, EventType::MemberJoined, BOB, TS_JOIN_BOB)
-        .unwrap();
+    log.append_context_event_with_payload(
+        &CTX,
+        EventType::MemberJoined,
+        ALICE,
+        join_payload(ALICE),
+        TS_JOIN_ALICE,
+    )
+    .unwrap();
+    log.append_context_event_with_payload(
+        &CTX,
+        EventType::MemberJoined,
+        BOB,
+        join_payload(BOB),
+        TS_JOIN_BOB,
+    )
+    .unwrap();
     log.append_context_event_with_payload(
         &CTX,
         EventType::GovernanceAction,
@@ -88,17 +113,19 @@ fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock
         TS_CREATED + local_clock_offset,
     )
     .unwrap();
-    log.append_context_event(
+    log.append_context_event_with_payload(
         &CTX,
         EventType::MemberJoined,
         ALICE,
+        join_payload(ALICE),
         TS_JOIN_ALICE + local_clock_offset,
     )
     .unwrap();
-    log.append_context_event(
+    log.append_context_event_with_payload(
         &CTX,
         EventType::MemberJoined,
         BOB,
+        join_payload(BOB),
         TS_JOIN_BOB + local_clock_offset,
     )
     .unwrap();
