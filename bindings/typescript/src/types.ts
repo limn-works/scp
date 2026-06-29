@@ -874,24 +874,60 @@ export interface TrustEvaluation {
    * pass).
    */
   readonly capabilityValidation: CapabilityValidation;
-  /** Layer 2: behavioral record computed from the event log. */
+  /**
+   * Layer 2: behavioral record. The Rust-computed participation facts
+   * (§7.3.2), RECEIVED from the core via {@link "./scp".SCP.participationRecord}
+   * — never recomputed client-side, so every binding observes the identical
+   * facts for the same context/subject.
+   */
   readonly behavioralRecord: BehavioralRecord;
   /** Layer 3: attestations for the subject. */
   readonly attestations: readonly AttestationSummary[];
 }
 
-/** Behavioral record computed from a context event log. */
+/**
+ * The participation facts (§7.3.2) for a subject DID in a context.
+ *
+ * The scalar projection of scp-core's `ParticipationRecord`, computed ONCE in
+ * the shared Rust core and surfaced through the NAPI `participationRecord` op
+ * (`NapiParticipationRecord`). The SDK RECEIVES these facts rather than
+ * re-aggregating event-log collections — eliminating cross-binding divergence
+ * by construction. Mirrors the Python SDK `BehavioralRecord` shape and the
+ * Rust `ParticipationFacts` 1:1.
+ */
 export interface BehavioralRecord {
-  /** Number of messages sent or actions taken. */
-  readonly participationCount: number;
-  /** Duration of participation in seconds. */
-  readonly participationDurationSeconds: number;
-  /** Tool invocations keyed by tool ID. */
-  readonly toolInvocations: Readonly<Record<string, number>>;
-  /** Governance actions initiated by this participant. */
-  readonly governanceActionsBy: number;
-  /** Governance actions targeting this participant. */
+  /** The DID whose participation is summarized. */
+  readonly subjectDid: string;
+  /** Total seconds of context participation (§7.3.2). */
+  readonly participationDurationSecs: number;
+  /** Count of governance actions taken against this identity. */
   readonly governanceActionsAgainst: number;
+  /** Count of governance actions initiated by this identity. */
+  readonly governanceActionsBy: number;
+  /** Total tool invocations across all tool types. */
+  readonly toolInvocationCount: number;
+  /**
+   * Whether {@link toolInvocationCount} is anchored in the canonical Merkle
+   * log. `false` until ADR-051 makes `ToolInvoked` a convergent leaf
+   * (§7.3.2; ADR-011 amendment exclusion taxonomy §2). Consumers MUST NOT
+   * treat the count as Merkle-proven while this is `false`.
+   */
+  readonly toolInvocationCountAnchored: boolean;
+  /** Number of contexts created by the subject (`ChildContextCreated`). */
+  readonly contextCreationCount: number;
+  /** Number of role transitions for the subject (`RoleAssigned`). */
+  readonly roleProgressionCount: number;
+  /**
+   * Number of accessible, currently-valid credential-layer attestations
+   * (§7.4) for the subject. A credential-layer fact, NOT a context-event
+   * count and NOT Merkle-anchored — verifier-relative (two agents may
+   * compute different counts from different accessible attestation sets).
+   */
+  readonly attestationCount: number;
+  /** Unix timestamp (seconds) when the record was computed. */
+  readonly computedAt: number;
+  /** Merkle root (hex) of the event log at computation time. */
+  readonly eventLogRoot: string;
 }
 
 /** Summary of an attestation. */

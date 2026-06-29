@@ -33,6 +33,31 @@ const ALL_PASS: CapabilityValidation = {
 };
 
 /**
+ * Builds a fake `NapiParticipationRecord`-shaped object (the native
+ * `participationRecord` return). The 11 fields map 1:1 to the SDK
+ * `BehavioralRecord`. Defaults model an empty event log; pass `overrides` to
+ * pin specific facts.
+ */
+function fakeParticipationRecord(
+  overrides: Partial<Record<string, number | string | boolean>> = {},
+): Record<string, number | string | boolean> {
+  return {
+    subjectDid: "did:dht:subject",
+    participationDurationSecs: 0,
+    governanceActionsAgainst: 0,
+    governanceActionsBy: 0,
+    toolInvocationCount: 0,
+    toolInvocationCountAnchored: false,
+    contextCreationCount: 0,
+    roleProgressionCount: 0,
+    attestationCount: 0,
+    computedAt: 1,
+    eventLogRoot: "00",
+    ...overrides,
+  };
+}
+
+/**
  * Builds a stateful, read-only `ucanEvaluate` mock keyed by token.
  *
  * The model is the production contract: evaluation is a read-only probe that
@@ -130,7 +155,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     cleanup = () => scp.shutdown(0);
     const probe = statefulUcanEvaluate();
     native.__stub("ucanEvaluate", probe.fn);
-    native.__stub("eventLogQuery", async () => []);
+    native.__stub("participationRecord", () => fakeParticipationRecord());
 
     const first = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", ["token-a"]);
     const second = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", ["token-a"]);
@@ -153,7 +178,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       "token-b": { withinCeiling: false },
     });
     native.__stub("ucanEvaluate", probe.fn);
-    native.__stub("eventLogQuery", async () => []);
+    native.__stub("participationRecord", () => fakeParticipationRecord());
 
     const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", [
       "token-a",
@@ -178,7 +203,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     cleanup = () => scp.shutdown(0);
     // ucanEvaluate must NOT be called when no tokens are supplied; leave it
     // unstubbed (strict mode would throw if it were called).
-    native.__stub("eventLogQuery", async () => []);
+    native.__stub("participationRecord", () => fakeParticipationRecord());
 
     const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
     expect(result.capabilityValidation).toEqual({
@@ -193,58 +218,74 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(native.__calls("ucanEvaluate").length).toBe(0);
   });
 
-  it("builds the Layer-2 behavioral record from ToolInvoked events", async () => {
+  it("RECEIVES the Layer-2 behavioral record from the core (no client-side classify)", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
-    // The mock returns the REAL NAPI/WASM bridge shape that `eventLogQuery`
-    // dispatches verbatim — `{eventType, actorDid, timestamp, payloadJson (a
-    // JSON STRING), sequence}`. The bridge never emits a `payload` OBJECT, and
-    // the queryable payloadJson carries no tool id, so all ToolInvoked events
-    // bucket under the literal "ToolInvoked" key (spec §7.2.4; per-tool-type
-    // keying awaits ADR-051's richer payload).
-    native.__stub("eventLogQuery", async () => [
-      {
-        eventType: "ToolInvoked",
-        actorDid: "did:dht:subject",
-        timestamp: 1,
-        payloadJson: JSON.stringify({ hash: "aa" }),
-        sequence: 0,
-      },
-      {
-        eventType: "ToolInvoked",
-        actorDid: "did:dht:subject",
-        timestamp: 2,
-        payloadJson: JSON.stringify({ hash: "bb" }),
-        sequence: 1,
-      },
-      {
-        eventType: "GovernanceActionExecuted",
-        actorDid: "did:dht:subject",
-        timestamp: 3,
-        payloadJson: JSON.stringify({ hash: "cc" }),
-        sequence: 2,
-      },
-    ]);
+    // The behavioral record is now flattened ONCE in the Rust core and surfaced
+    // by the native `participationRecord` op. The SDK projects the 11 typed
+    // fields straight through — it never re-aggregates an event-log collection.
+    native.__stub("participationRecord", () =>
+      fakeParticipationRecord({
+        participationDurationSecs: 300,
+        governanceActionsAgainst: 2,
+        governanceActionsBy: 1,
+        toolInvocationCount: 2,
+        contextCreationCount: 1,
+        roleProgressionCount: 3,
+        attestationCount: 0,
+        eventLogRoot: "deadbeef",
+      }),
+    );
 
     const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
-    expect(result.behavioralRecord.participationCount).toBe(3);
-    expect(result.behavioralRecord.toolInvocations).toEqual({ ToolInvoked: 2 });
+    expect(result.behavioralRecord.subjectDid).toBe("did:dht:subject");
+    expect(result.behavioralRecord.participationDurationSecs).toBe(300);
+    expect(result.behavioralRecord.governanceActionsAgainst).toBe(2);
     expect(result.behavioralRecord.governanceActionsBy).toBe(1);
+    expect(result.behavioralRecord.toolInvocationCount).toBe(2);
+    // tool_invocation_count is NOT Merkle-anchored until ADR-051.
+    expect(result.behavioralRecord.toolInvocationCountAnchored).toBe(false);
+    expect(result.behavioralRecord.contextCreationCount).toBe(1);
+    expect(result.behavioralRecord.roleProgressionCount).toBe(3);
+    // attestation_count is a credential-layer fact; evaluateTrust passes no
+    // cached attestations, so it is 0 (honest, verifier-relative).
+    expect(result.behavioralRecord.attestationCount).toBe(0);
+    expect(result.behavioralRecord.eventLogRoot).toBe("deadbeef");
     expect(result.subjectDid).toBe("did:dht:subject");
     expect(result.contextId).toBe("ctx-1");
   });
 
-  it("scopes the Layer-2 event-log query to the subject DID", async () => {
+  it("dispatches participationRecord with the subject, context, and an empty attestation set", async () => {
     const mock = createMockNativeScp();
     const { scp } = mountMockScp(mock);
     cleanup = () => scp.shutdown(0);
-    mock.__stub("eventLogQuery", async () => []);
+    mock.__stub("participationRecord", () => fakeParticipationRecord());
 
     await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
-    const call = mock.__lastCall("eventLogQuery");
+    const call = mock.__lastCall("participationRecord");
     expect(call).toBeDefined();
-    // The filter is the second arg, serialized as JSON with the actorDid.
-    const filter = JSON.parse(call?.args[1] as string) as { actorDid?: string };
-    expect(filter.actorDid).toBe("did:dht:subject");
+    // participationRecord(contextId, subjectDid, cachedAttestationsJson)
+    expect(call?.args[0]).toBe("ctx-1");
+    expect(call?.args[1]).toBe("did:dht:subject");
+    // evaluateTrust passes no cached attestations → empty JSON array.
+    expect(call?.args[2]).toBe("[]");
+  });
+
+  it("exposes participationRecord directly, projecting the typed core facts", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("participationRecord", () =>
+      fakeParticipationRecord({
+        subjectDid: "did:dht:alice",
+        participationDurationSecs: 42,
+        attestationCount: 5,
+      }),
+    );
+
+    const record = await scp.participationRecord("ctx-1", "did:dht:alice");
+    expect(record.subjectDid).toBe("did:dht:alice");
+    expect(record.participationDurationSecs).toBe(42);
+    expect(record.attestationCount).toBe(5);
+    expect(record.toolInvocationCountAnchored).toBe(false);
   });
 });
