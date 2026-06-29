@@ -1399,9 +1399,18 @@ fn xctx_saga_hosted_non_member_caller_rejected() {
             msg.contains("SCP-SAGA-13050"),
             "expected caller-axis SCP-SAGA-13050, got: {msg}"
         );
+        // BRIDGE-UNIQUE axis-b substring. The producer's gate 1 ALSO rejects a
+        // non-member with SCP-SAGA-13050 and a message containing the bare
+        // "is not a member of caller" phrasing — so asserting only "not a member
+        // of" would PASS even if the PyO3 membership axis were removed (the
+        // producer's gate would surface the same code + substring). Asserting
+        // the bridge-unique "is hosted by this bridge but is not a member of"
+        // prefix (which the producer never emits) makes this test fail closed if
+        // the bridge's axis-b `is_member` check is deleted.
         assert!(
-            msg.contains("not a member of"),
-            "message must name the membership mismatch, got: {msg}"
+            msg.contains("is hosted by this bridge but is not a member of"),
+            "message must be the BRIDGE axis-b membership rejection (not the producer gate-1 \
+             message), got: {msg}"
         );
     });
 }

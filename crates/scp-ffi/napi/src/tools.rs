@@ -1971,4 +1971,182 @@ mod tests {
         assert_eq!(out["sum"], 42, "committed output sum must be the handler's");
         assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
     }
+
+    // ------------------------------------------------------------------
+    // Caller-principal binding (§6.2.4 *Caller authentication*) — the two
+    // axes `enforce_caller_principal_binding` enforces at the NAPI seam,
+    // BEFORE the saga runs. These are the behavioral counterparts of the
+    // PyO3 `e2e_bridge.rs` axis-(a)/axis-(b) tests.
+    //
+    // MUTATION-RESISTANCE: the producer's own gate 1 ALSO rejects a
+    // non-member caller with SCP-SAGA-13050. Asserting only the code (as the
+    // TS addon test does) would PASS even if this bridge's binding were
+    // removed — the producer would surface 13050 anyway. So each test asserts
+    // the BRIDGE-UNIQUE message substring that `enforce_caller_principal_binding`
+    // emits and the producer never does:
+    //   axis (a): "is not an identity hosted by this bridge instance"
+    //   axis (b): "is hosted by this bridge but is not a member of"
+    // The producer's gate-1 message is "... is not a member of caller context
+    // '...' — not authorized to initiate over it", which contains neither.
+    // ------------------------------------------------------------------
+
+    /// Creates an ephemeral single-admin context owned by `owner_identity` whose
+    /// ceiling carries the saga-relevant capabilities. Mirrors the e2e setup but
+    /// without the tool/interface wiring the two binding-rejection tests never
+    /// reach (they abort at the caller gate before the producer runs).
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn create_saga_context(
+        bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+        owner_identity: &crate::identity::NapiIdentity,
+    ) -> crate::context::NapiContextHandle {
+        let params = serde_json::json!({
+            "ceiling": [
+                "governance:propose",
+                "tool:interface",
+                "tool:register",
+                "tools:invoke",
+                "messages:read",
+                "messages:write"
+            ],
+            "governance": "single_admin",
+            "memoryScope": "ephemeral",
+        })
+        .to_string();
+        crate::context::context_create_on(bi, owner_identity, params)
+            .await
+            .expect("context_create should succeed")
+    }
+
+    /// (a) Caller-principal binding, hosted axis: a `caller_did` this bridge
+    /// instance does NOT host is rejected with `SagaAborted` (SCP-SAGA-13050)
+    /// BEFORE the saga runs. Asserts the bridge-unique axis-(a) substring so the
+    /// test fails if `enforce_caller_principal_binding`'s registry check is
+    /// removed (the producer's gate-1 message never carries this phrasing).
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_saga_unhosted_caller_rejected_before_saga() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let handle_a = create_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_saga_context(&bi, &owner_identity).await;
+        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_unhosted_probe");
+
+        // A syntactically valid DID that was never created on this instance.
+        let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001".to_owned();
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+        // explicitly rather than `expect_err`.
+        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            unhosted_caller,
+            tool_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms,
+            1,
+            None,
+        ))
+        .await
+        else {
+            panic!("an unhosted caller_did must be rejected before the saga runs")
+        };
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::SAGA_13050),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // BRIDGE-UNIQUE axis-(a) substring — the producer never emits it.
+        assert!(
+            msg.contains("is not an identity hosted by this bridge instance"),
+            "message must be the BRIDGE axis-(a) hosted-principal rejection (not a producer \
+             message), got: {msg}"
+        );
+    }
+
+    /// (b) Caller-principal binding, membership axis: a `caller_did` that IS
+    /// hosted by this bridge but is NOT a member of `caller_context_id` is
+    /// rejected with `SagaAborted` (SCP-SAGA-13050) BEFORE the saga runs. Asserts
+    /// the bridge-unique axis-(b) substring so the test fails if the bridge's
+    /// `is_member` check is removed — the producer's gate-1 message shares only
+    /// the bare "not a member of" phrasing, not this prefix.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_saga_hosted_non_member_caller_rejected() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        // A SECOND hosted identity that is NOT a member of the caller context.
+        let stranger_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let stranger = stranger_identity.inner.did.clone();
+
+        // Contexts created by `owner` ⇒ `stranger` is hosted but not a member.
+        let handle_a = create_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_saga_context(&bi, &owner_identity).await;
+        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_nonmember_probe");
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+        // explicitly rather than `expect_err`.
+        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            stranger, // hosted, but not a member of caller context A
+            tool_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms,
+            1,
+            None,
+        ))
+        .await
+        else {
+            panic!("a hosted non-member caller must be rejected before the saga runs")
+        };
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::SAGA_13050),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // BRIDGE-UNIQUE axis-(b) substring — the producer's gate-1 message
+        // carries only the bare "not a member of" phrasing, not this prefix.
+        assert!(
+            msg.contains("is hosted by this bridge but is not a member of"),
+            "message must be the BRIDGE axis-(b) membership rejection (not the producer gate-1 \
+             message), got: {msg}"
+        );
+    }
 }
