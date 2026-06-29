@@ -222,6 +222,81 @@ pub trait ContextEventLogProvider: Send + Sync {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    /// Appends a `MemberJoined` / `MemberLeft` leaf carrying a subject-bearing
+    /// [`MembershipChangePayload`](scp_event_log::payload::MembershipChangePayload).
+    ///
+    /// `subject_did` is the *affected member* (joined/left) — NOT the governance
+    /// actor (`actor_did`), which on admin-driven membership changes is the
+    /// executing admin. `role_name` is the role the member holds at the
+    /// membership change. The leaf is convergent (ADR-011 amendment); the
+    /// participation record (§7.3.2) attributes the join/leave interval to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    fn append_membership_change_leaf(
+        &self,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        subject_did: &str,
+        role_name: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: subject_did.to_owned(),
+                role_name: role_name.to_owned(),
+            },
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            context_id,
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+    }
+
+    /// Appends a `RoleAssigned` leaf carrying a subject-bearing
+    /// [`RoleAssignedPayload`](scp_event_log::payload::RoleAssignedPayload).
+    ///
+    /// `subject_did` is the *affected member* whose role changed — NOT the
+    /// governance actor (`actor_did`). `role` is the newly-assigned role. The
+    /// leaf is convergent (ADR-011 amendment); the participation record (§7.3.2)
+    /// attributes the role transition (`role_progression_count`) to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    fn append_role_assigned_leaf(
+        &self,
+        context_id: &[u8; 32],
+        actor_did: &str,
+        subject_did: &str,
+        role: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+                subject_did: subject_did.to_owned(),
+                role: role.to_owned(),
+            })
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            context_id,
+            scp_event_log::EventType::RoleAssigned,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+    }
+
     // -- Entry reading (symmetric with append) --------------------------------
 
     /// Returns the event log entries for a context.
