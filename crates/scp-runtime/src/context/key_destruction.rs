@@ -22,6 +22,7 @@
 //!   path based on [`MemoryScope`].
 
 use scp_protocol::context::ContextError;
+use scp_protocol::context::MemoryScope;
 use scp_protocol::context::close::{
     CloseAction, CloseEvent, ContextCloseReason, DEFAULT_VERIFICATION_WINDOW_SECS,
     SummaryVerificationWindow,
@@ -30,7 +31,6 @@ use scp_protocol::context::memory_scope::{
     BlobId, KeyDestructionAttestation, KeyDestructionLevel, KeyDestructionResult,
     RelayDeletionRequest,
 };
-use scp_protocol::context::{MemoryScope, context_id_bytes};
 
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
@@ -81,7 +81,14 @@ impl<'a> KeyDestructionOrchestrator<'a> {
         attestation_level: KeyDestructionLevel,
         now: u64,
     ) -> Result<KeyDestructionResult, ContextError> {
-        let ctx_bytes = context_id_bytes(context_id);
+        // ADR-056: resolve the context-id string through the canonical
+        // chokepoint so destruction targets the SAME 32-byte digest the live
+        // MLS group and sender keys are keyed under. The raw `SHA-256(id)`
+        // primitive would address a different (nonexistent) group, so
+        // `destroy_mls_group` / `destroy_sender_key` would silently no-op and
+        // report KeysDestroyed while the real group SURVIVES — a fail-open on
+        // Ephemeral close.
+        let ctx_bytes = crate::context::state::context_id_to_bytes(context_id);
 
         // Step 1: Destroy MLS group state.
         self.crypto

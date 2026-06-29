@@ -127,7 +127,10 @@ pub fn build_encrypted_envelope(
     source_provenance: Option<&SourceContextInfo>,
     message_type: MessageType,
 ) -> Result<Vec<u8>, ContextError> {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: key the send-path crypto by the canonical digest (matches
+    // `state.context_id` and the MLS group keyed at creation), not a re-hash
+    // of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
     let provenance = source_provenance.map(|source_info| {
         let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
         let dp = scp_protocol::provenance::attach::attach_provenance(
@@ -880,7 +883,8 @@ pub async fn send_message(
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
-    let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
 
     // Pre-economy active + commit-fault gates run FIRST (matching the legacy
     // ordering: `require_active` → `check_commit_fault_marker` → signer-`None` →
@@ -1408,7 +1412,9 @@ pub fn deliver_incoming(
     encrypted_blob: &[u8],
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<DeliverOutcome, ContextError> {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: canonical digest (matches the MLS group / sender keys), not a
+    // re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
 
     state::require_active(view.handle_mut())?;
 
@@ -2386,7 +2392,8 @@ fn build_snapshot_for_persist(
     context_id: &str,
 ) -> crate::context::state::ContextSnapshot {
     let mut snapshot = build_snapshot_from_state(state);
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let ctx_id_bytes = state::context_id_to_bytes(context_id);
     match deps.crypto.export_crypto_state(&ctx_id_bytes) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -2791,7 +2798,8 @@ pub fn validate_and_drain_timeouts(
 
     // Drain timed-out gaps. `drain_timed_out_gaps` bundles the simultaneous
     // `&mut reorder_buffer` + `&sequence_tracker` borrow internally.
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
     let timed_out = view.drain_timed_out_gaps(now_ms);
     for (gap_info, messages) in timed_out {
         let gap_event = ContextEvent::SequenceGapDetected {
@@ -2884,7 +2892,8 @@ pub fn buffer_ahead_message(
     };
 
     if let Some((mut gap_info, messages)) = view.reorder_buffer_mut().buffer(buffered_msg) {
-        let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        // ADR-056: canonical digest, not a re-hash of the hex id.
+        let context_id_bytes = state::context_id_to_bytes(context_id);
         let expected = view
             .sequence_tracker_mut()
             .expected_sequence(context_id, sender_did)

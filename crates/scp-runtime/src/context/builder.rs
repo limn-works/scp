@@ -689,13 +689,20 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
 // Context creation (Phase 2)
 // ---------------------------------------------------------------------------
 
-/// Generates a deterministic 32-byte context identifier from the context's
-/// string ID.
+/// Resolves the context's string ID to the 32-byte value that keys its MLS
+/// group, broadcast/sender keys, and event log at creation.
 ///
-/// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`super::context_id_bytes`].
+/// Delegates to the canonical [`super::state::context_id_to_bytes`]
+/// (ADR-056): a real 64-hex context id (as [`generate_context_id`] produces)
+/// resolves to its raw digest, so the MLS group, sender key, and event log
+/// created here are keyed under the SAME bytes that `PerContextState.context_id`
+/// holds (`context_id_to_bytes` of the same id). A synthetic /
+/// non-context string hashes exactly as before. Without this alignment,
+/// creation would key crypto under `SHA-256(id)` while live state keys under
+/// the digest — every subsequent send/receive for a real context would miss
+/// the group.
 fn context_id_bytes(context_id: &str) -> [u8; 32] {
-    super::context_id_bytes(context_id)
+    super::state::context_id_to_bytes(context_id)
 }
 
 /// Executes the two-phase context creation flow.
@@ -944,5 +951,82 @@ mod tests {
         );
         let _mls = provider.mls_backend();
         let _hpke = provider.hpke_backend();
+    }
+
+    /// ADR-056 (Model A) / §6.2.4:276 conformance: a context whose
+    /// id is a real 64-hex string (the shape `generate_context_id` produces:
+    /// `hex(32 random bytes)`) keys its creation crypto under the **decoded
+    /// digest**, NOT under `SHA-256(id)`. This is the load-bearing fix: the
+    /// §6.2.4 cross-context tool saga compares the wire `target_context_id`
+    /// (the raw digest) against `state.context_id`, and `state.context_id` is
+    /// set by `context_id_to_bytes` of the same id — so the MLS group,
+    /// sender key, and event log created here MUST live under that identical
+    /// digest, or every real-context message/saga would address the wrong
+    /// group.
+    #[tokio::test]
+    async fn create_context_keys_crypto_under_decoded_digest_not_sha256() {
+        use crate::context::state::context_id_to_bytes;
+
+        // A canonical id: the lowercase-hex of a known 32-byte digest, exactly
+        // the form `generate_context_id` (scp-ffi-common) emits.
+        let digest: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // Boundary assertion: the canonical resolver (the single chokepoint the
+        // historical call sites route through) DECODES a 64-hex id to its
+        // digest and does NOT re-hash it. `SHA-256(id)` (the pre-ADR-056
+        // keying) is a DIFFERENT value — pinning the double-hash fix.
+        assert_eq!(
+            context_id_to_bytes(&id),
+            digest,
+            "a real 64-hex id must resolve to its decoded digest"
+        );
+        let sha256_of_id = scp_protocol::context::context_id_bytes(&id);
+        assert_ne!(
+            sha256_of_id, digest,
+            "test precondition: SHA-256(hex(digest)) must differ from the digest, \
+             else the test could not distinguish decode from hash"
+        );
+
+        // Drive real creation crypto. A real MLS provider + no-op transport /
+        // event log isolates the keying behavior under test.
+        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let handle = create_context(
+            id.clone(),
+            ContextParams::default(),
+            &crypto,
+            &TestTransport,
+            &TestEventLog,
+            TEST_DID,
+            1_700_000_000,
+        )
+        .await
+        .expect("create_context should succeed for a canonical 64-hex id");
+        assert_eq!(handle.context_id(), id, "handle carries the canonical id");
+
+        // Crypto-keying-site assertion: the MLS group / crypto state created by
+        // `create_context` lives under the DECODED digest. `export_crypto_state`
+        // returns the serialized state for a keyed context and an EMPTY vec for
+        // an unkeyed one (no entry under that key).
+        let under_digest = crypto
+            .export_crypto_state(&digest)
+            .expect("export under the decoded digest must not error");
+        assert!(
+            !under_digest.is_empty(),
+            "crypto state MUST be keyed under the decoded digest"
+        );
+        let under_sha256 = crypto
+            .export_crypto_state(&sha256_of_id)
+            .expect("export under SHA-256(id) must not error");
+        assert!(
+            under_sha256.is_empty(),
+            "crypto state MUST NOT be keyed under SHA-256(id) — that would be the \
+             pre-ADR-056 double-hash, diverging from state.context_id and the §6.2.4 wire digest"
+        );
     }
 }

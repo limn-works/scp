@@ -5692,11 +5692,13 @@ impl ClassSCell
         let event_log = crate::context::providers::event_log::MerkleEventLogProvider::new();
         let ctx_byte = 0x73u8;
         let ctx = ctx_hex(ctx_byte);
-        // The event-log key the consequence reader derives from the context-id
-        // STRING is `SHA-256(context_id)` (NOT the raw bytes), so the seeded
-        // governance leaf must be stored under that same hashed key to be visible to
+        // ADR-056: the event-log key the consequence reader derives from the
+        // context-id STRING is the canonical digest — for a real 64-hex id
+        // (`ctx_hex` = `hex([ctx_byte; 32])`) that is the DECODED digest
+        // `[ctx_byte; 32]`, NOT `SHA-256(ctx)`. The seeded governance leaf must
+        // be stored under that same digest to be visible to
         // `event_log_entries_for_consequences`.
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let sender = DID("did:example:paid-suspend-sender".to_owned());
 
         // Seed a convergent `WarningCount` evidence leaf: a `GovernanceAction`

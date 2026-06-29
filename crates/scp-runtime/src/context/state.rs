@@ -2025,9 +2025,57 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 // hoisted `lifecycle_helpers::create_context` path. Removed in
 // ADR-049 commit 12 alongside the rest of the manager-only code.
 
-/// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
+/// Resolves a context-ID string to the canonical 32-byte value that keys its
+/// MLS group, sender keys, and event log.
+///
+/// This is the SINGLE chokepoint (ADR-056) through which every context-id
+/// string is turned into keying bytes. Per ADR-056 (Model A) and spec
+/// §6.2.4:276, a context's canonical identity IS its 32-byte digest, and the
+/// id STRING is `hex(digest)` — exactly the form [`generate_context_id`]
+/// produces (32 CSPRNG bytes, lowercase-hex encoded, §18.4.1). For such a
+/// real context id the canonical bytes are the digest itself, recovered by
+/// **decoding** the hex — NOT by re-hashing the already-hex-encoded digest
+/// (which would double-hash and diverge from the raw digest the §6.2.4
+/// cross-context tool saga compares against on the wire).
+///
+/// Resolution rule:
+/// - If `context_id` is a canonical context id — exactly 64 characters, all
+///   lowercase hexadecimal — it is `hex::decode`d into the `[u8; 32]` digest.
+///   This is the single branch that makes the redirect blanket-safe: every
+///   real context id hits it and resolves to its digest.
+/// - Otherwise `context_id` is NOT a real context id — a synthetic namespace
+///   (`"identity-private-state"`), a standing-pair id (`"standing-" + hex`,
+///   which carries the prefix and so is never bare 64-hex), or an arbitrary
+///   test id (`"ctx-…"`). These fall through to the raw `SHA-256(id)`
+///   derivation, producing **byte-for-byte the same value as before this
+///   change** — they were never 64-hex, so their behavior is unchanged.
+///
+/// The 64-hex guard is strict (length 64 AND all `0-9a-f`): `hex::decode`
+/// alone would also accept uppercase, but [`generate_context_id`] emits only
+/// lowercase, so requiring lowercase keeps an uppercase 64-char test id on
+/// the hashing fallback rather than silently decoding it.
+///
+/// The fallback calls [`scp_protocol::context::context_id_bytes`] (the raw
+/// SHA-256 primitive) directly — that primitive stays a pure SHA-256
+/// derivation for synthetic / non-context labels only, never re-hashing a
+/// canonical context id (ADR-056, the double-hash trap).
+#[must_use]
 pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
+    if context_id.len() == 64
+        && context_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        // A 64-char all-lowercase-hex string decodes to exactly 32 bytes, so
+        // neither branch can fail. The fallthrough keeps the function total
+        // (no panic/unwrap — clippy denies them) even if `hex::decode` ever
+        // rejected the input.
+        if let Ok(decoded) = hex::decode(context_id)
+            && let Ok(digest) = <[u8; 32]>::try_from(decoded.as_slice())
+        {
+            return digest;
+        }
+    }
     scp_protocol::context::context_id_bytes(context_id)
 }
 
@@ -2189,5 +2237,97 @@ mod notification_window_backdating_tests {
         let effective_at = created_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
         assert!(!pending.is_effective(effective_at - 1));
         assert!(pending.is_effective(observed + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS));
+    }
+}
+
+#[cfg(test)]
+mod canonical_context_id_tests {
+    //! ADR-056 (Model A) / §6.2.4:276: a context's canonical
+    //! identity IS its 32-byte digest, and the id STRING is `hex(digest)`.
+    //! [`context_id_to_bytes`] must DECODE a real 64-hex id to its digest (not
+    //! re-hash it), while leaving every synthetic / non-64-hex string on the
+    //! byte-for-byte unchanged SHA-256 fallback.
+
+    use super::context_id_to_bytes;
+
+    #[test]
+    fn real_64hex_id_decodes_to_digest_not_sha256() {
+        let digest: [u8; 32] = [
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64);
+        // DECODE recovers the digest verbatim (single chokepoint).
+        assert_eq!(context_id_to_bytes(&id), digest);
+        // And that is NOT the same as hashing the hex string.
+        assert_ne!(
+            context_id_to_bytes(&id),
+            scp_protocol::context::context_id_bytes(&id),
+            "a real id must decode, not re-hash — that double-hash is the bug ADR-056 fixes"
+        );
+    }
+
+    #[test]
+    fn synthetic_namespace_id_falls_through_to_hash() {
+        // The identity-scoped PSK-rotation pseudo-context (§9.12 step 6).
+        let id = "identity-private-state";
+        assert_eq!(
+            context_id_to_bytes(id),
+            scp_protocol::context::context_id_bytes(id),
+            "a non-64-hex synthetic id must hash exactly as before"
+        );
+    }
+
+    #[test]
+    fn standing_prefixed_id_falls_through_to_hash() {
+        // Standing-pair display id: `"standing-" + 64-hex`. The prefix makes it
+        // longer than 64 chars, so it is never bare 64-hex and must hash —
+        // ADR-056 does not alter standing-context id derivation.
+        let id = format!("standing-{}", "ab".repeat(32));
+        assert!(id.len() > 64);
+        assert_eq!(
+            context_id_to_bytes(&id),
+            scp_protocol::context::context_id_bytes(&id)
+        );
+    }
+
+    #[test]
+    fn arbitrary_test_id_falls_through_to_hash() {
+        let id = "ctx-some-arbitrary-test-id";
+        assert_eq!(
+            context_id_to_bytes(id),
+            scp_protocol::context::context_id_bytes(id)
+        );
+    }
+
+    #[test]
+    fn uppercase_64hex_is_not_canonical_and_hashes() {
+        // `generate_context_id` emits only LOWERCASE hex. A 64-char UPPERCASE
+        // hex string is therefore not a canonical id: the strict lowercase
+        // guard keeps it on the hashing fallback rather than silently decoding.
+        let upper = "AB".repeat(32);
+        assert_eq!(upper.len(), 64);
+        assert_eq!(
+            context_id_to_bytes(&upper),
+            scp_protocol::context::context_id_bytes(&upper),
+            "uppercase 64-hex must hash, not decode (lowercase-only guard)"
+        );
+    }
+
+    #[test]
+    fn near_64_lengths_hash() {
+        // 63 and 65 lowercase-hex chars are not canonical ids.
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        assert_eq!(
+            context_id_to_bytes(&short),
+            scp_protocol::context::context_id_bytes(&short)
+        );
+        assert_eq!(
+            context_id_to_bytes(&long),
+            scp_protocol::context::context_id_bytes(&long)
+        );
     }
 }

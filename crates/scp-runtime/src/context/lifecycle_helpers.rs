@@ -169,7 +169,9 @@ pub fn export_context_blocks(
     deps: &ActorDeps,
 ) -> (crate::context::state::ContextSnapshot, Vec<u8>) {
     let context_id = state.handle.context_id();
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: resolve to the canonical digest (matches `state.context_id` and
+    // the crypto keys the snapshot exports), not a re-hash of the hex id.
+    let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
@@ -1421,6 +1423,12 @@ pub async fn create_context(
     // whether the supervisor returned a broadcast roster — the SCP-227
     // broadcast init path returns `Some(BroadcastContext)` iff
     // `params.mode == ContextMode::Broadcast`.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST.
+    // For a real context id (`hex(digest)`) DECODE recovers the digest — it
+    // does NOT re-hash the already-hex-encoded digest. This is what the
+    // §6.2.4 cross-context tool saga compares `target_context_id` against on
+    // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
@@ -1822,7 +1830,10 @@ pub async fn import_context(
     }
 
     let context_id = export.snapshot.context_id.clone();
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
+    // ADR-056: resolve the imported (64-hex) id to its canonical digest so the
+    // import-path crypto cleanup keys under the same bytes the context's live
+    // `PerContextState.context_id` will hold (set below via the same resolver).
+    let ctx_id_bytes = state::context_id_to_bytes(&context_id);
 
     // 2. Existing-context replaceability check + crypto state cleanup,
     // actor-native. If a context actor is already registered for this id,
@@ -2046,6 +2057,10 @@ pub async fn import_context(
     // (`broadcast_context: None` below). Derive the actor's `members` set
     // from the imported membership snapshot — `members()` enumerates the
     // current member DIDs in the post-validation `MembershipState`.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST —
+    // DECODE the imported (64-hex) id rather than re-hash it, so the restored
+    // crypto keys under the same digest the original creation did.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let actor_members: HashSet<DID> = export
         .snapshot
@@ -2532,6 +2547,10 @@ pub async fn restore_context(
     // snapshot's broadcast state was reloadable (`broadcast_ctx` is
     // `Some(BroadcastContext)` for broadcast contexts, `None` for
     // encrypted). Members come from the membership snapshot.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST —
+    // DECODE the (64-hex) id rather than re-hash it, so the rehydrated crypto
+    // keys under the same digest the live context used before the restart.
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let actor_members: HashSet<DID> = ctx_snapshot
         .membership

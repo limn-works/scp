@@ -59,10 +59,17 @@ use scp_protocol::context::{ContextError, ContextState, MemoryScope};
 // context_id_to_bytes helper (mirrors manager.rs)
 // ---------------------------------------------------------------------------
 
-/// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
+/// Resolves a context-ID string to its MLS/event-log keying bytes.
+///
+/// Delegates to the canonical [`crate::context::state::context_id_to_bytes`]
+/// (ADR-056): a real 64-hex context id resolves to its raw digest, matching
+/// `PerContextState.context_id`; synthetic / non-context strings hash exactly
+/// as before. Keeping this local wrapper aligned with `state`'s resolver is
+/// what prevents the close/expire TTL crypto paths (`destroy_mls_group`,
+/// `append_context_event`) from silently keying under the old `SHA-256(id)`
+/// while live state keys under the digest.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    scp_protocol::context::context_id_bytes(context_id)
+    crate::context::state::context_id_to_bytes(context_id)
 }
 
 // ---------------------------------------------------------------------------

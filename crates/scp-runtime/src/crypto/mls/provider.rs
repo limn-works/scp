@@ -1571,13 +1571,16 @@ impl MlsCryptoProvider {
             let ctx_str = inner.context_id.as_str();
 
             // Defense in depth: the supplied 32-byte `context_id` MUST be the
-            // SHA-256 of the inner envelope's `context_id` string. If they
-            // diverge, the AAD would bind a string unrelated to the routing /
-            // store keying, so fail closed rather than emit an unverifiable
-            // ciphertext. (No panic/unwrap — clippy denies them on this path.)
-            if scp_protocol::context::context_id_bytes(ctx_str) != *context_id {
+            // canonical digest of the inner envelope's `context_id` string —
+            // i.e. `context_id_to_bytes(ctx_str)` (ADR-056): the raw
+            // hex-decoded digest for a real 64-hex id, or `SHA-256(ctx_str)`
+            // for a synthetic / non-context string. If they diverge, the AAD
+            // would bind a string unrelated to the routing / store keying, so
+            // fail closed rather than emit an unverifiable ciphertext. (No
+            // panic/unwrap — clippy denies them on this path.)
+            if crate::context::state::context_id_to_bytes(ctx_str) != *context_id {
                 return Err(ContextError::CryptoFailed(
-                    "inner envelope context_id does not hash to the supplied context_id".into(),
+                    "inner envelope context_id does not resolve to the supplied context_id".into(),
                 ));
             }
 
@@ -1659,16 +1662,19 @@ impl MlsCryptoProvider {
     ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
         self.with_context(context_id, |state| {
             // Defense in depth (symmetry with `seal`): the supplied 32-byte
-            // `context_id` MUST be the SHA-256 of `context_id_str`. If they
-            // diverge, the AAD reconstructed below from `context_id_str` would
-            // bind a string unrelated to the routing / store keying, so fail
-            // fast here rather than relying on the AEAD layer to reject it.
-            // Unreachable from current callers (both are derived from one
-            // string) but cheap fail-closed insurance. (No panic/unwrap —
-            // clippy denies them on this path.)
-            if scp_protocol::context::context_id_bytes(context_id_str) != *context_id {
+            // `context_id` MUST be the canonical digest of `context_id_str` —
+            // `context_id_to_bytes(context_id_str)` (ADR-056): the raw
+            // hex-decoded digest for a real 64-hex id, or `SHA-256` for a
+            // synthetic / non-context string. If they diverge, the AAD
+            // reconstructed below from `context_id_str` would bind a string
+            // unrelated to the routing / store keying, so fail fast here rather
+            // than relying on the AEAD layer to reject it. Unreachable from
+            // current callers (both are derived from one string) but cheap
+            // fail-closed insurance. (No panic/unwrap — clippy denies them on
+            // this path.)
+            if crate::context::state::context_id_to_bytes(context_id_str) != *context_id {
                 return Err(ContextError::CryptoFailed(
-                    "context_id_str does not hash to the supplied context_id".into(),
+                    "context_id_str does not resolve to the supplied context_id".into(),
                 ));
             }
 
@@ -4495,25 +4501,27 @@ mod tests {
         let sealed_pos = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
 
         // Negative: opening with the hex-of-bytes string supplies a
-        // `context_id_str` that does NOT hash to `context_id` (the hex of the
-        // 32-byte id is not its SHA-256 preimage). `open`'s fail-fast guard —
-        // the mirror of `seal`'s hash-consistency assert — rejects this BEFORE
-        // any MLS/AEAD work, so the OLD (spec-violating) hex AAD can never even
-        // be reconstructed. This is strictly stronger than letting the AEAD
-        // layer reject it: a mismatched id/string pair is refused at the door.
+        // `context_id_str` of `hex(ctx_id)` instead of the raw `TEST_CTX_STR`
+        // the message was sealed under. The OLD (spec-violating) native code
+        // bound `hex(ctx_id)` as the AAD; the §9.16.1 fix binds the RAW string,
+        // so reconstructing the AAD from `hex(ctx_id)` yields a DIFFERENT AAD
+        // and the sender-layer AEAD authentication fails — proving the bound
+        // value is the raw string, not the hex.
+        //
+        // ADR-056 note: `hex(ctx_id)` is a canonical 64-hex string, so the
+        // top-of-`open` resolve-consistency guard (`context_id_to_bytes`)
+        // now resolves it back to `ctx_id` and PASSES — `hex(digest)` IS the
+        // canonical id-string form of `digest`. The rejection therefore comes
+        // from the AEAD layer (the AAD mismatch), one layer deeper than the
+        // pre-ADR-056 hash-consistency guard, but it still proves the same
+        // §9.16.1 contract: the AAD binds the raw string, not its hex. The
+        // dedicated guard-rejection path is covered by
+        // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
-        let err = bob
-            .open(&ctx_id, &hex_ctx, &sealed_neg)
-            .expect_err("opening with a context_id_str that does not hash to context_id must fail");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert!(
-                    msg.contains("does not hash to the supplied context_id"),
-                    "expected the fail-fast hash-consistency rejection, got: {msg}"
-                );
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
+        bob.open(&ctx_id, &hex_ctx, &sealed_neg).expect_err(
+            "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
+             under the RAW context_id string, so the rebuilt AAD does not authenticate",
+        );
 
         // Positive: opening the second blob with the RAW context_id string
         // (the spec value) succeeds, proving the AAD binds the raw string.
@@ -4529,22 +4537,25 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_context_id_str_that_does_not_hash_to_context_id() {
+    fn open_rejects_context_id_str_that_does_not_resolve_to_context_id() {
         // Defense-in-depth symmetry with `seal`: `open` asserts the supplied
-        // 32-byte `context_id` is `context_id_bytes(context_id_str)` and fails
-        // CLOSED if they diverge. This guard fires at the very top of `open`,
-        // BEFORE any outer-envelope deserialization, MLS decrypt, or
-        // sender-layer AEAD work — so the rejection is the fast-path
-        // hash-consistency error, distinct from an AEAD authentication failure.
+        // 32-byte `context_id` is `context_id_to_bytes(context_id_str)`
+        // (ADR-056) and fails CLOSED if they diverge. This guard fires at the
+        // very top of `open`, BEFORE any outer-envelope deserialization, MLS
+        // decrypt, or sender-layer AEAD work — so the rejection is the fast-path
+        // resolve-consistency error, distinct from an AEAD authentication
+        // failure.
         let (_alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
 
-        // A `context_id_str` whose SHA-256 is NOT `ctx_id`. (`ctx_id` is the
-        // hash of TEST_CTX_STR; any other string hashes elsewhere.)
+        // A `context_id_str` whose canonical resolution is NOT `ctx_id`. It is a
+        // non-64-hex string, so it resolves via the SHA-256 fallback; `ctx_id`
+        // is the resolution of TEST_CTX_STR, so any other string resolves
+        // elsewhere.
         let mismatched_ctx_str = "definitely-not-the-real-context-string";
         assert_ne!(
-            scp_protocol::context::context_id_bytes(mismatched_ctx_str),
+            crate::context::state::context_id_to_bytes(mismatched_ctx_str),
             ctx_id,
-            "test precondition: the mismatched string must not hash to ctx_id"
+            "test precondition: the mismatched string must not resolve to ctx_id"
         );
 
         // The outer bytes are deliberately garbage: the guard must reject the
@@ -4555,13 +4566,13 @@ mod tests {
         let bogus_outer = [0xABu8; 64];
         let err = bob
             .open(&ctx_id, mismatched_ctx_str, &bogus_outer)
-            .expect_err("open must reject a context_id_str that does not hash to context_id");
+            .expect_err("open must reject a context_id_str that does not resolve to context_id");
 
         match err {
             ContextError::CryptoFailed(msg) => {
                 assert_eq!(
-                    msg, "context_id_str does not hash to the supplied context_id",
-                    "expected the fail-fast hash-consistency rejection, not an AEAD or \
+                    msg, "context_id_str does not resolve to the supplied context_id",
+                    "expected the fail-fast resolve-consistency rejection, not an AEAD or \
                      deserialization failure, got: {msg}"
                 );
             }

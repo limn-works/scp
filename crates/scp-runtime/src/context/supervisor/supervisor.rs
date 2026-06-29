@@ -3502,8 +3502,13 @@ impl Supervisor {
     /// constructed with `epoch == 0`, exactly as the registered-actor
     /// handler does when `state.epoch.mls_epoch` is its default 0.
     ///
-    /// The seal keys off `SHA256(context_id)` (`context_id_to_bytes`) and
-    /// the relay routing ID off the domain-separated
+    /// The seal keys off `SHA256(context_id)` — the synthetic
+    /// `"identity-private-state"` id is not a real (64-hex) context id, so it
+    /// is hashed via the raw [`scp_protocol::context::context_id_bytes`]
+    /// primitive (NOT the canonical `context_id_to_bytes` resolver,
+    /// which is byte-identical for this non-64-hex input but reserved for
+    /// real-context digest keying per ADR-056) — and the relay routing ID off
+    /// the domain-separated
     /// [`context_routing_id`](scp_protocol::context::context_routing_id),
     /// so neither requires per-context state.
     ///
@@ -3531,7 +3536,15 @@ impl Supervisor {
         let transport = self.transport_ref().ok_or_else(not_init)?;
         let clock = self.clock_ref().ok_or_else(not_init)?;
 
-        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        // This direct path handles ONLY the synthetic, never-registered
+        // identity-scoped pseudo-context (`"identity-private-state"`, PSK
+        // rotation §9.12 step 6) — see the doc comment above. That string is
+        // not a real context id and is never 64-hex, so it must be HASHED, not
+        // decoded: call the raw SHA-256 primitive directly (ADR-056). Using the
+        // canonical resolver would be byte-identical here, but the direct call
+        // documents that this site is deliberately the synthetic/non-context
+        // case, distinct from the digest-keyed real-context crypto paths.
+        let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
         // No MLS group exists for an unregistered context, so the epoch is
         // 0 — matching the registered-actor handler's behaviour when
@@ -3874,18 +3887,18 @@ impl Supervisor {
         let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
         let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
 
-        // Register under the context's ORIGINAL id string (the one the
-        // `ContextHandle` carries and that every per-context dispatch /
-        // `lookup` uses), NOT `hex(state.context_id)`. `state.context_id`
-        // is `SHA256(original_id)` (`context_id_to_bytes`), so keying by
-        // its hex would diverge from the original-string id callers pass
-        // to `lookup` — the legacy `contexts` DashMap was keyed by the
-        // original string, and per-context dispatch (incl. the cross-
-        // context recovery flow) still is. For the test fixtures the
-        // handle id IS `hex(context_id_bytes)`, so this is identical
-        // there; for production `create_context` it is the caller's
-        // original id, which is what makes per-context dispatch resolve
-        // the actor.
+        // Register under the context's id string (the one the `ContextHandle`
+        // carries and that every per-context dispatch / `lookup` uses). The
+        // registry is keyed by this STRING, not by `state.context_id` bytes —
+        // value-agnostic, so it needs no change under ADR-056. Under ADR-056 a
+        // real context's id string is `hex(state.context_id)`:
+        // `state.context_id` is the canonical DIGEST and the id is its hex
+        // encoding (`context_id_to_bytes` round-trips them), so the
+        // string and `hex(state.context_id)` now coincide for real contexts —
+        // the production divergence that the old comment warned about no longer
+        // exists. (Synthetic / non-64-hex ids still hash, so for those the
+        // string is NOT `hex(state.context_id)`; that is irrelevant here since
+        // the registry keys by the string in every case.)
         let ctx_id_str = state.handle.context_id().to_owned();
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -9025,8 +9038,16 @@ impl Supervisor {
                         // and this read (raced close) — treat as not
                         // reconnectable and move on.
                         if let Some(params) = self.context_params(&context_id).await {
+                            // ADR-056: resolve through the canonical resolver so
+                            // the transport publish keys under the same bytes as
+                            // `state.context_id`. A standing-pair id carries the
+                            // `"standing-"` prefix (never bare 64-hex), so it
+                            // hashes via the fallback exactly as before — this
+                            // does NOT alter standing-context id derivation
+                            // (a separately-tracked concern); it only unifies
+                            // the resolver.
                             let context_id_bytes =
-                                scp_protocol::context::context_id_bytes(&context_id);
+                                crate::context::state::context_id_to_bytes(&context_id);
                             self.transport_ref()
                                 .ok_or_else(|| {
                                     ContextError::NotInitialized(
