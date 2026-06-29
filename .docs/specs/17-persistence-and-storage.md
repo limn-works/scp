@@ -414,7 +414,6 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | Platform | Mechanism | Notes |
 |----------|-----------|-------|
 | Native (iOS, Android, macOS, Linux, Windows, Python, Node) | `rusqlite` with `bundled-sqlcipher` feature | AES-256 encryption, PBKDF2 with SHA-512 key derivation (256K iterations). Encryption key derived from identity key material stored in platform key custody (Keychain/Keystore). |
-| Browser (WASM) | Value-level AES-256-GCM encryption | SQLCipher unavailable in WASM. Each value is encrypted individually before writing to wa-sqlite. Key derivation: the identity's `#0` key is imported into WebCrypto as raw key material, then `HKDF` is used with `salt = SHA-256("SCP-WASM-STORAGE-V1")`, `info = "scp-wasm-storage:" || did` (UTF-8), `hash = SHA-256`, `derivedKeyLength = 256` to produce an AES-256-GCM key. Per-value encryption: 12-byte nonce generated via `crypto.getRandomValues()` for each `store()` call. Stored format: `nonce (12 bytes) \|\| ciphertext \|\| tag (16 bytes)`. The key is stored in memory only (non-extractable WebCrypto key object). AAD (additional authenticated data): the storage key string (UTF-8 bytes), binding each encrypted value to its key path to prevent value relocation attacks. |
 | iOS | `NSFileProtectionCompleteUntilFirstUserAuthentication` | Allows background processing while device is locked. Applied to the SQLite database file. |
 | Android | TEE-backed key for SQLCipher key derivation | Android Keystore generates the key; SQLCipher uses it for database encryption. StrongBox opt-in only (dramatically slow). |
 
@@ -425,7 +424,6 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | `InMemoryStorage` | `HashMap<String, Vec<u8>>` + `RwLock` | All | Testing, CI, short-lived agents | Phase 1 (update for new methods) |
 | `SqliteStorage` | `rusqlite` + `bundled-sqlcipher`, WAL mode | Native (all) | **Default production backend** — universal | Phase 2 |
 | `FilesystemStorage` | Key -> file path | POSIX systems | Server/CLI, inspectable/debuggable storage | Phase 2 |
-| `WasmSqliteStorage` | wa-sqlite (TypeScript) | Browser WASM | Browser default | Phase 4 |
 
 ### In-Memory Storage Is Dev/Test-Only
 
@@ -536,14 +534,9 @@ conn.execute_batch("
 ")?;
 ```
 
-### Browser: The One Exception
+### Browser Clients Are Remote Thin Clients
 
-The Rust core's `rusqlite` cannot target browser WASM (no filesystem). **wa-sqlite** with **OPFSCoopSyncVFS** is the browser backend:
-
-- Supports 1GB+ databases
-- Works in all major browsers (Chrome, Firefox, Safari, Edge)
-- Falls back to **IDBBatchAtomicVFS** for Safari incognito (no OPFS access)
-- This is a TypeScript adapter, not Rust — it implements the `Storage` trait interface in TypeScript and communicates with the Rust WASM core via the binding layer
+Browser clients do not run storage in-process. Per ADR-055 (which supersedes ADR-034), a browser client is a remote thin client to a server-side `scp-node`: the node holds the protocol engine, MLS group state, custody, the event log, and persistent storage. There is no in-browser `Storage` adapter — the browser issues protocol operations over RPC/WebSocket, and persistence is the node's concern (a native `SqliteStorage` / `FilesystemStorage` backend).
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
@@ -894,8 +887,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 ### Phase 4
 
-- `WasmSqliteStorage` (wa-sqlite + OPFSCoopSyncVFS, IDBBatchAtomicVFS fallback) for browser
-- TypeScript SDK storage configuration
+- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser clients are remote thin clients to a node per ADR-055 and run no in-process storage)
 
 ### Phase 5
 

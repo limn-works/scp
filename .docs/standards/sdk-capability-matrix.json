@@ -32,7 +32,7 @@
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts, internal/wasm.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
+            "typescript": "Bridge plumbing exists (internal/native.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
             "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
@@ -58,7 +58,7 @@
           "kotlin": true,
           "swift": true,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey, internal/wasm.ts identity_add_agent_key) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
           }
         },
         {
@@ -87,7 +87,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi/wasm). Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi). Exported by all three bridges; see scripts/bridge-aliases.json."
         },
         {
           "name": "identity_remove_if_present",
@@ -95,7 +95,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all three bridges; see scripts/bridge-aliases.json."
         },
         {
           "name": "migrate",
@@ -104,7 +104,7 @@
           "kotlin": true,
           "swift": true,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts migrate, internal/wasm.ts identity_migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
+            "typescript": "Bridge plumbing exists (internal/native.ts migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
           }
         },
         {
@@ -249,10 +249,7 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "notes": {
-            "wasm": "ADR-034 divergence: the WASM core has no Supervisor/actor and no relay QUERY-since retrieval surface, so the ADR-029 reconnection driver cannot run in-process. The TypeScript SDK's SCP class is NAPI-only (the browser/WASM build throws on `new SCP()`), so this `typescript: true` entry is satisfied by the NAPI backend. The WASM SDK reconnects via its own constrained JS-driven path: JS retrieves relay-buffered blobs and feeds each to context_decrypt_message (which advances the MLS epoch on Commit), and signs/exchanges checkpoints via the in-process event_log_checkpoint path (#1540 Step 5/WASM)."
-          }
+          "swift": true
         },
         {
           "name": "receive",
@@ -369,7 +366,7 @@
           "typescript": true,
           "kotlin": false,
           "swift": true,
-          "notes": "ContextParams now carries optional consequence_rules JSON field (ADR-017, #1531). PyO3, NAPI, UniFFI, and WASM bridges parse and persist the field; PyO3/NAPI/UniFFI Swift SDK wrappers expose it via params struct field. Kotlin SDK has no Context wrapper that surfaces ContextParams construction.",
+          "notes": "ContextParams now carries optional consequence_rules JSON field (ADR-017, #1531). PyO3, NAPI, and UniFFI bridges parse and persist the field; PyO3/NAPI/UniFFI Swift SDK wrappers expose it via params struct field. Kotlin SDK has no Context wrapper that surfaces ContextParams construction.",
           "exemptions": {
             "kotlin": "Kotlin SDK exposes ContextParams via UniFFI generated bindings only; no idiomatic wrapper accepts consequence_rules"
           }
@@ -422,7 +419,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) \u2014 the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. WASM signs SHA-256(domain || scope_tag || snapshot_jcs) in-bridge with the creator's #active key (WASM_EXPORT_VERSION=5). Native exports (MessagePack, version 4) and WASM exports (JSON, version 5) are mutually NON-importable by design (ADR-034): only the signing construction converges, not the serialized bytes. A WASM export fed to a native bridge is rejected at the version gate with SCP-CTX-2094 (a version error, not a signature forgery). No direct SDK call site \u2014 invoked transitively from context_export.",
+          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) \u2014 the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site \u2014 invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",
@@ -436,7 +433,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. Cross-family imports are rejected there too: native (MessagePack, version 4) and WASM (JSON, version 5) exports are mutually NON-importable by design (ADR-034) \u2014 a WASM export handed to a native bridge surfaces SCP-CTX-2094 (version error), not a signature failure, even though the signing construction itself converges. No direct SDK call site \u2014 invoked transitively from context_import.",
+          "notes": "Internal (spec \u00a723.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI), failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",
@@ -466,7 +463,7 @@
             "swift": "subscribe not yet exposed as public API on Context actor"
           },
           "notes": {
-            "napi": "NAPI-only: context_subscribe_on co-spawns the §9.9.2 suppression-detection heartbeat scheduler (run_heartbeat_scheduler) alongside the relay subscribe loop, sharing the per-subscription cancel token so unsubscribe/disconnect/bridge-shutdown tears both down in lockstep. The send cadence is the local node's per-profile interval (HeartbeatConfig::for_profile); the receive-side monitor sizes its suppression threshold to the slowest honest sender (240s uniform). Mirrors the reconnection-driver note: this lives at the NAPI subscribe boundary, not in the WASM SDK."
+            "napi": "NAPI-only: context_subscribe_on co-spawns the §9.9.2 suppression-detection heartbeat scheduler (run_heartbeat_scheduler) alongside the relay subscribe loop, sharing the per-subscription cancel token so unsubscribe/disconnect/bridge-shutdown tears both down in lockstep. The send cadence is the local node's per-profile interval (HeartbeatConfig::for_profile); the receive-side monitor sizes its suppression threshold to the slowest honest sender (240s uniform). This lives at the NAPI subscribe boundary."
           }
         },
         {
@@ -524,7 +521,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "WASM coverage is satisfied via the TypeScript SDK's WASM backend path (the broadcast_open_key wasm export); the matrix tracks the four language SDKs, and the TypeScript SDK covers both the NAPI and WASM bridges."
+          "notes": "TypeScript coverage is satisfied via the NAPI-backed broadcast_open_key export; the matrix tracks the four language SDKs."
         },
         {
           "name": "validate_broadcast_key",
@@ -539,7 +536,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message \u2014 drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers. WASM bridge accepts the parameter but ignores it (underscore-prefixed in manager.rs:1356)."
+          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message \u2014 drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers."
         },
         {
           "name": "join_with_spending_ucan",
@@ -547,7 +544,7 @@
           "typescript": true,
           "kotlin": false,
           "swift": true,
-          "notes": "context_join accepts an optional spending_ucan_jwt parameter for join-cost authorization (#1537, batch-2 wiring). PyO3 bridge wires it through join_context (scp-ffi/src/context.rs context_join). Swift wrapper Context.join exposes spendingUcanJwt via the regenerated UniFFI bindings (Context.swift:620). TypeScript wrapper Context.join exposes spendingUcanJwt (typescript/src/context.ts:368). HOWEVER: the underlying NAPI bridge context_join hard-codes None (napi/src/context.rs:606), the UniFFI bridge context_join hard-codes None (uniffi/src/bridge.rs:2931), and WASM ignores the parameter (manager.rs:1265 _spending_ucan_jwt). Only the PyO3 bridge actually threads the spending UCAN through to ContextManager::join_context. The wrapper-level marks reflect the SDK surface visible to users; bridge drift is tracked here as a known follow-up.",
+          "notes": "context_join accepts an optional spending_ucan_jwt parameter for join-cost authorization (#1537, batch-2 wiring). PyO3 bridge wires it through join_context (scp-ffi/src/context.rs context_join). Swift wrapper Context.join exposes spendingUcanJwt via the regenerated UniFFI bindings (Context.swift:620). TypeScript wrapper Context.join exposes spendingUcanJwt (typescript/src/context.ts:368). HOWEVER: the underlying NAPI bridge context_join hard-codes None (napi/src/context.rs:606), the UniFFI bridge context_join hard-codes None (uniffi/src/bridge.rs:2931). Only the PyO3 bridge actually threads the spending UCAN through to ContextManager::join_context. The wrapper-level marks reflect the SDK surface visible to users; bridge drift is tracked here as a known follow-up.",
           "exemptions": {
             "kotlin": "Kotlin SDK has no idiomatic Context.join wrapper exposing spendingUcanJwt"
           }
@@ -663,7 +660,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all four bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, UniFFI, and WASM bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
+          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all four bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, and UniFFI bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
         },
         {
           "name": "evaluate_consequence_rules",
@@ -679,7 +676,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) and the WASM bridge dispatch_consequences_for_subject (scp-ffi-wasm/src/consequence.rs) are invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly \u2014 consequence enforcement is automatic on send and governance dispatch.",
+          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) is invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly \u2014 consequence enforcement is automatic on send and governance dispatch.",
           "exemptions": {
             "python": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
             "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
@@ -701,7 +698,7 @@
           "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal \u2014 no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
           "exemptions": {
             "python": "ContextManager submodule not yet exposed via PyO3 bridge",
-            "typescript": "ContextManager submodule not yet exposed via NAPI or WASM bridges",
+            "typescript": "ContextManager submodule not yet exposed via NAPI bridge",
             "kotlin": "ContextManager submodule not yet exposed via UniFFI bridge",
             "swift": "ContextManager submodule not yet exposed via UniFFI bridge"
           }
@@ -801,7 +798,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Direct-execute is BY ID across all four bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction, WASM context_execute_governance. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
+          "notes": "Direct-execute is BY ID across all four bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
         },
         {
           "name": "propose_action",
@@ -920,7 +917,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::SuspendCapability variant dispatched via the existing execute_action / propose_action entry points (PyO3 py_governance_execute, NAPI context_execute_governance_action, UniFFI governance_execute, WASM execute_governance_action). The wiring of cross-type enforcement conflict detection (#1530, batch-2) is invoked transitively from execute_governance_action."
+          "notes": "GovernanceAction::SuspendCapability variant dispatched via the existing execute_action / propose_action entry points (PyO3 py_governance_execute, NAPI context_execute_governance_action, UniFFI governance_execute). The wiring of cross-type enforcement conflict detection (#1530, batch-2) is invoked transitively from execute_governance_action."
         },
         {
           "name": "execute_suspend_access",
@@ -968,7 +965,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All four bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action, WASM propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
+          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All four bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
         }
       ]
     },
@@ -1002,7 +999,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript this holds for BOTH backends: the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts, and the WASM/browser runtime ALSO signs in-process (WASM identities are Rust-custodied in the DID-keyed IDENTITY_REGISTRY; the private key never crosses FFI, ADR-006) and surfaces the same Checkpoint.signature via bindings/typescript/src/internal/wasm.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; both backends populate the 64-byte (128-hex-char) Ed25519 signature. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash). The former WASM-vs-native asymmetry recorded under ADR-048 §7b is RESOLVED — WASM no longer returns an unsigned payload."
+          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) Ed25519 signature. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
         },
         {
           "name": "checkpoint_by_did",
@@ -1047,7 +1044,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges; the wasm bridge is exempt (no scp-runtime LocalTransportProvider / ContextManager on wasm32 per ADR-034). See the wasm exemption in scripts/bridge-aliases.json."
+          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges."
         }
       ]
     },
@@ -1313,7 +1310,7 @@
           "swift": false,
           "exemptions": {
             "python": "Bridge plumbing exists (scp-ffi PyScp.ucan_evaluate returning CapabilityValidation, the read-only structured diagnostic counterpart to ucan_validate) but no public SDK wrapper yet; the named public evaluate()/evaluateTrust() wrapper lands in the C3c SDK-parity follow-up that rebuilds the trust-signal consumer on top of this bridge op.",
-            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate + WASM ucan_evaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
+            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
             "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
             "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
           }
@@ -1434,7 +1431,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095).",
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs.",
           "exemptions": {
             "python": "economy.py exposes estimate_cost / policy helpers / evaluate_formula only; no named verify_payment_receipts public function yet. The Python verify_payment_receipts wrapper lands in the SDK-parity PR carved from the same bundled branch."
           }
@@ -1959,8 +1956,7 @@
       "domain": "Lifecycle",
       "operations": [
         {"name": "scp_new", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold. WASM remains a no-bridge-globals fixture: no parallel construct needed there.",
-         "exemptions": {"wasm": "WASM bridge is stateless between calls — no long-lived bridge instance to construct."}},
+         "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold."},
         {"name": "scp_with_storage_in_memory", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "SCP.withStorage({type: \"in_memory\"}) — in-memory storage variant. Default for tests and ephemeral workflows. Symmetric with with_storage_sqlite below. PyO3 SCP(storage={\"type\": \"in_memory\"}), NAPI SCP.withStorage({type: \"in_memory\"}), Swift SCP.withStorage(.inMemory), Kotlin SCP.withStorage(StorageConfig.InMemory).",
          "exemptions": {}},
@@ -1968,14 +1964,13 @@
          "notes": "Monotonic u64 instance identifier assigned at SCP() construction. Exposed as a read-only property ON THE SCP CLASS ONLY. Every handle type (ContextHandle, Identity, UcanToken, MessageReceiver, ...) carries its owning SCP's instance_id as a Rust-internal field — this per-handle id is NOT host-visible (no per-handle instanceId getter/export on any bridge; see ADR-048 §Per-handle host-visible instanceId is NOT exposed). Every handle-accepting FFI function runs a runtime affinity check (SCP-PERM-3030 on mismatch) enforced by scripts/check-handle-affinity.sh. Python scp.instance_id, TypeScript scp.instanceId, Kotlin scp.instanceId, Swift scp.instanceId.",
          "exemptions": {}},
         {"name": "shutdown_timeout", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all non-WASM bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges.",
-         "exemptions": {"wasm": "No long-lived native runtime to drain on WASM."}},
+         "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."},
         {"name": "suspend", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. No-op on WASM (no long-lived native runtime). All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."},
+         "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."},
         {"name": "resume", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws. WASM is a no-op (no long-lived native runtime)."},
+         "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws."},
         {"name": "with_storage_sqlite", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three non-WASM bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
+         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
          "exemptions": {}},
         {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
@@ -2026,7 +2021,7 @@
     },
     {
       "rule_id": "did-resolver-init-on-identity-create",
-      "description": "Every non-WASM bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized_on` before returning. The resolver is a per-bridge-instance slot used by UCAN validation (#311, ADR-048 renamed the helper from `ensure_did_resolver_initialized` to the `_on` suffix convention for per-instance helpers in Phase 4 PR 5); skipping initialization degrades UCAN verification to string-only lookups. WASM is exempt per ADR-034 (BridgeDidResolver stays in-process).",
+      "description": "Every bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized_on` before returning. The resolver is a per-bridge-instance slot used by UCAN validation (#311, ADR-048 renamed the helper from `ensure_did_resolver_initialized` to the `_on` suffix convention for per-instance helpers in Phase 4 PR 5); skipping initialization degrades UCAN verification to string-only lookups.",
       "applies_to": [
         "pyo3",
         "napi",
@@ -2044,9 +2039,6 @@
           "crates/scp-ffi/napi/src/scp.rs Scp::identity_create \u2192 ensure_did_resolver_initialized_on",
           "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized_on"
         ]
-      },
-      "exemptions": {
-        "wasm": "ADR-034: WASM bridge uses BridgeDidResolver directly (string-only resolver, no tokio runtime) \u2014 no ensure_did_resolver_initialized_on to precede."
       }
     }
   ]

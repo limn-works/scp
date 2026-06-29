@@ -13,7 +13,6 @@ TypeScript coding standards, toolchain, and CI for the SCP TypeScript SDK. Refer
 | Biome | latest | Linter + formatter (replaces ESLint + Prettier) |
 | bun:test | (built-in) | Test framework (Bun's built-in runner) |
 | tsup | latest | Bundler (ESM + CJS output) |
-| wasm-pack | latest | WASM build tool (browser target) |
 
 ## Biome Configuration
 
@@ -145,9 +144,6 @@ bun test
 # Build
 bun run build
 
-# Build WASM (browser target)
-wasm-pack build crates/scp-ffi/wasm --target bundler
-
 # Build napi (Bun/Node target)
 cd crates/scp-ffi/napi && napi build --release
 ```
@@ -162,7 +158,6 @@ cd crates/scp-ffi/napi && napi build --release
 | test (Bun) | ubuntu-latest, macos-latest | Bun latest | Every PR |
 | test (Node) | ubuntu-latest | Node 22 LTS | Every PR |
 | build-esm | ubuntu-latest | Bun | Every PR |
-| build-wasm | ubuntu-latest | wasm-pack | Every PR |
 | build-napi | ubuntu-latest, macos-latest, windows-latest | napi-rs | Every PR |
 | conformance | ubuntu-latest | Bun | Every PR |
 | publish (npm) | ubuntu-latest | Bun | Tagged release |

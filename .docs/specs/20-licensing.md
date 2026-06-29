@@ -66,7 +66,7 @@ scp-platform                 ──→      crates; dependency
 scp-identity                          flows one way)
 scp-event-log
 scp-primitives
-scp-ffi (PyO3, UniFFI, napi, wasm)
+scp-ffi (PyO3, UniFFI, napi)
 scp-mcp
 scp-media
 scp-testing

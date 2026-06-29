@@ -562,7 +562,6 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-ffi/wasm/src/transport.rs",
         "crates/scp-transport/src/webtransport/client.rs",
         "crates/scp-transport/src/webtransport/fallback.rs"
       ],
@@ -1444,7 +1443,7 @@
         "crates/scp-ffi/napi/src/transport.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "Bring the napi (Node/Bun TypeScript) and uniffi (Swift, Kotlin) bridges to parity with the PyO3 reference bridge for native QUIC transport selection. The PyO3 bridge (crates/scp-ffi/src/transport.rs) already routes its relay connect sites through the instance-scoped selector via bi.core.transport_selector().select_and_connect_discovering_with_suppression(...). This story routes the napi and uniffi connect sites through the same instance-scoped TransportSelector (SCP-299) and RelayTransportDiscovery (SCP-300) so Swift, Kotlin, and TypeScript native clients transparently prefer QUIC when a relay advertises it and fall back to WebSocket otherwise \u2014 with no SDK-surface API change. The selector is owned by the bridge instance (bi.core.transport_selector(), defined on the shared BridgeInstance in crates/scp-ffi/common/src/bridge_instance.rs), so QUIC suppression and discovery caches are per-instance, never singletons. WASM is browser-only and uses WebTransport (\u00a710.15), not native QUIC, so it is out of scope for this parity story.",
+      "description": "Bring the napi (Node/Bun TypeScript) and uniffi (Swift, Kotlin) bridges to parity with the PyO3 reference bridge for native QUIC transport selection. The PyO3 bridge (crates/scp-ffi/src/transport.rs) already routes its relay connect sites through the instance-scoped selector via bi.core.transport_selector().select_and_connect_discovering_with_suppression(...). This story routes the napi and uniffi connect sites through the same instance-scoped TransportSelector (SCP-299) and RelayTransportDiscovery (SCP-300) so Swift, Kotlin, and TypeScript native clients transparently prefer QUIC when a relay advertises it and fall back to WebSocket otherwise \u2014 with no SDK-surface API change. The selector is owned by the bridge instance (bi.core.transport_selector(), defined on the shared BridgeInstance in crates/scp-ffi/common/src/bridge_instance.rs), so QUIC suppression and discovery caches are per-instance, never singletons. Browser clients reach a node as remote thin clients over WebTransport (\u00a710.15) per ADR-055, not native QUIC, so they are out of scope for this native-bridge parity story.",
       "acceptanceCriteria": [
         "napi connect site routes through the instance selector: crates/scp-ffi/napi/src/transport.rs calls bi.core.transport_selector() and selector.select_and_connect_discovering_with_suppression(...) (grep returns >0 matches)",
         "uniffi connect site routes through the instance selector: crates/scp-ffi/uniffi/src/bridge.rs calls bi.core.transport_selector() and selector.select_and_connect_discovering_with_suppression(...) (grep returns >0 matches)",

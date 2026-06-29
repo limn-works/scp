@@ -15,7 +15,7 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 3 | Module-level Rust docs | 100% of Rust files have `//!` headers | All crates |
 | 4 | Trait contracts | ~100% documented | Invariants and error conditions |
 | 5 | Standards | `.docs/standards/` | 8 languages, error hierarchy, async patterns, CI tiers |
-| 6 | Inline doc coverage | ~82–100% across all crates (lowest: scp-ffi-wasm ~82%) | See §21.8.1 coverage table |
+| 6 | Inline doc coverage | ~82–100% across all crates | See §21.8.1 coverage table |
 | 7 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
 | 8 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
 | 9 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
@@ -43,8 +43,8 @@ An agent with no prior context should be able to visit the SCP repository, under
 | ~~Testing guide~~ | ~~Commands in standards only~~ | ~~`TESTING.md`~~ | Done |
 | ~~Contributing guide~~ | ~~None~~ | ~~`CONTRIBUTING.md`~~ | Done |
 | Example applications | Pseudocode only | Runnable examples per language | P0 |
-| FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,wasm,uniffi}/README.md` | P1 |
-| Inline doc coverage | 82% (scp-ffi-wasm lowest) | 100% | P1 |
+| FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,uniffi}/README.md` | P1 |
+| Inline doc coverage | 82% | 100% | P1 |
 | Generated API reference | None | Hosted rustdoc, typedoc, Dokka, DocC | P1 |
 | Remaining guides | 2 of 5 | Storage backends, relay ops, conformance testing | P2 |
 | Test vector hex outputs | Spec complete, outputs pending | Run reference impl to generate §25.18 | P2 |
@@ -78,7 +78,7 @@ docs/                            Published documentation (agent-facing)
 scaffolds/                       Clonable barebones project setups
 ├── rust-client/                 Minimal Rust binary using scp-core
 ├── python-agent/                Python agent skeleton with async runtime
-├── typescript-web/              Browser app with WASM binding
+├── typescript-web/              Browser app — remote thin client to a server-side scp-node (ADR-055)
 ├── typescript-node/             Node.js agent with NAPI binding
 ├── swift-ios/                   iOS app with Keychain custody
 ├── swift-macos/                 macOS app with Secure Enclave custody
@@ -100,7 +100,6 @@ bindings/kotlin/README.md      ✓ Kotlin SDK: install, quickstart, platform not
 
 crates/scp-ffi/README.md        PyO3 bridge: build, architecture, for maintainers
 crates/scp-ffi/napi/README.md    NAPI bridge: build, native addon compilation
-crates/scp-ffi/wasm/README.md    WASM bridge: build, JS callback injection
 crates/scp-ffi/uniffi/README.md  UniFFI bridge: build, XCFramework generation
 
 .docs/                         ✓ Internal project knowledge (27 specs, ADRs, standards)
@@ -136,7 +135,7 @@ Each binding directory gets a README answering:
 1. **What is this** — One sentence (e.g., "Python SDK for SCP, providing identity, contexts, encryption, and transport")
 2. **Install** — `pip install scp-python` / SPM / npm
 3. **Quickstart** — 10-20 lines of working code: create identity, create context, send message
-4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: WASM vs NAPI)
+4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: NAPI in-process for Node/Bun; browser = remote thin client per ADR-055)
 5. **API overview** — Brief listing of main classes/modules with one-line descriptions
 6. **Link to full docs** — Point to `docs/guides/sdk-quickstart.md` and generated API reference
 
@@ -215,7 +214,6 @@ Crates and their enforcement status:
 | `scp-ffi` | not yet | ~99% | 100% |
 | `scp-ffi-napi` | not yet | ~100% | 100% |
 | `scp-ffi-uniffi` | not yet | ~100% | 100% |
-| `scp-ffi-wasm` | not yet | ~82% | 100% |
 | `scp-primitives` | `warn` | ~100% | 100% |
 | `scp-testing` | not yet | ~90% | 100% |
 | `scp-node` | `warn` | ~91% | 100% |
@@ -260,7 +258,7 @@ Priority files (most undocumented items):
 
 ### 21.8.5 FFI Crate Targets
 
-All four FFI crates (`scp-ffi`, `napi`, `wasm`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
+All three FFI crates (`scp-ffi`, `napi`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
 
 ### 21.8.6 Language Binding Documentation
 
@@ -428,7 +426,7 @@ Each scaffold is a minimal, working project structure with:
 |---|---|---|
 | `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
 | `scaffolds/python-agent/` | Python | Python agent with scp-python, async runtime, identity setup |
-| `scaffolds/typescript-web/` | TypeScript | Browser app using WASM binding, identity in IndexedDB |
+| `scaffolds/typescript-web/` | TypeScript | Browser app as a remote thin client to a server-side scp-node (ADR-055) |
 | `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
 | `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |
 | `scaffolds/swift-macos/` | Swift | macOS app with Secure Enclave custody |
