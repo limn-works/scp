@@ -62,9 +62,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use scp_protocol::context::params;
-use scp_protocol::context::{
-    ContextError, ContextParams, ContextState, context_id_bytes, transition,
-};
+use scp_protocol::context::{ContextError, ContextParams, ContextState, transition};
 
 pub use config::{ContextConfig, ContextCreation};
 

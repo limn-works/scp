@@ -360,7 +360,7 @@ pub fn apply_broadcast_publish(
     signature: &[u8],
     payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
+    let routing_id = broadcast_publish_routing_id(context_id);
 
     // Resolve the reservation first so a stale/duplicate apply is a
     // clean typed error and never touches sequence state. Class-C
@@ -383,11 +383,29 @@ pub fn apply_broadcast_publish(
         cell,
         deps,
         context_id,
-        &context_id_bytes,
+        &routing_id,
         &pending,
         signature,
         payload,
     )
+}
+
+/// Relay routing id under which a sealed broadcast envelope is published.
+///
+/// Broadcast routing is `SHA-256(context_id)` (no domain separator) per spec
+/// §5.14.6 — the identical value the read side computes
+/// (`scp_node::projection::compute_routing_id`,
+/// `BroadcastRoutingId`/`ProjectedContext::routing_id`). It is deliberately
+/// **NOT** `context_id_to_bytes` (the ADR-056 keying chokepoint, which DECODES
+/// a real 64-hex id to its digest): for a real context id those two values
+/// diverge (`SHA-256(hex(digest)) != digest`), so routing a publish through the
+/// keying digest would store the blob at a relay slot no subscriber or
+/// projection ever reads — the deploy then commits zero assets
+/// (`scp-node` `host_site` `CommitCountMismatch { committed: 0, expected: N }`).
+/// Routing through the canonical broadcast-routing primitive keeps publish and
+/// projection addressing the SAME slot by construction.
+fn broadcast_publish_routing_id(context_id: &str) -> [u8; 32] {
+    scp_protocol::context::broadcast_routing_id(context_id)
 }
 
 /// Inner apply body. Separated so the caller-facing
@@ -397,7 +415,7 @@ fn apply_guarded(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
+    routing_id: &[u8; 32],
     pending: &PendingBroadcastPublish,
     signature: &[u8],
     payload: &[u8],
@@ -434,8 +452,7 @@ fn apply_guarded(
 
     let envelope_bytes = rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
-    deps.transport
-        .send_message(context_id_bytes, &envelope_bytes)?;
+    deps.transport.send_message(routing_id, &envelope_bytes)?;
 
     // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the
     // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
@@ -877,5 +894,72 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
+    }
+}
+
+#[cfg(test)]
+mod broadcast_routing_tests {
+    use super::broadcast_publish_routing_id;
+    use crate::context::state::context_id_to_bytes;
+
+    /// Regression guard (ADR-056 / spec §5.14.6): the broadcast publish path
+    /// MUST address the relay under the broadcast ROUTING id
+    /// (`SHA-256(context_id)`), NOT the canonical context-identity digest that
+    /// `context_id_to_bytes` decodes for a real 64-hex id. Before this guard,
+    /// `apply_broadcast_publish` routed the `send_message` slot through
+    /// `context_id_to_bytes`. On `main` that incidentally equalled
+    /// `SHA-256(id)`; ADR-056 broke the equality, so publish stored a blob at a
+    /// slot the projection (`compute_routing_id` = `SHA-256(id)`) never reads —
+    /// the self-host deploy then committed zero assets (`host_site`
+    /// `CommitCountMismatch`). This test pins the routing primitive so a future
+    /// edit that swaps it back to the keying digest fails fast, without a full
+    /// HTTP/relay round-trip.
+    #[test]
+    fn broadcast_publish_routes_under_sha256_routing_id_not_keying_digest() {
+        // A canonical id: lowercase-hex of a known 32-byte digest — exactly the
+        // shape `generate_context_id` emits (`hex(32 random bytes)`).
+        let digest: [u8; 32] = [
+            0x05, 0xf9, 0x1c, 0x9f, 0x77, 0x21, 0x9f, 0xd7, 0x6e, 0xee, 0x2b, 0x7e, 0x07, 0x16,
+            0x24, 0xf9, 0x1d, 0xf4, 0xc2, 0x11, 0x50, 0x71, 0xb4, 0xa6, 0x5b, 0x6b, 0xd8, 0x03,
+            0x5c, 0xf4, 0x6b, 0xbe,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // The keying chokepoint DECODES a real 64-hex id to its digest. For
+        // such an id that decoded digest IS the id's own bytes — and is NOT
+        // `SHA-256(id)`. This precondition is what makes the two slots diverge.
+        assert_eq!(
+            context_id_to_bytes(&id),
+            digest,
+            "a real 64-hex id resolves to its decoded digest (ADR-056 keying)"
+        );
+        let sha256_of_id = scp_protocol::context::context_id_bytes(&id);
+        assert_ne!(
+            sha256_of_id, digest,
+            "test precondition: SHA-256(hex(digest)) must differ from the digest, \
+             else publish-slot vs read-slot could not diverge"
+        );
+
+        // The publish path's routing slot MUST be the SHA-256 broadcast routing
+        // id, matching the projection read side …
+        let routing = broadcast_publish_routing_id(&id);
+        assert_eq!(
+            routing,
+            scp_protocol::context::broadcast_routing_id(&id),
+            "broadcast publish must route under the canonical broadcast routing id"
+        );
+        assert_eq!(
+            routing, sha256_of_id,
+            "broadcast routing id is SHA-256(context_id) per §5.14.6"
+        );
+
+        // … and MUST NOT be the ADR-056 keying digest (the bug this fixes).
+        assert_ne!(
+            routing,
+            context_id_to_bytes(&id),
+            "broadcast publish MUST NOT route under the keying digest — that stores \
+             the blob at a slot no subscriber/projection reads (host_site CommitCountMismatch)"
+        );
     }
 }

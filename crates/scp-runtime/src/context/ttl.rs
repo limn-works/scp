@@ -59,10 +59,17 @@ use scp_protocol::context::{ContextError, ContextState, MemoryScope};
 // context_id_to_bytes helper (mirrors manager.rs)
 // ---------------------------------------------------------------------------
 
-/// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
+/// Resolves a context-ID string to its MLS/event-log keying bytes.
+///
+/// Delegates to the canonical [`crate::context::state::context_id_to_bytes`]
+/// (ADR-056): a real 64-hex context id resolves to its raw digest, matching
+/// `PerContextState.context_id`; synthetic / non-context strings hash exactly
+/// as before. Keeping this local wrapper aligned with `state`'s resolver is
+/// what prevents the close/expire TTL crypto paths (`destroy_mls_group`,
+/// `append_context_event`) from silently keying under the old `SHA-256(id)`
+/// while live state keys under the digest.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    scp_protocol::context::context_id_bytes(context_id)
+    crate::context::state::context_id_to_bytes(context_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,6 +1520,116 @@ mod tests {
         .await;
         // Real MlsCryptoProvider is idempotent on destroy for unregistered ctxs.
         assert!(res.is_ok());
+    }
+
+    /// ADR-056 forward-secrecy regression guard for the TTL-expiry destruction
+    /// path. `try_ttl_expiry_cleanup` MUST resolve its MLS-keying bytes through
+    /// the canonical
+    /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)
+    /// chokepoint, NOT the raw
+    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
+    ///
+    /// For a REAL 64-hex member-context id the chokepoint DECODES the string to
+    /// its 32-byte digest, while the raw primitive RE-HASHES it
+    /// (`SHA-256(hex(digest))`). The live MLS group and sender key are keyed
+    /// under the DIGEST, so a regression to the raw primitive would call
+    /// `destroy_mls_group(SHA-256(id))` — a no-op against an unkeyed slot —
+    /// while the real group SURVIVES past TTL expiry (the ADR-056 fail-open).
+    ///
+    /// The other ttl.rs tests use `"ctx-*"` labels, for which the chokepoint
+    /// and the raw primitive coincide. This test seeds the group + sender key
+    /// under the DIGEST of a real 64-hex id, drives the production
+    /// `try_ttl_expiry_cleanup` path with an Ephemeral handle carrying the
+    /// STRING id, and asserts the group was PRESENT before and GONE after —
+    /// under the digest. `export_crypto_state` returns a non-empty snapshot only
+    /// for a keyed context (empty vec otherwise), so a destruction that keyed
+    /// off `SHA-256(id)` would leave the digest slot populated and FAIL the
+    /// post-destruction emptiness assertion (mutation-resistant).
+    #[tokio::test]
+    async fn ttl_expiry_destroys_real_context_via_chokepoint_not_raw_primitive() {
+        // A REAL (64-hex) member-context id: `hex(digest)` of a 32-byte digest.
+        let digest = [0xABu8; 32];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // Precondition: the canonical resolver DECODES the 64-hex id to its
+        // digest, while the raw primitive RE-HASHES it. The two must differ,
+        // otherwise this test could not distinguish the keying paths.
+        let chokepoint_bytes = crate::context::state::context_id_to_bytes(&id);
+        let raw_bytes = scp_protocol::context::context_id_bytes(&id);
+        assert_eq!(
+            chokepoint_bytes, digest,
+            "the chokepoint must decode a 64-hex id to its digest"
+        );
+        assert_ne!(
+            chokepoint_bytes, raw_bytes,
+            "test precondition: digest must differ from SHA-256(hex(digest))"
+        );
+
+        // Seed an MLS group AND a sender key under the DIGEST — the slot the
+        // live context (and the chokepoint) key on.
+        let crypto = mk_crypto();
+        crypto
+            .create_mls_group(&digest)
+            .expect("create_mls_group under the digest");
+        crypto
+            .generate_sender_key(&digest)
+            .expect("generate_sender_key under the digest");
+
+        // The group MUST be present under the digest before expiry — proves this
+        // is a real destroy, not a phantom no-op against an empty slot.
+        let before = crypto
+            .export_crypto_state(&digest)
+            .expect("export under the decoded digest must not error");
+        assert!(
+            !before.is_empty(),
+            "precondition: crypto state must be keyed under the digest before TTL expiry"
+        );
+
+        // Drive the REAL TTL-expiry destruction path with an Ephemeral handle
+        // carrying the STRING id, so production resolves id -> bytes via the
+        // chokepoint at :792.
+        let event_log = NullEventLog;
+        let handle = active_handle(&id, MemoryScope::Ephemeral).await;
+        let result = try_ttl_expiry_cleanup(
+            &handle,
+            crypto.as_ref(),
+            Some(&NullTransport),
+            &event_log,
+            0,
+            1_700_000_000,
+        )
+        .await;
+
+        // The cleanup must complete with no failures, and must report both the
+        // MLS group and the sender key destroyed.
+        assert!(
+            !result.has_failures(),
+            "TTL expiry cleanup must complete cleanly, errors: {:?}",
+            result.errors()
+        );
+        assert!(
+            result.mls_destroyed(),
+            "TTL expiry must destroy the MLS group"
+        );
+        assert!(
+            result.sender_key_destroyed(),
+            "TTL expiry must destroy the sender key"
+        );
+
+        // The group MUST be GONE under the digest after expiry. If production had
+        // resolved via the raw `SHA-256(id)` primitive, `destroy_mls_group`
+        // would have addressed an unkeyed slot (a silent no-op) and the digest
+        // slot would still be populated — this assertion FAILS in that case.
+        let after_digest = crypto
+            .export_crypto_state(&digest)
+            .expect("export under the decoded digest must not error");
+        assert!(
+            after_digest.is_empty(),
+            "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after TTL \
+             expiry — destruction keyed off the wrong slot (raw SHA-256(id) \
+             instead of the chokepoint digest)"
+        );
     }
 
     #[tokio::test]

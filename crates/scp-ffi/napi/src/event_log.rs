@@ -111,7 +111,10 @@ pub(crate) async fn event_log_query_on(
     // instance; the supervisor-owned `MerkleEventLogProvider` is the
     // authoritative source.
     let context_id_str = handle.context_id();
-    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
 
     let manager_entries = crate::runtime::supervisor(bi)
         .ok()
@@ -235,7 +238,10 @@ pub(crate) async fn event_log_verify_on(
     // EventLog so that prove_inclusion / prove_absence operate on the same
     // tree that tracks lifecycle events. The UCAN-state EventLog starts
     // empty; this populates it from the authoritative MerkleEventLogProvider.
-    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
     if let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())

@@ -346,8 +346,9 @@ pub fn recovery_send_notification(
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // Use domain-separated routing ID for relay routing, distinct from
-    // the raw context_id_bytes used for MLS crypto keying.
+    // Use domain-separated routing ID for relay routing, distinct from the
+    // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
+    // resolved above via `context_id_to_bytes`) used for MLS crypto keying.
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     let encrypted = deps.crypto.seal(
         &context_id_bytes,

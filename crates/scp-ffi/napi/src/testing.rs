@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use scp_core::context::governance::KeyResolver;
-use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
+use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 use crate::error::ScpNapiError;
@@ -245,7 +245,10 @@ pub(crate) fn fullstack_join_from_welcome_on(
     context_id: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, node);
-    let ctx_bytes = context_id_bytes(&context_id);
+    // ADR-056: key the shared crypto under the canonical digest via the
+    // chokepoint, never the raw routing primitive (which double-hashes a real
+    // 64-hex id and would diverge from the creator's deposit slot).
+    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
 
     // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
     // keys live directly in its `E2eCryptoProvider` (the joiner has no context
@@ -274,7 +277,9 @@ pub(crate) fn fullstack_sync_sender_keys_on(
     // from two different `SCP` instances would cross-wire the shared
     // `KeyExchange` used for sender key distribution.
     crate::napi_check_handle!(&bi.core, node_a, node_b);
-    let ctx_bytes = context_id_bytes(&context_id);
+    // ADR-056: key the shared KeyExchange under the canonical digest via the
+    // chokepoint, never the raw routing primitive.
+    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
     let did_a = node_a.inner.did.to_string();
     let did_b = node_b.inner.did.to_string();
 
@@ -379,7 +384,9 @@ pub(crate) fn fullstack_decrypt_message_on(
     sender_did: String,
 ) -> napi::Result<Buffer> {
     crate::napi_check_handle!(&bi.core, node);
-    let ctx_bytes = context_id_bytes(&context_id);
+    // ADR-056: key decryption under the canonical digest via the chokepoint,
+    // never the raw routing primitive.
+    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
     let plaintext = node
         .inner
         .decrypt_message(&context_id, &ctx_bytes, &ciphertext, &sender_did)

@@ -792,7 +792,11 @@ pub fn event_log_entries_for_consequences(
     // Source 1: Full event log history (persisted, with real timestamps and
     // actor_did). Acquired here from the provider; an unreadable/empty log
     // yields an empty slice (the merge then reflects only Source 2).
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    //
+    // ADR-056: key by the canonical digest (matches the event log init in
+    // `builder::create_context` and `state.context_id`), not a re-hash of the
+    // hex id — `context_id_to_bytes` resolves a real 64-hex id to its digest.
+    let context_id_bytes = context_id_to_bytes(context_id);
     let log_entries = match event_log.event_log_entries(&context_id_bytes) {
         Ok(Some(entries)) => entries,
         Ok(None) | Err(_) => Vec::new(),
@@ -892,13 +896,14 @@ mod convergence_tests {
             .membership
             .add_member(DID(SUBJECT.to_owned()), "member".to_owned(), Vec::new());
 
-        // The enforcement chain keys event-log storage by
-        // `context_id_bytes(context_id_str)` (a SHA-256 of the hex string, NOT
-        // the raw 32-byte id), so the test provider must init/query that exact
-        // derived key — otherwise the durable append targets a different,
+        // ADR-056: the enforcement chain keys event-log storage by the
+        // canonical digest of the context-id STRING — for a real 64-hex id
+        // (`hex(CTX_BYTES)`) that is the DECODED digest `CTX_BYTES` itself, NOT
+        // `SHA-256(hex(CTX_BYTES))`. The test provider must init/query that
+        // exact digest — otherwise the durable append targets a different,
         // uninitialised context and is silently dropped.
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
 
         let event_log = MerkleEventLogProvider::new();
         event_log.init_event_log(&storage_key).expect("init log");
@@ -1025,7 +1030,7 @@ mod convergence_tests {
     /// source from which convergent governance/consequence events may be drawn.
     fn convergent_log() -> (MerkleEventLogProvider, String) {
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).expect("init log");
         log.append_context_event_with_payload(
@@ -1127,7 +1132,7 @@ mod convergence_tests {
     #[test]
     fn per_author_messages_still_flow_from_buffer() {
         let context_id_str = hex::encode(CTX_BYTES);
-        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+        let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
         log.init_event_log(&storage_key).expect("init log");
 
