@@ -4581,6 +4581,50 @@ mod tests {
     }
 
     #[test]
+    fn seal_rejects_context_id_str_that_does_not_resolve_to_context_id() {
+        // Defense-in-depth symmetry with `open` (mirror of
+        // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`):
+        // `seal` asserts the AAD-bound inner-envelope `context_id` STRING
+        // resolves via `context_id_to_bytes` (ADR-056) to the supplied 32-byte
+        // `context_id` keying argument, and fails CLOSED if they diverge. This
+        // guard fires at the very top of `seal`'s `with_context` closure,
+        // BEFORE any inner-envelope serialization, sender-layer AEAD, or MLS
+        // encrypt work — so the rejection is the fast-path resolve-consistency
+        // error, not a downstream crypto failure.
+        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let routing_id = ctx_routing_id(&ctx_id);
+
+        // The keying argument is the REAL `ctx_id` (so `with_context` finds the
+        // live MLS group + sender key from setup), but the inner envelope binds
+        // a DIFFERENT context-id string. The string is non-64-hex, so it
+        // resolves via the SHA-256 fallback; `ctx_id` is the resolution of
+        // TEST_CTX_STR, so any other string resolves elsewhere. The mismatch is
+        // load-bearing: without it the guard would not fire.
+        let mismatched_ctx_str = "definitely-not-the-real-context-string";
+        assert_ne!(
+            crate::context::state::context_id_to_bytes(mismatched_ctx_str),
+            ctx_id,
+            "test precondition: the mismatched string must not resolve to ctx_id"
+        );
+
+        let inner = build_test_inner(mismatched_ctx_str, &alice_did, 0, 0);
+        let err = alice
+            .seal(&ctx_id, &inner, &routing_id, 300)
+            .expect_err("seal must reject an inner context_id that does not resolve to context_id");
+
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(
+                    msg, "inner envelope context_id does not resolve to the supplied context_id",
+                    "expected the fail-fast resolve-consistency rejection, not a serialization, \
+                     AEAD, or MLS-encrypt failure, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_recv_epoch_reorder_still_rejected() {
         // Regression: existing replay/reorder rejection must still
         // fire even with the H9 ceiling in place. After a successful
