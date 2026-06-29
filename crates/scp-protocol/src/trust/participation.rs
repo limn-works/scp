@@ -93,6 +93,106 @@ pub struct ParticipationRecord {
 }
 
 // ---------------------------------------------------------------------------
+// ParticipationFacts
+// ---------------------------------------------------------------------------
+
+/// The scalar (count-flattened) projection of a [`ParticipationRecord`].
+///
+/// [`ParticipationRecord`] carries rich collections (`tool_invocations`
+/// `HashMap`, `governance_actions_*` / `role_history` / `attestation_history`
+/// `Vec`s) that are awkward to convey verbatim across the FFI boundary and that
+/// every SDK would otherwise have to re-aggregate into counts — re-introducing
+/// the cross-binding divergence this projection exists to eliminate. This struct
+/// is the single canonical flattening: it derives ALL counts ONCE in the shared
+/// Rust core so the bridges and SDKs RECEIVE the facts rather than recompute
+/// them.
+///
+/// The flattening matches [`produce_participation_profile`]'s fact derivation
+/// exactly (the same `.len()` / `.values().sum()` reductions), so a
+/// `ParticipationFacts` and a [`ParticipationProfile`] computed from the same
+/// record carry identical fact values — the difference is that
+/// `ParticipationFacts` is an UNSIGNED, locally-computed view (no context
+/// signing key, no `signature` / `signer_public_key`), suitable for an agent
+/// reading its own accessible logs (§7.3.2), whereas `ParticipationProfile` is
+/// the context-hosted SIGNED attestation (§7.3.2.1).
+///
+/// See ADR-017 (§7.3.2) and the field docs on [`ParticipationProfile`] for the
+/// per-fact semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationFacts {
+    /// The DID whose participation is summarized.
+    pub subject_did: DID,
+
+    /// Total seconds of context participation, summed over the subject's
+    /// `MemberJoined`→`MemberLeft` intervals (§7.3.2).
+    pub participation_duration_secs: u64,
+
+    /// Count of governance actions taken against this identity (where the
+    /// projected `target_did` is the subject).
+    pub governance_actions_against: u64,
+
+    /// Count of governance actions initiated by this identity.
+    pub governance_actions_by: u64,
+
+    /// Total tool invocations across all tool types.
+    pub tool_invocation_count: u64,
+
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    ///
+    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+    /// computed from per-author local `ContextEvent`s, not the Merkle log
+    /// (spec §7.3.2; ADR-011 amendment exclusion taxonomy §2). Truth-in-
+    /// advertising — consumers MUST NOT treat the count as Merkle-proven while
+    /// this is `false`.
+    pub tool_invocation_count_anchored: bool,
+
+    /// Number of contexts created by the subject (`ChildContextCreated`).
+    pub context_creation_count: u64,
+
+    /// Number of role transitions for the subject.
+    pub role_progression_count: u64,
+
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative — a caller with no
+    /// attestation-cache access honestly yields 0.
+    pub attestation_count: u64,
+
+    /// Unix timestamp (seconds) when the underlying record was computed.
+    pub computed_at: u64,
+
+    /// Merkle root of the event log at computation time.
+    pub event_log_root: [u8; 32],
+}
+
+impl From<&ParticipationRecord> for ParticipationFacts {
+    /// Flattens a [`ParticipationRecord`]'s collections into scalar counts.
+    ///
+    /// This is the SAME reduction [`produce_participation_profile`] applies when
+    /// building a signed [`ParticipationProfile`] (`.len()` over the governance /
+    /// role / attestation `Vec`s; `.values().sum()` over the `tool_invocations`
+    /// `HashMap`); `tool_invocation_count_anchored` is `false` until ADR-051
+    /// (spec §7.3.2).
+    fn from(record: &ParticipationRecord) -> Self {
+        let tool_invocation_count: u64 = record.tool_invocations.values().sum();
+        Self {
+            subject_did: record.subject_did.clone(),
+            participation_duration_secs: record.participation_duration_seconds,
+            governance_actions_against: record.governance_actions_against.len() as u64,
+            governance_actions_by: record.governance_actions_by.len() as u64,
+            tool_invocation_count,
+            // `tool_invocation_count` is summed from local `ToolInvoked`
+            // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
+            tool_invocation_count_anchored: false,
+            context_creation_count: record.context_creation_count,
+            role_progression_count: record.role_history.len() as u64,
+            attestation_count: record.attestation_history.len() as u64,
+            computed_at: record.computed_at,
+            event_log_root: record.event_log_root,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // compute_participation_record
 // ---------------------------------------------------------------------------
 
@@ -980,21 +1080,23 @@ pub fn produce_participation_profile(
     let signing_key = derive_participation_signing_key(context_key_material, context_id)?;
     let verifying_key = signing_key.verifying_key();
 
-    // Build the profile with all 7 fact values from the record.
-    let total_tool_invocations: u64 = record.tool_invocations.values().sum();
+    // Flatten the record's collections into scalar facts via the single
+    // canonical reduction (shared with `ParticipationFacts`), so the signed
+    // profile and the unsigned facts view can never drift in how they count.
+    let facts = ParticipationFacts::from(&record);
 
     let mut profile = ParticipationProfile {
         subject_did: member_did.into(),
-        participation_duration_secs: record.participation_duration_seconds,
-        governance_actions_against: record.governance_actions_against.len() as u64,
-        governance_actions_by: record.governance_actions_by.len() as u64,
-        tool_invocation_count: total_tool_invocations,
+        participation_duration_secs: facts.participation_duration_secs,
+        governance_actions_against: facts.governance_actions_against,
+        governance_actions_by: facts.governance_actions_by,
+        tool_invocation_count: facts.tool_invocation_count,
         // `tool_invocation_count` is summed from local `ToolInvoked`
         // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
-        tool_invocation_count_anchored: false,
-        context_creation_count: record.context_creation_count,
-        role_progression_count: record.role_history.len() as u64,
-        attestation_count: record.attestation_history.len() as u64,
+        tool_invocation_count_anchored: facts.tool_invocation_count_anchored,
+        context_creation_count: facts.context_creation_count,
+        role_progression_count: facts.role_progression_count,
+        attestation_count: facts.attestation_count,
         updated_at: input.current_time,
         event_log_root: input.merkle_root,
         signer_public_key: verifying_key.to_bytes(),
@@ -2944,5 +3046,95 @@ mod tests {
                 .unwrap();
         // The admin executed the join but is not the affected member — no interval.
         assert_eq!(admin_record.participation_duration_seconds, 0);
+    }
+
+    #[test]
+    fn participation_facts_flattens_record_collections_to_counts() {
+        let member = "did:key:alice";
+        let admin = "did:key:admin";
+        let events = vec![
+            // Membership interval 1000 → 1300 = 300s for the member.
+            make_event(
+                EventType::MemberJoined,
+                admin,
+                1000,
+                0,
+                make_membership_payload(member, "member"),
+            ),
+            // Role assigned to the member (role_progression).
+            make_event(
+                EventType::RoleAssigned,
+                admin,
+                1100,
+                1,
+                make_role_payload(member, "admin"),
+            ),
+            // Adverse governance action targeting the member (against).
+            make_event(
+                EventType::GovernanceActionExecuted,
+                admin,
+                1150,
+                2,
+                make_gov_payload(member, "RemoveMember"),
+            ),
+            // Governance action executed BY the member (by).
+            make_event(
+                EventType::GovernanceActionExecuted,
+                member,
+                1200,
+                3,
+                make_gov_payload(admin, "RemoveMember"),
+            ),
+            // Child context created by the member.
+            make_event(EventType::ChildContextCreated, member, 1250, 4, vec![]),
+            make_event(
+                EventType::MemberLeft,
+                admin,
+                1300,
+                5,
+                make_membership_payload(member, "member"),
+            ),
+        ];
+
+        let record =
+            compute_participation_record(&events, member, "ctx-1", [9u8; 32], 5000, &[]).unwrap();
+        let facts = ParticipationFacts::from(&record);
+
+        // Each scalar fact equals the reduction of the corresponding record field.
+        assert_eq!(
+            facts.governance_actions_against,
+            record.governance_actions_against.len() as u64
+        );
+        assert_eq!(facts.governance_actions_against, 1);
+        assert_eq!(
+            facts.governance_actions_by,
+            record.governance_actions_by.len() as u64
+        );
+        assert_eq!(facts.governance_actions_by, 1);
+        assert_eq!(
+            facts.role_progression_count,
+            record.role_history.len() as u64
+        );
+        assert_eq!(facts.role_progression_count, 1);
+        assert_eq!(
+            facts.tool_invocation_count,
+            record.tool_invocations.values().sum::<u64>()
+        );
+        assert_eq!(
+            facts.attestation_count,
+            record.attestation_history.len() as u64
+        );
+        assert_eq!(
+            facts.participation_duration_secs,
+            record.participation_duration_seconds
+        );
+        assert_eq!(facts.participation_duration_secs, 300);
+        assert_eq!(facts.context_creation_count, record.context_creation_count);
+        assert_eq!(facts.context_creation_count, 1);
+        assert_eq!(facts.computed_at, record.computed_at);
+        assert_eq!(facts.event_log_root, record.event_log_root);
+        assert_eq!(facts.subject_did.as_ref(), member);
+        // Tool count is never Merkle-anchored until ADR-051.
+        assert!(!facts.tool_invocation_count_anchored);
     }
 }

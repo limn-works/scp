@@ -143,8 +143,8 @@ pub mod trust {
         evaluate_consequence_rules,
     };
     pub use scp_protocol::trust::participation::{
-        PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationProfile,
-        ParticipationRecord, ParticipationThreshold, RequireParticipation,
+        PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationFacts,
+        ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
         compute_participation_record, verify_participation_requirements,
     };
     pub use scp_protocol::trust::sybil::{
