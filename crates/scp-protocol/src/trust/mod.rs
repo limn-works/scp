@@ -308,14 +308,21 @@ pub struct RoleTransition {
     pub assigned_by: DID,
 }
 
-/// Reference to an attestation event in the log.
+/// Reference to a credential-layer attestation (§7.4) for a subject.
+///
+/// NOT an event-log entry: there is no attestation event type and attestations
+/// are never context-log leaves (§7.3.2). This references the credential-layer
+/// artifact, sourced from the subject's accessible attestations, not the Merkle
+/// log — so `event_sequence` carries no log position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationReference {
-    /// Unix timestamp (seconds) when the attestation was recorded.
+    /// Unix timestamp (seconds) when the attestation was issued (or last
+    /// renewed).
     pub timestamp: u64,
-    /// The sequence number of the event in the log.
+    /// Always `0`: attestations are credential-layer artifacts, not event-log
+    /// leaves, so they carry no log sequence number.
     pub event_sequence: u64,
-    /// The DID of the actor who created the attestation event.
+    /// The DID of the attestation issuer (§7.4).
     pub actor_did: DID,
 }
 

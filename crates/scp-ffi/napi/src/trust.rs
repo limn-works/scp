@@ -81,6 +81,11 @@ pub struct NapiParticipationRecord {
     /// Number of accessible, currently-valid credential-layer attestations
     /// (§7.4) for the subject. Verifier-relative.
     pub attestation_count: i64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+    /// never a context-event-log count (§7.3.2). Parallel of
+    /// `tool_invocation_count_anchored`.
+    pub attestation_count_anchored: bool,
     /// Unix timestamp (seconds) when the record was computed.
     pub computed_at: i64,
     /// Merkle root (hex) of the event log at computation time.
@@ -100,6 +105,7 @@ impl From<&scp_core::trust::ParticipationFacts> for NapiParticipationRecord {
             context_creation_count: f.context_creation_count as i64,
             role_progression_count: f.role_progression_count as i64,
             attestation_count: f.attestation_count as i64,
+            attestation_count_anchored: f.attestation_count_anchored,
             computed_at: f.computed_at as i64,
             event_log_root: hex::encode(f.event_log_root),
         }
@@ -474,9 +480,15 @@ pub(crate) fn participation_record_on(
     let record = crate::runtime::supervisor(bi)?
         .participation_record(&context_id, &subject_did, &verified)
         .map_err(|e| {
+            // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not the
+            // message; genuine failures stay on the generic CTX_2000.
+            let code = match e {
+                scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
+                _ => codes::CTX_2000,
+            };
             napi::Error::from(ScpNapiError::Context {
                 message: e.to_string(),
-                code: codes::CTX_2000.to_owned(),
+                code: code.to_owned(),
             })
         })?;
 
@@ -675,6 +687,7 @@ mod tests {
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
+            attestation_count_anchored: false,
             computed_at: 42,
             event_log_root: [7u8; 32],
         };
@@ -688,6 +701,7 @@ mod tests {
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
         assert_eq!(view.computed_at, 42);
         assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
     }

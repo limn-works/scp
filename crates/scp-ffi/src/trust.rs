@@ -526,6 +526,13 @@ pub struct PyParticipationRecord {
     /// (§7.4) for the subject. Verifier-relative.
     #[pyo3(get)]
     pub attestation_count: u64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — it is a credential-layer, verifier-relative
+    /// fact (§7.4), never a context-event-log count (§7.3.2). The parallel of
+    /// `tool_invocation_count_anchored`, surfaced so the non-anchored nature is
+    /// mechanically visible.
+    #[pyo3(get)]
+    pub attestation_count_anchored: bool,
     /// Unix timestamp (seconds) when the record was computed.
     #[pyo3(get)]
     pub computed_at: u64,
@@ -546,6 +553,7 @@ impl From<&scp_core::trust::ParticipationFacts> for PyParticipationRecord {
             context_creation_count: f.context_creation_count,
             role_progression_count: f.role_progression_count,
             attestation_count: f.attestation_count,
+            attestation_count_anchored: f.attestation_count_anchored,
             computed_at: f.computed_at,
             event_log_root: encode_hex(&f.event_log_root),
         }
@@ -560,7 +568,7 @@ impl PyParticipationRecord {
              governance_actions_against={}, governance_actions_by={}, \
              tool_invocation_count={}, tool_invocation_count_anchored={}, \
              context_creation_count={}, role_progression_count={}, \
-             attestation_count={})",
+             attestation_count={}, attestation_count_anchored={})",
             self.subject_did,
             self.participation_duration_secs,
             self.governance_actions_against,
@@ -570,6 +578,7 @@ impl PyParticipationRecord {
             self.context_creation_count,
             self.role_progression_count,
             self.attestation_count,
+            self.attestation_count_anchored,
         )
     }
 }
@@ -641,12 +650,22 @@ fn participation_record_impl(
 
     let record = crate::runtime::supervisor(bi)?
         .participation_record(context_id, subject_did, &verified)
-        // Use the generic context code (CTX_2000) to match NAPI/UniFFI on the
-        // supervisor/compute-failure path; `ScpPyError::context` would emit
-        // CTX_2001, diverging from the other bridges for the same condition.
-        .map_err(|e| crate::error::ScpPyError::ContextError {
-            message: e.to_string(),
-            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+        // Map the empty-log condition to its dedicated, stable code (CTX_2076) so
+        // SDKs can branch on "no recorded participation facts" without string-
+        // matching; genuine failures stay on the generic context code (CTX_2000),
+        // matching NAPI/UniFFI. `ScpPyError::context` would emit CTX_2001,
+        // diverging from the other bridges for the same condition.
+        .map_err(|e| {
+            let code = match e {
+                scp_core::context::ContextError::NoParticipationFacts { .. } => {
+                    scp_ffi_common::error_codes::CTX_2076
+                }
+                _ => scp_ffi_common::error_codes::CTX_2000,
+            };
+            crate::error::ScpPyError::ContextError {
+                message: e.to_string(),
+                code: code.to_owned(),
+            }
         })?;
 
     let facts = scp_core::trust::ParticipationFacts::from(&record);
@@ -962,6 +981,7 @@ mod tests {
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
+            attestation_count_anchored: false,
             computed_at: 42,
             event_log_root: [7u8; 32],
         };
@@ -975,6 +995,7 @@ mod tests {
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
         assert_eq!(view.computed_at, 42);
         assert_eq!(view.event_log_root, encode_hex(&[7u8; 32]));
     }

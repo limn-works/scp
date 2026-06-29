@@ -260,19 +260,17 @@ fn query_manager_entries(
             .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))?;
         // Project the typed payload's bridge-facing fields (e.g. `target_did`
         // for governance/access-revocation events, `subject_did` for
-        // role/membership events) through the single shared decoder so all four
+        // role/membership events) through the single shared helper so all
         // bridges surface byte-identical values. Each key is omitted when the
         // projection yields `None`.
-        let projection = scp_event_log::payload::project_payload(&entry.event_type, &entry.payload);
         let mut payload_json = serde_json::json!({
             "hash": encode_hex(&leaf_hash),
         });
-        if let Some(target_did) = projection.target_did {
-            payload_json["target_did"] = serde_json::Value::String(target_did);
-        }
-        if let Some(subject_did) = projection.subject_did {
-            payload_json["subject_did"] = serde_json::Value::String(subject_did);
-        }
+        scp_ffi_common::event_log::inject_projection(
+            &mut payload_json,
+            &entry.event_type,
+            &entry.payload,
+        );
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
             event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
@@ -429,20 +427,17 @@ fn query_storage_fallback(
             }
 
             // Project the typed payload's bridge-facing fields (`target_did`,
-            // `subject_did`) through the single shared decoder, agreeing with
+            // `subject_did`) through the single shared helper, agreeing with
             // the manager-path projection. Each key is omitted when the
             // projection yields `None`.
-            let projection =
-                scp_event_log::payload::project_payload(&event.event_type, &event.payload);
             let mut payload_json = serde_json::json!({
                 "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
             });
-            if let Some(target_did) = projection.target_did {
-                payload_json["target_did"] = serde_json::Value::String(target_did);
-            }
-            if let Some(subject_did) = projection.subject_did {
-                payload_json["subject_did"] = serde_json::Value::String(subject_did);
-            }
+            scp_ffi_common::event_log::inject_projection(
+                &mut payload_json,
+                &event.event_type,
+                &event.payload,
+            );
             let payload = json_to_py_dict(py, &payload_json)?;
 
             #[allow(clippy::cast_precision_loss)]

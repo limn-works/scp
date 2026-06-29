@@ -347,6 +347,14 @@ pub const CTX_2073: &str = "SCP-CTX-2073";
 pub const CTX_2074: &str = "SCP-CTX-2074";
 /// `UniFFI` context drain events error.
 pub const CTX_2075: &str = "SCP-CTX-2075";
+/// No recorded participation facts (spec §7.3.2).
+///
+/// The context event log is empty, so there is nothing to summarize for the
+/// subject. A normal, branchable outcome — NOT a failure — so callers can
+/// distinguish "no facts yet" from genuine errors (`NotInitialized`, provider
+/// failures, the generic `CTX_2000` catch-all) without string-matching the
+/// message. Maps from `ContextError::NoParticipationFacts`.
+pub const CTX_2076: &str = "SCP-CTX-2076";
 /// Snapshot import rejected: monotonic floor regression (spec §23.17).
 ///
 /// A per-sender monotonic floor (sender-key epoch, spending nonce, etc.) would

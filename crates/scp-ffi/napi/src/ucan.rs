@@ -337,13 +337,13 @@ pub(crate) async fn ucan_validate_on(
 /// validity with no invoked-capability grant-match challenge (mirroring
 /// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
 ///
-/// WARNING: when `presenting_agent_did` is `None` (or empty) the audience
-/// defaults to the token's OWN `aud`, making the step-5 audience check a
-/// tautological self-check (`aud == aud`) that does NOT bind the token to any
-/// external subject. A caller assessing a SPECIFIC subject MUST pass that
-/// subject's DID — otherwise a token addressed to someone else would report
-/// `signatures_valid` (trust inflation). The SDK trust path always passes the
-/// subject; this default is a convenience for self-evaluation only.
+/// FAIL CLOSED: `presenting_agent_did` is required (no silent security default).
+/// When it is `None` or empty this returns a validation error rather than
+/// defaulting to the token's own `aud` — defaulting would make the step-5
+/// audience check a tautological self-check (`aud == aud`) that does NOT bind the
+/// token to any external subject, so a token addressed to someone else would
+/// report `signatures_valid` (trust inflation). The SDK trust path always passes
+/// the subject; raw diagnostic callers must now pass an explicit presenting agent.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
@@ -362,6 +362,23 @@ pub(crate) async fn ucan_evaluate_on(
     if let Some(ref cap) = capability {
         validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
+
+    // FAIL CLOSED (no silent security default): require an explicit presenting
+    // agent DID instead of defaulting to the token's own `aud` (which would make
+    // the step-5 audience check tautological and inflate trust). Validated as a
+    // pure input before any state lookup.
+    let agent_did = presenting_agent_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: "presenting_agent_did is required: ucan_evaluate will not default to \
+                          the token's audience"
+                    .to_owned(),
+                code: codes::VALID_7010.to_owned(),
+            })
+        })?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -382,11 +399,6 @@ pub(crate) async fn ucan_evaluate_on(
                 })
         })
         .transpose()?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
 
     // Build proof resolver from optional proof tokens.
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
@@ -1464,6 +1476,48 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted
+    /// `presenting_agent_did` rather than defaulting to the token's own `aud`.
+    /// The check is a pure-input gate before context lookup / token parse, so a
+    /// dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_evaluate_requires_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-eval-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let omitted = ucan_evaluate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = ucan_evaluate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            None,
+            Some("   ".to_owned()),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is empty"
         );
     }
 }

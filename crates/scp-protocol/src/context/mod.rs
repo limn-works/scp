@@ -542,6 +542,22 @@ pub enum ContextError {
     #[error("SCP-CTX-2132: not initialized: {0}")]
     NotInitialized(String),
 
+    /// No recorded participation facts exist for the subject in the context.
+    ///
+    /// The event log is empty, so there is nothing to summarize. This is a
+    /// normal, branchable outcome (not a failure) — a freshly-created or
+    /// never-touched context, or a subject with no activity.
+    ///
+    /// Distinct from genuine failures (`NotInitialized`, provider errors, or the
+    /// generic `InvalidState` catch-all) so callers can detect "no facts yet"
+    /// without string-matching. Mapped to canonical code `SCP-CTX-2076` through
+    /// every FFI bridge translator.
+    #[error("SCP-CTX-2076: no recorded participation facts for {subject_did}")]
+    NoParticipationFacts {
+        /// The subject DID for which no participation facts were found.
+        subject_did: String,
+    },
+
     /// A transport operation exceeded its per-call timeout budget while
     /// invoked inside a context actor handler (ADR-049 §7 / plan §"Transport
     /// timeouts inside actor handlers"). Distinct from
