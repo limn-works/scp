@@ -1739,12 +1739,14 @@ mod tests {
     // The handler returns `{"sum":42,"ok":1}`, which Commit-B validates against
     // the registered numeric `{sum, ok}` output schema before committing.
     //
-    // The owner is created via the real `identity_create` BEFORE the first
-    // `context_create_on` so its DID document is published into the per-instance
-    // resolver and the supervisor (built lazily on first create) snapshots that
-    // real resolver — governance vote verification resolves the proposer key
-    // through it. Prepare-B enforces a §9.14 ±5min timestamp skew, so the
-    // invocation uses `SystemTime::now()`.
+    // For hermeticity against the process-global `SHARED_DHT_CLIENT` `OnceLock`,
+    // the test installs its OWN per-instance resolver (over a caller-retained
+    // in-memory DHT) BEFORE the first `identity_create`, then explicitly seeds
+    // the owner's DID document into that resolver-visible store. The supervisor
+    // (built lazily on first `context_create_on`) snapshots that resolver, so
+    // governance vote verification resolves the proposer key through it without
+    // racing a concurrent sibling on the global. Prepare-B enforces a §9.14
+    // ±5min timestamp skew, so the invocation uses `SystemTime::now()`.
     // ------------------------------------------------------------------
 
     /// Serializes a `RegisterTool` governance action for the saga tool. Mirrors
@@ -1830,6 +1832,87 @@ mod tests {
         }
     }
 
+    /// Installs a per-instance DID resolver backed by a caller-retained
+    /// in-memory DHT client on `bi` and returns that client, so the committed
+    /// e2e test can seed the owner's DID document into the SAME store the
+    /// supervisor's governance key resolver reads from — WITHOUT depending on
+    /// the process-global `SHARED_DHT_CLIENT` `OnceLock`.
+    ///
+    /// Why this is necessary (test hermeticity): the production
+    /// `ensure_did_resolver_initialized_on` path stores its `InMemoryDhtClient`
+    /// in the process-wide `SHARED_DHT_CLIENT` `OnceLock` (#1144, so
+    /// cross-identity flows in one process share a DHT). The three co-located
+    /// `xctx_saga` tests run concurrently under the default test harness; a
+    /// sibling can win the `SHARED_DHT_CLIENT.set` (or mutate the shared DHT)
+    /// first, so this test's owner DID document lands in / is read from a
+    /// resolver the committed test does not control, and governance vote
+    /// verification fails with `[SCP-CTX-2041] unknown voter: cannot resolve
+    /// public key for DID …`. Installing a FRESH per-instance resolver here,
+    /// BEFORE the first identity creation, makes `ensure_did_resolver_initialized_on`
+    /// a no-op (it short-circuits when a resolver is already present), so this
+    /// retained client is the one the supervisor snapshots — fully isolated from
+    /// the global. Mirrors the `UniFFI` bridge's `install_seedable_resolver`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn install_seedable_resolver(
+        bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+    ) -> std::sync::Arc<scp_identity::InMemoryDhtClient> {
+        let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
+        let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
+            std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
+            std::sync::Arc::clone(&dht_client),
+            std::sync::Arc::new(scp_identity::DidCache::new()),
+            Vec::new(),
+        ));
+        crate::runtime::init_did_resolver(bi, resolver, tokio::runtime::Handle::current());
+        dht_client
+    }
+
+    /// Publishes `owner_identity`'s DID document into `dht_client` (the
+    /// resolver-visible store installed by [`install_seedable_resolver`]) by
+    /// signing the BEP44 record with the identity's retained in-memory custody.
+    /// Mirrors the production `publish_to_shared_dht_for` step so the
+    /// supervisor's governance key resolver can resolve the proposer key during
+    /// single-admin vote verification.
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn seed_owner_document_into_resolver(
+        owner_identity: &crate::identity::NapiIdentity,
+        dht_client: &std::sync::Arc<scp_identity::InMemoryDhtClient>,
+    ) {
+        use scp_identity::DhtClient as _;
+        use scp_platform::traits::KeyCustody as _;
+
+        let inner = &owner_identity.inner;
+        let identity = inner
+            .scp_identity
+            .as_ref()
+            .expect("in-memory owner retains its ScpIdentity");
+        let document = inner
+            .document
+            .as_ref()
+            .expect("in-memory owner retains its DID document");
+        let custody = inner
+            .in_memory_custody
+            .as_ref()
+            .expect("in-memory owner retains its custody");
+
+        let doc_json = document.to_json().expect("document serializes to JSON");
+        let value = doc_json.as_bytes();
+        let public_key =
+            scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
+        let seq: u64 = 1;
+        let signable = scp_identity::dht::bep44_signable(value, seq);
+        let sig_bytes = custody
+            .sign(&identity.identity_key, &signable)
+            .await
+            .expect("identity custody signs the BEP44 record")
+            .into_bytes();
+        let signature: [u8; 64] = sig_bytes.try_into().expect("Ed25519 signature is 64 bytes");
+        dht_client
+            .publish(&public_key, &signature, value, seq)
+            .await
+            .expect("publish into the resolver-visible store");
+    }
+
     /// Full `Committed` terminal through the NAPI bridge: an authenticated
     /// caller drives the §6.2.4 cross-context tool-invocation saga to a real
     /// commit and the bridge returns the committed receipt + output bytes.
@@ -1839,15 +1922,28 @@ mod tests {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
-        // Owner via the real identity-create path so its DID document is
-        // resolvable for governance vote verification. MUST precede the first
+        // Install a per-instance, caller-retained DID resolver BEFORE the first
+        // identity creation, so this test is hermetic against the process-global
+        // `SHARED_DHT_CLIENT` `OnceLock` a concurrent sibling `xctx_saga` test
+        // could win first (which otherwise leaves this owner's DID unresolvable
+        // → `[SCP-CTX-2041] unknown voter`). See `install_seedable_resolver`.
+        let resolver_dht = install_seedable_resolver(&bi);
+
+        // Owner via the real identity-create path so it retains a real
+        // `ScpIdentity`, custody, and DID document. MUST precede the first
         // context_create (which lazily builds the supervisor + snapshots the
-        // resolver).
+        // resolver installed above).
         let owner_identity = scp
             .identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
         let owner = owner_identity.inner.did.clone();
+
+        // Seed the owner's DID document into the per-instance resolver's store
+        // so governance vote verification (RegisterTool / EstablishToolInterface
+        // auto-execute under single_admin) can resolve the proposer's public
+        // key. Without this the resolver is empty and the propose below fails.
+        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
 
         // Context A (caller/source): ceiling carries governance:propose (so the
         // admin can propose) and tool:interface (required by
