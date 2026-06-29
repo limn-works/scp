@@ -12253,6 +12253,29 @@ impl Scp {
     /// / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
     /// (the target validates them; they are not minted here).
     ///
+    /// # Trust boundary (co-resident single-tenant only)
+    ///
+    /// The caller-principal binding (`enforce_caller_principal_binding`) treats
+    /// "hosted in this bridge instance's identity custody registry" as the
+    /// channel-authenticated principal. That equivalence holds ONLY for a
+    /// single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+    /// across a trust boundary within one process: a multi-tenant host loading
+    /// multiple users' identities into one bridge instance could assert any
+    /// hosted `caller_did`, since the registry cannot distinguish which tenant
+    /// is making the call. The future cross-node leg needs real channel auth
+    /// (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+    /// the authenticated-principal proof.
+    ///
+    /// The caller/target context-id axes are bound by the instance-affine
+    /// handle pre-check: `source_handle` / `target_handle` must have been minted
+    /// by THIS bridge instance (a foreign handle is rejected) before the
+    /// supervisor membership / tool-interface gates run.
+    ///
+    /// The receipt's signer-authorization — that the target key is
+    /// governance-authorized to act for the target context (§6.2.4 "Signer
+    /// authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+    /// when the receipt is consumed, NOT enforced at this export.
+    ///
     /// # Arguments
     ///
     /// * `source_handle` — The initiating (caller) context handle.

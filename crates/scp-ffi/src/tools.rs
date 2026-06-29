@@ -1866,6 +1866,33 @@ impl crate::scp::PyScp {
     /// `chain_depth` REMAIN caller-supplied freshness fields (the target
     /// validates them; they are not minted here).
     ///
+    /// # Trust boundary (co-resident single-tenant only)
+    ///
+    /// The caller-principal binding (`enforce_caller_principal_binding`) treats
+    /// "hosted in this bridge instance's identity registry" as the
+    /// channel-authenticated principal. That equivalence holds ONLY for a
+    /// single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+    /// across a trust boundary within one process: a multi-tenant host loading
+    /// multiple users' identities into one bridge instance could assert any
+    /// hosted `caller_did`, since the registry cannot distinguish which tenant
+    /// is making the call. The future cross-node leg needs real channel auth
+    /// (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+    /// the authenticated-principal proof.
+    ///
+    /// On the `PyO3` string-id surface the caller/target context-id axes are
+    /// enforced by the supervisor gates — membership (`is_member`) for the
+    /// caller context and the governance-established tool-interface gate for the
+    /// target context — rather than the instance-affine handle pre-check the
+    /// NAPI/UniFFI handle-based surfaces apply. The authorization is equivalent;
+    /// the difference is only that this surface carries less pre-flight
+    /// defense-in-depth, matching the `PyO3` string-id idiom (the gates are the
+    /// authoritative check on both surfaces).
+    ///
+    /// The receipt's signer-authorization — that the target key is
+    /// governance-authorized to act for `target_context_id` (§6.2.4 "Signer
+    /// authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+    /// when the receipt is consumed, NOT enforced at this export.
+    ///
     /// # Arguments
     ///
     /// * `caller_context_id` — The initiating (caller) context id.
