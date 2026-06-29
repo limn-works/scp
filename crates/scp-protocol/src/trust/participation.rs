@@ -173,35 +173,13 @@ pub fn compute_participation_record(
                 *tool_invocations.entry(tool_id).or_insert(0) += 1;
             }
 
-            EventType::GovernanceActionExecuted => {
-                if is_subject {
-                    // Subject performed a governance action — keyed on actor_did.
-                    governance_actions_by.push(GovernanceActionSummary {
-                        timestamp: event.timestamp,
-                        actor_did: event.actor_did.clone(),
-                        target_did: project_payload(&event.event_type, &event.payload)
-                            .target_did
-                            .map(Into::into),
-                        event_sequence: event.sequence,
-                    });
-                } else {
-                    // Check if the subject is the projected target of this
-                    // governance action AND the action is adverse (H18: filter
-                    // out beneficial actions such as RestoreAccess that could
-                    // otherwise be used to deflate the target's standing score).
-                    let target = project_payload(&event.event_type, &event.payload).target_did;
-                    if target.as_deref() == Some(subject_did)
-                        && is_adverse_governance_action(&event.payload)
-                    {
-                        governance_actions_against.push(GovernanceActionSummary {
-                            timestamp: event.timestamp,
-                            actor_did: event.actor_did.clone(),
-                            target_did: target.map(Into::into),
-                            event_sequence: event.sequence,
-                        });
-                    }
-                }
-            }
+            EventType::GovernanceActionExecuted => record_governance_action(
+                event,
+                is_subject,
+                subject_did,
+                &mut governance_actions_by,
+                &mut governance_actions_against,
+            ),
 
             EventType::RoleAssigned => {
                 // Role assignments where the projected subject is the subject.
@@ -365,24 +343,58 @@ const ADVERSE_ACTION_TYPES: &[&str] = &[
     "ResetMember",
 ];
 
-/// Returns `true` if the governance action carried by `payload` is adverse
-/// toward its target and should therefore be counted in
-/// `governance_actions_against`.
+/// Returns `true` if a governance action's `action_type` is adverse toward its
+/// target and should therefore be counted in `governance_actions_against`.
 ///
-/// The payload is the canonical [`GovernanceActionExecutedPayload`] (positional
-/// `MessagePack`, ADR-011 amendment). An action is adverse if its `action_type`
-/// matches one of the [`ADVERSE_ACTION_TYPES`]. An absent or empty `action_type`
-/// — a payload that does not decode, or an empty `action_type` string — is
-/// conservatively treated as adverse (preserving the pre-H18 behavior).
-fn is_adverse_governance_action(payload: &scp_event_log::EventPayload) -> bool {
-    let action_type = decode_payload::<GovernanceActionExecutedPayload>(payload)
-        .ok()
-        .map(|p| p.action_type)
-        .filter(|t| !t.is_empty());
-    // No (or empty) action_type — treat conservatively as adverse.
-    action_type
-        .as_deref()
-        .is_none_or(|t| ADVERSE_ACTION_TYPES.contains(&t))
+/// `action_type` comes from the canonical [`GovernanceActionExecutedPayload`]
+/// (positional `MessagePack`, ADR-011 amendment). An action is adverse if its
+/// `action_type` matches one of the [`ADVERSE_ACTION_TYPES`]. An empty
+/// `action_type` string is conservatively treated as adverse (preserving the
+/// pre-H18 behavior for legacy events that decode but carry no `action_type`).
+fn is_adverse_action_type(action_type: &str) -> bool {
+    // Empty action_type — treat conservatively as adverse.
+    action_type.is_empty() || ADVERSE_ACTION_TYPES.contains(&action_type)
+}
+
+/// Records a [`EventType::GovernanceActionExecuted`] leaf into the appropriate
+/// bucket for `compute_participation_record`.
+///
+/// When the subject is the actor, the action is recorded in `actions_by` keyed
+/// on the actor. Otherwise the canonical [`GovernanceActionExecutedPayload`] is
+/// decoded **once** and recorded in `actions_against` only when the subject is
+/// the (non-empty) target AND the action is adverse (H18: beneficial actions
+/// such as `RestoreAccess` must not deflate the target's standing score). An
+/// undecodable payload yields no target, so — as under the prior two-decode
+/// shape — it can never match the subject and is never counted here.
+fn record_governance_action(
+    event: &Event,
+    is_subject: bool,
+    subject_did: &str,
+    actions_by: &mut Vec<GovernanceActionSummary>,
+    actions_against: &mut Vec<GovernanceActionSummary>,
+) {
+    if is_subject {
+        // Subject performed a governance action — keyed on actor_did.
+        actions_by.push(GovernanceActionSummary {
+            timestamp: event.timestamp,
+            actor_did: event.actor_did.clone(),
+            target_did: project_payload(&event.event_type, &event.payload)
+                .target_did
+                .map(Into::into),
+            event_sequence: event.sequence,
+        });
+    } else if let Ok(p) = decode_payload::<GovernanceActionExecutedPayload>(&event.payload) {
+        // Empty `target_did` projects to `None`, mirroring `project_payload`.
+        let target = (!p.target_did.is_empty()).then(|| p.target_did.clone());
+        if target.as_deref() == Some(subject_did) && is_adverse_action_type(&p.action_type) {
+            actions_against.push(GovernanceActionSummary {
+                timestamp: event.timestamp,
+                actor_did: event.actor_did.clone(),
+                target_did: target.map(Into::into),
+                event_sequence: event.sequence,
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
