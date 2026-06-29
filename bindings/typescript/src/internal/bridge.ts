@@ -344,7 +344,19 @@ export interface Bridge {
   transportDisconnect(handle: BridgeTransportHandle): Promise<void>;
 
   // UCAN
-  ucanValidate(handle: BridgeContextHandle, token: string, capability: string): Promise<void>;
+  /**
+   * Enforcing UCAN gate. FAIL CLOSED: `presentingAgentDid` is required by the
+   * bridge (it will not default to the token's own `aud`, which would make the
+   * step-5 audience check a tautology and inflate trust). Omitting it makes the
+   * bridge reject the call.
+   */
+  ucanValidate(
+    handle: BridgeContextHandle,
+    token: string,
+    capability: string,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<void>;
   /**
    * Read-only, structured counterpart to {@link ucanValidate}: runs the same
    * 11-step ADR-016 pipeline but resolves to a {@link CapabilityValidation}

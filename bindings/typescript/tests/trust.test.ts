@@ -51,6 +51,7 @@ function fakeParticipationRecord(
     contextCreationCount: 0,
     roleProgressionCount: 0,
     attestationCount: 0,
+    attestationCountAnchored: false,
     computedAt: 1,
     eventLogRoot: "00",
     ...overrides,
@@ -287,5 +288,98 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(record.participationDurationSecs).toBe(42);
     expect(record.attestationCount).toBe(5);
     expect(record.toolInvocationCountAnchored).toBe(false);
+    // attestationCount is credential-layer, never Merkle-anchored.
+    expect(record.attestationCountAnchored).toBe(false);
+  });
+
+  it("folds an empty event log (SCP-CTX-2076) into a zeroed behavioral record", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    // The core surfaces the dedicated SCP-CTX-2076 code for "no recorded
+    // participation facts" — the SDK branches on the structured code, NOT prose.
+    native.__stub("participationRecord", () => {
+      throw new Error("[SCP-CTX-2076] context error: no recorded participation facts");
+    });
+
+    const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
+    const record = result.behavioralRecord;
+    // Non-null, fully-zeroed record — identical shape to the populated case.
+    expect(record.subjectDid).toBe("did:dht:subject");
+    expect(record.participationDurationSecs).toBe(0);
+    expect(record.governanceActionsAgainst).toBe(0);
+    expect(record.governanceActionsBy).toBe(0);
+    expect(record.toolInvocationCount).toBe(0);
+    expect(record.toolInvocationCountAnchored).toBe(false);
+    expect(record.contextCreationCount).toBe(0);
+    expect(record.roleProgressionCount).toBe(0);
+    expect(record.attestationCount).toBe(0);
+    expect(record.attestationCountAnchored).toBe(false);
+    expect(record.computedAt).toBe(0);
+    expect(record.eventLogRoot).toBe("");
+  });
+
+  it("propagates a genuine (non-2076) ContextError instead of swallowing it", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    // A real failure (e.g. an uninitialized/invalid context) must NOT be folded
+    // into a zeroed record — only the dedicated empty-log code is graceful.
+    native.__stub("participationRecord", () => {
+      throw new Error("[SCP-CTX-2001] context error: not initialized");
+    });
+
+    await expect(scp.evaluateTrust("handle", "did:dht:subject", "ctx-1")).rejects.toThrow(
+      /not initialized/i,
+    );
+  });
+});
+
+describe("scp.participationRecord — typed cached-attestation input", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("defaults to an empty array, serialized as '[]' on the wire", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("participationRecord", () => fakeParticipationRecord());
+
+    const record = await scp.participationRecord("ctx-1", "did:dht:subject");
+    // No attestations seeded → count 0, and the bridge receives "[]".
+    expect(record.attestationCount).toBe(0);
+    const call = native.__lastCall("participationRecord");
+    expect(call?.args[2]).toBe("[]");
+  });
+
+  it("JSON.stringifies a typed CachedAttestation[] straight onto the wire", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("participationRecord", () => fakeParticipationRecord({ attestationCount: 1 }));
+
+    const cached = [
+      {
+        attestation: {
+          id: "att-1",
+          attestation_type: "IdentityLink",
+          issuer: "did:dht:issuer",
+          subject: "did:dht:subject",
+          claim: { platform: "github" },
+          issued_at: 1000,
+          revocation_status: "Active",
+          signature: [1, 2, 3],
+        },
+        verified_at: 1234,
+        ttl_secs: 300,
+      },
+    ] as const;
+
+    const record = await scp.participationRecord("ctx-1", "did:dht:subject", cached);
+    expect(record.attestationCount).toBe(1);
+    const call = native.__lastCall("participationRecord");
+    // The SDK stringifies the typed input verbatim (the Python `list[dict]`
+    // analogue) — the wire string round-trips to the same structure.
+    expect(call?.args[2]).toBe(JSON.stringify(cached));
+    expect(JSON.parse(call?.args[2] as string)).toEqual(cached as unknown as unknown[]);
   });
 });

@@ -600,6 +600,32 @@ class TestUcan:
         except Exception:
             pass  # May fail depending on implementation state
 
+    async def test_ucan_validate_fails_closed_without_presenting_agent(self, scp: SCP):
+        """The ENFORCING ucan_validate gate rejects an absent presenting agent.
+
+        Symmetric with the diagnostic ucan_evaluate gate: defaulting the
+        presenting agent to the token's own ``aud`` would make the step-5
+        audience check a tautology and inflate trust. The fail-closed check fires
+        before token parse, so any well-formed token string reaches it.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        # Omitted presenting agent → rejected.
+        with pytest.raises(Exception, match="presenting_agent_did is required"):
+            scp._native.ucan_validate(handle.context_id, "header.payload.sig", "messages:read")
+        # Empty / whitespace presenting agent → also rejected.
+        with pytest.raises(Exception, match="presenting_agent_did is required"):
+            scp._native.ucan_validate(
+                handle.context_id, "header.payload.sig", "messages:read", "   "
+            )
+
     async def test_evaluate_trust_end_to_end_real_ffi(self, scp: SCP):
         """Exercise ``evaluate_trust`` against the real ``_scp_core`` bridge.
 
@@ -1026,6 +1052,9 @@ class TestTrust:
         assert member_record.attestation_count == 0
         assert admin_record.tool_invocation_count_anchored is False
         assert member_record.tool_invocation_count_anchored is False
+        # attestation_count is credential-layer (§7.4), never Merkle-anchored.
+        assert admin_record.attestation_count_anchored is False
+        assert member_record.attestation_count_anchored is False
         # Real Merkle root over the convergent governance leaves (64 hex chars).
         assert len(admin_record.event_log_root) == 64
         assert admin_record.event_log_root != "0" * 64

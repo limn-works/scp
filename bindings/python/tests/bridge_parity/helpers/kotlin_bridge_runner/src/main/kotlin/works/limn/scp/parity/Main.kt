@@ -400,7 +400,9 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {
@@ -440,7 +442,9 @@ private suspend fun opUcanEvaluateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {

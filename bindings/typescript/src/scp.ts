@@ -43,10 +43,21 @@ import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/
 import type { Node, Relay } from "./server";
 import type {
 	BehavioralRecord,
+	CachedAttestation,
 	CapabilityValidation,
 	SagaResult,
 	TrustEvaluation,
 } from "./types";
+
+/**
+ * Stable error code (spec §7.3.2) the core surfaces when a context has no
+ * recorded participation facts yet (an empty event log). {@link
+ * SCP.evaluateTrust} branches Layer 2 on this structured code — NOT on error
+ * prose — folding "no facts yet" into a zeroed behavioral record while letting
+ * every other failure propagate. Maps from `ContextError::NoParticipationFacts`
+ * across all bridges.
+ */
+const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -1987,6 +1998,25 @@ export class SCP {
   // Domain: UCAN
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Enforcing UCAN gate: runs the full 11-step ADR-016 pipeline and throws a
+   * typed {@link "./errors".ScpError} at the first failing stage (use
+   * {@link ucanEvaluate} for the non-throwing diagnostic).
+   *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that does NOT bind
+   * the token to any external subject, passing a token addressed to someone else
+   * (trust inflation). Pass the agent the token must be addressed to.
+   *
+   * @param handle The context handle to validate against.
+   * @param token The UCAN token string to validate.
+   * @param capability The required capability URI (mandatory on this gate).
+   * @param presentingAgentDid The DID the token must be addressed to. Required —
+   *   an absent or empty value is rejected by the bridge.
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
   async ucanValidate(
     handle: unknown,
     token: string,
@@ -2039,7 +2069,7 @@ export class SCP {
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation> {
     // Route the native dispatch through the single error chokepoint
-    // (`mapBridgeError`) so a raw NAPI/WASM throw or rejection surfaces as a
+    // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
     // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-057
     // Decision 4 (error typing routes through one mapping site, not per-call
     // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
@@ -2459,7 +2489,12 @@ export class SCP {
     try {
       behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
     } catch (error) {
-      if (error instanceof ContextError && /event log is empty/i.test(error.message)) {
+      // Branch on the STRUCTURED code (`SCP-CTX-2076`), never error prose: the
+      // typed `ContextError` carries the stable code the core assigned to
+      // `NoParticipationFacts` (ADR-057 — structured, not prose, classification).
+      // Anything else (NotInitialized, a provider failure, malformed input) is a
+      // genuine error and propagates unchanged.
+      if (error instanceof ContextError && error.code === NO_PARTICIPATION_FACTS_CODE) {
         behavioralRecord = {
           subjectDid,
           participationDurationSecs: 0,
@@ -2470,6 +2505,7 @@ export class SCP {
           contextCreationCount: 0,
           roleProgressionCount: 0,
           attestationCount: 0,
+          attestationCountAnchored: false,
           computedAt: 0,
           eventLogRoot: "",
         };
@@ -2494,7 +2530,7 @@ export class SCP {
    * The shared Rust core gathers the FULL context event log and flattens the
    * participation facts ONCE (`Supervisor::participation_record`), and the NAPI
    * bridge sources the subject's accessible, currently-valid attestations from
-   * its own persistent trust store (seeded by `cachedAttestationsJson`). The
+   * its own persistent trust store (seeded by `cachedAttestations`). The
    * SDK RECEIVES the flattened {@link BehavioralRecord} — it never re-aggregates
    * event-log collections, so every binding observes identical facts for the
    * same context/subject.
@@ -2502,23 +2538,23 @@ export class SCP {
    * `attestationCount` is a credential-layer fact (§7.4): it is NOT a
    * context-event count and NOT Merkle-anchored, and is verifier-relative
    * (computed from the attestations the bridge can access). Pass the subject's
-   * accessible attestations as `cachedAttestationsJson` (a JSON array) to
-   * populate it; the default `"[]"` honestly reports only what the bridge's
-   * trust store already holds.
+   * accessible attestations as `cachedAttestations` to populate it; the default
+   * `[]` honestly reports only what the bridge's trust store already holds.
    *
    * @param contextId The context the participation is scoped to.
    * @param subjectDid The DID whose participation facts are computed.
-   * @param cachedAttestationsJson JSON array of cached attestations to seed the
-   *   bridge's trust store before sourcing the subject's verified set. Defaults
-   *   to `"[]"` (source only what is already persisted).
+   * @param cachedAttestations Typed cached attestations to seed the bridge's
+   *   trust store before sourcing the subject's verified set. Serialized to JSON
+   *   internally — matching the Python SDK's `cached_attestations: list[dict]`.
+   *   Defaults to `[]` (source only what is already persisted).
    * @returns The flattened participation facts as a {@link BehavioralRecord}.
    * @throws {@link "./errors".ScpError} on malformed FFI input or a behavioral
-   *   compute failure (e.g. an empty event log).
+   *   compute failure (e.g. an empty event log → `SCP-CTX-2076`).
    */
   async participationRecord(
     contextId: string,
     subjectDid: string,
-    cachedAttestationsJson = "[]",
+    cachedAttestations: readonly CachedAttestation[] = [],
   ): Promise<BehavioralRecord> {
     let record: BehavioralRecord;
     try {
@@ -2528,7 +2564,7 @@ export class SCP {
           subj: string,
           ca: string,
         ) => BehavioralRecord
-      )(contextId, subjectDid, cachedAttestationsJson);
+      )(contextId, subjectDid, JSON.stringify(cachedAttestations));
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -2545,6 +2581,7 @@ export class SCP {
       contextCreationCount: record.contextCreationCount,
       roleProgressionCount: record.roleProgressionCount,
       attestationCount: record.attestationCount,
+      attestationCountAnchored: record.attestationCountAnchored,
       computedAt: record.computedAt,
       eventLogRoot: record.eventLogRoot,
     };

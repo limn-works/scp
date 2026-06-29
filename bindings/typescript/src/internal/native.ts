@@ -1022,10 +1022,22 @@ export function createNativeBridge(scp: SCP): Bridge {
       handle: BridgeContextHandle,
       token: string,
       capability: string,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
     ): Promise<void> {
+      // FAIL CLOSED on the enforcing gate: `presentingAgentDid` is required by
+      // the bridge (it will not default to the token's own `aud`). Forward it
+      // (and the optional proof chain) so a facade caller can satisfy the gate;
+      // omitted optionals normalize to `null` for the napi-rs `Option<…>` shape.
       await (
-        native.ucanValidate as (h: BridgeContextHandle, t: string, c: string) => Promise<void>
-      )(handle, token, capability);
+        native.ucanValidate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<void>
+      )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
     },
 
     async ucanEvaluate(
@@ -1049,8 +1061,7 @@ export function createNativeBridge(scp: SCP): Bridge {
           pt: readonly string[] | null,
         ) => Promise<CapabilityValidation>
       )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
-      // Shared six-field projection — pins the canonical shape in one place
-      // across the native and WASM bridges.
+      // Shared six-field projection — pins the canonical shape in one place.
       return toCapabilityValidation(raw);
     },
 

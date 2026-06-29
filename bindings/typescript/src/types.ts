@@ -812,11 +812,11 @@ export interface EventClaim {
  * validation pipeline, surfaced by the read-only `ucanEvaluate` diagnostic
  * (spec §7.2.4, ADR-057 Decision 3).
  *
- * The six booleans cross the FFI already camelCased (NAPI
- * `NapiCapabilityValidation`, WASM serde `rename_all = "camelCase"`), so the
- * SDK consumes them directly and never reverse-engineers *which* check failed
- * by parsing human-readable error prose. All fields must be `true` for the
- * subject to be considered protocol-compliant.
+ * The six booleans cross the FFI already camelCased (the NAPI
+ * `NapiCapabilityValidation` `#[napi(object)]`), so the SDK consumes them
+ * directly and never reverse-engineers *which* check failed by parsing
+ * human-readable error prose. All fields must be `true` for the subject to be
+ * considered protocol-compliant.
  */
 export interface CapabilityValidation {
   /** Step 1: UCAN tokens parse and have valid structure. */
@@ -924,10 +924,73 @@ export interface BehavioralRecord {
    * compute different counts from different accessible attestation sets).
    */
   readonly attestationCount: number;
+  /**
+   * Whether {@link attestationCount} is anchored in / verifiable against a
+   * context Merkle root. Always `false`: it is a credential-layer,
+   * verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
+   * The parallel of {@link toolInvocationCountAnchored}; consumers MUST NOT
+   * treat the count as Merkle-proven while this is `false`.
+   */
+  readonly attestationCountAnchored: boolean;
   /** Unix timestamp (seconds) when the record was computed. */
   readonly computedAt: number;
   /** Merkle root (hex) of the event log at computation time. */
   readonly eventLogRoot: string;
+}
+
+/**
+ * Wire-format attestation envelope (ADR-017 §7.4.1).
+ *
+ * This is a pass-through DTO — the TypeScript analogue of the Python SDK's
+ * untyped `cached_attestations` dicts — so its field names are the
+ * serde-canonical snake_case the Rust core deserializes, NOT the camelCase the
+ * SDK uses for core-modeled types. {@link SCP.participationRecord}
+ * `JSON.stringify`s it straight onto the wire, exactly as the Python SDK
+ * `json.dumps`es its dicts.
+ */
+export interface CachedAttestationEnvelope {
+  /** Unique attestation identifier. */
+  readonly id: string;
+  /** Attestation type (serde tag, e.g. `"IdentityLink"`). */
+  readonly attestation_type: string;
+  /** DID of the attestation issuer. */
+  readonly issuer: string;
+  /** DID of the attestation subject. */
+  readonly subject: string;
+  /** Type-specific claim data. */
+  readonly claim: unknown;
+  /** Optional evidence supporting the attestation. */
+  readonly evidence?: { readonly evidence_type: string; readonly data: unknown } | null;
+  /** Unix timestamp (seconds) when the attestation was issued. */
+  readonly issued_at: number;
+  /** Optional expiry timestamp (seconds). */
+  readonly expires_at?: number | null;
+  /** Optional renewal interval (`std::time::Duration` → `{ secs, nanos }`). */
+  readonly renewal_interval?: { readonly secs: number; readonly nanos: number } | null;
+  /** Timestamp (seconds) of the last renewal, if renewable. */
+  readonly renewed_at?: number | null;
+  /** Current revocation status (serde-tagged). */
+  readonly revocation_status: unknown;
+  /** Ed25519 signature over the attestation content (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * A verified attestation with cache TTL metadata (ADR-017).
+ *
+ * Pass an array of these to {@link SCP.participationRecord} to seed the
+ * bridge's trust store before it sources the subject's verified set. Mirrors
+ * the Rust `CachedAttestation` and the Python SDK `cached_attestations` dicts
+ * 1:1. An empty array (the default) seeds nothing — the bridge reports only
+ * what it already holds (verifier-relative, §7.4).
+ */
+export interface CachedAttestation {
+  /** The verified attestation envelope. */
+  readonly attestation: CachedAttestationEnvelope;
+  /** Unix timestamp (seconds) when the attestation was last verified. */
+  readonly verified_at: number;
+  /** Time-to-live in seconds for the cache entry. */
+  readonly ttl_secs: number;
 }
 
 /** Summary of an attestation. */

@@ -52,11 +52,12 @@ from scp_sdk.types import CustodyType
 if TYPE_CHECKING:
     from scp_sdk.tools import SagaResult
 
-    # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate``'s return
-    # type without a runtime circular import (trust.py imports SCP). With
-    # ``from __future__ import annotations`` the annotation is a lazy string,
-    # so the name need only resolve for type checkers, not at import time.
-    from scp_sdk.trust import CapabilityValidation
+    # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
+    # ``participation_record`` return types without a runtime circular import
+    # (trust.py imports SCP). With ``from __future__ import annotations`` the
+    # annotation is a lazy string, so the name need only resolve for type
+    # checkers, not at import time.
+    from scp_sdk.trust import BehavioralRecord, CapabilityValidation
 
 logger = logging.getLogger("scp_sdk")
 
@@ -1862,7 +1863,7 @@ class SCP:
         context_id: str,
         subject_did: str,
         cached_attestations: list[dict[str, Any]] | None = None,
-    ) -> Any:
+    ) -> BehavioralRecord:
         """Compute the participation record (§7.3.2) for a subject in a context.
 
         Delegates to :func:`scp_sdk.trust.participation_record`, which calls the
