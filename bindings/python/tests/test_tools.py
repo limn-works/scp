@@ -519,6 +519,25 @@ class TestSagaAbortedTranslation:
         assert exc_info.value.retry_after_ms is not None
         assert exc_info.value.code == "SCP-SAGA-13067"
 
+    async def test_abort_without_code_falls_back_to_generic_default(self) -> None:
+        """A bridge abort that omits the code (1-tuple ``args``) surfaces the
+        generic ``SCP-SAGA-13067`` class default — never a more specific code.
+
+        The bridge always supplies an explicit ``SCP-SAGA-13xxx`` code; this
+        exercises the ``code is None`` translation branch so the class default
+        stays load-bearing (the generic abort code, not a Prepare-reason code).
+        """
+        from scp_sdk.errors import SagaAbortedError
+
+        scp = _make_scp(_native_raising(_BridgeSagaAborted("rejected")))
+
+        with pytest.raises(SagaAbortedError) as exc_info:
+            await _invoke_saga(scp)
+
+        assert exc_info.value.code == "SCP-SAGA-13067"
+        assert exc_info.value.retry_after_ms is None
+        assert exc_info.value.message == "rejected"
+
 
 class TestSagaNeedsRepairTranslation:
     """Commit-retry exhaustion → SDK SagaNeedsRepairError, saga_id preserved."""
