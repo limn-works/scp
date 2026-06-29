@@ -60,9 +60,20 @@ pub trait TrustProtocolRepository: Send + Sync {
         subject_did: &str,
     ) -> Result<Vec<CachedAttestation>, TrustError>;
 
-    /// Stores a verified attestation in the cache with a TTL.
+    /// Stores an ALREADY-VERIFIED attestation in the cache with a TTL.
     ///
     /// If an attestation with the same ID already exists, it is replaced.
+    ///
+    /// SECURITY: this is a raw write that performs NO verification — the caller
+    /// is asserting the attestation was verified at `entry.verified_at`. It is
+    /// therefore NOT a safe ingest boundary for caller-controlled data: feeding
+    /// it an attestation whose `verified_at`/`ttl_secs` came from an untrusted
+    /// caller lets a forged attestation masquerade as "freshly verified" and be
+    /// returned unverified by [`AttestationCache::get_verified_attestations`].
+    /// Untrusted attestations MUST instead go through
+    /// [`AttestationCache::verify_and_cache`], which verifies the signature,
+    /// expiry, and revocation against the resolver-resolved issuer key and stamps
+    /// a trusted `verified_at` before calling this method.
     ///
     /// # Errors
     ///
@@ -194,6 +205,17 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
     /// - If the cache entry is expired, the attestation is re-verified. If
     ///   verification succeeds, the cache entry is updated. If verification
     ///   fails (expired, revoked, bad signature), the entry is discarded.
+    ///
+    /// SECURITY: returning fresh entries WITHOUT re-verification is sound only
+    /// because `verified_at` is a TRUSTED stamp — it is set exclusively by
+    /// [`Self::verify_and_cache`] AFTER a successful signature/expiry/revocation
+    /// check (and re-stamped here after a successful re-verification). The cache
+    /// invariant is therefore "fresh ⟹ verified within TTL". Callers MUST NOT
+    /// populate the backing store with caller-controlled `verified_at` via the
+    /// raw [`TrustProtocolRepository::store_cached_attestation`]; untrusted
+    /// attestations are ingested through [`Self::verify_and_cache`] (see the FFI
+    /// `verified_attestations` / `populate_and_aggregate` helpers), which is what
+    /// keeps a forged, freshly-marked entry from ever being returned here.
     ///
     /// # Errors
     ///
