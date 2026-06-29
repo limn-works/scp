@@ -344,6 +344,26 @@ impl TransientGovernanceEngine {
         }
     }
 
+    /// Reads the engine's authoritative recorded proposal back by id.
+    ///
+    /// After a vote (`ingest_approve` / `ingest_reject`) the engine holds the
+    /// proposal with EXACTLY the votes it actually recorded and the status it
+    /// resolved. This is the WASM source of truth that the vote endpoints
+    /// persist verbatim into their stored map, so the stored vote vectors are
+    /// byte-identical to native's `engine.get_proposal(...)` (§9.9.3). Crucially
+    /// this is correct even when the keyless precheck AUTO-RESOLVES a
+    /// past-deadline vote WITHOUT recording it (`MajorityVoteEngine::precheck_vote`
+    /// returns `Resolved` before `push_and_resolve` runs): the engine's proposal
+    /// then carries only the pre-deadline votes, matching native — whereas an
+    /// optimistic `approvals.push(new_vote)` on the WASM side would diverge.
+    fn get_proposal(&self, proposal_id: &[u8; 32]) -> Option<&GovernanceProposal> {
+        match self {
+            Self::Threshold(e) => e.get_proposal(proposal_id),
+            Self::Majority(e) => e.get_proposal(proposal_id),
+            Self::Unanimity(e) => e.get_proposal(proposal_id),
+        }
+    }
+
     /// Gated vote withdrawal (`GovernanceEngine::withdraw_vote`): enforces
     /// eligible-set membership, pending status, the voting deadline, and that
     /// the voter actually voted, before removing the vote.
@@ -5468,9 +5488,12 @@ impl WasmContextManager {
     }
 
     /// Runs the shared governance engine's quorum tally for a single keyless
-    /// vote and returns ONLY the resulting [`ProposalStatus`] — the quorum
-    /// DECISION. The caller owns the proposal's vote vectors and status; this
-    /// method never mutates stored state.
+    /// vote and returns the resulting [`ProposalStatus`] (the quorum DECISION)
+    /// together with the engine's AUTHORITATIVE recorded proposal — the proposal
+    /// carrying exactly the votes the engine actually counted plus the resolved
+    /// status. The caller PERSISTS that returned proposal verbatim into its
+    /// stored map; it must NOT optimistically push the new vote itself. This
+    /// transient engine never touches the manager's stored state.
     ///
     /// The engine is rebuilt from the context's FROZEN config, seeded with a
     /// clone of the proposal AS IT STANDS BEFORE this vote (via
@@ -5483,9 +5506,18 @@ impl WasmContextManager {
     /// WASM `Approved`/`Rejected`/`Pending` decision is byte-identical to the
     /// native engine's (§9.9.3).
     ///
+    /// Returning the engine's proposal (instead of having the caller push the
+    /// vote onto its own copy) is what makes the WASM stored vote vectors match
+    /// native exactly: when the keyless precheck AUTO-RESOLVES a past-deadline
+    /// majority vote it does so WITHOUT recording that vote, so the engine's
+    /// proposal carries only the pre-deadline votes — the previous optimistic
+    /// `approvals.push(new_vote)` recorded a phantom extra vote and diverged the
+    /// vote vector from native (§9.9.3).
+    ///
     /// The `proposal_for_seed` MUST be the proposal in its pre-this-vote state
-    /// (i.e. the new vote is NOT yet in its `approvals`/`rejections`). The caller
-    /// applies the vote to its own copy after this returns the decision.
+    /// (i.e. the new vote is NOT yet in its `approvals`/`rejections`); the engine
+    /// applies the vote (or auto-resolves) and the returned proposal reflects the
+    /// engine's actual record.
     ///
     /// # Errors
     ///
@@ -5501,7 +5533,7 @@ impl WasmContextManager {
         vote: VoteType,
         now_secs: u64,
         error_code: &str,
-    ) -> Result<ProposalStatus, ScpWasmError> {
+    ) -> Result<(ProposalStatus, GovernanceProposal), ScpWasmError> {
         let mut engine = Self::build_transient_governance_engine(ctx)?.ok_or_else(|| {
             // single_admin has no multi-party engine; callers must route
             // single_admin through the auto-execute path, never here.
@@ -5524,7 +5556,24 @@ impl WasmContextManager {
             VoteType::Reject => engine.ingest_reject(&proposal_id, &voter, &gov_ctx),
         }
         .map_err(|e| Self::map_governance_error(&e, error_code))?;
-        Ok(status)
+
+        // Read the engine's AUTHORITATIVE recorded proposal back: it holds
+        // exactly the votes the engine counted (which EXCLUDES this vote when a
+        // past-deadline majority auto-resolved without recording it) and the
+        // resolved status. The caller persists THIS verbatim, so the WASM stored
+        // proposal's vote vectors are byte-identical to native's
+        // `engine.get_proposal(...)` (§9.9.3). The proposal is always present
+        // here — `ingest_proposal` seeded it and the vote just succeeded.
+        let recorded =
+            engine
+                .get_proposal(&proposal_id)
+                .cloned()
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: "internal: engine lost the proposal after a successful vote"
+                        .to_owned(),
+                    code: error_code.to_owned(),
+                })?;
+        Ok((status, recorded))
     }
 
     /// The canonical wire label for a [`ProposalStatus`] returned to JS callers.
@@ -5665,7 +5714,7 @@ impl WasmContextManager {
             created_at: now_secs,
             voting_deadline: voting_deadline_secs,
             approvals: if single_admin {
-                vec![proposer_vote.clone()]
+                vec![proposer_vote]
             } else {
                 Vec::new()
             },
@@ -5713,7 +5762,7 @@ impl WasmContextManager {
         // engine to obtain the quorum decision (the proposal is seeded with no
         // votes; the engine builds + counts the proposer's empty-sig vote). A
         // 1-of-N threshold can reach `Approved` from this single vote.
-        let post_status = {
+        let (post_status, engine_proposal) = {
             let ctx = self.require_active_context_mut(context_id)?;
             Self::decide_vote_via_engine(
                 ctx,
@@ -5736,14 +5785,13 @@ impl WasmContextManager {
                 .retain(|_, p| p.voting_deadline > now_secs);
         }
 
-        // Mirror the engine-counted proposer vote onto the stored proposal and
-        // carry the engine-derived status, so `get_proposal` and any subsequent
-        // vote see the same accumulated state the engine tallied.
-        let mut proposal = proposal;
-        proposal.approvals.push(proposer_vote);
-        proposal.status = post_status;
+        // Persist the ENGINE's authoritative proposal verbatim (it already
+        // carries the engine-counted proposer vote and the engine-derived
+        // status), so the stored vote vectors are byte-identical to native's
+        // `engine.get_proposal(...)` and any subsequent vote re-seeds from the
+        // exact state the engine tallied (§9.9.3).
         let pid = proposal_id.to_owned();
-        ctx.pending_proposals.insert(pid.clone(), proposal);
+        ctx.pending_proposals.insert(pid.clone(), engine_proposal);
 
         ctx.push_event(ContextEvent::GovernanceActionExecuted {
             proposal_id: proposal_id_bytes,
@@ -5858,7 +5906,7 @@ impl WasmContextManager {
         // the SOLE quorum authority on the WASM path (it replaced the former
         // hand-rolled string-match arithmetic), so the WASM decision is
         // byte-identical to native (§9.9.3).
-        let post_status = {
+        let (post_status, engine_proposal) = {
             let ctx = self.require_active_context_mut(context_id)?;
             let proposal = ctx
                 .pending_proposals
@@ -5881,16 +5929,17 @@ impl WasmContextManager {
         let meets_quorum = matches!(post_status, ProposalStatus::Approved);
 
         let ctx = self.require_active_context_mut(context_id)?;
-        // Apply the now-validated vote + engine-derived status to the stored
-        // proposal (the engine accepted it, so dedup/deadline/eligibility passed).
-        if let Some(proposal) = ctx.pending_proposals.get_mut(proposal_id) {
-            proposal.approvals.push(SignedVote {
-                voter_did: DID(voter_did.to_owned()),
-                vote: VoteType::Approve,
-                timestamp: now_secs,
-                signature: Vec::new(),
-            });
-            proposal.status = post_status.clone();
+        // Persist the ENGINE's authoritative proposal verbatim over the stored
+        // pending proposal: it carries EXACTLY the votes the engine recorded
+        // (which EXCLUDES this vote when a past-deadline majority auto-resolved
+        // without recording it) and the engine-derived status. This is what
+        // keeps the WASM stored vote vectors byte-identical to native's
+        // `engine.get_proposal(...)` — an optimistic `approvals.push` here would
+        // record a phantom uncounted vote and diverge (§9.9.3). The downstream
+        // quorum / terminal-move branches operate on this stored proposal.
+        if ctx.pending_proposals.contains_key(proposal_id) {
+            ctx.pending_proposals
+                .insert(proposal_id.to_owned(), engine_proposal);
         }
 
         // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
@@ -6017,7 +6066,7 @@ impl WasmContextManager {
         // when the rejection makes approval impossible (or breaks unanimity),
         // else `Pending`. This replaces the former hand-rolled
         // `remaining_possible_approvals` / `can_still_reach_quorum` arithmetic.
-        let post_status = {
+        let (post_status, engine_proposal) = {
             let ctx = self.require_active_context_mut(context_id)?;
             let proposal = ctx
                 .pending_proposals
@@ -6039,16 +6088,16 @@ impl WasmContextManager {
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
-        // Apply the now-validated rejection vote + engine status to the stored
-        // proposal.
-        if let Some(proposal) = ctx.pending_proposals.get_mut(proposal_id) {
-            proposal.rejections.push(SignedVote {
-                voter_did: DID(voter_did.to_owned()),
-                vote: VoteType::Reject,
-                timestamp: now_secs,
-                signature: Vec::new(),
-            });
-            proposal.status = post_status.clone();
+        // Persist the ENGINE's authoritative proposal verbatim over the stored
+        // pending proposal: it carries EXACTLY the rejections the engine
+        // recorded (which EXCLUDES this vote when a past-deadline majority
+        // auto-resolved without recording it) and the engine-derived status —
+        // keeping the WASM stored vote vectors byte-identical to native's
+        // `engine.get_proposal(...)` (§9.9.3). The downstream terminal-move
+        // branch operates on this stored proposal.
+        if ctx.pending_proposals.contains_key(proposal_id) {
+            ctx.pending_proposals
+                .insert(proposal_id.to_owned(), engine_proposal);
         }
 
         // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
@@ -14774,6 +14823,22 @@ mod tests {
             },
             "stored status must be the engine-resolved Rejected reason"
         );
+        // §9.9.3 CONVERGENCE: the past-deadline approve vote was NOT recorded by
+        // the engine (`precheck_vote` auto-resolved before `push_and_resolve`),
+        // so the stored proposal must carry ONLY the proposer's pre-deadline
+        // approval — exactly what native's `engine.get_proposal(...)` holds. A
+        // phantom second approval here (the former optimistic push) is the
+        // native↔WASM vote-vector divergence this fix closes.
+        assert_eq!(
+            stored.approvals.len(),
+            1,
+            "only the pre-deadline proposer approval is recorded; the past-deadline approve is NOT counted (matches native)"
+        );
+        assert_eq!(
+            stored.rejections.len(),
+            0,
+            "no rejections were cast on this proposal"
+        );
         assert_eq!(
             r.get("status").and_then(serde_json::Value::as_str),
             Some(WasmContextManager::proposal_status_label(&stored.status)),
@@ -14879,6 +14944,22 @@ mod tests {
             .and_then(|c| c.resolved_proposals.get(&pid))
             .expect("proposal moved to resolved");
         assert_eq!(stored.status, ProposalStatus::Approved);
+        // §9.9.3 CONVERGENCE: the past-deadline reject vote (voter_d) was NOT
+        // recorded by the engine — it auto-resolved on the pre-deadline tally.
+        // The stored proposal must carry exactly the 2 pre-deadline approvals
+        // (creator + voter_b) and the 1 pre-deadline rejection (voter_c) that
+        // native's `engine.get_proposal(...)` holds — NOT a phantom second
+        // rejection from the former optimistic push.
+        assert_eq!(
+            stored.approvals.len(),
+            2,
+            "the 2 pre-deadline approvals are recorded (creator + voter_b)"
+        );
+        assert_eq!(
+            stored.rejections.len(),
+            1,
+            "only the pre-deadline rejection (voter_c) is recorded; the past-deadline reject (voter_d) is NOT counted (matches native)"
+        );
         assert_eq!(
             r_d.get("status").and_then(serde_json::Value::as_str),
             Some(WasmContextManager::proposal_status_label(&stored.status)),
@@ -14889,6 +14970,76 @@ mod tests {
                 .get(context_id)
                 .is_some_and(|c| c.pending_proposals.contains_key(&pid)),
             "a resolved proposal must not linger in pending_proposals"
+        );
+    }
+
+    /// §9.9.3 CONVERGENCE (happy path): a NORMAL (pre-deadline) approve records
+    /// EXACTLY ONE additional approval on the stored proposal. This pins the
+    /// other side of the past-deadline regression — the engine-recorded-proposal
+    /// persistence must still count an in-window vote, not silently drop it. A
+    /// 5-voter majority: proposer auto-approves (1), then `voter_b` approves (2,
+    /// still Pending since `2*2 > 5` is false). The stored approvals grow 1 -> 2.
+    #[test]
+    fn pr2b_normal_approve_records_exactly_one_additional_vote() {
+        let creator = "did:dht:zNrmA";
+        let voter_b = "did:dht:zNrmB";
+        let voter_c = "did:dht:zNrmC";
+        let voter_d = "did:dht:zNrmD";
+        let voter_e = "did:dht:zNrmE";
+        let context_id = "ctx-pr2b-normal-approve";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zNrmTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zNrmTarget");
+        let pid = pr2b_pid(0x88);
+
+        // Proposer auto-approves -> 1 recorded approval, still Pending (2*2 > 5 false).
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        let after_propose = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.pending_proposals.get(&pid))
+            .expect("proposal pending after propose")
+            .approvals
+            .len();
+        assert_eq!(
+            after_propose, 1,
+            "the proposer's implicit approval is recorded once"
+        );
+
+        // voter_b approves IN WINDOW -> exactly one more approval; still Pending.
+        let r_b = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve b ok");
+        assert_eq!(
+            r_b.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2-of-5 majority (2*2 > 5 false) stays Pending"
+        );
+        let after_vote = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.pending_proposals.get(&pid))
+            .expect("proposal still pending after in-window vote")
+            .approvals
+            .len();
+        assert_eq!(
+            after_vote, 2,
+            "a normal in-window approve records EXACTLY one additional vote (the engine-recorded proposal is persisted, not dropped)"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "no execution before quorum"
         );
     }
 
