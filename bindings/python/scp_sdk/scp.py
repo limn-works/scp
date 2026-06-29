@@ -1855,6 +1855,28 @@ class SCP:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
 
+    async def participation_record(
+        self,
+        context_id: str,
+        subject_did: str,
+        cached_attestations: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Compute the participation record (§7.3.2) for a subject in a context.
+
+        Delegates to :func:`scp_sdk.trust.participation_record`, which calls the
+        typed PyO3 ``participation_record`` op and returns a
+        :class:`~scp_sdk.trust.BehavioralRecord` of the eleven flattened facts.
+        The shared Rust core gathers the full event log and computes the record
+        ONCE; the SDK RECEIVES it rather than recomputing Layer 2 client-side.
+        ``attestation_count`` is a credential-layer fact (§7.4), verifier-
+        relative; pass ``cached_attestations`` to populate it (default: none).
+        """
+        from scp_sdk.trust import participation_record as _participation_record
+
+        return await asyncio.to_thread(
+            _participation_record, self, context_id, subject_did, cached_attestations
+        )
+
     # endregion Trust
 
     # region SCPID
