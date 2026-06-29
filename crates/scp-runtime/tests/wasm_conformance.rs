@@ -2247,6 +2247,112 @@ fn golden_sender_key_roundtrip() {
     );
 }
 
+/// Cross-family sender-layer convergence (§9.16.1 / #1877, #1909 Phase 2).
+///
+/// Both the native `scp-runtime` MLS provider `seal` and the WASM
+/// `WasmCryptoState::encrypt_message` build the MLS application plaintext the
+/// SAME way: `encrypt_sender_layer(...)` to produce the AEAD ciphertext, then
+/// `build_sender_header(epoch, sequence, ct)` to prepend the 16-byte
+/// `epoch (8B BE) || sequence (8B BE)` header. The receive sides both
+/// `parse_sender_header` (header authoritative) and `decrypt_sender_layer` with
+/// the PARSED epoch/sequence and the RAW `context_id` string in the AAD.
+///
+/// This test models BOTH families over the shared `scp_protocol` functions they
+/// each call, with the SAME `(context_id, sender_did, sender_key_epoch,
+/// sequence)`, and asserts:
+/// 1. The 16-byte header is deterministic and byte-identical across families.
+/// 2. A message framed the "native way" decrypts the "WASM way" and vice versa
+///    (the AAD — `context_id` string + `sender_did` + parsed epoch/seq — matches).
+#[test]
+fn cross_family_sender_layer_header_and_aad_converge() {
+    use scp_protocol::crypto::sender_keys::SenderKey;
+    use scp_protocol::crypto::sender_keys::encrypt::{
+        SENDER_HEADER_SIZE, build_sender_header, decrypt_sender_layer, encrypt_sender_layer,
+        parse_sender_header,
+    };
+
+    // Identical inputs on both families. The epoch is the per-sender
+    // `sender_key_epoch` (§9.16.5), NOT the MLS group epoch — that is the Phase
+    // 2 convergence on top of the Phase 1 raw-context_id AAD convergence.
+    let key = SenderKey::from_bytes([0x5A; 32]);
+    let plaintext = b"cross-family payload";
+    let context_id = "ctx-cross-family";
+    let sender_did = "did:dht:zCrossFamily";
+    let sender_key_epoch = 4u64;
+    let sequence = 11u64;
+
+    // --- "Native seal" framing: encrypt_sender_layer then build_sender_header,
+    // using state.sender_key_epoch + state.send_sequence. ---
+    let native_ct = encrypt_sender_layer(
+        &key,
+        plaintext,
+        context_id,
+        sender_did,
+        sender_key_epoch,
+        sequence,
+    )
+    .expect("native-style sender encrypt must succeed");
+    let native_framed = build_sender_header(sender_key_epoch, sequence, &native_ct);
+
+    // --- "WASM encrypt_message" framing: the identical two shared calls. ---
+    let wasm_ct = encrypt_sender_layer(
+        &key,
+        plaintext,
+        context_id,
+        sender_did,
+        sender_key_epoch,
+        sequence,
+    )
+    .expect("wasm-style sender encrypt must succeed");
+    let wasm_framed = build_sender_header(sender_key_epoch, sequence, &wasm_ct);
+
+    // 1. The 16-byte header is deterministic and byte-identical across families.
+    // (The AEAD bodies differ only by their random 12-byte nonces.)
+    assert_eq!(SENDER_HEADER_SIZE, 16);
+    assert_eq!(
+        &native_framed[..SENDER_HEADER_SIZE],
+        &wasm_framed[..SENDER_HEADER_SIZE],
+        "the epoch || sequence header must be byte-identical across families"
+    );
+    assert_eq!(
+        &native_framed[..8],
+        &sender_key_epoch.to_be_bytes(),
+        "header bytes 0..8 must be the sender_key_epoch big-endian"
+    );
+    assert_eq!(
+        &native_framed[8..16],
+        &sequence.to_be_bytes(),
+        "header bytes 8..16 must be the sequence big-endian"
+    );
+
+    // 2a. Native-framed message decrypts the "WASM way" (parse header → decrypt
+    // with parsed epoch/seq + raw context_id AAD).
+    let (epoch_n, seq_n, ct_n) = parse_sender_header(&native_framed).expect("parse native header");
+    assert_eq!((epoch_n, seq_n), (sender_key_epoch, sequence));
+    let wasm_recovers_native =
+        decrypt_sender_layer(&key, ct_n, context_id, sender_did, epoch_n, seq_n)
+            .expect("WASM-style open must decrypt native-framed message");
+    assert_eq!(wasm_recovers_native, plaintext);
+
+    // 2b. WASM-framed message decrypts the "native way".
+    let (epoch_w, seq_w, ct_w) = parse_sender_header(&wasm_framed).expect("parse wasm header");
+    assert_eq!((epoch_w, seq_w), (sender_key_epoch, sequence));
+    let native_recovers_wasm =
+        decrypt_sender_layer(&key, ct_w, context_id, sender_did, epoch_w, seq_w)
+            .expect("native-style open must decrypt WASM-framed message");
+    assert_eq!(native_recovers_wasm, plaintext);
+
+    // Defense: a header epoch mismatch between the AAD-bound epoch and the
+    // parsed-header epoch breaks AEAD (the header is authoritative — a tampered
+    // header that disagrees with the sealed AAD fails closed).
+    let tampered = build_sender_header(sender_key_epoch + 1, sequence, &native_ct);
+    let (te, ts, tct) = parse_sender_header(&tampered).expect("parse tampered header");
+    assert!(
+        decrypt_sender_layer(&key, tct, context_id, sender_did, te, ts).is_err(),
+        "a header epoch that disagrees with the sealed AAD must fail AEAD"
+    );
+}
+
 /// Revocation CID golden value: `compute_revocation_cid("test-token")`
 /// must produce a known SHA-256 hash.
 #[test]

@@ -27,4 +27,4 @@ pub use encrypt::{mls_decrypt, mls_encrypt};
 pub use error::WasmCryptoError;
 pub use group::WasmMlsGroup;
 pub use sender_key::{SenderKey, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key};
-pub use state::WasmCryptoState;
+pub use state::{INITIAL_SENDER_KEY_EPOCH, WasmCryptoState, WasmReplayStateSnapshot};

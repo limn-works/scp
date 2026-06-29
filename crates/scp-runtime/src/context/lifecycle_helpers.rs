@@ -1690,7 +1690,7 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
         ctx_id_bytes,
         local_epoch_floors,
-        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
         trusted_local,
     ) {
         let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);

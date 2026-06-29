@@ -53,16 +53,9 @@ use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::crypto::sender_keys::{
-    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
-    generate_sender_key, generate_wrapping_keypair,
+    MAX_EPOCH_ADVANCE, NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse,
+    SenderKeyStore, generate_sender_key, generate_wrapping_keypair,
 };
-
-/// Maximum allowed epoch advance in a single sender key distribution.
-/// Prevents epoch poisoning attacks where an attacker sets `epoch=u64::MAX`.
-///
-/// Also used by `import_context` (§23.17 Invariant 3) to bound incoming
-/// snapshot epoch values against the local per-sender floors.
-pub(crate) const MAX_EPOCH_ADVANCE: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
