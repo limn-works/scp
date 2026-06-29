@@ -279,7 +279,8 @@
         "SCP-227",
         "SCP-230",
         "SCP-231",
-        "SCP-302"
+        "SCP-302",
+        "SCP-303"
       ]
     }
   ],
@@ -3541,7 +3542,7 @@
         "TrustInput struct defined with fields: verified_attestations (Vec<Attestation>), participation_record (ParticipationRecord), challenge_results (Vec<(ChallengeRequest, ChallengeResponse)>), consequence_structure (Vec<ConsequenceRule>), threshold_counts (HashMap<AttestationType, (u32, u32)>)",
         "ParticipationRecord struct defined with fields: subject_did (DID), context_id (ContextId), participation_count (u64), participation_duration_seconds (u64), tool_invocations (HashMap<ToolId, u64>), governance_actions_by (Vec<GovernanceActionSummary>), governance_actions_against (Vec<GovernanceActionSummary>), role_history (Vec<RoleTransition>), attestation_history (Vec<AttestationReference>), context_creation_count (u64), computed_at (u64), event_log_root ([u8; 32])",
         "compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError> scans event log entries for the subject DID",
-        "compute_participation_record computes: participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history",
+        "compute_participation_record computes the leaf-derived facts from the event log (participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, context creation history) and populates attestation history from the credential layer (§7.4) — attestation_history/attestation_count is the one exception that is NOT event-log-derived and NOT covered by event_log_root (there is no AttestationPublished event type; attestations are credential-layer artifacts threaded in by the caller, verifier-relative)",
         "compute_participation_record captures the Merkle root at computation time for verifiability",
         "compute_participation_record is pure computation — no side effects, no storage",
         "Module root re-exports all public types from submodules"
@@ -3554,7 +3555,7 @@
         "Implement tool invocation frequency computation from ToolInvoked events",
         "Implement governance action extraction (actions by and against subject)",
         "Implement role history extraction from RoleAssigned events",
-        "Implement attestation history extraction",
+        "Implement attestation history population from the credential layer (§7.4), NOT from event-log entries — attestation_history is the credential-layer exception, sourced from accessible, currently-valid endorsements rather than context-log leaves",
         "Implement context creation count from ContextCreated events",
         "Capture Merkle root from event log at computation time",
         "Write unit tests for compute_participation_record with mock event logs"
@@ -10374,6 +10375,76 @@
       ],
       "details": {
         "outOfScope": "Kotlin and Swift idiomatic evaluate/evaluateTrust wrappers are explicitly out of scope and tracked separately per ADR-055 §Decision-5 and the per-SDK-idiom lesson; the UniFFI bridge already exports CapabilityValidationRecord, so only the idiomatic SDK sugar remains for those two languages. The CapabilityValidation record shape, the throwing enforcement gate ucan_validate (its required_capability stays mandatory), and the structured diagnostic substrate already exist and are otherwise unchanged. This story DOES make one narrow core+bridge change per ADR-055 Consequences: the read-only diagnostic evaluate_ucan / ucan_evaluate challenge capability becomes optional (Option) so the trust-signal consumer can request intrinsic-validity mode without the rejected \"*\" sentinel; no new protocol operation is added."
+      }
+    },
+    {
+      "id": "SCP-303",
+      "title": "Wire the typed participation_record op into the Python and TypeScript trust SDKs and ground its facts in the leaf/credential split",
+      "gate": "gate-audit",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "blockedBy": [],
+      "files": [
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-ffi/src/trust.rs",
+        "crates/scp-ffi/napi/src/trust.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/python/scp_sdk/trust.py",
+        "bindings/python/tests/test_trust.py",
+        "bindings/python/tests/test_real_ffi.py",
+        "bindings/typescript/src/types.ts",
+        "bindings/typescript/src/scp.ts",
+        "bindings/typescript/tests/trust.test.ts",
+        "bindings/typescript/tests/real-napi.test.ts",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Spec §7.3.2 defines a participation record as a set of verifiable facts about a subject DID in a context. Six of those facts are leaf-derived from the context's convergent Merkle event log — participation duration (MemberJoined/MemberLeft), governance actions against (events whose projected target_did is the subject), governance actions by (events whose actor_did is the subject), context creation (ChildContextCreated by the subject), role progression (RoleAssigned whose leaf subject_did is the subject), and tool invocation count (ToolInvoked). The seventh, attestation_count, is the explicit exception: it is a credential-layer fact (§7.4), NOT derived from the event log and NOT covered by event_log_root — there is no AttestationPublished/AttestationRevoked event type (ADR-011 amendment exclusion taxonomy), so it is computed on-demand from the accessible, currently-valid attestations the verifying agent can reach and is therefore verifier-relative. tool_invocation_count is per-author application activity that is NOT yet Merkle-anchored: it stays anchored=false until ADR-051 (causal-DAG application-event ordering) makes ToolInvoked a convergent leaf. The typed participation_record op (Supervisor::participation_record gathering the full unfiltered event log + Merkle root, projected to the eleven-field ParticipationFacts and surfaced as PyParticipationRecord / NapiParticipationRecord / UniFFI ParticipationRecordView) already exists at the Rust core and the PyO3, NAPI, and UniFFI bridges (landed in Phase 2C-1; origin: the C3c SDK-wiring follow-up). Before that op, the Python and TypeScript SDKs recomputed Layer 2 of evaluate_trust/evaluateTrust client-side from a per-actor event-log query — hardcoding contexts_participated=1 / participationCount=rawEvents.length and participation_duration=0, classifying events by an eventType string the queryable payload does not reliably carry, and bucketing every ToolInvoked under a literal key — two independent reimplementations that diverge by construction. This story is the SDK rebuild: replace the client-side Layer-2 computation in both SDKs with a call to the typed participation_record op so both bindings RECEIVE the identical Rust-computed record; reshape the Python BehavioralRecord dataclass and the TypeScript BehavioralRecord interface to the eleven typed fields (snake_case in Python, camelCase in TypeScript) reconciled to §7.3.2.1; and add the public participation_record / participationRecord SDK wrappers. Per the per-SDK-idiom lesson, Kotlin and Swift idiomatic wrappers are OUT OF SCOPE and tracked separately (the UniFFI bridge already exports ParticipationRecordView). evaluate_trust/evaluateTrust pass an empty cached-attestation set (no attestation set is available in their inputs), so attestation_count honestly reflects only what the bridge can source from its own persistent trust store — the SDK never fabricates attestations.",
+      "acceptanceCriteria": [
+        "scp-runtime exposes Supervisor::participation_record(context_id, subject_did, accessible_attestations) returning scp_protocol::trust::ParticipationRecord, gathering the FULL unfiltered event-log entry set (so governance_actions_against, which counts events whose projected target is the subject, is not undercounted) and the log's Merkle root, and delegating to the pure-core compute_participation_record (grep finds the fn signature in crates/scp-runtime/src/context/supervisor/supervisor.rs)",
+        "The typed participation_record op is exported by the PyO3 bridge (PyScp::participation_record returning PyParticipationRecord), the NAPI bridge (Scp.participationRecord js_name returning NapiParticipationRecord), and the UniFFI bridge (Scp::participation_record returning ParticipationRecordView), each carrying the eleven fields subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, tool_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, computed_at, and event_log_root (grep finds PyParticipationRecord, NapiParticipationRecord, and ParticipationRecordView)",
+        "RoleAssigned, MemberJoined, and MemberLeft leaf payloads carry a projected subject_did so role_progression_count and participation duration attribute to the affected member (not the assigning/acting governance actor): the projection surfaces subject_did and compute_participation_record counts RoleAssigned by leaf subject_did per §7.3.2 (a unit test asserts role_progression_count attributes to the role's subject, not the actor)",
+        "bindings/python/scp_sdk/trust.py exposes a public participation_record wrapper that calls the PyO3 participation_record op and returns a BehavioralRecord dataclass whose fields are exactly subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, tool_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, computed_at, and event_log_root; the dataclass no longer defines contexts_participated, total_duration, tool_invocations, role_history, or endorsement_accuracy (grep -c each returns 0 in trust.py)",
+        "bindings/python/scp_sdk/trust.py evaluate_trust derives its Layer-2 behavioral_record from the participation_record op (no instance.event_log_query call and no client-side event classification remain in evaluate_trust; grep finds zero event_log_query and zero contexts_participated=1 in evaluate_trust), and Layer 1 (ucan_evaluate) and Layer 3 (attestations) are unchanged",
+        "bindings/typescript/src/types.ts defines the BehavioralRecord interface with exactly the eleven camelCase fields subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, toolInvocationCount, toolInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, computedAt, and eventLogRoot; the obsolete toolInvocations, participationCount, and participationDurationSeconds fields are removed (grep -c each returns 0 in types.ts)",
+        "bindings/typescript/src/scp.ts exposes a public participationRecord method on the SCP class that calls this.#native.participationRecord routed through the mapBridgeError chokepoint and returns the typed BehavioralRecord, and evaluateTrust derives its Layer-2 behavioralRecord from participationRecord with no eventLogQuery call and no eventType === \"GovernanceActionAgainst\"/\"ToolInvoked\" string classification remaining in evaluateTrust (grep finds zero GovernanceActionAgainst and zero participationCount = in scp.ts evaluateTrust)",
+        "attestation_count is sourced from the credential layer, not the event log: the bridge participation_record impls source the subject's accessible, currently-valid attestations from the bridge's own ProtocolRepository trust store (verified_attestations over the concrete storage backend), and evaluate_trust/evaluateTrust pass an empty cached-attestation set so attestation_count is 0 when no attestations are available (a real-FFI/real-napi test that creates a context with governance activity but no attestations asserts attestation_count == 0)",
+        "tool_invocation_count_anchored is false in the computed record (a real-FFI/real-napi test asserts the field is False/false), reflecting that ToolInvoked is per-author application activity not yet Merkle-anchored until ADR-051",
+        "A cross-SDK parity assertion exists: a test builds the same context and subject and asserts the Python participation_record and the TypeScript participationRecord produce identical values for every one of the eleven fields (the divergence-killer — both SDKs receive the same Rust-computed record)",
+        "A real-FFI Python test (bindings/python/tests/test_real_ffi.py) and a real-napi TypeScript test (bindings/typescript/tests/real-napi.test.ts) build a multi-member context, perform governance actions (add member, change role, remove member) and child-context creation, and assert the leaf-derived facts move accordingly (governance_actions_by and/or governance_actions_against > 0, role_progression_count > 0, context_creation_count matches the child contexts created); the real-addon tests run unskipped",
+        "The capability matrix .docs/standards/sdk-capability-matrix.json flips the participation_record python and typescript cells to true and removes their exemptions, keeps the kotlin and swift cells false with an exemption that states the UniFFI bridge exports ParticipationRecordView and no idiomatic SDK wrapper is written yet (matching the rotate_key UniFFI-only convention, no longer citing an imminent follow-up), and python3.12 scripts/check-sdk-coverage.py exits 0",
+        "All local gates pass: cargo clippy --workspace --all-targets with the in-memory-custody/testing feature set is green; in bindings/typescript with the .node addon built bun run check && bun run lint && bun test succeed; in bindings/python python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed with DYLD_LIBRARY_PATH set; and python3.12 scripts/validate-prd.py exits 0"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.2 Participation Records"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.2.1 Participation Admission Requirements"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
+        },
+        {
+          "file": ".docs/adrs/ADR-051-causal-dag-application-event-ordering.md",
+          "section": "# ADR-051: Causal-DAG Application-Event Ordering"
+        }
+      ],
+      "actionItems": [
+        "Confirm Supervisor::participation_record gathers the full unfiltered event log + Merkle root and delegates to compute_participation_record, and that RoleAssigned/MemberJoined/MemberLeft payloads carry a projected subject_did (landed in Phase 2C-1; verify, do not re-implement)",
+        "Reshape bindings/python/scp_sdk/trust.py BehavioralRecord to the eleven typed fields, add the public participation_record wrapper over the PyO3 op, and rewrite evaluate_trust Layer 2 to consume it (deleting the event_log_query + client-side classification block); pass an empty cached-attestation set",
+        "Reshape bindings/typescript/src/types.ts BehavioralRecord to the eleven camelCase fields, add the public participationRecord method on the SCP class routed through mapBridgeError, and rewrite evaluateTrust Layer 2 to consume it (deleting the eventLogQuery + classification block); pass an empty cached-attestation set",
+        "Flip the participation_record python and typescript capability-matrix cells to true, remove their exemptions, and rewrite the kotlin/swift exemptions to the UniFFI-only convention; run scripts/check-sdk-coverage.py",
+        "Add real-FFI (Python) and real-napi (TypeScript) tests covering governance actions, child-context creation, attestation_count == 0, and tool_invocation_count_anchored == false; remove obsolete toolInvocations-map and client-side-classify tests; add the cross-SDK parity assertion that Python and TypeScript yield identical field values",
+        "Run all local gates (cargo clippy with the feature set, bun check/lint/test with the addon built, ruff + pytest with DYLD, check-sdk-coverage.py, validate-prd.py) and confirm green before opening the PR"
+      ],
+      "details": {
+        "origin": "The typed participation_record op (core + PyO3 + NAPI + UniFFI) landed in Phase 2C-1 on this branch; this story is the SDK-consumption rebuild (Phase 2C-2) that makes the Python and TypeScript SDKs receive the Rust-computed record instead of recomputing Layer 2 client-side.",
+        "outOfScope": "Kotlin and Swift idiomatic participation_record wrappers are out of scope and tracked separately per the per-SDK-idiom lesson; the UniFFI bridge already exports ParticipationRecordView, so only the idiomatic SDK sugar remains for those two languages. WASM is native-only for this op (bridge-aliases.json: wasm empty, wasm_required false) and out of scope. tool_invocation_count_anchored stays false until ADR-051 makes ToolInvoked a convergent leaf; flipping it to true is ADR-051 work, not this story."
       }
     }
   ]

@@ -620,6 +620,10 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["verifyParticipationRequirements"],
         "swift": ["verifyParticipationRequirements"],
     },
+    ("Trust", "participation_record"): {
+        "python": ["participation_record"],
+        "typescript": ["participationRecord"],
+    },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {
         "python": ["parse_address"],
