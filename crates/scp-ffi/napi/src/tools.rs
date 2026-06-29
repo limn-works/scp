@@ -1716,6 +1716,68 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // decode_asserted_nonce — the §6.2.4 envelope-nonce hex decoder is
+    // fail-closed on BOTH malformed-input arms. It is a pure hex-decode +
+    // length-check (no supervisor, no custody), so these live in the
+    // non-gated `mod tests` and run even in the no-feature lib build.
+    // VALID_7001 is shared across both arms, so each test also pins its
+    // arm-specific message substring (mirrors the UniFFI bridge's tests).
+    // ------------------------------------------------------------------
+
+    /// `decode_asserted_nonce` is fail-closed on non-hex input: it surfaces a
+    /// validation error (`SCP-VALID-7001`) with the non-hex arm's message —
+    /// the bridge never pads, truncates, or coerces a malformed envelope nonce.
+    #[test]
+    fn decode_asserted_nonce_non_hex_fails_closed() {
+        let err = decode_asserted_nonce("not-hex-at-all-zz")
+            .expect_err("non-hex must be rejected fail-closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::VALID_7001),
+            "error should carry SCP-VALID-7001, got: {msg}"
+        );
+        // VALID_7001 is shared with the wrong-length arm; pin the non-hex arm
+        // specifically (mirrors how the wrong-length test asserts "16 bytes").
+        assert!(
+            msg.contains("is not valid hex"),
+            "must reject for the non-hex arm specifically; got: {msg}"
+        );
+    }
+
+    /// `decode_asserted_nonce` is fail-closed on a wrong-length input (valid hex
+    /// but 8 bytes, not 16): a wrong length is a malformed §6.2.4 envelope,
+    /// surfaced as a validation error (`SCP-VALID-7001`) — never padded or
+    /// truncated to fit.
+    #[test]
+    fn decode_asserted_nonce_wrong_length_fails_closed() {
+        // 8 bytes (16 hex chars), not 16.
+        let err = decode_asserted_nonce("0011223344556677")
+            .expect_err("a wrong-length nonce must be rejected fail-closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::VALID_7001),
+            "error should carry SCP-VALID-7001, got: {msg}"
+        );
+        assert!(
+            msg.contains("exactly 16 bytes"),
+            "message must explain the 16-byte requirement, got: {msg}"
+        );
+    }
+
+    /// The happy path: a canonical 32-char hex nonce decodes to its 16 bytes
+    /// verbatim — pins the success contract locally alongside the fail-closed
+    /// arms.
+    #[test]
+    fn decode_asserted_nonce_accepts_canonical_32_hex_chars() {
+        let nonce = decode_asserted_nonce("000102030405060708090a0b0c0d0e0f")
+            .expect("a canonical 32-char hex nonce must decode");
+        assert_eq!(
+            nonce,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
     /// All §6.2.4 cross-context-tool saga binding tests and their pure-string /
     /// DHT / governance helpers live in this single submodule gated on
     /// `allow_in_memory_custody`. Gating the module (rather than each item)
