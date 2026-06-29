@@ -2478,8 +2478,7 @@
       ],
       "napi": [
         "identity_create_link_attestation"
-      ],
-      "_note": "RESOLVED 2026-04-26: WASM was aligned to #active signing per spec \u00a73.5.2 wire format (previously signed with #0). See ADR-048 \u00a77b cross-bridge semantic divergence registry for the full record. This note retained for one release cycle so consumers verifying signatures cached from old WASM builds know the signing-key shift occurred."
+      ]
     },
     {
       "canonical": "node_start_in_memory",
