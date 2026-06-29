@@ -58,9 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
-use scp_core::context::builder::{
-    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
-};
+use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
@@ -815,8 +813,11 @@ impl Drop for PyBridgeInstance {
 /// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
 /// `NotConfiguredTransportProvider` (returns descriptive errors until transport
-/// is configured via `transport_connect`), and `NoOpEventLogProvider`
-/// (bridge-level `EventLog` instances handle Merkle ops).
+/// is configured via `transport_connect`), and the persistent
+/// `MerkleEventLogProvider` from [`build_event_log_provider`] (sharing the
+/// bridge instance's single storage backend), so the supervisor's own
+/// convergent event log is readable by `Supervisor::participation_record`
+/// (§7.3.2) and the other supervisor log queries — not a no-op.
 ///
 /// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
 /// the MLS credential identity for group operations and sender key generation.
@@ -1139,7 +1140,7 @@ impl ContextPersistence for ArcContextPersistence {
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
 /// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
 /// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
-fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
+pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
     match bi.storage_provider() {
         Some(StorageProvider::InMemoryEncrypted(storage)) => {
             let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
@@ -1381,28 +1382,6 @@ fn document_vm_key_resolver(
 // Unlike `LocalTransportProvider` (which silently succeeds), this returns
 // descriptive errors when transport operations are attempted without a relay.
 use scp_core::context::NotConfiguredTransportProvider;
-
-/// No-op event log provider for bridge-layer `ContextManager` initialization.
-pub(crate) struct NoOpEventLogProvider;
-
-impl ContextEventLogProvider for NoOpEventLogProvider {
-    fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn append_event(
-        &self,
-        _context_id: &[u8; 32],
-        _event_type: scp_event_log::EventType,
-        _actor_did: &str,
-        _payload: scp_event_log::EventPayload,
-        _timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // FfiBridgeState -- per-context FFI-specific state
@@ -2736,7 +2715,7 @@ mod tests {
                 "did:test:pyo3-bridge-test".to_owned(),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
+            build_event_log_provider(&isolated),
             None,
         )
         .expect("build_supervisor must succeed with in-memory storage set");

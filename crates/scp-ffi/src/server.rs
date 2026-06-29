@@ -106,8 +106,13 @@ fn auto_wire_context_manager(
                 scp_core::crypto::mls::provider::MlsCryptoProvider::new(did_owned.clone()),
             );
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-            let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
-                Box::new(crate::runtime::NoOpEventLogProvider);
+            // The supervisor's own event log MUST be the persistent Merkle
+            // provider (sharing the bridge instance's single storage backend),
+            // NOT a NoOp — `Supervisor::participation_record` (§7.3.2) and other
+            // supervisor reads of the convergent log require entry/Merkle-root
+            // support. A NoOp silently dropped every governance/role/membership
+            // leaf. Matches `configure_relay_transport` and the local path.
+            let event_log = crate::runtime::build_event_log_provider(bi);
             crate::runtime::init_context_manager_with(
                 bi, &did_owned, crypto, transport, event_log, None,
             );
