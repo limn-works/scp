@@ -388,7 +388,13 @@ def _committed_native(
     return native
 
 
-async def _invoke_saga(scp: MagicMock, *, chain_depth: int = 0, timestamp_ms: int = _DUMMY_TS_MS):
+async def _invoke_saga(
+    scp: MagicMock,
+    *,
+    chain_depth: int = 0,
+    timestamp_ms: int = _DUMMY_TS_MS,
+    ucan_proof_id: str | None = None,
+):
     from scp_sdk.scp import SCP
 
     return await SCP.tool_invoke_cross_context_saga(
@@ -401,6 +407,7 @@ async def _invoke_saga(scp: MagicMock, *, chain_depth: int = 0, timestamp_ms: in
         _DUMMY_NONCE_HEX,
         timestamp_ms,
         chain_depth,
+        ucan_proof_id,
     )
 
 
@@ -447,6 +454,25 @@ class TestSagaHappyPath:
             42,
             7,
             None,
+        )
+
+    async def test_native_forwards_ucan_proof_id(self) -> None:
+        """A non-default ``ucan_proof_id`` is forwarded as the 9th positional arg."""
+        native = _committed_native()
+        scp = _make_scp(native)
+
+        await _invoke_saga(scp, ucan_proof_id="some-proof-id")
+
+        native.tool_invoke_cross_context_saga.assert_called_once_with(
+            _DUMMY_CTX_CALLER,
+            _DUMMY_CTX_TGT,
+            _DUMMY_DID,
+            _DUMMY_REG_ID,
+            {"a": 1},
+            _DUMMY_NONCE_HEX,
+            _DUMMY_TS_MS,
+            0,
+            "some-proof-id",
         )
 
 
@@ -559,30 +585,36 @@ class TestSagaChainDepthValidation:
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=-1)
         assert exc_info.value.code == "SCP-VALID-7002"
+        # Fail-fast: validation MUST reject before the side-effectful saga fires.
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_256_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=256)
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_float_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=1.5)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_bool_true_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=True)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_bool_false_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=False)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
 
 class TestSagaTimestampValidation:
@@ -598,15 +630,28 @@ class TestSagaTimestampValidation:
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=-1)
         assert exc_info.value.code == "SCP-VALID-7002"
+        # Fail-fast: validation MUST reject before the side-effectful saga fires.
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_timestamp_float_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=1.5)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
 
     async def test_timestamp_bool_true_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=True)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+
+    async def test_timestamp_bool_false_rejected(self) -> None:
+        # ``False == 0`` but a bool is still rejected: the u64 boundary takes
+        # the type, not the numeric value.
+        scp = _make_scp(_committed_native())
+        with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
+            await _invoke_saga(scp, timestamp_ms=False)  # type: ignore[arg-type]
+        assert exc_info.value.code == "SCP-VALID-7002"
+        scp._native.tool_invoke_cross_context_saga.assert_not_called()
