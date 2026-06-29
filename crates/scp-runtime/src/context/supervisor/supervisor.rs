@@ -3453,17 +3453,32 @@ impl Supervisor {
             }
             // Unlike the other per-context recovery variants, a
             // `RecoverySendNotification` to an unregistered context is a
-            // legitimate, supported operation: identity-scoped recovery
-            // steps (notably PSK rotation, spec §9.12 step 6) target a
-            // synthetic identity-private-state pseudo-context that is
-            // deliberately never registered as a per-context actor. Those
-            // notifications need only the supervisor-shared crypto +
-            // transport providers and an epoch of 0 (no MLS group exists
-            // for the synthetic context) — no per-context membership,
-            // governance, or MLS group state. Seal and send directly
-            // through the shared providers, matching the registered-actor
-            // handler's `recovery_send_notification` semantics with
-            // `mls_epoch == 0`.
+            // legitimate, supported operation. This direct path is reached
+            // for ANY context with no live actor at recovery time (ADR-049
+            // lazy-spawn), of two distinct shapes:
+            //   - the synthetic `identity-private-state` pseudo-context (PSK
+            //     rotation, spec §9.12 step 6), deliberately never registered
+            //     as a per-context actor; and
+            //   - real (64-hex) member contexts during compromise recovery —
+            //     the `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
+            //     steps in `identity/recovery.rs` dispatch real member ids with
+            //     no registration gate.
+            // Both need only the supervisor-shared crypto + transport
+            // providers — no per-context membership, governance, or MLS group
+            // state. Seal and send directly through the shared providers,
+            // keying through the canonical ADR-056 chokepoint
+            // `context_id_to_bytes` so the seal lands in the same slot as the
+            // registered-actor handler's `recovery_send_notification` (the
+            // decoded 32-byte digest for a real id, the hashed synthetic label
+            // otherwise). The envelope's `inner.epoch` is hardcoded to 0: the
+            // direct path has no per-context actor state to read `mls_epoch`
+            // from. This is safe because `inner.epoch` is a signed *plaintext*
+            // field that is NOT AAD-bound — the epoch the AAD does bind is the
+            // *sender-key* epoch, drawn from real crypto state inside `seal`,
+            // not this envelope field — and the recipient's recovery handler
+            // ignores `inner.epoch` entirely, so the hardcoded 0 does not
+            // affect openability even when a real unregistered member context
+            // has a digest-keyed MLS group at a non-zero MLS epoch.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self.recovery_send_notification_direct(
@@ -3502,15 +3517,33 @@ impl Supervisor {
     /// constructed with `epoch == 0`, exactly as the registered-actor
     /// handler does when `state.epoch.mls_epoch` is its default 0.
     ///
-    /// The seal keys off `SHA256(context_id)` — the synthetic
-    /// `"identity-private-state"` id is not a real (64-hex) context id, so it
-    /// is hashed via the raw [`scp_protocol::context::context_id_bytes`]
-    /// primitive (NOT the canonical `context_id_to_bytes` resolver,
-    /// which is byte-identical for this non-64-hex input but reserved for
-    /// real-context digest keying per ADR-056) — and the relay routing ID off
+    /// This direct path is reached for ANY context with no live actor at
+    /// recovery time (ADR-049 lazy-spawn), NOT only the synthetic
+    /// pseudo-context. Two distinct callers exercise it:
+    ///
+    /// - The synthetic `identity-private-state` pseudo-context (PSK
+    ///   rotation §9.12 step 6), which is never a real (64-hex) context id.
+    /// - Real (64-hex) member contexts that simply have no spawned actor at
+    ///   recovery time — e.g. the
+    ///   [`revoke_ucans`](crate::identity::recovery) (seq 1) and
+    ///   [`rotate_key_packages`](crate::identity::recovery) (seq 2)
+    ///   compromise-recovery notifications, which dispatch to a real member
+    ///   context id with no registration gate.
+    ///
+    /// Because both shapes reach here, the seal MUST key off the canonical
+    /// ADR-056 resolver [`context_id_to_bytes`](crate::context::state::context_id_to_bytes):
+    /// it decodes a real 64-hex id to its 32-byte digest — matching the
+    /// registered-actor handler
+    /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification),
+    /// which also keys via that resolver — and hashes a synthetic, non-64-hex
+    /// label via `SHA-256`. The raw
+    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive
+    /// must NOT be used here: on a real id it would compute
+    /// `SHA-256(hex(digest))`, double-hashing and keying a slot no member
+    /// listens on — the ADR-056 fail-open. The relay routing ID is taken from
     /// the domain-separated
     /// [`context_routing_id`](scp_protocol::context::context_routing_id),
-    /// so neither requires per-context state.
+    /// which requires no per-context state.
     ///
     /// # Errors
     ///
@@ -3536,15 +3569,18 @@ impl Supervisor {
         let transport = self.transport_ref().ok_or_else(not_init)?;
         let clock = self.clock_ref().ok_or_else(not_init)?;
 
-        // This direct path handles ONLY the synthetic, never-registered
-        // identity-scoped pseudo-context (`"identity-private-state"`, PSK
-        // rotation §9.12 step 6) — see the doc comment above. That string is
-        // not a real context id and is never 64-hex, so it must be HASHED, not
-        // decoded: call the raw SHA-256 primitive directly (ADR-056). Using the
-        // canonical resolver would be byte-identical here, but the direct call
-        // documents that this site is deliberately the synthetic/non-context
-        // case, distinct from the digest-keyed real-context crypto paths.
-        let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        // Resolve the keying bytes through the canonical ADR-056 chokepoint
+        // (see the doc comment above). This path is reached for ANY
+        // unregistered context: the synthetic `identity-private-state`
+        // pseudo-context (PSK rotation §9.12 step 6, hashed because it is a
+        // non-64-hex label) AND real (64-hex) member contexts with no live
+        // actor — e.g. the `revoke_ucans` / `rotate_key_packages` compromise-
+        // recovery notifications, which decode to their 32-byte digest. Using
+        // the raw `context_id_bytes` primitive here would double-hash a real id
+        // (`SHA-256(hex(digest))`) and key a slot no member listens on, the
+        // ADR-056 fail-open. The resolver matches the registered-actor handler
+        // `recovery_send_notification`, so both paths key the same slot.
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
 
         // No MLS group exists for an unregistered context, so the epoch is
         // 0 — matching the registered-actor handler's behaviour when
@@ -3570,7 +3606,8 @@ impl Supervisor {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Domain-separated routing ID for relay routing, distinct from the
-        // raw `context_id_bytes` used for MLS crypto keying.
+        // canonical-resolver `context_id_bytes` (digest for a real id, hash of
+        // a synthetic label) used above for MLS crypto keying.
         let routing_id = scp_protocol::context::context_routing_id(context_id);
         let encrypted = crypto.seal(
             &context_id_bytes,
@@ -12665,9 +12702,11 @@ mod tests {
         snapshot
             .membership
             .add_member(DID(owning_member.to_owned()), "member".to_owned(), vec![]);
-        // Event-log bytes keyed on the import path's own derivation so
-        // the recomputed Merkle root matches what the importer expects.
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        // Event-log bytes keyed via the canonical ADR-056 resolver — the
+        // same chokepoint `import_context` uses — so the recomputed Merkle
+        // root matches what the importer derives. The caller passes a real
+        // 64-hex id; the raw primitive would double-hash it and diverge.
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
         let event_log_data =
             create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
         crate::context::export_import::create_export(
@@ -14052,6 +14091,111 @@ mod tests {
             merged.iter().any(|(d, e)| d == sender_did && *e == 12),
             "merged floor must be the higher live value (12), got {merged:?}"
         );
+    }
+
+    /// ADR-056 regression guard: `recovery_send_notification_direct` MUST
+    /// resolve its MLS-keying bytes through the canonical
+    /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)
+    /// chokepoint, NOT the raw
+    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
+    ///
+    /// This direct path is reached for ANY unregistered context — including
+    /// REAL 64-hex member contexts whose actor is not spawned at recovery time
+    /// (the `revoke_ucans` / `rotate_key_packages` compromise-recovery
+    /// notifications). For a real id, the chokepoint DECODES the 64-hex string
+    /// to its 32-byte digest, whereas the raw primitive would double-hash it
+    /// (`SHA-256(hex(digest))`) and key a slot no member listens on — the
+    /// ADR-056 fail-open.
+    ///
+    /// The test seeds an MLS group + sender key under the *digest* of a real
+    /// 64-hex id, then drives the direct path. Because `seal` looks up crypto
+    /// state by the exact keying bytes:
+    ///
+    /// - With the chokepoint (digest), `seal` SUCCEEDS and the method proceeds
+    ///   to the transport step, where `NotConfiguredTransportProvider` returns
+    ///   `TransportFailed` — proving the seal keyed off the digest.
+    /// - With the raw primitive (`SHA-256(id)`), `seal` finds NO state under
+    ///   that key and returns `CryptoFailed("no MLS group ...")` — never
+    ///   reaching the transport.
+    ///
+    /// Asserting `TransportFailed` (and NOT `CryptoFailed`) therefore FAILS if
+    /// line is regressed to the raw primitive (mutation-resistant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_direct_keys_real_context_via_chokepoint_not_raw_primitive() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        // A REAL (64-hex) member-context id: `hex(digest)` of a 32-byte digest.
+        let digest = [0x5Au8; 32];
+        let context_id = hex::encode(digest);
+        assert_eq!(context_id.len(), 64, "fixture must be a real 64-hex id");
+
+        // Precondition: the canonical resolver DECODES the id to its digest,
+        // while the raw primitive RE-HASHES it — the two must differ, otherwise
+        // this test could not distinguish the keying paths.
+        let chokepoint_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let raw_bytes = scp_protocol::context::context_id_bytes(&context_id);
+        assert_eq!(
+            chokepoint_bytes, digest,
+            "the chokepoint must decode a 64-hex id to its digest"
+        );
+        assert_ne!(
+            chokepoint_bytes, raw_bytes,
+            "test precondition: digest must differ from SHA-256(hex(digest))"
+        );
+
+        // Seed MLS group + sender key under the DIGEST — the slot the
+        // registered-actor handler (and the chokepoint) key on.
+        let crypto = sup
+            .crypto_ref()
+            .expect("test supervisor has crypto")
+            .clone();
+        crypto
+            .create_mls_group(&digest)
+            .expect("create_mls_group under the digest");
+        crypto
+            .generate_sender_key(&digest)
+            .expect("generate_sender_key under the digest");
+
+        // Sanity: NO crypto state exists under the raw SHA-256(id) key, so a
+        // direct-path seal that (wrongly) keyed off the raw primitive would
+        // fail at the seal step.
+        assert_ne!(raw_bytes, digest);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let result = sup.recovery_send_notification_direct(
+            &context_id,
+            "did:example:recovery-sender",
+            b"recovery-notification-payload",
+            1,
+            &signing_key,
+        );
+
+        // The seal MUST have succeeded (state found under the digest), so the
+        // method reaches the transport step and fails THERE with
+        // `TransportFailed` (the unconfigured test transport). A `CryptoFailed`
+        // "no MLS group" here would mean the seal keyed off the raw primitive's
+        // `SHA-256(id)` — the ADR-056 double-hash fail-open.
+        match result {
+            Err(ContextError::TransportFailed(msg)) => {
+                assert!(
+                    msg.contains("transport not configured"),
+                    "expected the unconfigured-transport error (proving the seal \
+                     succeeded under the digest), got: {msg}"
+                );
+            }
+            Err(ContextError::CryptoFailed(msg)) => {
+                panic!(
+                    "ADR-056 REGRESSION: seal keyed off the raw SHA-256(id) primitive \
+                     instead of the canonical digest — recovery notification keyed to the \
+                     wrong slot. got CryptoFailed: {msg}"
+                );
+            }
+            other => {
+                panic!("expected TransportFailed (seal succeeded under the digest), got: {other:?}")
+            }
+        }
     }
 
     /// The watchdog logs the crash WITHOUT the panic payload: the captured
