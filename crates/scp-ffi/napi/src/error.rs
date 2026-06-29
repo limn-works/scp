@@ -319,7 +319,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
             // actually suspended for the member (and the member is not
             // read-excluded with read requested). Dedicated SCP-CTX-2137
             // instead of the CTX_2001 catch-all so a caller can detect a no-op
-            // restore. Mirrors the PyO3 and WASM bridges for cross-bridge
+            // restore. Mirrors the PyO3 bridge for cross-bridge
             // parity.
             CE::NothingToRestore(_) => Self::Context {
                 message: format!("{e}"),
@@ -756,7 +756,7 @@ mod tests {
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the
     /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
-    /// The same code is surfaced by the `PyO3` and WASM bridges for
+    /// The same code is surfaced by the `PyO3` bridge for
     /// cross-bridge parity.
     #[test]
     fn nothing_to_restore_surfaces_ctx_2137() {

@@ -88,15 +88,6 @@ fi
 # comment.
 # ---------------------------------------------------------------------------
 ALLOWLIST=(
-    # internal/bridge.ts — cached Bridge instance, initialized exactly once
-    # on first async SDK call (napi or WASM path selected by BRIDGE_TARGET).
-    # Reset-on-test-only helper `_resetBridge` exists for test isolation.
-    _bridge
-    # internal/wasm.ts — cached WASM module and its one-shot init promise.
-    # WASM init is intrinsically per-process (wasm-bindgen `__wbindgen_init`
-    # writes global state in the WebAssembly instance).
-    _wasmModule
-    _initPromise
     # scp.ts — lazy-resolved napi native constructor.
     _nativeScp
     # internal/native.ts — single shared napi addon cache. Holds both
@@ -109,14 +100,6 @@ ALLOWLIST=(
     # SDK would defeat the cache discipline and re-open the
     # `require.cache` mutation surface that the freeze closes.
     _nativeAddon
-    # mcp.ts — cached napi addon handle for MCP bridge functions.
-    _mcpAddon
-    # server.ts — cached napi addon handle for Server bridge functions.
-    _addon
-    # internal/bridge.ts — WASM runtime is intrinsically process-wide
-    # (wasm-bindgen writes global state in the WebAssembly instance);
-    # cannot be per-SCP like the native bridge. See ADR-048.
-    _wasmBridge
 )
 
 SCAN_DIR="bindings/typescript/src"

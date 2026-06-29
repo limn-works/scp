@@ -3798,7 +3798,7 @@ pub async fn vote_on_proposal_inner(
             // whose approval crossed quorum and therefore committed the action
             // (ADR-031 §7.3.1 "committing member"). This is the divergence-
             // causing path: stamping the proposer here (the old behavior) made
-            // native disagree with WASM whenever proposer != quorum-crossing
+            // the leaf diverge whenever proposer != quorum-crossing
             // voter.
             Box::pin(execute_governance_action(
                 cell,
@@ -4883,7 +4883,7 @@ pub async fn execute_governance_action(
     // - `None` on the direct-execute FFI path, where there is no
     //   quorum-crossing voter: the executor is resolved from the *tracked*
     //   proposal's `proposer_did` (never a caller-supplied DID), preserving the
-    //   convention and the native↔WASM leaf convergence established for the
+    //   convention and the cross-implementation leaf convergence established for the
     //   direct path. Spec: ADR-031 §8 "executor DID" / §7.3.1 "committing
     //   member" / ADR-051 §6.
     executor_did: Option<&DID>,
@@ -4920,8 +4920,8 @@ pub async fn execute_governance_action(
 
     // Resolve the committing member. The direct-execute path (`None`) attributes
     // to the TRACKED proposal's proposer — never a caller-supplied DID — so the
-    // `GovernanceActionExecuted` leaf actor_did is convergent with WASM and the
-    // quorum path's own attribution.
+    // `GovernanceActionExecuted` leaf actor_did is convergent across honest
+    // members and with the quorum path's own attribution.
     let executor_did: &DID = executor_did.unwrap_or(&proposal.proposer_did);
 
     // The engine's own status — set to `Approved` only at genuine quorum.

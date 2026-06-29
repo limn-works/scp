@@ -25,10 +25,11 @@
 //!   produces a non-deterministic digest. Sorting the elements before
 //!   serialization makes the canonical JSON — and therefore the export
 //!   signature digest — byte-identical across runs **within a single
-//!   serializer/bridge-family** (ADR-050, the `BTreeSet` convention named in
-//!   §23.16.8). This is NOT a cross-family byte-equivalence claim: native
-//!   (`MessagePack`) and WASM (JSON) serialize structurally different snapshot
-//!   value types, so only the *construction* converges, not the digest bytes.
+//!   serializer family** (ADR-050, the `BTreeSet` convention named in
+//!   §23.16.8). This is NOT a cross-serializer byte-equivalence claim: the
+//!   `MessagePack` wire format and the JSON (JCS) signing format serialize
+//!   structurally different snapshot value types, so only the *construction*
+//!   converges, not the digest bytes across serializers.
 //!   Deserialization
 //!   is order-independent for a set, so sorted serialization is always safe:
 //!   nothing correct can depend on a `HashSet`'s incidental iteration order.
@@ -474,8 +475,8 @@ pub mod serde_sorted_set {
         //
         // Amplification note: this performs one extra JCS serialization per set
         // element (O(n) in the number of elements), bounded by the export size
-        // cap enforced upstream before signing runs (native 64 MiB / WASM
-        // 16 MiB). Element types here are flat (no nested set-of-sets), so the
+        // cap enforced upstream before signing runs (64 MiB). Element types
+        // here are flat (no nested set-of-sets), so the
         // per-element JCS work is proportional to total export size, not
         // quadratic. If a nested set-of-sets element type is ever added,
         // re-evaluate the amplification factor before relying on this bound.

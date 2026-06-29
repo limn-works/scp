@@ -8,7 +8,7 @@ SCP provides language SDKs for Rust, Python, TypeScript, Swift, and Kotlin. All 
 |----------|---------|-----------|--------|
 | **Rust** | `scp-core` (workspace crate) | N/A (native) | `use scp_core::*;` |
 | **Python** | `scp-python` | PyO3 (`crates/scp-ffi/src/`) | `from scp_sdk import Identity, Context` |
-| **TypeScript** | `@limn-works/scp-ts` | NAPI (server) / WASM (browser) | `import { Identity, Context } from "@limn-works/scp-ts"` |
+| **TypeScript** | `@limn-works/scp-ts` | NAPI (server, in-process; browser = remote thin client) | `import { Identity, Context } from "@limn-works/scp-ts"` |
 | **Swift** | `SCP` (Swift Package) | UniFFI (`crates/scp-ffi/uniffi/`) | `import SCP` |
 | **Kotlin** | `works.limn:scp-kt` | UniFFI (`crates/scp-ffi/uniffi/`) | `import works.limn.scp.*` |
 
@@ -49,8 +49,8 @@ python3.12 --version  # >= 3.12
 ### TypeScript
 
 - Bun >= 1.0 or Node >= 22
-- The package ships both a NAPI native addon (server) and a WASM module (browser)
-- Bridge selection is automatic at import time
+- The package ships a NAPI native addon for server runtimes (Bun/Node), running the protocol engine in-process
+- In the browser the SDK operates as a remote thin client (the protocol engine runs server-side); there is no in-browser protocol backend
 
 ```bash
 bun --version   # >= 1.0

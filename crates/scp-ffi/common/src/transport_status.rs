@@ -1,6 +1,6 @@
-//! Canonical handleless transport-status triple shared across all four FFI bridges.
+//! Canonical handleless transport-status triple shared across all FFI bridges.
 //!
-//! Every FFI bridge (`PyO3`, napi-rs, `UniFFI`, wasm-bindgen) exposes a
+//! Every FFI bridge (`PyO3`, napi-rs, `UniFFI`) exposes a
 //! no-handle-supplied `transport_status()` probe whose contract, per
 //! ADR-048 §7a, is `(has_transport(), None, None)`. The `relay_url` and
 //! `latency_ms` fields live on the `TransportManager` handle, not on the
@@ -14,12 +14,12 @@
 //! after both bridges ship. Centralising the shape here turns the
 //! regression into a compile-level invariant: every bridge calls the
 //! same helper, so the disconnected triple stays byte-identical across
-//! `PyO3`, napi-rs, `UniFFI`, and wasm-bindgen without further
+//! `PyO3`, napi-rs, and `UniFFI` without further
 //! enforcement.
 //!
 //! # Why `Option<f64>` for `latency_ms`
 //!
-//! All four per-bridge `TransportStatus`-equivalent structs store
+//! All per-bridge `TransportStatus`-equivalent structs store
 //! `latency_ms` as `Option<f64>` so the language SDKs expose a nullable
 //! floating-point millisecond value (Swift `Double?`, Kotlin `Double?`,
 //! Python `float | None`, TypeScript `number | null`). The shared helper
@@ -29,7 +29,7 @@
 ///
 /// Every bridge's handleless `transport_status()` probe lowers to this
 /// helper so the disconnected shape remains byte-identical across
-/// `PyO3`, napi-rs, `UniFFI`, and wasm-bindgen:
+/// `PyO3`, napi-rs, and `UniFFI`:
 ///
 /// - `connected = has_transport` (the only bit of state the bridge has
 ///   when no handle is supplied)

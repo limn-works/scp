@@ -68,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_wasm_raw_concatenation() {
+    fn matches_spec_raw_concatenation() {
         // Verify the hash uses raw concatenation per spec §12.2.1:
         // SHA-256(context_id || operator_did || platform || timestamp).
         // Manually compute the expected hash for a known timestamp.

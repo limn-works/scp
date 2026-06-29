@@ -51,7 +51,7 @@ bun run tools.ts
 
 ## Key Patterns
 
-- **Dual-target**: The SDK auto-selects napi-rs (Bun/Node) or WASM (browser) at runtime.
+- **Server in-process**: On Bun/Node the SDK runs the protocol engine in-process via the napi-rs native addon. In the browser it operates as a remote thin client (no in-browser protocol backend).
 - **AsyncDisposable**: `Context` implements `Symbol.asyncDispose` for `await using` cleanup.
 - **Typed params**: Use `ContextParams`, `ToolDefinition`, `Message` types for safety.
 - **UCAN authorization**: Tool invocation requires a valid UCAN token (spec section 7.2).
@@ -62,5 +62,4 @@ bun run tools.ts
 
 - TypeScript SDK source: `bindings/typescript/src/`
 - NAPI bridge: `crates/scp-ffi/napi/`
-- WASM bridge: `crates/scp-ffi/wasm/`
 - Protocol spec: `.docs/specs/`

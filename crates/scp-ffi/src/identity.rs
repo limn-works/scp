@@ -299,16 +299,13 @@ pub struct PyIdentity {
     /// bytes. Populated for identities created via `PyScp::identity_create`;
     /// `None` for identities loaded from storage without a live custody.
     ///
-    /// Why `#0` (`identity_key`), not `#active`: the WASM bridge uses a
-    /// simplified single-key model in production where the DID-deriving
-    /// key *is* the signing key, while scp-core uses three distinct keys
-    /// per [`ScpIdentity`]. Exposing the identity key gives a byte-
-    /// identical value across all four bridges under a deterministic
-    /// `seed` (ADR-046). SCPID signatures use `#active`; under the
-    /// `testing` feature WASM *also* derives a distinct `#active` key
-    /// from `seed[32..64]` so `#active`-signed signatures are byte-
-    /// identical across all four bridges under the `signed_at_override`
-    /// affordance.
+    /// Why `#0` (`identity_key`), not `#active`: the DID-deriving identity
+    /// key is exposed (scp-core uses three distinct keys per
+    /// [`ScpIdentity`]) so the value is byte-identical across all bridges
+    /// under a deterministic `seed` (ADR-046). SCPID signatures use
+    /// `#active`, derived from `seed[32..64]`, so `#active`-signed
+    /// signatures are likewise byte-identical across all bridges under the
+    /// `signed_at_override` affordance.
     verifying_key_hex: Option<String>,
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
     /// [`crate::pyscp_check_handle!`] at every entry point that accepts this
@@ -955,7 +952,7 @@ impl crate::scp::PyScp {
         // `InMemoryKeyCustody::from_seed_bytes`, so the same hygiene
         // we apply to other private-key material applies here.
         //
-        // Unlike the UniFFI / NAPI / WASM bridges, PyO3 hands us a
+        // Unlike the UniFFI / NAPI bridges, PyO3 hands us a
         // `&[u8]` borrow straight from the caller's `PyBytes` — the
         // narrowing below copies through `expect_fixed_bytes::<32>`
         // with no intermediate `Vec` on the Rust side, so there is no

@@ -499,7 +499,7 @@ private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
 private suspend fun opTransportStatus(args: JsonObject): JsonObject =
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
     // alongside the handle-taking `transportStatus(manager)`, matching the
-    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // PyO3 / NAPI probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
     uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val status = scp.transportManagerStatus()
@@ -526,7 +526,7 @@ private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
     uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use {
         // UniFFI `scpidSign` takes an opaque `Identity` handle rather
         // than a DID string, so the bridge-local registry lookup path
-        // the PyO3/NAPI/WASM bridges exercise is not reachable. Instead,
+        // the PyO3/NAPI bridges exercise is not reachable. Instead,
         // we exercise the SAME error code via `identityResolve` on the
         // fake DID: its 64-char zbase32 suffix decodes to 40 bytes (not
         // the 32 required by did:dht), so `DidDht::extract_public_key`

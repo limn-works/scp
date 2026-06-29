@@ -510,9 +510,9 @@ fn event_log_query_empty_returns_empty() {
 
         // Per commit a5b4cc8ec ("fix: emit ContextCreated on context
         // create"), the PyO3 bridge now wires a MerkleEventLogProvider
-        // (matching NAPI/UniFFI/WASM). `ContextManager::create_context`
+        // (matching NAPI/UniFFI). `ContextManager::create_context`
         // appends exactly one `ContextCreated` event at sequence 0, so a
-        // fresh context has event_count = 1 across all four bridges.
+        // fresh context has event_count = 1 across all bridges.
         // This test pins the post-alignment invariant.
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert_eq!(

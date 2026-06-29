@@ -535,8 +535,7 @@ pub(crate) async fn ucan_delegate_on(
     // Defense-in-depth: verify delegator DID matches parent token's audience.
     // The delegator must be the audience of the parent token to form a valid
     // delegation chain (iss/aud linkage). scp-core enforces this too, but
-    // catching it at the bridge level provides clearer error messages and
-    // matches the WASM bridge's defense-in-depth check.
+    // catching it at the bridge level provides clearer error messages.
     if delegator_did != parsed_parent.payload.aud {
         return Err(napi::Error::from(ScpNapiError::Permission {
             message: format!(

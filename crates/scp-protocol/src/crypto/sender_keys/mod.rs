@@ -63,8 +63,7 @@ pub use key_protocol_verify::{
 ///
 /// The value is shared by every consumer so the ceiling cannot diverge across
 /// implementations:
-/// - the `scp-runtime` MLS crypto provider (`seal` / `open` receive ceiling),
-/// - the WASM crypto state (`decrypt_message` receive ceiling), and
+/// - the `scp-runtime` MLS crypto provider (`seal` / `open` receive ceiling) and
 /// - [`SenderKeyStore::merge_incoming_epochs`] snapshot-import overshoot guard
 ///   (callers pass this as `max_advance_per_sender`).
 pub const MAX_EPOCH_ADVANCE: u64 = 1000;

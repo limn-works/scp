@@ -22,7 +22,7 @@
 //! - [`NapiIdentity::has_agent_key`] — Checks if an agent key exists.
 //! - [`NapiIdentity::agent_public_key`] — Returns the agent key's public key.
 //!
-//! Unlike the WASM bridge, this bridge calls `scp-core` directly for the
+//! This bridge calls `scp-core` directly for the
 //! `"in_memory"` custody path — the tokio multi-thread runtime is available
 //! in the Bun/Node environment.
 //!
@@ -296,10 +296,9 @@ pub(crate) struct NapiIdentityInner {
     /// bytes. Populated for identities created via `Scp::identity_create`;
     /// `None` for externally loaded identities.
     ///
-    /// Uses `identity_key` (not `#active`) because the WASM bridge has a
-    /// simplified single-key model; exposing the identity key gives
-    /// byte-exact cross-bridge parity under a deterministic `seed`
-    /// (ADR-046).
+    /// Uses `identity_key` (not `#active`): exposing the DID-deriving
+    /// identity key gives byte-exact cross-bridge parity under a
+    /// deterministic `seed` (ADR-046).
     pub(crate) verifying_key_hex: Option<String>,
     /// `NapiBridgeInstance` id that minted this handle — used for runtime
     /// handle-affinity checks at every FFI entry point that accepts a
@@ -887,9 +886,9 @@ impl NapiIdentity {
 /// `verifying_key` is a parity-test convenience, not a correctness-
 /// critical field.
 ///
-/// Callers pass `identity.identity_key` (not `active_signing_key`): the
-/// WASM bridge has only one key per identity, so byte-exact cross-bridge
-/// parity requires every bridge to expose the DID-deriving identity key.
+/// Callers pass `identity.identity_key` (not `active_signing_key`):
+/// byte-exact cross-bridge parity requires every bridge to expose the
+/// DID-deriving identity key.
 pub(crate) async fn identity_verifying_key_hex(
     custody: &Arc<crate::custody::NapiKeyCustody>,
     handle: &scp_platform::traits::KeyHandle,

@@ -326,7 +326,7 @@ pub(crate) async fn transport_connect_on(
 /// downgraded to disconnected.
 ///
 /// When `manager` is `None`, returns a stateless snapshot drawn from the
-/// bridge's transport state. Mirrors the `PyO3` / WASM handleless probe
+/// bridge's transport state. Mirrors the `PyO3` handleless probe
 /// so callers can observe the disconnected shape before ever calling
 /// `transportConnect`, without needing to construct a
 /// `NapiTransportManager` handle.
@@ -348,8 +348,8 @@ pub(crate) async fn transport_status_on(
         return Ok(status);
     }
     // Handleless probe — mirrors UniFFI `Scp::transport_manager_status`
-    // (PyO3 and WASM have their own per-bridge-state probes with different
-    // contracts). Reports whether a `TransportManager` is wired on this
+    // (PyO3 has its own per-bridge-state probe with a different
+    // contract). Reports whether a `TransportManager` is wired on this
     // bridge; the relay URL / latency fields are null because those live
     // on the handle, not in the bridge instance.
     let (connected, relay_url, latency_ms) =

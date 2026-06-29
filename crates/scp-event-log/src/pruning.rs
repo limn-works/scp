@@ -376,7 +376,7 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 /// classification decision at compile time rather than silently defaulting.
 ///
 /// The 36 base variants retain their established classification. The 40
-/// native↔WASM unification variants (ADR-011 Amendment) are classified per the
+/// typed-event unification variants (ADR-011 Amendment) are classified per the
 /// same §2c rationale: governance / membership / lifecycle /
 /// structural-evolution events are structural; high-frequency operational
 /// records are operational. The 2 ADR-011 Amendment §6 cross-context-saga

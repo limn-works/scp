@@ -1565,7 +1565,7 @@ mod tests {
     fn petname_malformed_owner_rejected() {
         // A non-empty owner that is not a syntactically valid DID must be
         // rejected by the pre-existing petname ops, matching the strict
-        // `validate_did` gate the WASM bridge and the §4.7 ops already enforce.
+        // `validate_did` gate the §4.7 ops already enforce.
         let scp = default_scp();
         let bad = "not-a-did";
         assert!(scp.petname_set(bad, "did:dht:z1", "test").is_err());

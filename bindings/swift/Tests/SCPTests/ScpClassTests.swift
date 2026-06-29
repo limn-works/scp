@@ -272,8 +272,8 @@ final class ScpClassTests: XCTestCase {
     }
 
     /// A non-empty but syntactically invalid `ownerDid` is rejected by the
-    /// pre-existing petname ops, matching the strict DID validation the WASM
-    /// bridge and the §4.7 ops already enforce. All four bridges treat the
+    /// pre-existing petname ops, matching the strict DID validation the
+    /// §4.7 ops already enforce. All bridges treat the
     /// per-identity petname partition key uniformly as a DID.
     func testPetnameRejectsMalformedOwner() {
         let bad = "not-a-did"

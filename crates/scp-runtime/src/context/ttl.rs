@@ -1415,9 +1415,9 @@ mod tests {
         }
     }
 
-    /// §9.9.3 native↔WASM convergence: the native `finalize_close` producer MUST
+    /// §9.9.3 convergence: the native `finalize_close` producer MUST
     /// stamp the descriptive sentinel `"system:close"` on the `ContextClosed`
-    /// leaf so it is byte-identical to the WASM bridge's `finalize_close` leaf.
+    /// leaf so it is byte-identical across all honest members' `finalize_close` leaves.
     #[tokio::test]
     async fn finalize_close_stamps_system_close_actor_did() {
         let crypto = mk_crypto();
@@ -1442,13 +1442,13 @@ mod tests {
             .expect("ContextClosed leaf must be appended by finalize_close");
         assert_eq!(
             closed.1, "system:close",
-            "native ContextClosed leaf MUST stamp \"system:close\" (§9.9.3 native↔WASM parity)"
+            "native ContextClosed leaf MUST stamp \"system:close\" (§9.9.3 convergence)"
         );
     }
 
-    /// §9.9.3 native↔WASM convergence: the native `handle_ttl_expiry` producer
+    /// §9.9.3 convergence: the native `handle_ttl_expiry` producer
     /// MUST stamp the descriptive sentinel `"system:timer"` on the
-    /// `ContextExpired` leaf so it is byte-identical to the WASM bridge's leaf.
+    /// `ContextExpired` leaf so it is byte-identical across all honest members' leaves.
     #[tokio::test]
     async fn handle_ttl_expiry_stamps_system_timer_actor_did() {
         let crypto = mk_crypto();
@@ -1465,7 +1465,7 @@ mod tests {
             .expect("ContextExpired leaf must be appended by handle_ttl_expiry");
         assert_eq!(
             expired.1, "system:timer",
-            "native ContextExpired leaf MUST stamp \"system:timer\" (§9.9.3 native↔WASM parity)"
+            "native ContextExpired leaf MUST stamp \"system:timer\" (§9.9.3 convergence)"
         );
     }
 

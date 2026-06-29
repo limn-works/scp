@@ -461,14 +461,14 @@ async fn ac4_majority_propose_approve_execute() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM convergence: GovernanceActionExecuted leaf actor_did is
+// §9.9.3 convergence: GovernanceActionExecuted leaf actor_did is
 // the EXECUTOR (the quorum-crossing committing member), NOT the proposer.
 //
 // ADR-031 §8 ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6.
-// The WASM bridge stamps `initiator_did` (the committing voter) on its
-// `GovernanceActionExecuted` leaf; native MUST do the same so the same logical
-// commit yields a byte-identical leaf actor_did — and therefore the same leaf
-// hash and Merkle root — across the two bridges. This drives the REAL native
+// Every honest member stamps `initiator_did` (the committing voter) on its
+// `GovernanceActionExecuted` leaf, so the same logical commit yields a
+// byte-identical leaf actor_did — and therefore the same leaf hash and Merkle
+// root — across all honest members. This drives the REAL native
 // quorum-approval path through the `Supervisor` with a REAL
 // `MerkleEventLogProvider`, then reads the landed leaf back out.
 // =========================================================================
@@ -551,29 +551,28 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
         executed_leaf.actor_did.as_ref(),
         bob().as_ref(),
         "the GovernanceActionExecuted leaf actor_did MUST be the quorum-crossing executor (bob), \
-         NOT the proposer (alice) — ADR-031 §8 executor DID; §9.9.3 native↔WASM convergence"
+         NOT the proposer (alice) — ADR-031 §8 executor DID; §9.9.3 convergence"
     );
     // Non-vacuity: alice (proposer) != bob (executor), so a proposer stamp
     // would be a distinct, divergent leaf actor_did.
     assert_ne!(
         executed_leaf.actor_did.as_ref(),
         alice().as_ref(),
-        "stamping the proposer would diverge from the WASM bridge, which stamps the committing voter"
+        "stamping the proposer would diverge from the committing voter that every honest member stamps"
     );
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM ACCEPT-decision parity: a quorum-crossing eligible voter
+// §9.9.3 ACCEPT-decision behavior: a quorum-crossing eligible voter
 // who is NOT the proposer and holds no per-action capability still causes the
 // action to execute and mint EXACTLY ONE GovernanceActionExecuted leaf.
 //
-// Native `execute_governance_action` performs NO per-member action-capability
-// check (only status / context-id / replay / commit-fault). The WASM bridge
-// previously gated on `member_has_capability(voter, action_cap)` at execute,
-// which a vote-eligible-but-action-less voter fails — minting 0 where native
-// mints 1. That per-member check has been removed from WASM so both bridges
-// mint exactly 1. This native test pins the "native mints 1" half (the WASM
-// half is `cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm`).
+// `execute_governance_action` performs NO per-member action-capability
+// check (only status / context-id / replay / commit-fault). Gating on
+// `member_has_capability(voter, action_cap)` at execute would make a
+// vote-eligible-but-action-less voter mint 0 where the correct behavior is
+// to mint 1. This test pins the mint-exactly-one behavior; the §9.9.3
+// convergence requirement is that all honest members mint the identical leaf.
 // =========================================================================
 #[tokio::test]
 async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
@@ -635,17 +634,16 @@ async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
     assert_eq!(
         executed, 1,
         "native MUST mint EXACTLY ONE GovernanceActionExecuted leaf for a quorum-crossing voter \
-         lacking the action capability — the convergent target the WASM bridge must match (§9.9.3)"
+         lacking the action capability — the convergent target all honest members must produce (§9.9.3)"
     );
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity: an action whose required
+// §9.9.3 REJECT-decision behavior: an action whose required
 // capability is NOT in the context ceiling is rejected, minting no
 // GovernanceActionExecuted leaf. `RevokeAccess` is gated on `member:ban` in
-// native (`execute_revoke`). With `member:ban` absent from the ceiling, native
-// rejects — the WASM bridge now applies the same per-action ceiling gate
-// (`cross_impl_out_of_ceiling_action_rejected_wasm`).
+// `execute_revoke`. With `member:ban` absent from the ceiling, the action
+// is rejected — the convergent reject all honest members must produce (§9.9.3).
 // =========================================================================
 #[tokio::test]
 async fn governance_out_of_ceiling_action_rejected_native() {
@@ -683,7 +681,7 @@ async fn governance_out_of_ceiling_action_rejected_native() {
     assert!(
         result.is_err(),
         "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected by native — \
-         the convergent reject decision the WASM bridge must match (§9.9.3; ADR-031 §8)"
+         the convergent reject decision all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
@@ -702,13 +700,12 @@ async fn governance_out_of_ceiling_action_rejected_native() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
-// Native gates this on `Capability::ChildContextCreate` in
+// §9.9.3 REJECT-decision behavior for `CreateChildContext`.
+// Gated on `Capability::ChildContextCreate` in
 // `execute_create_child_context` (`governance_helpers.rs`). With the capability
-// absent from the ceiling, native rejects and mints ZERO leaves — pinning the
-// convergent reject that the WASM bridge now also enforces
-// (`cross_impl_out_of_ceiling_create_child_context_rejected_wasm`). Previously
-// WASM EXECUTED this action (ungated), a §9.9.3 divergence and security gap.
+// absent from the ceiling, the action is rejected and mints ZERO leaves —
+// pinning the convergent reject all honest members must produce. Executing this
+// action ungated would be a §9.9.3 divergence and security gap.
 // =========================================================================
 #[tokio::test]
 async fn governance_out_of_ceiling_create_child_context_rejected_native() {
@@ -733,7 +730,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
         .await
         .unwrap();
 
-    // Built via serde to mirror the WASM KAT fixture exactly.
+    // Built via serde to mirror the convergence KAT fixture exactly.
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
         "CreateChildContext": {"params": {
             "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
@@ -751,7 +748,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
     assert!(
         result.is_err(),
         "an out-of-ceiling CreateChildContext (context:child:create not in ceiling) MUST be \
-         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+         rejected by native — the convergent reject all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
@@ -771,12 +768,11 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
-// Native gates this on `Capability::ToolInterface` in
+// §9.9.3 REJECT-decision behavior for `EstablishToolInterface`.
+// Gated on `Capability::ToolInterface` in
 // `execute_establish_tool_interface` (`governance_helpers.rs`). With the
-// capability absent from the ceiling, native rejects and mints ZERO leaves —
-// pinning the convergent reject the WASM bridge now also enforces
-// (`cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm`).
+// capability absent from the ceiling, the action is rejected and mints ZERO
+// leaves — pinning the convergent reject all honest members must produce.
 // =========================================================================
 #[tokio::test]
 async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
@@ -818,7 +814,7 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
     assert!(
         result.is_err(),
         "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
-         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+         rejected by native — the convergent reject all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);

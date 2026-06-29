@@ -266,7 +266,7 @@ fn different_event_order_produces_different_root() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.8 Typed-leaf + checkpoint KAT (ADR-011 native↔WASM unification)
+// §25.8 Typed-leaf + checkpoint KAT (ADR-011 typed-event unification)
 //
 // The vectors above pin the abstract RFC 6962 tree construction. These pin the
 // *typed* leaf preimage: each leaf is SHA-256(0x00 || rmp_serde(Event)) over a

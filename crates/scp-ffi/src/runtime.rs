@@ -21,7 +21,7 @@
 //! share these registries. Context IDs and identity DIDs from one tenant are
 //! accessible to another. This is a known architectural limitation.
 //!
-//! The NAPI (`Node.js`), `UniFFI` (Swift/Kotlin), and WASM bridges avoid this
+//! The NAPI (`Node.js`) and `UniFFI` (Swift/Kotlin) bridges avoid this
 //! issue by using per-instance handle objects instead of global registries.
 //! The `PyO3` bridge must be refactored to match.
 //!
@@ -1137,7 +1137,7 @@ impl ContextPersistence for ArcContextPersistence {
 /// and is visible to `py_event_log_query`.
 ///
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
-/// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
+/// same initial `ContextCreated` event as the NAPI and `UniFFI`
 /// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
 fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
     match bi.storage_provider() {
@@ -1165,7 +1165,7 @@ fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogPro
 /// outbound webhook dispatcher (spec §12.10.5), wired in
 /// [`crate::server::node_start_in_memory`]/`node_start_local`. Lagging consumers
 /// drop the oldest events (logged, never panics); `1024` is the documented
-/// default shared across all three non-WASM bridges.
+/// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// `Supervisor::with_providers` is the single entry point that constructs the

@@ -1072,7 +1072,7 @@ fn every_exemption_reason_cites_durable_provenance() {
 #[test]
 fn provenance_detector_accepts_durable_artifacts() {
     assert!(cites_durable_provenance(
-        "WASM lacks the tokio runtime per ADR-034"
+        "Constrained bridge dependency set per ADR-034"
     ));
     assert!(cites_durable_provenance(
         "Sender-side key layer, separate from MLS (spec §9.16)"
@@ -1111,7 +1111,7 @@ fn cited_tokens_extracts_maximal_digit_runs() {
 
 /// The existence check backing the exemption gate: a real artifact is present
 /// in its corpus; a fabricated one is not. This is what makes the gate reject
-/// shape-valid-but-bogus reasons like "WASM gap, see ADR-999" / "see SCP-9999".
+/// shape-valid-but-bogus reasons like "coverage gap, see ADR-999" / "see SCP-9999".
 #[test]
 fn provenance_existence_distinguishes_real_from_fabricated() {
     let adrs = adrs_in_repo();

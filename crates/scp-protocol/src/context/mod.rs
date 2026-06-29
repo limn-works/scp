@@ -627,10 +627,9 @@ pub enum ContextError {
     /// could otherwise carry plaintext or key material).
     ///
     /// Mapped to canonical code `SCP-CTX-2134` through a dedicated
-    /// translator arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not
+    /// translator arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not
     /// the generic `SCP-CTX-2001` fallthrough — so a caller can detect a
-    /// poisoned context. (WASM has no actor model per ADR-034, so it never
-    /// produces this variant.)
+    /// poisoned context.
     #[error(
         "SCP-CTX-2134: context is poisoned (exceeded respawn budget); \
          operator intervention required: {0}"
@@ -648,11 +647,10 @@ pub enum ContextError {
     /// The payload is the affected context id — never a panic payload.
     ///
     /// Mapped to canonical code `SCP-CTX-2135` through a dedicated translator
-    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
     /// `SCP-CTX-2001` fallthrough — so a caller can distinguish an
     /// unrecoverable crash from a poisoned context (`SCP-CTX-2134`) and from a
-    /// generic context error. (WASM has no actor model per ADR-034, so it
-    /// never produces this variant.)
+    /// generic context error.
     #[error("SCP-CTX-2135: context actor crashed and could not be respawned: {0}")]
     ActorCrashed(String),
 
@@ -670,9 +668,8 @@ pub enum ContextError {
     /// into an idempotent success rather than a permanent replay failure.
     ///
     /// Mapped to canonical code `SCP-CTX-2136` through a dedicated translator
-    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
     /// `SCP-CTX-2001` fallthrough — so a caller can detect a single-use replay.
-    /// (WASM has no actor model per ADR-034, so it never produces this variant.)
     #[error("SCP-CTX-2136: key package already consumed (init-key replay rejected): {0}")]
     KeyPackageReplay(String),
 }

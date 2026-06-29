@@ -2,7 +2,7 @@
 
 Native addon (`.node` file) for Node.js and Bun. Exposes `scp-core` APIs via
 napi-rs `#[napi]` functions and types. Consumed by the `@limn-works/scp-ts`
-TypeScript package as its native (non-WASM) backend.
+TypeScript package as its native backend.
 
 ## Architecture
 
@@ -45,7 +45,6 @@ released or the deadline elapses.
 
 ## Key differences from PyO3
 
-- Calls `scp-core` directly (unlike the WASM bridge).
 - `NapiUcanToken` carries an `encoded` field for revocation/validation.
 - Capability URIs are auto-scoped to `scp:ctx:{context_id}/` when not prefixed.
 - Nonce format: `{unix_millis}-{16_random_bytes_hex}` (ADR-016 section 7.2).

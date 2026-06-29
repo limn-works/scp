@@ -53,7 +53,7 @@ const TS_TRUST: &str = include_str!("../../../../bindings/typescript/src/trust.t
 const TS_SYNC: &str = include_str!("../../../../bindings/typescript/src/sync.ts");
 const TS_BRIDGE: &str = include_str!("../../../../bindings/typescript/src/bridge.ts");
 // The TypeScript `Bridge` interface — the low-level adapter contract that
-// the SDK's native + WASM backends implement and that SCP class methods
+// the SDK's native backend implements and that SCP class methods
 // delegate to. Analogous to Swift's `ScpBindings.swift` (UniFFI-generated)
 // and Kotlin's `CoroutineBridge.kt`. Some NAPI-exposed operations
 // (`identityAddAgentKey`, `identityRotateAgentKey`,

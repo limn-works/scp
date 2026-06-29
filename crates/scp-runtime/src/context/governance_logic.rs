@@ -16,7 +16,7 @@ pub(in crate::context) use super::actor::class_s::ConsequenceStateSplit;
 use super::state::{context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
-// RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
+// Consequence enforcement — synthetic actor DID + shared wire-stable labels
 // ---------------------------------------------------------------------------
 //
 // The `CommitRetryOutcome` / `CommitRetryOutcomeKind` types that previously
@@ -35,8 +35,8 @@ pub(super) const CONSEQUENCE_ACTOR_DID: &str =
     scp_event_log::system_actors::SYSTEM_CONSEQUENCE_ACTOR;
 
 // The canonical wire-stable `trigger_kind` / `action_type` labels and the
-// durable consequence-leaf payload bytes are produced by SHARED code so the
-// native runtime and the WASM bridge emit byte-identical Merkle-leaf preimages
+// durable consequence-leaf payload bytes are produced by SHARED code so all
+// honest members emit byte-identical Merkle-leaf preimages
 // (§9.9.3 convergence): `scp_protocol::trust::consequence::{trigger_kind_str,
 // consequence_action_type}` for the labels and
 // `scp_event_log::payload::consequence_event_payload` for the JSON bytes.
@@ -754,7 +754,7 @@ fn emit_failure_escalation(
 /// acquires Source 1 (the persisted event log) from the
 /// [`ContextEventLogProvider`](crate::context::builder::ContextEventLogProvider)
 /// and Source 2 (the receive buffer) from `receive_buffer`, then delegates the
-/// projection + buffer-gate merge so native and WASM produce byte-identical
+/// projection + buffer-gate merge so all honest members produce byte-identical
 /// merged event sets (§9.9.3 equivocation detection). All constants, the
 /// `EventType` projection, and the buffer-gate logic live in that shared
 /// function — see it for the CONVERGENCE INVARIANT documentation.
@@ -828,7 +828,7 @@ pub fn event_log_entries_for_consequences(
     let convergent_now = log_entries.iter().map(|e| e.timestamp).max().unwrap_or(now);
 
     // Source 2: the receive buffer. Delegate the convergence-critical merge
-    // (projection + buffer gates) to the shared function so native and WASM
+    // (projection + buffer gates) to the shared function so all honest members
     // stay byte-identical.
     let merged = scp_protocol::trust::consequence::merge_consequence_events(
         &log_entries,

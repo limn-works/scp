@@ -13,8 +13,7 @@ Handle-level methods on the PyO3 objects — ``shutdown``, ``serve``,
 exposes them directly on the handle type. No :class:`SCP` dispatch is
 needed for those calls.
 
-Gated behind the ``server`` feature in ``scp-ffi-common``. Not available
-for WASM (ADR-034).
+Gated behind the ``server`` feature in ``scp-ffi-common``.
 """
 
 from __future__ import annotations

@@ -476,7 +476,7 @@ pub const fn validate_inner_version(
 /// cross-implementation parity is needed.
 ///
 /// **This is NOT the same as FFI bridge provenance hashing.** The FFI bridges
-/// (`PyO3`, NAPI, `UniFFI`, WASM) use `serde_json::to_vec` (canonical JSON) for
+/// (`PyO3`, NAPI, `UniFFI`) use `serde_json::to_vec` (canonical JSON) for
 /// provenance hashing because that hash crosses implementation boundaries
 /// (Rust ↔ Python ↔ TypeScript ↔ Swift ↔ Kotlin). The protocol rule is:
 /// **cross-implementation canonical hashing uses JSON (RFC 8785); `MessagePack`

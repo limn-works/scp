@@ -6,7 +6,7 @@
 //! FFI consumers. All functions bind to `127.0.0.1:0` (OS-assigned port) so
 //! tests can run in parallel without port conflicts.
 //!
-//! Gated behind the `server` feature. Not available for WASM (ADR-034).
+//! Gated behind the `server` feature.
 
 use std::net::SocketAddr;
 use std::path::{Component, Path};
@@ -606,7 +606,7 @@ impl RunningNode {
     /// this node's webhook dispatcher, and supervises the consumer under the
     /// bridge instance's lifecycle (spec §12.10.5).
     ///
-    /// This is the shared seam for all three non-WASM bridges (`PyO3`, `NAPI`,
+    /// This is the shared seam for all three FFI bridges (`PyO3`, `NAPI`,
     /// `UniFFI`). Each bridge's node-startup path calls it once, after the
     /// `Supervisor` is attached, passing the instance's `JoinSet` guard and
     /// cancellation token. Consolidating the subscribe → wire → supervise block
@@ -750,7 +750,7 @@ impl RunningNode {
 /// or [`RunningNode::wire_context_events`]) under the bridge instance's
 /// `JoinSet`, bound to its cancellation token.
 ///
-/// This is the single shared supervision wire for all three non-WASM bridges
+/// This is the single shared supervision wire for all three FFI bridges
 /// (`PyO3` reference, `NAPI`, `UniFFI`). Each bridge subscribes to its
 /// `Supervisor` event channel and wires the consumer via its node, then hands
 /// the resulting `JoinHandle` here so the supervision policy lives in one place

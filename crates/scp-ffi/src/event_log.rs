@@ -289,7 +289,7 @@ fn event_log_query_impl(
     // First, try the ContextManager's event log provider — this is the
     // authoritative source populated by `builder_create_context`
     // (`ContextCreated` at step 7) and subsequent manager operations.
-    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI —
+    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/UniFFI —
     // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
     // and `OP_EVENT_LOG_FILTERED` (ADR-046).
     if let Some(events) = query_manager_entries(bi, py, context_id, &query_filter)? {
@@ -672,7 +672,7 @@ fn event_log_verify_impl(
 /// Both public entry points (`event_log_checkpoint`, which takes the identity's
 /// own DID, and `event_log_checkpoint_by_did`, which takes a member DID) share
 /// this implementation — they are distinct public surface but identical in
-/// behavior, mirroring the WASM bridge's single `checkpoint_promise` helper.
+/// behavior.
 fn event_log_checkpoint_impl(
     bi: &PyBridgeInstance,
     context_id: &str,

@@ -38,7 +38,7 @@ All tools are managed by mise (see `.mise.toml`):
 | Kotlin | 2.3 |
 | Gradle | 8.14 |
 | Java | Zulu 17 |
-| cargo-nextest, wasm-pack, maturin, cargo-deny | latest |
+| cargo-nextest, maturin, cargo-deny | latest |
 
 **Never use npm or npx** -- this project uses bun exclusively for JS/TS.
 
@@ -94,7 +94,7 @@ crates/              # Rust workspace -- the protocol core
   scp-core/          #   Protocol logic (context, crypto, governance, trust, sync)
   scp-identity/      #   DID, DHT, document, key management
   scp-transport/     #   Relay, adapters, blob storage
-  scp-ffi/           #   FFI bridges (PyO3, UniFFI, NAPI, WASM)
+  scp-ffi/           #   FFI bridges (PyO3, UniFFI, NAPI)
   scp-relay/         #   Standalone relay binary
   scp-node/          #   Application node binary
   scp-testing/       #   Conformance macros, E2E tests
@@ -102,7 +102,7 @@ crates/              # Rust workspace -- the protocol core
 
 bindings/            # Language SDK wrappers
   python/            #   scp_sdk (wraps PyO3 bridge)
-  typescript/        #   @limn-works/scp-ts (wraps NAPI bridge + WASM fallback)
+  typescript/        #   @limn-works/scp-ts (wraps NAPI bridge; browser = remote thin client)
   swift/             #   SCP Swift package (wraps UniFFI bridge)
   kotlin/            #   scp-kt (wraps UniFFI bridge)
 

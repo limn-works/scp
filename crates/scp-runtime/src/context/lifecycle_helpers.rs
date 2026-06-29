@@ -2002,7 +2002,7 @@ pub async fn import_context(
     }
 
     // C3: Clamp imported `cooldown_until` to a bounded horizon and drop
-    // entries with out-of-range rule indices, mirroring the WASM bridge
+    // entries with out-of-range rule indices, per the
     // `validate_imported_snapshot` policy.
     let mut sanitized_cooldown_until = export.snapshot.cooldown_until.clone();
     crate::context::lifecycle_logic::sanitize_cooldown_until(

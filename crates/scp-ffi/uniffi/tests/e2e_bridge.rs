@@ -365,7 +365,7 @@ async fn context_join_and_leave() {
 
 /// C5 parity: `context_join` must accept the optional `spending_ucan_jwt`
 /// parameter and reject malformed JWTs at the bridge boundary with the
-/// SCP-ECON-12061 code (mirrors PyO3/NAPI/WASM bridges).
+/// SCP-ECON-12061 code (mirrors PyO3/NAPI bridges).
 #[tokio::test]
 async fn context_join_rejects_malformed_spending_ucan_jwt() {
     let scp = Scp::new_in_memory_for_test();

@@ -72,7 +72,7 @@ pub mod runtime;
 pub mod scp;
 
 // Server startup (relay + application node) — behind the `server` feature on
-// scp-ffi-common. Not available for WASM (ADR-034).
+// scp-ffi-common.
 #[cfg(feature = "server")]
 pub mod server;
 

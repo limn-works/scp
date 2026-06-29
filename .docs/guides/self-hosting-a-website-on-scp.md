@@ -83,9 +83,6 @@ pull+decrypt:
 - The generic transport-receive path `deliver_incoming`
   (`crates/scp-runtime/src/context/messaging_helpers.rs:1002`) is **MLS-only**; it
   has no `BroadcastEnvelope` branch.
-- WASM (browser) has **no transport at all** — `scp-ffi-wasm` doesn't depend on
-  `scp-transport`/`scp-runtime`, and its `web-sys` features don't even include
-  `WebSocket` (ADR-034). `transport_connect` returns `connected: false`.
 
 **Consequence:** "is the website reachable?" reduces exactly to "**is the origin
 node's HTTP port inbound-reachable?**" Everything below is about answering that

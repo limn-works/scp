@@ -1158,7 +1158,7 @@ fn drain_and_deliver_via_sender(
 ///
 /// Delegates to the shared [`scp_ffi_common::context_params::build_context_params`]
 /// builder, which centralizes all parameter parsing and validation logic
-/// across the three non-WASM bridges (#1447).
+/// across the three FFI bridges (#1447).
 fn build_core_context_params(
     py_params: &PyContextParams,
 ) -> PyResult<scp_core::context::ContextParams> {
@@ -1263,7 +1263,7 @@ fn resolve_verifying_key(
                 crate::error::ScpPyError::context(format!("failed to resolve verifying key: {e}"))
             })?;
         // 32-byte length + canonical-point decode: the shared conversion tail
-        // in scp-ffi-common, identical across all non-WASM bridges. A `None`
+        // in scp-ffi-common, identical across all FFI bridges. A `None`
         // (wrong length or non-canonical point) is the fail-closed signal that
         // this DID has no usable local verifying key.
         scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key).ok_or_else(|| {
@@ -1287,7 +1287,7 @@ fn resolve_verifying_key(
 /// from the creator identity.
 ///
 /// Resolution order (local-custody-first, then DID resolver) is shared across
-/// all non-WASM bridges via
+/// all FFI bridges via
 /// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
 /// 1. **Local identity custody** — if the creator is a local identity (the
 ///    common self-export case: a device importing a context it exported), the
@@ -4491,7 +4491,7 @@ impl crate::scp::PyScp {
                     results.push(result);
                 }
 
-                // Return {"results": [...], "deploy_id": "..."} matching NAPI/UniFFI/WASM.
+                // Return {"results": [...], "deploy_id": "..."} matching NAPI/UniFFI.
                 let outer = build_batch_publish_dict(results, &deploy_id_owned)?;
                 Ok(outer)
             })

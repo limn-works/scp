@@ -23,7 +23,7 @@ body:
         |-------|-------------|--------|
         | Called from | Which ContextManager method? | |
         | Pipeline step | Which of the 14 send/receive steps? | |
-        | FFI bridges | PyO3 / UniFFI / NAPI / WASM | |
+        | FFI bridges | PyO3 / UniFFI / NAPI | |
         | SDK wrappers | Python / TypeScript / Kotlin / Swift | |
         | Tests | What verifies the wiring? | |
     validations:

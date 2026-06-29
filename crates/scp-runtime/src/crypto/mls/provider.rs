@@ -1565,8 +1565,8 @@ impl MlsCryptoProvider {
         self.with_context(context_id, |state| {
             // The sender-layer AEAD AAD MUST bind the RAW `context_id` string
             // (UTF-8, 4-byte BE length prefix) per spec §9.16.1 + §9.5.1 — not
-            // the hex encoding of its 32-byte hash. WASM binds the raw string;
-            // binding anything else here breaks native↔WASM interop and the
+            // the hex encoding of its 32-byte hash. Binding anything else here
+            // breaks cross-implementation interop and the
             // spec contract. The raw string is carried on the inner envelope.
             let ctx_str = inner.context_id.as_str();
 
@@ -1592,7 +1592,7 @@ impl MlsCryptoProvider {
             // 2. Sender key encrypt (AES-256-GCM, ADR-007).
             // AAD binds context_id, sender_did, epoch, and sequence to prevent
             // ciphertext relocation. Binds the RAW context_id string per
-            // §9.16.1 so the receive side (and WASM) can reconstruct it.
+            // §9.16.1 so the receive side can reconstruct it.
             let sender_encrypted =
                 scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
                     &state.sender_key,
@@ -1743,7 +1743,7 @@ impl MlsCryptoProvider {
                         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
                     // Epoch/sequence from header — see send_message comment about AAD.
                     // The AAD binds the RAW context_id string per §9.16.1 (NOT
-                    // the hex store key), matching the `seal` / WASM encode path.
+                    // the hex store key), matching the `seal` encode path.
                     let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
                         sender_ciphertext,
@@ -4483,7 +4483,7 @@ mod tests {
     fn seal_open_binds_raw_context_id_string_not_hex() {
         // §9.16.1: the sender-layer AEAD AAD MUST bind the RAW context_id
         // string (UTF-8, BE32 length-prefixed), NOT the hex encoding of its
-        // 32-byte hash. This is the #1909 fix and the WASM↔native interop
+        // 32-byte hash. This is the #1909 fix and the cross-implementation interop
         // contract. Proof: a `seal`ed message opens with the raw string but
         // FAILS to open when the hex-of-bytes string is supplied as the AAD
         // source — the exact value native used to (incorrectly) bind.
