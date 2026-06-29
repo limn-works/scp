@@ -9684,6 +9684,96 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Computes the participation record (§7.3.2) for `subject_did` in
+    /// `context_id` from the context's FULL event log.
+    ///
+    /// Gathers the context's UNFILTERED Merkle-log events and the log's Merkle
+    /// root from the supervisor's shared event-log provider, then delegates to
+    /// the pure-core
+    /// [`compute_participation_record`](scp_protocol::trust::compute_participation_record).
+    /// The full event set is required because
+    /// `governance_actions_against` counts events where the subject is the
+    /// projected TARGET (not the actor), so a query filtered to the subject's
+    /// own events would undercount.
+    ///
+    /// # Attestation source (`accessible_attestations`)
+    ///
+    /// `attestation_count` is a credential-layer fact (§7.4) and is the one
+    /// fact NOT derivable from the event log. The supervisor does NOT hold the
+    /// trust [`AttestationCache`](scp_protocol::trust::aggregate::AttestationCache)
+    /// / [`TrustProtocolRepository`](scp_protocol::trust::aggregate::TrustProtocolRepository):
+    /// the raw `Storage` handle is consumed into the durable-providers pair at
+    /// construction and is not re-exposed (ADR-049). The trust store is
+    /// reconstructed at the FFI bridge layer (each bridge owns its
+    /// `ProtocolRepository`), exactly as `aggregate_trust_input` does. The
+    /// caller therefore threads the subject's accessible, currently-valid
+    /// attestations IN — the bridge sources them from its own
+    /// `AttestationCache::get_verified_attestations`. A caller with no
+    /// attestation access honestly passes an empty slice (count 0,
+    /// verifier-relative per §7.3.2), but this method itself never fabricates an
+    /// empty set — it forwards whatever the caller supplies.
+    ///
+    /// Synchronous — reads the shared provider directly without a per-context
+    /// lock or actor mailbox (stateless w.r.t. per-context state), mirroring
+    /// [`Self::event_log_entries`]; the FFI sync paths that call it cannot
+    /// `.await`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if the event-log provider or
+    /// clock is not configured, [`ContextError`] if the provider fails, and
+    /// surfaces [`TrustError`](scp_protocol::trust::TrustError) (e.g.
+    /// `EmptyEventLog`) from the core computation as
+    /// [`ContextError::InvalidState`].
+    pub fn participation_record(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+        accessible_attestations: &[scp_protocol::trust::attestation::Attestation],
+    ) -> Result<scp_protocol::trust::ParticipationRecord, ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::participation_record — event_log provider not configured".to_owned(),
+            )
+        })?;
+        let now_secs = self
+            .clock_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::participation_record — clock not configured".to_owned(),
+                )
+            })?
+            .now_secs();
+
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        // FULL, unfiltered event set — `governance_actions_against` needs
+        // events where the subject is the projected target, not the actor.
+        let events = event_log
+            .event_log_entries(&context_id_bytes)?
+            .unwrap_or_default();
+        // Tolerate an absent log (no Merkle root) the same way every other
+        // participation call site does: an empty log yields `[0u8; 32]` and the
+        // core computation then returns `EmptyEventLog` below — we do not fail
+        // here on a missing-root provider error for a context with no events.
+        let merkle_root = event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+
+        scp_protocol::trust::compute_participation_record(
+            &events,
+            subject_did,
+            context_id,
+            merkle_root,
+            now_secs,
+            accessible_attestations,
+        )
+        .map_err(|e| {
+            ContextError::InvalidState(format!(
+                "participation record computation failed for {subject_did}: {e}"
+            ))
+        })
+    }
+
     /// Returns the broadcast sender key + epoch for `author_did` in
     /// `context_id` via the actor mailbox.
     ///
