@@ -323,7 +323,7 @@ impl MajorityVoteEngine {
     /// Run the pre-vote guard checks.
     ///
     /// This is the portion that MUST run **before** any signing or signature
-    /// verification on the signed path, so that a double vote is caught as
+    /// verification, so that a double vote is caught as
     /// `AlreadyVoted` regardless of which key signed the second attempt, and an
     /// ineligible voter is rejected as `NotEligible` rather than
     /// `InvalidSignature`. The checks and their error variants match the
@@ -389,14 +389,12 @@ impl MajorityVoteEngine {
     /// Record an already-checked, already-verified vote and run the inline
     /// early-resolution.
     ///
-    /// Runs **after** `precheck_vote` (and, on the signed path, after signature
-    /// verification): pushes the vote into `approvals`/`rejections`, emits the
+    /// Runs **after** `precheck_vote` (and after signature verification):
+    /// pushes the vote into `approvals`/`rejections`, emits the
     /// `VoteCast` event, and applies the inline early-resolution
     /// (`approvals * 2 > eligible` for an approval, `rejections >=
     /// eligible.div_ceil(2)` for a rejection). No unverified vote ever reaches
-    /// this point on the signed path — the keyless
-    /// [`TrustedVoteIngest`](super::TrustedVoteIngest) path supplies an
-    /// empty-signature vote by contract. The deadline has already been handled
+    /// this point. The deadline has already been handled
     /// by `precheck_vote`, so the proposal here is guaranteed not past-deadline.
     fn push_and_resolve(
         &mut self,
@@ -753,65 +751,6 @@ impl GovernanceEngine for MajorityVoteEngine {
         } else {
             Ok(CheckpointAttestationStatus::PartiallyAttested)
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TrustedVoteIngest implementation (ADR-034 keyless path)
-// ---------------------------------------------------------------------------
-
-impl super::TrustedVoteIngest for MajorityVoteEngine {
-    fn ingest_proposal(&mut self, proposal: GovernanceProposal) -> Result<(), GovernanceError> {
-        // Keyless seed (ADR-034): the proposer must be in the frozen eligible
-        // voter set, and the proposal_id must be new. The proposal — including
-        // its status and accumulated votes — is stored VERBATIM; no re-tally, no
-        // signature verification (see the TrustedVoteIngest::ingest_proposal
-        // contract).
-        if !self.eligible_voter_dids.contains(&proposal.proposer_did) {
-            return Err(GovernanceError::NotEligible(
-                "proposer is not in the eligible voter set".to_owned(),
-            ));
-        }
-        if self.proposals.contains_key(&proposal.proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex::encode(
-                proposal.proposal_id,
-            )));
-        }
-        self.proposals.insert(proposal.proposal_id, proposal);
-        Ok(())
-    }
-
-    fn ingest_approve(
-        &mut self,
-        proposal_id: &ProposalId,
-        voter: &DID,
-        context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Keyless: run the same guards, then push an empty-signature vote
-        // through the same tally as the signed path. No sign_vote, no
-        // verify_vote — the caller is responsible for authenticating the vote
-        // out-of-band (see the TrustedVoteIngest contract). A past-deadline
-        // ingest short-circuits to the auto-resolution from precheck.
-        match self.precheck_vote(proposal_id, voter, context)? {
-            super::PrecheckOutcome::Proceed => {}
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
-        }
-        let signed_vote = super::build_unsigned_vote(voter, VoteType::Approve, context.now);
-        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
-    }
-
-    fn ingest_reject(
-        &mut self,
-        proposal_id: &ProposalId,
-        voter: &DID,
-        context: &GovernanceContext,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        match self.precheck_vote(proposal_id, voter, context)? {
-            super::PrecheckOutcome::Proceed => {}
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
-        }
-        let signed_vote = super::build_unsigned_vote(voter, VoteType::Reject, context.now);
-        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
     }
 }
 
@@ -2472,187 +2411,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TrustedVoteIngest (keyless, ADR-034) — Majority
-    // -----------------------------------------------------------------------
-
-    use crate::context::governance::TrustedVoteIngest;
-
-    #[test]
-    fn ingest_approve_reaches_absolute_majority() {
-        // 3 voters: two ingested approvals -> absolute majority (2*2 > 3) ->
-        // Approved. (Majority does not auto-count the proposer.)
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        let (status, _) = engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Pending);
-
-        let (status, events) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Approved);
-        assert_eq!(events.len(), 2); // VoteCast + ProposalResolved
-
-        // Recorded ingested votes carry empty signatures.
-        let p = engine.get_proposal(&pid).expect("found");
-        assert_eq!(p.approvals.len(), 2);
-        assert!(p.approvals[0].signature.is_empty());
-        assert!(p.approvals[1].signature.is_empty());
-    }
-
-    #[test]
-    fn ingest_stays_pending_below_majority() {
-        // 5 voters: two ingested approvals is not an absolute majority
-        // (2*2 = 4, not > 5) and the deadline has not passed -> Pending.
-        let voters = all_five();
-        let mut engine = default_engine(voters.clone());
-        let ctx = test_context(&voters, T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Pending);
-    }
-
-    #[test]
-    fn ingest_reject_reaches_early_rejection() {
-        // 3 voters: two ingested rejections >= ceil(3/2) = 2 -> early rejection.
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        let (status, _) = engine.ingest_reject(&pid, &alice(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Pending);
-
-        let (status, _) = engine.ingest_reject(&pid, &bob(), &ctx).expect("ingest");
-        assert_eq!(
-            status,
-            ProposalStatus::Rejected {
-                reason: RejectionReason::MajorityRejected
-            }
-        );
-    }
-
-    #[test]
-    fn ingest_tallies_against_frozen_eligible_set() {
-        // The engine's frozen eligible_voter_dids is the denominator regardless
-        // of any external membership notion. The engine is frozen at 3 voters;
-        // the GovernanceContext lists a DIFFERENT (larger) membership. Two
-        // ingested approvals still reach absolute majority of the FROZEN set
-        // (2*2 > 3), proving the context membership is not consulted.
-        let mut engine = default_engine(three_voters());
-        // Context advertises five members, but the engine's frozen set is three.
-        let ctx = test_context(&all_five(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
-        // Would still be pending if the denominator were 5 (4 !> 5); Approved
-        // confirms the frozen denominator of 3 is used.
-        assert_eq!(status, ProposalStatus::Approved);
-    }
-
-    #[test]
-    fn ingest_approve_rejects_non_eligible() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-
-        // Dave is not in the frozen eligible voter set.
-        let result = engine.ingest_approve(&proposal.proposal_id, &dave(), &ctx);
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::NotEligible(_)
-        ));
-    }
-
-    #[test]
-    fn ingest_approve_rejects_already_voted() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-        let result = engine.ingest_approve(&pid, &alice(), &ctx);
-        assert!(matches!(result.unwrap_err(), GovernanceError::AlreadyVoted));
-    }
-
-    #[test]
-    fn ingest_approve_rejects_terminal_proposal() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        // Drive to Approved (2 of 3).
-        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Approved);
-
-        let result = engine.ingest_approve(&pid, &carol(), &ctx);
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::ProposalNotPending { .. }
-        ));
-    }
-
-    #[test]
-    fn ingest_approve_past_deadline_triggers_resolve() {
-        // Mirrors approve_past_deadline_triggers_resolve for the keyless path:
-        // a post-deadline ingest defers to resolve(). One vote / 3 eligible =
-        // 3333 bps < 5000 quorum -> InsufficientParticipation.
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
-        let pid = proposal.proposal_id;
-
-        engine.ingest_approve(&pid, &alice(), &ctx).expect("ingest");
-
-        let ctx_late = test_context(&three_voters(), T0 + WINDOW + 1);
-        let (status, _) = engine
-            .ingest_approve(&pid, &bob(), &ctx_late)
-            .expect("resolve");
-        assert_eq!(
-            status,
-            ProposalStatus::Rejected {
-                reason: RejectionReason::InsufficientParticipation
-            }
-        );
-    }
-
-    #[test]
-    fn ingest_and_signed_paths_reach_identical_status() {
-        let ctx = test_context(&three_voters(), T0);
-
-        // Signed path: alice + bob approve -> absolute majority -> Approved.
-        let mut signed = default_engine(three_voters());
-        let sp = propose_add_member(&mut signed, &alice(), &ctx, &sk_alice());
-        signed
-            .approve(&sp.proposal_id, &alice(), &ctx, &sk_alice())
-            .expect("approve");
-        let (signed_status, _) = signed
-            .approve(&sp.proposal_id, &bob(), &ctx, &sk_bob())
-            .expect("approve");
-
-        // Ingest path: same sequence, keyless.
-        let mut ingested = default_engine(three_voters());
-        let ip = propose_add_member(&mut ingested, &alice(), &ctx, &sk_alice());
-        ingested
-            .ingest_approve(&ip.proposal_id, &alice(), &ctx)
-            .expect("ingest");
-        let (ingest_status, _) = ingested
-            .ingest_approve(&ip.proposal_id, &bob(), &ctx)
-            .expect("ingest");
-
-        assert_eq!(signed_status, ingest_status);
-        assert_eq!(signed_status, ProposalStatus::Approved);
-    }
-
-    // -----------------------------------------------------------------------
     // Guard ordering: dedup and eligibility precede signature verification.
     //
     // Mirrors the scp-runtime agent-binding scenario at the engine layer:
@@ -2706,99 +2464,5 @@ mod tests {
             matches!(result.unwrap_err(), GovernanceError::NotEligible(_)),
             "eligibility must precede signature verification (expected NotEligible)"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // ingest_proposal: keyless seed (ADR-034)
-    // -----------------------------------------------------------------------
-
-    fn make_unsigned_proposal(
-        proposer: &DID,
-        ctx: &GovernanceContext,
-        status: ProposalStatus,
-    ) -> GovernanceProposal {
-        let action = GovernanceAction::AddMember {
-            did: DID::from("did:dht:z6MkNewbie"),
-            role: "member".to_owned(),
-        };
-        let action_bytes = crate::jcs::to_vec(&action).expect("jcs");
-        let proposal_id = crate::context::governance::compute_proposal_id(
-            &ctx.context_id,
-            proposer,
-            &action_bytes,
-            ctx.now,
-        );
-        GovernanceProposal {
-            proposal_id,
-            context_id: ctx.context_id.clone(),
-            proposer_did: proposer.clone(),
-            action,
-            status,
-            created_at: ctx.now,
-            voting_deadline: ctx.now + WINDOW,
-            approvals: vec![crate::context::governance::build_unsigned_vote(
-                proposer,
-                VoteType::Approve,
-                ctx.now,
-            )],
-            rejections: Vec::new(),
-            created_at_epoch: ctx.current_epoch,
-        }
-    }
-
-    #[test]
-    fn ingest_proposal_then_ingest_approve_reaches_quorum() {
-        // 3 voters: seeded proposal carries alice's approval (1); bob's keyless
-        // approval makes 2 of 3 -> absolute majority -> Approved.
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Pending);
-        let pid = proposal.proposal_id;
-
-        engine.ingest_proposal(proposal).expect("seed ok");
-        let (status, _) = engine.ingest_approve(&pid, &bob(), &ctx).expect("ingest");
-        assert_eq!(status, ProposalStatus::Approved);
-    }
-
-    #[test]
-    fn ingest_proposal_preserves_terminal_status() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Approved);
-        let pid = proposal.proposal_id;
-
-        engine.ingest_proposal(proposal).expect("seed ok");
-        let result = engine.ingest_approve(&pid, &bob(), &ctx);
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::ProposalNotPending { .. }
-        ));
-    }
-
-    #[test]
-    fn ingest_proposal_rejects_non_eligible_proposer() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        // Dave is not in the frozen eligible voter set.
-        let proposal = make_unsigned_proposal(&dave(), &ctx, ProposalStatus::Pending);
-        let result = engine.ingest_proposal(proposal);
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::NotEligible(_)
-        ));
-    }
-
-    #[test]
-    fn ingest_proposal_rejects_duplicate_id() {
-        let mut engine = default_engine(three_voters());
-        let ctx = test_context(&three_voters(), T0);
-        let proposal = make_unsigned_proposal(&alice(), &ctx, ProposalStatus::Pending);
-        let dup = proposal.clone();
-        engine.ingest_proposal(proposal).expect("first seed ok");
-        let result = engine.ingest_proposal(dup);
-        assert!(matches!(
-            result.unwrap_err(),
-            GovernanceError::DuplicateProposal(_)
-        ));
     }
 }

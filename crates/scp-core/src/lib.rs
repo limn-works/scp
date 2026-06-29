@@ -102,21 +102,7 @@ pub mod context {
         verify_etag,
     };
     pub mod governance {
-        // Explicit re-export of every public `governance` symbol EXCEPT
-        // `TrustedVoteIngest`. The keyless trusted-ingest trait is intentionally
-        // namable only from `scp-protocol` directly (the WASM bridge depends on
-        // `scp-protocol`, not this facade); a glob `*` would leak it into the
-        // native facade and undermine that omission.
-        pub use scp_protocol::context::governance::{
-            AccessScope, CheckpointAttestationStatus, CheckpointSchedule, ConflictResolution,
-            ContextCheckpoint, CosignedCheckpoint, DeadlockJustification, EventTypeRetention,
-            GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError,
-            GovernanceEvent, GovernanceModelConfig, GovernanceProposal, GovernanceReconfigAction,
-            KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RejectionReason, SignedVote,
-            SingleAdminEngine, SizeBasedPolicy, TimeBasedPolicy, VoteType, actions_conflict,
-            compute_proposal_id, majority, mls_integration, multisig, sign_vote, unanimity,
-            verify_proposal_votes, verify_vote,
-        };
+        pub use scp_protocol::context::governance::*;
         pub use scp_runtime::context::governance::timeout;
     }
     pub mod tools {
