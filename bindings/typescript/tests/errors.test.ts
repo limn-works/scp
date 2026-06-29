@@ -270,17 +270,6 @@ describe("mapBridgeError already-typed pass-through (Finding N)", () => {
     expect(mapped.code).not.toBe("SCP-UNKNOWN-0000");
   });
 
-  it("preserves a bracket-less EconomicPolicyUnsupportedOnWasm subclass + code", () => {
-    const typed = new EconomicPolicyUnsupportedOnWasm(
-      "economic policy is unsupported on WASM",
-      "SCP-ECON-12095",
-    );
-    const mapped = mapBridgeError(typed);
-    expect(mapped).toBe(typed);
-    expect(mapped).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
-    expect(mapped.code).toBe("SCP-ECON-12095");
-  });
-
   it("keeps an already-typed throw intact when routed through wrapBridgeErrors", async () => {
     // A minimal bridge stub whose async method throws a typed error with a
     // bracket-LESS message. `wrapBridgeErrors` re-maps rejections through
@@ -308,7 +297,7 @@ describe("mapBridgeError already-typed pass-through (Finding N)", () => {
   it("keeps a synchronous already-typed throw intact through wrapBridgeErrors", () => {
     // The Proxy must also map synchronous throws (e.g. an argument guard firing
     // before the first await). A pre-typed sync throw must pass through untouched.
-    const thrown = new EconomicPolicyUnsupportedOnWasm("unsupported", "SCP-ECON-12095");
+    const thrown = new TransportError("relay down", "SCP-TRANS-5099");
     const stub = {
       failing(): never {
         throw thrown;
@@ -322,8 +311,8 @@ describe("mapBridgeError already-typed pass-through (Finding N)", () => {
     } catch (e) {
       caught = e;
     }
-    expect(caught).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
-    expect((caught as ScpError).code).toBe("SCP-ECON-12095");
+    expect(caught).toBeInstanceOf(TransportError);
+    expect((caught as ScpError).code).toBe("SCP-TRANS-5099");
   });
 });
 

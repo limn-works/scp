@@ -4882,8 +4882,8 @@ mod tests {
     /// (the auto-emitted `ContextCreated` leaf) must omit the `target_did` key.
     /// The `Some(target_did)` projection is byte-identical to the PyO3/UniFFI
     /// manager paths (all three call the same decoder) and is asserted with a
-    /// real `GovernanceActionExecuted` leaf in those bridges' tests, the shared
-    /// decoder unit tests, and the cross-target `wasm_conformance` parity check.
+    /// real `GovernanceActionExecuted` leaf in those bridges' tests and the
+    /// shared decoder unit tests in `scp-event-log`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_manager_path_omits_target_did_for_non_target_event() {
@@ -4950,7 +4950,7 @@ mod tests {
 
         // Seed a RoleAssigned leaf carrying the affected member's subject_did
         // into the supervisor-owned event log (the manager-path source).
-        let ctx_id_bytes = scp_core::context::context_id_bytes(&ctx_id);
+        let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&ctx_id);
         let payload =
             scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
                 subject_did: subject_did.to_owned(),

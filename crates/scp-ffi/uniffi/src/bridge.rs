@@ -17036,7 +17036,7 @@ mod tests {
     /// `event_log_query` must project a `GovernanceActionExecuted` leaf's
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
-    /// byte-identical across all four bridges.
+    /// byte-identical across the three native bridges.
     #[tokio::test]
     async fn event_log_query_projects_governance_target_did() {
         let scp = scp_test();
@@ -17088,7 +17088,7 @@ mod tests {
     /// affected member, NOT the governance actor) into the returned event's
     /// `payload_json`, decoded through the shared
     /// `scp_event_log::payload::project_payload` so the value is byte-identical
-    /// across all four bridges.
+    /// across the three native bridges.
     #[tokio::test]
     async fn event_log_query_projects_role_assigned_subject_did() {
         let scp = scp_test();
