@@ -12,11 +12,12 @@
 # real 64-hex id) — never by RE-HASHING it. Re-hashing a real id with the raw
 # SHA-256 primitive `context::context_id_bytes(id)` is a DOUBLE HASH
 # (`SHA-256(hex(digest))`) that diverges from the digest the §6.2.4 wire saga,
-# the MLS group, the sender keys, and the event log all address — the exact bug
-# #1924 fixed. Adversarial review later found four FFI event-log sites still
-# calling the raw primitive (via the `scp_core::` re-export), silently keying
-# the wrong event-log slot (empty queries + empty inclusion/absence proofs for
-# every real context — a fail-OPEN).
+# the MLS group, the sender keys, and the event log all address — the
+# double-hash fail-open the canonical-digest fix closed. Adversarial review
+# later found four FFI event-log sites still calling the raw primitive (via the
+# `scp_core::` re-export), silently keying the wrong event-log slot (empty
+# queries + empty inclusion/absence proofs for every real context — a
+# fail-OPEN).
 #
 # Every context-id → keying-bytes resolution MUST therefore funnel through the
 # single chokepoint `scp_runtime::context::state::context_id_to_bytes` (reached
@@ -33,6 +34,26 @@
 # correctness. The REAL guarantee is the chokepoint resolver
 # `context_id_to_bytes` itself — the single source of truth for keying bytes.
 #
+# This tripwire targets ONLY the common accidental-copy shape: fully-qualified
+# `scp_protocol::`/`scp_core::context::context_id_bytes(` calls, plus a bare
+# `context_id_bytes(` call in a file that imports the raw symbol unqualified.
+# An accidental copy inherits the surrounding fully-qualified idiom, so those
+# shapes are what a real regression looks like. DELIBERATE evasion shapes — a
+# symbol alias (`use … context_id_bytes as raw; raw(id)`), a module alias
+# (`use scp_core::context as cx; cx::context_id_bytes(id)`), a bare
+# module-path, or a multiline-split call — are insider shapes that cannot arise
+# from an accidental copy-paste. They are EXPLICITLY OUT OF SCOPE here and are
+# NOT chased: doing so would turn this into an ever-expanding denylist of "one
+# more spelling." Those shapes are closed instead by the principled compiler
+# enforcement (see INTERIM note below), not by this script.
+#
+# INTERIM: this is a temporary coarse tripwire. The PRINCIPLED, compiler-
+# enforced path is a `ContextDigest` newtype that ONLY the chokepoint resolver
+# can mint, so the raw primitive's bytes can never reach a keying call site —
+# making every evasion shape a compile error, not a grep target. When that
+# newtype lands, DELETE this script outright; do NOT extend it with more
+# call-shapes in the meantime.
+#
 # Known, accepted blind spots (coarse by design — do NOT grow this into a
 # Rust lexer):
 #   - A multiline-split qualified call, e.g.
@@ -40,21 +61,20 @@
 #             context_id_bytes(id)
 #     is line-based-evadable here. It is caught instead by `cargo fmt --check`
 #     in CI: rustfmt never emits that split, so any such call fails formatting.
-#   - Brace counting for the test-scope tracker (below) is naive: `{`/`}`
-#     inside string/char literals or comments miscount depth. Acceptable for a
-#     coarse tripwire.
-#
-# The PRINCIPLED, compiler-enforced path is a `ContextDigest` newtype that only
-# the chokepoint can mint (so the raw primitive's bytes can never reach a
-# keying call site) — tracked as a follow-up. That, not this script, is the
-# sound enforcement; this gate only resists the common accident in the interim.
+#   - The test-scope tracker (below) strips `//` line comments and string/char
+#     literals before arming on `#[cfg(test)]` and before counting braces, so a
+#     prose mention of `#[cfg(test)]` or a stray brace inside a comment/literal
+#     no longer miscounts. BLOCK comments (`/* … */`) are NOT stripped and
+#     remain a coarse blind spot — acceptable, because they never appear on an
+#     attribute line or a raw-primitive keying line.
 #
 # ---------------------------------------------------------------------------
 # WHAT IT SCANS / MATCHES
 # ---------------------------------------------------------------------------
-# Scans BOTH `crates/scp-runtime/src` AND `crates/scp-ffi` (the latter
-# recursively covers `src/`, `napi/src/`, `uniffi/src/`, `wasm/`). It FAILS if
-# any PRODUCTION site calls the raw primitive, matched as any of:
+# Scans `crates/scp-runtime/src`, `crates/scp-ffi` (the latter recursively
+# covers `src/`, `napi/src/`, `uniffi/src/`, `wasm/`), AND `crates/scp-testing/
+# src` (the E2E full-stack harness keys real contexts too). It FAILS if any
+# PRODUCTION site calls the raw primitive, matched as any of:
 #
 #   - the qualified `scp_protocol::context::context_id_bytes(` spelling, OR
 #   - the qualified `scp_core::context::context_id_bytes(` spelling (the
@@ -62,10 +82,8 @@
 #     catch the real regression), OR
 #   - a bare `context_id_bytes(` call in a file that imports the raw symbol
 #     unqualified (`use {scp_protocol,scp_core}::context::{ … context_id_bytes …
-#     }`), OR
-#   - a bare `ALIAS(` call when the file imports the raw symbol under an alias
-#     (`use …context::context_id_bytes as ALIAS;`, including inside a brace
-#     group) — sound import-binding resolution, not spelling enumeration.
+#     }`) — the realistic accidental shape when a file already imports the raw
+#     symbol for a legitimate synthetic-label use.
 #
 # …OUTSIDE a small, positively-enumerated allowlist:
 #
@@ -136,11 +154,12 @@ fi
 #   - `scp_core::context::context_id_bytes(`     (the facade re-export — the
 #                                                 literal spelling the FFI bug
 #                                                 used)
-# plus a bare `context_id_bytes(` / aliased `ALIAS(` call IN A FILE THAT IMPORTS
-# the raw primitive (see RAW_IMPORT_RE / the alias detection in scan_tree). The
-# bare `fn context_id_bytes` local wrappers in builder.rs / ttl.rs delegate to
-# the chokepoint and are NOT the primitive — they live in files that do NOT
-# import the raw symbol, so a bare call there is not flagged.
+# plus a bare `context_id_bytes(` call IN A FILE THAT IMPORTS the raw primitive
+# unqualified (see RAW_IMPORT_RE). The bare `fn context_id_bytes` local wrappers
+# in builder.rs / ttl.rs delegate to the chokepoint and are NOT the primitive —
+# they live in files that do NOT import the raw symbol, so a bare call there is
+# not flagged. Aliased / module-path spellings are deliberately NOT matched (see
+# the out-of-scope note in the header).
 RAW_QUALIFIED_PROTOCOL='scp_protocol::context::context_id_bytes('
 RAW_QUALIFIED_CORE='scp_core::context::context_id_bytes('
 # Unaliased brace-group import of the raw symbol, from either crate.
@@ -162,13 +181,17 @@ ALLOWLIST=(
     "crates/scp-runtime/src/context/supervisor/supervisor.rs|let context_id_bytes = scp_protocol::context::context_id_bytes(context_id)|ADR-056 synthetic identity-private-state (recovery_send_notification_direct, §9.12) — deliberately hashed, never a real 64-hex id"
 )
 
-# Directories scanned. ADR-056's chokepoint convention is now a cross-layer
-# property: the runtime core AND the FFI bridges (which reach the chokepoint via
-# the `scp_core::` re-export). `find … -name '*.rs'` recurses, so listing
-# `crates/scp-ffi` covers `src/`, `napi/src/`, `uniffi/src/`, and `wasm/`.
+# Directories scanned. ADR-056's chokepoint convention is a cross-layer
+# property: the runtime core, the FFI bridges (which reach the chokepoint via
+# the `scp_core::` re-export), AND the scp-testing full-stack harness (which
+# keys real contexts in its E2E `add_member` path). `find … -name '*.rs'`
+# recurses, so listing `crates/scp-ffi` covers `src/`, `napi/src/`,
+# `uniffi/src/`, and `wasm/`. The `tests/` integration dir is NOT under `src/`,
+# so it is not scanned.
 SCAN_DIRS=(
     "crates/scp-runtime/src"
     "crates/scp-ffi"
+    "crates/scp-testing/src"
 )
 
 # ---------------------------------------------------------------------------
@@ -192,11 +215,12 @@ is_allowlisted() {
 # Raw-primitive call shapes detected:
 #   - qualified `scp_protocol::context::context_id_bytes(` (always),
 #   - qualified `scp_core::context::context_id_bytes(`     (always),
-#   - bare `context_id_bytes(` when the file imports the raw symbol unqualified,
-#   - bare `ALIAS(` when the file imports the raw symbol under `as ALIAS`.
+#   - bare `context_id_bytes(` when the file imports the raw symbol unqualified.
 #
-# Test scope (exempt), tracked by BRACE DEPTH so that production code AFTER an
-# early `#[cfg(test)]` module is NOT exempted:
+# Test scope (exempt), tracked by BRACE DEPTH on a comment/literal-stripped view
+# of each line so that production code AFTER an early `#[cfg(test)]` module is
+# NOT exempted, and so that a prose `#[cfg(test)]` mention or a brace inside a
+# string/comment does not miscount:
 #   - a file whose basename is `*_tests.rs` or `testing.rs` (whole-file exempt),
 #   - any line inside a `#[cfg(test)]` item (the item's brace span).
 # ---------------------------------------------------------------------------
@@ -204,7 +228,7 @@ scan_tree() {
     local root="$1"
     [[ -d "$root" ]] || { printf '%serror:%s scan dir missing: %s\n' "$C_RED" "$C_RESET" "$root" >&2; exit 2; }
 
-    local f basename imports_raw alias_name
+    local f basename imports_raw
     # NUL-safe file walk; only *.rs.
     while IFS= read -r -d '' f; do
         basename="${f##*/}"
@@ -219,22 +243,13 @@ scan_tree() {
             imports_raw=0
         fi
 
-        # Alias import of the raw symbol, e.g.
-        #   use scp_protocol::context::context_id_bytes as raw;
-        #   use scp_core::context::{ … context_id_bytes as raw … };
-        # Capture the alias name (first one wins; multiple aliases of the same
-        # symbol in one file are pathological and out of scope for a tripwire).
-        alias_name="$(grep -Eo 'context_id_bytes[[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' -- "$f" 2>/dev/null \
-            | head -1 | awk '{print $NF}')"
-        [[ -z "$alias_name" ]] && alias_name="__no_alias_sentinel__"
-
         # Emit every raw-primitive call line. Qualified spellings always; bare
-        # only when the file imports the raw symbol unqualified; aliased only
-        # when an alias import was found.
+        # only when the file imports the raw symbol unqualified. Aliased /
+        # module-path spellings are deliberately NOT matched (insider shapes,
+        # out of scope — see the header).
         awk -v qual_protocol="$RAW_QUALIFIED_PROTOCOL" \
             -v qual_core="$RAW_QUALIFIED_CORE" \
             -v imports_raw="$imports_raw" \
-            -v alias_name="$alias_name" \
             -v fname="$f" '
             BEGIN {
                 # Test-scope brace-depth tracker state.
@@ -242,16 +257,12 @@ scan_tree() {
                 pending = 0        # saw #[cfg(test)], awaiting the opening brace
                 in_test = 0        # currently inside a #[cfg(test)] item
                 test_open_depth = 0
-                have_alias = (alias_name != "__no_alias_sentinel__")
-                # Build an alias-call regex like  (^|[^:_alnum])ALIAS\(
-                if (have_alias) {
-                    alias_re = "(^|[^:_[:alnum:]])" alias_name "\\("
-                }
             }
             {
                 line = $0
 
                 # --- detect raw-primitive call shapes on THIS line -----------
+                # Runs on the ORIGINAL line text — the call is real code.
                 is_raw = 0
                 if (index(line, qual_protocol) > 0) is_raw = 1
                 if (index(line, qual_core) > 0)     is_raw = 1
@@ -260,35 +271,59 @@ scan_tree() {
                         is_raw = 1
                     }
                 }
-                if (have_alias) {
-                    if (line ~ alias_re && line !~ ("fn[[:space:]]+" alias_name)) {
-                        is_raw = 1
-                    }
-                }
+
+                # --- build a comment/literal-stripped "code" view ------------
+                # Used ONLY for structural decisions (cfg-test arming + brace
+                # depth), so a prose `#[cfg(test)]` mention or a brace inside a
+                # string/char literal or `//` comment cannot miscount. Block
+                # comments (/* ... */) are a documented coarse blind spot — they
+                # never appear on an attribute or keying line.
+                code = line
+                gsub(/"([^"\\]|\\.)*"/, "", code)            # strip string literals
+                gsub(/'\''([^'\''\\]|\\.)*'\''/, "", code)   # strip char literals
+                sub(/\/\/.*/, "", code)                      # strip // line-comment tail (incl ///)
+                # NOTE: stripping balanced string/char literals first removes
+                # their inner braces; the trailing // strip then drops any line
+                # comment. Block comments (/* ... */) remain a coarse blind spot.
 
                 # --- brace-depth test-scope tracking -------------------------
                 # depth_before = depth at the START of this line.
                 depth_before = depth
-                opens = gsub(/{/, "{", line)   # count "{" (gsub returns count)
-                closes = gsub(/}/, "}", line)  # count "}"
+                opens = gsub(/{/, "{", code)   # count "{" on the code view
+                closes = gsub(/}/, "}", code)  # count "}" on the code view
 
                 # Decide test-scope membership for THIS line BEFORE mutating
                 # in_test on its own closing brace, so the line that closes the
                 # test item is itself still treated as test scope.
                 this_line_in_test = in_test
 
-                # A #[cfg(test)] attribute arms the tracker; the NEXT block that
-                # opens captures the item-open depth.
-                if (line ~ /#\[cfg\(test\)\]/) {
+                # Is this code line the leading `#[cfg(test)]` attribute itself?
+                is_cfg_attr = (code ~ /^[[:space:]]*#\[cfg\(test\)\]/)
+
+                # Arm the tracker ONLY on a LEADING `#[cfg(test)]` attribute on
+                # the code view — never a prose mention buried in a comment or
+                # string (those are stripped from `code`, and the leading-token
+                # anchor is the real guard). The attribute governs the very next
+                # item; the item may open a block on this same line or later.
+                if (is_cfg_attr) {
                     pending = 1
                 }
 
                 # If armed and this line opens a block, record the item-open
-                # depth.
+                # depth: this is a `#[cfg(test)]` item with a body (mod/fn/impl).
                 if (pending == 1 && opens > 0) {
                     test_open_depth = depth_before
                     in_test = 1
                     this_line_in_test = 1
+                    pending = 0
+                }
+                # If armed but the awaited item turns out to be BRACELESS — a
+                # `#[cfg(test)] use …;` / `#[cfg(test)] mod foo;` etc., i.e. the
+                # next code-bearing line carries a `;` and opens no block — then
+                # the attribute did NOT open a test window; disarm so following
+                # production code is not wrongly exempted. (Skip the attribute
+                # line itself and blank/comment-only lines.)
+                else if (pending == 1 && !is_cfg_attr && code ~ /[^[:space:]]/ && index(code, ";") > 0) {
                     pending = 0
                 }
 
@@ -375,11 +410,14 @@ run_self_test() {
     local sup_f="$tmp/crates/scp-runtime/src/context/supervisor/supervisor.rs"
     local bad_f="$tmp/crates/scp-runtime/src/context/messaging_helpers.rs"
     local core_f="$tmp/crates/scp-runtime/src/context/core_spelling.rs"
-    local alias_f="$tmp/crates/scp-runtime/src/context/aliased.rs"
     local ffi_f="$tmp/crates/scp-ffi/src/event_log.rs"
     local early_f="$tmp/crates/scp-runtime/src/context/early_test.rs"
     local testing_f="$tmp/crates/scp-ffi/src/testing.rs"
     local trailtest_f="$tmp/crates/scp-runtime/src/context/export_import.rs"
+    # New lexing-soundness fixtures (Task 1).
+    local doccomment_f="$tmp/crates/scp-runtime/src/context/doc_mention.rs"
+    local strbrace_f="$tmp/crates/scp-runtime/src/context/str_brace.rs"
+    local cfguse_f="$tmp/crates/scp-runtime/src/context/cfg_use.rs"
 
     # (i) allowlisted resolver fallback in state.rs.
     {
@@ -410,15 +448,6 @@ run_self_test() {
         echo '    let ctx_bytes = scp_core::context::context_id_bytes(context_id);'
         echo '}'
     } > "$core_f"
-
-    # (BAD-alias) forbidden aliased-import call at a production site: MUST be
-    # denied.
-    {
-        echo 'use scp_protocol::context::context_id_bytes as raw;'
-        echo 'pub fn keyit(context_id: &str) {'
-        echo '    let ctx_bytes = raw(context_id);'
-        echo '}'
-    } > "$alias_f"
 
     # (BAD-ffi) forbidden production call under crates/scp-ffi/src/ — proves
     # scp-ffi is scanned: MUST be denied.
@@ -463,7 +492,53 @@ run_self_test() {
         echo '}'
     } > "$trailtest_f"
 
-    printf '%sself-test:%s planted forbidden (protocol/core/alias/ffi/early-after-test) + allowlisted + exempt (testing/trailing-test) calls\n' "$C_DIM" "$C_RESET"
+    # (DOC-MENTION) a `///` doc comment that merely MENTIONS `#[cfg(test)]`
+    # above a PRODUCTION raw call, with NO real test module. The old line-based
+    # arming would fire on the prose mention and silently exempt the call
+    # (fail-OPEN); with comment-stripping + leading-token arming, the call MUST
+    # be DENIED. Note: there is a stray `{` inside the comment to also prove a
+    # comment brace does not inflate depth.
+    {
+        echo '/// Production keying. Do NOT confuse this with a #[cfg(test)] helper {'
+        echo 'pub fn doc_mention_keying(context_id: &str) {'
+        echo '    let ctx_bytes = scp_protocol::context::context_id_bytes(context_id);'
+        echo '}'
+    } > "$doccomment_f"
+
+    # (STR-BRACE) a trailing #[cfg(test)] mod whose FIRST #[test] fn contains a
+    # string literal with a stray `}`; a SECOND #[test] fn then makes a raw
+    # call. The old naive brace count would close the test window early on the
+    # literal `}` and wrongly DENY the second call (false-POSITIVE / CI break).
+    # With literal-stripping the second call MUST stay exempt.
+    {
+        echo 'pub fn prod_noop() {}'
+        echo '#[cfg(test)]'
+        echo 'mod tests {'
+        echo '    #[test]'
+        echo '    fn first() {'
+        echo '        let s = "x } y";'
+        echo '        let _ = s;'
+        echo '    }'
+        echo '    #[test]'
+        echo '    fn second() {'
+        echo '        let _ = scp_protocol::context::context_id_bytes("ctx-second");'
+        echo '    }'
+        echo '}'
+    } > "$strbrace_f"
+
+    # (CFG-USE) a BRACELESS `#[cfg(test)] use …;` line followed later by a
+    # PRODUCTION raw call. The braceless cfg-test line must NOT open a test
+    # window (no `{`), so the later production call MUST be DENIED.
+    {
+        echo '#[cfg(test)]'
+        echo 'use std::collections::HashMap;'
+        echo ''
+        echo 'pub fn after_cfg_use(context_id: &str) {'
+        echo '    let ctx_bytes = scp_protocol::context::context_id_bytes(context_id);'
+        echo '}'
+    } > "$cfguse_f"
+
+    printf '%sself-test:%s planted forbidden (protocol/core/ffi/early-after-test/doc-mention/cfg-use) + allowlisted + exempt (testing/trailing-test/str-brace-2nd) calls\n' "$C_DIM" "$C_RESET"
 
     # Expect the real-check logic to DENY the forbidden files and allow/exempt
     # the rest. Scan BOTH roots (runtime + ffi).
@@ -495,20 +570,24 @@ run_self_test() {
     assert_deny "messaging_helpers.rs" "forbidden scp_protocol:: production call"
     # 2. scp_core-spelled forbidden call → DENY (new spelling).
     assert_deny "core_spelling.rs" "forbidden scp_core:: production call"
-    # 3. aliased-import forbidden call → DENY.
-    assert_deny "aliased.rs" "forbidden aliased-import production call"
-    # 4. forbidden call under crates/scp-ffi/src → DENY (scp-ffi is scanned).
+    # 3. forbidden call under crates/scp-ffi/src → DENY (scp-ffi is scanned).
     assert_deny "event_log.rs" "forbidden production call in scp-ffi"
-    # 5. production call AFTER an early test module → DENY (B4 soundness).
+    # 4. production call AFTER an early test module → DENY (B4 soundness).
     assert_deny "early_test.rs" "production call after an early #[cfg(test)] module"
-    # 6. Overall verdict must be failure (rc != 0).
+    # 5. production call below a `///` doc comment that MENTIONS #[cfg(test)] →
+    #    DENY (fail-open closed: prose mention must not arm test scope).
+    assert_deny "doc_mention.rs" "production call under a doc-comment #[cfg(test)] mention"
+    # 6. production call after a BRACELESS `#[cfg(test)] use …;` → DENY
+    #    (braceless cfg-test must not open a test window).
+    assert_deny "cfg_use.rs" "production call after a braceless #[cfg(test)] use"
+    # 7. Overall verdict must be failure (rc != 0).
     if [[ "$rc" -ne 0 ]]; then
         printf '  %sOK%s   overall verdict = FAIL with forbidden calls present\n' "$C_GREEN" "$C_RESET"
     else
         printf '  %sFAIL%s gate passed despite forbidden calls\n' "$C_RED" "$C_RESET" >&2
         ok=0
     fi
-    # 7. The allowlisted sites must appear but NOT as DENY.
+    # 8. The allowlisted sites must appear but NOT as DENY.
     if grep -q "state.rs" <<< "$out" && grep -q "supervisor.rs" <<< "$out" \
         && ! grep -E "state.rs.*\[DENY\]|supervisor.rs.*\[DENY\]" <<< "$out"; then
         printf '  %sOK%s   allowlisted sites → allow\n' "$C_GREEN" "$C_RESET"
@@ -516,10 +595,14 @@ run_self_test() {
         printf '  %sFAIL%s an allowlisted site was misclassified\n' "$C_RED" "$C_RESET" >&2
         ok=0
     fi
-    # 8. Trailing end-of-file test-module call → exempt.
+    # 9. Trailing end-of-file test-module call → exempt.
     assert_exempt "export_import.rs" "trailing #[cfg(test)] call"
-    # 9. testing.rs whole-file → exempt.
+    # 10. testing.rs whole-file → exempt.
     assert_exempt "testing.rs" "testing.rs whole-file call"
+    # 11. Second #[test] fn's raw call after a string with a stray `}` in the
+    #     first #[test] fn → exempt (literal-stripping keeps the test window
+    #     open; no false-positive DENY).
+    assert_exempt "str_brace.rs" "raw call in 2nd #[test] after a stray-brace string literal"
 
     if [[ "$ok" -eq 1 ]]; then
         printf '%sself-test PASSED%s\n' "$C_GREEN" "$C_RESET"

@@ -57,19 +57,23 @@ pub use roles::{
 pub use state_machine::transition;
 pub use templates::{TemplateError, template_params, validate_against_template};
 
-/// Converts a `context_id` string to a deterministic 32-byte array using SHA-256.
+/// Hashes an arbitrary label to a deterministic 32-byte array using SHA-256.
 ///
-/// This is the **canonical** context ID byte representation used across all
-/// context operations: builder, manager, TTL, memory scope, and any code that
-/// needs a `[u8; 32]` from a context ID string. Using SHA-256 ensures:
-/// - Fixed output size regardless of input length (no truncation/collision).
-/// - Uniform distribution (suitable as cryptographic key material identifiers).
-/// - No information leakage about input length (unlike zero-padding).
+/// This is the **raw routing / synthetic-label primitive ONLY**. It is the
+/// correct tool for hashing non-context labels — broadcast routing ids and
+/// synthetic pseudo-contexts (e.g. the `"identity-private-state"` recovery
+/// label) that are never a real canonical context id. SHA-256 gives a fixed
+/// output size, uniform distribution, and no input-length leakage.
 ///
-/// # CRITICAL: All modules MUST use this function.
-/// Using raw UTF-8 bytes (truncation/zero-padding) produces different values
-/// than SHA-256 for the same input, causing crypto operations to address the
-/// wrong MLS groups, sender keys, and event logs.
+/// # CRITICAL: do NOT use this to key a real context.
+/// Per ADR-056 a context's canonical identity IS its 32-byte digest, and the
+/// id string is `hex(digest)`. Passing a real 64-hex context id here
+/// **double-hashes** it (`SHA-256(hex(digest))`), producing a key that diverges
+/// from the digest the MLS group, sender keys, and event log all address — a
+/// silent fail-open. To resolve a context id to keying bytes, always route
+/// through the canonical chokepoint resolver `context_id_to_bytes` (in
+/// `scp-runtime`), which DECODES a real 64-hex id to its digest and falls back
+/// to this primitive only for genuine non-context labels.
 #[must_use]
 pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();

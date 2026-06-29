@@ -286,7 +286,11 @@ impl FullStackNode {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id();
-        let ctx_bytes = scp_core::context::context_id_bytes(context_id);
+        // ADR-056: resolve the context-id string to keying bytes through the
+        // canonical chokepoint, which DECODES a real 64-hex id to its digest
+        // rather than re-hashing it (the raw primitive would double-hash a real
+        // id and key the wrong MLS group / key-exchange slot).
+        let ctx_bytes = scp_core::context::state::context_id_to_bytes(context_id);
 
         // 1. The joiner mints a real MLS key package (its provider retains the
         //    matching signer state) and deposits the bytes in the exchange.
