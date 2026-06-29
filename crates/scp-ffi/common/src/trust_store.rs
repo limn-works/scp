@@ -147,16 +147,33 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     >,
     attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
 ) -> Result<String, TrustError> {
-    for ca in cached_attestations {
-        store.store_cached_attestation(context_id, ca)?;
-    }
-    for cr in challenge_results {
-        store.store_challenge_result(context_id, cr)?;
-    }
-
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
+
+    // SECURITY (verify-on-ingest). Caller-supplied attestations carry caller-
+    // controlled `verified_at`/`ttl_secs`. Persisting them raw via
+    // `store_cached_attestation` would let a caller mark a forged attestation
+    // "fresh" so it is counted AND durably persisted UNVERIFIED — a forged
+    // `attestation_count` plus persistent poisoning of every later
+    // `evaluate_trust`. Route each caller entry through `verify_and_cache`, which
+    // verifies the Ed25519 signature against the RESOLVER-resolved issuer key and
+    // checks expiry/revocation BEFORE caching, and stamps a trusted `verified_at`
+    // from the injected clock (the caller's is ignored). Entries that fail
+    // verification are dropped — never counted, never persisted.
+    for ca in cached_attestations {
+        if let Err(reason) = cache.verify_and_cache(context_id, &ca.attestation, &resolver, &clock)
+        {
+            tracing::debug!(
+                attestation_id = %ca.attestation.id,
+                %reason,
+                "dropping caller-supplied attestation that failed verify-on-ingest",
+            );
+        }
+    }
+    for cr in challenge_results {
+        cache.store().store_challenge_result(context_id, cr)?;
+    }
 
     let ctx = scp_core::trust::aggregate::AggregationContext {
         context_id,
@@ -206,13 +223,26 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
 ) -> Result<Vec<scp_core::trust::attestation::Attestation>, TrustError> {
-    for ca in cached_attestations {
-        store.store_cached_attestation(context_id, ca)?;
-    }
-
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
+
+    // SECURITY (verify-on-ingest). See `populate_and_aggregate`: caller-supplied
+    // `verified_at`/`ttl_secs` are NOT trusted as proof of prior verification.
+    // Every caller entry is verified (signature/expiry/revocation) against the
+    // resolver-resolved issuer key via `verify_and_cache` BEFORE it can be
+    // counted; forged/expired/revoked entries are dropped, so a caller can never
+    // inflate `attestation_count` with an unverified, freshly-marked entry.
+    for ca in cached_attestations {
+        if let Err(reason) = cache.verify_and_cache(context_id, &ca.attestation, &resolver, &clock)
+        {
+            tracing::debug!(
+                attestation_id = %ca.attestation.id,
+                %reason,
+                "dropping caller-supplied attestation that failed verify-on-ingest",
+            );
+        }
+    }
 
     cache.get_verified_attestations(context_id, subject_did, &resolver, &clock)
 }
@@ -460,5 +490,107 @@ mod tests {
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("att-integration-1"));
         assert!(json.contains("cv-1"));
+    }
+
+    /// Builds a caller-supplied attestation that an attacker has marked "fresh"
+    /// (`verified_at`/`ttl_secs` maxed out) but whose signature is forged and
+    /// whose issuer is attacker-chosen.
+    fn make_forged_fresh_cached(subject: &str) -> CachedAttestation {
+        CachedAttestation {
+            attestation: scp_core::trust::Attestation {
+                id: "forged-fresh-1".to_owned(),
+                attestation_type: AttestationType::Endorsement,
+                // Attacker-chosen issuer; the signature below does not authenticate
+                // the attestation under this issuer's key.
+                issuer: "did:key:00000000000000000000000000000000000000000000000000000000000000ff"
+                    .into(),
+                subject: subject.into(),
+                claim: serde_json::json!({"skill": "rust", "level": "expert"}),
+                evidence: None,
+                issued_at: 1,
+                expires_at: Some(u64::MAX),
+                renewal_interval: None,
+                revocation_status: RevocationStatus::Active,
+                signature: vec![0u8; 64],
+                renewed_at: None,
+            },
+            // The attacker asserts "verified just now, valid forever" — exactly the
+            // metadata the old raw-store path trusted on the caller's say-so.
+            verified_at: u64::MAX,
+            ttl_secs: u64::MAX,
+        }
+    }
+
+    /// SECURITY (verify-on-ingest, Finding 1). A caller-supplied attestation
+    /// marked fresh with a FORGED signature MUST NOT be returned by
+    /// `verified_attestations`: every caller entry is re-verified against the
+    /// resolver-resolved issuer key before it can be counted, so the forgery is
+    /// dropped (`attestation_count == 0`) rather than trusted on the caller's
+    /// metadata. Pre-fix, the raw-store path returned the fresh-marked entry
+    /// unverified (count 1).
+    #[test]
+    fn forged_fresh_attestation_excluded_by_verified_attestations() {
+        let context_id = "ctx-forgery";
+        let subject_did =
+            "did:key:11111111111111111111111111111111111111111111111111111111111111aa";
+
+        let store = InMemoryFfiTrustStore::new();
+        let verified = verified_attestations(
+            store,
+            context_id,
+            subject_did,
+            vec![make_forged_fresh_cached(subject_did)],
+        )
+        .unwrap();
+
+        assert!(
+            verified.is_empty(),
+            "forged fresh attestation must be excluded on ingest, got {} entry/entries",
+            verified.len()
+        );
+    }
+
+    /// SECURITY (verify-on-ingest, Finding 1). The same exclusion holds through
+    /// the full `populate_and_aggregate` path: the serialized `TrustInput` carries
+    /// no verified attestations for a forged fresh entry, so `attestation_count`
+    /// cannot be inflated and the durable store is not poisoned.
+    #[test]
+    fn forged_fresh_attestation_excluded_by_populate_and_aggregate() {
+        let context_id = "ctx-forgery-agg";
+        let subject_did =
+            "did:key:22222222222222222222222222222222222222222222222222222222222222bb";
+
+        // One real event so the participation record computes (an empty log would
+        // short-circuit with EmptyEventLog before attestation aggregation).
+        let events = vec![make_event(
+            EventType::MessageSent,
+            subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+
+        let store = InMemoryFfiTrustStore::new();
+        let json = populate_and_aggregate(
+            store,
+            context_id,
+            subject_did,
+            vec![make_forged_fresh_cached(subject_did)],
+            &[],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let attestations = parsed["verified_attestations"].as_array().unwrap();
+        assert!(
+            attestations.is_empty(),
+            "forged fresh attestation must not survive aggregation, got {} entry/entries",
+            attestations.len()
+        );
     }
 }
