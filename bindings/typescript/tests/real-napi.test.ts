@@ -2021,9 +2021,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // is a separate SDK-wrapper slice). So these tests reach it on the RAW
   // native instance the bridge already wraps, obtained via `__getNativeScp`
   // against the SAME `SCP` that minted the context handles. Using the same
-  // instance is mandatory: the per-instance handle-affinity guard (#1549
-  // Phase 4) rejects a handle minted by any other instance with
-  // SCP-PERM-3030.
+  // instance is mandatory: the per-instance handle-affinity guard rejects a
+  // handle minted by any other instance with SCP-PERM-3030.
   //
   // The signature crossing the addon boundary is:
   //   toolInvokeCrossContextSaga(
