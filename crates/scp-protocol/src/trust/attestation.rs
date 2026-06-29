@@ -1078,9 +1078,7 @@ pub fn check_threshold_attestation(
 ///
 /// Returns [`TrustError::InvalidEventData`] if evidence or revocation
 /// status serialization fails.
-pub fn canonical_attestation_bytes(
-    attestation: &Attestation,
-) -> Result<Vec<u8>, TrustError> {
+pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Serialize evidence as MessagePack bytes (named/sorted keys) if present.
