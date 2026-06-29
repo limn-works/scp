@@ -372,4 +372,113 @@ mod tests {
             _ => panic!("expected VerificationWindowOpened"),
         }
     }
+
+    /// ADR-056 forward-secrecy regression guard: the ephemeral-close key
+    /// DESTRUCTION path MUST resolve its MLS-keying bytes through the canonical
+    /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)
+    /// chokepoint, NOT the raw
+    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
+    ///
+    /// For a REAL 64-hex member-context id the chokepoint DECODES the string to
+    /// its 32-byte digest, while the raw primitive RE-HASHES it
+    /// (`SHA-256(hex(digest))`). The live MLS group and sender key are keyed
+    /// under the DIGEST, so a regression to the raw primitive would call
+    /// `destroy_mls_group(SHA-256(id))` — a no-op against an unkeyed slot —
+    /// while the real group SURVIVES. That is precisely the ADR-056 fail-open
+    /// ("ephemeral close no longer fails open under a phantom group").
+    ///
+    /// The happy-path tests above use `"ctx-*"` labels, for which the
+    /// chokepoint and the raw primitive coincide, so they cannot catch this
+    /// regression. This test seeds the group + sender key under the DIGEST of a
+    /// real 64-hex id, drives the production destruction path with the STRING
+    /// id, and asserts the group was PRESENT before and GONE after — under the
+    /// digest. Because `export_crypto_state` returns a non-empty snapshot only
+    /// for a keyed context (empty vec otherwise), a destruction that keyed off
+    /// `SHA-256(id)` would leave the digest slot populated and FAIL the
+    /// post-destruction emptiness assertion (mutation-resistant).
+    #[test]
+    fn destroy_ephemeral_keys_real_context_via_chokepoint_not_raw_primitive() {
+        use crate::context::state::context_id_to_bytes;
+
+        // A REAL (64-hex) member-context id: `hex(digest)` of a 32-byte digest,
+        // exactly the form `generate_context_id` emits.
+        let digest = [0xABu8; 32];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // Precondition: the canonical resolver DECODES the 64-hex id to its
+        // digest, while the raw primitive RE-HASHES it. The two must differ,
+        // otherwise this test could not distinguish the keying paths and would
+        // be meaningless.
+        let chokepoint_bytes = context_id_to_bytes(&id);
+        let raw_bytes = scp_protocol::context::context_id_bytes(&id);
+        assert_eq!(
+            chokepoint_bytes, digest,
+            "the chokepoint must decode a 64-hex id to its digest"
+        );
+        assert_ne!(
+            chokepoint_bytes, raw_bytes,
+            "test precondition: digest must differ from SHA-256(hex(digest))"
+        );
+
+        // Seed an MLS group AND a sender key under the DIGEST — the slot the
+        // live context (and the chokepoint) key on.
+        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        crypto
+            .create_mls_group(&digest)
+            .expect("create_mls_group under the digest");
+        crypto
+            .generate_sender_key(&digest)
+            .expect("generate_sender_key under the digest");
+
+        // The group MUST be present under the digest before destruction — proves
+        // this is a real destroy, not a phantom no-op against an empty slot.
+        let before = crypto
+            .export_crypto_state(&digest)
+            .expect("export under the decoded digest must not error");
+        assert!(
+            !before.is_empty(),
+            "precondition: crypto state must be keyed under the digest before destruction"
+        );
+
+        // Drive the REAL ephemeral-close destruction path, passing the STRING id
+        // so production resolves id -> bytes via the chokepoint at :91.
+        let orchestrator = KeyDestructionOrchestrator::new(&crypto);
+        let result = orchestrator
+            .destroy_ephemeral_keys(
+                &id,
+                &["wss://relay.example.com".to_owned()],
+                &[[0x42; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                1_700_000_000,
+            )
+            .expect("destroy_ephemeral_keys must succeed");
+        assert!(result.attestation.mls_group_destroyed);
+        assert!(result.attestation.sender_keys_destroyed);
+
+        // The group/sender-key MUST be GONE under the digest after destruction.
+        // If production had resolved via the raw `SHA-256(id)` primitive,
+        // `destroy_mls_group(SHA-256(id))` would have addressed an unkeyed slot
+        // (a silent no-op) and the digest slot would still be populated — this
+        // assertion FAILS in that case (the ADR-056 fail-open).
+        let after_digest = crypto
+            .export_crypto_state(&digest)
+            .expect("export under the decoded digest must not error");
+        assert!(
+            after_digest.is_empty(),
+            "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after \
+             ephemeral close — destruction keyed off the wrong slot (raw SHA-256(id) \
+             instead of the chokepoint digest)"
+        );
+
+        // Belt-and-suspenders: nothing was ever keyed under SHA-256(id), so that
+        // slot is (and remains) empty regardless of the resolution path.
+        let after_raw = crypto
+            .export_crypto_state(&raw_bytes)
+            .expect("export under SHA-256(id) must not error");
+        assert!(
+            after_raw.is_empty(),
+            "no state should ever exist under SHA-256(id) — the pre-ADR-056 double-hash slot"
+        );
+    }
 }
