@@ -1,17 +1,33 @@
 <!DOCTYPE html>
+<!--
+  PENDING: this page previews a future browser UI, but it does NOT work in a
+  browser today. The bundle it loads (./dist/index.js) runs the protocol engine
+  in-process via the @limn-works/scp-ts NAPI native addon, which loads only under
+  Node.js / Bun. Per ADR-055 the browser model is a remote thin client to a
+  server-side scp-node (no in-browser protocol execution); that transport does
+  not exist yet. Until it lands, run the example with `bun run start`, not by
+  opening this file in a browser.
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SCP Browser App</title>
+  <title>SCP Example (Node/Bun — browser pending ADR-055)</title>
   <style>
     body { font-family: monospace; padding: 2rem; background: #1a1a2e; color: #eee; }
     pre { background: #16213e; padding: 1rem; border-radius: 4px; overflow-x: auto; }
+    .note { color: #ffcc66; margin-bottom: 1rem; font-size: 0.85rem; }
   </style>
 </head>
 <body>
-  <h1>SCP Browser App</h1>
-  <pre id="output">Connecting...</pre>
+  <h1>SCP Example</h1>
+  <p class="note">
+    This UI previews a future browser app. It does not run in a browser yet —
+    the SDK uses an in-process NAPI addon (Node/Bun only). Run with
+    <code>bun run start</code>. Browser support is pending the ADR-055
+    remote-thin-client transport.
+  </p>
+  <pre id="output">Run with `bun run start` (Node/Bun).</pre>
   <script type="module" src="./dist/index.js"></script>
 </body>
 </html>

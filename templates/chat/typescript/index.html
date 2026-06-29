@@ -1,9 +1,18 @@
 <!DOCTYPE html>
+<!--
+  PENDING: this page previews a future browser chat UI, but it does NOT work in a
+  browser today. The bundle it loads (./dist/index.js) runs the protocol engine
+  in-process via the @limn-works/scp-ts NAPI native addon, which loads only under
+  Node.js / Bun. Per ADR-055 the browser model is a remote thin client to a
+  server-side scp-node (no in-browser protocol execution); that transport does
+  not exist yet. Until it lands, run the example with `bun run dev`, not by
+  opening this file in a browser.
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SCP Chat</title>
+  <title>SCP Chat (Node/Bun — browser pending ADR-055)</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -16,6 +25,8 @@
     }
     .container { max-width: 600px; width: 100%; }
     h1 { margin-bottom: 1rem; font-size: 1.4rem; color: #7aa2f7; }
+    .pending-note { font-size: 0.8rem; color: #ffcc66; margin-bottom: 0.75rem; line-height: 1.4; }
+    .pending-note code { color: #e0e0e0; }
     #status { font-size: 0.85rem; color: #888; margin-bottom: 0.5rem; }
     #context-id {
       font-size: 0.75rem;
@@ -88,7 +99,13 @@
 <body>
   <div class="container">
     <h1>SCP Chat</h1>
-    <div id="status">Connecting...</div>
+    <p class="pending-note">
+      Previews a future browser chat. Does not run in a browser yet — the SDK
+      uses an in-process NAPI addon (Node/Bun only). Run with
+      <code>bun run dev</code>. Browser support is pending the ADR-055
+      remote-thin-client transport.
+    </p>
+    <div id="status">Ready (run under Node/Bun).</div>
     <div id="context-id"></div>
 
     <div class="controls">

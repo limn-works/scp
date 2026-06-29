@@ -1,13 +1,21 @@
 /**
- * Two-party encrypted chat in the browser over SCP.
+ * Two-party encrypted chat over SCP (in-process via the NAPI native addon).
  *
- * Creates or joins an encrypted context and exchanges messages via a
- * minimal web UI.  In the browser the SDK is a remote thin client: it
- * connects to a server-side scp-node that runs the protocol engine.
+ * Creates or joins an encrypted context and exchanges messages via a minimal
+ * web UI.
+ *
+ * This runs the protocol engine in-process through `@limn-works/scp-ts`, whose
+ * NAPI native addon loads only under Node.js / Bun — NOT in a browser. So this
+ * is a server-side (Node/Bun) example, even though the DOM code below previews a
+ * future browser chat UI.
+ *
+ * Browser support is forthcoming and not what this does today: per ADR-055 the
+ * browser model is a remote thin client to a server-side scp-node over
+ * RPC/WebSocket (no in-browser protocol execution). That transport does not
+ * exist yet — until it lands, run this under Bun/Node, not in a browser.
  *
  * Usage:
- *   bun install && bun run build
- *   Open index.html in a browser (or run `bun run serve`)
+ *   bun install && bun run dev    # builds and serves under Bun
  */
 
 import { Context, Identity } from "@limn-works/scp-ts";
@@ -135,8 +143,10 @@ async function joinContext(): Promise<void> {
 
     setStatus("Joining context...");
     // In a full deployment, the context handle comes from discovery or an
-    // invite link.  Here we create a local context and join -- the bridge
-    // resolves the context_id to the remote state.
+    // invite link, resolved over the network. This in-process (NAPI) example
+    // has no networking, so it creates a fresh local context to demonstrate the
+    // create/join/send shape; cross-party state resolution arrives with the
+    // ADR-055 remote-thin-client transport.
     ctx = await Context.create(id, {
       ceiling: ["MessagesRead", "MessagesWrite", "MemberInvite"],
       memoryScope: "ephemeral",

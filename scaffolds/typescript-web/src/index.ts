@@ -1,13 +1,20 @@
 /**
- * Minimal SCP browser app (remote thin client).
+ * Minimal SCP example (in-process via the NAPI native addon).
  *
  * Creates a DID identity, opens an encrypted context, and sends a message.
- * In the browser the SDK is a remote thin client: it drives a server-side
- * scp-node that runs the protocol engine.
+ *
+ * This runs the protocol engine in-process through `@limn-works/scp-ts`, whose
+ * NAPI native addon loads only under Node.js / Bun — NOT in a browser. So this
+ * is a server-side (Node/Bun) example, even though the DOM code below previews a
+ * future browser UI.
+ *
+ * Browser support is forthcoming and not what this does today: per ADR-055 the
+ * browser model is a remote thin client to a server-side scp-node over
+ * RPC/WebSocket (no in-browser protocol execution). That transport does not
+ * exist yet — until it lands, run this under Bun/Node, not in a browser.
  *
  * Usage:
- *   bun install && bun run build
- *   Open index.html in a browser
+ *   bun install && bun run start   # builds and runs under Bun
  */
 
 import { Context, Identity } from "@limn-works/scp-ts";
