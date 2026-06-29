@@ -7,7 +7,7 @@
 //!
 //! The sender-layer wire format and epoch semantics mirror the native
 //! `scp-runtime` MLS crypto provider (`crypto/mls/provider.rs`) so that WASM
-//! and native cross-decrypt (§9.16.1 / #1877). In particular:
+//! and native cross-decrypt (§9.16.1). In particular:
 //!
 //! - Each MLS application plaintext is `epoch (8B BE) || sequence (8B BE) ||
 //!   sender_key_ciphertext` (the shared
@@ -39,31 +39,6 @@ use super::sender_key::{
 /// message's 8-byte big-endian epoch prefix as `0x0000000000000001`, which can
 /// never collide with the 4-byte `SCPM_MAGIC` management prefix (§9.16.1).
 pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
-
-/// Serializable replay/epoch state for a [`WasmCryptoState`] (§9.16.1 MUST:
-/// "the tracker is persisted in the crypto state snapshot").
-///
-/// WASM contexts are ephemeral (ADR-034) — the live MLS group is never
-/// serialized and an imported context re-establishes encryption via a fresh
-/// Welcome. This struct is therefore the WASM analogue of the receive-side /
-/// epoch portion of native's `MlsCryptoSnapshot`: it captures exactly the
-/// state §9.16.1 requires to survive a crypto-state snapshot so that a replay
-/// presented after restore is still rejected and a rolled-back sender-key epoch
-/// is still refused.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct WasmReplayStateSnapshot {
-    /// This participant's own `sender_key_epoch` high-water counter.
-    pub sender_key_epoch: u64,
-    /// Per-sender epoch high-water marks for the context: `(sender_did, epoch)`
-    /// pairs, exported from the [`SenderKeyStore`]. Restored via
-    /// [`SenderKeyStore::restore_epoch_high_water`] so `set_checked` keeps
-    /// rejecting epoch regressions after restore (#1608 parity).
-    pub sender_key_epochs: Vec<(String, u64)>,
-    /// Receive-side replay tracker: `(sender_did, last_epoch, last_sequence)`
-    /// triples. Restored verbatim so a replay/reorder seen before the snapshot
-    /// is still rejected after restore.
-    pub recv_sequence_tracker: Vec<(String, u64, u64)>,
-}
 
 /// Combined MLS + sender key state for a single context.
 ///
@@ -365,60 +340,6 @@ impl WasmCryptoState {
         self.sender_key_epoch = self.sender_key_epoch.saturating_add(1);
     }
 
-    /// Exports the replay/epoch state for persistence in a crypto-state
-    /// snapshot (§9.16.1 MUST-persist).
-    ///
-    /// Captures `sender_key_epoch`, the per-sender epoch high-water marks, and
-    /// the receive-side replay tracker — exactly the state required so that a
-    /// replay presented after restore is still rejected and a rolled-back
-    /// sender-key epoch is still refused. The live MLS group and key material
-    /// are intentionally NOT part of this snapshot (WASM contexts re-establish
-    /// MLS via a fresh Welcome, ADR-034).
-    #[must_use]
-    pub fn replay_state_snapshot(&self) -> WasmReplayStateSnapshot {
-        let mut recv_sequence_tracker: Vec<(String, u64, u64)> = self
-            .recv_sequence_tracker
-            .iter()
-            .map(|(did, &(epoch, seq))| (did.clone(), epoch, seq))
-            .collect();
-        // Deterministic order so the serialized snapshot is stable across runs.
-        recv_sequence_tracker.sort_unstable();
-
-        let mut sender_key_epochs = self.sender_key_store.epochs_for_context(&self.context_id);
-        sender_key_epochs.sort_unstable();
-
-        WasmReplayStateSnapshot {
-            sender_key_epoch: self.sender_key_epoch,
-            sender_key_epochs,
-            recv_sequence_tracker,
-        }
-    }
-
-    /// Restores replay/epoch state from a previously exported snapshot
-    /// (§9.16.1 MUST-persist).
-    ///
-    /// Repopulates `sender_key_epoch`, the per-sender epoch high-water marks
-    /// (via [`SenderKeyStore::restore_epoch_high_water`], which does NOT enforce
-    /// monotonicity — the restored values ARE the authoritative high-water
-    /// marks), and the receive-side replay tracker. After restore, subsequent
-    /// sends continue from the restored epoch and a replay seen before the
-    /// snapshot is still rejected.
-    pub fn restore_replay_state(&mut self, snapshot: &WasmReplayStateSnapshot) {
-        self.sender_key_epoch = snapshot.sender_key_epoch;
-
-        let context_id = self.context_id.clone();
-        for (did, epoch) in &snapshot.sender_key_epochs {
-            self.sender_key_store
-                .restore_epoch_high_water(&context_id, did, *epoch);
-        }
-
-        self.recv_sequence_tracker = snapshot
-            .recv_sequence_tracker
-            .iter()
-            .map(|(did, epoch, seq)| (did.clone(), (*epoch, *seq)))
-            .collect();
-    }
-
     /// Destroys all crypto state (MLS group + sender keys).
     ///
     /// Eagerly zeroizes the local sender key rather than waiting for
@@ -687,70 +608,54 @@ mod tests {
         );
     }
 
-    /// Snapshot round-trip: export Bob's replay state, serde round-trip it,
-    /// restore into a FRESH Bob state, and prove a replay at the persisted
-    /// sequence is STILL rejected while a strictly newer sequence is accepted
-    /// (§9.16.1 MUST-persist).
+    /// Replay protection is IN-SESSION ONLY, matching native's foreign-node
+    /// behavior: a freshly established WASM crypto state starts with an EMPTY
+    /// receive-sequence tracker, an empty per-sender epoch high-water store, and
+    /// `sender_key_epoch` at the initial value. Native deliberately DROPS its
+    /// freshness/replay cache from the portable cross-party export (a foreign
+    /// node has no authority over it and a fresh node opens its own receive
+    /// window — see `scp-runtime` `export_import.rs`). WASM converges: the
+    /// receive window is rebuilt live as messages arrive within the session, and
+    /// is never seeded from an importable snapshot (which would let a signed-but-
+    /// malicious creator reopen replay or poison a third-party sender's epoch
+    /// high-water, bypassing the `MAX_EPOCH_ADVANCE` ceiling).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn snapshot_restore_preserves_replay_rejection() {
-        // Phase 1: Bob sees Alice's seq 5 → tracker records (1, 5).
-        let mut alice_state = WasmCryptoState::new_for_context(CTX_ID, ALICE_DID).unwrap();
-        let mut bob_state = add_member_and_build(&mut alice_state, BOB_DID);
-        bob_state.insert_sender_key(
-            ALICE_DID,
-            SenderKey::from_bytes(*alice_state.local_sender_key.as_bytes()),
-        );
-        let ct5 = alice_state
-            .encrypt_message(b"five", CTX_ID, ALICE_DID, 5)
-            .unwrap();
-        assert_eq!(
-            bob_state.decrypt_message(&ct5, CTX_ID, ALICE_DID).unwrap(),
-            b"five"
-        );
-
-        // Export + serde round-trip.
-        let snapshot = bob_state.replay_state_snapshot();
-        let bytes = serde_json::to_vec(&snapshot).unwrap();
-        let restored: WasmReplayStateSnapshot = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            restored.recv_sequence_tracker,
-            vec![(ALICE_DID.to_owned(), 1u64, 5u64)]
-        );
-
-        // Phase 2: a FRESH context (as if after restart — production would
-        // re-establish MLS via a new Welcome). Restore Bob's replay state into
-        // it, then prove the tracker survived.
-        let mut alice2 = WasmCryptoState::new_for_context(CTX_ID, ALICE_DID).unwrap();
-        let mut restored_bob = add_member_and_build(&mut alice2, BOB_DID);
-        restored_bob.insert_sender_key(
-            ALICE_DID,
-            SenderKey::from_bytes(*alice2.local_sender_key.as_bytes()),
-        );
-        restored_bob.restore_replay_state(&restored);
-
-        // A message at seq 5 from Alice is now a replay even though this MLS
-        // group is brand new — the restored tracker says (1, 5).
-        let replay_ct = alice2
-            .encrypt_message(b"replay-five", CTX_ID, ALICE_DID, 5)
-            .unwrap();
+    fn fresh_crypto_state_starts_with_empty_replay_window() {
+        // A creator-established state.
+        let alice_state = WasmCryptoState::new_for_context(CTX_ID, ALICE_DID).unwrap();
         assert!(
-            restored_bob
-                .decrypt_message(&replay_ct, CTX_ID, ALICE_DID)
-                .is_err(),
-            "after restore, a replay at the persisted sequence must be rejected"
+            alice_state.recv_sequence_tracker.is_empty(),
+            "a fresh crypto state must start with an empty receive replay window"
+        );
+        assert!(
+            alice_state
+                .sender_key_store
+                .epochs_for_context(CTX_ID)
+                .is_empty(),
+            "a fresh crypto state must start with no per-sender epoch high-water"
+        );
+        assert_eq!(
+            alice_state.sender_key_epoch, INITIAL_SENDER_KEY_EPOCH,
+            "a fresh crypto state must start at the initial sender-key epoch"
         );
 
-        // A strictly newer sequence is accepted.
-        let fresh_ct = alice2
-            .encrypt_message(b"six", CTX_ID, ALICE_DID, 6)
-            .unwrap();
-        assert_eq!(
-            restored_bob
-                .decrypt_message(&fresh_ct, CTX_ID, ALICE_DID)
-                .unwrap(),
-            b"six"
+        // A member-established state (joined via Welcome) likewise starts fresh —
+        // there is no cross-party tracker injection path.
+        let mut alice_state = alice_state;
+        let bob_state = add_member_and_build(&mut alice_state, BOB_DID);
+        assert!(
+            bob_state.recv_sequence_tracker.is_empty(),
+            "a Welcome-joined crypto state must start with an empty receive window"
         );
+        assert!(
+            bob_state
+                .sender_key_store
+                .epochs_for_context(CTX_ID)
+                .is_empty(),
+            "a Welcome-joined crypto state must start with no epoch high-water"
+        );
+        assert_eq!(bob_state.sender_key_epoch, INITIAL_SENDER_KEY_EPOCH);
     }
 
     const CAROL_DID: &str = "did:dht:z6MkCarol";

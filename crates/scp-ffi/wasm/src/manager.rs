@@ -737,19 +737,6 @@ pub(crate) struct PerContextState {
     /// MLS encryption + sender key state. `Some` for encrypted contexts,
     /// `None` for broadcast-only or unencrypted contexts.
     crypto: Option<crate::crypto::WasmCryptoState>,
-    /// Replay/epoch crypto state carried by an export snapshot but not yet
-    /// installed into a live [`crate::crypto::WasmCryptoState`] (§9.16.1
-    /// MUST-persist).
-    ///
-    /// On `import_context`, `crypto` is `None` — WASM contexts re-establish MLS
-    /// via a fresh Welcome (ADR-034), so there is no live crypto to restore the
-    /// receive-side replay tracker / sender-key epoch high-water into at import
-    /// time. The snapshot's replay state is parked here and consumed by
-    /// `join_context_encrypted` (and `create_context_encrypted_from_welcome`)
-    /// the moment crypto is established, so a replay presented after an
-    /// export→import→rejoin round-trip is still rejected. `None` for a freshly
-    /// created or non-encrypted context.
-    pending_replay_state: Option<crate::crypto::WasmReplayStateSnapshot>,
     /// Convergent creator-assigned context-creation timestamp (Unix seconds).
     ///
     /// The same value this member stamped on the `ContextCreated` event-log leaf
@@ -1839,7 +1826,6 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         consequence_rules: Vec::new(),
         cooldown_until: HashMap::new(),
         crypto: None,
-        pending_replay_state: None,
         creation_timestamp_secs: 0,
     }
 }
@@ -2193,8 +2179,6 @@ impl WasmContextManager {
             consequence_rules,
             cooldown_until: HashMap::new(),
             crypto,
-            // Freshly created contexts have no carried replay state.
-            pending_replay_state: None,
             creation_timestamp_secs,
         };
 
@@ -2548,8 +2532,8 @@ impl WasmContextManager {
         // The reserved sequence above is rolled back on ANY failure before the
         // message is recorded, mirroring native
         // `MembershipState::rollback_sequence_number` (membership.rs, a
-        // `saturating_sub(1)`): a failed send (invalid base64, MLS epoch read,
-        // encryption) must burn no sequence, so two honest members never
+        // `saturating_sub(1)`): a failed send (invalid base64 or encryption)
+        // must burn no sequence, so two honest members never
         // diverge on a gap. The fallible work is wrapped in a closure so the
         // single `?`-propagating error path is captured for rollback rather
         // than early-returning. The closure borrows `ctx.crypto` mutably; the
@@ -2854,7 +2838,7 @@ impl WasmContextManager {
         // assigned `now_secs()` timestamp) is IDENTICAL to the unencrypted
         // `join_context` leaf; only WHEN it is appended differs.
         let ctx = self.require_active_context_mut(context_id)?;
-        let mut established_crypto = crate::crypto::WasmCryptoState {
+        let established_crypto = crate::crypto::WasmCryptoState {
             mls_group,
             local_sender_key: crate::crypto::sender_key::generate_sender_key(),
             context_id: context_id.to_owned(),
@@ -2862,14 +2846,13 @@ impl WasmContextManager {
             sender_key_store: scp_protocol::crypto::sender_keys::SenderKeyStore::new(),
             recv_sequence_tracker: std::collections::HashMap::new(),
         };
-        // §9.16.1 MUST-persist: if this context was imported with a parked
-        // replay/epoch snapshot, seed the freshly established crypto with it so
-        // a replay presented after an export→import→rejoin round-trip is still
-        // rejected and the sender-key epoch cannot roll back. Consume (take) the
-        // pending state so a later rejoin does not re-apply a stale tracker.
-        if let Some(pending) = ctx.pending_replay_state.take() {
-            established_crypto.restore_replay_state(&pending);
-        }
+        // A freshly established WASM crypto state opens its OWN receive replay
+        // window (empty recv tracker, empty epoch high-water, initial
+        // sender-key epoch). This matches native's foreign-node behavior: the
+        // portable cross-party export deliberately DROPS the freshness/replay
+        // cache (it has no authority on a foreign node — see `scp-runtime`
+        // `export_import.rs`), so an importer never seeds replay state from a
+        // signed-but-untrusted snapshot. Replay protection is in-session only.
         ctx.crypto = Some(established_crypto);
         ctx.push_event(ContextEvent::MemberJoined {
             member_did: DID(member_did.to_owned()),
@@ -7398,14 +7381,6 @@ impl WasmContextManager {
             economic_policy_locked: ctx.economic_policy_locked,
             hard_rate_limit_config: ctx.hard_rate_limit_config.clone(),
             creation_timestamp_secs: ctx.creation_timestamp_secs,
-            // §9.16.1 MUST-persist: carry the live crypto replay/epoch state
-            // (sender-key epoch, per-sender high-water, receive replay tracker)
-            // so it survives export/import. `None` when the context is not
-            // encrypted (no live crypto).
-            replay_state: ctx
-                .crypto
-                .as_ref()
-                .map(crate::crypto::WasmCryptoState::replay_state_snapshot),
         };
 
         // Canonicalize every set/map-derived array to sorted order before
@@ -7982,15 +7957,6 @@ impl WasmContextManager {
             // from imported MLS state, this sidecar becomes a nonce-reuse vector
             // and MUST be re-evaluated.
             crypto: None,
-            // §9.16.1 MUST-persist: park the snapshot's replay/epoch state until
-            // a fresh Welcome re-establishes crypto (ADR-034 — imported WASM
-            // contexts hold no live MLS state). The crypto-establishment path
-            // (`join_context_encrypted`) consumes this and seeds the new
-            // `WasmCryptoState` so a replay presented after rejoin is rejected
-            // and the sender-key epoch cannot roll back. Authenticated: it is
-            // inside the creator-signed snapshot preimage `verify_strict`'d
-            // above, so a tampered tracker fails the signature.
-            pending_replay_state: snap.replay_state.clone(),
             // Convergent creator-assigned creation time, restored from the
             // signed snapshot so the imported TTL deadline base
             // (`creation_timestamp_secs + ttl_seconds`) matches what every other
@@ -8333,7 +8299,7 @@ pub struct ContextMetadata {
 /// bridge is rejected at the version gate, never silently parsed. The two
 /// numbers are therefore **not** expected to match and must **not** be
 /// "reconciled" — only the signing construction converges, not the bytes.
-const WASM_EXPORT_VERSION: u32 = 6;
+const WASM_EXPORT_VERSION: u32 = 5;
 
 /// Maximum byte length of a context-export envelope accepted by
 /// [`WasmContextManager::deserialize_and_verify_envelope`].
@@ -8583,17 +8549,6 @@ struct WasmContextExportSnapshot {
     /// `#[serde(default)]` so pre-field envelopes deserialize as `0`.
     #[serde(default)]
     creation_timestamp_secs: u64,
-    /// Replay/epoch crypto state (§9.16.1 MUST-persist): the sender-key epoch
-    /// counter, per-sender epoch high-water marks, and the receive-side replay
-    /// tracker. Exported from the live `WasmCryptoState` when the context is
-    /// encrypted, and parked in `PerContextState.pending_replay_state` on
-    /// import until a fresh Welcome re-establishes crypto, so a replay
-    /// presented after an export→import→rejoin round-trip is still rejected.
-    /// `None` for non-encrypted contexts or contexts exported without live
-    /// crypto. Part of the signed digest (it is a field of the signed snapshot
-    /// preimage), so tampering with the persisted tracker fails `verify_strict`.
-    #[serde(default)]
-    replay_state: Option<crate::crypto::WasmReplayStateSnapshot>,
 }
 
 /// Canonicalizes every set/map-derived array in an export snapshot to a
@@ -9362,13 +9317,14 @@ mod tests {
     fn export_version_matches_signed_constant() {
         // The WASM JSON-envelope version is an independent per-serializer
         // integer (§23.16.8): it need NOT equal the native MessagePack
-        // export version. It is currently 6 — v5 bound the export-scope
+        // export version. It is currently 5 — v5 bound the export-scope
         // discriminant into the Ed25519 signed preimage (v4 introduced the
-        // full-snapshot signature); v6 adds the `replay_state` field
-        // (sender-key epoch, per-sender high-water, receive replay tracker) to
-        // the signed snapshot per §9.16.1 MUST-persist. This test pins the
-        // constant so a change is deliberate.
-        assert_eq!(WASM_EXPORT_VERSION, 6);
+        // full-snapshot signature). The portable export deliberately carries NO
+        // receive-side replay/freshness cache (a foreign importer opens its own
+        // in-session replay window, matching native's foreign-node behavior in
+        // `scp-runtime` `export_import.rs`). This test pins the constant so a
+        // change is deliberate.
+        assert_eq!(WASM_EXPORT_VERSION, 5);
     }
 
     /// **§23.16.8 version-gate:** an envelope whose version exceeds the current
@@ -9981,7 +9937,6 @@ mod tests {
             economic_policy_locked: false,
             hard_rate_limit_config: None,
             creation_timestamp_secs: 0,
-            replay_state: None,
         }
     }
 
@@ -13080,134 +13035,6 @@ mod tests {
             *post_role_state, pre_role_state,
             "the whole ContextRoleState must round-trip verbatim (members, assignments + \
              tokens, ceiling, role_definitions, member_capabilities, suspensions)"
-        );
-
-        crate::identity::test_helpers::cleanup_identity_registry();
-    }
-
-    /// §9.16.1 MUST-persist: the receive-side replay tracker and sender-key
-    /// epoch high-water survive `export_context` → `import_context`. The
-    /// imported context holds NO live crypto (ADR-034 — `crypto: None`), so the
-    /// state is parked in `pending_replay_state` and would be seeded into a
-    /// fresh `WasmCryptoState` on the next encrypted join. This proves the
-    /// snapshot carries (and restores) the tracker so a replay presented after
-    /// a round-trip is still rejected once crypto is re-established.
-    #[test]
-    fn export_import_round_trips_replay_state() {
-        let context_id = "ctx-replay-persist";
-        let sender = "did:dht:zReplaySender";
-
-        crate::identity::test_helpers::cleanup_identity_registry();
-        let (creator, _ik, _ak, _gk) =
-            crate::identity::test_helpers::register_identity_with_agent_key();
-
-        let mut src = WasmContextManager::new();
-        let mut state = make_bare_per_context_state(context_id, &creator);
-
-        // Attach a live crypto state and seed its replay/epoch trackers as if a
-        // few messages had already been received and the local key rotated.
-        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(context_id, &creator)
-            .expect("crypto state must construct");
-        crypto.sender_key_epoch = 3;
-        crypto
-            .recv_sequence_tracker
-            .insert(sender.to_owned(), (2, 7));
-        // Record a per-sender epoch high-water in the store (monotonic install).
-        crypto
-            .sender_key_store
-            .set_checked(
-                context_id,
-                sender,
-                crate::crypto::sender_key::generate_sender_key(),
-                2,
-            )
-            .expect("first epoch install must succeed");
-        state.crypto = Some(crypto);
-        src.contexts.insert(context_id.to_owned(), state);
-
-        // Export (signs with the creator's #active key) and import into a fresh
-        // manager.
-        let bytes = src.export_context(context_id).expect("export must succeed");
-        let mut dst = WasmContextManager::new();
-        dst.import_context(&bytes).expect("import must succeed");
-
-        // Imported context holds no live crypto.
-        assert!(
-            dst.contexts[context_id].crypto.is_none(),
-            "imported WASM contexts must hold no live MLS crypto (ADR-034)"
-        );
-
-        // The replay/epoch state is parked, ready for the next encrypted join.
-        let parked = dst.contexts[context_id]
-            .pending_replay_state
-            .as_ref()
-            .expect("the replay state must be carried + parked on import");
-        assert_eq!(parked.sender_key_epoch, 3, "sender-key epoch must survive");
-        assert_eq!(
-            parked.recv_sequence_tracker,
-            vec![(sender.to_owned(), 2u64, 7u64)],
-            "the receive replay tracker must survive verbatim"
-        );
-        assert_eq!(
-            parked.sender_key_epochs,
-            vec![(sender.to_owned(), 2u64)],
-            "the per-sender epoch high-water must survive"
-        );
-
-        crate::identity::test_helpers::cleanup_identity_registry();
-    }
-
-    /// The persisted `replay_state` is inside the signed snapshot preimage:
-    /// tampering with the receive tracker after signing makes `import_context`
-    /// reject the envelope (the Ed25519 / HMAC verification fails). This pins
-    /// that the §9.16.1-persisted tracker is authenticated, not attacker-mutable.
-    #[test]
-    fn tampered_replay_state_fails_import() {
-        let context_id = "ctx-replay-tamper";
-        let sender = "did:dht:zTamperSender";
-
-        crate::identity::test_helpers::cleanup_identity_registry();
-        let (creator, _ik, _ak, _gk) =
-            crate::identity::test_helpers::register_identity_with_agent_key();
-
-        let mut src = WasmContextManager::new();
-        let mut state = make_bare_per_context_state(context_id, &creator);
-        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(context_id, &creator)
-            .expect("crypto state must construct");
-        crypto
-            .recv_sequence_tracker
-            .insert(sender.to_owned(), (1, 9));
-        state.crypto = Some(crypto);
-        src.contexts.insert(context_id.to_owned(), state);
-
-        let bytes = src.export_context(context_id).expect("export must succeed");
-
-        // Tamper: lower the recorded sequence in the signed JSON so a replay at
-        // seq 9 would (incorrectly) be accepted post-restore. The envelope is a
-        // JSON object carrying the snapshot + signature; flipping the tracker
-        // value invalidates the signature over the snapshot preimage.
-        let tampered = String::from_utf8(bytes).expect("export is UTF-8 JSON");
-        // The tracker serializes as the triple [sender, 1, 9]; rewrite 9 -> 0.
-        let needle = "[\"did:dht:zTamperSender\",1,9]";
-        assert!(
-            tampered.contains(needle),
-            "expected the serialized tracker triple in the export JSON; got: {tampered}"
-        );
-        let tampered = tampered.replace(needle, "[\"did:dht:zTamperSender\",1,0]");
-
-        let mut dst = WasmContextManager::new();
-        let err = dst
-            .import_context(tampered.as_bytes())
-            .expect_err("a tampered signed snapshot must be rejected on import");
-        // The failure is a signature/validation rejection, not a silent accept.
-        let msg = format!("{err:?}");
-        assert!(
-            msg.to_lowercase().contains("sign")
-                || msg.to_lowercase().contains("verif")
-                || msg.to_lowercase().contains("hmac")
-                || msg.to_lowercase().contains("mac")
-                || msg.to_lowercase().contains("integrity"),
-            "import must fail with a signature/integrity error, got: {msg}"
         );
 
         crate::identity::test_helpers::cleanup_identity_registry();

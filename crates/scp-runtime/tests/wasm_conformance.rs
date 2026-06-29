@@ -2247,108 +2247,173 @@ fn golden_sender_key_roundtrip() {
     );
 }
 
-/// Cross-family sender-layer convergence (§9.16.1 / #1877, #1909 Phase 2).
+/// Cross-family sender-layer convergence (§9.16.1 / §9.16.5).
 ///
-/// Both the native `scp-runtime` MLS provider `seal` and the WASM
-/// `WasmCryptoState::encrypt_message` build the MLS application plaintext the
-/// SAME way: `encrypt_sender_layer(...)` to produce the AEAD ciphertext, then
-/// `build_sender_header(epoch, sequence, ct)` to prepend the 16-byte
-/// `epoch (8B BE) || sequence (8B BE)` header. The receive sides both
-/// `parse_sender_header` (header authoritative) and `decrypt_sender_layer` with
-/// the PARSED epoch/sequence and the RAW `context_id` string in the AAD.
+/// This drives the REAL native `MlsCryptoProvider` wrapper end-to-end —
+/// `seal` on the send side, `open` on the receive side — across a deliberate
+/// divergence between the MLS group epoch and the per-sender `sender_key_epoch`,
+/// and asserts the full round-trip still succeeds. The point is to catch a
+/// future regression that sources the sender-layer header/AAD epoch from the
+/// MLS group epoch instead of `sender_key_epoch` (§9.16.5).
 ///
-/// This test models BOTH families over the shared `scp_protocol` functions they
-/// each call, with the SAME `(context_id, sender_did, sender_key_epoch,
-/// sequence)`, and asserts:
-/// 1. The 16-byte header is deterministic and byte-identical across families.
-/// 2. A message framed the "native way" decrypts the "WASM way" and vice versa
-///    (the AAD — `context_id` string + `sender_did` + parsed epoch/seq — matches).
+/// Why a divergence is required: `seal` binds `state.sender_key_epoch` into
+/// BOTH the AEAD AAD and the 16-byte header, and `open` reconstructs the AAD
+/// from the PARSED header epoch. If a regression switched either side to the MLS
+/// group epoch, the AAD `seal` bound and the AAD `open` reconstructs would
+/// disagree and AEAD verification would fail closed. By advancing
+/// `sender_key_epoch` via the real `rotate_sender_key` (a sender-key-only
+/// operation that does NOT advance the MLS group epoch), the two epoch axes are
+/// made unequal, so a tautological "they happen to match" pass is impossible.
+///
+/// The WASM `WasmCryptoState` wrapper cannot be driven from this crate (ADR-034:
+/// `scp-runtime` must not depend on `scp-ffi-wasm`), but it sources the header
+/// and AAD epoch from `self.sender_key_epoch` identically, and its own
+/// `#[cfg(test)]` `rotate_advances_epoch_in_header_and_aad` drives the real
+/// `WasmCryptoState` over the same property. Together the two pin both wrappers.
 #[test]
 fn cross_family_sender_layer_header_and_aad_converge() {
+    use scp_protocol::context::builder::OpenResult;
+    use scp_protocol::context::{context_id_bytes, context_routing_id};
+    use scp_protocol::envelope::SCP_PROTOCOL_VERSION;
+    use scp_protocol::envelope::inner::{InnerEnvelopeParams, MessageType};
+    use scp_runtime::crypto::mls::MlsCryptoProvider;
+    use scp_runtime::envelope::inner::sign::create_inner_envelope_raw;
+
+    let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
+    let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+    let context_id_str = "cross-family-sender-epoch-ctx";
+    let context_id = context_id_bytes(context_id_str);
+    let routing_id = context_routing_id(context_id_str);
+
+    // Alice (sender) and Bob (receiver) as two separate providers.
+    let alice = MlsCryptoProvider::new(alice_did.to_string());
+    let bob = MlsCryptoProvider::new(bob_did.to_string());
+
+    alice.create_mls_group(&context_id).unwrap();
+    alice.generate_sender_key(&context_id).unwrap();
+
+    // Bob joins via Welcome (the add commit advances the MLS group epoch to 1).
+    let bob_kp = bob.prepare_key_package_for_join().unwrap();
+    let add = alice
+        .add_member(&context_id, bob_did, Some(&bob_kp))
+        .unwrap();
+    bob.join_from_welcome(&context_id, &add.welcome_bytes)
+        .unwrap();
+    bob.generate_sender_key(&context_id).unwrap();
+
+    // Distribute the current key so Bob can later decrypt the ROTATED key.
+    fn distribute(
+        from: &MlsCryptoProvider,
+        to: &MlsCryptoProvider,
+        context_id: &[u8; 32],
+        from_did: &str,
+        to_did: &str,
+    ) {
+        from.distribute_sender_key(context_id, to_did).unwrap();
+        for (_target, msg) in from.drain_pending_sender_key_messages(context_id).unwrap() {
+            to.process_incoming_sender_key(context_id, from_did, &msg)
+                .unwrap();
+        }
+    }
+    distribute(&alice, &bob, &context_id, alice_did, bob_did);
+
+    // --- Force sender_key_epoch != MLS group epoch ---------------------------
+    // Rotate Alice's sender key: `rotate_sender_key` increments the per-sender
+    // `sender_key_epoch` from 1 to 2 (§9.16.5), while the MLS group epoch stays
+    // at 1 (rotation is a sender-key-only operation that issues no MLS commit).
+    // The two epoch axes are now unequal, so a regression that sourced the
+    // header/AAD epoch from the MLS group epoch could not pass as a coincidence.
+    let rotated_epoch: u64 = 2;
+    alice.rotate_sender_key(&context_id).unwrap();
+    // `rotate_sender_key` itself queues an HPKE-sealed distribution of the new
+    // (epoch-2) key to every remaining member. Drain and deliver those to Bob so
+    // he can open the post-rotation send. `process_incoming_sender_key` records
+    // the distributed epoch as Bob's per-sender high-water, which his
+    // receive-side ceiling checks against.
+    for (_target, msg) in alice
+        .drain_pending_sender_key_messages(&context_id)
+        .unwrap()
+    {
+        bob.process_incoming_sender_key(&context_id, alice_did, &msg)
+            .unwrap();
+    }
+    assert_eq!(
+        bob.export_sender_key_epochs(&context_id)
+            .into_iter()
+            .find(|(did, _)| did == alice_did)
+            .map(|(_, e)| e),
+        Some(rotated_epoch),
+        "Bob must record Alice's distributed sender-key epoch (2), proving the          epoch axis is the sender-key epoch — distinct from the MLS group epoch (1)"
+    );
+
+    // --- Real native seal -> real native open across the divergence ----------
+    let plaintext = b"cross-family payload";
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let params = InnerEnvelopeParams {
+        version: SCP_PROTOCOL_VERSION,
+        context_id: context_id_str,
+        sender_did: alice_did,
+        epoch: 0,
+        generation: 0,
+        sequence: 1,
+        timestamp: 1_700_000_000,
+        message_type: MessageType::Content,
+        payload: plaintext,
+        provenance: None,
+        signing_key_id: scp_identity::SigningKeyId::Active,
+    };
+    let inner = create_inner_envelope_raw(&params, &sk).unwrap();
+
+    let sealed = alice.seal(&context_id, &inner, &routing_id, 300).unwrap();
+
+    // Bob opens via the real native receive pipeline (MLS decrypt ->
+    // parse_sender_header -> decrypt_sender_layer with the RAW context_id AAD).
+    // Success here proves the seal/open wrappers agree on the sender-key epoch
+    // in BOTH header and AAD even though it differs from the MLS group epoch.
+    let opened = bob.open(&context_id, context_id_str, &sealed).unwrap();
+    match opened {
+        OpenResult::Application(env) => {
+            assert_eq!(
+                env.sender_did, alice_did,
+                "the opened envelope must attribute the sender DID"
+            );
+            assert_eq!(
+                env.inner.sequence, 1,
+                "the opened inner envelope must round-trip the sequence"
+            );
+        }
+        other => panic!("expected an Application open result, got {other:?}"),
+    }
+
+    // Defense (shared primitive): the header is authoritative — a header epoch
+    // that disagrees with the AEAD-bound epoch fails closed. This guards the
+    // exact failure mode an MLS-epoch regression would introduce.
     use scp_protocol::crypto::sender_keys::SenderKey;
     use scp_protocol::crypto::sender_keys::encrypt::{
         SENDER_HEADER_SIZE, build_sender_header, decrypt_sender_layer, encrypt_sender_layer,
         parse_sender_header,
     };
-
-    // Identical inputs on both families. The epoch is the per-sender
-    // `sender_key_epoch` (§9.16.5), NOT the MLS group epoch — that is the Phase
-    // 2 convergence on top of the Phase 1 raw-context_id AAD convergence.
     let key = SenderKey::from_bytes([0x5A; 32]);
-    let plaintext = b"cross-family payload";
-    let context_id = "ctx-cross-family";
-    let sender_did = "did:dht:zCrossFamily";
-    let sender_key_epoch = 4u64;
-    let sequence = 11u64;
-
-    // --- "Native seal" framing: encrypt_sender_layer then build_sender_header,
-    // using state.sender_key_epoch + state.send_sequence. ---
-    let native_ct = encrypt_sender_layer(
+    let ct = encrypt_sender_layer(
         &key,
         plaintext,
-        context_id,
-        sender_did,
-        sender_key_epoch,
-        sequence,
+        context_id_str,
+        alice_did,
+        rotated_epoch,
+        11,
     )
-    .expect("native-style sender encrypt must succeed");
-    let native_framed = build_sender_header(sender_key_epoch, sequence, &native_ct);
-
-    // --- "WASM encrypt_message" framing: the identical two shared calls. ---
-    let wasm_ct = encrypt_sender_layer(
-        &key,
-        plaintext,
-        context_id,
-        sender_did,
-        sender_key_epoch,
-        sequence,
-    )
-    .expect("wasm-style sender encrypt must succeed");
-    let wasm_framed = build_sender_header(sender_key_epoch, sequence, &wasm_ct);
-
-    // 1. The 16-byte header is deterministic and byte-identical across families.
-    // (The AEAD bodies differ only by their random 12-byte nonces.)
+    .expect("sender encrypt must succeed");
+    let framed = build_sender_header(rotated_epoch, 11, &ct);
     assert_eq!(SENDER_HEADER_SIZE, 16);
     assert_eq!(
-        &native_framed[..SENDER_HEADER_SIZE],
-        &wasm_framed[..SENDER_HEADER_SIZE],
-        "the epoch || sequence header must be byte-identical across families"
-    );
-    assert_eq!(
-        &native_framed[..8],
-        &sender_key_epoch.to_be_bytes(),
+        &framed[..8],
+        &rotated_epoch.to_be_bytes(),
         "header bytes 0..8 must be the sender_key_epoch big-endian"
     );
-    assert_eq!(
-        &native_framed[8..16],
-        &sequence.to_be_bytes(),
-        "header bytes 8..16 must be the sequence big-endian"
-    );
-
-    // 2a. Native-framed message decrypts the "WASM way" (parse header → decrypt
-    // with parsed epoch/seq + raw context_id AAD).
-    let (epoch_n, seq_n, ct_n) = parse_sender_header(&native_framed).expect("parse native header");
-    assert_eq!((epoch_n, seq_n), (sender_key_epoch, sequence));
-    let wasm_recovers_native =
-        decrypt_sender_layer(&key, ct_n, context_id, sender_did, epoch_n, seq_n)
-            .expect("WASM-style open must decrypt native-framed message");
-    assert_eq!(wasm_recovers_native, plaintext);
-
-    // 2b. WASM-framed message decrypts the "native way".
-    let (epoch_w, seq_w, ct_w) = parse_sender_header(&wasm_framed).expect("parse wasm header");
-    assert_eq!((epoch_w, seq_w), (sender_key_epoch, sequence));
-    let native_recovers_wasm =
-        decrypt_sender_layer(&key, ct_w, context_id, sender_did, epoch_w, seq_w)
-            .expect("native-style open must decrypt WASM-framed message");
-    assert_eq!(native_recovers_wasm, plaintext);
-
-    // Defense: a header epoch mismatch between the AAD-bound epoch and the
-    // parsed-header epoch breaks AEAD (the header is authoritative — a tampered
-    // header that disagrees with the sealed AAD fails closed).
-    let tampered = build_sender_header(sender_key_epoch + 1, sequence, &native_ct);
+    let tampered = build_sender_header(rotated_epoch + 1, 11, &ct);
     let (te, ts, tct) = parse_sender_header(&tampered).expect("parse tampered header");
     assert!(
-        decrypt_sender_layer(&key, tct, context_id, sender_did, te, ts).is_err(),
+        decrypt_sender_layer(&key, tct, context_id_str, alice_did, te, ts).is_err(),
         "a header epoch that disagrees with the sealed AAD must fail AEAD"
     );
 }
