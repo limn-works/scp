@@ -605,7 +605,7 @@ pub enum PreRotationCustodyError {
 }
 
 /// Discriminator for the six approved §9.7.4.1 §4 custody methods, plus the
-/// bridge-callback and WASM-local variants that route to one of the six.
+/// bridge-callback variant that routes to one of the six.
 ///
 /// Used for diagnostics and SDK UX (e.g., "Your pre-rotation key is on a
 /// hardware token — please tap your `YubiKey`"). MUST NOT be used for security
@@ -639,10 +639,6 @@ pub enum PreRotationCustodyKind {
     /// operational custody, Android Keystore alias with separate
     /// authentication flow, FIDO2/PRF, encrypted backup, etc.).
     Callback,
-    /// In-process linear-memory retention. **DOCUMENTED degraded mode** — the
-    /// pre-rotation key co-resides in process memory with operational keys.
-    /// Pending passkey-PRF cold storage as a follow-up workstream.
-    WasmLocalRetention,
 }
 
 /// Cold-custody interface for pre-rotation keys (spec §9.7.4.1).
