@@ -948,48 +948,36 @@ fn tool_invoke_cross_context_impl(
 // ---------------------------------------------------------------------------
 
 /// Maps a `SagaError` terminal (the typed §6.2.4 terminal space) onto the
-/// bridge's typed saga error variants, reading every structured datum
-/// STRUCTURALLY off the variant — never by re-parsing a message string.
+/// bridge's typed saga error variants.
 ///
-/// - `Aborted { reason, code, message }` → [`ScpPyError::SagaAborted`].
-///   `retry_after_ms` is read directly off `SagaAbortReason::RateLimited`
-///   (an `Option<u64>`); a plain `Rejected` carries `None`. `None` is
-///   propagated, NEVER coerced to `0` (a `0` would read as "retry
-///   immediately" and re-trip the same hard limit). `code` is formatted as
-///   the canonical `SCP-SAGA-{code}` string from the numeric discriminant.
-/// - `NeedsRepair { saga_id, message }` → [`ScpPyError::SagaNeedsRepair`]
-///   carrying the durable operator-repair handle (`SCP-SAGA-13065`).
-/// - `Busy { contended_context, message }` → [`ScpPyError::SagaBusy`]
-///   (`SCP-SAGA-13066`).
+/// The decomposition — the `SagaAbortReason::RateLimited → Option<u64>` read,
+/// the `None`-never-coerced-to-`0` rule, and the `SCP-SAGA-{code}` formatting —
+/// lives ONCE in [`scp_ffi_common::saga_errors::decompose_saga_error`], unit-
+/// tested there, so the three bridges cannot drift. This function is the thin
+/// per-bridge tail that carries the `PyO3` field labels (`message:`):
+///
+/// - `Aborted` → [`ScpPyError::SagaAborted`] (`retry_after_ms`, `None` never
+///   `0`, `SCP-SAGA-{code}`).
+/// - `NeedsRepair` → [`ScpPyError::SagaNeedsRepair`] (durable repair handle,
+///   `SCP-SAGA-13065`).
+/// - `Busy` → [`ScpPyError::SagaBusy`] (`SCP-SAGA-13066`).
 fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpPyError {
-    use scp_core::context::supervisor::{SagaAbortReason, SagaError};
-    match err {
-        SagaError::Aborted {
-            reason,
-            code,
-            message,
-        } => {
-            let retry_after_ms = match reason {
-                SagaAbortReason::RateLimited { retry_after_ms } => retry_after_ms,
-                SagaAbortReason::Rejected => None,
-            };
-            ScpPyError::SagaAborted {
-                message,
-                code: format!("SCP-SAGA-{code}"),
-                retry_after_ms,
-            }
-        }
-        SagaError::NeedsRepair { saga_id, message } => ScpPyError::SagaNeedsRepair {
-            message,
-            code: codes::SAGA_13065.to_owned(),
-            saga_id: saga_id.0,
+    use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
+    let parts = decompose_saga_error(err);
+    match parts.kind {
+        SagaErrorKind::Aborted { retry_after_ms } => ScpPyError::SagaAborted {
+            message: parts.message,
+            code: parts.code,
+            retry_after_ms,
         },
-        SagaError::Busy {
-            contended_context,
-            message,
-        } => ScpPyError::SagaBusy {
-            message,
-            code: codes::SAGA_13066.to_owned(),
+        SagaErrorKind::NeedsRepair { saga_id } => ScpPyError::SagaNeedsRepair {
+            message: parts.message,
+            code: parts.code,
+            saga_id,
+        },
+        SagaErrorKind::Busy { contended_context } => ScpPyError::SagaBusy {
+            message: parts.message,
+            code: parts.code,
             contended_context,
         },
     }
@@ -2556,29 +2544,33 @@ mod tests {
     // ------------------------------------------------------------------
     // map_saga_error — the bridge's typed-terminal → typed-error mapping.
     //
-    // The producer's actual terminal behavior (which SagaError a given saga
-    // run yields) is covered in `crates/scp-runtime`; here we test ONLY the
-    // bridge's mapping responsibility: that each typed `SagaError` becomes the
-    // right `ScpPyError` variant with EVERY structured datum preserved
-    // STRUCTURALLY (read off the variant, never parsed from a message) and the
-    // canonical `SCP-SAGA-13xxx` code attached.
+    // The classification itself (the `RateLimited → Option<u64>` read, the
+    // `None`-never-`0` rule, the `SCP-SAGA-{code}` formatting, the fixed
+    // terminal codes) lives in `scp_ffi_common::saga_errors` and is unit-tested
+    // there for all three bridges. The producer's actual terminal behavior is
+    // covered in `crates/scp-runtime`. Here we test ONLY this bridge's thin
+    // tail: that each `SagaErrorKind` routes through `common` onto the right
+    // `ScpPyError` variant with the shared `code`/`message` and the
+    // per-terminal datum (`retry_after_ms`/`saga_id`/`contended_context`)
+    // carried onto the PyO3 fields — including that `retry_after_ms = None` is
+    // preserved (never coerced to `Some(0)`).
     // ------------------------------------------------------------------
 
     use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError, SagaId};
 
-    /// A rate-limited abort preserves `retry_after_ms = Some(ms)` STRUCTURALLY
-    /// and formats the producer's numeric `code` as the canonical
-    /// `SCP-SAGA-{code}` string.
+    /// `Aborted` routes through `common` onto `ScpPyError::SagaAborted` with the
+    /// `SCP-SAGA-{code}` string and `retry_after_ms` carried structurally; a
+    /// `None` back-off hint stays `None` (never `Some(0)`).
     #[test]
-    fn map_saga_error_rate_limited_preserves_retry_after_ms() {
-        let mapped = map_saga_error(CoreSagaError::Aborted {
+    fn map_saga_error_aborted_routes_through_common() {
+        let some = map_saga_error(CoreSagaError::Aborted {
             reason: SagaAbortReason::RateLimited {
                 retry_after_ms: Some(2500),
             },
             code: 13026,
             message: "inbound rate limit exceeded".to_owned(),
         });
-        match mapped {
+        match some {
             ScpPyError::SagaAborted {
                 code,
                 retry_after_ms,
@@ -2589,21 +2581,15 @@ mod tests {
             }
             other => panic!("expected SagaAborted, got {other:?}"),
         }
-    }
 
-    /// A rate-limited abort with NO precise back-off instant preserves
-    /// `retry_after_ms = None` — NEVER coerced to `Some(0)` (a `0` would read
-    /// as "retry immediately" and re-trip the same hard limit).
-    #[test]
-    fn map_saga_error_rate_limited_none_is_not_zero() {
-        let mapped = map_saga_error(CoreSagaError::Aborted {
+        let none = map_saga_error(CoreSagaError::Aborted {
             reason: SagaAbortReason::RateLimited {
                 retry_after_ms: None,
             },
             code: 13026,
             message: "hard limit, no precise back-off".to_owned(),
         });
-        match mapped {
+        match none {
             ScpPyError::SagaAborted { retry_after_ms, .. } => {
                 assert_eq!(retry_after_ms, None, "None must NOT be coerced to Some(0)");
             }
@@ -2611,53 +2597,27 @@ mod tests {
         }
     }
 
-    /// A plain (non-rate-limit) `Rejected` abort carries `retry_after_ms = None`.
+    /// `NeedsRepair` / `Busy` route through `common` onto their `PyO3` variants
+    /// with the fixed terminal codes and per-terminal datum carried.
     #[test]
-    fn map_saga_error_rejected_has_no_retry_hint() {
-        let mapped = map_saga_error(CoreSagaError::Aborted {
-            reason: SagaAbortReason::Rejected,
-            code: 13050,
-            message: "caller not a member".to_owned(),
-        });
-        match mapped {
-            ScpPyError::SagaAborted {
-                code,
-                retry_after_ms,
-                ..
-            } => {
-                assert_eq!(code, "SCP-SAGA-13050");
-                assert_eq!(retry_after_ms, None);
-            }
-            other => panic!("expected SagaAborted, got {other:?}"),
-        }
-    }
-
-    /// `NeedsRepair` preserves the durable `saga_id` operator-repair handle and
-    /// the fixed terminal code `SCP-SAGA-13065`.
-    #[test]
-    fn map_saga_error_needs_repair_preserves_saga_id() {
-        let mapped = map_saga_error(CoreSagaError::NeedsRepair {
+    fn map_saga_error_needs_repair_and_busy_route_through_common() {
+        let repair = map_saga_error(CoreSagaError::NeedsRepair {
             saga_id: SagaId("saga-abc-123".to_owned()),
             message: "commit retries exhausted".to_owned(),
         });
-        match mapped {
+        match repair {
             ScpPyError::SagaNeedsRepair { code, saga_id, .. } => {
                 assert_eq!(code, codes::SAGA_13065);
                 assert_eq!(saga_id, "saga-abc-123");
             }
             other => panic!("expected SagaNeedsRepair, got {other:?}"),
         }
-    }
 
-    /// `Busy` preserves the contended context id and the fixed terminal code
-    /// `SCP-SAGA-13066`.
-    #[test]
-    fn map_saga_error_busy_preserves_contended_context() {
-        let mapped = map_saga_error(CoreSagaError::Busy {
+        let busy = map_saga_error(CoreSagaError::Busy {
             contended_context: "ctx-shared-99".to_owned(),
             message: "participant set overlaps an in-flight saga".to_owned(),
         });
-        match mapped {
+        match busy {
             ScpPyError::SagaBusy {
                 code,
                 contended_context,
