@@ -693,7 +693,7 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
 /// group, broadcast/sender keys, and event log at creation.
 ///
 /// Delegates to the canonical [`super::state::context_id_to_bytes`]
-/// (ADR-056): a real 64-hex context id (as [`generate_context_id`] produces)
+/// (ADR-056): a real 64-hex context id (as `generate_context_id` produces)
 /// resolves to its raw digest, so the MLS group, sender key, and event log
 /// created here are keyed under the SAME bytes that `PerContextState.context_id`
 /// holds (`context_id_to_bytes` of the same id). A synthetic /

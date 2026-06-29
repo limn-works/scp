@@ -2031,7 +2031,7 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 /// This is the SINGLE chokepoint (ADR-056) through which every context-id
 /// string is turned into keying bytes. Per ADR-056 (Model A) and spec
 /// §6.2.4:276, a context's canonical identity IS its 32-byte digest, and the
-/// id STRING is `hex(digest)` — exactly the form [`generate_context_id`]
+/// id STRING is `hex(digest)` — exactly the form `generate_context_id`
 /// produces (32 CSPRNG bytes, lowercase-hex encoded, §18.4.1). For such a
 /// real context id the canonical bytes are the digest itself, recovered by
 /// **decoding** the hex — NOT by re-hashing the already-hex-encoded digest
@@ -2051,7 +2051,7 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 ///   change** — they were never 64-hex, so their behavior is unchanged.
 ///
 /// The 64-hex guard is strict (length 64 AND all `0-9a-f`): `hex::decode`
-/// alone would also accept uppercase, but [`generate_context_id`] emits only
+/// alone would also accept uppercase, but `generate_context_id` emits only
 /// lowercase, so requiring lowercase keeps an uppercase 64-char test id on
 /// the hashing fallback rather than silently decoding it.
 ///
