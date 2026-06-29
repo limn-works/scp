@@ -494,8 +494,6 @@ pub fn context_decrypt_message(
     handle: &WasmContextHandle,
     sender_did: String,
     ciphertext_base64: String,
-    epoch: u64,
-    sequence: u64,
 ) -> Promise {
     if let Err(e) = validate_did(&sender_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -503,16 +501,14 @@ pub fn context_decrypt_message(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let plaintext = with_manager(|mgr| {
-            mgr.decrypt_message(
-                &context_id,
-                &sender_did,
-                &ciphertext_base64,
-                epoch,
-                sequence,
-            )
-        })
-        .map_err(ScpWasmError::into_js)?;
+        // Epoch and sequence are carried INSIDE the message (the authoritative
+        // 16-byte `epoch || sequence` header, §9.16.1) and parsed by the crypto
+        // layer — the JS caller no longer supplies them. This also removes a
+        // class of caller error (passing the wrong epoch/sequence) and aligns
+        // the WASM receive API with native `open`.
+        let plaintext =
+            with_manager(|mgr| mgr.decrypt_message(&context_id, &sender_did, &ciphertext_base64))
+                .map_err(ScpWasmError::into_js)?;
 
         // Return as Uint8Array.
         let js_array = js_sys::Uint8Array::from(plaintext.as_slice());

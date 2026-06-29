@@ -2098,12 +2098,12 @@ impl WasmContextManager {
         // Initialize MLS crypto state for Encrypted mode.
         let crypto = if mode == "Encrypted" {
             Some(
-                crate::crypto::WasmCryptoState::new_for_context(creator_did).map_err(|e| {
-                    ScpWasmError::Crypto {
+                crate::crypto::WasmCryptoState::new_for_context(context_id, creator_did).map_err(
+                    |e| ScpWasmError::Crypto {
                         message: format!("MLS group creation failed: {e}"),
                         code: codes::CRYPTO_4004.to_owned(),
-                    }
-                })?,
+                    },
+                )?,
             )
         } else {
             None
@@ -2532,8 +2532,8 @@ impl WasmContextManager {
         // The reserved sequence above is rolled back on ANY failure before the
         // message is recorded, mirroring native
         // `MembershipState::rollback_sequence_number` (membership.rs, a
-        // `saturating_sub(1)`): a failed send (invalid base64, MLS epoch read,
-        // encryption) must burn no sequence, so two honest members never
+        // `saturating_sub(1)`): a failed send (invalid base64 or encryption)
+        // must burn no sequence, so two honest members never
         // diverge on a gap. The fallible work is wrapped in a closure so the
         // single `?`-propagating error path is captured for rollback rather
         // than early-returning. The closure borrows `ctx.crypto` mutably; the
@@ -2548,13 +2548,12 @@ impl WasmContextManager {
                         code: codes::CRYPTO_4001.to_owned(),
                     })?;
 
-                let epoch = crypto.mls_group.epoch().map_err(|e| ScpWasmError::Crypto {
-                    message: format!("failed to read MLS epoch: {e}"),
-                    code: codes::CRYPTO_4002.to_owned(),
-                })?;
-
+                // The sender-key epoch fed into the AAD + 16-byte header is the
+                // per-sender `sender_key_epoch` (§9.16.5), held inside
+                // `WasmCryptoState` — NOT the MLS group epoch. `encrypt_message`
+                // reads it internally, so no epoch is passed here.
                 let ciphertext = crypto
-                    .encrypt_message(&raw_bytes, context_id, sender_did, epoch, seq)
+                    .encrypt_message(&raw_bytes, context_id, sender_did, seq)
                     .map_err(|e| ScpWasmError::Crypto {
                         message: format!("encryption failed: {e}"),
                         code: codes::CRYPTO_4003.to_owned(),
@@ -2667,8 +2666,6 @@ impl WasmContextManager {
         context_id: &str,
         sender_did: &str,
         ciphertext_base64: &str,
-        epoch: u64,
-        sequence: u64,
     ) -> Result<Vec<u8>, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -2684,8 +2681,11 @@ impl WasmContextManager {
                 code: codes::CRYPTO_4001.to_owned(),
             })?;
 
+        // Epoch/sequence are NOT supplied by the caller — they are parsed from
+        // the authoritative 16-byte header inside `decrypt_message` (§9.16.1),
+        // which also enforces the epoch-poisoning ceiling and replay detection.
         crypto
-            .decrypt_message(&ciphertext, context_id, sender_did, epoch, sequence)
+            .decrypt_message(&ciphertext, context_id, sender_did)
             .map_err(|e| ScpWasmError::Crypto {
                 message: format!("decryption failed: {e}"),
                 code: codes::CRYPTO_4011.to_owned(),
@@ -2838,11 +2838,22 @@ impl WasmContextManager {
         // assigned `now_secs()` timestamp) is IDENTICAL to the unencrypted
         // `join_context` leaf; only WHEN it is appended differs.
         let ctx = self.require_active_context_mut(context_id)?;
-        ctx.crypto = Some(crate::crypto::WasmCryptoState {
+        let established_crypto = crate::crypto::WasmCryptoState {
             mls_group,
             local_sender_key: crate::crypto::sender_key::generate_sender_key(),
-            sender_key_store: std::collections::HashMap::new(),
-        });
+            context_id: context_id.to_owned(),
+            sender_key_epoch: crate::crypto::INITIAL_SENDER_KEY_EPOCH,
+            sender_key_store: scp_protocol::crypto::sender_keys::SenderKeyStore::new(),
+            recv_sequence_tracker: std::collections::HashMap::new(),
+        };
+        // A freshly established WASM crypto state opens its OWN receive replay
+        // window (empty recv tracker, empty epoch high-water, initial
+        // sender-key epoch). This matches native's foreign-node behavior: the
+        // portable cross-party export deliberately DROPS the freshness/replay
+        // cache (it has no authority on a foreign node — see `scp-runtime`
+        // `export_import.rs`), so an importer never seeds replay state from a
+        // signed-but-untrusted snapshot. Replay protection is in-session only.
+        ctx.crypto = Some(established_crypto);
         ctx.push_event(ContextEvent::MemberJoined {
             member_did: DID(member_did.to_owned()),
             role_name: "member".to_owned(),
@@ -9306,10 +9317,13 @@ mod tests {
     fn export_version_matches_signed_constant() {
         // The WASM JSON-envelope version is an independent per-serializer
         // integer (§23.16.8): it need NOT equal the native MessagePack
-        // export version. It is currently 5 — the version that bound the
-        // export-scope discriminant into the Ed25519 signed preimage (v4
-        // introduced the full-snapshot signature). This test pins the constant
-        // so a change is deliberate.
+        // export version. It is currently 5 — v5 bound the export-scope
+        // discriminant into the Ed25519 signed preimage (v4 introduced the
+        // full-snapshot signature). The portable export deliberately carries NO
+        // receive-side replay/freshness cache (a foreign importer opens its own
+        // in-session replay window, matching native's foreign-node behavior in
+        // `scp-runtime` `export_import.rs`). This test pins the constant so a
+        // change is deliberate.
         assert_eq!(WASM_EXPORT_VERSION, 5);
     }
 
@@ -11809,7 +11823,7 @@ mod tests {
         {
             let ctx = mgr.contexts.get_mut(context_id).unwrap();
             ctx.crypto = Some(
-                crate::crypto::WasmCryptoState::new_for_context(creator)
+                crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
                     .expect("MLS group creation must succeed"),
             );
         }
@@ -11879,7 +11893,7 @@ mod tests {
             // runs. The creator created the group; the member only needs the
             // decode step, which fails first.
             ctx.crypto = Some(
-                crate::crypto::WasmCryptoState::new_for_context(creator)
+                crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
                     .expect("MLS group creation must succeed"),
             );
             // Add a write-granting member (so the role gate passes), then strip
@@ -11953,7 +11967,7 @@ mod tests {
             // Real MLS crypto so the encrypt path runs and a MessageSent leaf is
             // emitted to the receive buffer.
             ctx.crypto = Some(
-                crate::crypto::WasmCryptoState::new_for_context(creator)
+                crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
                     .expect("MLS group creation must succeed"),
             );
             ctx.test_insert_member(member, "member");
@@ -13548,7 +13562,7 @@ mod tests {
 
         let mut ctx = make_bare_per_context_state(context_id, creator);
         ctx.crypto = Some(
-            crate::crypto::WasmCryptoState::new_for_context(creator)
+            crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
                 .expect("MLS group creation must succeed for the test fixture"),
         );
         ctx.test_insert_member(removed, "member");
@@ -13636,7 +13650,7 @@ mod tests {
         let timestamp_secs = 1_700_700_700_u64;
 
         let mut ctx = make_bare_per_context_state(context_id, creator);
-        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
             .expect("MLS group creation must succeed for the test fixture");
         // Destroy the MLS group so any eviction attempt hits GroupDestroyed — a
         // genuine MLS failure (not a missing-leaf no-op).
@@ -13849,8 +13863,9 @@ mod tests {
         // A separate creator MLS group adds the joiner's key package and mints
         // the Welcome. `add_member` returns already-TLS-serialized
         // `(commit_bytes, welcome_bytes)`.
-        let mut creator_crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
-            .expect("MLS group creation must succeed for the creator");
+        let mut creator_crypto =
+            crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
+                .expect("MLS group creation must succeed for the creator");
         let joiner_kp_in = KeyPackageIn::tls_deserialize(&mut &*joiner_kp_bytes)
             .expect("key package deserializes");
         let (_commit_bytes, welcome_bytes) = creator_crypto
@@ -13920,7 +13935,7 @@ mod tests {
         let timestamp_secs = 1_700_800_800_u64;
 
         let mut ctx = make_bare_per_context_state(context_id, creator);
-        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+        let mut crypto = crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
             .expect("MLS group creation must succeed");
 
         // Add Bob as a REAL MLS leaf via the standard key-package + add flow.
@@ -14006,7 +14021,7 @@ mod tests {
         let timestamp_secs = 1_701_000_000_u64;
 
         let mut ctx = make_bare_per_context_state(context_id, creator);
-        let crypto = crate::crypto::WasmCryptoState::new_for_context(creator)
+        let crypto = crate::crypto::WasmCryptoState::new_for_context(context_id, creator)
             .expect("MLS group creation must succeed");
         ctx.crypto = Some(crypto);
         // Seed F5 per-DID state for the creator so we can prove it is cleaned up.
