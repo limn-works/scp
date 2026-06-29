@@ -381,6 +381,19 @@
       ]
     },
     {
+      "canonical": "tool_invoke_cross_context_saga",
+      "category": "tools",
+      "pyo3": [
+        "tool_invoke_cross_context_saga"
+      ],
+      "uniffi": [
+        "tool_invoke_cross_context_saga"
+      ],
+      "napi": [
+        "tool_invoke_cross_context_saga"
+      ]
+    },
+    {
       "canonical": "tool_session_create",
       "category": "tools",
       "pyo3": [

@@ -1381,7 +1381,12 @@ fn discovery_and_provenance_coverage() {
 // `evaluate_ucan`, returns a structured CapabilityValidation; never records the
 // nonce) is exposed across all three bridges. Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 105;
+//
+// Subsequently RAISED 105 -> 106 by the `tool_invoke_cross_context_saga` op:
+// the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a), exposed
+// across all three native bridges (PyO3 / UniFFI / NAPI). Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 106;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement
