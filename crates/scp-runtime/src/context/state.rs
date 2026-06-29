@@ -2059,8 +2059,17 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 /// SHA-256 primitive) directly — that primitive stays a pure SHA-256
 /// derivation for synthetic / non-context labels only, never re-hashing a
 /// canonical context id (ADR-056, the double-hash trap).
+///
+/// This is the canonical CROSS-CRATE keying resolver: the single permitted way
+/// for ANY layer — the runtime core AND the FFI bridges (`PyO3` / NAPI /
+/// `UniFFI`), which reach it as `scp_core::context::state::context_id_to_bytes`
+/// — to turn a context-id string into keying bytes. The raw routing primitive
+/// [`scp_protocol::context::context_id_bytes`] is routing/fallback ONLY and
+/// must never be used for keying: it double-hashes a real 64-hex id and keys
+/// the wrong slot (the fail-open this ADR-056 chokepoint closes). Every storage
+/// / crypto / event-log keying site must funnel through here.
 #[must_use]
-pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
+pub fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
     if context_id.len() == 64
         && context_id
             .bytes()

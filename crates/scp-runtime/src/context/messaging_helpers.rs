@@ -3781,7 +3781,9 @@ mod pseudonym_routing_tests {
         };
 
         let ctx = ctx_hex(0x11);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
+        // fidelity with production keying (decodes the digest, never re-hashes).
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: RegressionState = encrypted_state();
 
         // Install a MessageVelocity rule that triggers on the FIRST message from
@@ -4211,7 +4213,9 @@ mod pseudonym_routing_tests {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         let ctx = ctx_hex(0x11);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
+        // fidelity with production keying (decodes the digest, never re-hashes).
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: PerContextState = encrypted_state();
 
         // The direct delivery path requires an Active context handle.

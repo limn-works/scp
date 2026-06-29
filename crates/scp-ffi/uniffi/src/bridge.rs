@@ -12776,7 +12776,12 @@ impl Scp {
                 // cross-bridge parity harness's `OP_EVENT_LOG_APPEND` and
                 // `OP_EVENT_LOG_FILTERED` (ADR-046).
                 if let Some(manager) = bi.try_context_manager_ready() {
-                    let ctx_id_bytes = scp_core::context::context_id_bytes(&handle.context_id);
+                    // ADR-056: resolve the context-id string to its 32-byte
+                    // digest via the canonical chokepoint (NOT the raw SHA-256
+                    // routing primitive, which double-hashes a real 64-hex id
+                    // and queries the wrong event-log key).
+                    let ctx_id_bytes =
+                        scp_core::context::state::context_id_to_bytes(&handle.context_id);
                     if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
                         && !entries.is_empty()
                     {

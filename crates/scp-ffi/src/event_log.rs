@@ -225,7 +225,10 @@ fn query_manager_entries(
     context_id: &str,
     query_filter: &scp_core::store::event_log::EventQueryFilter,
 ) -> PyResult<Option<Vec<PyEvent>>> {
-    let ctx_id_bytes = scp_core::context::context_id_bytes(context_id);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
     let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())

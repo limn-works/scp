@@ -26,7 +26,9 @@ A context's **canonical identity IS its 32-byte digest.** The id STRING is `hex(
 All resolution funnels through a **single chokepoint** in `crates/scp-runtime/src/context/state.rs`:
 
 ```rust
-pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32]
+// `pub` (not `pub(crate)`): the FFI bridges reach it cross-crate as
+// `scp_core::context::state::context_id_to_bytes`.
+pub fn context_id_to_bytes(context_id: &str) -> [u8; 32]
 ```
 
 with the resolution rule:
@@ -43,6 +45,8 @@ No new hashing is introduced. `generate_context_id` *already* mints `hex(32 CSPR
 ### The double-hash trap (invariant)
 
 Canonical context ids are **decoded, never re-hashed.** `scp_protocol::context::context_id_bytes` stays a **pure SHA-256 primitive** used only for synthetic / non-context labels (the resolver's own fallback, and the documented `"identity-private-state"` site). Re-applying it to a real `hex(digest)` id is precisely the bug this ADR fixes; the single-chokepoint discipline plus a closed-allowlist gate (`scripts/check-context-id-keying.sh`) enforce mechanically that no keying site in `scp-runtime` calls the raw primitive on a context id outside the documented allowlist.
+
+The chokepoint is a **cross-layer** convention, not a runtime-only one. The FFI bridges (PyO3 / NAPI / UniFFI) resolve context-id keying via `scp_core::context::state::context_id_to_bytes` — the same chokepoint, reached through the `scp_core` facade re-export — so an event-log query or Merkle inclusion/absence proof keys the identical digest slot the manager wrote under. (Four FFI event-log sites originally called the raw `scp_core::context::context_id_bytes` re-export, double-hashing every real id and querying an empty slot — a fail-open caught in adversarial review and fixed.) Correspondingly, `scripts/check-context-id-keying.sh` scans **both** `crates/scp-runtime/src` and `crates/scp-ffi`, and matches the `scp_protocol::`, `scp_core::`, and bare/aliased import spellings of the raw primitive. That gate is a **coarse line-based tripwire** for the common accidental-copy regression — defense in depth, **not** the primary guarantee and not a proof of correctness (a multiline-split qualified call is line-evadable, though caught by `cargo fmt --check`). The **principled, compiler-enforced** path is a `ContextDigest` newtype that only the chokepoint can mint, so the raw primitive's bytes can never reach a keying call site; that work is tracked as issue #1931.
 
 ## Rationale
 
