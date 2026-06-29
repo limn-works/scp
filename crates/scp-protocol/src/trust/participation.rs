@@ -359,13 +359,18 @@ fn is_adverse_action_type(action_type: &str) -> bool {
 /// Records a [`EventType::GovernanceActionExecuted`] leaf into the appropriate
 /// bucket for `compute_participation_record`.
 ///
-/// When the subject is the actor, the action is recorded in `actions_by` keyed
-/// on the actor. Otherwise the canonical [`GovernanceActionExecutedPayload`] is
-/// decoded **once** and recorded in `actions_against` only when the subject is
-/// the (non-empty) target AND the action is adverse (H18: beneficial actions
-/// such as `RestoreAccess` must not deflate the target's standing score). An
-/// undecodable payload yields no target, so — as under the prior two-decode
-/// shape — it can never match the subject and is never counted here.
+/// The canonical [`GovernanceActionExecutedPayload`] is decoded **at most once**
+/// per event; the decoded `target_did` (empty → `None`) is reused by both
+/// branches.
+///
+/// - When the subject is the actor, the action is **always** recorded in
+///   `actions_by` keyed on the actor — even when the payload is undecodable, in
+///   which case its `target_did` is best-effort `None`.
+/// - Otherwise the action is recorded in `actions_against` only when the payload
+///   decoded, the subject is the (non-empty) target, AND the action is adverse
+///   (H18: beneficial actions such as `RestoreAccess` must not deflate the
+///   target's standing score). An undecodable payload yields no target, so it
+///   can never match the subject and is never counted here.
 fn record_governance_action(
     event: &Event,
     is_subject: bool,
@@ -373,27 +378,34 @@ fn record_governance_action(
     actions_by: &mut Vec<GovernanceActionSummary>,
     actions_against: &mut Vec<GovernanceActionSummary>,
 ) {
+    // Decode once; reuse for both buckets. Empty `target_did` → `None`.
+    let decoded = decode_payload::<GovernanceActionExecutedPayload>(&event.payload).ok();
+    let target = decoded
+        .as_ref()
+        .and_then(|p| (!p.target_did.is_empty()).then(|| p.target_did.clone()));
+
     if is_subject {
-        // Subject performed a governance action — keyed on actor_did.
+        // Subject performed a governance action — keyed on actor_did. Recorded
+        // unconditionally; `target_did` is best-effort (None if undecodable).
         actions_by.push(GovernanceActionSummary {
             timestamp: event.timestamp,
             actor_did: event.actor_did.clone(),
-            target_did: project_payload(&event.event_type, &event.payload)
-                .target_did
-                .map(Into::into),
+            target_did: target.map(Into::into),
             event_sequence: event.sequence,
         });
-    } else if let Ok(p) = decode_payload::<GovernanceActionExecutedPayload>(&event.payload) {
-        // Empty `target_did` projects to `None`, mirroring `project_payload`.
-        let target = (!p.target_did.is_empty()).then(|| p.target_did.clone());
-        if target.as_deref() == Some(subject_did) && is_adverse_action_type(&p.action_type) {
-            actions_against.push(GovernanceActionSummary {
-                timestamp: event.timestamp,
-                actor_did: event.actor_did.clone(),
-                target_did: target.map(Into::into),
-                event_sequence: event.sequence,
-            });
-        }
+    } else if target.as_deref() == Some(subject_did)
+        && decoded
+            .as_ref()
+            .is_some_and(|p| is_adverse_action_type(&p.action_type))
+    {
+        // A non-empty `target` implies the payload decoded, so `decoded` is
+        // `Some` here; record the adverse action against the subject.
+        actions_against.push(GovernanceActionSummary {
+            timestamp: event.timestamp,
+            actor_did: event.actor_did.clone(),
+            target_did: target.map(Into::into),
+            event_sequence: event.sequence,
+        });
     }
 }
 
