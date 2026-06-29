@@ -306,10 +306,11 @@ pub fn consequence_event_payload(
 /// payload, emitting only the leaf hash. Layer-2 behavioral records need the
 /// `target_did` carried by governance/access-revocation events to compute
 /// participation facts (e.g. `governance_actions_against`). This struct is the
-/// single shared decode surface so that all four bridges (`PyO3`, NAPI,
-/// `UniFFI`, WASM) project byte-identical values for the same event — the
-/// cross-bridge parity contract. WASM links `scp-event-log` (not
-/// `scp-ffi-common`), so this must live here per ADR-034.
+/// single shared decode surface so that the three native bridges (`PyO3`,
+/// NAPI, `UniFFI`) project byte-identical values for the same event — the
+/// cross-bridge parity contract. It lives alongside the payload types in
+/// `scp-event-log` (not `scp-ffi-common`), so every bridge shares one decoder
+/// by construction.
 ///
 /// Fields default to `None`; only variants that carry the field decode it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -111,7 +111,7 @@ fn active_attestation(id: &str, subject: &str) -> Attestation {
 /// carries a representative spread of subject-bearing and target-bearing leaves.
 fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     let provider = MerkleEventLogProvider::new();
-    let ctx_bytes = scp_protocol::context::context_id_bytes(CONTEXT_ID);
+    let ctx_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
     provider.init_event_log(&ctx_bytes).expect("init log");
 
     // Walk the log in timestamp order. Bob joins at t=100, leaves at t=400 →

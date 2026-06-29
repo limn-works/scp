@@ -151,7 +151,7 @@ pub(crate) async fn event_log_query_on(
             // Project the typed payload's bridge-facing fields (e.g.
             // `target_did` for governance/access-revocation events,
             // `subject_did` for role/membership events) through the single
-            // shared decoder so all four bridges surface byte-identical values.
+            // shared decoder so all three native bridges surface byte-identical values.
             // Each key is omitted when the projection yields `None`.
             let projection =
                 scp_event_log::payload::project_payload(&entry.event_type, &entry.payload);
