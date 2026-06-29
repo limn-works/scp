@@ -1,10 +1,12 @@
 # SCP Chat Template
 
-Two-party encrypted chat over the Shared Context Protocol. Includes a Python CLI client and a TypeScript browser client. Both use real SCP SDK APIs: DID identity creation, encrypted context lifecycle, and async message send/receive.
+Two-party encrypted chat over the Shared Context Protocol. Provides a Python CLI client that uses real SCP SDK APIs: DID identity creation, encrypted context lifecycle, and async message send/receive.
+
+A browser client is not included: in-browser SCP runs as a remote thin client to a server-side `scp-node` (ADR-055), which is being added separately.
 
 ## Architecture
 
-Both clients perform the same protocol flow:
+The client performs the following protocol flow:
 
 1. **Create an identity** with in-memory key custody (`Identity.create`).
 2. **Create or join an encrypted context** with messaging capabilities (`Context.create`, `Context.join`).
@@ -41,35 +43,11 @@ python chat.py --relay wss://relay.example.com create
 - `/quit` or `/exit` to leave.
 - Ctrl-D (EOF) to leave.
 
-## TypeScript Browser
+## Connecting two participants
 
-### Prerequisites
+Both participants must be able to reach the same SCP relay to exchange messages. Pass `--relay wss://relay.example.com` to the Python CLI on each side.
 
-```sh
-cd typescript
-bun install
-```
-
-### Run
-
-```sh
-bun run build
-bun run serve
-# Open http://localhost:3000
-```
-
-### Usage
-
-1. Click **Create** to start a new context. The context ID is displayed.
-2. Copy the context ID and paste it into a second browser tab (or another machine).
-3. Click **Join** in the second tab.
-4. Type messages and press Enter or click **Send**.
-
-## Connecting the two clients
-
-Both clients must be able to reach the same SCP relay to exchange messages. Pass `--relay wss://relay.example.com` to the Python CLI, and for the browser client add a `Transport.connect` call with the same relay URL.
-
-Without a relay, the template demonstrates the SDK API patterns locally -- each client creates its own local context state. In a deployment with a shared relay, messages sent by one client appear in the other's receive stream.
+Without a relay, the template demonstrates the SDK API patterns locally -- each participant creates its own local context state. In a deployment with a shared relay, messages sent by one participant appear in the other's receive stream.
 
 ## Customization
 
@@ -77,4 +55,4 @@ Without a relay, the template demonstrates the SDK API patterns locally -- each 
 - **Memory scope**: change `"ephemeral"` to `"full"` to retain chat history after the context closes.
 - **Governance**: pass `governance="threshold"` for multi-admin contexts that require voting.
 - **Custody**: replace `"in_memory"` with `"platform"` for production key storage.
-- **Relay**: wire up `Transport.connect` / `TransportConfig` to connect both clients through the same relay.
+- **Relay**: wire up `Transport.connect` / `TransportConfig` to connect both participants through the same relay.

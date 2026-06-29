@@ -78,7 +78,6 @@ docs/                            Published documentation (agent-facing)
 scaffolds/                       Clonable barebones project setups
 ├── rust-client/                 Minimal Rust binary using scp-core
 ├── python-agent/                Python agent skeleton with async runtime
-├── typescript-web/              Browser app — remote thin client to a server-side scp-node (ADR-055)
 ├── typescript-node/             Node.js agent with NAPI binding
 ├── swift-ios/                   iOS app with Keychain custody
 ├── swift-macos/                 macOS app with Secure Enclave custody
@@ -86,7 +85,7 @@ scaffolds/                       Clonable barebones project setups
 └── relay/                       Minimal relay with scp-node, TLS, monitoring
 
 templates/                       Clonable working applications for common use cases
-├── chat/                        Two-party encrypted chat (CLI + web)
+├── chat/                        Two-party encrypted chat (Python CLI)
 ├── agent-tool-provider/         Agent exposing tools via SCP context + MCP
 ├── collaborative-workspace/     Multi-party context with roles and tools
 ├── personal-relay/              Self-hosted relay with auto-TLS
@@ -426,7 +425,6 @@ Each scaffold is a minimal, working project structure with:
 |---|---|---|
 | `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
 | `scaffolds/python-agent/` | Python | Python agent with scp-python, async runtime, identity setup |
-| `scaffolds/typescript-web/` | TypeScript | Browser app as a remote thin client to a server-side scp-node (ADR-055) |
 | `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
 | `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |
 | `scaffolds/swift-macos/` | Swift | macOS app with Secure Enclave custody |
@@ -450,7 +448,7 @@ Each template is a complete, running application that demonstrates a real use ca
 
 | Template | Language(s) | What it is |
 |---|---|---|
-| `templates/chat/` | Python + TypeScript | Two-party encrypted chat (CLI + web) |
+| `templates/chat/` | Python | Two-party encrypted chat (Python CLI) |
 | `templates/agent-tool-provider/` | Python | Agent exposing tools via SCP context with MCP bridge |
 | `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, tools, and governance |
 | `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
