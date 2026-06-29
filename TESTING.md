@@ -63,18 +63,6 @@ swift test
 
 Requires Swift 6.2. macOS ships 6.1 -- install 6.2 via [swift.org](https://swift.org/download/) or use `swift-actions/setup-swift@v2` in CI.
 
-### WASM
-
-```bash
-# Conformance tests (run on native, test WASM logic)
-cargo test -p scp-core --test wasm_conformance
-
-# Clippy for WASM target
-cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown
-```
-
-Some WASM tests are gated with `#[cfg(target_arch = "wasm32")]` because `JsError` panics on native.
-
 ## Feature Flags
 
 CI runs clippy and tests with four feature flags that enable in-memory key custody for testing. Always use these locally for CI parity:
@@ -126,4 +114,3 @@ Integration tests live in `crates/scp-testing/tests/integration/`.
 | TypeScript | ubuntu | tsc, biome, bun test |
 | Kotlin | ubuntu | ktlint, detekt, assembleRelease |
 | Swift | macOS | swiftlint, swiftformat, build, test |
-| WASM | ubuntu | clippy (wasm32 target) |

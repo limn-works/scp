@@ -13,26 +13,26 @@
     "Each entry has REQUIRED fields `name` and `path`, plus `kind` and `reason`.",
     "`path` is the workspace-relative source file that defines the exported fn",
     "(e.g. crates/scp-ffi/src/identity.rs). The gate matches on the QUALIFIED",
-    "key `<path>::<name>` — mirroring scripts/pure-helpers-allowlist.txt — so an",
+    "key `<path>::<name>` \u2014 mirroring scripts/pure-helpers-allowlist.txt \u2014 so an",
     "entry exempts ONLY the specific fn in the specific file it was written for.",
     "A bare-name match would silently swallow any future op sharing the name",
     "(e.g. a genuine op named `tools`, colliding with the `tools` getter),",
     "recreating the hide-by-omission class this gate exists to kill. The same",
     "fn name in two files needs two entries, one per path.",
     "",
-    "kind values: getter | lifecycle | dunder | wasm-only | test-fixture |",
+    "kind values: getter | lifecycle | dunder | test-fixture |",
     "introspection | constructor | bridge-specific | pending-registration.",
     "",
     "`bridge-specific` marks an export that is legitimately implemented in ONLY",
     "one bridge by design (verified against .docs/standards/sdk-capability-matrix.json",
-    "or the bridge's binding model) — NOT a parity gap. Do not register these in",
+    "or the bridge's binding model) \u2014 NOT a parity gap. Do not register these in",
     "bridge-aliases.json: doing so would make the other bridges report 'missing'.",
     "Its `reason` MUST reference the capability-matrix justification",
-    "(sdk-capability-matrix.json) OR an existing ADR-NNN / §N / SCP-NNN.",
+    "(sdk-capability-matrix.json) OR an existing ADR-NNN / \u00a7N / SCP-NNN.",
     "",
-    "`wasm-only` and `pending-registration` reasons MUST cite a durable",
-    "artifact (ADR-NNN / §N / SCP-NNN), and every cited ADR/SCP token must",
-    "actually EXIST in the repo corpus (.docs/adrs, .docs/prds) — a fabricated",
+    "`pending-registration` reasons MUST cite a durable",
+    "artifact (ADR-NNN / \u00a7N / SCP-NNN), and every cited ADR/SCP token must",
+    "actually EXIST in the repo corpus (.docs/adrs, .docs/prds) \u2014 a fabricated",
     "ADR-999 / SCP-9999 is rejected. The other kinds need a non-empty reason.",
     "This file is an enforcement artifact: only ADD entries (or remove an entry",
     "once the export it covers is deleted/registered). Weakening requires human",
@@ -43,49 +43,49 @@
       "name": "py_bridge_claim_shadow",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Claims a bridge shadow identity via identity attestation (ADR-023; spec §12.2.1). PyO3-only helper in bridge_connector.rs; the registered cross-bridge op is bridge_create_shadow, not claim. Not a parity gap."
+      "reason": "Claims a bridge shadow identity via identity attestation (ADR-023; spec \u00a712.2.1). PyO3-only helper in bridge_connector.rs; the registered cross-bridge op is bridge_create_shadow, not claim. Not a parity gap."
     },
     {
       "name": "py_bridge_derive_credential_key",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Derives a per-bridge credential encryption key (ADR-023; spec §12.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops (bridge_credential_provision, bridge_credential_retrieve, bridge_credential_rotate, bridge_credential_revoke, bridge_credential_list, bridge_credential_store_key, bridge_credential_get_key, bridge_credential_delete_key) are registered separately. Not a parity gap."
+      "reason": "Derives a per-bridge credential encryption key (ADR-023; spec \u00a712.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops (bridge_credential_provision, bridge_credential_retrieve, bridge_credential_rotate, bridge_credential_revoke, bridge_credential_list, bridge_credential_store_key, bridge_credential_get_key, bridge_credential_delete_key) are registered separately. Not a parity gap."
     },
     {
       "name": "py_bridge_generate_credential_key",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Generates a random bridge credential key (ADR-023; spec §12.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops are registered separately. Not a parity gap."
+      "reason": "Generates a random bridge credential key (ADR-023; spec \u00a712.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops are registered separately. Not a parity gap."
     },
     {
       "name": "py_bridge_oauth_build_auth_url",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Builds an OAuth 2.0 authorization URL for a bridge connector (ADR-023; spec §12.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
+      "reason": "Builds an OAuth 2.0 authorization URL for a bridge connector (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
     },
     {
       "name": "py_bridge_oauth_generate_pkce",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "PKCE S256 challenge generation for bridge-connector OAuth (ADR-023; spec §12.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
+      "reason": "PKCE S256 challenge generation for bridge-connector OAuth (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
     },
     {
       "name": "py_bridge_oauth_scopes_for_mode",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Returns recommended OAuth scopes for a bridge mode (ADR-023; spec §12.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
+      "reason": "Returns recommended OAuth scopes for a bridge mode (ADR-023; spec \u00a712.2.1). PyO3-only convenience helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
     },
     {
       "name": "py_bridge_open_shadow_envelope",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Opens a sender-key-encrypted bridge shadow envelope (ADR-023; spec §12.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
+      "reason": "Opens a sender-key-encrypted bridge shadow envelope (ADR-023; spec \u00a712.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
     },
     {
       "name": "py_bridge_seal_shadow_envelope",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Seals a sender-key-encrypted bridge shadow envelope (ADR-023; spec §12.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
+      "reason": "Seals a sender-key-encrypted bridge shadow envelope (ADR-023; spec \u00a712.10.2). PyO3-only crypto helper in bridge_connector.rs; not among the 11 cross-bridge Bridge ops in .docs/standards/sdk-capability-matrix.json. Not a parity gap."
     },
     {
       "name": "__aiter__",
@@ -115,7 +115,7 @@
       "name": "ceiling_policy",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
-      "reason": "Getter for ceiling policy on a metadata result type (spec §5.7)."
+      "reason": "Getter for ceiling policy on a metadata result type (spec \u00a75.7)."
     },
     {
       "name": "consequence_config",
@@ -139,7 +139,7 @@
       "name": "context_seed_peer_pseudonym",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "test-fixture",
-      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "creator_did",
@@ -193,7 +193,7 @@
       "name": "mode",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
-      "reason": "Getter for context mode on a metadata result type (spec §5.7)."
+      "reason": "Getter for context mode on a metadata result type (spec \u00a75.7)."
     },
     {
       "name": "new",
@@ -211,7 +211,7 @@
       "name": "promotion_policy",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
-      "reason": "Getter for promotion policy on a metadata result type (spec §5.7)."
+      "reason": "Getter for promotion policy on a metadata result type (spec \u00a75.7)."
     },
     {
       "name": "roles",
@@ -379,7 +379,7 @@
       "name": "py_mcp_load_contexts",
       "path": "crates/scp-ffi/src/mcp.rs",
       "kind": "bridge-specific",
-      "reason": "Loads MCP contexts from local/known registries plus relay probe for an MCP identity (ADR-015; spec §8). PyO3-only helper for the Python MCP server runtime; NAPI/WASM have no MCP server host. Not a cross-bridge parity op."
+      "reason": "Loads MCP contexts from local/known registries plus relay probe for an MCP identity (ADR-015; spec \u00a78). PyO3-only helper for the Python MCP server runtime; NAPI has no MCP server host. Not a cross-bridge parity op."
     },
     {
       "name": "py_mcp_server_info",
@@ -391,13 +391,13 @@
       "name": "py_mcp_server_wait",
       "path": "crates/scp-ffi/src/mcp.rs",
       "kind": "bridge-specific",
-      "reason": "Blocks until a registered MCP server handle finishes (ADR-015; spec §8). PyO3-only helper for the Python MCP server runtime; NAPI/WASM have no equivalent server host. Not a cross-bridge parity op."
+      "reason": "Blocks until a registered MCP server handle finishes (ADR-015; spec \u00a78). PyO3-only helper for the Python MCP server runtime; NAPI has no equivalent server host. Not a cross-bridge parity op."
     },
     {
       "name": "py_register_tool_handler",
       "path": "crates/scp-ffi/src/mcp.rs",
       "kind": "bridge-specific",
-      "reason": "Synchronous in-process tool-handler registration (mcp_register_tool_handler; SCP-212, ADR-010). Python-only by design per .docs/standards/sdk-capability-matrix.json MCP domain (register_tool_handler: python=true, ts/kt/swift=false): NAPI/WASM wire handlers via their own callback model and do not export this op. Not a parity gap."
+      "reason": "Synchronous in-process tool-handler registration (mcp_register_tool_handler; SCP-212, ADR-010). Python-only by design per .docs/standards/sdk-capability-matrix.json MCP domain (register_tool_handler: python=true, ts/kt/swift=false): NAPI wires handlers via its own callback model and do not export this op. Not a parity gap."
     },
     {
       "name": "py_registry_cleanup",
@@ -541,7 +541,7 @@
       "name": "fullstack_seed_peer_pseudonym",
       "path": "crates/scp-ffi/src/testing.rs",
       "kind": "test-fixture",
-      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_reset_network",
@@ -893,7 +893,7 @@
       "name": "context_cancel_subscription",
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "bridge-specific",
-      "reason": "Cancels an active context subscription stream (the explicit teardown counterpart of context_subscribe; spec §5 context lifecycle). NAPI-only by design: the napi-rs streaming model returns a handle the JS caller must explicitly cancel, whereas PyO3 drives cancellation via the async-iterator drop / CancellationToken and UniFFI/WASM expose no equivalent. Not a cross-bridge parity op."
+      "reason": "Cancels an active context subscription stream (the explicit teardown counterpart of context_subscribe; spec \u00a75 context lifecycle). NAPI-only by design: the napi-rs streaming model returns a handle the JS caller must explicitly cancel, whereas PyO3 drives cancellation via the async-iterator drop / CancellationToken and UniFFI exposes no equivalent. Not a cross-bridge parity op."
     },
     {
       "name": "context_migration_state",
@@ -905,7 +905,7 @@
       "name": "context_seed_peer_pseudonym",
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "test-fixture",
-      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_add_member",
@@ -947,7 +947,7 @@
       "name": "fullstack_seed_peer_pseudonym",
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "test-fixture",
-      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_reset_network",
@@ -1112,458 +1112,23 @@
       "reason": "Getter for a UCAN token id on a result type."
     }
   ],
-  "wasm": [
-    {
-      "name": "attributed_role",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for an attributed role on a result type."
-    },
-    {
-      "name": "bridge_id",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for a bridge id on a result type."
-    },
-    {
-      "name": "context_id",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for the context id on a handle/result type."
-    },
-    {
-      "name": "mode",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for context mode on a metadata result type."
-    },
-    {
-      "name": "operator_did",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for an operator DID on a result type."
-    },
-    {
-      "name": "platform",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for a platform descriptor on a result type."
-    },
-    {
-      "name": "platform_handle",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for a platform handle on a result type."
-    },
-    {
-      "name": "provenance_status",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for provenance status on a result type."
-    },
-    {
-      "name": "shadow_id",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for a shadow-identity id on a result type."
-    },
-    {
-      "name": "status",
-      "path": "crates/scp-ffi/wasm/src/bridge.rs",
-      "kind": "getter",
-      "reason": "Getter for transport status on a result type."
-    },
-    {
-      "name": "ceiling",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for context ceiling on a metadata result type."
-    },
-    {
-      "name": "ceiling_policy",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for ceiling policy on a metadata result type."
-    },
-    {
-      "name": "context_decrypt_message",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only message-decrypt sub-operation; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "context_extend_ttl",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only context TTL-extension sub-operation; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "context_generate_key_package",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only MLS key-package generation sub-operation; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "context_id",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for the context id on a handle/result type."
-    },
-    {
-      "name": "context_join_encrypted",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only encrypted-join sub-operation of context_join; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "context_ttl_remaining",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only context TTL-remaining accessor; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "creator_did",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for the context creator DID on a result type."
-    },
-    {
-      "name": "economic_policy",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for economic policy on a metadata result type."
-    },
-    {
-      "name": "governance",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for governance config on a metadata result type."
-    },
-    {
-      "name": "member_count",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for member count on a context-info result type (the parity op is context_member_count)."
-    },
-    {
-      "name": "min_protocol_version",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for minimum protocol version on a result type."
-    },
-    {
-      "name": "mode",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for context mode on a metadata result type."
-    },
-    {
-      "name": "payload_base64",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for a base64-encoded payload on a result type."
-    },
-    {
-      "name": "promotion_policy",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for promotion policy on a metadata result type."
-    },
-    {
-      "name": "sender_did",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for the message sender DID on a result type."
-    },
-    {
-      "name": "sequence",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for a sequence number on a result type."
-    },
-    {
-      "name": "state",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for a context/handle state on a result type."
-    },
-    {
-      "name": "timestamp",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for a timestamp field on a result type."
-    },
-    {
-      "name": "ttl_seconds",
-      "path": "crates/scp-ffi/wasm/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for context TTL seconds on a metadata result type."
-    },
-    {
-      "name": "petname_list_events",
-      "path": "crates/scp-ffi/wasm/src/discovery.rs",
-      "kind": "wasm-only",
-      "reason": "WASM-only petname event-log accessor; verbatim re-implementation at the WASM boundary per ADR-034."
-    },
-    {
-      "name": "context_id",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for the context id on a handle/result type."
-    },
-    {
-      "name": "details_json",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for a details JSON blob on a result type."
-    },
-    {
-      "name": "epoch",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for an MLS/group epoch on a result type."
-    },
-    {
-      "name": "event_count",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for an event count on an event-log result type."
-    },
-    {
-      "name": "merkle_root",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for the Merkle root on an event-log result type."
-    },
-    {
-      "name": "proof_type",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for a proof type on a result type."
-    },
-    {
-      "name": "sender_did",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for the message sender DID on a result type."
-    },
-    {
-      "name": "signature",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for the in-process Ed25519 checkpoint signature (hex) on a result type."
-    },
-    {
-      "name": "signing_payload_hash",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for a signing-payload hash on a result type."
-    },
-    {
-      "name": "timestamp",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Getter for a timestamp field on a result type."
-    },
-    {
-      "name": "verified",
-      "path": "crates/scp-ffi/wasm/src/event_log.rs",
-      "kind": "getter",
-      "reason": "Boolean getter: whether something is verified, on a result type."
-    },
-    {
-      "name": "agent_public_key",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for an identity's agent public key on a result type."
-    },
-    {
-      "name": "also_known_as_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for DID-document alsoKnownAs (JSON) on a result type."
-    },
-    {
-      "name": "assertion_methods_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for DID-document assertion methods (JSON) on a result type."
-    },
-    {
-      "name": "authentication_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for DID-document authentication methods (JSON) on a result type."
-    },
-    {
-      "name": "custody_type",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for custody type on a result type."
-    },
-    {
-      "name": "did",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for the DID string on a result type."
-    },
-    {
-      "name": "from_did",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "constructor",
-      "reason": "WasmIdentity constructor from a DID string (wasm-bindgen static); constructor, not a protocol operation."
-    },
-    {
-      "name": "from_fields",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "constructor",
-      "reason": "WasmIdentity constructor from explicit fields (wasm-bindgen static); constructor, not a protocol operation."
-    },
-    {
-      "name": "has_agent_key",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Boolean getter: whether an identity has an agent key."
-    },
-    {
-      "name": "id",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for an entity id on a result type."
-    },
-    {
-      "name": "identity",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for the identity field on a result type."
-    },
-    {
-      "name": "rotation_event_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for a key-rotation event JSON on a result type."
-    },
-    {
-      "name": "services_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for DID-document services (JSON) on a result type."
-    },
-    {
-      "name": "verification_methods_json",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for DID-document verification methods (JSON) on a result type."
-    },
-    {
-      "name": "verifying_key",
-      "path": "crates/scp-ffi/wasm/src/identity.rs",
-      "kind": "getter",
-      "reason": "Getter for an identity/token verifying key on a result type."
-    },
-    {
-      "name": "scp_init",
-      "path": "crates/scp-ffi/wasm/src/lib.rs",
-      "kind": "wasm-only",
-      "reason": "WASM module init hook (sets the panic hook); ADR-034 WASM bridge bootstrap, no cross-bridge peer."
-    },
-    {
-      "name": "scp_version",
-      "path": "crates/scp-ffi/wasm/src/lib.rs",
-      "kind": "wasm-only",
-      "reason": "WASM module version accessor exported at module scope; ADR-034 WASM bridge surface, no cross-bridge peer."
-    },
-    {
-      "name": "verify_reference_attestation",
-      "path": "crates/scp-ffi/wasm/src/reference_verify.rs",
-      "kind": "wasm-only",
-      "reason": "JS-boundary reference-attestation verification with no scp-protocol counterpart; lives only in the WASM bridge per ADR-034."
-    },
-    {
-      "name": "failures_json",
-      "path": "crates/scp-ffi/wasm/src/tools.rs",
-      "kind": "getter",
-      "reason": "Getter for a failures JSON blob on a verification result type."
-    },
-    {
-      "name": "passed",
-      "path": "crates/scp-ffi/wasm/src/tools.rs",
-      "kind": "getter",
-      "reason": "Boolean getter: whether a verification passed, on a result type."
-    },
-    {
-      "name": "tool_id",
-      "path": "crates/scp-ffi/wasm/src/tools.rs",
-      "kind": "getter",
-      "reason": "Getter for a tool id on a result type."
-    },
-    {
-      "name": "connected",
-      "path": "crates/scp-ffi/wasm/src/transport.rs",
-      "kind": "getter",
-      "reason": "Boolean getter: whether transport is connected, on a status result type."
-    },
-    {
-      "name": "latency_ms",
-      "path": "crates/scp-ffi/wasm/src/transport.rs",
-      "kind": "getter",
-      "reason": "Getter for latency in ms on a transport-status result type."
-    },
-    {
-      "name": "relay_url",
-      "path": "crates/scp-ffi/wasm/src/transport.rs",
-      "kind": "getter",
-      "reason": "Getter for the relay URL on a started Relay/Node handle."
-    },
-    {
-      "name": "audience",
-      "path": "crates/scp-ffi/wasm/src/ucan.rs",
-      "kind": "getter",
-      "reason": "Getter for UCAN token audience on a result type."
-    },
-    {
-      "name": "capabilities_json",
-      "path": "crates/scp-ffi/wasm/src/ucan.rs",
-      "kind": "getter",
-      "reason": "Getter for UCAN token capabilities (JSON) on a result type."
-    },
-    {
-      "name": "expires_at",
-      "path": "crates/scp-ffi/wasm/src/ucan.rs",
-      "kind": "getter",
-      "reason": "Getter for UCAN token expiry on a result type."
-    },
-    {
-      "name": "issuer",
-      "path": "crates/scp-ffi/wasm/src/ucan.rs",
-      "kind": "getter",
-      "reason": "Getter for UCAN token issuer on a result type."
-    },
-    {
-      "name": "token_id",
-      "path": "crates/scp-ffi/wasm/src/ucan.rs",
-      "kind": "getter",
-      "reason": "Getter for a UCAN token id on a result type."
-    }
-  ],
   "pending_registration": {
-    "_comment": "Two UniFFI candidates remain pending registration: register_local_did and is_local_did (crates/scp-ffi/uniffi/src/bridge.rs). They are genuine cross-bridge candidates — UniFFI exposes them as Scp methods, while PyO3/NAPI only call core register_local_did/is_local_did internally and never export a free-fn form — so no bridge-aliases.json canonical exists yet. They stay here (treated as allowed, keeping the gate green) until a canonical alias entry lands. Seven earlier candidates (metadata_record_to_json, commit_deploy, rollback_deploy, transport_add_relay, transport_assign_relay_set, transport_adapter_count, transport_reliability) were REGISTERED in scripts/bridge-aliases.json; the remaining one-bridge exports were reclassified as `bridge-specific` in the per-bridge arrays above. A future genuine parity GAP — an op present in some-but-not-all applicable bridges that ought to be implemented everywhere — goes here with `kind:pending-registration` and durable provenance until the missing bridges land it.",
+    "_comment": "Two UniFFI candidates remain pending registration: register_local_did and is_local_did (crates/scp-ffi/uniffi/src/bridge.rs). They are genuine cross-bridge candidates \u2014 UniFFI exposes them as Scp methods, while PyO3/NAPI only call core register_local_did/is_local_did internally and never export a free-fn form \u2014 so no bridge-aliases.json canonical exists yet. They stay here (treated as allowed, keeping the gate green) until a canonical alias entry lands. Seven earlier candidates (metadata_record_to_json, commit_deploy, rollback_deploy, transport_add_relay, transport_assign_relay_set, transport_adapter_count, transport_reliability) were REGISTERED in scripts/bridge-aliases.json; the remaining one-bridge exports were reclassified as `bridge-specific` in the per-bridge arrays above. A future genuine parity GAP \u2014 an op present in some-but-not-all applicable bridges that ought to be implemented everywhere \u2014 goes here with `kind:pending-registration` and durable provenance until the missing bridges land it.",
     "pyo3": [],
     "uniffi": [
       {
         "name": "is_local_did",
         "path": "crates/scp-ffi/uniffi/src/bridge.rs",
         "kind": "pending-registration",
-        "reason": "Per-instance ContextManager local-DID membership check (ADR-048 multi-instance). Exported only on the UniFFI Scp type; PyO3/NAPI keep the free-fn form internal. No bridge-aliases canonical exists. TODO register — see F2 triage."
+        "reason": "Per-instance ContextManager local-DID membership check (ADR-048 multi-instance). Exported only on the UniFFI Scp type; PyO3/NAPI keep the free-fn form internal. No bridge-aliases canonical exists. TODO register \u2014 see F2 triage."
       },
       {
         "name": "register_local_did",
         "path": "crates/scp-ffi/uniffi/src/bridge.rs",
         "kind": "pending-registration",
-        "reason": "Per-instance ContextManager local-DID registration (ADR-048 multi-instance). Exported only on the UniFFI Scp type; PyO3/NAPI keep the free-fn form internal. No bridge-aliases canonical exists. TODO register — see F2 triage."
+        "reason": "Per-instance ContextManager local-DID registration (ADR-048 multi-instance). Exported only on the UniFFI Scp type; PyO3/NAPI keep the free-fn form internal. No bridge-aliases canonical exists. TODO register \u2014 see F2 triage."
       }
     ],
-    "napi": [],
-    "wasm": []
+    "napi": []
   }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check-bridge-symmetry.sh — Enforce surface-area symmetry across the four
-# FFI bridges (PyO3, UniFFI, NAPI, WASM).
+# check-bridge-symmetry.sh — Enforce surface-area symmetry across the three
+# FFI bridges (PyO3, UniFFI, NAPI).
 #
 # Scope: SURFACE AREA ONLY. For every canonical operation declared in
 # `scripts/bridge-aliases.json`, verify that each required bridge exposes at
@@ -134,14 +134,12 @@ fi
 PYO3_DIR="crates/scp-ffi/src"
 UNIFFI_DIR="crates/scp-ffi/uniffi/src"
 NAPI_DIR="crates/scp-ffi/napi/src"
-WASM_DIR="crates/scp-ffi/wasm/src"
 
 bridge_dir() {
     case "$1" in
         pyo3)   echo "$PYO3_DIR" ;;
         uniffi) echo "$UNIFFI_DIR" ;;
         napi)   echo "$NAPI_DIR" ;;
-        wasm)   echo "$WASM_DIR" ;;
         *)
             echo "ERROR: unknown bridge: $1" >&2
             return 1
@@ -404,7 +402,6 @@ collect_fn_names_from_file() {
         #           #[pymethods]           (impl block only)
         #   NAPI:   #[napi] / #[napi(...)] (free fn OR impl block)
         #   UniFFI: #[uniffi::export]      (free fn OR impl block)
-        #   WASM:   #[wasm_bindgen]        (free fn OR impl block)
         # Bare-token and parenthesized-arg forms must both match. Detection
         # mirrors `attrs_have_free_fn_ffi_export` /
         # `attrs_have_impl_block_ffi_export` in the syn scanner; both layers
@@ -415,9 +412,7 @@ collect_fn_names_from_file() {
             || code ~ /#\[napi\]/ \
             || code ~ /#\[napi\(/ \
             || code ~ /#\[uniffi::export\]/ \
-            || code ~ /#\[uniffi::export\(/ \
-            || code ~ /#\[wasm_bindgen\]/ \
-            || code ~ /#\[wasm_bindgen\(/) {
+            || code ~ /#\[uniffi::export\(/) {
             pending_ffi_attr = 1
         }
 
@@ -574,7 +569,7 @@ collect_fn_names_from_file() {
             #     free fn is not an export.
             # The looser pre-hardening behaviour (emit every `fn NAME(`) is
             # gone. Existing fixtures got `#[napi]` / `#[uniffi::export]`
-            # / `#[wasm_bindgen]` / `#[pyfunction]` decorations on their
+            # / `#[pyfunction]` decorations on their
             # widget_create production fns; the new
             # `bad-alias-undecorated-fn` fixture exercises the undecorated
             # phantom-alias case the strict scanner now rejects.
@@ -688,35 +683,30 @@ is_op_exempt() {
 # CI mode driver
 #
 # Batches all jq queries up-front to avoid O(ops × bridges) jq invocations.
-# Output format: `<canonical>|<wasm_required>|<bridge>|<alias1>,<alias2>,...`
+# Output format: `<canonical>|<bridge>|<alias1>,<alias2>,...`
 # (one line per (op, bridge) tuple, aliases comma-separated).
 # ---------------------------------------------------------------------------
 run_ci_mode() {
     local total_findings=0
 
-    # Pre-cache all four bridges.
+    # Pre-cache all three bridges.
     cache_bridge_fns pyo3
     cache_bridge_fns uniffi
     cache_bridge_fns napi
-    cache_bridge_fns wasm
     load_exemptions
 
-    # One jq pass: emit `canonical|wasm_required|bridge|alias1,alias2,...`
+    # One jq pass: emit `canonical|bridge|alias1,alias2,...`
     # and check each tuple in a tight bash loop.
     local tuples
     tuples=$(jq -r '
         .operations[] as $op |
-        ["pyo3", "uniffi", "napi", "wasm"][] as $b |
-        "\($op.canonical)|\($op.wasm_required)|\($b)|\(($op[$b] // []) | join(","))"
+        ["pyo3", "uniffi", "napi"][] as $b |
+        "\($op.canonical)|\($b)|\(($op[$b] // []) | join(","))"
     ' "$ALIASES_JSON")
 
-    local canonical wasm_required bridge aliases alias found
-    while IFS='|' read -r canonical wasm_required bridge aliases; do
+    local canonical bridge aliases alias found
+    while IFS='|' read -r canonical bridge aliases; do
         [[ -z "$canonical" ]] && continue
-        # WASM is only required when the flag is true.
-        if [[ "$bridge" == "wasm" && "$wasm_required" != "true" ]]; then
-            continue
-        fi
         # Documented exemption?
         if is_op_exempt "$bridge" "$canonical"; then
             continue
@@ -755,7 +745,6 @@ touched_bridge_for_file() {
         *"crates/scp-ffi/src/"*)          echo "pyo3" ;;
         *"crates/scp-ffi/uniffi/src/"*)   echo "uniffi" ;;
         *"crates/scp-ffi/napi/src/"*)     echo "napi" ;;
-        *"crates/scp-ffi/wasm/src/"*)     echo "wasm" ;;
         *)                                 echo "" ;;
     esac
 }
@@ -838,7 +827,7 @@ check_hook_file() {
             # Is ANY sibling still exposing it via any alias?
             local any_sibling=0
             local sib
-            for sib in pyo3 uniffi napi wasm; do
+            for sib in pyo3 uniffi napi; do
                 [[ "$sib" == "$bridge" ]] && continue
                 local sib_aliases
                 sib_aliases=$(jq -r --arg c "$canonical" --arg b "$sib" \
@@ -875,7 +864,7 @@ check_hook_file() {
             # Siblings missing?
             local missing_sibs=()
             local sib
-            for sib in pyo3 uniffi napi wasm; do
+            for sib in pyo3 uniffi napi; do
                 [[ "$sib" == "$bridge" ]] && continue
                 if is_op_exempt "$sib" "$canonical"; then continue; fi
                 local sib_aliases
@@ -891,12 +880,7 @@ check_hook_file() {
                     fi
                 done <<< "$sib_aliases"
                 if [[ $found_sib -eq 0 ]]; then
-                    # Only warn if sib is required for this op.
-                    local wasm_req
-                    wasm_req=$(jq -r --arg c "$canonical" '.operations[] | select(.canonical == $c) | .wasm_required' "$ALIASES_JSON")
-                    if [[ "$sib" != "wasm" || "$wasm_req" == "true" ]]; then
-                        missing_sibs+=("$sib")
-                    fi
+                    missing_sibs+=("$sib")
                 fi
             done
             if [[ ${#missing_sibs[@]} -gt 0 ]]; then

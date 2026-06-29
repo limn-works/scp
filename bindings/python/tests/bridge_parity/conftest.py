@@ -3,7 +3,7 @@
 The parity suite drives three runner subprocesses, one per non-PyO3
 bridge surface:
 
-- `bun_runner` — Bun/Node.js, dispatches to NAPI and WASM bridges.
+- `bun_runner` — Bun/Node.js, dispatches to the NAPI bridge.
 - `kotlin_runner` — JVM process, dispatches to the UniFFI Kotlin
   bindings.
 - `swift_runner` — macOS-only executable, dispatches to the UniFFI
@@ -225,7 +225,7 @@ def _teardown_runner(
 
 
 # ----------------------------------------------------------------------
-# Bun (NAPI + WASM) runner
+# Bun (NAPI) runner
 # ----------------------------------------------------------------------
 
 
@@ -242,8 +242,8 @@ def bun_runner() -> Iterator[RunnerClient]:
 
     bun = _locate_bun()
 
-    # cwd = bindings/typescript so that `@limn-works/scp-ts-wasm` and
-    # `@limn-works/scp-ts-napi-*` resolve via its node_modules tree.
+    # cwd = bindings/typescript so that `@limn-works/scp-ts-napi-*`
+    # resolves via its node_modules tree.
     # Bun (and Node) walk upward from cwd looking for node_modules; the
     # helpers/ dir has none. The runner script is specified by absolute
     # path so cwd does not affect its resolution.

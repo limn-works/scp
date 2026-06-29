@@ -55,7 +55,6 @@ jobs:
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
-              - 'crates/scp-ffi/wasm/**'
               - 'crates/scp-ffi/common/**'
             kotlin:
               - 'bindings/kotlin/**'
@@ -101,7 +100,7 @@ jobs:
         run: bash scripts/check-cross-layer.sh
 
   # ── Bridge symmetry (ADR-047) ────────────────────────────────────────
-  # Verifies that the four FFI bridges (PyO3, UniFFI, NAPI, WASM) expose the
+  # Verifies that the three FFI bridges (PyO3, UniFFI, NAPI) expose the
   # same canonical operation set (per scripts/bridge-aliases.json). Scope is
   # SURFACE-AREA symmetry only; call-ordering invariants are enforced by
   # Layer B (scripts/check-call-invariants.py). Complements the Rust-side
@@ -757,21 +756,6 @@ jobs:
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           ./gradlew testDebugUnitTest
 
-  # ── WASM ───────────────────────────────────────────────────────────
-  wasm-clippy:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    name: WASM / clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown -- -D warnings
-
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
     needs: changes
@@ -843,9 +827,9 @@ jobs:
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
-  # NAPI/WASM (Bun child) with identical inputs, asserts normalized
-  # output equality. Layer C of the bridge enforcement stack (Layer A =
-  # FFI conformance, Layer B = SDK capability matrix).
+  # NAPI (Bun child) with identical inputs, asserts normalized output
+  # equality. Layer C of the bridge enforcement stack (Layer A = FFI
+  # conformance, Layer B = SDK capability matrix).
   bridge-parity:
     needs: changes
     if: >-
@@ -890,11 +874,7 @@ jobs:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Python deps
         run: |
           python -m venv .venv
@@ -927,35 +907,10 @@ jobs:
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
-      - name: Build WASM bridge (nodejs target for Bun runtime)
-        run: |
-          # The parity harness runs the WASM bridge under Bun, which
-          # uses a Node-style runtime loader. `--target bundler` emits
-          # ESM with a bare `import * from "./X.wasm"` that only works
-          # behind a bundler. `--target nodejs` emits a self-loading
-          # CJS-compatible module that Bun can consume directly.
-          cd crates/scp-ffi/wasm
-          wasm-pack build --target nodejs --release --out-dir pkg-node -- \
-            --features testing
-      - name: Wire WASM package into node_modules
-        run: |
-          WASM_PKG_DIR="bindings/typescript/node_modules/@limn-works/scp-ts-wasm"
-          mkdir -p "$WASM_PKG_DIR"
-          cp -r crates/scp-ffi/wasm/pkg-node/* "$WASM_PKG_DIR/"
-          # Patch the package name to match the dynamic import target.
-          python3 -c "
-          import json
-          p = '$WASM_PKG_DIR/package.json'
-          with open(p) as f:
-              j = json.load(f)
-          j['name'] = '@limn-works/scp-ts-wasm'
-          with open(p, 'w') as f:
-              json.dump(j, f, indent=2)
-          "
       - name: Install TypeScript workspace deps
         working-directory: bindings/typescript
         run: bun install
-      - name: Run parity tests (NAPI + WASM only)
+      - name: Run parity tests (NAPI only)
         # The Kotlin and Swift alt-bridge cases are covered by dedicated
         # jobs (`bridge-parity-kotlin`, `bridge-parity-swift`) that own
         # their respective toolchains. Filter by test ID (which encodes
@@ -965,7 +920,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "napi or wasm"
+          PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "napi"
 
   # ── Bridge parity (Kotlin UniFFI) ──────────────────────────────────
   # Layer C extension: runs the same ADR-046 harness against the UniFFI
@@ -1126,7 +1081,6 @@ jobs:
       - typescript-check
       - kotlin-lint
       - kotlin-test
-      - wasm-clippy
       - swift-lint
       - swift-build-test
       - fuzz-build
@@ -1165,7 +1119,6 @@ jobs:
             "${{ needs.typescript-check.result }}" \
             "${{ needs.kotlin-lint.result }}" \
             "${{ needs.kotlin-test.result }}" \
-            "${{ needs.wasm-clippy.result }}" \
             "${{ needs.swift-lint.result }}" \
             "${{ needs.swift-build-test.result }}" \
             "${{ needs.fuzz-build.result }}" \

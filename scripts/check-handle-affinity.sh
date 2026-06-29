@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 # WHAT THIS CHECKS
 # ---------------------------------------------------------------------------
-# Every FFI function in one of the three non-WASM bridges
+# Every FFI function in one of the three bridges
 #   crates/scp-ffi/src/        (PyO3   — #[pyfunction] / #[pymethods])
 #   crates/scp-ffi/napi/src/   (NAPI   — #[napi])
 #   crates/scp-ffi/uniffi/src/ (UniFFI — #[uniffi::export])

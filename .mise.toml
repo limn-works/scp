@@ -6,7 +6,6 @@ kotlin = "2.3.10"
 gradle = "8.14.4"
 rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin" }
 "cargo:cargo-nextest" = "latest"
-"cargo:wasm-pack" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-fuzz" = "latest"

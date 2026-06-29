@@ -9,7 +9,6 @@
     "smoke": "bun run node_bridge_runner.ts < /dev/null"
   },
   "dependencies": {
-    "@limn-works/scp-ts": "workspace:*",
-    "@limn-works/scp-ts-wasm": "workspace:*"
+    "@limn-works/scp-ts": "workspace:*"
   }
 }

@@ -2,9 +2,9 @@
 /**
  * Long-lived Bun JSON-RPC server for cross-bridge parity testing.
  *
- * Reads length-prefixed JSON requests on stdin, dispatches to either the
- * NAPI bridge or the WASM bridge based on the `bridge_mode` field, and
- * writes length-prefixed JSON responses on stdout.
+ * Reads length-prefixed JSON requests on stdin, dispatches to the NAPI
+ * bridge based on the `bridge_mode` field, and writes length-prefixed
+ * JSON responses on stdout.
  *
  * Wire format (HTTP-style):
  *
@@ -12,20 +12,19 @@
  *     \r\n
  *     <N bytes of JSON>
  *
- * Request: `{id, op, args, bridge_mode}` where bridge_mode is "napi" or "wasm".
+ * Request: `{id, op, args, bridge_mode}` where bridge_mode is "napi".
  * Response: either `{id, ok: true, result: {...}}` on success
  *           or `{id, ok: false, error: {type, code, message}}` on bridge error.
  *
- * Bridge selection is explicit — NO auto-fallback. If the requested bridge
- * cannot be loaded, the response is an error. The harness surfaces this
- * as a test failure, not a skip.
+ * Bridge selection is explicit — NO auto-fallback. If a non-NAPI bridge
+ * mode is requested, the response is an error. The harness surfaces this
+ * as a test failure, not a skip. (The WASM bridge was removed per ADR-055;
+ * the browser target is a remote thin client, not an in-process engine.)
  *
  * ADR-048 / #1549 Phase 4 PR 4: NAPI ops construct a fresh `addon.SCP()`
  * per call and invoke per-instance methods on the resulting handle. The
  * pre-PR 4 free-function façade and the process-wide default instance
- * it routed to were both deleted. WASM still exposes free functions
- * (ADR-034 — no process-global state to multiplex), so the wasm branch
- * keeps the `raw.identity_create(...)` shape.
+ * it routed to were both deleted.
  *
  * Note: the field is named `bridge_mode` rather than `mode` to avoid a
  * name collision with the DOM `RequestMode` type (DOM types are pulled
@@ -155,30 +154,6 @@ async function writeFrame(payload: unknown): Promise<void> {
 // biome-ignore lint/suspicious/noExplicitAny: bridge interfaces are complex
 type AnyBridge = any;
 
-let wasmModule: AnyBridge | null = null;
-
-// The parity runner loads the Node/Bun-target wasm-pack build (pkg-node),
-// not the bundler-target package that ships to npm. The bundler output
-// uses `import * as wasm from "./scp_ffi_wasm_bg.wasm"` followed by
-// `wasm.__wbindgen_start()` at module load — a shape that depends on the
-// bundler (Webpack/Rollup) instantiating the wasm import synchronously
-// so that `__wbindgen_start` is reachable on the namespace. Bun's native
-// ESM wasm import does not expose start-function exports on the namespace
-// object, so loading the bundler package under Bun fails with
-// `wasm.__wbindgen_start is not a function` and leaves the instance
-// half-initialized (subsequent calls fail with `malloc is not a
-// function`). The Node-target build (`--target nodejs`) is a CommonJS
-// module that reads and instantiates the `.wasm` binary itself via
-// `fs.readFileSync` + `new WebAssembly.Instance(...)` and invokes
-// `__wbindgen_start()` directly — so it works in every Node-compatible
-// runtime (Bun included) without any bundler contract.
-//
-// Build once before running the parity suite:
-//   wasm-pack build crates/scp-ffi/wasm --target nodejs \
-//     --out-dir pkg-node --features testing
-const WASM_RAW_PATH =
-  "../../../../../crates/scp-ffi/wasm/pkg-node/scp_ffi_wasm.js";
-
 // Lazy handle to the raw napi-rs native addon. The SDK `createNativeBridge`
 // requires a caller-supplied `SCP` (ADR-048 per-instance routing); the
 // parity runner talks directly to the raw addon so each op can construct
@@ -237,15 +212,15 @@ async function newNapiScp(): Promise<AnyBridge> {
   return new (addon.SCP as new (configJson: string) => any)('{"type":"in_memory"}');
 }
 
-async function loadWasm(): Promise<{ raw: AnyBridge }> {
-  if (wasmModule !== null) {
-    return { raw: wasmModule };
+/** Rejects any bridge mode other than NAPI. The parity matrix only routes
+ * `napi` to this runner (the WASM bridge was removed per ADR-055); a
+ * non-NAPI mode reaching here is a harness wiring bug, surfaced loudly. */
+function requireNapi(mode: BridgeMode): void {
+  if (mode !== "napi") {
+    throw new Error(
+      `bun runner only serves the NAPI bridge; got bridge_mode '${mode}'`,
+    );
   }
-  // Bun resolves imports relative to the .ts file, not cwd. Use a
-  // relative path so the @limn-works/scp-ts-wasm package is found via
-  // bindings/typescript/node_modules (the only place we wire it).
-  wasmModule = await import(WASM_RAW_PATH);
-  return { raw: wasmModule };
 }
 
 function resetBridgeCaches(): void {
@@ -255,60 +230,19 @@ function resetBridgeCaches(): void {
   // regardless, so the "reset" semantics from the Python harness mean
   // "don't reuse cached bridge imports" — which this accomplishes.
   napiAddon = null;
-  wasmModule = null;
 }
 
 /**
- * Emit a one-shot startup diagnostic so operators can see which bridge
- * modules resolved and where. This is the exact failure mode the harness
- * was built to catch: if a path typo or symlink causes WASM to be loaded
- * where NAPI was expected, this line makes it obvious.
- *
- * Paths are emitted as repo-root-relative so public CI logs do not leak
- * developer/runner filesystem layout (absolute home paths, hostnames,
- * runner IDs embedded in paths, etc.). We compute the repo root from
- * this file's location rather than trusting an env var, which keeps the
- * diagnostic correct regardless of caller cwd.
+ * Emit a one-shot startup diagnostic so operators can see that the runner
+ * came up. The bun runner serves only the NAPI bridge; the addon is loaded
+ * lazily on first op, so there is no eager module path to report here.
  */
-async function emitStartupDiagnostic(): Promise<void> {
-  const path = await import("node:path");
-  // This file is bindings/python/tests/bridge_parity/helpers/
-  // node_bridge_runner.ts, so the repo root is 5 levels up.
-  const repoRoot = path.resolve(import.meta.dir, "../../../../..");
-  const rel = (p: string): string => {
-    const r = path.relative(repoRoot, p);
-    // If the resolved path escapes the repo (shouldn't happen for the
-    // in-tree bridges, but could for a symlinked node_modules), fall
-    // back to a fingerprint rather than leaking the absolute path.
-    if (r.startsWith("..") || path.isAbsolute(r)) {
-      const hasher = new Bun.CryptoHasher("sha256");
-      hasher.update(p);
-      return `sha256:${hasher.digest("hex").slice(0, 16)}`;
-    }
-    return r;
-  };
-  // Each resolver is wrapped in its own try/catch so one failure does
-  // not mask the other.
-  let wasmRawResolved: string | null = null;
-  const resolveErrors: Record<string, string> = {};
-  try {
-    wasmRawResolved = Bun.resolveSync(WASM_RAW_PATH, import.meta.dir);
-  } catch (err) {
-    resolveErrors.wasm_raw = String(err);
-  }
-  if (Object.keys(resolveErrors).length > 0) {
-    process.stderr.write(
-      `${JSON.stringify({
-        event: "bridge_parity_runner_resolve_error",
-        errors: resolveErrors,
-      })}\n`,
-    );
-  }
+function emitStartupDiagnostic(): void {
   process.stderr.write(
     `${JSON.stringify({
       event: "bridge_parity_runner_loaded",
       runner: "bun",
-      wasm_raw: wasmRawResolved === null ? null : rel(wasmRawResolved),
+      bridge: "napi",
     })}\n`,
   );
 }
@@ -317,7 +251,7 @@ async function emitStartupDiagnostic(): Promise<void> {
 // Op dispatch
 // ---------------------------------------------------------------------------
 
-type BridgeMode = "napi" | "wasm";
+type BridgeMode = "napi";
 
 // Named `BridgeRequest` (not `Request`) and the field `bridgeMode` (not
 // `mode`) to avoid collisions with the DOM `Request` / `RequestMode`
@@ -439,9 +373,8 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
 // ---------------------------------------------------------------------------
 
 // Converts a hex string (expected 64 chars = 32 bytes) to the native seed
-// representation for the target bridge. NAPI accepts Node `Buffer`; WASM
-// accepts a `Uint8Array`. Both surface in Rust as the same 32 bytes.
-function seedFromHex(hex: string | undefined, forWasm: boolean): unknown {
+// representation NAPI accepts (a Node `Buffer`). Surfaces in Rust as 32 bytes.
+function seedFromHex(hex: string | undefined): unknown {
   if (hex === undefined) return undefined;
   if (hex.length !== 64) {
     throw new Error(
@@ -452,32 +385,23 @@ function seedFromHex(hex: string | undefined, forWasm: boolean): unknown {
   for (let i = 0; i < 32; i++) {
     bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
-  return forWasm ? bytes : Buffer.from(bytes);
+  return Buffer.from(bytes);
 }
 
 async function opIdentityCreate(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const custody = String(req.args.custody ?? "in_memory");
   const seedHex =
     typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
-  if (req.bridgeMode === "napi") {
-    // ADR-048: every NAPI bridge operation routes through a per-instance
-    // `SCP.identityCreate(custody, testingSeed?: Buffer)`. The raw addon
-    // exposes `SCP` as a constructor; we instantiate it fresh per op so
-    // parity cases are independent.
-    const scp = await newNapiScp();
-    const testingSeed = seedFromHex(seedHex, false);
-    const handle = await scp.identityCreate(custody, testingSeed);
-    return {
-      did: handle.did,
-      custody,
-      verifying_key: handle.verifyingKey ?? handle.verifying_key ?? null,
-    };
-  }
-  const { raw } = await loadWasm();
-  const testingSeed = seedFromHex(seedHex, true);
-  const handle = await raw.identity_create(custody, testingSeed);
+  // ADR-048: every NAPI bridge operation routes through a per-instance
+  // `SCP.identityCreate(custody, testingSeed?: Buffer)`. The raw addon
+  // exposes `SCP` as a constructor; we instantiate it fresh per op so
+  // parity cases are independent.
+  const scp = await newNapiScp();
+  const testingSeed = seedFromHex(seedHex);
+  const handle = await scp.identityCreate(custody, testingSeed);
   return {
     did: handle.did,
     custody,
@@ -488,25 +412,16 @@ async function opIdentityCreate(
 async function opContextCreate(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const params = (req.args.params as Record<string, unknown>) ?? {
     name: "parity-test",
     mode: "encrypted",
   };
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    return {
-      context_id: handle.contextId,
-      creator_did: identity.did,
-      mode: String(params.mode),
-    };
-  }
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
   return {
-    context_id: handle.contextId ?? handle.context_id,
+    context_id: handle.contextId,
     creator_did: identity.did,
     mode: String(params.mode),
   };
@@ -515,18 +430,14 @@ async function opContextCreate(
 async function opInvalidCapability(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const fakeDid =
     "did:dht:znevercreatednevercreatednevercreatednevercreated";
   const badChallenge =
     '{"protocol":"scpid/1","nonce":"00","audience":"x","issued_at":0,"expires_at":0}';
   try {
-    if (req.bridgeMode === "napi") {
-      const scp = await newNapiScp();
-      scp.scpidSign(fakeDid, "#active", badChallenge, null);
-    } else {
-      const { raw } = await loadWasm();
-      raw.scpid_sign(fakeDid, "#active", badChallenge);
-    }
+    const scp = await newNapiScp();
+    scp.scpidSign(fakeDid, "#active", badChallenge, null);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -557,6 +468,7 @@ const FAKE_UNREGISTERED_DID =
 async function opUnregisteredDidRejected(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   // Valid SCPID challenge (passes shape validation). Paired with a DID
   // that is NOT in this instance's identity registry, `scpidSign` must
   // reach the registry-lookup step and reject with SCP-IDENT-1001.
@@ -576,13 +488,8 @@ async function opUnregisteredDidRejected(
     expires_at: nowMs + 60_000,
   });
   try {
-    if (req.bridgeMode === "napi") {
-      const scp = await newNapiScp();
-      scp.scpidSign(FAKE_UNREGISTERED_DID, "#active", challenge, null);
-    } else {
-      const { raw } = await loadWasm();
-      raw.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge);
-    }
+    const scp = await newNapiScp();
+    scp.scpidSign(FAKE_UNREGISTERED_DID, "#active", challenge, null);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -601,39 +508,19 @@ async function opUnregisteredDidRejected(
 async function opEventLogAppend(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(
-      identity,
-      JSON.stringify({ name: "parity-elog", mode: "encrypted" }),
-    );
-    const events = await scp.eventLogQuery(handle, undefined);
-    const first = events[0];
-    if (!first) return { event_count: 0, first_event_type: "", first_sequence: 0 };
-    return {
-      event_count: events.length,
-      first_event_type: String(first.eventType),
-      first_sequence: Number(first.sequence ?? 0),
-    };
-  }
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(
-    identity.did,
+  requireNapi(req.bridgeMode);
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(
+    identity,
     JSON.stringify({ name: "parity-elog", mode: "encrypted" }),
   );
-  const eventsJson = await raw.event_log_query(handle, undefined);
-  const events = JSON.parse(eventsJson) as Array<{
-    eventType?: string;
-    event_type?: string;
-    sequence?: number;
-  }>;
+  const events = await scp.eventLogQuery(handle, undefined);
   const first = events[0];
   if (!first) return { event_count: 0, first_event_type: "", first_sequence: 0 };
   return {
     event_count: events.length,
-    first_event_type: String(first.eventType ?? first.event_type ?? ""),
+    first_event_type: String(first.eventType),
     first_sequence: Number(first.sequence ?? 0),
   };
 }
@@ -669,103 +556,63 @@ const PARITY_TOOL_CEILING = [
 async function opToolRegister(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const ceiling = (req.args.ceiling as string[]) ?? PARITY_TOOL_CEILING;
   const params = { name: "parity-tools", mode: "encrypted", ceiling };
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    // NapiToolDefinition fields are camelCase on the JS side (napi-rs
-    // renames `input_schema_json` → `inputSchemaJson`) and expect JSON
-    // STRINGS, not nested objects. Matches
-    // `crates/scp-ffi/napi/src/tools.rs::NapiToolDefinition`.
-    // napi-rs `Option<T>` fields are serialized from JS `undefined`, not
-    // `null` — passing `null` hits the non-null `FromNapiValue<String>`
-    // path and errors with "Failed to convert JavaScript value `Null`".
-    // Omit optional fields entirely; napi-rs reads them as `None`.
-    const toolId = await scp.toolRegister(handle, {
-      name: PARITY_TOOL_NAME,
-      description: "parity harness probe tool",
-      inputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.input),
-      outputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.output),
-      operatorDid: identity.did,
-    });
-    return { tool_id: toolId };
-  }
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(identity.did, JSON.stringify(params));
-  // WASM tool_register takes a definition JSON with `schema` (input) and
-  // `outputSchema` fields at the top level (see scp-ffi/wasm/src/tools.rs).
-  const toolDef = {
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // NapiToolDefinition fields are camelCase on the JS side (napi-rs
+  // renames `input_schema_json` → `inputSchemaJson`) and expect JSON
+  // STRINGS, not nested objects. Matches
+  // `crates/scp-ffi/napi/src/tools.rs::NapiToolDefinition`.
+  // napi-rs `Option<T>` fields are serialized from JS `undefined`, not
+  // `null` — passing `null` hits the non-null `FromNapiValue<String>`
+  // path and errors with "Failed to convert JavaScript value `Null`".
+  // Omit optional fields entirely; napi-rs reads them as `None`.
+  const toolId = await scp.toolRegister(handle, {
     name: PARITY_TOOL_NAME,
     description: "parity harness probe tool",
-    schema: PARITY_TOOL_SCHEMA.input,
-    outputSchema: PARITY_TOOL_SCHEMA.output,
+    inputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.input),
+    outputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.output),
     operatorDid: identity.did,
-  };
-  const toolId = await raw.tool_register(handle, JSON.stringify(toolDef));
+  });
   return { tool_id: toolId };
 }
 
 async function opUcanMint(req: BridgeRequest): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const memberDid = String(req.args.member_did);
   const capabilities = (req.args.capabilities as string[]) ?? ["messages:read"];
   const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
   const params = { name: "parity-ucan", mode: "encrypted", ceiling };
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    const token = await scp.ucanMint(handle, memberDid, capabilities);
-    return {
-      issuer: token.issuer,
-      audience: token.audience,
-      capability_count: token.capabilities.length,
-    };
-  }
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(identity.did, JSON.stringify(params));
-  const token = await raw.ucan_mint(
-    handle,
-    memberDid,
-    JSON.stringify(capabilities),
-  );
-  // WASM returns capabilities as a JSON-encoded string; NAPI returns an array.
-  const caps = JSON.parse(token.capabilitiesJson ?? "[]") as string[];
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  const token = await scp.ucanMint(handle, memberDid, capabilities);
   return {
     issuer: token.issuer,
     audience: token.audience,
-    capability_count: caps.length,
+    capability_count: token.capabilities.length,
   };
 }
 
 async function opUcanValidateMalformed(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
   const params = { name: "parity-ucan-v", mode: "encrypted", ceiling };
   const badToken = "not.a.jwt";
   const capability = "scp:ctx:any/messages:read";
   try {
-    if (req.bridgeMode === "napi") {
-      const scp = await newNapiScp();
-      const identity = await scp.identityCreate("in_memory");
-      const handle = await scp.contextCreate(
-        identity,
-        JSON.stringify(params),
-      );
-      await scp.ucanValidate(handle, badToken, capability);
-    } else {
-      const { raw } = await loadWasm();
-      const identity = await raw.identity_create("in_memory");
-      const handle = await raw.context_create(
-        identity.did,
-        JSON.stringify(params),
-      );
-      await raw.ucan_validate(handle, badToken, capability, identity.did, undefined);
-    }
+    const scp = await newNapiScp();
+    const identity = await scp.identityCreate("in_memory");
+    const handle = await scp.contextCreate(
+      identity,
+      JSON.stringify(params),
+    );
+    await scp.ucanValidate(handle, badToken, capability);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -784,28 +631,19 @@ async function opUcanValidateMalformed(
 async function opUcanEvaluateMalformed(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
   const params = { name: "parity-ucan-e", mode: "encrypted", ceiling };
   const badToken = "not.a.jwt";
   const capability = "scp:ctx:any/messages:read";
   try {
-    if (req.bridgeMode === "napi") {
-      const scp = await newNapiScp();
-      const identity = await scp.identityCreate("in_memory");
-      const handle = await scp.contextCreate(
-        identity,
-        JSON.stringify(params),
-      );
-      await scp.ucanEvaluate(handle, badToken, capability);
-    } else {
-      const { raw } = await loadWasm();
-      const identity = await raw.identity_create("in_memory");
-      const handle = await raw.context_create(
-        identity.did,
-        JSON.stringify(params),
-      );
-      await raw.ucan_evaluate(handle, badToken, capability, identity.did, undefined);
-    }
+    const scp = await newNapiScp();
+    const identity = await scp.identityCreate("in_memory");
+    const handle = await scp.contextCreate(
+      identity,
+      JSON.stringify(params),
+    );
+    await scp.ucanEvaluate(handle, badToken, capability);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -824,6 +662,7 @@ async function opUcanEvaluateMalformed(
 async function opUcanEvaluateStructured(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   // Mint a VALID root token granting `messages:read`, then evaluate it
   // requiring `messages:write` (a capability the token does NOT grant). Core
   // `evaluate_ucan` short-circuits at grant-match, returning the partial-false
@@ -834,42 +673,12 @@ async function opUcanEvaluateStructured(
   const requiredCap = String(req.args.required_capability ?? "messages:write");
   const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
   const params = { name: "parity-ucan-es", mode: "encrypted", ceiling };
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    const token = await scp.ucanMint(handle, memberDid, capabilities);
-    const required = `scp:ctx:${handle.contextId}/${requiredCap}`;
-    const result = await scp.ucanEvaluate(handle, token.encoded, required);
-    return {
-      tokens_valid: result.tokensValid,
-      signatures_valid: result.signaturesValid,
-      within_ceiling: result.withinCeiling,
-      nonce_valid: result.nonceValid,
-      not_revoked: result.notRevoked,
-      time_bounds_valid: result.timeBoundsValid,
-    };
-  }
-  // WASM: no in-bridge key custody (ADR-034) — minting throws, so this op is
-  // xfail'd for WASM. We still attempt it so the strict xfail observes the
-  // expected failure rather than silently passing.
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(identity.did, JSON.stringify(params));
-  const contextId = handle.contextId ?? handle.context_id;
-  const token = await raw.ucan_mint(
-    handle,
-    memberDid,
-    JSON.stringify(capabilities),
-  );
-  const required = `scp:ctx:${contextId}/${requiredCap}`;
-  const result = await raw.ucan_evaluate(
-    handle,
-    token.encoded,
-    required,
-    identity.did,
-    undefined,
-  );
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  const token = await scp.ucanMint(handle, memberDid, capabilities);
+  const required = `scp:ctx:${handle.contextId}/${requiredCap}`;
+  const result = await scp.ucanEvaluate(handle, token.encoded, required);
   return {
     tokens_valid: result.tokensValid,
     signatures_valid: result.signaturesValid,
@@ -883,22 +692,12 @@ async function opUcanEvaluateStructured(
 async function opTransportStatus(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
-  // NAPI and WASM both expose a handleless transport probe. NAPI routes
-  // through `SCP.transportStatus(null)` — the `null` opts into the
-  // BridgeInstance-level stateless snapshot. WASM keeps a free function
-  // with no argument (ADR-034 — single-threaded, no process-global state
-  // to multiplex).
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const status = await scp.transportStatus(null);
-    return {
-      connected: status.connected ?? false,
-      relay_url: status.relayUrl ?? status.relay_url ?? null,
-      latency_ms: status.latencyMs ?? status.latency_ms ?? null,
-    };
-  }
-  const { raw } = await loadWasm();
-  const status = raw.transport_status();
+  requireNapi(req.bridgeMode);
+  // NAPI exposes a handleless transport probe via
+  // `SCP.transportStatus(null)` — the `null` opts into the
+  // BridgeInstance-level stateless snapshot.
+  const scp = await newNapiScp();
+  const status = await scp.transportStatus(null);
   return {
     connected: status.connected ?? false,
     relay_url: status.relayUrl ?? status.relay_url ?? null,
@@ -909,88 +708,51 @@ async function opTransportStatus(
 async function opEventLogQueryFiltered(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const filter = (req.args.filter as Record<string, unknown>) ?? {
     event_type: "ContextCreated",
   };
   const params = { name: "parity-elog-f", mode: "encrypted" };
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const identity = await scp.identityCreate("in_memory");
-    const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    // Raw NAPI `eventLogQuery` takes `filter_json: Option<String>`, not
-    // an Object. Pass a JSON-encoded filter.
-    const events = await scp.eventLogQuery(handle, JSON.stringify(filter));
-    const first = events[0];
-    return {
-      event_count: events.length,
-      first_event_type: first ? String(first.eventType) : "",
-    };
-  }
-  const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
-  const handle = await raw.context_create(identity.did, JSON.stringify(params));
-  const eventsJson = await raw.event_log_query(handle, JSON.stringify(filter));
-  const events = JSON.parse(eventsJson) as Array<{
-    eventType?: string;
-    event_type?: string;
-  }>;
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // Raw NAPI `eventLogQuery` takes `filter_json: Option<String>`, not
+  // an Object. Pass a JSON-encoded filter.
+  const events = await scp.eventLogQuery(handle, JSON.stringify(filter));
   const first = events[0];
   return {
     event_count: events.length,
-    first_event_type: first
-      ? String(first.eventType ?? first.event_type ?? "")
-      : "",
+    first_event_type: first ? String(first.eventType) : "",
   };
 }
 
 async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
   const audience = String(
     req.args.audience ?? "https://parity-test.example.com",
   );
   const ttl = Number(req.args.ttl_seconds ?? 60);
   const seedHex =
     typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
-  // Optional `signed_at_override` (ms since epoch). When present, both
-  // bridges pin `signed_at` to the same value so Ed25519 signatures are
-  // byte-exact across PyO3/NAPI/UniFFI/WASM under the shared seed.
+  // Optional `signed_at_override` (ms since epoch). When present, the
+  // bridge pins `signed_at` to that value so Ed25519 signatures are
+  // byte-exact across PyO3/NAPI/UniFFI under the shared seed.
   const signedAtOverride =
     typeof req.args.signed_at_override === "number"
       ? Number(req.args.signed_at_override)
       : undefined;
-  if (req.bridgeMode === "napi") {
-    const scp = await newNapiScp();
-    const testingSeed = seedFromHex(seedHex, false);
-    const identity = await scp.identityCreate("in_memory", testingSeed);
-    // `scpidChallenge` on the NAPI bridge is an `Scp` method after
-    // ADR-048 Phase D — every entry point routes through the instance
-    // for handle affinity. It is stateless (no registry lookup), but
-    // still hangs off `scp` so the API surface is uniform.
-    const challenge = scp.scpidChallenge(audience, ttl);
-    const patched = patchChallengeForOverride(challenge, signedAtOverride);
-    const overrideArg =
-      signedAtOverride === undefined ? null : BigInt(signedAtOverride);
-    const responseJson = scp.scpidSign(
-      identity.did,
-      "#active",
-      patched,
-      overrideArg,
-    );
-    const response = JSON.parse(responseJson);
-    return {
-      protocol: response.protocol,
-      did: response.did,
-      signing_key_id: response.signing_key_id,
-      signature: response.signature,
-    };
-  }
-  const { raw } = await loadWasm();
-  const testingSeed = seedFromHex(seedHex, true);
-  const identity = await raw.identity_create("in_memory", testingSeed);
-  const challenge = raw.scpid_challenge(audience, ttl);
+  const scp = await newNapiScp();
+  const testingSeed = seedFromHex(seedHex);
+  const identity = await scp.identityCreate("in_memory", testingSeed);
+  // `scpidChallenge` on the NAPI bridge is an `Scp` method after
+  // ADR-048 Phase D — every entry point routes through the instance
+  // for handle affinity. It is stateless (no registry lookup), but
+  // still hangs off `scp` so the API surface is uniform.
+  const challenge = scp.scpidChallenge(audience, ttl);
   const patched = patchChallengeForOverride(challenge, signedAtOverride);
   const overrideArg =
-    signedAtOverride === undefined ? undefined : BigInt(signedAtOverride);
-  const responseJson = raw.scpid_sign(
+    signedAtOverride === undefined ? null : BigInt(signedAtOverride);
+  const responseJson = scp.scpidSign(
     identity.did,
     "#active",
     patched,
@@ -1054,7 +816,7 @@ function extractRequestId(value: unknown): number {
 }
 
 async function main(): Promise<void> {
-  await emitStartupDiagnostic();
+  emitStartupDiagnostic();
   while (true) {
     let req: unknown;
     try {

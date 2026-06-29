@@ -99,10 +99,6 @@ name = "phase5_integration"
 required-features = ["testing"]
 
 [[test]]
-name = "wasm_conformance"
-required-features = ["testing"]
-
-[[test]]
 name = "agent_binding_integration"
 required-features = ["testing"]
 
