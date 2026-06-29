@@ -969,3 +969,29 @@ pub const ECON_12091: &str = "SCP-ECON-12091";
 pub const ECON_12095: &str = "SCP-ECON-12095";
 /// Economy budget exceeded error.
 pub const ECON_12096: &str = "SCP-ECON-12096";
+
+// -------------------------------------------------------------------------
+// Cross-context tool-invocation saga (SCP-SAGA- 13000--13999)
+// -------------------------------------------------------------------------
+//
+// The §6.2.4 / ADR-049 §3a saga terminal codes the FFI saga surface maps the
+// typed `SagaError` onto. All registered in `.docs/standards/sdk-common.md`;
+// band-validated by `scripts/check-error-codes.sh` (13000--13999). The
+// `Aborted` arm's specific sub-code (e.g. 13050/13062/13067) is formatted
+// inline from the producer's numeric `code` discriminant — these named
+// constants pin the two FIXED terminal codes (`NeedsRepair`, `Busy`) plus the
+// caller-axis authorization code the bridge's channel-auth binding reuses.
+
+/// Saga caller-axis authorize-before-reserve rejection.
+///
+/// The initiator is not authorized to act over the named caller context. The
+/// bridge reuses this for its channel-auth binding (`caller_did` not hosted by
+/// this bridge instance, or not a member of `caller_context_id`) ⇒ a
+/// `Rejected`-flavored `SagaAborted`.
+pub const SAGA_13050: &str = "SCP-SAGA-13050";
+/// Saga `NeedsRepair` terminal — Commit-retry exhausted; the saga diverged and
+/// requires operator repair (carries the durable `saga_id`).
+pub const SAGA_13065: &str = "SCP-SAGA-13065";
+/// Saga `Busy` terminal — the participant context set overlapped an in-flight
+/// saga (per-participant-context-set gating, §5.15.4).
+pub const SAGA_13066: &str = "SCP-SAGA-13066";

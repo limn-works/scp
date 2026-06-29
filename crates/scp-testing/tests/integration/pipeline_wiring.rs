@@ -164,7 +164,13 @@ const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/uc
 // C2 economy fail-closed gate, ucan_evaluate routing) lost their subject and
 // were removed. This is a deleted-target cleanup, not a weakening of the
 // remaining native/PyO3/NAPI/UniFFI assertions.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 41;
+// Raised 41 -> 44 when the §6.2.4 cross-context tool-invocation saga export
+// (ADR-049 §3a) was wired through all three native bridges: one per-bridge
+// structural assertion (PyO3 / NAPI / UniFFI) pins each export body to the
+// caller-principal binding, the ADR-056 `context_id_to_bytes` keying chokepoint,
+// AND the `start_cross_context_tool_invocation_saga` producer. Pure coverage
+// expansion locking the new export wiring into the ratchet floor.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 44;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2279,6 +2285,169 @@ fn uniffi_ucan_evaluate_routes_to_core_evaluate_ucan() {
         fn_body_contains(UNIFFI_BRIDGE_SRC, "ucan_evaluate", "evaluate_ucan("),
         "UniFFI ucan_evaluate must call the shared core evaluate_ucan pipeline, \
          not re-implement capability evaluation locally"
+    );
+}
+
+// ===========================================================================
+// §6.2.4 cross-context tool-invocation saga — FFI export wiring (ADR-049 §3a)
+// ===========================================================================
+//
+// Each native bridge's `tool_invoke_cross_context_saga` export MUST, before the
+// saga can run:
+//   (a) bind the caller principal — `enforce_caller_principal_binding`, which
+//       authenticates the hosted caller via `identity_registry_contains` and
+//       `is_member` (ADR-049 §3a:94 normative: caller_did/caller_context bound
+//       to the authenticated FFI principal, NOT an envelope-asserted value);
+//   (b) convert the caller/target id STRING → [u8; 32] through the canonical
+//       ADR-056 keying chokepoint `context_id_to_bytes` (a raw re-hash would
+//       double-hash a 64-hex id and key a non-existent actor slot); and
+//   (c) dispatch to the merged producer
+//       `start_cross_context_tool_invocation_saga`.
+//
+// These pin the bridge bodies so a refactor cannot silently sever any of the
+// three from the export — e.g. drop the principal binding (replay/forgery),
+// re-hash the id (spurious ContextNotRegistered), or bypass the saga producer.
+// The principal-binding helper that wraps `identity_registry_contains` +
+// `is_member` is itself pinned (the export → helper edge), so the named tokens
+// cannot be satisfied by an unrelated sibling's substring.
+
+#[test]
+fn pyo3_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_impl",
+            "enforce_caller_principal_binding(",
+        ),
+        "PyO3 cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_impl",
+            "context_id_to_bytes(",
+        ),
+        "PyO3 cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_impl",
+            "start_cross_context_tool_invocation_saga(",
+        ),
+        "PyO3 cross-context saga export must dispatch to the producer \
+         start_cross_context_tool_invocation_saga"
+    );
+    // The principal-binding helper itself must authenticate the hosted caller
+    // (registry membership + context membership), so the (a) edge is meaningful.
+    assert!(
+        fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "enforce_caller_principal_binding",
+            "identity_registry_contains",
+        ) && fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "PyO3 enforce_caller_principal_binding must check identity_registry_contains \
+         AND is_member (authenticated-principal binding, ADR-049 §3a:94)"
+    );
+}
+
+#[test]
+fn napi_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_on",
+            "enforce_caller_principal_binding(",
+        ),
+        "NAPI cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_on",
+            "context_id_to_bytes(",
+        ),
+        "NAPI cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "tool_invoke_cross_context_saga_on",
+            "start_cross_context_tool_invocation_saga(",
+        ),
+        "NAPI cross-context saga export must dispatch to the producer \
+         start_cross_context_tool_invocation_saga"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "enforce_caller_principal_binding",
+            "identity_registry_contains",
+        ) && fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "NAPI enforce_caller_principal_binding must check identity_registry_contains \
+         AND is_member (authenticated-principal binding, ADR-049 §3a:94)"
+    );
+}
+
+#[test]
+fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "tool_invoke_cross_context_saga",
+            "enforce_caller_principal_binding(",
+        ),
+        "UniFFI cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "tool_invoke_cross_context_saga",
+            "context_id_to_bytes(",
+        ),
+        "UniFFI cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "tool_invoke_cross_context_saga",
+            "start_cross_context_tool_invocation_saga(",
+        ),
+        "UniFFI cross-context saga export must dispatch to the producer \
+         start_cross_context_tool_invocation_saga"
+    );
+    // UniFFI authenticates the hosted caller against the per-instance custody
+    // registry (`identity_custody_registry(bi).contains_key`) rather than the
+    // PyO3/NAPI `identity_registry_contains` helper — a per-SDK idiom difference,
+    // same authenticated-principal property. Both legs (registry presence +
+    // context membership via `is_member`) must be present.
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "enforce_caller_principal_binding",
+            "identity_custody_registry",
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "UniFFI enforce_caller_principal_binding must check the per-instance \
+         identity_custody_registry AND is_member (authenticated-principal \
+         binding, ADR-049 §3a:94)"
     );
 }
 

@@ -583,6 +583,20 @@
           "swift": true
         },
         {
+          "name": "invoke_cross_context_saga",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 tool_invoke_cross_context_saga, UniFFI tool_invoke_cross_context_saga, NAPI toolInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category tools). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_tool_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. The public per-SDK wrapper methods are tracked by #1939 (the PR-6c SDK-wrapper slice).",
+          "exemptions": {
+            "python": "Bridge export exists (PyO3 tool_invoke_cross_context_saga); the named public SDK wrapper on the tools surface is tracked by #1939 (PR-6c SDK-wrapper slice, §6.2.4 / ADR-049 §3a).",
+            "typescript": "Bridge export exists (NAPI toolInvokeCrossContextSaga); the named public SDK wrapper on the tools surface is tracked by #1939 (PR-6c SDK-wrapper slice, §6.2.4 / ADR-049 §3a).",
+            "kotlin": "UniFFI bridge exports tool_invoke_cross_context_saga; the named public Kotlin SDK wrapper is tracked by #1939 (PR-6c SDK-wrapper slice, §6.2.4 / ADR-049 §3a).",
+            "swift": "UniFFI bridge exports tool_invoke_cross_context_saga; the named public Swift SDK wrapper is tracked by #1939 (PR-6c SDK-wrapper slice, §6.2.4 / ADR-049 §3a)."
+          }
+        },
+        {
           "name": "session_create",
           "python": true,
           "typescript": true,

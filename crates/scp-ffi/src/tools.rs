@@ -143,6 +143,53 @@ impl PyToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
+// PySagaResult (§6.2.4 cross-context tool-invocation saga — committed terminal)
+// ---------------------------------------------------------------------------
+
+/// The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+///
+/// Returned by [`PyScp::tool_invoke_cross_context_saga`] on a `Committed`
+/// terminal. Every NON-committed terminal raises a typed saga exception
+/// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) instead.
+///
+/// Carries the supervisor-minted `saga_id` plus — for the committed
+/// cross-context invocation — the target's signed receipt and the captured
+/// tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+/// is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+/// receipt's canonical `output_jcs` bytes (the exact bytes the caller side
+/// recorded a hash of). Both are surfaced as Python `bytes` so a caller can
+/// verify the receipt signature and recompute `output_hash` without a
+/// re-serialization step.
+#[pyclass(name = "SagaResult")]
+#[derive(Debug, Clone)]
+pub struct PySagaResult {
+    /// The durable saga identifier (supervisor-minted, never a caller input).
+    #[pyo3(get)]
+    pub saga_id: String,
+
+    /// The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+    #[pyo3(get)]
+    pub receipt: Option<Vec<u8>>,
+
+    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// or `None`.
+    #[pyo3(get)]
+    pub output: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PySagaResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "SagaResult(saga_id={:?}, receipt={} bytes, output={} bytes)",
+            self.saga_id,
+            self.receipt.as_ref().map_or(0, Vec::len),
+            self.output.as_ref().map_or(0, Vec::len),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
@@ -897,6 +944,300 @@ fn tool_invoke_cross_context_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a)
+// ---------------------------------------------------------------------------
+
+/// Maps a `SagaError` terminal (the typed §6.2.4 terminal space) onto the
+/// bridge's typed saga error variants.
+///
+/// The decomposition — the `SagaAbortReason::RateLimited → Option<u64>` read,
+/// the `None`-never-coerced-to-`0` rule, and the `SCP-SAGA-{code}` formatting —
+/// lives ONCE in [`scp_ffi_common::saga_errors::decompose_saga_error`], unit-
+/// tested there, so the three bridges cannot drift. This function is the thin
+/// per-bridge tail that carries the `PyO3` field labels (`message:`):
+///
+/// - `Aborted` → [`ScpPyError::SagaAborted`] (`retry_after_ms`, `None` never
+///   `0`, `SCP-SAGA-{code}`).
+/// - `NeedsRepair` → [`ScpPyError::SagaNeedsRepair`] (durable repair handle,
+///   `SCP-SAGA-13065`).
+/// - `Busy` → [`ScpPyError::SagaBusy`] (`SCP-SAGA-13066`).
+fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpPyError {
+    use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
+    let parts = decompose_saga_error(err);
+    match parts.kind {
+        SagaErrorKind::Aborted { retry_after_ms } => ScpPyError::SagaAborted {
+            message: parts.message,
+            code: parts.code,
+            retry_after_ms,
+        },
+        SagaErrorKind::NeedsRepair { saga_id } => ScpPyError::SagaNeedsRepair {
+            message: parts.message,
+            code: parts.code,
+            saga_id,
+        },
+        SagaErrorKind::Busy { contended_context } => ScpPyError::SagaBusy {
+            message: parts.message,
+            code: parts.code,
+            contended_context,
+        },
+    }
+}
+
+/// Resolves the Active Signing Key the supervisor saga signs under for the
+/// co-resident context `context_id` — the key of the context's owning
+/// identity (`FfiBridgeState.creator_did`), exported via the shared custody
+/// path. The caller and target each resolve to their OWN creator's key so the
+/// receipt (target-signed) and each side's divergence marker (own-signed) are
+/// signed under the correct per-context Active Signing Key (spec §6.2.4
+/// "Signer authorization": the receipt key MUST be the one authorized to act
+/// for `target_context_id`).
+fn resolve_context_signing_key(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> PyResult<ed25519_dalek::SigningKey> {
+    let creator_did =
+        crate::runtime::with_context(bi, context_id, |rt| Ok(rt.creator_did.clone()))?;
+    crate::context::resolve_signing_key(bi, &creator_did)
+}
+
+/// Decodes the §6.2.4 envelope nonce from its canonical 32-char hex form into
+/// the 16-byte value, FAIL-CLOSED.
+///
+/// The nonce is a 16-byte value carried as a hex string — the one canonical
+/// wire form (§6.2.4 wire envelope). Any other length is a malformed envelope,
+/// NOT a "pad it" situation; and we never accept a Python int (which would
+/// invite an ambiguous endianness/width interpretation). Both failure modes
+/// surface as `ValidationError`.
+fn decode_asserted_nonce(asserted_nonce_hex: &str) -> PyResult<[u8; 16]> {
+    let bytes = hex::decode(asserted_nonce_hex).map_err(|e| ScpPyError::ValidationError {
+        message: format!(
+            "asserted_nonce_hex is not valid hex: {e} — supply the 16-byte §6.2.4 envelope \
+             nonce as a 32-char lowercase-hex string"
+        ),
+        code: codes::VALID_7001.to_owned(),
+    })?;
+    let nonce =
+        <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| ScpPyError::ValidationError {
+            message: format!(
+                "asserted_nonce_hex must decode to exactly 16 bytes (32 hex chars), got {} bytes",
+                bytes.len()
+            ),
+            code: codes::VALID_7001.to_owned(),
+        })?;
+    Ok(nonce)
+}
+
+/// Enforces the §6.2.4 *Caller authentication* binding (normative — §6.2.4 +
+/// ADR-049 §3a) BEFORE the saga runs.
+///
+/// `caller_did` / `caller_context_id` MUST be the channel-authenticated
+/// identity of the transport leg, never an envelope-asserted free value. For
+/// the co-resident `PyO3` bridge the "channel-authenticated principal" is an
+/// identity THIS bridge instance hosts — one present in its per-instance
+/// identity registry (populated only by `py_identity_create` on this
+/// instance). Both axes are enforced here:
+///
+///   (a) `caller_did` is hosted/authenticated by this bridge instance, AND
+///   (b) `caller_did` is a member of the named `caller_context_id`.
+///
+/// A mismatch on either axis ⇒ a typed `Rejected`-flavored `SagaAborted` (the
+/// §6.2.4 "mismatch ⇒ Rejected" terminal), carrying the registered caller-axis
+/// code `SCP-SAGA-13050`. The supervisor's own gate 1 ALSO checks membership,
+/// but membership alone is necessary-not-sufficient (it does not prove the
+/// request leg is authenticated AS that member) — so axis (a) is the
+/// load-bearing addition this seam contributes. Enforcing here, before the
+/// entry point, also means the saga never observes an unauthenticated caller.
+fn enforce_caller_principal_binding(
+    bi: &PyBridgeInstance,
+    supervisor: &std::sync::Arc<scp_core::context::supervisor::Supervisor>,
+    tokio_rt: &tokio::runtime::Runtime,
+    caller_context_id: &str,
+    caller_did: &str,
+) -> PyResult<()> {
+    if !crate::runtime::identity_registry_contains(bi, caller_did) {
+        return Err(ScpPyError::SagaAborted {
+            message: format!(
+                "caller_did '{caller_did}' is not an identity hosted by this bridge instance — \
+                 a cross-context saga's caller MUST be the channel-authenticated principal (an \
+                 identity created on this instance), not an envelope-asserted value (§6.2.4 \
+                 Caller authentication)"
+            ),
+            code: codes::SAGA_13050.to_owned(),
+            retry_after_ms: None,
+        }
+        .into());
+    }
+
+    let caller_is_member = tokio_rt.block_on(supervisor.is_member(caller_context_id, caller_did));
+    if !caller_is_member {
+        return Err(ScpPyError::SagaAborted {
+            message: format!(
+                "caller_did '{caller_did}' is hosted by this bridge but is not a member of \
+                 caller_context_id '{caller_context_id}' — not authorized to initiate a \
+                 cross-context saga over it (§6.2.4 Caller authentication)"
+            ),
+            code: codes::SAGA_13050.to_owned(),
+            retry_after_ms: None,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Implements the §6.2.4 cross-context tool-invocation saga export.
+///
+/// See [`PyScp::tool_invoke_cross_context_saga`] for the full contract. The
+/// flow is, in order:
+///
+/// 1. **Validate inputs** (well-formed ids/dids/tool-id; the nonce decodes to
+///    `[u8; 16]`, fail-closed on a wrong length — a hex string is the one
+///    canonical form).
+/// 2. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
+///    `caller_did` MUST be an identity THIS bridge instance hosts/authenticated
+///    (present in the per-instance identity registry — the co-resident SDK
+///    seam's channel-authenticated principal) AND a member of
+///    `caller_context_id`. A mismatch ⇒ a typed `Rejected`-flavored
+///    `SagaAborted` BEFORE the saga runs (the saga never observes an
+///    unauthenticated caller). `nonce` / `timestamp` / `chain_depth` REMAIN
+///    caller-supplied freshness fields (the target B validates them — they are
+///    not minted here).
+/// 3. **Chokepoint (ADR-056).** Convert the caller/target id STRINGS → `[u8; 32]`
+///    via `scp_core::context::state::context_id_to_bytes` (decode-64-hex-else-
+///    SHA256). Raw `Sha256` of a 64-hex id would double-hash and miss the actor.
+/// 4. **Signing keys.** Resolve each co-resident context's Active Signing Key
+///    via the context's `creator_did`.
+/// 5. **Executor.** Snapshot the TARGET context's tool handler under
+///    [`with_context`](crate::runtime::with_context) and build the
+///    non-`Send`-safe `move |input| async {…}` closure the supervisor runs
+///    supervisor-side at Commit-B (mirrors `tool_invoke_impl`'s executor
+///    pattern).
+/// 6. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
+///    terminal `SagaError` → typed bridge error, `Committed` →
+///    [`PySagaResult`].
+#[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
+fn tool_invoke_cross_context_saga_impl(
+    bi: &PyBridgeInstance,
+    caller_context_id: &str,
+    target_context_id: &str,
+    caller_did: &str,
+    tool_registration_id: &str,
+    input: &Bound<'_, PyDict>,
+    asserted_nonce_hex: &str,
+    asserted_timestamp_ms: u64,
+    asserted_chain_depth: u8,
+    ucan_proof_id: Option<String>,
+) -> PyResult<PySagaResult> {
+    use scp_core::context::supervisor::{CrossContextToolInvocationRequest, SagaSigningKeys};
+
+    validate::validate_context_id(caller_context_id)?;
+    validate::validate_context_id(target_context_id)?;
+    validate::validate_did(caller_did)?;
+    validate::validate_tool_id(tool_registration_id)?;
+
+    let asserted_nonce = decode_asserted_nonce(asserted_nonce_hex)?;
+    let input_json = py_dict_to_json(input)?;
+
+    // Caller-principal binding (§6.2.4 *Caller authentication*) — BEFORE the
+    // saga runs, so the supervisor never observes an unauthenticated caller.
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let tokio_rt = crate::runtime()?;
+    enforce_caller_principal_binding(bi, supervisor, tokio_rt, caller_context_id, caller_did)?;
+
+    // ----- Chokepoint (ADR-056): id STRING → [u8; 32] ------------------------
+    //
+    // MANDATORY: convert via the canonical cross-crate keying resolver, which
+    // decodes a real 64-hex id rather than re-hashing it. The producer does
+    // `hex::encode(wire)` for actor lookup, so a raw SHA-256 of a 64-hex id
+    // here would double-hash and key the wrong (non-existent) actor slot,
+    // surfacing as a spurious ContextNotRegistered abort.
+    let caller_context_bytes = scp_core::context::state::context_id_to_bytes(caller_context_id);
+    let target_context_bytes = scp_core::context::state::context_id_to_bytes(target_context_id);
+
+    // ----- Signing keys: each context's Active Signing Key -------------------
+    let target_signing_key = resolve_context_signing_key(bi, target_context_id)?;
+    let caller_signing_key = resolve_context_signing_key(bi, caller_context_id)?;
+
+    // ----- Executor: snapshot the TARGET context's tool handler --------------
+    //
+    // Mirrors `tool_invoke_impl`: snapshot the registered handler closure
+    // (an `Arc<dyn Fn>` — cloning is a refcount bump) OUTSIDE the runtime call,
+    // then move it into the `FnOnce` executor the supervisor runs
+    // supervisor-side at Commit-B (off the actor mailbox). Falls back to a
+    // schema-only echo when no handler is registered, matching the synchronous
+    // cross-context path. The supervisor validates the output against the
+    // tool's registered output schema at Commit-B, so the executor only
+    // produces the value.
+    let handler = crate::runtime::with_context(bi, target_context_id, |rt| {
+        Ok(rt.tool_handlers.get(tool_registration_id).cloned())
+    })?;
+    let tool_id_for_echo = tool_registration_id.to_owned();
+    let target_ctx_for_echo = target_context_id.to_owned();
+    let caller_did_for_echo = caller_did.to_owned();
+    let executor = move |value: serde_json::Value| {
+        let handler = handler.clone();
+        let echo_input = value.clone();
+        async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": tool_id_for_echo,
+                        "target_context": target_ctx_for_echo,
+                        "caller_did": caller_did_for_echo,
+                        "status": "validated",
+                        "input_valid": true,
+                        "validated_input": echo_input,
+                    }))
+                },
+                |h| {
+                    h(value).map_err(|e| {
+                        format!(
+                            "cross-context saga tool handler for '{tool_id_for_echo}' failed: {e}"
+                        )
+                    })
+                },
+            )
+        }
+    };
+
+    let request = CrossContextToolInvocationRequest {
+        caller_context_id: caller_context_bytes,
+        target_context_id: target_context_bytes,
+        caller_did: scp_primitives::DID(caller_did.to_owned()),
+        tool_registration_id: tool_registration_id.to_owned(),
+        ucan_proof_id,
+        input: input_json,
+        asserted_chain_depth,
+        asserted_nonce,
+        asserted_timestamp_ms,
+    };
+
+    // Dispatch to the producer on the global multi-thread runtime. PyO3 calls
+    // are sync; the Python SDK wrapper invokes us off `asyncio.to_thread`, so
+    // we are NOT inside a tokio context and `block_on` is safe (matches
+    // `tool_invoke_impl`). The saga blocks until a terminal state.
+    let output = tokio_rt
+        .block_on(async {
+            supervisor
+                .start_cross_context_tool_invocation_saga(
+                    request,
+                    SagaSigningKeys {
+                        target: &target_signing_key,
+                        caller: &caller_signing_key,
+                    },
+                    executor,
+                )
+                .await
+        })
+        .map_err(map_saga_error)?;
+
+    Ok(PySagaResult {
+        saga_id: output.saga_id.0,
+        receipt: output.receipt,
+        output: output.output,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Stateful tool sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
@@ -1503,6 +1844,128 @@ impl crate::scp::PyScp {
         )
     }
 
+    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// (spec §6.2.4, ADR-049 §3a).
+    ///
+    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// single-context-side path), this drives the full §6.2.4 cross-context
+    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// (caller + target): Prepare-A / Prepare-B authorize and stage both
+    /// sides, the tool executes EXACTLY ONCE supervisor-side at Commit-B, and
+    /// each side records its own event-log entry. Both contexts MUST be
+    /// co-resident in this bridge instance (the cross-node child-bridge
+    /// transport is separate future work).
+    ///
+    /// # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+    ///
+    /// `caller_did` is bound to the bridge-authenticated principal: it MUST be
+    /// an identity THIS bridge instance hosts (created here via identity
+    /// creation) AND a member of `caller_context_id`. A mismatch raises
+    /// `SagaAbortedError` BEFORE the saga runs — the saga never observes an
+    /// unauthenticated caller. The `asserted_nonce_hex` / `timestamp_ms` /
+    /// `chain_depth` REMAIN caller-supplied freshness fields (the target
+    /// validates them; they are not minted here).
+    ///
+    /// # Trust boundary (co-resident single-tenant only)
+    ///
+    /// The caller-principal binding (`enforce_caller_principal_binding`) treats
+    /// "hosted in this bridge instance's identity registry" as the
+    /// channel-authenticated principal. That equivalence holds ONLY for a
+    /// single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+    /// across a trust boundary within one process: a multi-tenant host loading
+    /// multiple users' identities into one bridge instance could assert any
+    /// hosted `caller_did`, since the registry cannot distinguish which tenant
+    /// is making the call. The future cross-node leg needs real channel auth
+    /// (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+    /// the authenticated-principal proof.
+    ///
+    /// On the `PyO3` string-id surface the caller/target context-id axes are
+    /// enforced by the supervisor gates — membership (`is_member`) for the
+    /// caller context and the governance-established tool-interface gate for the
+    /// target context — rather than the instance-affine handle pre-check the
+    /// NAPI/UniFFI handle-based surfaces apply. The authorization is equivalent;
+    /// the difference is only that this surface carries less pre-flight
+    /// defense-in-depth, matching the `PyO3` string-id idiom (the gates are the
+    /// authoritative check on both surfaces).
+    ///
+    /// The receipt's signer-authorization — that the target key is
+    /// governance-authorized to act for `target_context_id` (§6.2.4 "Signer
+    /// authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+    /// when the receipt is consumed, NOT enforced at this export.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller_context_id` — The initiating (caller) context id.
+    /// * `target_context_id` — The executing (target) context id.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `tool_registration_id` — The tool to invoke across the interface.
+    /// * `input` — Tool input (a Python dict; schema-checked target-side).
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a
+    ///   32-char hex string (the freshness/dedup token).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+    ///   the target re-derives `+1`).
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B. `None` for an ungated tool.
+    ///
+    /// # Returns
+    ///
+    /// A [`PySagaResult`] on the committed terminal, carrying the
+    /// supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+    /// captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+    /// never an input.
+    ///
+    /// # Errors
+    ///
+    /// Raises one of the typed saga exceptions — `SagaAbortedError` (a
+    /// Prepare-phase rejection — authorization, freshness, rate limit, or
+    /// co-residency; carries `retry_after_ms`), `SagaNeedsRepairError`
+    /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+    /// handle), or `SagaBusyError` (the participant context set overlapped an
+    /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/tool-id
+    /// is malformed or `asserted_nonce_hex` does not decode to 16 bytes.
+    ///
+    /// See spec §6.2.4 and ADR-049 §3a.
+    #[pyo3(name = "tool_invoke_cross_context_saga")]
+    #[pyo3(signature = (
+        caller_context_id,
+        target_context_id,
+        caller_did,
+        tool_registration_id,
+        input,
+        asserted_nonce_hex,
+        timestamp_ms,
+        chain_depth,
+        ucan_proof_id=None,
+    ))]
+    #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params.
+    pub fn tool_invoke_cross_context_saga(
+        &self,
+        caller_context_id: &str,
+        target_context_id: &str,
+        caller_did: &str,
+        tool_registration_id: &str,
+        input: &Bound<'_, PyDict>,
+        asserted_nonce_hex: &str,
+        timestamp_ms: u64,
+        chain_depth: u8,
+        ucan_proof_id: Option<String>,
+    ) -> PyResult<PySagaResult> {
+        let bi = &*self.inner;
+        tool_invoke_cross_context_saga_impl(
+            bi,
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            tool_registration_id,
+            input,
+            asserted_nonce_hex,
+            timestamp_ms,
+            chain_depth,
+            ucan_proof_id,
+        )
+    }
+
     /// Creates a stateful tool session.
     ///
     /// Sessions enable multi-turn workflows with state preservation across
@@ -1642,6 +2105,7 @@ impl crate::scp::PyScp {
 pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyToolRegistration>()?;
     m.add_class::<PyToolVerificationResult>()?;
+    m.add_class::<PySagaResult>()?;
     Ok(())
 }
 
@@ -1650,7 +2114,7 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
@@ -2102,5 +2566,94 @@ mod tests {
 
         // Clean up global state.
         crate::runtime::remove_ffi_state(bi, &ctx_id);
+    }
+
+    // ------------------------------------------------------------------
+    // map_saga_error — the bridge's typed-terminal → typed-error mapping.
+    //
+    // The classification itself (the `RateLimited → Option<u64>` read, the
+    // `None`-never-`0` rule, the `SCP-SAGA-{code}` formatting, the fixed
+    // terminal codes) lives in `scp_ffi_common::saga_errors` and is unit-tested
+    // there for all three bridges. The producer's actual terminal behavior is
+    // covered in `crates/scp-runtime`. Here we test ONLY this bridge's thin
+    // tail: that each `SagaErrorKind` routes through `common` onto the right
+    // `ScpPyError` variant with the shared `code`/`message` and the
+    // per-terminal datum (`retry_after_ms`/`saga_id`/`contended_context`)
+    // carried onto the PyO3 fields — including that `retry_after_ms = None` is
+    // preserved (never coerced to `Some(0)`).
+    // ------------------------------------------------------------------
+
+    use scp_core::context::supervisor::{SagaAbortReason, SagaError as CoreSagaError, SagaId};
+
+    /// `Aborted` routes through `common` onto `ScpPyError::SagaAborted` with the
+    /// `SCP-SAGA-{code}` string and `retry_after_ms` carried structurally; a
+    /// `None` back-off hint stays `None` (never `Some(0)`).
+    #[test]
+    fn map_saga_error_aborted_routes_through_common() {
+        let some = map_saga_error(CoreSagaError::Aborted {
+            reason: SagaAbortReason::RateLimited {
+                retry_after_ms: Some(2500),
+            },
+            code: 13026,
+            message: "inbound rate limit exceeded".to_owned(),
+        });
+        match some {
+            ScpPyError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, "SCP-SAGA-13026");
+                assert_eq!(retry_after_ms, Some(2500));
+            }
+            other => panic!("expected SagaAborted, got {other:?}"),
+        }
+
+        let none = map_saga_error(CoreSagaError::Aborted {
+            reason: SagaAbortReason::RateLimited {
+                retry_after_ms: None,
+            },
+            code: 13026,
+            message: "hard limit, no precise back-off".to_owned(),
+        });
+        match none {
+            ScpPyError::SagaAborted { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, None, "None must NOT be coerced to Some(0)");
+            }
+            other => panic!("expected SagaAborted, got {other:?}"),
+        }
+    }
+
+    /// `NeedsRepair` / `Busy` route through `common` onto their `PyO3` variants
+    /// with the fixed terminal codes and per-terminal datum carried.
+    #[test]
+    fn map_saga_error_needs_repair_and_busy_route_through_common() {
+        let repair = map_saga_error(CoreSagaError::NeedsRepair {
+            saga_id: SagaId("saga-abc-123".to_owned()),
+            message: "commit retries exhausted".to_owned(),
+        });
+        match repair {
+            ScpPyError::SagaNeedsRepair { code, saga_id, .. } => {
+                assert_eq!(code, codes::SAGA_13065);
+                assert_eq!(saga_id, "saga-abc-123");
+            }
+            other => panic!("expected SagaNeedsRepair, got {other:?}"),
+        }
+
+        let busy = map_saga_error(CoreSagaError::Busy {
+            contended_context: "ctx-shared-99".to_owned(),
+            message: "participant set overlaps an in-flight saga".to_owned(),
+        });
+        match busy {
+            ScpPyError::SagaBusy {
+                code,
+                contended_context,
+                ..
+            } => {
+                assert_eq!(code, codes::SAGA_13066);
+                assert_eq!(contended_context, "ctx-shared-99");
+            }
+            other => panic!("expected SagaBusy, got {other:?}"),
+        }
     }
 }

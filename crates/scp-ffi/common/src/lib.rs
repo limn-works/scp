@@ -144,6 +144,15 @@ pub mod event_log;
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 
+// Canonical §6.2.4 SagaError decomposition shared across PyO3, napi-rs, and
+// UniFFI. Pins the `RateLimited → Option<u64>` read, the `None`-never-`0` rule,
+// and the `SCP-SAGA-{code}` formatting in ONE place so the three bridges'
+// `map_saga_error` cannot drift. Requires scp-core for
+// `scp_core::context::supervisor::SagaError` (behind `resolvers` feature). WASM
+// has no Supervisor and never drives the saga (ADR-034).
+#[cfg(feature = "resolvers")]
+pub mod saga_errors;
+
 // Shared broadcast key-distribution value-shape helpers (§5.14.2). The
 // Grant→sealed-JSON and sealed-JSON→raw-key seams are identical across PyO3,
 // napi-rs, and UniFFI; extracted here so the hand-populated author_did/context_id

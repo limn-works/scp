@@ -76,6 +76,8 @@ tempfile = "3"
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
+# Needs `allow_in_memory_custody` for the in-memory custody/storage test
+# harness (`new_in_memory_for_test`, `scp-platform/testing`).
 required-features = ["allow_in_memory_custody"]
 
 [lints]

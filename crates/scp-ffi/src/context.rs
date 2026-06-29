@@ -1220,7 +1220,11 @@ fn build_core_context_params(
 /// provider and active signing key handle, and exports the raw
 /// `ed25519_dalek::SigningKey`. Required because the core governance
 /// lifecycle functions take `&SigningKey` directly.
-fn resolve_signing_key(
+///
+/// `pub(crate)` so the cross-context saga export in `tools.rs` can resolve
+/// each co-resident participant context's Active Signing Key (via that
+/// context's `creator_did`) without re-implementing the custody-export path.
+pub(crate) fn resolve_signing_key(
     bi: &crate::runtime::PyBridgeInstance,
     identity_did: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {

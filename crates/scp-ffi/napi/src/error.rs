@@ -111,6 +111,63 @@ pub enum ScpNapiError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
+
+    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase
+    /// (ADR-049 §3a).
+    ///
+    /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
+    /// only payload is a message string (the TypeScript SDK reverses the
+    /// `[{code}]` prefix into a typed `ScpError`). So the load-bearing
+    /// structured datum — the rate-limit back-off hint — is appended to the
+    /// message in a machine-parseable `(retry_after_ms=…)` suffix that the TS
+    /// wrapper reads. `retry_after_ms` is rendered as a literal `null` when
+    /// `None` (NEVER `0`): a `0` would read as "retry immediately" and re-trip
+    /// the same hard limit. The field stays `Option<u64>` here so the value is
+    /// read STRUCTURALLY off `SagaAbortReason::RateLimited`, never re-parsed.
+    #[error(
+        "[{code}] saga aborted: {message} (retry_after_ms={})",
+        retry_after_ms.map_or_else(|| "null".to_owned(), |v| v.to_string())
+    )]
+    SagaAborted {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13xxx` code.
+        code: String,
+        /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+        retry_after_ms: Option<u64>,
+    },
+
+    /// A §6.2.4 saga exhausted its Commit retries and may have diverged
+    /// (ADR-049 §3a).
+    ///
+    /// The durable `saga_id` operator-repair handle is appended to the message
+    /// in a machine-parseable `(saga_id=…)` suffix for the TS wrapper, and held
+    /// STRUCTURALLY in the variant.
+    #[error("[{code}] saga needs repair: {message} (saga_id={saga_id})")]
+    SagaNeedsRepair {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13065` code.
+        code: String,
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: String,
+    },
+
+    /// A §6.2.4 saga's participant context set overlapped an in-flight saga
+    /// (§5.15.4).
+    ///
+    /// The contended context id is appended to the message in a
+    /// machine-parseable `(contended_context=…)` suffix for the TS wrapper, and
+    /// held STRUCTURALLY in the variant.
+    #[error("[{code}] saga busy: {message} (contended_context={contended_context})")]
+    SagaBusy {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13066` code.
+        code: String,
+        /// The shared context id that forced serialization.
+        contended_context: String,
+    },
 }
 
 impl From<ScpNapiError> for napi::Error {

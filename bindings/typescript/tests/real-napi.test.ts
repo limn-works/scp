@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
-import { SCP } from "../src/scp";
+import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 
 /**
@@ -2009,6 +2009,326 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         expect(r).toHaveProperty("etag");
         expect(r).toHaveProperty("deployId");
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a)
+  // ---------------------------------------------------------------------------
+  //
+  // The §6.2.4 saga export lives on the native `SCP` class as
+  // `toolInvokeCrossContextSaga` (NOT yet on the SDK `Bridge` wrapper — that
+  // is a separate SDK-wrapper slice). So these tests reach it on the RAW
+  // native instance the bridge already wraps, obtained via `__getNativeScp`
+  // against the SAME `SCP` that minted the context handles. Using the same
+  // instance is mandatory: the per-instance handle-affinity guard rejects a
+  // handle minted by any other instance with SCP-PERM-3030.
+  //
+  // The signature crossing the addon boundary is:
+  //   toolInvokeCrossContextSaga(
+  //     sourceHandle, targetHandle, callerDid, toolRegistrationId,
+  //     inputJson, assertedNonceHex, timestampMs: BigInt, chainDepth: u8,
+  //     ucanProofId?: string,
+  //   ) => Promise<{ sagaId, receipt?, output? }>
+  //
+  // What these cases pin is the JS-marshaling boundary the Rust-side napi
+  // test cannot exercise: the `BigInt` timestamp narrowing, the hex-nonce
+  // string, the `#[napi(object)] NapiSagaResult` (`saga_id`/`receipt`/`output`)
+  // round-trip, and — the load-bearing one — that a typed `SagaError` survives
+  // the collapse to a single `napi::Error` message string with its
+  // `SCP-SAGA-{code}` + parseable structured suffix intact, so the TypeScript
+  // error layer can reverse it.
+  describe("Cross-context tool-invocation saga (real NAPI)", () => {
+    // A 16-byte freshness nonce as the one canonical 32-char lowercase-hex
+    // wire form (§6.2.4 envelope nonce).
+    const NONCE_HEX = "0123456789abcdef0123456789abcdef";
+
+    // The deterministic, cross-bridge tool id form (`generate_tool_id(name)`).
+    const TOOL_NAME = "xctx_saga_ts_tool";
+    const TOOL_ID = `tool-${TOOL_NAME}`;
+
+    // A near-now Unix-ms timestamp as a JS `BigInt`. Prepare-B enforces a
+    // §9.14 ±5min skew, so a fixed historical value would abort with a skew
+    // error rather than reaching the terminal under test.
+    function nowMsBigInt(): bigint {
+      return BigInt(Date.now());
+    }
+
+    // Handle types, inferred from the bridge surface so this block needs no
+    // extra import. `napi.contextCreate` returns the raw native context handle
+    // (it carries `.contextId`); `napi.identityCreate` returns the raw native
+    // identity handle (it carries `.did`).
+    type IdentityHandle = Awaited<ReturnType<typeof napi.identityCreate>>;
+    type ContextHandle = Awaited<ReturnType<typeof napi.contextCreate>>;
+
+    // The native `toolInvokeCrossContextSaga` method as it crosses the addon
+    // boundary, read off the raw native SCP that minted every handle below.
+    // Using that exact instance is mandatory — the per-instance handle-affinity
+    // guard rejects a handle minted by any other instance (SCP-PERM-3030).
+    type SagaResult = { sagaId: string; receipt?: Uint8Array; output?: Uint8Array };
+    type SagaFn = (
+      sourceHandle: ContextHandle,
+      targetHandle: ContextHandle,
+      callerDid: string,
+      toolRegistrationId: string,
+      inputJson: string,
+      assertedNonceHex: string,
+      timestampMs: bigint,
+      chainDepth: number,
+      ucanProofId: string | undefined,
+    ) => Promise<SagaResult>;
+    function nativeSaga(): SagaFn {
+      const raw = __getNativeScp(scpInstance) as unknown as {
+        toolInvokeCrossContextSaga: SagaFn;
+      };
+      return raw.toolInvokeCrossContextSaga.bind(raw);
+    }
+
+    // Creates a caller (source) context A owned by `ownerDid`. A's ceiling
+    // carries `governance:propose` (so the admin can propose) and
+    // `tool:interface` (required by execute_establish_tool_interface's ceiling
+    // check). `contextCreate` mints a real 64-hex id so the ADR-056 saga
+    // chokepoint round-trips to A's actor.
+    async function createCallerContext(owner: IdentityHandle): Promise<ContextHandle> {
+      return napi.contextCreate(
+        owner,
+        JSON.stringify({
+          ceiling: [
+            "governance:propose",
+            "tool:interface",
+            "tools:invoke",
+            "messages:read",
+            "messages:write",
+          ],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+    }
+
+    // Creates a target (executing) context B owned by `ownerDid`. B's ceiling
+    // carries `governance:propose` + `tool:register` so the saga tool can be
+    // registered into B's ACTOR governance state (the saga's Prepare-B reads
+    // the tool from there).
+    async function createTargetContext(owner: IdentityHandle): Promise<ContextHandle> {
+      return napi.contextCreate(
+        owner,
+        JSON.stringify({
+          ceiling: ["governance:propose", "tool:register"],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+    }
+
+    // Externally-tagged `GovernanceAction::RegisterTool` for the saga tool.
+    // Two input + two output properties clear the §9.2.1 specificity floor of
+    // 2. `implementation_hash` is a 32-element JSON number array (serde expects
+    // a fixed `[u8; 32]`). `operator_did` is a required string (not nullable).
+    // Registering this into B's actor state via governance is what the saga's
+    // Prepare-B requires.
+    function registerToolActionJson(operatorDid: string): string {
+      return JSON.stringify({
+        RegisterTool: {
+          registration: {
+            tool_id: TOOL_ID,
+            name: TOOL_NAME,
+            description: `Tool: ${TOOL_NAME}`,
+            schema: {
+              input_schema: {
+                type: "object",
+                properties: { a: { type: "string" }, b: { type: "string" } },
+              },
+              output_schema: {
+                type: "object",
+                properties: { sum: { type: "number" }, ok: { type: "number" } },
+              },
+            },
+            implementation_hash: new Array(32).fill(0),
+            test_vectors: [],
+            operator_did: operatorDid,
+            cost: null,
+            registered_at: 0,
+            signature: [],
+          },
+        },
+      });
+    }
+
+    // Externally-tagged `GovernanceAction::EstablishToolInterface`, source=A,
+    // target=B, BOTH approvals true. The producer's gate 2 queries this
+    // bidirectionally-approved interface against the CALLER context A's actor
+    // governance state, so it is established IN A.
+    function establishInterfaceActionJson(ctxA: string, ctxB: string): string {
+      return JSON.stringify({
+        EstablishToolInterface: {
+          interface: {
+            source_context: ctxA,
+            target_context: ctxB,
+            tool_id: TOOL_ID,
+            rate_limit: null,
+            inbound_rate_limit: null,
+            per_caller_rate_limit: null,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: null,
+            inbound_policy: null,
+          },
+        },
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Method exists + argument marshaling.
+    //
+    // Drives the saga from a real authenticated caller (a member of context A)
+    // with a `BigInt` timestamp and a 32-char hex nonce, but WITHOUT an
+    // established interface. The producer's target-axis gate 2 then aborts with
+    // SCP-SAGA-13062 — which is exactly the point: a typed terminal (not a
+    // `TypeError` / native panic) proves the `BigInt`, the hex nonce, the two
+    // raw context handles, and the chain-depth `u8` all marshaled across the
+    // addon and the saga actually ran.
+    // -----------------------------------------------------------------------
+    test("is callable: BigInt timestamp + hex nonce marshal and the saga runs", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      const promise = nativeSaga()(
+        ctxA,
+        ctxB,
+        owner.did,
+        TOOL_ID,
+        JSON.stringify({ a: "x", b: "y" }),
+        NONCE_HEX,
+        nowMsBigInt(),
+        1,
+        undefined,
+      );
+
+      // No established interface ⇒ the producer's gate 2 rejects. The
+      // rejection is a real `Error` carrying the typed saga code (NOT a
+      // synchronous TypeError from a failed BigInt/handle marshal).
+      let caught: unknown;
+      try {
+        await promise;
+        throw new Error("saga unexpectedly resolved without an established interface");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const message = (caught as Error).message;
+      expect(message).not.toMatch(/TypeError/);
+      // Target-axis gate (no interface) ⇒ SCP-SAGA-13062.
+      expect(message).toContain("SCP-SAGA-13062");
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. Error-code surfacing — the key marshaling check.
+    //
+    // A caller_did that is NOT an identity hosted by this bridge instance
+    // trips the FFI-side §6.2.4 Caller-authentication binding BEFORE the saga
+    // runs, mapping to a typed `SagaAborted` with code SCP-SAGA-13050 and a
+    // `retry_after_ms = None` (rendered as the literal `null`). This proves the
+    // typed-SagaError → napi::Error → JS-Error-message mapping survives the
+    // boundary with both the code AND the parseable structured suffix intact.
+    // -----------------------------------------------------------------------
+    test("surfaces SCP-SAGA-13050 with a parseable structured suffix on a caller mismatch", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      // A well-formed did:dht that this bridge instance does NOT host.
+      const foreignCallerDid = "did:dht:z6MkNeverHostedSagaCallerForMarshalTest";
+
+      let caught: unknown;
+      try {
+        await nativeSaga()(
+          ctxA,
+          ctxB,
+          foreignCallerDid,
+          TOOL_ID,
+          JSON.stringify({ a: "x", b: "y" }),
+          NONCE_HEX,
+          nowMsBigInt(),
+          1,
+          undefined,
+        );
+        throw new Error("saga unexpectedly resolved for a non-hosted caller");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const message = (caught as Error).message;
+      // The canonical caller-axis saga code.
+      expect(message).toContain("SCP-SAGA-13050");
+      // The structured back-off suffix is present and parseable: a plain
+      // (non-rate-limit) caller rejection carries no precise back-off, so it
+      // renders as the literal `null` — never coerced to `0`.
+      expect(message).toMatch(/\(retry_after_ms=null\)/);
+    });
+
+    // -----------------------------------------------------------------------
+    // 3. Committed terminal through the addon — result-object marshaling.
+    //
+    // Establishes the full saga precondition entirely through the addon's
+    // governance surface (no Rust-internal handler hook is reachable from JS):
+    //
+    //   - RegisterTool into B's ACTOR governance state (Prepare-B reads it).
+    //   - EstablishToolInterface (bidirectionally approved) into A (gate 2).
+    //
+    // No tool handler is registered (the only handler-attach path is
+    // Rust-internal `register_tool_handler`, not a napi export), so the
+    // supervisor-side executor runs the schema-echo fallback the FFI bridge
+    // builds — the producer captures whatever the executor returns as the
+    // signed `output_jcs`. The committed result object therefore marshals to a
+    // non-empty `sagaId`, a `receipt` Buffer, and an `output` Buffer that
+    // decodes to the echoed JSON.
+    // -----------------------------------------------------------------------
+    test("commits via governance-established interface and marshals the result object", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      // Register the saga tool into B's actor governance state (auto-executes
+      // under single_admin). The tool's operator is the owner DID.
+      await napi.contextGovernancePropose(ctxB, registerToolActionJson(owner.did), owner.did);
+
+      // Establish the bidirectionally-approved interface in A (auto-executes
+      // under single_admin). The id-form fields compare on the raw 64-hex
+      // digest the handles carry.
+      await napi.contextGovernancePropose(
+        ctxA,
+        establishInterfaceActionJson(ctxA.contextId, ctxB.contextId),
+        owner.did,
+      );
+
+      const result = await nativeSaga()(
+        ctxA,
+        ctxB,
+        owner.did,
+        TOOL_ID,
+        JSON.stringify({ a: "x", b: "y" }),
+        NONCE_HEX,
+        nowMsBigInt(),
+        1,
+        undefined,
+      );
+
+      // The `#[napi(object)] NapiSagaResult` round-trips: a non-empty
+      // supervisor-minted saga id and the receipt/output buffers.
+      expect(typeof result.sagaId).toBe("string");
+      expect(result.sagaId.length).toBeGreaterThan(0);
+      expect(result.receipt).toBeInstanceOf(Uint8Array);
+      expect((result.receipt as Uint8Array).length).toBeGreaterThan(0);
+      expect(result.output).toBeInstanceOf(Uint8Array);
+
+      // The committed output decodes to the executor's (echo-fallback) JSON.
+      // Assert the parsed structure, not raw bytes, so a JCS-canonical
+      // encoding still passes: the echo carries the validated input back.
+      const decoded = JSON.parse(new TextDecoder().decode(result.output as Uint8Array));
+      expect(decoded).toBeTruthy();
+      expect(decoded.validated_input).toEqual({ a: "x", b: "y" });
     });
   });
 }

@@ -1378,6 +1378,18 @@ pub(crate) fn identity_registry(bi: &NapiBridgeInstance) -> &DashMap<String, Nap
     bi.identity_registry.as_ref()
 }
 
+/// Returns `true` iff `did` is an identity hosted by this bridge instance.
+///
+/// The per-instance identity registry is populated only by the identity
+/// creation paths on THIS instance, so membership here is the co-resident
+/// bridge's notion of a "channel-authenticated principal". Used by the §6.2.4
+/// cross-context saga export's caller-principal binding (ADR-049 §3a) to reject
+/// an envelope-asserted caller that this instance does not host. Mirrors the
+/// `PyO3` reference `identity_registry_contains`.
+pub(crate) fn identity_registry_contains(bi: &NapiBridgeInstance, did: &str) -> bool {
+    identity_registry(bi).contains_key(did)
+}
+
 /// Registers an identity in the bridge instance's identity registry.
 ///
 /// Called by `identity_create`, `identity_create_with_agent_key`, and
