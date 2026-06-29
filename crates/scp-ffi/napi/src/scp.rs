@@ -3545,6 +3545,30 @@ impl Scp {
         )
     }
 
+    /// Computes the structured participation record (§7.3.2) for `subjectDid`
+    /// in `contextId`.
+    ///
+    /// The bridge sources the subject's accessible, currently-valid attestations
+    /// from this instance's persistent trust store (populating any
+    /// caller-supplied `cachedAttestationsJson` first), and the shared
+    /// Supervisor gathers the FULL event log to derive every other fact. Returns
+    /// a typed `NapiParticipationRecord` — the SDK receives the flattened facts
+    /// and never re-aggregates event-log collections. See ADR-017, spec §7.3.2.
+    #[napi(js_name = "participationRecord")]
+    pub fn participation_record(
+        &self,
+        context_id: String,
+        subject_did: String,
+        cached_attestations_json: String,
+    ) -> napi::Result<crate::trust::NapiParticipationRecord> {
+        crate::trust::participation_record_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            cached_attestations_json,
+        )
+    }
+
     // ====================================================================
     // #1549 Phase 4 PR 4 — sub-slice E: mcp/testing/media/provenance/sync
     // operations on SCP.

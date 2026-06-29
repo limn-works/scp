@@ -1730,6 +1730,60 @@ impl From<scp_core::crypto::ucan::validate::CapabilityValidation> for Capability
     }
 }
 
+/// Structured participation facts (§7.3.2) for a subject DID in a context.
+///
+/// The scalar projection of scp-core's `ParticipationRecord`, produced by
+/// `aggregate.participation_record`. Counts are flattened ONCE in the shared
+/// Rust core (`ParticipationFacts`) so the Swift/Kotlin SDKs RECEIVE the facts
+/// rather than re-aggregating event-log collections — eliminating cross-binding
+/// divergence by construction. See ADR-017.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ParticipationRecordView {
+    /// The DID whose participation is summarized.
+    pub subject_did: String,
+    /// Total seconds of context participation (§7.3.2).
+    pub participation_duration_secs: u64,
+    /// Count of governance actions taken against this identity (projected
+    /// `target_did` is the subject).
+    pub governance_actions_against: u64,
+    /// Count of governance actions initiated by this identity.
+    pub governance_actions_by: u64,
+    /// Total tool invocations across all tool types.
+    pub tool_invocation_count: u64,
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
+    /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
+    pub tool_invocation_count_anchored: bool,
+    /// Number of contexts created by the subject (`ChildContextCreated`).
+    pub context_creation_count: u64,
+    /// Number of role transitions for the subject.
+    pub role_progression_count: u64,
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative.
+    pub attestation_count: u64,
+    /// Unix timestamp (seconds) when the record was computed.
+    pub computed_at: u64,
+    /// Merkle root (hex) of the event log at computation time.
+    pub event_log_root: String,
+}
+
+impl From<&scp_core::trust::ParticipationFacts> for ParticipationRecordView {
+    fn from(f: &scp_core::trust::ParticipationFacts) -> Self {
+        Self {
+            subject_did: f.subject_did.to_string(),
+            participation_duration_secs: f.participation_duration_secs,
+            governance_actions_against: f.governance_actions_against,
+            governance_actions_by: f.governance_actions_by,
+            tool_invocation_count: f.tool_invocation_count,
+            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            context_creation_count: f.context_creation_count,
+            role_progression_count: f.role_progression_count,
+            attestation_count: f.attestation_count,
+            computed_at: f.computed_at,
+            event_log_root: hex::encode(f.event_log_root),
+        }
+    }
+}
+
 /// Current data availability status of the source context (spec §24.2.2).
 ///
 /// Reflects operational state, not creation-time memory scope. A persistent
@@ -15221,6 +15275,88 @@ impl Scp {
         }
     }
 
+    /// Computes the structured participation record (§7.3.2) for `subject_did`
+    /// in `context_id`.
+    ///
+    /// Sources the subject's accessible, currently-valid attestations from THIS
+    /// instance's `ProtocolRepository` variant (populating any caller-supplied
+    /// `cached_attestations_json` first, exactly as `aggregate_trust_input`
+    /// does) — the REAL credential-layer source, not `&[]`. The shared
+    /// Supervisor gathers the FULL event log + Merkle root for every other fact.
+    /// Returns the flattened typed [`ParticipationRecordView`] so the
+    /// Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
+    pub fn participation_record(
+        &self,
+        context_id: String,
+        subject_did: String,
+        cached_attestations_json: String,
+    ) -> Result<ParticipationRecordView, ScpError> {
+        // Full format validation (matching the PyO3 reference bridge), not just
+        // a non-empty check, so all native bridges reject malformed ids
+        // identically.
+        validate_context_id(&context_id)?;
+        validate_did(&subject_did)?;
+
+        let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+            serde_json::from_str(&cached_attestations_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse cached_attestations JSON: {e}"),
+                code: codes::VALID_7059.to_owned(),
+            })?;
+
+        // Source verified attestations from this instance's `ProtocolRepository`
+        // (same backend as context/event-log writes).
+        let verified = match self.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                let handle = runtime().handle().clone();
+                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                    std::sync::Arc::clone(repo),
+                    handle,
+                );
+                scp_ffi_common::trust_store::verified_attestations(
+                    bridge,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                )
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                let handle = runtime().handle().clone();
+                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                    std::sync::Arc::clone(repo),
+                    handle,
+                );
+                scp_ffi_common::trust_store::verified_attestations(
+                    bridge,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                )
+            }
+        }
+        .map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: codes::VALID_7059.to_owned(),
+        })?;
+
+        let supervisor = self
+            .inner
+            .core
+            .supervisor()
+            .ok_or_else(|| ScpError::Context {
+                msg: "supervisor not initialized — cannot compute participation record".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })?;
+        let record = supervisor
+            .participation_record(&context_id, &subject_did, &verified)
+            .map_err(|e| ScpError::Context {
+                msg: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })?;
+
+        let facts = scp_core::trust::ParticipationFacts::from(&record);
+        Ok(ParticipationRecordView::from(&facts))
+    }
+
     // ===== State-touching operations — per-instance methods on `Scp` =====
     //
     // The remaining state-touching operations live on `impl Scp`, routing
@@ -17085,6 +17221,73 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    #[test]
+    fn participation_record_rejects_empty_context() {
+        let scp = scp_test();
+        let result =
+            scp.participation_record(String::new(), "did:key:test".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_empty_did() {
+        let scp = scp_test();
+        let result = scp.participation_record("ctx-1".to_owned(), String::new(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_invalid_attestations_json() {
+        let scp = scp_test();
+        let result = scp.participation_record(
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_malformed_did() {
+        // Format validation (not just non-empty) matches the PyO3 reference
+        // bridge: a non-empty but malformed DID is rejected.
+        let scp = scp_test();
+        let result =
+            scp.participation_record("ctx-1".to_owned(), "not-a-did".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    /// The typed `ParticipationRecordView` surfaces every flattened fact from
+    /// the shared `ParticipationFacts` projection with identical values.
+    #[test]
+    fn participation_record_view_exposes_all_facts() {
+        let facts = scp_core::trust::ParticipationFacts {
+            subject_did: "did:key:bob".into(),
+            participation_duration_secs: 300,
+            governance_actions_against: 1,
+            governance_actions_by: 2,
+            tool_invocation_count: 5,
+            tool_invocation_count_anchored: false,
+            context_creation_count: 1,
+            role_progression_count: 3,
+            attestation_count: 2,
+            computed_at: 42,
+            event_log_root: [7u8; 32],
+        };
+        let view = ParticipationRecordView::from(&facts);
+        assert_eq!(view.subject_did, "did:key:bob");
+        assert_eq!(view.participation_duration_secs, 300);
+        assert_eq!(view.governance_actions_against, 1);
+        assert_eq!(view.governance_actions_by, 2);
+        assert_eq!(view.tool_invocation_count, 5);
+        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.context_creation_count, 1);
+        assert_eq!(view.role_progression_count, 3);
+        assert_eq!(view.attestation_count, 2);
+        assert_eq!(view.computed_at, 42);
+        assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
     }
 
     /// Builds a synthetic `ContextHandle` stamped with `scp`'s own

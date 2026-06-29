@@ -177,6 +177,46 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     })
 }
 
+/// Populates a trust store with caller-supplied attestations and returns the
+/// subject's accessible, currently-valid (non-expired, non-revoked, signature-
+/// verified) attestations.
+///
+/// This is the attestation-sourcing half of [`populate_and_aggregate`], factored
+/// out so the participation-record bridge path can obtain the credential-layer
+/// `attestation_count` input (§7.4) WITHOUT running the full trust aggregation.
+/// It uses the SAME `AttestationCache` /
+/// [`IdentityDidPublicKeyResolver`](scp_core::trust::IdentityDidPublicKeyResolver) /
+/// [`SystemClock`](scp_identity::cache::SystemClock) wiring as
+/// `aggregate_trust_input`, so the participation `attestation_count` and the
+/// aggregation's `verified_attestations` agree by construction.
+///
+/// The returned attestations are threaded into
+/// [`Supervisor::participation_record`](scp_core) /
+/// [`compute_participation_record`](scp_core::trust::compute_participation_record):
+/// the caller passes them, this helper sources them — neither fabricates an
+/// empty set. A subject with no cached/persisted attestations yields an empty
+/// `Vec` (count 0, verifier-relative per §7.3.2).
+///
+/// # Errors
+///
+/// Returns [`TrustError`] if store population or attestation verification fails.
+pub fn verified_attestations<S: TrustProtocolRepository>(
+    store: S,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, TrustError> {
+    for ca in cached_attestations {
+        store.store_cached_attestation(context_id, ca)?;
+    }
+
+    let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    cache.get_verified_attestations(context_id, subject_did, &resolver, &clock)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

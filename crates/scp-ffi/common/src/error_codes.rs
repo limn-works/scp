@@ -801,6 +801,8 @@ pub const VALID_7056: &str = "SCP-VALID-7056";
 pub const VALID_7057: &str = "SCP-VALID-7057";
 /// Bridge connector import validation error.
 pub const VALID_7058: &str = "SCP-VALID-7058";
+/// Participation record validation error (§7.3.2).
+pub const VALID_7059: &str = "SCP-VALID-7059";
 /// Discovery validation error.
 pub const VALID_7060: &str = "SCP-VALID-7060";
 /// Discovery member validation error.
