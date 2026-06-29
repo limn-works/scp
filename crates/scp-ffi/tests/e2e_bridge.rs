@@ -1222,3 +1222,305 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 // Validation of unknown storage `type` strings now happens at the Python
 // boundary in `crate::scp::PyScp::with_storage` (covered by
 // `bindings/python/tests/test_scp_class.py::test_with_storage_rejects_unknown_type`).
+
+// ============================================================================
+// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — PyO3 export
+// ============================================================================
+//
+// These tests exercise what the PyO3 bridge ADDS on top of the supervisor
+// producer (`start_cross_context_tool_invocation_saga`), whose committed /
+// abort / busy / rate-limit / co-residency paths are covered in
+// `crates/scp-runtime` integration tests (the full `Committed` path needs the
+// actor-state interface establishment those tests inject directly, which has
+// no bridge-public wiring). At the bridge layer the export's own
+// responsibilities are:
+//
+//   - the §6.2.4 *Caller authentication* binding (caller_did MUST be hosted by
+//     this bridge instance AND a member of caller_context_id) — rejected BEFORE
+//     the saga runs;
+//   - the ADR-056 chokepoint (a real 64-hex id decodes to the digest the
+//     producer's `hex::encode` lookup expects — it reaches the actor rather
+//     than double-hashing to a missing slot);
+//   - the participant-context-set gating surfaced as `SagaBusyError`;
+//   - fail-closed nonce decoding;
+//   - the typed terminal → typed Python exception mapping.
+
+/// A real 64-character lowercase-hex context id (32 bytes). The ADR-056
+/// chokepoint decodes such an id to its digest, and the producer's
+/// `hex::encode(digest)` actor lookup reproduces the SAME 64-hex string — so a
+/// context registered under this id is reachable by the saga. (The 32-hex
+/// `random_context_id` helper would hit the SHA-256 fallback and miss the
+/// actor.)
+fn random_64hex_context_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Creates a co-resident context under a real 64-hex id (so the saga
+/// chokepoint round-trips to the actor). Mirrors [`create_test_context`] but
+/// with a caller-chosen id.
+fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context_id: &str) {
+    setup();
+    runtime::register_context(bi, context_id, creator_did, &[]).unwrap();
+
+    let rt = test_runtime();
+    let supervisor = runtime::supervisor(bi).unwrap().clone();
+    let creator = scp_identity::DID(creator_did.to_owned());
+    let ctx_id = context_id.to_owned();
+
+    rt.block_on(async move {
+        let params = scp_core::context::ContextParams::default();
+        supervisor
+            .create_context(ctx_id.clone(), params, creator.clone(), None)
+            .await
+            .unwrap();
+        supervisor.register_local_did(creator).await.unwrap();
+    });
+}
+
+/// Registers a minimal `{a,b} -> {sum,ok}` tool in `context_id`, returning the
+/// tool registration id. Reuses the shared [`build_tool_reg`] schema.
+fn register_saga_tool(
+    py: Python<'_>,
+    scp: &_scp_core::scp::PyScp,
+    context_id: &str,
+    operator_did: &str,
+) -> String {
+    let reg = build_tool_reg(py, "xctx_saga_tool", operator_did);
+    scp.tool_register(context_id, &reg.as_borrowed()).unwrap()
+}
+
+/// A valid 16-byte nonce as a 32-char hex string.
+fn nonce_hex() -> String {
+    "00112233445566778899aabbccddeeff".to_owned()
+}
+
+/// (a) Caller-principal binding: a `caller_did` this bridge instance does NOT
+/// host is rejected with `SagaAbortedError` (SCP-SAGA-13050) BEFORE the saga
+/// runs — the §6.2.4 *Caller authentication* channel-auth binding. The caller
+/// is a real well-formed DID that is simply not in this instance's registry.
+#[test]
+fn xctx_saga_unhosted_caller_rejected_before_saga() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+
+        // A syntactically valid DID that was never created on this instance.
+        let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001";
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                unhosted_caller,
+                &tool_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("an unhosted caller_did must be rejected before the saga runs");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13050"),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        assert!(
+            msg.contains("not an identity hosted by this bridge"),
+            "message must name the hosted-principal mismatch, got: {msg}"
+        );
+    });
+}
+
+/// (b) Caller-principal binding, membership axis: a `caller_did` that IS hosted
+/// by this bridge but is NOT a member of `caller_context_id` is rejected with
+/// `SagaAbortedError` (SCP-SAGA-13050) BEFORE the saga runs.
+#[test]
+fn xctx_saga_hosted_non_member_caller_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        // A SECOND hosted identity that is NOT a member of caller_ctx.
+        let stranger = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                &stranger, // hosted, but not a member of caller_ctx
+                &tool_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a hosted non-member caller must be rejected before the saga runs");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13050"),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        assert!(
+            msg.contains("not a member of"),
+            "message must name the membership mismatch, got: {msg}"
+        );
+    });
+}
+
+/// (c)+(e) Chokepoint + target-axis authorization: an authenticated caller
+/// (hosted + member) over REAL 64-hex contexts passes the bridge's
+/// channel-auth binding and the chokepoint round-trips to the actor — the saga
+/// then aborts at the supervisor's TARGET-axis gate (SCP-SAGA-13062: no
+/// established interface) rather than at the caller gate or with a spurious
+/// `ContextNotRegistered`. Reaching 13062 proves the digest keyed the right
+/// actor (had the chokepoint double-hashed, gate 1's `is_member` would have
+/// failed first with 13050).
+#[test]
+fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                &owner, // hosted AND a member of caller_ctx (its creator)
+                &tool_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("no established interface exists, so the target-axis gate aborts the saga");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13062"),
+            "expected target-axis SCP-SAGA-13062 (caller passed gate 1 — chokepoint reached the \
+             actor), got: {msg}"
+        );
+        assert!(
+            !msg.contains("SCP-SAGA-13050"),
+            "must NOT be the caller-axis reject — the authenticated caller passed gate 1, got: {msg}"
+        );
+    });
+}
+
+// (d) Participant-context-set gating → `SagaBusyError` (SCP-SAGA-13066): NOT
+// reachable from the bridge's PUBLIC surface. The producer evaluates the
+// target-axis interface gate (SCP-SAGA-13062) BEFORE it attempts the
+// participant-context-set reservation (supervisor.rs:
+// `start_cross_context_tool_invocation_saga` runs gate 1 → gate 2 → reserve).
+// Establishing the actor-state `ToolInterface` that gate 2 requires has no
+// bridge-public wiring (the bridge's `tool_interface_expose`/`accept` write
+// only the FFI-side copy, not the actor's `governance.tool_interfaces`), so a
+// bridge caller cannot pass gate 2 and therefore can never reach the
+// reservation step to observe `SagaBusy`. The producer's actual `SagaBusy`
+// terminal is covered in `crates/scp-runtime` integration tests; the bridge's
+// SOLE added responsibility for the Busy terminal is the typed-error mapping,
+// which is unit-tested directly in `tools.rs`
+// (`map_saga_error` → `SagaBusyError` with the structured `contended_context`).
+
+/// Fail-closed nonce decoding: a malformed `asserted_nonce_hex` (wrong length)
+/// raises `ValidationError` — the bridge does NOT pad, truncate, or accept any
+/// non-canonical form. The saga never runs.
+#[test]
+fn xctx_saga_malformed_nonce_rejected_fail_closed() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        // 8 bytes, not 16.
+        let short_nonce = "0011223344556677";
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                &owner,
+                &tool_id,
+                &input.as_borrowed(),
+                short_nonce,
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a wrong-length nonce must be rejected fail-closed");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::ValidationError>(py),
+            "expected ValidationError, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("16 bytes"),
+            "message must explain the 16-byte requirement, got: {err}"
+        );
+    });
+}

@@ -78,6 +78,55 @@ pyo3::create_exception!(
     "Input validation failed (malformed data, schema mismatch, constraint violation)."
 );
 
+// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) terminal errors.
+//
+// These three exceptions surface the typed
+// `Supervisor::start_cross_context_tool_invocation_saga` terminal space
+// (`SagaError`) WITHOUT the caller having to parse a message string: each
+// carries the structured terminal datum the §6.2.4 / ADR-049 §3a contract
+// makes load-bearing as a positional Python exception argument (read from
+// `e.args`, never re-parsed from the message text):
+//
+// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase
+//   rejection (§6.2.4). `retry_after_ms` is the rate-limit back-off hint:
+//   an `int` of milliseconds when the tripped limiter can compute one, or
+//   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
+//   read as "retry immediately" and re-trip the same hard limit. A plain
+//   (non-rate-limit) rejection also carries `None`.
+// - `SagaNeedsRepairError(message, code, saga_id)` — Commit-retry exhausted;
+//   the saga may have partially committed (a divergence). `saga_id` is the
+//   durable operator-repair handle.
+// - `SagaBusyError(message, code, contended_context)` — the participant
+//   context set overlapped an in-flight saga (§5.15.4). `contended_context`
+//   names the shared context id.
+//
+// `code` is the canonical `SCP-SAGA-13xxx` string and is ALSO embedded in
+// `message` (`"[SCP-SAGA-13xxx] …"`) so a flattened log line still
+// disambiguates by `grep`.
+pyo3::create_exception!(
+    scp_sdk,
+    SagaAbortedError,
+    ScpError,
+    "A cross-context tool-invocation saga aborted at a Prepare phase (§6.2.4). \
+     args = (message, code, retry_after_ms): retry_after_ms is an int of \
+     milliseconds or None (never 0)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    SagaNeedsRepairError,
+    ScpError,
+    "A cross-context tool-invocation saga exhausted its Commit retries and may \
+     have diverged (ADR-049 §3a). args = (message, code, saga_id): saga_id is \
+     the durable operator-repair handle."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    SagaBusyError,
+    ScpError,
+    "A cross-context tool-invocation saga's participant context set overlapped \
+     an in-flight saga (§5.15.4). args = (message, code, contended_context)."
+);
+
 // ---------------------------------------------------------------------------
 // ScpPyError enum
 // ---------------------------------------------------------------------------
@@ -137,6 +186,43 @@ pub enum ScpPyError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
+    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+    ///
+    /// Maps to the Python `SagaAbortedError`. Carries the rate-limit back-off
+    /// hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is the limiter's
+    /// computed cooldown; `None` (NEVER `0`) means no precise back-off instant
+    /// (a token-bucket hard limit, or a non-rate-limit rejection).
+    SagaAborted {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13xxx` code.
+        code: String,
+        /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+        retry_after_ms: Option<u64>,
+    },
+    /// A §6.2.4 saga exhausted its Commit retries and may have diverged.
+    ///
+    /// Maps to the Python `SagaNeedsRepairError`. Carries the durable
+    /// `saga_id` operator-repair handle.
+    SagaNeedsRepair {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13065` code.
+        code: String,
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: String,
+    },
+    /// A §6.2.4 saga's participant context set overlapped an in-flight saga.
+    ///
+    /// Maps to the Python `SagaBusyError`. Carries the contended context id.
+    SagaBusy {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13066` code.
+        code: String,
+        /// The shared context id that forced serialization.
+        contended_context: String,
+    },
 }
 
 impl std::fmt::Display for ScpPyError {
@@ -159,6 +245,19 @@ impl std::fmt::Display for ScpPyError {
             }
             Self::ValidationError { message, code } => {
                 write!(f, "[{code}] validation error: {message}")
+            }
+            // Saga terminals embed the canonical SCP-SAGA-13xxx code so a
+            // flattened log line still `grep`-disambiguates; the structured
+            // datum (retry_after_ms / saga_id / contended_context) rides the
+            // exception args, not the message text.
+            Self::SagaAborted { message, code, .. } => {
+                write!(f, "[{code}] saga aborted: {message}")
+            }
+            Self::SagaNeedsRepair { message, code, .. } => {
+                write!(f, "[{code}] saga needs repair: {message}")
+            }
+            Self::SagaBusy { message, code, .. } => {
+                write!(f, "[{code}] saga busy: {message}")
             }
         }
     }
@@ -252,6 +351,27 @@ impl From<ScpPyError> for PyErr {
             ScpPyError::TransportError { .. } => TransportError::new_err(formatted),
             ScpPyError::UcanError { .. } => UcanError::new_err(formatted),
             ScpPyError::ValidationError { .. } => ValidationError::new_err(formatted),
+            // Saga terminals carry their structured datum as positional
+            // exception args so a Python caller reads `retry_after_ms` /
+            // `saga_id` / `contended_context` directly from `e.args[2]` —
+            // never by re-parsing the message text. `formatted` (carrying the
+            // `[SCP-SAGA-…]` prefix) is `args[0]`; the canonical code is
+            // `args[1]`. `retry_after_ms` maps `None` → Python `None`
+            // (NEVER `0`), preserving the §6.2.4 back-off semantics across
+            // the FFI boundary.
+            ScpPyError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => SagaAbortedError::new_err((formatted, code, retry_after_ms)),
+            ScpPyError::SagaNeedsRepair { code, saga_id, .. } => {
+                SagaNeedsRepairError::new_err((formatted, code, saga_id))
+            }
+            ScpPyError::SagaBusy {
+                code,
+                contended_context,
+                ..
+            } => SagaBusyError::new_err((formatted, code, contended_context)),
         }
     }
 }
@@ -775,6 +895,12 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     m.add("UcanError", m.py().get_type::<UcanError>())?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
+    m.add("SagaAbortedError", m.py().get_type::<SagaAbortedError>())?;
+    m.add(
+        "SagaNeedsRepairError",
+        m.py().get_type::<SagaNeedsRepairError>(),
+    )?;
+    m.add("SagaBusyError", m.py().get_type::<SagaBusyError>())?;
     Ok(())
 }
 
@@ -928,5 +1054,89 @@ mod tests {
         )
         .into();
         assert_eq!(context_code_of(err), codes::CTX_2137);
+    }
+
+    // ------------------------------------------------------------------
+    // Saga terminal → Python exception: the structured datum MUST ride the
+    // exception args so a Python caller reads it directly (never by parsing
+    // the message text). args = (message, code, structured_field).
+    // ------------------------------------------------------------------
+
+    /// `SagaAborted` → `SagaAbortedError` carrying `retry_after_ms` as `args[2]`
+    /// (a Python `int` when `Some`).
+    #[test]
+    fn saga_aborted_maps_to_exception_with_retry_after_ms_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaAborted {
+                message: "rate limited".to_owned(),
+                code: "SCP-SAGA-13026".to_owned(),
+                retry_after_ms: Some(2500),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaAbortedError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let code: String = args.get_item(1).unwrap().extract().unwrap();
+            assert_eq!(code, "SCP-SAGA-13026");
+            let retry: u64 = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(retry, 2500);
+        });
+    }
+
+    /// `SagaAborted` with `retry_after_ms = None` → `args[2]` is Python `None`,
+    /// NEVER `0`.
+    #[test]
+    fn saga_aborted_none_retry_is_python_none_not_zero() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaAborted {
+                message: "no back-off".to_owned(),
+                code: "SCP-SAGA-13026".to_owned(),
+                retry_after_ms: None,
+            }
+            .into();
+            let args = err.value(py).getattr("args").unwrap();
+            let retry = args.get_item(2).unwrap();
+            assert!(
+                retry.is_none(),
+                "retry_after_ms None must surface as Python None, not 0"
+            );
+        });
+    }
+
+    /// `SagaNeedsRepair` → `SagaNeedsRepairError` carrying `saga_id` as `args[2]`.
+    #[test]
+    fn saga_needs_repair_maps_to_exception_with_saga_id_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaNeedsRepair {
+                message: "diverged".to_owned(),
+                code: codes::SAGA_13065.to_owned(),
+                saga_id: "saga-xyz".to_owned(),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaNeedsRepairError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let saga_id: String = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(saga_id, "saga-xyz");
+        });
+    }
+
+    /// `SagaBusy` → `SagaBusyError` carrying `contended_context` as `args[2]`.
+    #[test]
+    fn saga_busy_maps_to_exception_with_contended_context_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaBusy {
+                message: "busy".to_owned(),
+                code: codes::SAGA_13066.to_owned(),
+                contended_context: "ctx-shared".to_owned(),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaBusyError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let contended: String = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(contended, "ctx-shared");
+        });
     }
 }
