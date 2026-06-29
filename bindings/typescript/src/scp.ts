@@ -37,11 +37,11 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
-import { mapBridgeError, ValidationError } from "./errors";
+import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
-import type { CapabilityValidation, EventFilter, TrustEvaluation } from "./types";
+import type { BehavioralRecord, CapabilityValidation, TrustEvaluation } from "./types";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -2262,8 +2262,16 @@ export class SCP {
    *   never inspects error prose — it reads the structured
    *   {@link CapabilityValidation} directly. With no tokens supplied, every
    *   field stays `false` (no stage was observed to pass).
-   * - **Layer 2 — behavioral validation.** Queries the context event log for
-   *   the subject's verifiable facts (participation, tool usage, governance).
+   * - **Layer 2 — behavioral validation.** RECEIVES the subject's verifiable
+   *   participation facts (§7.3.2) from the shared Rust core via
+   *   {@link participationRecord} — the core gathers the full event log and
+   *   flattens the facts ONCE, so the SDK never re-aggregates event-log
+   *   collections (no cross-binding divergence). A context with no convergent
+   *   events yet (an empty event log) is not an error here: the behavioral
+   *   record is reported with all counts zeroed (the subject simply has no
+   *   recorded facts), so a Layer-1-only caller never has to populate the log
+   *   first. Use {@link participationRecord} directly when the empty-log case
+   *   should surface as an error instead.
    *
    * The capability outcome is non-throwing (it reads booleans); only malformed
    * FFI inputs (bad context handle / token / capability) propagate as a typed
@@ -2336,53 +2344,53 @@ export class SCP {
       };
     }
 
-    // Layer 2: behavioral record from the event log, scoped to the subject.
-    // The event-log query is the other direct native dispatch in this method;
-    // route it through the same `mapBridgeError` chokepoint as the per-token
-    // diagnostic (ADR-055 Decision 4) so a raw bridge error becomes a typed
-    // `ScpError` here too. (`ucanEvaluate` above already maps its own dispatch.)
-    // `eventLogQuery` returns the RAW bridge shape verbatim — NAPI
-    // `NapiEvent` / WASM event records carry `{eventType, actorDid, timestamp,
-    // payloadJson (a JSON string), sequence}`. There is NO `payload` object
-    // field, and the queryable `payloadJson` on the manager path is just
-    // `{"hash":...}` — it does NOT carry a tool id. So per-tool-type keying is
-    // not achievable from this data today; it awaits ADR-051 making
-    // `ToolInvoked` a convergent leaf with a richer payload. Type to the actual
-    // runtime shape (an `eventType` string) rather than the unsound
-    // `as readonly Event[]` cast, which masked a non-existent `payload` read.
-    let rawEvents: readonly { eventType: string }[];
+    // Layer 2: behavioral record RECEIVED from the shared Rust core. The core
+    // gathers the FULL event log and flattens the participation facts (§7.3.2)
+    // ONCE in `Supervisor::participation_record`; the SDK never re-aggregates
+    // event-log collections, so every binding observes identical facts for the
+    // same context/subject (the divergence the old client-side classify
+    // suffered).
+    //
+    // No cached attestations are supplied: `evaluateTrust` takes no attestation
+    // set, so `attestationCount` reflects only what the bridge can source from
+    // its own persistent trust store (verifier-relative, §7.3.2). This honestly
+    // passes nothing rather than fabricating attestations.
+    //
+    // A context with no convergent events yet makes the core return
+    // `EmptyEventLog` (surfaced as a `ContextError`). That is not a failure for
+    // a trust evaluation — it means "no recorded facts" — so it is folded into a
+    // zeroed behavioral record rather than thrown, keeping `evaluateTrust`
+    // usable on activity-free contexts (e.g. a Layer-1-only check). Any other
+    // error (malformed input, provider failure) still propagates.
+    // The native participation-record op keys the event log by the context's
+    // canonical id — the 64-char hex `contextId` the handle carries, the same
+    // value `eventLogQuery` derives from the handle — NOT the caller-supplied
+    // `contextId` label argument (which only labels the returned evaluation).
+    // Resolve it from the handle so the lookup hits the real log; fall back to
+    // the label when the handle is opaque (e.g. a mock that omits `contextId`).
+    const resolvedContextId = (handle as { readonly contextId?: string }).contextId ?? contextId;
+    let behavioralRecord: BehavioralRecord;
     try {
-      const filter: EventFilter = { actorDid: subjectDid };
-      rawEvents = (await this.eventLogQuery(handle, JSON.stringify(filter))) as readonly {
-        eventType: string;
-      }[];
+      behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
     } catch (error) {
-      throw mapBridgeError(error);
-    }
-    // `tool_invocations` is a MAP keyed by tool type whose values are counts
-    // (spec §7.2.4: `ToolInvocationCount = tool_invocations.values().sum()`).
-    // Until ADR-051's richer ToolInvoked payload arrives, every ToolInvoked
-    // event buckets under the literal `"ToolInvoked"` key — matching the Python
-    // SDK exactly (`{"ToolInvoked": <count>}`).
-    const toolInvocations: Record<string, number> = {};
-    let governanceActionsBy = 0;
-    let governanceActionsAgainst = 0;
-    for (const event of rawEvents) {
-      if (event.eventType === "ToolInvoked") {
-        toolInvocations.ToolInvoked = (toolInvocations.ToolInvoked ?? 0) + 1;
-      } else if (event.eventType === "GovernanceActionExecuted") {
-        governanceActionsBy += 1;
-      } else if (event.eventType === "GovernanceActionAgainst") {
-        governanceActionsAgainst += 1;
+      if (error instanceof ContextError && /event log is empty/i.test(error.message)) {
+        behavioralRecord = {
+          subjectDid,
+          participationDurationSecs: 0,
+          governanceActionsAgainst: 0,
+          governanceActionsBy: 0,
+          toolInvocationCount: 0,
+          toolInvocationCountAnchored: false,
+          contextCreationCount: 0,
+          roleProgressionCount: 0,
+          attestationCount: 0,
+          computedAt: 0,
+          eventLogRoot: "",
+        };
+      } else {
+        throw error;
       }
     }
-    const behavioralRecord = {
-      participationCount: rawEvents.length,
-      participationDurationSeconds: 0,
-      toolInvocations,
-      governanceActionsBy,
-      governanceActionsAgainst,
-    };
 
     return {
       subjectDid,
@@ -2390,6 +2398,69 @@ export class SCP {
       capabilityValidation,
       behavioralRecord,
       attestations: [],
+    };
+  }
+
+  /**
+   * Computes the structured participation record (§7.3.2) for `subjectDid` in
+   * `contextId`.
+   *
+   * The shared Rust core gathers the FULL context event log and flattens the
+   * participation facts ONCE (`Supervisor::participation_record`), and the NAPI
+   * bridge sources the subject's accessible, currently-valid attestations from
+   * its own persistent trust store (seeded by `cachedAttestationsJson`). The
+   * SDK RECEIVES the flattened {@link BehavioralRecord} — it never re-aggregates
+   * event-log collections, so every binding observes identical facts for the
+   * same context/subject.
+   *
+   * `attestationCount` is a credential-layer fact (§7.4): it is NOT a
+   * context-event count and NOT Merkle-anchored, and is verifier-relative
+   * (computed from the attestations the bridge can access). Pass the subject's
+   * accessible attestations as `cachedAttestationsJson` (a JSON array) to
+   * populate it; the default `"[]"` honestly reports only what the bridge's
+   * trust store already holds.
+   *
+   * @param contextId The context the participation is scoped to.
+   * @param subjectDid The DID whose participation facts are computed.
+   * @param cachedAttestationsJson JSON array of cached attestations to seed the
+   *   bridge's trust store before sourcing the subject's verified set. Defaults
+   *   to `"[]"` (source only what is already persisted).
+   * @returns The flattened participation facts as a {@link BehavioralRecord}.
+   * @throws {@link "./errors".ScpError} on malformed FFI input or a behavioral
+   *   compute failure (e.g. an empty event log).
+   */
+  async participationRecord(
+    contextId: string,
+    subjectDid: string,
+    cachedAttestationsJson = "[]",
+  ): Promise<BehavioralRecord> {
+    let record: BehavioralRecord;
+    try {
+      record = (
+        this.#native.participationRecord as (
+          ctx: string,
+          subj: string,
+          ca: string,
+        ) => BehavioralRecord
+      )(contextId, subjectDid, cachedAttestationsJson);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+    // Project an explicit, documented SDK shape rather than passing the native
+    // object through — the field set is stable and matches the Python SDK /
+    // Rust `ParticipationFacts` 1:1.
+    return {
+      subjectDid: record.subjectDid,
+      participationDurationSecs: record.participationDurationSecs,
+      governanceActionsAgainst: record.governanceActionsAgainst,
+      governanceActionsBy: record.governanceActionsBy,
+      toolInvocationCount: record.toolInvocationCount,
+      toolInvocationCountAnchored: record.toolInvocationCountAnchored,
+      contextCreationCount: record.contextCreationCount,
+      roleProgressionCount: record.roleProgressionCount,
+      attestationCount: record.attestationCount,
+      computedAt: record.computedAt,
+      eventLogRoot: record.eventLogRoot,
     };
   }
 

@@ -22,6 +22,7 @@ import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import type { BehavioralRecord } from "../src/types";
 import { allValid } from "../src/types";
 
 /**
@@ -795,42 +796,289 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result.behavioralRecord).toBeDefined();
     });
 
-    // Finding M: the Layer-2 behavioral record's `toolInvocations` is a MAP
-    // keyed by tool type whose values are counts (spec §7.2.4). Drive it from
-    // the SAME raw event log `evaluateTrust` consumes so the assertion pins the
-    // ACTUAL bucketing against real bridge data, not a fabricated shape. Every
-    // queryable `ToolInvoked` event buckets under the literal "ToolInvoked" key
-    // (per-tool-type keying awaits ADR-051's richer payload). The bridge never
-    // emits a `payload` OBJECT — events carry `payloadJson` (a JSON string) —
-    // so a `payload.toolId` read (the bug this guards) is structurally
-    // impossible and would silently bucket everything under one fallback.
-    test("evaluateTrust behavioralRecord.toolInvocations buckets ToolInvoked by type from real events", async () => {
+    // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
+    // participation record (§7.3.2) RECEIVED from the shared Rust core via
+    // `participationRecord` — the SDK no longer classifies raw events
+    // client-side, so the divergence-prone per-binding `toolInvocations` map is
+    // gone. The record exposes the flattened `ParticipationFacts` 1:1.
+    //
+    // After create+join the context's supervisor Merkle log holds convergent
+    // leaves (the `eventLogRoot` is a real, non-zero hash that advances with
+    // each lifecycle op), so `participationRecord` RETURNS a typed record — it
+    // does NOT throw. This test pins the baseline record SHAPE on a context with
+    // no governance activity yet: a real Merkle root, a real `computedAt`,
+    // `attestationCount == 0` (no attestations supplied — credential-layer, §7.4),
+    // `toolInvocationCountAnchored == false` (ADR-051), and the obsolete
+    // client-side fields absent. The per-fact governance/role COUNTS being
+    // exercised live (and asserted non-zero) is the job of the affirmative test
+    // below — the runtime DOES populate the ADR-011-amendment subject-bearing
+    // payloads on the live NAPI governance path, so those counts move with
+    // activity. This test deliberately does not assert them, since no governance
+    // action has occurred at this point.
+    test("participationRecord returns a typed record with a real Merkle root (real SCP method)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
-      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
+      );
       await napi.contextJoin(ctx, member.did);
 
-      // Query the SAME raw event log the SDK consumes (this.#native path:
-      // events carry `payloadJson`, NOT a `payload` object). Compute the
-      // expected map exactly as the SDK should: count ToolInvoked events and
-      // bucket them under the single "ToolInvoked" key.
-      const rawEvents = (await scpInstance.eventLogQuery(
-        ctx,
-        JSON.stringify({ actor_did: member.did }),
-      )) as readonly { eventType: string; payloadJson?: string }[];
-      // Prove the raw shape: a `payloadJson` string, never a `payload` object.
-      for (const e of rawEvents) {
-        expect(typeof e.payloadJson).toBe("string");
-        expect((e as Record<string, unknown>).payload).toBeUndefined();
-      }
-      const toolInvokedCount = rawEvents.filter((e) => e.eventType === "ToolInvoked").length;
-      const expected = toolInvokedCount > 0 ? { ToolInvoked: toolInvokedCount } : {};
+      // Key the lookup by the context's canonical id (the 64-char hex the handle
+      // carries) — the same value `evaluateTrust` resolves from the handle — so
+      // the lookup hits the context's REAL supervisor log.
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      const record = await scpInstance.participationRecord(realContextId, member.did);
 
-      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      const result = await scpInstance.evaluateTrust(ctx, member.did, "ctx-real", [good.encoded]);
-      // CONTENT assertion (not just "defined"): the map matches the real events,
-      // keyed by event type — never a per-toolId fallback off a missing field.
-      expect(result.behavioralRecord.toolInvocations).toEqual(expected);
+      expect(record.subjectDid).toBe(member.did);
+      // The log is non-empty: a real 32-byte Merkle root (64 hex chars), not the
+      // all-zero placeholder of an absent root.
+      expect(record.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.eventLogRoot).not.toBe("0".repeat(64));
+      expect(record.computedAt).toBeGreaterThan(0);
+      // `tool_invocation_count` is never Merkle-anchored until ADR-051 (§7.3.2).
+      expect(record.toolInvocationCountAnchored).toBe(false);
+      // No cached attestations supplied → credential-layer count is 0 (§7.4),
+      // honest and verifier-relative — the SDK fabricates none.
+      expect(record.attestationCount).toBe(0);
+      // The obsolete client-side fields are gone from the typed shape.
+      expect((record as unknown as Record<string, unknown>).toolInvocations).toBeUndefined();
+      expect((record as unknown as Record<string, unknown>).participationCount).toBeUndefined();
+    });
+
+    // C3c (Phase 2C-2): the leaf-derived participation facts (§7.3.2) MOVE in
+    // response to real governance activity. A `single_admin` context whose
+    // ceiling carries the governance capabilities auto-executes each proposal
+    // on `propose` (ADR-031), appending convergent `GovernanceActionExecuted` /
+    // `RoleAssigned` / `ChildContextCreated` leaves to the supervisor's Merkle
+    // log. The typed `participationRecord` then RECEIVES non-zero counts
+    // attributed by the subject-bearing payloads (ADR-011 amendment): the actor
+    // for `governance_actions_by` / `context_creation_count`, and the projected
+    // member for `role_progression_count` / `governance_actions_against`. This
+    // is the affirmative counterpart to the create+join-only test above — it
+    // proves the facts are real, not perpetually zero.
+    test("participationRecord reflects real governance activity (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      // The ceiling MUST carry the governance + child-creation capabilities, or
+      // the proposer (creator) lacks `governance:propose` / the child-creation
+      // capability and the proposal is permission-denied.
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+
+      // 1. ChangeRole(member → moderator): a RoleAssigned leaf projected to the
+      //    member + a GovernanceActionExecuted leaf actored by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      // 2. RemoveMember(member): an adverse action → governance_actions_against
+      //    the member + another GovernanceActionExecuted by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "participation-test" } }),
+        admin.did,
+      );
+      // 3. CreateChildContext: a ChildContextCreated leaf actored by the admin →
+      //    the admin's context_creation_count increments by one.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              tools: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRecord = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRecord = await scpInstance.participationRecord(realContextId, member.did);
+
+      // Admin INITIATED all three governance actions and created one child.
+      expect(adminRecord.governanceActionsBy).toBe(3);
+      expect(adminRecord.governanceActionsAgainst).toBe(0);
+      expect(adminRecord.contextCreationCount).toBe(1);
+      expect(adminRecord.roleProgressionCount).toBe(0);
+      // Member was the TARGET of one role change and one (adverse) removal.
+      expect(memberRecord.roleProgressionCount).toBe(1);
+      expect(memberRecord.governanceActionsAgainst).toBe(1);
+      expect(memberRecord.governanceActionsBy).toBe(0);
+      expect(memberRecord.contextCreationCount).toBe(0);
+      // Credential-layer / anchoring invariants hold for both subjects.
+      expect(adminRecord.attestationCount).toBe(0);
+      expect(memberRecord.attestationCount).toBe(0);
+      expect(adminRecord.toolInvocationCountAnchored).toBe(false);
+      expect(memberRecord.toolInvocationCountAnchored).toBe(false);
+      // Real Merkle root over the convergent governance leaves.
+      expect(adminRecord.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(adminRecord.eventLogRoot).not.toBe("0".repeat(64));
+
+      // evaluateTrust (handle-resolved contextId) RECEIVES the SAME record the
+      // direct op returns — no client-side recomputation, no divergence.
+      const evaluated = await scpInstance.evaluateTrust(ctx, admin.did, "lbl");
+      expect(evaluated.behavioralRecord).toEqual(adminRecord);
+    });
+
+    // CROSS-SDK PARITY (the divergence-killer). Because both SDKs now RECEIVE
+    // the identical Rust-computed `ParticipationFacts` rather than each
+    // recomputing Layer 2, the SAME governance scenario MUST yield the SAME
+    // per-fact counts in TypeScript and Python. This test pins the canonical
+    // expected counts for the scenario; the Python sibling
+    // `test_participation_record_reflects_governance_real_ffi`
+    // (bindings/python/tests/test_real_ffi.py) asserts the IDENTICAL counts for
+    // the IDENTICAL scenario — so a divergence between the two bindings is a
+    // CI-visible test failure on one side, by construction. (DIDs and the
+    // Merkle root vary per run and are excluded from the parity tuple; the
+    // leaf-derived/credential counts are deterministic for the scenario.)
+    test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "parity" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              tools: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRec = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRec = await scpInstance.participationRecord(realContextId, member.did);
+
+      // The CANONICAL counts the Python sibling test asserts verbatim. Keys are
+      // the deterministic, DID-independent facts (the Merkle root + subject_did
+      // are excluded since they vary per run).
+      const counts = (r: BehavioralRecord) => ({
+        governanceActionsAgainst: r.governanceActionsAgainst,
+        governanceActionsBy: r.governanceActionsBy,
+        toolInvocationCount: r.toolInvocationCount,
+        toolInvocationCountAnchored: r.toolInvocationCountAnchored,
+        contextCreationCount: r.contextCreationCount,
+        roleProgressionCount: r.roleProgressionCount,
+        attestationCount: r.attestationCount,
+        participationDurationSecs: r.participationDurationSecs,
+      });
+      expect(counts(adminRec)).toEqual({
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 3,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 1,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+      expect(counts(memberRec)).toEqual({
+        governanceActionsAgainst: 1,
+        governanceActionsBy: 0,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 1,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+    });
+
+    // `evaluateTrust` must remain usable on a context with NO convergent leaves
+    // (the EmptyEventLog case): the core returns `EmptyEventLog`, which the SDK
+    // folds into a zeroed behavioral record rather than throwing, so a
+    // Layer-1-only trust check never has to populate the log first. Drive the
+    // genuinely-empty case by keying the (handle-resolved) lookup at a context
+    // label the supervisor has never seen, so the core's event-log lookup is
+    // empty and the graceful fold is exercised end-to-end against the real
+    // bridge. `participationRecord` on the same empty context propagates instead.
+    test("evaluateTrust folds an empty event log into a zeroed behavioral record (real SCP method)", async () => {
+      const member = await napi.identityCreate("in_memory");
+      // A handle whose resolved contextId is a never-created label → empty log.
+      const emptyHandle = { contextId: "ctx-never-created-empty-log" };
+
+      // Direct record request on the empty context → typed ContextError.
+      await expect(
+        scpInstance.participationRecord(emptyHandle.contextId, member.did),
+      ).rejects.toThrow(/event log is empty/i);
+
+      // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
+      // Layer-2 empty-log fold is exercised) → graceful zeroed record.
+      const result = await scpInstance.evaluateTrust(emptyHandle, member.did, "ctx-real");
+      const record = result.behavioralRecord;
+      expect(record.subjectDid).toBe(member.did);
+      expect(record.participationDurationSecs).toBe(0);
+      expect(record.governanceActionsAgainst).toBe(0);
+      expect(record.governanceActionsBy).toBe(0);
+      expect(record.toolInvocationCount).toBe(0);
+      expect(record.toolInvocationCountAnchored).toBe(false);
+      expect(record.contextCreationCount).toBe(0);
+      expect(record.roleProgressionCount).toBe(0);
+      expect(record.attestationCount).toBe(0);
+      // Empty-log fold uses the all-zero root placeholder, not a real hash.
+      expect(record.eventLogRoot).toBe("");
     });
 
     // Finding O: audience-mismatch trust-inflation regression (TS sibling of
