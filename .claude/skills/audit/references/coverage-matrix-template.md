@@ -7,10 +7,10 @@ Use this template to build cross-layer coverage matrices during audits. Fill eve
 For each spec file, track which requirements are implemented and where.
 
 ```
-| Spec Requirement | Core Rust | PyO3 Bridge | UniFFI Bridge | NAPI Bridge | WASM Bridge | Python SDK | TS SDK | Kotlin SDK | Swift SDK | Tests |
-|-----------------|-----------|-------------|---------------|-------------|-------------|------------|--------|------------|-----------|-------|
-| §X.Y.Z Req 1   | ✓ file:ln | ✓ file:ln   | ✓ file:ln     | ✓ file:ln   | ✓ file:ln   | ✓ file:ln  | ✓      | ✓          | ✓         | ✓     |
-| §X.Y.Z Req 2   | ✓         | ✗ MISSING   | ✓             | ✗ MISSING   | N/A         | ✗          | ✗      | ✓          | ✓         | ✗     |
+| Spec Requirement | Core Rust | PyO3 Bridge | UniFFI Bridge | NAPI Bridge | Python SDK | TS SDK | Kotlin SDK | Swift SDK | Tests |
+|-----------------|-----------|-------------|---------------|-------------|------------|--------|------------|-----------|-------|
+| §X.Y.Z Req 1   | ✓ file:ln | ✓ file:ln   | ✓ file:ln     | ✓ file:ln   | ✓ file:ln  | ✓      | ✓          | ✓         | ✓     |
+| §X.Y.Z Req 2   | ✓         | ✗ MISSING   | ✓             | ✗ MISSING   | ✗          | ✗      | ✓          | ✓         | ✗     |
 ```
 
 ## Function Export Matrix
@@ -18,10 +18,10 @@ For each spec file, track which requirements are implemented and where.
 Track which core functions are exported through each bridge.
 
 ```
-| Core Function           | Module      | PyO3 | UniFFI | NAPI | WASM | Notes |
-|------------------------|-------------|------|--------|------|------|-------|
-| create_context()       | context     | ✓    | ✓      | ✓    | ✓    |       |
-| validate_capability()  | governance  | ✓    | ✗      | ✗    | N/A  | Gap   |
+| Core Function           | Module      | PyO3 | UniFFI | NAPI | Notes |
+|------------------------|-------------|------|--------|------|-------|
+| create_context()       | context     | ✓    | ✓      | ✓    |       |
+| validate_capability()  | governance  | ✓    | ✗      | ✗    | Gap   |
 ```
 
 ## SDK Wrapper Matrix
@@ -68,7 +68,7 @@ For each item in the left column, search for its counterpart in each layer colum
 
 - `✓` — implemented and verified (include file:line reference)
 - `✗` — missing (this is a finding)
-- `N/A` — not applicable (e.g., WASM can't do certain operations per ADR-034)
+- `N/A` — not applicable (e.g., an operation a given bridge legitimately does not expose, with a documented exemption)
 - `~` — partial implementation (this is a finding)
 - `?` — could not determine (needs investigation)
 

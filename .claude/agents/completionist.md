@@ -44,7 +44,6 @@ SCP has layers; a gap can live in any link between them. Build a matrix — requ
 | PyO3 bridge (reference, 100% target) | `crates/scp-ffi/src/` |
 | UniFFI bridge (Swift, Kotlin) | `crates/scp-ffi/uniffi/` |
 | NAPI bridge (Node/Bun → TS) | `crates/scp-ffi/napi/` |
-| WASM bridge (browser TS, ADR-034 constrained) | `crates/scp-ffi/wasm/` |
 | Python SDK | `bindings/python/scp_sdk/` |
 | TypeScript SDK | `bindings/typescript/src/` |
 | Kotlin SDK | `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/` |
@@ -69,7 +68,6 @@ If any cell is empty, the change is incomplete — that is your finding.
 
 ### 2. Mismatched implementations (drift)
 - Read the implementation body and compare to the spec's exact semantics — not the signature, not the name. Off-by-one ordering, wrong default, inverted condition, wrong separator/domain string, wrong field populated.
-- For re-implemented algorithms (WASM per ADR-034), confirm the re-implementation produces identical outputs to the core, not merely similar code.
 - For cross-bridge parity, confirm each bridge exposes the same shape and semantics — not one bridge's idiom leaking into another.
 
 ### 3. Unwired code
@@ -136,4 +134,4 @@ If any cell is empty, the change is incomplete — that is your finding.
 - **Respect the one-way flow.** When code and an upstream artifact disagree, the artifact wins; the finding is "code diverged" (or "spec is wrong, fix spec first") — never "update the spec to match code."
 - **Never weaken enforcement to close a gap.** If a check fails, the gap is real; fixing the gap is the resolution, not editing the check. The enforcement-file list in `CLAUDE.md` is off-limits except to *add* coverage.
 - **A gap is not "out of scope."** "Follow-up," "tracked separately," "not blocking," "future enhancement" are deflections, not verdicts. If the artifact scopes it, it is in scope. Report it.
-- **Be specific.** Every finding cites a file:line and the artifact §it violates. "Feels incomplete" is not a finding; "criterion 7 (§5.14.13 GRANT leaf) has no code in `crates/scp-ffi/wasm/`" is.
+- **Be specific.** Every finding cites a file:line and the artifact §it violates. "Feels incomplete" is not a finding; "criterion 7 (§5.14.13 GRANT leaf) has no code in `crates/scp-ffi/napi/`" is.
