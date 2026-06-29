@@ -25,6 +25,7 @@ use std::sync::Once;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use _scp_core::context::PyContextHandle;
 use _scp_core::custody::FfiKeyCustody;
 use _scp_core::runtime::{self, IdentityEntry, PyBridgeInstance};
 
@@ -1522,5 +1523,289 @@ fn xctx_saga_malformed_nonce_rejected_fail_closed() {
             err.to_string().contains("16 bytes"),
             "message must explain the 16-byte requirement, got: {err}"
         );
+    });
+}
+
+/// Reads a `PyContextHandle`'s `context_id` through its Python getter. The
+/// bridge's `context_create` generates the id internally and the Rust-level
+/// getter is `#[pymethods]`-private, so the id is read the same way a Python
+/// caller would: via the `context_id` attribute.
+fn handle_context_id(py: Python<'_>, handle: &PyContextHandle) -> String {
+    handle
+        .clone()
+        .into_pyobject(py)
+        .unwrap()
+        .getattr("context_id")
+        .unwrap()
+        .extract::<String>()
+        .unwrap()
+}
+
+/// Builds and wires the full saga precondition through the `PyO3` bridge:
+/// owner identity, caller context A, target context B, the tool registered into
+/// both B's actor governance state and the FFI-side registry (with a
+/// deterministic handler), and the bidirectionally-approved `ToolInterface`
+/// established in A. Returns `(scp, ctx_a, ctx_b, owner, tool_id)` so the
+/// `#[test]` body can invoke the saga and assert its terminal state. All setup
+/// lives here; every assertion stays in the test.
+///
+/// The setup mirrors the producer's two authorization axes
+/// (`start_cross_context_tool_invocation_saga`, supervisor.rs):
+///
+/// 1. **Caller axis (gate 1).** `caller_did` must be hosted by this bridge AND a
+///    member of the CALLER (source) context A. Creating A via `context_create`
+///    with `owner` as the single-admin creator satisfies both.
+/// 2. **Target axis (gate 2).** The producer requires a *bidirectionally
+///    approved* `ToolInterface` (`approved_by_source && approved_by_target`)
+///    that it queries against the CALLER context A's actor governance state
+///    (`has_established_tool_interface`, `queries_helpers.rs`) — NOT context B's.
+///    So the interface is established IN A, via a governance
+///    `EstablishToolInterface` action proposed by A's admin (auto-executed under
+///    `single_admin`). `execute_establish_tool_interface` (`governance_helpers.rs`)
+///    pushes the interface verbatim into A's `governance.tool_interfaces`, and
+///    additionally requires A's ceiling to contain `tool:interface` — which the
+///    admin role grants because A's ceiling lists it. The three id-form fields
+///    (`source_context` = A, `target_context` = B, `tool_id` = the registration
+///    id) are compared on the raw 64-hex digest form, so they must equal A/B/id
+///    exactly, with BOTH approvals `true`.
+///
+/// Context B holds the registered tool plus the handler the executor snapshots
+/// and runs once at Commit-B (`rt.tool_handlers.get(tool_id)`, tools.rs). The
+/// handler returns `{"sum": 42, "ok": 1}`, which Commit-B validates against the
+/// tool's registered numeric `{sum, ok}` output schema (from `build_tool_reg`)
+/// before committing. The committed output bytes therefore decode to that JSON.
+fn establish_xctx_saga_commit_preconditions(
+    py: Python<'_>,
+) -> (_scp_core::scp::PyScp, String, String, String, String) {
+    // Initializes the process-global tokio runtime the bridge methods
+    // (`identity_create`, `context_create`, `governance_propose`,
+    // `tool_invoke_cross_context_saga`) block on.
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let bi = scp.bridge_instance();
+
+    // Create the owner via the bridge's real `identity_create` so its DID
+    // document is published into the per-instance resolver DHT, and so the
+    // resolver itself is initialized on the instance. Governance vote
+    // verification (even single_admin auto-execute) resolves the proposer's
+    // public key through that resolver — a registry-only test identity is
+    // unresolvable and fails with "unknown voter".
+    //
+    // This MUST precede `init_context_manager_for_test`: the supervisor
+    // snapshots `bi.did_resolver()` at build time, falling back to the
+    // always-`None` resolver if none is configured yet. Creating the
+    // identity first means the supervisor's governance key resolver is the
+    // real document-VM resolver that can see the published document.
+    let owner_identity = scp
+        .identity_create(py, "in_memory", None)
+        .unwrap()
+        .into_pyobject(py)
+        .unwrap();
+    let owner = owner_identity
+        .getattr("did")
+        .unwrap()
+        .extract::<String>()
+        .unwrap();
+
+    runtime::init_context_manager_for_test(bi);
+
+    // Context A (caller/source). Its ceiling carries the two load-bearing
+    // capabilities: `governance:propose` (so `owner`, as admin, can propose)
+    // and `tool:interface` (required by `execute_establish_tool_interface`'s
+    // ceiling check). The remaining entries are harmless. `context_create`
+    // generates a real 64-hex id, so the ADR-056 saga chokepoint round-trips
+    // to A's actor.
+    let params_a = PyDict::new(py);
+    let ceiling_a = PyList::new(
+        py,
+        [
+            "governance:propose",
+            "tool:interface",
+            "tools:invoke",
+            "messages:read",
+            "messages:write",
+        ],
+    )
+    .unwrap();
+    params_a.set_item("ceiling", ceiling_a).unwrap();
+    let handle_a = scp.context_create(&owner, &params_a.as_borrowed()).unwrap();
+    let ctx_a = handle_context_id(py, &handle_a);
+
+    // Context B (target). Its ceiling carries `governance:propose` and
+    // `tool:register` so the saga tool can be registered into B's ACTOR
+    // governance state (the saga's Prepare-B reads the tool from B's
+    // `governance.registered_tools`, not from the FFI-side registry).
+    let params_b = PyDict::new(py);
+    let ceiling_b = PyList::new(py, ["governance:propose", "tool:register"]).unwrap();
+    params_b.set_item("ceiling", ceiling_b).unwrap();
+    let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
+    let ctx_b = handle_context_id(py, &handle_b);
+
+    // The tool id is the deterministic `generate_tool_id(name)` form shared
+    // by all bridges. The same id keys (a) B's actor `registered_tools`
+    // (saga Prepare-B), (b) the interface in A (saga gate 2), and (c) the
+    // FFI-side handler the executor snapshots at Commit-B.
+    let tool_name = "xctx_saga_commit_tool";
+    let tool_id = format!("tool-{tool_name}");
+
+    // Register the saga tool into B's ACTOR governance state so the saga's
+    // Prepare-B finds it.
+    let register_json = register_tool_action_json(&tool_id, tool_name, &owner);
+    scp.governance_propose(&handle_b, &owner, &register_json)
+        .expect("RegisterTool must auto-execute under single_admin");
+
+    // The executor snapshots the handler from the FFI-side `tool_handlers`
+    // at Commit-B. `register_tool_handler` requires the tool to exist in
+    // the FFI-side `tool_registry`, so register it there too (same id), then
+    // attach a deterministic handler returning the numeric `{sum, ok}`.
+    let reg = build_tool_reg(py, tool_name, &owner);
+    let ffi_tool_id = scp.tool_register(&ctx_b, &reg.as_borrowed()).unwrap();
+    assert_eq!(
+        ffi_tool_id, tool_id,
+        "FFI and governance tool ids must agree (deterministic generate_tool_id)"
+    );
+    let handler: runtime::ToolHandler =
+        Arc::new(|_input: serde_json::Value| Ok(serde_json::json!({"sum": 42, "ok": 1})));
+    runtime::register_tool_handler(bi, &ctx_b, &tool_id, handler).unwrap();
+
+    // Establish the bidirectionally-approved interface in A via governance.
+    let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+    let propose_result = scp
+        .governance_propose(&handle_a, &owner, &action_json)
+        .expect("EstablishToolInterface must auto-execute under single_admin");
+    assert!(
+        !propose_result.is_empty(),
+        "governance_propose must return a non-empty result JSON"
+    );
+
+    (scp, ctx_a, ctx_b, owner, tool_id)
+}
+
+/// Serializes a `RegisterTool` governance action for the saga tool. The schema
+/// mirrors `build_tool_reg`: 2 input + 2 output properties (clears the §9.2.1
+/// specificity floor of 2), numeric `{sum, ok}` output (so Commit-B's
+/// output-schema validation accepts the handler's response). `implementation_hash`
+/// is a fixed `[u8; 32]`; serde expects a 32-element JSON number array (the
+/// `json!` macro has no array-repeat sugar).
+fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
+    let impl_hash = serde_json::Value::from(vec![0u8; 32]);
+    let register_action = serde_json::json!({
+        "RegisterTool": {
+            "registration": {
+                "tool_id": tool_id,
+                "name": tool_name,
+                "description": format!("Tool: {tool_name}"),
+                "schema": {
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "string"},
+                            "b": {"type": "string"}
+                        }
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sum": {"type": "number"},
+                            "ok": {"type": "number"}
+                        }
+                    }
+                },
+                "implementation_hash": impl_hash,
+                "test_vectors": [],
+                "operator_did": owner,
+                "cost": null,
+                "registered_at": 0,
+                "signature": []
+            }
+        }
+    });
+    serde_json::to_string(&register_action).unwrap()
+}
+
+/// Serializes the bidirectionally-approved `EstablishToolInterface` governance
+/// action. Externally-tagged `GovernanceAction` (no serde rename) → the
+/// `EstablishToolInterface` variant wraps the `snake_case` `ToolInterface` struct;
+/// the `Option` fields render as JSON `null`.
+fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+    let action = serde_json::json!({
+        "EstablishToolInterface": {
+            "interface": {
+                "source_context": ctx_a,
+                "target_context": ctx_b,
+                "tool_id": tool_id,
+                "rate_limit": null,
+                "inbound_rate_limit": null,
+                "per_caller_rate_limit": null,
+                "approved_by_source": true,
+                "approved_by_target": true,
+                "outbound_policy": null,
+                "inbound_policy": null
+            }
+        }
+    });
+    serde_json::to_string(&action).unwrap()
+}
+
+/// Full `Committed` terminal through the `PyO3` bridge: an authenticated caller
+/// drives the §6.2.4 cross-context tool-invocation saga to a real commit and
+/// the bridge returns the committed receipt + output bytes. See
+/// `establish_xctx_saga_commit_preconditions` for the setup it depends on.
+#[test]
+fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, owner, tool_id) = establish_xctx_saga_commit_preconditions(py);
+
+        // Invoke the saga from A → B with the authenticated caller. The tool's
+        // input schema wants string `a`/`b`.
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance,
+        // so a fixed historical timestamp would abort with SCP-SAGA-13018.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let result = scp
+            .tool_invoke_cross_context_saga(
+                &ctx_a,
+                &ctx_b,
+                &owner,
+                &tool_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .expect("saga must reach Committed");
+
+        // Committed terminal: non-empty saga id + a receipt + output bytes.
+        assert!(
+            !result.saga_id.is_empty(),
+            "a committed saga must carry a non-empty saga id"
+        );
+        assert!(
+            result.receipt.is_some(),
+            "committed saga must carry a receipt"
+        );
+        assert!(
+            result.output.is_some(),
+            "committed saga must carry output bytes"
+        );
+
+        // The committed output decodes to the handler's response (numeric, per
+        // the registered output schema). Assert the parsed values, not raw
+        // bytes, so a JCS-canonical encoding still passes.
+        let out: serde_json::Value =
+            serde_json::from_slice(result.output.as_ref().unwrap()).unwrap();
+        assert_eq!(out["sum"], 42, "committed output sum must be the handler's");
+        assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
     });
 }
