@@ -124,7 +124,7 @@ class SagaAbortedError(ToolError):
             "retry immediately" and re-trip the same hard limit.
     """
 
-    _default_code: str = "SCP-SAGA-13050"
+    _default_code: str = "SCP-SAGA-13067"
 
     def __init__(
         self,
