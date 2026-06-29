@@ -1220,7 +1220,6 @@ mod cross_impl_leaf_parity {
             "did:dht:z6MkMemberC",
             "did:dht:z6MkMemberD",
         ]);
-        ctx.test_set_min_participation_bps(5000);
         // Admins resolve capabilities through the ceiling — admit the
         // governance propose/vote capabilities the handlers gate on.
         ctx.test_insert_ceiling("governance:propose");
@@ -1697,7 +1696,6 @@ mod cross_impl_leaf_parity {
         // Freeze the eligible voter set (item A): the shared engine reads its
         // quorum denominator from this frozen set, not live members.
         ctx.test_set_eligible_voters(&[proposer, voter, "did:dht:z6MkMemberC"]);
-        ctx.test_set_min_participation_bps(5000);
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
         // A target action distinct from both proposer and voter keeps the
@@ -1789,7 +1787,6 @@ mod cross_impl_leaf_parity {
         // Freeze the eligible voter set (item A): the shared engine reads its
         // quorum denominator from this frozen set, not live members.
         ctx.test_set_eligible_voters(&[proposer, voter, "did:dht:z6MkMemberC"]);
-        ctx.test_set_min_participation_bps(5000);
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
         ctx.test_insert_ceiling("role:assign");
