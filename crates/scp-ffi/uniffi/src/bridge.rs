@@ -20619,6 +20619,7 @@ mod tests {
     /// identity creation makes `ensure_did_resolver_initialized_on` a no-op
     /// (it skips when a resolver is already present), so this client is the one
     /// the supervisor snapshots.
+    #[cfg(feature = "allow_in_memory_custody")]
     fn install_seedable_resolver(
         bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     ) -> Arc<scp_identity::InMemoryDhtClient> {
@@ -20638,6 +20639,7 @@ mod tests {
     /// in-memory custody. Mirrors the production `publish_to_resolver_dht_for`
     /// step so the supervisor's governance key resolver can resolve the proposer
     /// key during single-admin vote verification.
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn seed_owner_document_into_resolver(
         owner_identity: &Identity,
         dht_client: &Arc<scp_identity::InMemoryDhtClient>,
@@ -20854,6 +20856,7 @@ mod tests {
     /// a `RegisterTool` action; saga Prepare-B reads it there) plus the FFI-side
     /// handler the executor snapshots and runs once at Commit-B (returns
     /// `{sum:42, ok:1}`, validated against the registered numeric output schema).
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test]
     async fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
         let scp = scp_test();
@@ -21042,6 +21045,7 @@ mod tests {
     /// BOTH the `RegisterTool` governance action and the FFI `ToolDefinition`, so
     /// Commit-B's output-schema validation accepts the echo and the saga reaches
     /// a real `Committed`. Proves the no-handler echo path commits end-to-end.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test]
     async fn xctx_saga_commits_with_echo_fallback_when_no_handler_registered() {
         let scp = scp_test();
@@ -21201,6 +21205,7 @@ mod tests {
     /// runs — no governance/resolver scaffolding is needed. A valid nonce hex
     /// and a near-now timestamp ensure the binding (not nonce/validation) is
     /// the rejecting gate.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test]
     async fn xctx_saga_unhosted_caller_did_is_rejected_axis_a() {
         let scp = scp_test();
@@ -21288,6 +21293,7 @@ mod tests {
     /// the caller context A (owned by `owner`). Axis (b)
     /// (`supervisor.is_member`) trips and the saga aborts with `SCP-SAGA-13050`
     /// BEFORE the producer runs.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test]
     async fn xctx_saga_hosted_non_member_caller_is_rejected_axis_b() {
         let scp = scp_test();
