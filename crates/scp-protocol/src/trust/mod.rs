@@ -30,9 +30,9 @@ pub use custody_violation::{
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
 pub use participation::{
-    ParticipationFact, ParticipationInput, ParticipationProfile, ParticipationRecord,
-    ParticipationThreshold, RequireParticipation, compute_participation_record,
-    produce_participation_profile,
+    ParticipationFact, ParticipationFacts, ParticipationInput, ParticipationProfile,
+    ParticipationRecord, ParticipationThreshold, RequireParticipation,
+    compute_participation_record, produce_participation_profile,
 };
 pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
