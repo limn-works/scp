@@ -44,10 +44,13 @@ import asyncio
 import logging
 import math
 from types import TracebackType
-from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
+
+if TYPE_CHECKING:
+    from scp_sdk.tools import SagaResult
 
 logger = logging.getLogger("scp_sdk")
 
@@ -2034,6 +2037,84 @@ class SCP:
             ucan_token,
             chain_depth,
             proof_tokens,
+        )
+
+    async def tool_invoke_cross_context_saga(
+        self,
+        caller_context_id: str,
+        target_context_id: str,
+        caller_did: str,
+        tool_registration_id: str,
+        input: dict[str, Any],
+        asserted_nonce_hex: str,
+        timestamp_ms: int,
+        chain_depth: int,
+        ucan_proof_id: str | None = None,
+    ) -> SagaResult:
+        """Run the §6.2.4 atomic cross-context tool-invocation saga.
+
+        Delegates to ``_scp_core.SCP.tool_invoke_cross_context_saga``. The
+        saga either commits — returning a :class:`~scp_sdk.tools.SagaResult`
+        carrying the supervisor-minted ``saga_id`` plus the target's signed
+        receipt and captured output bytes — or reaches a typed terminal,
+        which is re-raised as one of the SDK saga exceptions:
+
+        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase
+          rejection; carries ``retry_after_ms`` (``None``, never ``0``,
+          when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
+          exhausted; carries the durable ``saga_id`` repair handle.
+        - :class:`~scp_sdk.errors.SagaBusyError` — the participant context
+          set overlapped an in-flight saga; carries ``contended_context``.
+
+        Validates ``chain_depth`` is an integer in the closed range
+        ``0..255`` (u8 on the bridge side) and ``timestamp_ms`` is a
+        non-negative integer. Both reject ``bool`` (Python's ``bool``
+        passes ``isinstance(..., int)``) and floats, matching the bridge's
+        ``u8`` / ``u64`` boundaries. See spec §6.2.4 and ADR-049 §3a.
+        """
+        from scp_sdk.errors import ValidationError, _saga_terminal_from_bridge
+        from scp_sdk.tools import SagaResult
+
+        if (
+            isinstance(chain_depth, bool)
+            or not isinstance(chain_depth, int)
+            or chain_depth < 0
+            or chain_depth > 255
+        ):
+            raise ValidationError(
+                f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+                code="SCP-VALID-7002",
+            )
+        if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+            raise ValidationError(
+                f"timestamp_ms must be a non-negative integer, got {timestamp_ms!r}",
+                code="SCP-VALID-7002",
+            )
+
+        try:
+            native_result = await asyncio.to_thread(
+                self._native.tool_invoke_cross_context_saga,
+                caller_context_id,
+                target_context_id,
+                caller_did,
+                tool_registration_id,
+                input,
+                asserted_nonce_hex,
+                timestamp_ms,
+                chain_depth,
+                ucan_proof_id,
+            )
+        except Exception as exc:
+            translated = _saga_terminal_from_bridge(exc)
+            if translated is None:
+                raise
+            raise translated from exc
+
+        return SagaResult(
+            saga_id=native_result.saga_id,
+            receipt=native_result.receipt,
+            output=native_result.output,
         )
 
     async def tool_register(self, context_id: str, registration: dict[str, Any]) -> Any:

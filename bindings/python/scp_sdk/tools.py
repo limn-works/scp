@@ -148,6 +148,32 @@ class ToolDefinition:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SagaResult:
+    """The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+
+    Returned by :meth:`scp_sdk.SCP.tool_invoke_cross_context_saga` only on a
+    ``Committed`` terminal — every non-committed terminal raises a typed saga
+    exception (:class:`~scp_sdk.errors.SagaAbortedError`,
+    :class:`~scp_sdk.errors.SagaNeedsRepairError`, or
+    :class:`~scp_sdk.errors.SagaBusyError`) instead.
+
+    The fields are a faithful pass-through of the bridge result: ``receipt``
+    and ``output`` are surfaced exactly as the bridge returns them (``None``
+    when absent — never synthesized). See spec §6.2.4 and ADR-049 §3a.
+    """
+
+    #: The durable saga identifier (supervisor-minted, never a caller input).
+    saga_id: str
+
+    #: The target's signed ``CrossContextToolReceipt`` bytes (JCS), or ``None``.
+    receipt: bytes | None = None
+
+    #: The captured tool output bytes (the receipt's canonical ``output_jcs``),
+    #: or ``None``.
+    output: bytes | None = None
+
+
 # ---------------------------------------------------------------------------
 # Stateful tool sessions (spec section 6.2.1)
 # ---------------------------------------------------------------------------
@@ -159,6 +185,7 @@ class ToolDefinition:
 
 
 __all__ = [
+    "SagaResult",
     "TestVector",
     "ToolCost",
     "ToolDefinition",

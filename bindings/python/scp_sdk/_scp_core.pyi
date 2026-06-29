@@ -74,9 +74,56 @@ class ValidationError(ScpError):
 
     ...
 
+# Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
+# Each carries the structured terminal datum as a positional ``args`` entry
+# (``args = (message, code, datum)``), read structurally — never re-parsed
+# from the message text.
+
+class SagaAbortedError(ScpError):
+    """A §6.2.4 saga aborted at a Prepare phase.
+
+    ``args = (message, code, retry_after_ms)``: ``retry_after_ms`` is an
+    ``int`` of milliseconds or ``None`` (never ``0``).
+    """
+
+    ...
+
+class SagaNeedsRepairError(ScpError):
+    """A §6.2.4 saga exhausted its Commit retries and may have diverged.
+
+    ``args = (message, code, saga_id)``: ``saga_id`` is the durable
+    operator-repair handle.
+    """
+
+    ...
+
+class SagaBusyError(ScpError):
+    """A §6.2.4 saga's participant context set overlapped an in-flight saga.
+
+    ``args = (message, code, contended_context)``: ``contended_context`` is
+    the shared context id.
+    """
+
+    ...
+
 # ---------------------------------------------------------------------------
 # Bridge value types (crates/scp-ffi/src/{identity,context,ucan,...}.rs)
 # ---------------------------------------------------------------------------
+
+class SagaResult:
+    """The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+
+    Returned by :meth:`SCP.tool_invoke_cross_context_saga` on a ``Committed``
+    terminal; every non-committed terminal raises a typed saga exception.
+    """
+
+    @property
+    def saga_id(self) -> str: ...
+    @property
+    def receipt(self) -> bytes | None: ...
+    @property
+    def output(self) -> bytes | None: ...
+    def __repr__(self) -> str: ...
 
 class PyIdentity:
     """An SCP identity handle.
@@ -632,6 +679,18 @@ class SCP:
         chain_depth: Any,
         proof_tokens: Any = ...,
     ) -> Any: ...
+    def tool_invoke_cross_context_saga(
+        self,
+        caller_context_id: Any,
+        target_context_id: Any,
+        caller_did: Any,
+        tool_registration_id: Any,
+        input: Any,
+        asserted_nonce_hex: Any,
+        timestamp_ms: Any,
+        chain_depth: Any,
+        ucan_proof_id: Any = ...,
+    ) -> SagaResult: ...
     def tool_register(self, context_id: Any, registration: Any) -> Any: ...
     def tool_session_close(self, context_id: Any, session_id: Any) -> Any: ...
     def tool_session_create(

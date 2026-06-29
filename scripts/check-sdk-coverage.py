@@ -552,6 +552,12 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["invokeCrossContext"],
         "swift": ["toolInvokeCrossContext"],
     },
+    ("Tools", "invoke_cross_context_saga"): {
+        "python": ["tool_invoke_cross_context_saga"],
+        "typescript": ["toolInvokeCrossContextSaga"],
+        "kotlin": ["invokeCrossContextSaga"],
+        "swift": ["toolInvokeCrossContextSaga"],
+    },
     ("Tools", "session_create"): {
         "python": ["tool_session_create"],
         "typescript": ["toolSessionCreate"],
