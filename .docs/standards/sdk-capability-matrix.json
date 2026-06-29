@@ -657,7 +657,7 @@
           "typescript": true,
           "kotlin": false,
           "swift": false,
-          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. The Python and TypeScript SDKs expose idiomatic wrappers (scp_sdk participation_record / SCP.participationRecord) and feed evaluate_trust/evaluateTrust Layer 2 from the Rust-computed record. WASM bridge is native-only here (see scripts/bridge-aliases.json: wasm empty, wasm_required false).",
+          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. The Python and TypeScript SDKs expose idiomatic wrappers (scp_sdk participation_record / SCP.participationRecord) and feed evaluate_trust/evaluateTrust Layer 2 from the Rust-computed record.",
           "exemptions": {
             "kotlin": "UniFFI bridge exports participation_record (ParticipationRecordView); Kotlin SDK has no idiomatic wrapper exposing it yet",
             "swift": "UniFFI bridge exports participation_record (ParticipationRecordView); no public SDK wrapper written yet"

@@ -130,12 +130,14 @@ pub mod trust {
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
         DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, NoOpRevocationChecker,
-        RevocationStatus, ThresholdRequirement, ThresholdResult, check_attestation_freshness,
-        check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
+        RevocationStatus, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        check_attestation_freshness, check_threshold_attestation, verify_attestation,
+        verify_attestation_with_revocation,
     };
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
         VerificationMethod, issue_challenge, verify_challenge_response,
+        verify_challenge_verification,
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,

@@ -26,7 +26,7 @@ pub mod crypto;
 pub mod identity;
 pub mod time;
 
-pub use identity::{DID, SigningKeyId, extract_public_key_from_did};
+pub use identity::{DID, SigningKeyId, did_dht_from_public_key, extract_public_key_from_did};
 
 // Re-export Clock types at the crate root for convenience.
 pub use time::{Clock, SystemClock, TestClock};

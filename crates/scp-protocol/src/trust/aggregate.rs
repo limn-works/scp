@@ -26,8 +26,9 @@ use scp_event_log::Event;
 use scp_primitives::Clock;
 
 use super::attestation::{
-    Attestation, AttestorInfo, DidPublicKeyResolver, FreshnessStatus, ThresholdRequirement,
-    check_attestation_freshness, check_threshold_attestation, verify_attestation,
+    Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
+    ThresholdRequirement, check_attestation_freshness, check_threshold_attestation,
+    verify_attestation, verify_attestation_with_revocation,
 };
 use super::challenge::ChallengeVerification;
 use super::consequence::ConsequenceRule;
@@ -272,6 +273,40 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         clock: &impl Clock,
     ) -> Result<(), TrustError> {
         verify_attestation(attestation, resolver, clock)?;
+
+        let entry = CachedAttestation {
+            attestation: attestation.clone(),
+            verified_at: clock.now_secs(),
+            ttl_secs: self.ttl_secs,
+        };
+        self.store.store_cached_attestation(context_id, entry)?;
+
+        Ok(())
+    }
+
+    /// Verifies and caches a new attestation, additionally consulting an
+    /// external revocation checker.
+    ///
+    /// Identical to [`verify_and_cache`](Self::verify_and_cache) except the
+    /// supplied [`AttestationRevocationChecker`] is queried during verification
+    /// (via [`verify_attestation_with_revocation`]). An attestation that is
+    /// validly signed but listed in the context's external revocation list is
+    /// rejected, so it is neither cached nor counted. Passing `None` makes this
+    /// behave exactly like `verify_and_cache` (issuer-bound `revocation_status`
+    /// field only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if verification or caching fails.
+    pub fn verify_and_cache_with_revocation(
+        &self,
+        context_id: &str,
+        attestation: &Attestation,
+        resolver: &impl DidPublicKeyResolver,
+        clock: &impl Clock,
+        revocation_checker: Option<&dyn AttestationRevocationChecker>,
+    ) -> Result<(), TrustError> {
+        verify_attestation_with_revocation(attestation, resolver, clock, revocation_checker)?;
 
         let entry = CachedAttestation {
             attestation: attestation.clone(),
