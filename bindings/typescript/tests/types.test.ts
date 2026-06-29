@@ -366,7 +366,7 @@ describe("type definitions", () => {
   });
 
   it("Checkpoint is a flat always-signed shape with a required signature", () => {
-    // Every live runtime (NAPI + WASM) signs the checkpoint in-process, so the
+    // The NAPI runtime signs the checkpoint in-process, so the
     // SDK surface is a flat checkpoint carrying a required hex `signature` —
     // matching the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs. The
     // field set (contextId, senderDid, merkleRoot, eventCount, epoch,

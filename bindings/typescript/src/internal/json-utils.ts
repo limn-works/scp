@@ -1,10 +1,10 @@
 /**
  * Shared JSON parsing utilities for the SCP TypeScript SDK bridge layer.
  *
- * Both the native (napi-rs) and WASM (wasm-bindgen) bridges return JSON
- * strings that need parsing. This module provides a safe wrapper around
- * `JSON.parse` that converts raw `SyntaxError` into a descriptive
- * `ValidationError` with error code `SCP-VALID-7001`.
+ * The native (napi-rs) bridge returns JSON strings that need parsing. This
+ * module provides a safe wrapper around `JSON.parse` that converts raw
+ * `SyntaxError` into a descriptive `ValidationError` with error code
+ * `SCP-VALID-7001`.
  */
 
 import { ValidationError } from "../errors";

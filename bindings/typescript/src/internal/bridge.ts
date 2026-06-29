@@ -1,21 +1,17 @@
 /**
- * Runtime detection and unified bridge interface for the SCP TypeScript SDK.
+ * Unified bridge interface for the SCP TypeScript SDK.
  *
- * This module selects the correct FFI backend at import time based on the
- * runtime environment:
+ * The SDK has a single FFI backend: the napi-rs native addon (`./native.js`),
+ * which runs in Bun/Node.js. Browser clients connect to a node as remote thin
+ * clients over the network (ADR-055) and do not load an in-process bridge.
  *
- * - **Bun/Node.js** -> napi-rs native addon (`./native.js`)
- * - **Browser** -> wasm-bindgen WASM module (`./wasm.js`)
- *
- * Bridge selection is synchronous — no top-level await — to preserve CJS
- * compatibility. The actual bridge module is loaded lazily on first use via
- * `getBridge()`.
+ * The actual bridge module is loaded lazily on first use via `getBridge()`.
  *
  * Application code never imports from `internal/`. The public API classes
  * (`Identity`, `Context`, etc.) call `getBridge()` internally on their async
  * factory methods.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
+ * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048, and ADR-055.
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
@@ -37,12 +33,11 @@ import type {
 } from "../types";
 
 // ---------------------------------------------------------------------------
-// Bridge interface — the contract both native and WASM bridges implement
+// Bridge interface — the contract the native bridge implements
 // ---------------------------------------------------------------------------
 
 /**
- * Unified bridge interface that both the native (napi-rs) and WASM
- * (wasm-bindgen) bridges must satisfy.
+ * Unified bridge interface that the native (napi-rs) bridge satisfies.
  *
  * Each method maps to a flat bridge function exposed by the Rust FFI crate.
  * The TypeScript wrapper classes (`Identity`, `Context`, etc.) delegate to
@@ -65,18 +60,15 @@ export interface Bridge {
    * setup. The remaining context methods (`contextJoin`, `contextLeave`, etc.)
    * take a plain `identityDid: string` since they operate on an already-
    * established context.
-   *
-   * WASM bridge implementers: the underlying `context_create` WASM export
-   * still accepts a DID string — extract `identity.did` before calling it.
    */
   contextCreate(identity: BridgeIdentityHandle, paramsJson: string): Promise<BridgeContextHandle>;
   /**
    * Joins an existing context.
    *
    * `spendingUcanJwt` is optional and may be omitted, `undefined`, or
-   * explicitly `null`. The bridge implementations (NAPI, WASM, mock) all
+   * explicitly `null`. The bridge implementations (NAPI, mock) all
    * normalize the absent case so consumers can call without a third argument
-   * for the common no-payment join. See ADR-033 §19 and #1531 for the
+   * for the common no-payment join. See ADR-033 §19 for the
    * join-cost AND-composition flow.
    *
    * Note: this is the SDK's internal contract — SDK wrappers always normalize
@@ -221,7 +213,6 @@ export interface Bridge {
   contextGovernanceListProposals(handle: BridgeContextHandle): Promise<string>;
 
   // TTL operations
-  contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null>;
   contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean>;
   contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void>;
   contextProposeTtlExtension(
@@ -238,14 +229,12 @@ export interface Bridge {
   // Context export/import
   contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
   // §9.10.4: `importerDid` identifies the importing member so the native
-  // bridge can derive that identity's per-context pseudonym routing ID. The
-  // WASM bridge ignores it (ADR-034: shared routing IDs, no pseudonym path).
+  // bridge can derive that identity's per-context pseudonym routing ID.
   contextImport(data: Uint8Array, importerDid: string): Promise<string>;
 
   // §9.10.4 test-only: inject a peer's per-member pseudonym routing ID into this
   // context's registry (simulating the peer's PseudonymAnnouncement) so a
-  // co-located encrypted send can fan out to it. Native-only; feature-gated to
-  // dev/test builds. Not present on the WASM bridge.
+  // co-located encrypted send can fan out to it. Feature-gated to dev/test builds.
   contextSeedPeerPseudonym(
     handle: BridgeContextHandle,
     peerDid: string,
@@ -640,12 +629,9 @@ export interface Bridge {
   shutdown(timeoutMillis: number): Promise<void>;
   suspend(): void;
   /**
-   * Resumes the bridge. On the NAPI path this is a real async call
-   * (#1678) — the bridge reconnects transport from pending relay URLs
-   * and restores persisted context snapshots before the promise
-   * settles. The WASM path is a no-op, but still returns a resolved
-   * promise to keep the interface uniform and to let callers
-   * `await bridge.resume()` without branching on target.
+   * Resumes the bridge. On the NAPI path this is a real async call —
+   * the bridge reconnects transport from pending relay URLs and
+   * restores persisted context snapshots before the promise settles.
    */
   resume(): Promise<void>;
 }
@@ -694,37 +680,21 @@ export interface MessageCallback {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime detection
+// Bridge target
 // ---------------------------------------------------------------------------
-
-/** The detected bridge target: `"native"` for Bun/Node, `"wasm"` for browser. */
-export type BridgeTarget = "native" | "wasm";
 
 /**
- * Detects the runtime environment synchronously.
- *
- * - Bun exposes `process.versions.bun`.
- * - Node.js exposes `process.versions.node` but not `bun`.
- * - Browsers have neither.
- *
- * This function contains no top-level await and no I/O — it is safe to call
- * at module import time, preserving CJS compatibility.
+ * The bridge target. The SDK has a single in-process backend — the napi-rs
+ * native addon (Bun/Node.js). Retained as a diagnostics constant on the
+ * public surface.
  */
-function detectBridge(): BridgeTarget {
-  if (typeof process !== "undefined" && process.versions?.bun) {
-    return "native";
-  }
-  if (typeof process !== "undefined" && process.versions?.node) {
-    return "native";
-  }
-  return "wasm";
-}
+export type BridgeTarget = "native";
 
-/** The detected bridge target, computed once at import time. */
-export const BRIDGE_TARGET: BridgeTarget = detectBridge();
+/** The bridge target. Always `"native"` — the SDK is napi-only (ADR-055). */
+export const BRIDGE_TARGET: BridgeTarget = "native";
 
 // ---------------------------------------------------------------------------
-// Per-SCP native bridge cache + WASM singleton bridge cache
+// Per-SCP native bridge cache
 // ---------------------------------------------------------------------------
 
 /**
@@ -740,12 +710,8 @@ export const BRIDGE_TARGET: BridgeTarget = detectBridge();
  */
 const _nativeBridgeForScp = new WeakMap<SCP, Bridge>();
 
-/** WASM singleton bridge — the WASM runtime is inherently process-wide. */
-let _wasmBridge: Bridge | null = null;
-
 /**
- * Returns the cached bridge instance synchronously, scoped to an SCP on
- * native targets.
+ * Returns the cached bridge instance synchronously, scoped to an SCP.
  *
  * This is safe to call only after at least one async SDK method has completed
  * (which triggers `getBridge()` and caches the bridge). If called before
@@ -754,37 +720,25 @@ let _wasmBridge: Bridge | null = null;
  * Used by synchronous SDK functions (`ScopedHandle.hasCapability`,
  * `validateCapabilityDeclaration`) that cannot await.
  *
- * @param scp The SCP instance whose bridge should be returned on native
- *   targets. Ignored on WASM.
+ * @param scp The SCP instance whose bridge should be returned.
  * @returns The cached `Bridge` instance.
  * @throws {Error} If the bridge has not been initialized yet.
  */
 export function getBridgeSync(scp: SCP): Bridge {
-  if (BRIDGE_TARGET === "native") {
-    const bridge = _nativeBridgeForScp.get(scp);
-    if (bridge === undefined) {
-      throw new Error("Bridge not initialized — call an async SCP function first");
-    }
-    return bridge;
-  }
-  if (_wasmBridge === null) {
+  const bridge = _nativeBridgeForScp.get(scp);
+  if (bridge === undefined) {
     throw new Error("Bridge not initialized — call an async SCP function first");
   }
-  return _wasmBridge;
+  return bridge;
 }
 
 /**
  * Returns the initialized bridge instance for the given {@link SCP},
  * loading it lazily on first call.
  *
- * - For `"native"` targets: dynamically imports `./native.js` and
- *   instantiates a per-SCP bridge keyed against the supplied wrapper.
- * - For `"wasm"` targets: dynamically imports `./wasm.js` and calls
- *   `initWasm()` for one-time WASM initialization. The WASM bridge is
- *   a process-wide singleton — the `scp` parameter is unused.
- *
- * Subsequent calls for the same `SCP` return the cached instance — no
- * re-initialization.
+ * Dynamically imports `./native.js` and instantiates a per-SCP bridge keyed
+ * against the supplied wrapper. Subsequent calls for the same `SCP` return
+ * the cached instance — no re-initialization.
  *
  * Each `SCP` instance owns an independent bridge (ADR-048 multi-
  * instance routing), which eliminates cross-test state poisoning in
@@ -793,20 +747,11 @@ export function getBridgeSync(scp: SCP): Bridge {
  * @returns The initialized `Bridge` instance.
  */
 export async function getBridge(scp: SCP): Promise<Bridge> {
-  if (BRIDGE_TARGET === "native") {
-    let bridge = _nativeBridgeForScp.get(scp);
-    if (bridge === undefined) {
-      const mod = await import("./native.js");
-      bridge = mod.createNativeBridge(scp);
-      _nativeBridgeForScp.set(scp, bridge);
-    }
-    return bridge;
+  let bridge = _nativeBridgeForScp.get(scp);
+  if (bridge === undefined) {
+    const mod = await import("./native.js");
+    bridge = mod.createNativeBridge(scp);
+    _nativeBridgeForScp.set(scp, bridge);
   }
-
-  if (_wasmBridge === null) {
-    const mod = await import("./wasm.js");
-    await mod.initWasm();
-    _wasmBridge = mod.createWasmBridge();
-  }
-  return _wasmBridge;
+  return bridge;
 }

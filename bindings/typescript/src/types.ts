@@ -728,11 +728,11 @@ export interface Proof {
 /**
  * A consistency checkpoint from the event log.
  *
- * Every runtime — NAPI (Node/Bun) **and** WASM (browser) — signs the canonical
- * checkpoint payload in-process with the identity's `#active` Ed25519 key, so a
- * checkpoint always carries a hex `signature` over the canonical checkpoint
- * hash. WASM identities are Rust-custodied; the private key never crosses the
- * FFI boundary (ADR-006). The field set matches the flat signed checkpoint
+ * The NAPI (Node/Bun) runtime signs the canonical checkpoint payload
+ * in-process with the identity's `#active` Ed25519 key, so a checkpoint
+ * always carries a hex `signature` over the canonical checkpoint hash.
+ * Identities are Rust-custodied; the private key never crosses the FFI
+ * boundary (ADR-006). The field set matches the flat signed checkpoint
  * returned by the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs.
  */
 export interface Checkpoint {

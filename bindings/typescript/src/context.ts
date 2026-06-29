@@ -30,10 +30,9 @@ import type { SCP } from "./scp";
 /**
  * Validates that a JSON string conforms to the `EconomicPolicy` schema.
  *
- * Defense-in-depth for the WASM path: the WASM bridge can only validate
- * that the input is well-formed JSON (ADR-034 prevents importing scp-core
- * types). This function checks required fields and basic types so schema
- * violations are caught before crossing the FFI boundary.
+ * Defense-in-depth at the SDK layer: this function checks required fields
+ * and basic types so schema violations are caught before crossing the FFI
+ * boundary.
  *
  * @throws {ValidationError} if the JSON is malformed or missing required fields.
  * @internal Exported as `_validateEconomicPolicyJson` for testing.

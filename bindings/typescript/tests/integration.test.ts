@@ -32,7 +32,6 @@
  * - `real-napi.test.ts` — the `Bridge` wrapper façade (`napi.*`)
  * - `e2e-relay.test.ts` — raw bridge send-pipeline through the relay
  * - `e2e-fullstack.test.ts` — FullStackNetwork A+ decrypt roundtrip
- * - `e2e-cross-bridge.test.ts` — NAPI Node + WASM interop
  *
  * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
  */
@@ -74,10 +73,10 @@ function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } 
 }
 
 // ---------------------------------------------------------------------------
-// 1. EconomicPolicy schema validation (§19.3, ADR-034)
+// 1. EconomicPolicy schema validation (§19.3)
 //
 // `_validateEconomicPolicyJson` is the defense-in-depth validator the
-// WASM path runs before forwarding the JSON to the Rust parser. These
+// SDK runs before forwarding the JSON to the Rust parser. These
 // tests pin the accept/reject surface so schema drift is caught at
 // the SDK layer instead of silently landing in the bridge.
 // ---------------------------------------------------------------------------
@@ -677,10 +676,9 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 // simulator.
 //
 // Skip-gracefully contract: if the platform-specific
-// `@limn-works/scp-ts-napi-*` package is unavailable (browser/WASM
-// runtime, missing prebuilt binary), the whole block skips — matching
-// the pattern used by `real-napi.test.ts`, `e2e-relay.test.ts`, and
-// `scp-class.test.ts`.
+// `@limn-works/scp-ts-napi-*` package is unavailable (missing prebuilt
+// binary), the whole block skips — matching the pattern used by
+// `real-napi.test.ts`, `e2e-relay.test.ts`, and `scp-class.test.ts`.
 // ---------------------------------------------------------------------------
 
 let napiSkipReason = "";
@@ -2238,8 +2236,7 @@ describe("IdentityAttestation value object", () => {
 
 // ---------------------------------------------------------------------------
 // 8. Error hierarchy — SDK-level regressions so consumers can rely on
-//    `instanceof` checks against the typed subclasses. Restored from
-//    the pre-B4 `WASM economy fail-closed` section; without a running
+//    `instanceof` checks against the typed subclasses. Without a running
 //    bridge these tests still pin the contract that the typed
 //    subclasses exist and extend `ScpError`.
 // ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ import {
   AttestationError,
   ContextError,
   CryptoError,
-  EconomicPolicyUnsupportedOnWasm,
   EconomyError,
   GovernanceError,
   IdentityError,
@@ -22,7 +21,6 @@ import {
   TransportError,
   UcanPermissionError,
   ValidationError,
-  WasmCannotValidateSpendingUcan,
 } from "../src/errors";
 
 describe("ScpError hierarchy", () => {
@@ -125,30 +123,6 @@ describe("ScpError hierarchy", () => {
     expect(err).toBeInstanceOf(EconomyError);
     expect(err.name).toBe("EconomyError");
   });
-
-  it("EconomicPolicyUnsupportedOnWasm extends EconomyError", () => {
-    const err = new EconomicPolicyUnsupportedOnWasm(
-      "[SCP-ECON-12095] context error: paid context",
-      "SCP-ECON-12095",
-    );
-    expect(err).toBeInstanceOf(ScpError);
-    expect(err).toBeInstanceOf(EconomyError);
-    expect(err).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
-    expect(err.name).toBe("EconomicPolicyUnsupportedOnWasm");
-    expect(err.code).toBe("SCP-ECON-12095");
-  });
-
-  it("WasmCannotValidateSpendingUcan extends EconomyError", () => {
-    const err = new WasmCannotValidateSpendingUcan(
-      "[SCP-ECON-12096] context error: paid context",
-      "SCP-ECON-12096",
-    );
-    expect(err).toBeInstanceOf(ScpError);
-    expect(err).toBeInstanceOf(EconomyError);
-    expect(err).toBeInstanceOf(WasmCannotValidateSpendingUcan);
-    expect(err.name).toBe("WasmCannotValidateSpendingUcan");
-    expect(err.code).toBe("SCP-ECON-12096");
-  });
 });
 
 describe("mapBridgeError", () => {
@@ -250,46 +224,6 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-ECON-12001");
   });
 
-  it("maps SCP-ECON-12095 to typed EconomicPolicyUnsupportedOnWasm", () => {
-    // C2 fail-closed gate (PR #1606): the WASM bridge rejects paid
-    // contexts at create / SetEconomicPolicy because it cannot run
-    // scp-runtime's enforce_economy pipeline (ADR-034). The bridge
-    // emits SCP-ECON-12095 which mapBridgeError must surface as the
-    // typed `EconomicPolicyUnsupportedOnWasm` subclass so SDK consumers
-    // can `instanceof`-check it for actionable handling.
-    const err = mapBridgeError(
-      new Error(
-        "[SCP-ECON-12095] context error: EconomicPolicyUnsupportedOnWasm: \
-paid contexts cannot be created from the WASM bridge",
-      ),
-    );
-    expect(err).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
-    expect(err).toBeInstanceOf(EconomyError);
-    expect(err).toBeInstanceOf(ScpError);
-    expect(err.code).toBe("SCP-ECON-12095");
-    expect(err.message).toContain("EconomicPolicyUnsupportedOnWasm");
-  });
-
-  it("maps SCP-ECON-12096 to typed WasmCannotValidateSpendingUcan", () => {
-    // C2 fail-closed gate (PR #1606): join_context and send_message
-    // against a paid context are rejected on the WASM bridge regardless
-    // of whether a spending UCAN is supplied — the WASM bridge cannot
-    // cryptographically validate spending UCANs (ADR-034). The bridge
-    // emits SCP-ECON-12096 which must surface as the typed
-    // `WasmCannotValidateSpendingUcan` subclass.
-    const err = mapBridgeError(
-      new Error(
-        "[SCP-ECON-12096] context error: WasmCannotValidateSpendingUcan: \
-context 'ctx-paid' has an economic policy requiring payment",
-      ),
-    );
-    expect(err).toBeInstanceOf(WasmCannotValidateSpendingUcan);
-    expect(err).toBeInstanceOf(EconomyError);
-    expect(err).toBeInstanceOf(ScpError);
-    expect(err.code).toBe("SCP-ECON-12096");
-    expect(err.message).toContain("WasmCannotValidateSpendingUcan");
-  });
-
   it("falls back to ScpError for unknown error codes", () => {
     const err = mapBridgeError(new Error("[SCP-UNKNOWN-9999] something failed"));
     expect(err).toBeInstanceOf(ScpError);
@@ -312,7 +246,7 @@ context 'ctx-paid' has an economic policy requiring payment",
 // ---------------------------------------------------------------------------
 // PreRotationCustodyError typed-code round-trip
 //
-// SDK-layer contract: when the NAPI / WASM bridge emits a typed
+// SDK-layer contract: when the NAPI bridge emits a typed
 // IDENT_1047, IDENT_1048, IDENT_1049, IDENT_1050, IDENT_1051, or
 // IDENT_1052 code for a PreRotationCustodyError variant, the TS SDK's
 // `mapBridgeError` and the `IdentityError` class MUST preserve the code
