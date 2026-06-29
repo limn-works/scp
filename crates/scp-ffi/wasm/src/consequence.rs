@@ -1211,6 +1211,15 @@ mod cross_impl_leaf_parity {
         ctx.test_insert_member(voter, "admin");
         ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
         ctx.test_insert_member("did:dht:z6MkMemberD", "admin");
+        // Freeze the 4-voter set (item A): proposer (creator) + the three added
+        // members. Quorum = 4/2 + 1 = 3, so the proposer's lone vote stays
+        // Pending.
+        ctx.test_set_eligible_voters(&[
+            proposer,
+            voter,
+            "did:dht:z6MkMemberC",
+            "did:dht:z6MkMemberD",
+        ]);
         // Admins resolve capabilities through the ceiling — admit the
         // governance propose/vote capabilities the handlers gate on.
         ctx.test_insert_ceiling("governance:propose");
@@ -1684,6 +1693,9 @@ mod cross_impl_leaf_parity {
         ctx.test_insert_member(proposer, "admin");
         ctx.test_insert_member(voter, "admin");
         ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        // Freeze the eligible voter set (item A): the shared engine reads its
+        // quorum denominator from this frozen set, not live members.
+        ctx.test_set_eligible_voters(&[proposer, voter, "did:dht:z6MkMemberC"]);
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
         // A target action distinct from both proposer and voter keeps the
@@ -1772,6 +1784,9 @@ mod cross_impl_leaf_parity {
         ctx.test_insert_member(proposer, "admin");
         ctx.test_insert_member(voter, "admin");
         ctx.test_insert_member("did:dht:z6MkMemberC", "admin");
+        // Freeze the eligible voter set (item A): the shared engine reads its
+        // quorum denominator from this frozen set, not live members.
+        ctx.test_set_eligible_voters(&[proposer, voter, "did:dht:z6MkMemberC"]);
         ctx.test_insert_ceiling("governance:propose");
         ctx.test_insert_ceiling("governance:vote");
         ctx.test_insert_ceiling("role:assign");

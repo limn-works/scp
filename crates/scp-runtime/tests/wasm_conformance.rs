@@ -640,6 +640,254 @@ fn governance_resolved_proposals_evicts_oldest_at_capacity() {
 }
 
 // ===========================================================================
+// PR-2b: WASM keyless engine path converges with native signed path
+// ===========================================================================
+
+/// The WASM bridge runs the shared governance engine via the keyless
+/// `TrustedVoteIngest` path (`ingest_proposal` + `ingest_approve` /
+/// `ingest_reject`); native runs the signed `GovernanceEngine`
+/// (`propose` + `approve`). Given the SAME frozen config and the SAME vote
+/// sequence, both MUST reach the SAME terminal `ProposalStatus`. This is the
+/// engine-boundary half of the §9.9.3 native↔WASM governance convergence the
+/// WASM engine adoption exists to guarantee: the quorum DECISION is identical,
+/// so honest native and keyless-WASM participants never diverge on
+/// Approved/Rejected.
+#[test]
+fn wasm_keyless_ingest_matches_native_signed_threshold_decision() {
+    use scp_protocol::context::governance::multisig::ThresholdEngine;
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceProposal, KeyResolver,
+        ProposalStatus, SignedVote, TrustedVoteIngest, VoteType, compute_proposal_id,
+    };
+    use scp_protocol::jcs;
+    use std::sync::Arc;
+
+    let alice = scp_identity::DID::from("did:dht:z6MkAlice");
+    let bob = scp_identity::DID::from("did:dht:z6MkBob");
+    let carol = scp_identity::DID::from("did:dht:z6MkCarol");
+    let signers = vec![alice.clone(), bob.clone(), carol];
+    let now = 1_700_000_000_u64;
+
+    let ctx = GovernanceContext {
+        context_id: "ctx-conv".to_owned(),
+        members: signers
+            .iter()
+            .map(|d| (d.clone(), "admin".to_owned()))
+            .collect(),
+        admin_dids: vec![alice.clone()],
+        current_epoch: Some(1),
+        now,
+    };
+
+    let action = GovernanceAction::AddMember {
+        did: scp_identity::DID::from("did:dht:z6MkNewbie"),
+        role: "member".to_owned(),
+    };
+
+    // Resolver maps the deterministic test seeds to verifying keys for the
+    // signed path. The keyless path never invokes it.
+    let resolver: KeyResolver = Arc::new(|did: &scp_identity::DID, _kid| {
+        let s: &str = did.as_ref();
+        let seed: [u8; 32] = match s {
+            "did:dht:z6MkAlice" => [1u8; 32],
+            "did:dht:z6MkBob" => [2u8; 32],
+            "did:dht:z6MkCarol" => [3u8; 32],
+            _ => return None,
+        };
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    });
+
+    // --- Native signed path: alice proposes (1-of-3), bob approves (2-of-3). ---
+    let mut native = ThresholdEngine::new(signers.clone(), 2, 86_400, resolver.clone())
+        .expect("valid threshold config");
+    let sk_alice = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let sk_bob = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let (native_prop, _) = native
+        .propose(&alice, action.clone(), &ctx, &sk_alice)
+        .expect("native propose");
+    let (native_status, _) = native
+        .approve(&native_prop.proposal_id, &bob, &ctx, &sk_bob)
+        .expect("native approve");
+
+    // --- Keyless WASM path: build the proposal struct (no key), seed it via
+    // ingest_proposal, then bob's keyless approval. ---
+    let action_bytes = jcs::to_vec(&action).expect("jcs");
+    let pid = compute_proposal_id(&ctx.context_id, &alice, &action_bytes, now);
+    let wasm_prop = GovernanceProposal {
+        proposal_id: pid,
+        context_id: ctx.context_id.clone(),
+        proposer_did: alice.clone(),
+        action,
+        status: ProposalStatus::Pending,
+        created_at: now,
+        voting_deadline: now + 86_400,
+        approvals: vec![SignedVote {
+            voter_did: alice.clone(),
+            vote: VoteType::Approve,
+            timestamp: now,
+            signature: Vec::new(),
+        }],
+        rejections: Vec::new(),
+        created_at_epoch: Some(1),
+    };
+    let mut wasm = ThresholdEngine::new(signers, 2, 86_400, resolver).expect("valid");
+    wasm.ingest_proposal(wasm_prop).expect("seed");
+    let (wasm_status, _) = wasm
+        .ingest_approve(&pid, &bob, &ctx)
+        .expect("ingest approve");
+
+    assert_eq!(
+        native_status, wasm_status,
+        "native signed and keyless WASM paths must reach the same status"
+    );
+    assert_eq!(
+        wasm_status,
+        ProposalStatus::Approved,
+        "2-of-3 must Approve on both paths"
+    );
+}
+
+/// §9.9.3 native↔WASM convergence — past-deadline majority auto-resolve must
+/// record the SAME vote sets on the native signed path and the keyless WASM
+/// path. When a vote arrives AFTER the voting deadline, `MajorityVoteEngine`
+/// auto-resolves on the already-recorded votes WITHOUT counting the late vote
+/// (`precheck_vote` returns `Resolved` before `push_and_resolve` runs). Both
+/// the native signed `approve` and the keyless `ingest_approve` exhibit this,
+/// so `engine.get_proposal(...)` holds IDENTICAL `approvals`/`rejections` on
+/// both paths — the late vote is in NEITHER. This is the exact property the
+/// WASM `ContextManager` now relies on: it persists the engine's recorded
+/// proposal verbatim instead of optimistically pushing the late vote (which
+/// would have left WASM with an extra phantom approval vs native).
+#[test]
+fn wasm_keyless_ingest_matches_native_past_deadline_majority_vote_sets() {
+    use scp_protocol::context::governance::majority::MajorityVoteEngine;
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceProposal, KeyResolver,
+        ProposalStatus, SignedVote, TrustedVoteIngest, VoteType, compute_proposal_id,
+    };
+    use scp_protocol::jcs;
+    use std::sync::Arc;
+
+    let alice = scp_identity::DID::from("did:dht:z6MkAlice");
+    let bob = scp_identity::DID::from("did:dht:z6MkBob");
+    let carol = scp_identity::DID::from("did:dht:z6MkCarol");
+    let voters = vec![alice.clone(), bob.clone(), carol];
+    let created = 1_700_000_000_u64;
+    let deadline = created + 86_400;
+    // A vote time strictly past the deadline triggers the auto-resolve branch.
+    let past_deadline_now = deadline + 1;
+
+    let ctx_at_vote = GovernanceContext {
+        context_id: "ctx-conv-deadline".to_owned(),
+        members: voters
+            .iter()
+            .map(|d| (d.clone(), "admin".to_owned()))
+            .collect(),
+        admin_dids: vec![alice.clone()],
+        current_epoch: Some(1),
+        now: past_deadline_now,
+    };
+
+    let action = GovernanceAction::AddMember {
+        did: scp_identity::DID::from("did:dht:z6MkNewbie"),
+        role: "member".to_owned(),
+    };
+
+    let resolver: KeyResolver = Arc::new(|did: &scp_identity::DID, _kid| {
+        let s: &str = did.as_ref();
+        let seed: [u8; 32] = match s {
+            "did:dht:z6MkAlice" => [1u8; 32],
+            "did:dht:z6MkBob" => [2u8; 32],
+            "did:dht:z6MkCarol" => [3u8; 32],
+            _ => return None,
+        };
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    });
+
+    // Pre-deadline recorded state shared by both paths: alice approved while the
+    // proposal was open (1 approval, 0 rejections). 1/3 participation = 3333 bps,
+    // below the 5000-bps default floor, so a past-deadline resolve -> Rejected
+    // (InsufficientParticipation) WITHOUT recording the late vote.
+    let action_bytes = jcs::to_vec(&action).expect("jcs");
+    let pid = compute_proposal_id(&ctx_at_vote.context_id, &alice, &action_bytes, created);
+    let seed_proposal = GovernanceProposal {
+        proposal_id: pid,
+        context_id: ctx_at_vote.context_id.clone(),
+        proposer_did: alice.clone(),
+        action,
+        status: ProposalStatus::Pending,
+        created_at: created,
+        voting_deadline: deadline,
+        approvals: vec![SignedVote {
+            voter_did: alice,
+            vote: VoteType::Approve,
+            timestamp: created,
+            signature: Vec::new(),
+        }],
+        rejections: Vec::new(),
+        created_at_epoch: Some(1),
+    };
+
+    // --- Native signed path: bob's signed approve arrives past the deadline. ---
+    let mut native = MajorityVoteEngine::new(voters.clone(), 86_400, 5_000, resolver.clone())
+        .expect("valid majority config");
+    native
+        .ingest_proposal(seed_proposal.clone())
+        .expect("seed native");
+    let sk_bob = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let (native_status, _) = native
+        .approve(&pid, &bob, &ctx_at_vote, &sk_bob)
+        .expect("native past-deadline approve auto-resolves");
+    let native_recorded = native.get_proposal(&pid).expect("native proposal").clone();
+
+    // --- Keyless WASM path: bob's keyless approve arrives past the deadline. ---
+    let mut wasm = MajorityVoteEngine::new(voters, 86_400, 5_000, resolver).expect("valid");
+    wasm.ingest_proposal(seed_proposal).expect("seed wasm");
+    let (wasm_status, _) = wasm
+        .ingest_approve(&pid, &bob, &ctx_at_vote)
+        .expect("keyless past-deadline approve auto-resolves");
+    let wasm_recorded = wasm.get_proposal(&pid).expect("wasm proposal").clone();
+
+    // Status convergence.
+    assert_eq!(
+        native_status, wasm_status,
+        "native signed and keyless WASM past-deadline resolution must match"
+    );
+
+    // Vote-SET convergence: the late vote is recorded on NEITHER path.
+    assert_eq!(
+        native_recorded.approvals.len(),
+        1,
+        "native records only the pre-deadline approval"
+    );
+    assert_eq!(
+        wasm_recorded.approvals.len(),
+        1,
+        "keyless WASM records only the pre-deadline approval (late vote dropped)"
+    );
+    assert_eq!(
+        native_recorded.rejections.len(),
+        wasm_recorded.rejections.len(),
+        "rejection vectors must match across paths"
+    );
+    // The voter DIDs recorded must be identical sets.
+    let native_approvers: Vec<&str> = native_recorded
+        .approvals
+        .iter()
+        .map(|v| v.voter_did.as_ref())
+        .collect();
+    let wasm_approvers: Vec<&str> = wasm_recorded
+        .approvals
+        .iter()
+        .map(|v| v.voter_did.as_ref())
+        .collect();
+    assert_eq!(
+        native_approvers, wasm_approvers,
+        "recorded approver DID sets must be byte-identical across paths"
+    );
+}
+
+// ===========================================================================
 // Handle registry conformance (WASM vs core HandleRegistry)
 // ===========================================================================
 

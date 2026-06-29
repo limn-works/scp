@@ -1647,6 +1647,61 @@ pub trait TrustedVoteIngest {
         voter: &DID,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
+
+    /// Seed a caller-built (empty-signature) proposal into the engine VERBATIM,
+    /// preserving its status, for the keyless WASM bridge (ADR-034) to rebuild a
+    /// transient engine from its own stored state before
+    /// [`ingest_approve`](Self::ingest_approve) /
+    /// [`ingest_reject`](Self::ingest_reject).
+    ///
+    /// # Purpose
+    ///
+    /// The signed [`GovernanceEngine::propose`] path is the only way to create a
+    /// proposal inside an engine, and it requires a signing key plus a
+    /// [`KeyResolver`] — neither of which the no-key WASM bridge has (ADR-034).
+    /// The engine is also neither `Clone` nor `Serialize` (the resolver is an
+    /// `Arc<dyn Fn>`), so WASM cannot persist a live engine; it rebuilds a
+    /// transient engine per governance op and must re-seed it with the proposal
+    /// it already tracks in its own state before re-running the shared tally via
+    /// `ingest_approve` / `ingest_reject`. This method is that seed.
+    ///
+    /// # Caller contract (keyless, NO verification)
+    ///
+    /// Like the rest of [`TrustedVoteIngest`], this performs **NO signature
+    /// verification**. The caller is trusted to assert that `proposal` is a
+    /// faithful copy of state it already authenticated out-of-band (the same
+    /// trust boundary as `ingest_approve` / `ingest_reject` — see the trait-level
+    /// contract). It is **not** trusted to bypass the eligibility and uniqueness
+    /// invariants enforced here:
+    ///
+    /// 1. `proposal.proposer_did` MUST be in the engine's frozen signer / voter
+    ///    set, else [`GovernanceError::NotEligible`]. This is the same frozen set
+    ///    the tally enforces, so a proposal whose proposer is not eligible can
+    ///    never be seeded (and therefore never tallied).
+    /// 2. `proposal.proposal_id` MUST NOT already be present, else
+    ///    [`GovernanceError::DuplicateProposal`]. This prevents a second seed from
+    ///    silently overwriting an in-flight proposal's accumulated votes.
+    ///
+    /// # Status is preserved VERBATIM
+    ///
+    /// The proposal is inserted **as-is**: its [`status`](GovernanceProposal::status),
+    /// [`approvals`](GovernanceProposal::approvals), and
+    /// [`rejections`](GovernanceProposal::rejections) are stored unchanged. This
+    /// method performs **NO re-tally and NO re-resolution** — the WASM caller owns
+    /// that state and re-runs the tally itself via the subsequent `ingest_*` call.
+    /// In particular, a **terminal** proposal (e.g. already `Approved` or
+    /// `Rejected`) stays terminal: a later `ingest_approve` / `ingest_reject` on
+    /// the seeded engine then returns [`GovernanceError::ProposalNotPending`],
+    /// exactly as it would for a natively-resolved proposal. Seeding therefore
+    /// never resurrects, re-opens, or re-executes a finished proposal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError::NotEligible`] if `proposal.proposer_did` is not
+    /// in the frozen signer / voter set, or
+    /// [`GovernanceError::DuplicateProposal`] if a proposal with the same
+    /// `proposal_id` is already tracked by this engine.
+    fn ingest_proposal(&mut self, proposal: GovernanceProposal) -> Result<(), GovernanceError>;
 }
 
 // ---------------------------------------------------------------------------

@@ -40,9 +40,13 @@ use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
 use scp_protocol::context::EXPORT_SCOPE_TAG_FULL;
 use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+use scp_protocol::context::governance::majority::MajorityVoteEngine;
+use scp_protocol::context::governance::multisig::ThresholdEngine;
+use scp_protocol::context::governance::unanimity::UnanimityEngine;
 use scp_protocol::context::governance::{
-    AccessScope, ConflictResolution, GovernanceAction, GovernanceProposal, ProposalStatus,
-    SignedVote, VoteType,
+    AccessScope, ConflictResolution, GovernanceAction, GovernanceContext, GovernanceEngine,
+    GovernanceError, GovernanceEvent, GovernanceProposal, KeyResolver, ProposalStatus, SignedVote,
+    TrustedVoteIngest, VoteType,
 };
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ContextMode;
@@ -216,14 +220,18 @@ fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
 /// # Why this exists
 ///
 /// `create_context` previously stored the `governance` string verbatim with no
-/// validation, and [`WasmContextManager::governance_quorum`] treats any
-/// UNRECOGNIZED model as `single_admin` auto-execute (its `_ =>` arm). A typo
-/// such as `"threshhold"` or `"majorty"` therefore silently became single-admin
-/// auto-execute — a security-relevant fail-open in which a context the caller
-/// intended to be multi-party-governed instead auto-approves every proposal.
-/// Rejecting unknown models at the boundary (create + import) closes that
-/// fail-open: every STORED `governance` string is now one of the recognized
-/// models, so the `_ =>` quorum arm is unreachable for stored contexts.
+/// validation, and the quorum tally treats any UNRECOGNIZED model as
+/// `single_admin` auto-execute (the `_ =>` arm of
+/// [`WasmContextManager::build_transient_governance_engine`], which returns
+/// `None` — no multi-party engine — for an unknown model, routing it to the
+/// auto-execute path). A typo such as `"threshhold"` or `"majorty"` therefore
+/// silently became single-admin auto-execute — a security-relevant fail-open in
+/// which a context the caller intended to be multi-party-governed instead
+/// auto-approves every proposal. Rejecting unknown models at the boundary
+/// (`validate_governance_model` / `resolve_governance_config`, on create AND
+/// import) closes that fail-open: every STORED `governance` string is now one of
+/// the recognized models, so the `_ =>` auto-execute arm is unreachable for
+/// stored contexts.
 ///
 /// # Divergence note (intentional)
 ///
@@ -231,9 +239,10 @@ fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
 /// additionally accepts the legacy aliases `"multisig"` (→ `Threshold`) and
 /// `"token_voting"` (→ `Majority`) for backward compatibility with the older
 /// `UniFFI` typed variants. The WASM bridge has never emitted or recognized those
-/// aliases in `governance_quorum`, so accepting them here WITHOUT quorum support
-/// would reintroduce the very fail-open this fix closes (the alias would fall
-/// through to the `_ =>` auto-execute arm). We therefore validate against the
+/// aliases in its governance handling, so accepting them here WITHOUT quorum
+/// support would reintroduce the very fail-open this fix closes (the alias would
+/// fall through to the transient-engine `_ =>` auto-execute arm). We therefore
+/// validate against the
 /// canonical set ONLY; the aliases are rejected as unknown on the WASM path.
 ///
 /// # Errors
@@ -250,6 +259,236 @@ fn validate_governance_model(governance: &str) -> Result<(), ScpWasmError> {
                  single_admin / threshold / majority / unanimity"
             ),
             code: codes::VALID_7005.to_owned(),
+        }),
+    }
+}
+
+/// The frozen, collapse-resolved governance configuration for a context.
+///
+/// Produced by [`resolve_governance_config`] from the raw wire / snapshot
+/// inputs and stored on [`PerContextState`]. The `model` here is the
+/// **post-collapse** model: a `threshold` request with no signers or a
+/// `majority` / `unanimity` request with no voters has already been rewritten
+/// to `single_admin`, exactly as the native `parse_governance` does
+/// (`crates/scp-ffi/common/src/context_params.rs`). Building the shared
+/// governance engine from this resolved config — never from live
+/// `role_state.members` — is what makes the WASM quorum tally byte-converge
+/// with native (§9.9.3).
+struct ResolvedGovernance {
+    /// Post-collapse model string: `single_admin` / `threshold` / `majority`
+    /// / `unanimity`.
+    model: String,
+    /// Threshold signer set (non-empty only for a surviving `threshold`).
+    threshold_signers: Vec<String>,
+    /// Threshold value (>= 1 for a surviving `threshold`; `0` otherwise).
+    threshold_value: u32,
+    /// Frozen eligible voter set (non-empty only for `majority` / `unanimity`).
+    eligible_voters: Vec<String>,
+}
+
+/// A transient, per-op shared governance engine for the keyless WASM bridge.
+///
+/// Wraps the concrete `scp_protocol` engine for a context's frozen
+/// (collapse-resolved) multi-party model. WASM rebuilds this per governance op
+/// (the engines are neither `Clone` nor `Serialize`), seeds it from its own
+/// stored proposal via [`TrustedVoteIngest::ingest_proposal`], then either runs
+/// the keyless tally (`ingest_approve` / `ingest_reject`) or the gated
+/// [`GovernanceEngine::withdraw_vote`]. Holding the concrete engine (rather than
+/// a `Box<dyn TrustedVoteIngest>`) is what lets the withdrawal path reach the
+/// gated `withdraw_vote`, which lives on `GovernanceEngine` and is intentionally
+/// NOT on `TrustedVoteIngest`.
+enum TransientGovernanceEngine {
+    /// M-of-N threshold engine (ADR-031 §4b).
+    Threshold(ThresholdEngine),
+    /// Majority-vote engine (ADR-031 §4c).
+    Majority(MajorityVoteEngine),
+    /// Unanimity engine (ADR-031 §4d).
+    Unanimity(UnanimityEngine),
+}
+
+impl TransientGovernanceEngine {
+    /// Seeds the stored proposal verbatim (status + votes preserved).
+    fn ingest_proposal(&mut self, proposal: GovernanceProposal) -> Result<(), GovernanceError> {
+        match self {
+            Self::Threshold(e) => e.ingest_proposal(proposal),
+            Self::Majority(e) => e.ingest_proposal(proposal),
+            Self::Unanimity(e) => e.ingest_proposal(proposal),
+        }
+    }
+
+    /// Keyless approval tally.
+    fn ingest_approve(
+        &mut self,
+        proposal_id: &[u8; 32],
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        match self {
+            Self::Threshold(e) => e.ingest_approve(proposal_id, voter, context),
+            Self::Majority(e) => e.ingest_approve(proposal_id, voter, context),
+            Self::Unanimity(e) => e.ingest_approve(proposal_id, voter, context),
+        }
+    }
+
+    /// Keyless rejection tally.
+    fn ingest_reject(
+        &mut self,
+        proposal_id: &[u8; 32],
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        match self {
+            Self::Threshold(e) => e.ingest_reject(proposal_id, voter, context),
+            Self::Majority(e) => e.ingest_reject(proposal_id, voter, context),
+            Self::Unanimity(e) => e.ingest_reject(proposal_id, voter, context),
+        }
+    }
+
+    /// Reads the engine's authoritative recorded proposal back by id.
+    ///
+    /// After a vote (`ingest_approve` / `ingest_reject`) the engine holds the
+    /// proposal with EXACTLY the votes it actually recorded and the status it
+    /// resolved. This is the WASM source of truth that the vote endpoints
+    /// persist verbatim into their stored map, so the stored vote vectors are
+    /// byte-identical to native's `engine.get_proposal(...)` (§9.9.3). Crucially
+    /// this is correct even when the keyless precheck AUTO-RESOLVES a
+    /// past-deadline vote WITHOUT recording it (`MajorityVoteEngine::precheck_vote`
+    /// returns `Resolved` before `push_and_resolve` runs): the engine's proposal
+    /// then carries only the pre-deadline votes, matching native — whereas an
+    /// optimistic `approvals.push(new_vote)` on the WASM side would diverge.
+    fn get_proposal(&self, proposal_id: &[u8; 32]) -> Option<&GovernanceProposal> {
+        match self {
+            Self::Threshold(e) => e.get_proposal(proposal_id),
+            Self::Majority(e) => e.get_proposal(proposal_id),
+            Self::Unanimity(e) => e.get_proposal(proposal_id),
+        }
+    }
+
+    /// Gated vote withdrawal (`GovernanceEngine::withdraw_vote`): enforces
+    /// eligible-set membership, pending status, the voting deadline, and that
+    /// the voter actually voted, before removing the vote.
+    fn withdraw_vote(
+        &mut self,
+        proposal_id: &[u8; 32],
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        match self {
+            Self::Threshold(e) => e.withdraw_vote(proposal_id, voter, context),
+            Self::Majority(e) => e.withdraw_vote(proposal_id, voter, context),
+            Self::Unanimity(e) => e.withdraw_vote(proposal_id, voter, context),
+        }
+    }
+}
+
+/// Resolves a raw governance request into its frozen, collapse-applied
+/// configuration, mirroring the native `parse_governance` + typed-engine
+/// validation chain (`context_params.rs` + `state.rs::validate_governance_model`).
+///
+/// # Collapse policy (matches native exactly)
+///
+/// - `threshold` with an EMPTY signer set collapses to `single_admin`
+///   (`single_admin` auto-execute). A populated signer set is retained.
+/// - `majority` / `unanimity` with an EMPTY voter set collapses to
+///   `single_admin`. A populated voter set is retained.
+///
+/// The collapse runs BEFORE the threshold-floor validation below, so a
+/// `threshold` request with no signers becomes `single_admin` and is never
+/// subjected to the `threshold >= 1` check — identical to native, where the
+/// empty-signers branch returns `SingleAdmin` before `validate_governance_model`
+/// runs.
+///
+/// # Threshold floor (item D / native `validate_governance_model`)
+///
+/// A SURVIVING `threshold` context (non-empty signers) with `threshold == 0`
+/// or `threshold > signers.len()` is REJECTED with a validation error — it is
+/// NOT silently rewritten to auto-execute. This routes the quorum decision
+/// through `ThresholdEngine::new`, whose own `threshold == 0` rejection is the
+/// authoritative guard; this pre-check surfaces the same condition as a clean
+/// `SCP-VALID-7005` at create/import time.
+///
+/// # Errors
+///
+/// Returns a [`ScpWasmError::Validation`] if the model name is unknown
+/// (delegated to [`validate_governance_model`]) or if a surviving `threshold`
+/// has a degenerate `threshold` value.
+fn resolve_governance_config(
+    model: &str,
+    threshold_signers: Vec<String>,
+    threshold_value: u32,
+    eligible_voters: Vec<String>,
+) -> Result<ResolvedGovernance, ScpWasmError> {
+    validate_governance_model(model)?;
+
+    match model {
+        "threshold" => {
+            if threshold_signers.is_empty() {
+                // Collapse to single_admin (native parity): no signers means
+                // no multi-party engine — the creator auto-executes.
+                return Ok(ResolvedGovernance {
+                    model: "single_admin".to_owned(),
+                    threshold_signers: Vec::new(),
+                    threshold_value: 0,
+                    eligible_voters: Vec::new(),
+                });
+            }
+            // Surviving threshold: enforce the threshold floor (item D). The
+            // shared `ThresholdEngine::new` is the authoritative guard; this
+            // pre-check surfaces the same reject cleanly at create/import.
+            let signer_count = u32::try_from(threshold_signers.len()).unwrap_or(u32::MAX);
+            if threshold_value == 0 || threshold_value > signer_count {
+                return Err(ScpWasmError::Validation {
+                    message: format!(
+                        "threshold governance requires 1 <= threshold <= signers.len();                          got threshold {threshold_value} with {signer_count} signer(s)"
+                    ),
+                    code: codes::VALID_7005.to_owned(),
+                });
+            }
+            Ok(ResolvedGovernance {
+                model: "threshold".to_owned(),
+                threshold_signers,
+                threshold_value,
+                eligible_voters: Vec::new(),
+            })
+        }
+        "majority" => {
+            if eligible_voters.is_empty() {
+                return Ok(ResolvedGovernance {
+                    model: "single_admin".to_owned(),
+                    threshold_signers: Vec::new(),
+                    threshold_value: 0,
+                    eligible_voters: Vec::new(),
+                });
+            }
+            Ok(ResolvedGovernance {
+                model: "majority".to_owned(),
+                threshold_signers: Vec::new(),
+                threshold_value: 0,
+                eligible_voters,
+            })
+        }
+        "unanimity" => {
+            if eligible_voters.is_empty() {
+                return Ok(ResolvedGovernance {
+                    model: "single_admin".to_owned(),
+                    threshold_signers: Vec::new(),
+                    threshold_value: 0,
+                    eligible_voters: Vec::new(),
+                });
+            }
+            Ok(ResolvedGovernance {
+                model: "unanimity".to_owned(),
+                threshold_signers: Vec::new(),
+                threshold_value: 0,
+                eligible_voters,
+            })
+        }
+        // "single_admin" | "" (already validated above).
+        _ => Ok(ResolvedGovernance {
+            model: "single_admin".to_owned(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            eligible_voters: Vec::new(),
         }),
     }
 }
@@ -442,6 +681,15 @@ pub(crate) struct PerContextState {
     /// Current threshold value (ADR-031 §4b). `0` means threshold governance
     /// is not configured.
     threshold_value: u32,
+    /// FROZEN eligible voter set for the `majority` / `unanimity` governance
+    /// models (ADR-031 §4c/§4d). Captured at context creation from the
+    /// `governanceVoters` parameter and NEVER recomputed from live
+    /// `role_state.members`. This is the denominator the shared governance
+    /// engine uses for quorum: a member added mid-proposal does NOT move the
+    /// bar, exactly as the native `MajorityVoteEngine` / `UnanimityEngine`
+    /// freeze their voter set at construction. Empty for `single_admin` /
+    /// `threshold` contexts.
+    eligible_voters: Vec<String>,
     /// Established tool interfaces (spec section 6.2).
     tool_interfaces: Vec<String>,
     /// Whether governance is frozen due to conflicting proposals (ADR-031 §7).
@@ -1039,6 +1287,24 @@ impl PerContextState {
         self.governance = model.to_owned();
     }
 
+    /// Test-only: freeze the eligible voter set for `majority` / `unanimity`
+    /// contexts. The shared governance engine reads its quorum denominator from
+    /// this frozen set (item A), so cross-impl tests that drive a multi-party
+    /// model MUST seed it (the production `create_context` path captures it from
+    /// the `governanceVoters` wire param).
+    #[cfg(test)]
+    pub(crate) fn test_set_eligible_voters(&mut self, voters: &[&str]) {
+        self.eligible_voters = voters.iter().map(|v| (*v).to_owned()).collect();
+    }
+
+    /// Test-only: freeze the threshold signer set + value for `threshold`
+    /// contexts.
+    #[cfg(test)]
+    pub(crate) fn test_set_threshold_config(&mut self, signers: &[&str], threshold: u32) {
+        self.threshold_signers = signers.iter().map(|v| (*v).to_owned()).collect();
+        self.threshold_value = threshold;
+    }
+
     /// Test-only: insert a resolved (e.g. `Approved`) proposal directly, so
     /// sibling-module cross-impl tests can drive the direct-execute path
     /// (which requires the proposal tracked-and-`Approved`).
@@ -1167,6 +1433,62 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
             message: format!("{field_name} must have format 'did:method:id': got '{value}'"),
             code: codes::CTX_2032.to_owned(),
         });
+    }
+    Ok(())
+}
+
+/// Caps and per-element DID-validates the attacker-controlled identity sets on
+/// an imported snapshot: the frozen governance sets (`eligible_voters`,
+/// `threshold_signers`) and the role-state `members`.
+///
+/// These sets are fed to the engine builder (`MajorityVoteEngine::new` /
+/// `ThresholdEngine::new`) during live governance ops and consumed by
+/// `resolve_governance_config` at import; `members` additionally seeds the
+/// imported `ContextRoleState`. The Ed25519 envelope signature authenticates
+/// ORIGIN, not bounds — an unbounded set, or one seeded with junk DIDs, is a
+/// denial-of-service vector. We reject any over-cap set (the same closed
+/// `WASM_MEMBER_CAP` gate the live `add_member` path enforces) and validate
+/// every entry as a DID BEFORE the resolve/build step consumes the sets, so the
+/// cap is a true gate rather than a post-hoc check. Run this ahead of
+/// `resolve_governance_config` on the import path.
+fn validate_imported_governance_and_member_sets(
+    snap: &WasmContextExportSnapshot,
+) -> Result<(), ScpWasmError> {
+    if snap.role_state.members.len() > WASM_MEMBER_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} members, exceeds cap {WASM_MEMBER_CAP}",
+                snap.role_state.members.len()
+            ),
+            code: codes::CTX_2032.to_owned(),
+        });
+    }
+    for did in &snap.role_state.members {
+        validate_imported_did(did, "member DID")?;
+    }
+    if snap.eligible_voters.len() > WASM_MEMBER_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} eligible voters, exceeds cap {WASM_MEMBER_CAP}",
+                snap.eligible_voters.len()
+            ),
+            code: codes::CTX_2032.to_owned(),
+        });
+    }
+    for did in &snap.eligible_voters {
+        validate_imported_did(did, "eligible_voters DID")?;
+    }
+    if snap.threshold_signers.len() > WASM_MEMBER_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} threshold signers, exceeds cap {WASM_MEMBER_CAP}",
+                snap.threshold_signers.len()
+            ),
+            code: codes::CTX_2032.to_owned(),
+        });
+    }
+    for did in &snap.threshold_signers {
+        validate_imported_did(did, "threshold_signers DID")?;
     }
     Ok(())
 }
@@ -1493,6 +1815,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         sessions: HashMap::new(),
         threshold_signers: Vec::new(),
         threshold_value: 0,
+        eligible_voters: Vec::new(),
         tool_interfaces: Vec::new(),
         governance_freeze: false,
         pending_proposals: HashMap::new(),
@@ -1524,6 +1847,16 @@ impl WasmContextManager {
     #[cfg(test)]
     pub(crate) fn test_insert_context(&mut self, context_id: &str, ctx: PerContextState) {
         self.contexts.insert(context_id.to_owned(), ctx);
+    }
+
+    /// Test-only: insert a member into an ALREADY-REGISTERED context (manager
+    /// level). Lets tests add a member mid-proposal to prove the frozen
+    /// governance denominator does not move.
+    #[cfg(test)]
+    pub(crate) fn test_insert_member_pub(&mut self, context_id: &str, did: &str, role: &str) {
+        if let Some(ctx) = self.contexts.get_mut(context_id) {
+            ctx.test_insert_member(did, role);
+        }
     }
 
     /// Test-only: clone the durable event-log leaves for `context_id`. Lets
@@ -1609,20 +1942,61 @@ impl WasmContextManager {
             .to_owned();
         let ttl_seconds = params["ttlSeconds"].as_u64();
         let promotion_policy = params["promotionPolicy"].as_str().map(str::to_owned);
-        let governance = params["governance"]
+        let governance_requested = params["governance"]
             .as_str()
             .unwrap_or("single_admin")
             .to_owned();
-        // Reject an unrecognized governance model NAME before any state is
-        // mutated. An unknown model would otherwise be stored verbatim and
-        // silently collapse to `single_admin` auto-execute in `governance_quorum`
-        // (its `_ =>` arm) — a security-relevant fail-open. This validates the
-        // model discriminant only; it does NOT validate the quorum parameters
-        // (signer set / threshold value) that native's typed `GovernanceModel`
-        // additionally carries, so a recognized model (e.g. `threshold`) can
-        // still hold a degenerate quorum until the shared governance engine is
-        // adopted on the WASM path.
-        validate_governance_model(&governance)?;
+        // Parse the typed quorum parameters that accompany a multi-party
+        // governance model (ADR-031). These mirror the native wire fields read
+        // by `build_context_params` (`governance_signers`, `governance_threshold`,
+        // `governance_voters`): the WASM SDK passes them as
+        // `governanceSigners` / `governanceThreshold` / `governanceVoters`. The
+        // frozen sets captured here are the engine's denominator forever after —
+        // they are NEVER recomputed from
+        // live `role_state.members` (item A: frozen-set invariant).
+        let governance_signers: Vec<String> = params["governanceSigners"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Default threshold 1 (NEVER 0) per item B — matches native's
+        // `params.governance_threshold.unwrap_or(1)`.
+        let governance_threshold: u32 = params["governanceThreshold"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(1);
+        let governance_voters: Vec<String> = params["governanceVoters"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // NOTE: the majority participation floor is NOT read from the wire. It
+        // defaults to 5000 bps, applied in `build_transient_governance_engine`.
+        // Per ADR-031, `min_participation_bps` is a configurable `Majority` field
+        // (range `(0, 10000]`) whose default is 5000; it is simply not wired
+        // configurable on EITHER bridge today (native hardcodes the same
+        // default), so import has nothing to read. Wiring it later must land on
+        // both bridges together to keep the native↔WASM tally convergent.
+
+        // Resolve the request into its frozen, collapse-applied configuration
+        // (item C collapse + item D threshold==0 reject). An unknown model name
+        // is rejected here (fail-closed) before any state is mutated; a
+        // `threshold` / `majority` / `unanimity` request with an empty
+        // signer/voter set collapses to `single_admin` exactly as native does;
+        // a surviving `threshold` with a degenerate value is rejected.
+        let resolved_governance = resolve_governance_config(
+            &governance_requested,
+            governance_signers,
+            governance_threshold,
+            governance_voters,
+        )?;
+        let governance = resolved_governance.model.clone();
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
         // C2 fail-closed: reject paid economic policies at WASM context creation.
@@ -1792,8 +2166,9 @@ impl WasmContextManager {
             read_exclusion_list: HashSet::new(),
             broadcast_context,
             sessions: HashMap::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
+            threshold_signers: resolved_governance.threshold_signers.clone(),
+            threshold_value: resolved_governance.threshold_value,
+            eligible_voters: resolved_governance.eligible_voters,
             tool_interfaces: Vec::new(),
             governance_freeze: false,
             pending_proposals: HashMap::new(),
@@ -3577,22 +3952,18 @@ impl WasmContextManager {
         // diverges from native's `created_at`, breaking cross-platform Merkle
         // equivocation detection. Fail loudly so a future regression surfaces
         // instead of corrupting the convergent log.
-        let proposal_created_at = {
+        // Resolve the action + leaf timestamp from the TRACKED proposal — never
+        // from a caller-supplied action — and key the replay guard on the
+        // CANONICAL `compute_proposal_id` of that tracked proposal, NOT the
+        // caller-supplied hex `proposal_id`. A caller cannot double-execute the
+        // same action by minting a fresh (non-canonical) id: two proposals over
+        // the same (context_id, proposer, JCS(action), created_at) compute the
+        // same canonical id, so the second execution hits the replay guard
+        // regardless of the hex key the caller chose.
+        let (proposal_created_at, action, replay_key) = {
             let ctx = self.require_active_context_mut(context_id)?;
             let now = crate::time::now_ms();
 
-            if ctx.executed_proposals.contains_key(proposal_id) {
-                return Err(ScpWasmError::Permission {
-                    message: "governance proposal has already been executed".to_owned(),
-                    code: codes::PERM_3000.to_owned(),
-                });
-            }
-
-            // Resolve BOTH the convergent leaf timestamp AND the action to
-            // dispatch from the TRACKED proposal — never from a caller-supplied
-            // action. This closes the action-substitution facet of the
-            // direct-execute quorum bypass: the executed action is exactly the
-            // one the engine tracked for this id.
             let tracked = ctx
                 .pending_proposals
                 .get(proposal_id)
@@ -3606,6 +3977,24 @@ impl WasmContextManager {
                 })?;
             let created_at = tracked.created_at;
             let tracked_action = tracked.action.clone();
+            // Canonical replay key: SHA-256 over (context_id, proposer,
+            // JCS(action), created_at) — the same id native computes. JCS
+            // serialization failure is fatal (the action must canonicalize).
+            let replay_key = Self::canonical_replay_key_for_tracked(ctx, proposal_id, context_id)
+                .ok_or_else(|| ScpWasmError::Context {
+                message: format!(
+                    "failed to derive canonical replay key for governance proposal \
+                         '{proposal_id}'"
+                ),
+                code: codes::CTX_2041.to_owned(),
+            })?;
+
+            if ctx.executed_proposals.contains_key(&replay_key) {
+                return Err(ScpWasmError::Permission {
+                    message: "governance proposal has already been executed".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
+                });
+            }
 
             // Evict expired proposals when over capacity.
             if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
@@ -3613,10 +4002,9 @@ impl WasmContextManager {
                 ctx.executed_proposals.retain(|_, ts| *ts > cutoff);
             }
 
-            ctx.executed_proposals.insert(proposal_id.to_owned(), now);
-            (created_at, tracked_action)
+            ctx.executed_proposals.insert(replay_key.clone(), now);
+            (created_at, tracked_action, replay_key)
         };
-        let (proposal_created_at, action) = proposal_created_at;
         let action = &action;
 
         // `proposal_created_at` is the convergent committer-assigned leaf
@@ -3631,11 +4019,11 @@ impl WasmContextManager {
         let result =
             self.dispatch_governance_action(context_id, action, executor_did, proposal_created_at);
 
-        // Roll back on failure.
+        // Roll back on failure (remove the CANONICAL replay key inserted above).
         if result.is_err()
             && let Some(ctx) = self.contexts.get_mut(context_id)
         {
-            ctx.executed_proposals.remove(proposal_id);
+            ctx.executed_proposals.remove(&replay_key);
         }
 
         // Record governance event on success.
@@ -4791,20 +5179,33 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
         // Clear governance freeze (ADR-031 §7).
         ctx.governance_freeze = false;
-        // Record conflicting proposals as executed (invalidated).
+        // Record conflicting proposals as executed (invalidated) so they can
+        // never later be executed. The replay guard in
+        // `execute_governance_action` keys on the CANONICAL `compute_proposal_id`
+        // of the TRACKED proposal, so the invalidation must use the same
+        // canonical key — marking the caller-supplied hex would leave a hole
+        // where an invalidated proposal still passes the replay guard. We look
+        // up each tracked proposal and mark its canonical id; an untracked id is
+        // skipped (nothing to execute).
         let now = crate::time::now_ms();
-        if is_invalidate_both {
-            ctx.executed_proposals.insert(proposal_a.to_owned(), now);
-            ctx.executed_proposals.insert(proposal_b.to_owned(), now);
+        let to_invalidate: Vec<&str> = if is_invalidate_both {
+            vec![proposal_a, proposal_b]
         } else {
-            // AcceptProposal: resolution is the winner_id, loser is
+            // AcceptProposal: resolution is the winner_id, the loser is
             // invalidated. The winner remains eligible for execution.
             let loser = if resolution == proposal_a {
                 proposal_b
             } else {
                 proposal_a
             };
-            ctx.executed_proposals.insert(loser.to_owned(), now);
+            vec![loser]
+        };
+        for pid in to_invalidate {
+            if let Some(canonical_key) =
+                Self::canonical_replay_key_for_tracked(ctx, pid, context_id)
+            {
+                ctx.executed_proposals.insert(canonical_key, now);
+            }
         }
         Ok(serde_json::json!({"action": "ResolveConflict"}))
     }
@@ -4936,26 +5337,290 @@ impl WasmContextManager {
     // Governance proposal lifecycle (#621)
     // -----------------------------------------------------------------------
 
-    /// Determines the quorum requirement for a governance action.
+    /// Whether this context uses `single_admin` governance (including any model
+    /// that collapsed to it at create/import). For `single_admin` the proposer
+    /// IS the sole authority, so a proposal auto-executes immediately — there is
+    /// no multi-party engine and no transient tally.
     ///
-    /// - `single_admin`: auto-approved (quorum = 0, always approved immediately).
-    /// - `threshold`: requires `threshold_value` approvals.
-    /// - `majority`: requires > 50% of members.
-    /// - `unanimity`: requires all members.
+    /// Every other stored model (`threshold` / `majority` / `unanimity`) has a
+    /// non-empty frozen signer/voter set (the collapse in
+    /// [`resolve_governance_config`] guarantees a surviving multi-party model is
+    /// never degenerate) and routes through the shared governance engine.
+    fn is_single_admin_governance(ctx: &PerContextState) -> bool {
+        ctx.governance != "threshold"
+            && ctx.governance != "majority"
+            && ctx.governance != "unanimity"
+    }
+
+    /// A no-op [`KeyResolver`]: the keyless [`TrustedVoteIngest`] path
+    /// (`ingest_proposal` / `ingest_approve` / `ingest_reject`) NEVER invokes the
+    /// resolver — it performs no signature verification (ADR-034). This resolver
+    /// exists only to satisfy the engine constructors' signature; if it were ever
+    /// called it would deny (return `None`), failing closed. The WASM bridge
+    /// authenticates votes out-of-band (member capability + caller identity)
+    /// before reaching the tally, per the `TrustedVoteIngest` caller contract.
+    fn no_op_key_resolver() -> KeyResolver {
+        std::sync::Arc::new(|_did, _kid| None)
+    }
+
+    /// Computes the CANONICAL replay-guard key (hex of `compute_proposal_id`)
+    /// for a TRACKED proposal looked up by its caller-supplied `proposal_id`,
+    /// or `None` if no proposal with that id is tracked (pending or resolved) or
+    /// its action cannot be JCS-canonicalized.
     ///
-    /// Returns `(required_approvals, total_members)`.
-    fn governance_quorum(ctx: &PerContextState) -> (usize, usize) {
-        let total = ctx.role_state.members.len();
+    /// The replay guard MUST key on the canonical id — `SHA-256` over
+    /// `(context_id, proposer, JCS(action), created_at)` — and not the
+    /// caller-supplied hex, so a caller cannot double-execute the same action by
+    /// minting a fresh non-canonical id (item F). Both `execute_governance_action`
+    /// and conflict-invalidation use this one helper so they share a single
+    /// canonical keyspace.
+    fn canonical_replay_key_for_tracked(
+        ctx: &PerContextState,
+        proposal_id: &str,
+        context_id: &str,
+    ) -> Option<String> {
+        let tracked = ctx
+            .pending_proposals
+            .get(proposal_id)
+            .or_else(|| ctx.resolved_proposals.get(proposal_id))?;
+        let action_bytes = scp_protocol::jcs::to_vec(&tracked.action).ok()?;
+        let canonical_id = scp_protocol::context::governance::compute_proposal_id(
+            context_id,
+            &tracked.proposer_did,
+            &action_bytes,
+            tracked.created_at,
+        );
+        Some(hex::encode(canonical_id))
+    }
+
+    /// Builds a transient shared governance engine from a context's FROZEN
+    /// configuration, or `None` for `single_admin` (no multi-party engine).
+    ///
+    /// The engine is rebuilt per governance op because it is neither `Clone` nor
+    /// `Serialize` (the [`KeyResolver`] is an `Arc<dyn Fn>`); WASM persists only
+    /// the proposal state and re-seeds a fresh engine via
+    /// [`TrustedVoteIngest::ingest_proposal`] before each tally / withdrawal. The
+    /// engine's signer / voter denominator comes EXCLUSIVELY from the frozen
+    /// `threshold_signers` / `eligible_voters` fields — NEVER from live
+    /// `role_state.members` — so a member added mid-proposal cannot move the bar
+    /// (item A frozen-set invariant; §9.9.3 native↔WASM convergence).
+    ///
+    /// Returns a [`TransientGovernanceEngine`] enum (not a `Box<dyn ...>`) so the
+    /// caller can reach BOTH the keyless `TrustedVoteIngest` tally and the gated
+    /// `GovernanceEngine::withdraw_vote` on the concrete engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpWasmError::Context`] if the frozen config is rejected by the
+    /// engine constructor (e.g. `threshold == 0`, empty signer/voter set). Such a
+    /// config should have been rejected at create/import by
+    /// [`resolve_governance_config`]; this is the authoritative secondary guard.
+    fn build_transient_governance_engine(
+        ctx: &PerContextState,
+    ) -> Result<Option<TransientGovernanceEngine>, ScpWasmError> {
+        let map_err =
+            |e: scp_protocol::context::governance::GovernanceError| ScpWasmError::Context {
+                message: format!("governance engine construction failed: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            };
         match ctx.governance.as_str() {
-            "threshold" => (ctx.threshold_value as usize, total),
-            "majority" => (total / 2 + 1, total),
-            "unanimity" => (total, total),
-            // `single_admin` (quorum 0 → auto-approve). Any OTHER string is now
-            // unreachable for a stored context: `validate_governance_model`
-            // rejects unrecognized models at both `create_context` and
-            // `import_context`, so the only value that reaches this arm is
-            // `single_admin` (or the empty-string default that normalizes to it).
-            _ => (0, total),
+            "threshold" => {
+                let signers: Vec<DID> = ctx
+                    .threshold_signers
+                    .iter()
+                    .map(|s| DID(s.clone()))
+                    .collect();
+                let engine = ThresholdEngine::new(
+                    signers,
+                    ctx.threshold_value,
+                    // Window is enforced per-proposal via the proposal's own
+                    // `voting_deadline`; the engine window only bounds construction
+                    // validity. Use the native default (86_400) so construction
+                    // never spuriously rejects.
+                    86_400,
+                    Self::no_op_key_resolver(),
+                )
+                .map_err(map_err)?;
+                Ok(Some(TransientGovernanceEngine::Threshold(engine)))
+            }
+            "majority" => {
+                let voters: Vec<DID> = ctx.eligible_voters.iter().map(|s| DID(s.clone())).collect();
+                // Majority participation floor: 5000 bps (50%). ADR-031 defines
+                // `min_participation_bps` as a CONFIGURABLE `Majority` field in
+                // `(0, 10000]`; 5000 is its DEFAULT, not a protocol invariant.
+                // Neither bridge currently wires it configurable — native
+                // hardcodes the default in `MajorityVoteEngine::new(voters,
+                // 86_400, 5000, ..)` (scp-runtime/src/context/state.rs) and the
+                // WASM path mirrors that same literal (and the same 86_400
+                // window), keeping the WASM tally byte-for-byte convergent with
+                // native per §9.9.3. A future change wiring the field through
+                // must do so on BOTH bridges in lockstep to preserve convergence.
+                let engine =
+                    MajorityVoteEngine::new(voters, 86_400, 5000, Self::no_op_key_resolver())
+                        .map_err(map_err)?;
+                Ok(Some(TransientGovernanceEngine::Majority(engine)))
+            }
+            "unanimity" => {
+                let voters: Vec<DID> = ctx.eligible_voters.iter().map(|s| DID(s.clone())).collect();
+                let engine = UnanimityEngine::new(voters, 86_400, Self::no_op_key_resolver())
+                    .map_err(map_err)?;
+                Ok(Some(TransientGovernanceEngine::Unanimity(engine)))
+            }
+            // single_admin (or collapsed): no multi-party engine.
+            _ => Ok(None),
+        }
+    }
+
+    /// Builds the [`GovernanceContext`] the engine tally reads. Only `context_id`
+    /// and `now` are consumed by the keyless tally path: the deadline check uses
+    /// the SEEDED proposal's own `voting_deadline`, and the quorum denominator is
+    /// the engine's frozen signer/voter set — NOT `members`. `members` /
+    /// `admin_dids` are therefore left empty (they would only matter for the
+    /// engine's `eligible_voters()` query, which the tally path does not call).
+    fn governance_context_for_engine(context_id: &str, now_secs: u64) -> GovernanceContext {
+        GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: Vec::new(),
+            admin_dids: Vec::new(),
+            current_epoch: None,
+            now: now_secs,
+        }
+    }
+
+    /// Runs the shared governance engine's quorum tally for a single keyless
+    /// vote and returns the resulting [`ProposalStatus`] (the quorum DECISION)
+    /// together with the engine's AUTHORITATIVE recorded proposal — the proposal
+    /// carrying exactly the votes the engine actually counted plus the resolved
+    /// status. The caller PERSISTS that returned proposal verbatim into its
+    /// stored map; it must NOT optimistically push the new vote itself. This
+    /// transient engine never touches the manager's stored state.
+    ///
+    /// The engine is rebuilt from the context's FROZEN config, seeded with a
+    /// clone of the proposal AS IT STANDS BEFORE this vote (via
+    /// [`TrustedVoteIngest::ingest_proposal`], so its already-recorded votes are
+    /// counted), then the new vote is fed through `ingest_approve` /
+    /// `ingest_reject`. The engine enforces eligibility, single-vote dedup, the
+    /// proposal's own `voting_deadline`, and terminal-state finality, returning
+    /// the post-vote status. This is the SOLE quorum authority on the WASM path
+    /// — it replaces the former hand-rolled string-match arithmetic — so the
+    /// WASM `Approved`/`Rejected`/`Pending` decision is byte-identical to the
+    /// native engine's (§9.9.3).
+    ///
+    /// Returning the engine's proposal (instead of having the caller push the
+    /// vote onto its own copy) is what makes the WASM stored vote vectors match
+    /// native exactly: when the keyless precheck AUTO-RESOLVES a past-deadline
+    /// majority vote it does so WITHOUT recording that vote, so the engine's
+    /// proposal carries only the pre-deadline votes — the previous optimistic
+    /// `approvals.push(new_vote)` recorded a phantom extra vote and diverged the
+    /// vote vector from native (§9.9.3).
+    ///
+    /// The `proposal_for_seed` MUST be the proposal in its pre-this-vote state
+    /// (i.e. the new vote is NOT yet in its `approvals`/`rejections`); the engine
+    /// applies the vote (or auto-resolves) and the returned proposal reflects the
+    /// engine's actual record.
+    ///
+    /// # Errors
+    ///
+    /// Propagates engine construction errors and maps every
+    /// [`scp_protocol::context::governance::GovernanceError`] from the tally
+    /// (`NotEligible`, `AlreadyVoted`, `ProposalNotPending`,
+    /// `VotingWindowExpired`, …) to a typed [`ScpWasmError`] with `code`.
+    fn decide_vote_via_engine(
+        ctx: &PerContextState,
+        context_id: &str,
+        proposal_for_seed: &GovernanceProposal,
+        voter_did: &str,
+        vote: VoteType,
+        now_secs: u64,
+        error_code: &str,
+    ) -> Result<(ProposalStatus, GovernanceProposal), ScpWasmError> {
+        let mut engine = Self::build_transient_governance_engine(ctx)?.ok_or_else(|| {
+            // single_admin has no multi-party engine; callers must route
+            // single_admin through the auto-execute path, never here.
+            ScpWasmError::Context {
+                message: "internal: decide_vote_via_engine called for single_admin governance"
+                    .to_owned(),
+                code: error_code.to_owned(),
+            }
+        })?;
+
+        let proposal_id = proposal_for_seed.proposal_id;
+        engine
+            .ingest_proposal(proposal_for_seed.clone())
+            .map_err(|e| Self::map_governance_error(&e, error_code))?;
+
+        let gov_ctx = Self::governance_context_for_engine(context_id, now_secs);
+        let voter = DID(voter_did.to_owned());
+        let (status, _events) = match vote {
+            VoteType::Approve => engine.ingest_approve(&proposal_id, &voter, &gov_ctx),
+            VoteType::Reject => engine.ingest_reject(&proposal_id, &voter, &gov_ctx),
+        }
+        .map_err(|e| Self::map_governance_error(&e, error_code))?;
+
+        // Read the engine's AUTHORITATIVE recorded proposal back: it holds
+        // exactly the votes the engine counted (which EXCLUDES this vote when a
+        // past-deadline majority auto-resolved without recording it) and the
+        // resolved status. The caller persists THIS verbatim, so the WASM stored
+        // proposal's vote vectors are byte-identical to native's
+        // `engine.get_proposal(...)` (§9.9.3). The proposal is always present
+        // here — `ingest_proposal` seeded it and the vote just succeeded.
+        let recorded =
+            engine
+                .get_proposal(&proposal_id)
+                .cloned()
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: "internal: engine lost the proposal after a successful vote"
+                        .to_owned(),
+                    code: error_code.to_owned(),
+                })?;
+        Ok((status, recorded))
+    }
+
+    /// The canonical wire label for a [`ProposalStatus`] returned to JS callers.
+    ///
+    /// Single source of truth for the status string surfaced by the governance
+    /// vote endpoints (`approve`/`reject`/`withdraw`) and `get_proposal`, so the
+    /// label a caller reads is always the proposal's ACTUAL stored status — the
+    /// same value the engine resolved and persisted — never a pre-decision
+    /// placeholder. The terminal variants carry richer detail (`Rejected.reason`,
+    /// `Invalidated.reason`) on the stored proposal; the wire label is the
+    /// coarse lifecycle state, matching native's status surface.
+    fn proposal_status_label(status: &ProposalStatus) -> &'static str {
+        match status {
+            ProposalStatus::Pending => "Pending",
+            ProposalStatus::Approved => "Approved",
+            ProposalStatus::Rejected { .. } => "Rejected",
+            ProposalStatus::Expired => "Expired",
+            ProposalStatus::Cancelled => "Cancelled",
+            ProposalStatus::Invalidated { .. } => "Invalidated",
+        }
+    }
+
+    /// Maps a shared [`scp_protocol::context::governance::GovernanceError`] to a
+    /// typed [`ScpWasmError`], preserving the per-operation error `code` and
+    /// surfacing the same rejection reasons the former hand-rolled checks did
+    /// (eligibility, dedup, deadline, finality).
+    fn map_governance_error(
+        e: &scp_protocol::context::governance::GovernanceError,
+        code: &str,
+    ) -> ScpWasmError {
+        use scp_protocol::context::governance::GovernanceError as GE;
+        match e {
+            GE::NotEligible(_) | GE::NotAdmin | GE::AlreadyVoted => ScpWasmError::Permission {
+                message: format!("governance vote rejected: {e}"),
+                code: code.to_owned(),
+            },
+            GE::ProposalNotPending { .. }
+            | GE::ProposalNotFound { .. }
+            | GE::VotingWindowExpired { .. }
+            | GE::DuplicateProposal(_) => ScpWasmError::Context {
+                message: format!("governance vote rejected: {e}"),
+                code: code.to_owned(),
+            },
+            other => ScpWasmError::Context {
+                message: format!("governance error: {other}"),
+                code: code.to_owned(),
+            },
         }
     }
 
@@ -5003,10 +5668,13 @@ impl WasmContextManager {
             }
         }
 
-        // Check governance model.
-        let (required, _total) = {
+        // Determine whether this is single_admin (auto-execute) or a
+        // multi-party model (route the quorum decision through the shared
+        // engine). The decision is taken from the FROZEN governance config, not
+        // live members.
+        let single_admin = {
             let ctx = self.require_active_context_mut(context_id)?;
-            Self::governance_quorum(ctx)
+            Self::is_single_admin_governance(ctx)
         };
 
         // Build the proposal up front so even the SingleAdmin / quorum=0
@@ -5026,6 +5694,17 @@ impl WasmContextManager {
         // boundary). A divergent `proposal_id` here would break cross-platform
         // Merkle equivocation detection.
         let proposal_id_bytes: [u8; 32] = parse_proposal_id_bytes(proposal_id)?;
+        // The proposer's implicit approval vote. For single_admin it is carried
+        // on the proposal directly (auto-execute). For multi-party models the
+        // proposal is seeded with EMPTY approvals and this vote is cast THROUGH
+        // the shared engine below, so it is tallied by the same quorum logic
+        // every other vote uses — then mirrored back onto the stored proposal.
+        let proposer_vote = SignedVote {
+            voter_did: DID(proposer_did.to_owned()),
+            vote: VoteType::Approve,
+            timestamp: now_secs,
+            signature: Vec::new(),
+        };
         let proposal = GovernanceProposal {
             proposal_id: proposal_id_bytes,
             context_id: context_id.to_owned(),
@@ -5034,23 +5713,25 @@ impl WasmContextManager {
             status: ProposalStatus::Pending,
             created_at: now_secs,
             voting_deadline: voting_deadline_secs,
-            approvals: vec![SignedVote {
-                voter_did: DID(proposer_did.to_owned()),
-                vote: VoteType::Approve,
-                timestamp: now_secs,
-                signature: Vec::new(),
-            }],
+            approvals: if single_admin {
+                vec![proposer_vote]
+            } else {
+                Vec::new()
+            },
             rejections: Vec::new(),
             created_at_epoch: None,
         };
 
-        // SingleAdmin or quorum=0: auto-approve and execute immediately. The
-        // proposer IS the committing member here, so the executor is the
-        // proposer (matches native's propose auto-execute). Insert the proposal
-        // as `Approved` into `resolved_proposals` BEFORE executing so it is
-        // tracked when `execute_governance_action` derives the convergent leaf
-        // timestamp and checks the status precondition.
-        if required == 0 {
+        // SingleAdmin: auto-approve and execute immediately. The proposer IS the
+        // committing member here, so the executor is the proposer (matches
+        // native's propose auto-execute). Insert the proposal as `Approved` into
+        // `resolved_proposals` BEFORE executing so it is tracked when
+        // `execute_governance_action` derives the convergent leaf timestamp and
+        // checks the status precondition. After the engine adoption this path is
+        // reached ONLY for genuine single_admin (no `required == 0` from a
+        // degenerate multi-party model — those are rejected/collapsed at
+        // create/import).
+        if single_admin {
             let pid = proposal_id.to_owned();
             let mut approved = proposal;
             approved.status = ProposalStatus::Approved;
@@ -5077,6 +5758,24 @@ impl WasmContextManager {
             }
         }
 
+        // Multi-party: cast the proposer's implicit approval through the shared
+        // engine to obtain the quorum decision (the proposal is seeded with no
+        // votes; the engine builds + counts the proposer's empty-sig vote). A
+        // 1-of-N threshold can reach `Approved` from this single vote.
+        let (post_status, engine_proposal) = {
+            let ctx = self.require_active_context_mut(context_id)?;
+            Self::decide_vote_via_engine(
+                ctx,
+                context_id,
+                &proposal,
+                proposer_did,
+                VoteType::Approve,
+                now_secs,
+                codes::CTX_2041,
+            )?
+        };
+        let meets_quorum = matches!(post_status, ProposalStatus::Approved);
+
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Evict expired proposals if at capacity.
@@ -5086,10 +5785,13 @@ impl WasmContextManager {
                 .retain(|_, p| p.voting_deadline > now_secs);
         }
 
-        // Check if proposer's initial vote meets quorum immediately.
-        let meets_quorum = proposal.approvals.len() >= required;
+        // Persist the ENGINE's authoritative proposal verbatim (it already
+        // carries the engine-counted proposer vote and the engine-derived
+        // status), so the stored vote vectors are byte-identical to native's
+        // `engine.get_proposal(...)` and any subsequent vote re-seeds from the
+        // exact state the engine tallied (§9.9.3).
         let pid = proposal_id.to_owned();
-        ctx.pending_proposals.insert(pid.clone(), proposal);
+        ctx.pending_proposals.insert(pid.clone(), engine_proposal);
 
         ctx.push_event(ContextEvent::GovernanceActionExecuted {
             proposal_id: proposal_id_bytes,
@@ -5192,54 +5894,53 @@ impl WasmContextManager {
 
         // Check expiry and find proposal.
         let now = crate::time::now_ms();
-        let (required, _total) = {
-            let ctx = self.require_active_context_mut(context_id)?;
-            Self::governance_quorum(ctx)
-        };
-
-        let ctx = self.require_active_context_mut(context_id)?;
-
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let now_secs = (now / 1000.0) as u64;
-        let meets_quorum = {
-            let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
-                ScpWasmError::Context {
+
+        // Run the quorum decision through the SHARED governance engine. The
+        // engine enforces eligibility (frozen signer/voter set), single-vote
+        // dedup, the proposal's `voting_deadline`, and terminal-state finality,
+        // and returns the post-vote status. We seed it with the proposal AS IT
+        // STANDS (the new vote not yet applied), decide, then mirror the vote +
+        // status back onto the stored proposal. The transient shared engine is
+        // the SOLE quorum authority on the WASM path (it replaced the former
+        // hand-rolled string-match arithmetic), so the WASM decision is
+        // byte-identical to native (§9.9.3).
+        let (post_status, engine_proposal) = {
+            let ctx = self.require_active_context_mut(context_id)?;
+            let proposal = ctx
+                .pending_proposals
+                .get(proposal_id)
+                .ok_or_else(|| ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
                     code: codes::CTX_2042.to_owned(),
-                }
-            })?;
-
-            if proposal.voting_deadline <= now_secs {
-                return Err(ScpWasmError::Context {
-                    message: "proposal voting deadline has expired".to_owned(),
-                    code: codes::CTX_2042.to_owned(),
-                });
-            }
-
-            // Check for duplicate vote.
-            if proposal
-                .approvals
-                .iter()
-                .any(|v| v.voter_did.0 == voter_did)
-                || proposal
-                    .rejections
-                    .iter()
-                    .any(|v| v.voter_did.0 == voter_did)
-            {
-                return Err(ScpWasmError::Permission {
-                    message: format!("member {voter_did} has already voted on this proposal"),
-                    code: codes::CTX_2042.to_owned(),
-                });
-            }
-
-            proposal.approvals.push(SignedVote {
-                voter_did: DID(voter_did.to_owned()),
-                vote: VoteType::Approve,
-                timestamp: now_secs,
-                signature: Vec::new(),
-            });
-            proposal.approvals.len() >= required
+                })?
+                .clone();
+            Self::decide_vote_via_engine(
+                ctx,
+                context_id,
+                &proposal,
+                voter_did,
+                VoteType::Approve,
+                now_secs,
+                codes::CTX_2042,
+            )?
         };
+        let meets_quorum = matches!(post_status, ProposalStatus::Approved);
+
+        let ctx = self.require_active_context_mut(context_id)?;
+        // Persist the ENGINE's authoritative proposal verbatim over the stored
+        // pending proposal: it carries EXACTLY the votes the engine recorded
+        // (which EXCLUDES this vote when a past-deadline majority auto-resolved
+        // without recording it) and the engine-derived status. This is what
+        // keeps the WASM stored vote vectors byte-identical to native's
+        // `engine.get_proposal(...)` — an optimistic `approvals.push` here would
+        // record a phantom uncounted vote and diverge (§9.9.3). The downstream
+        // quorum / terminal-move branches operate on this stored proposal.
+        if ctx.pending_proposals.contains_key(proposal_id) {
+            ctx.pending_proposals
+                .insert(proposal_id.to_owned(), engine_proposal);
+        }
 
         // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
         // payload (`append_context_event`, no payload) — match it so the leaf
@@ -5311,7 +6012,23 @@ impl WasmContextManager {
             }
         }
 
-        Ok(serde_json::json!({ "status": "Pending" }))
+        // Not a quorum-crossing approval. The engine may STILL have resolved the
+        // proposal to a terminal non-`Approved` status — e.g. a past-deadline
+        // approve on a Majority proposal below the participation floor resolves
+        // to `Rejected { InsufficientParticipation }` (the engine auto-resolves
+        // without recording the vote). That resolved status was already mirrored
+        // onto the stored proposal above; mirror the reject path and move the now
+        // terminal proposal pending → resolved so retrieval is consistent, then
+        // report the ACTUAL stored status to the caller. A still-`Pending`
+        // proposal stays pending and reports `Pending`.
+        if !matches!(post_status, ProposalStatus::Pending)
+            && let Some(ctx) = self.contexts.get_mut(context_id)
+            && let Some(mut p) = ctx.pending_proposals.remove(&pid)
+        {
+            p.status = post_status.clone();
+            ctx.insert_resolved_proposal(pid.clone(), p);
+        }
+        Ok(serde_json::json!({ "status": Self::proposal_status_label(&post_status) }))
     }
 
     /// Casts a rejection vote on a pending governance proposal.
@@ -5340,53 +6057,48 @@ impl WasmContextManager {
         }
 
         let now = crate::time::now_ms();
-        let (_required, total) = {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let now_secs = (now / 1000.0) as u64;
+
+        // Run the rejection through the SHARED governance engine (same path as
+        // approve). The engine enforces eligibility, dedup, deadline, and
+        // finality, and returns the post-vote status — `Rejected { reason }`
+        // when the rejection makes approval impossible (or breaks unanimity),
+        // else `Pending`. This replaces the former hand-rolled
+        // `remaining_possible_approvals` / `can_still_reach_quorum` arithmetic.
+        let (post_status, engine_proposal) = {
             let ctx = self.require_active_context_mut(context_id)?;
-            Self::governance_quorum(ctx)
+            let proposal = ctx
+                .pending_proposals
+                .get(proposal_id)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!("proposal {proposal_id} not found"),
+                    code: codes::CTX_2043.to_owned(),
+                })?
+                .clone();
+            Self::decide_vote_via_engine(
+                ctx,
+                context_id,
+                &proposal,
+                voter_did,
+                VoteType::Reject,
+                now_secs,
+                codes::CTX_2043,
+            )?
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
-
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let now_secs = (now / 1000.0) as u64;
-        let remaining_possible_approvals = {
-            let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
-                ScpWasmError::Context {
-                    message: format!("proposal {proposal_id} not found"),
-                    code: codes::CTX_2043.to_owned(),
-                }
-            })?;
-
-            if proposal.voting_deadline <= now_secs {
-                return Err(ScpWasmError::Context {
-                    message: "proposal voting deadline has expired".to_owned(),
-                    code: codes::CTX_2043.to_owned(),
-                });
-            }
-
-            if proposal
-                .approvals
-                .iter()
-                .any(|v| v.voter_did.0 == voter_did)
-                || proposal
-                    .rejections
-                    .iter()
-                    .any(|v| v.voter_did.0 == voter_did)
-            {
-                return Err(ScpWasmError::Permission {
-                    message: format!("member {voter_did} has already voted on this proposal"),
-                    code: codes::CTX_2043.to_owned(),
-                });
-            }
-
-            proposal.rejections.push(SignedVote {
-                voter_did: DID(voter_did.to_owned()),
-                vote: VoteType::Reject,
-                timestamp: now_secs,
-                signature: Vec::new(),
-            });
-            total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
-        };
+        // Persist the ENGINE's authoritative proposal verbatim over the stored
+        // pending proposal: it carries EXACTLY the rejections the engine
+        // recorded (which EXCLUDES this vote when a past-deadline majority
+        // auto-resolved without recording it) and the engine-derived status —
+        // keeping the WASM stored vote vectors byte-identical to native's
+        // `engine.get_proposal(...)` (§9.9.3). The downstream terminal-move
+        // branch operates on this stored proposal.
+        if ctx.pending_proposals.contains_key(proposal_id) {
+            ctx.pending_proposals
+                .insert(proposal_id.to_owned(), engine_proposal);
+        }
 
         // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
         // payload (`append_context_event`, no payload) — match it so the leaf
@@ -5403,27 +6115,26 @@ impl WasmContextManager {
             now_secs,
         );
 
-        let can_still_reach_quorum = {
-            let ctx2 = self.require_active_context_mut(context_id)?;
-            let (req, _) = Self::governance_quorum(ctx2);
-            let p = ctx2.pending_proposals.get(proposal_id);
-            p.is_some_and(|pp| pp.approvals.len() + remaining_possible_approvals >= req)
-        };
-
-        if !can_still_reach_quorum {
-            // Proposal is dead — move to resolved_proposals for later retrieval.
-            if let Some(ctx3) = self.contexts.get_mut(context_id)
-                && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
-            {
-                p.status = ProposalStatus::Rejected {
-                    reason: scp_protocol::context::governance::RejectionReason::ApprovalImpossible,
-                };
-                ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
-            }
-            return Ok(serde_json::json!({ "status": "Rejected" }));
+        // If the engine resolved the proposal to ANY terminal status, move it
+        // from pending to resolved_proposals (carrying the engine's reason, e.g.
+        // a `RejectionReason` or an `Invalidated` reason) for later retrieval.
+        // A reject vote is normally `Pending` or `Rejected`, but a past-deadline
+        // reject can auto-resolve to `Approved` (turnout now meets the
+        // participation floor with a surviving majority) or `Invalidated`; in
+        // every terminal case we report the proposal's ACTUAL stored status, not
+        // a hardcoded label. A still-`Pending` proposal stays pending and
+        // reports `Pending`. (Unlike the approve path's quorum branch, a reject
+        // vote never executes the action — the rejecter is not an executor —
+        // even when the engine reports `Approved`.)
+        if !matches!(post_status, ProposalStatus::Pending)
+            && let Some(ctx3) = self.contexts.get_mut(context_id)
+            && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
+        {
+            // Preserve the engine-derived status (already set above).
+            p.status = post_status.clone();
+            ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
         }
-
-        Ok(serde_json::json!({ "status": "Pending" }))
+        Ok(serde_json::json!({ "status": Self::proposal_status_label(&post_status) }))
     }
 
     /// Withdraws a previously cast vote on a pending governance proposal.
@@ -5437,6 +6148,62 @@ impl WasmContextManager {
         proposal_id: &str,
         voter_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
+        let now_secs = crate::time::now_secs();
+        let single_admin = {
+            let ctx = self.require_active_context_mut(context_id)?;
+            Self::is_single_admin_governance(ctx)
+        };
+
+        // Multi-party: route the withdrawal through the shared engine's GATED
+        // `withdraw_vote` (item G). It enforces eligible-set membership, pending
+        // status, the voting deadline, and that the voter actually voted —
+        // exactly native's gating — before removing the vote, then returns the
+        // re-resolved status. We mirror the removal + status onto the stored
+        // proposal so subsequent reads/votes see the same state.
+        if !single_admin {
+            let post_status = {
+                let ctx = self.require_active_context_mut(context_id)?;
+                let proposal = ctx
+                    .pending_proposals
+                    .get(proposal_id)
+                    .ok_or_else(|| ScpWasmError::Context {
+                        message: format!("proposal {proposal_id} not found"),
+                        code: codes::CTX_2044.to_owned(),
+                    })?
+                    .clone();
+                let proposal_id_bytes = proposal.proposal_id;
+                let mut engine =
+                    Self::build_transient_governance_engine(ctx)?.ok_or_else(|| {
+                        ScpWasmError::Context {
+                            message: "internal: multi-party governance has no engine".to_owned(),
+                            code: codes::CTX_2044.to_owned(),
+                        }
+                    })?;
+                engine
+                    .ingest_proposal(proposal)
+                    .map_err(|e| Self::map_governance_error(&e, codes::CTX_2044))?;
+                let gov_ctx = Self::governance_context_for_engine(context_id, now_secs);
+                let voter = DID(voter_did.to_owned());
+                let (status, _events) = engine
+                    .withdraw_vote(&proposal_id_bytes, &voter, &gov_ctx)
+                    .map_err(|e| Self::map_governance_error(&e, codes::CTX_2044))?;
+                status
+            };
+
+            let ctx = self.require_active_context_mut(context_id)?;
+            if let Some(proposal) = ctx.pending_proposals.get_mut(proposal_id) {
+                proposal.approvals.retain(|v| v.voter_did.0 != voter_did);
+                proposal.rejections.retain(|v| v.voter_did.0 != voter_did);
+                proposal.status = post_status.clone();
+            }
+            ctx.append_log_event(EventType::GovernanceVoteWithdrawn, voter_did, b"", now_secs);
+            let status_str = Self::proposal_status_label(&post_status);
+            return Ok(serde_json::json!({ "status": status_str }));
+        }
+
+        // single_admin: proposals auto-execute and are never pending, so a
+        // withdrawal can only be a "not found"/"not voted" no-op. Preserve the
+        // manual behavior for completeness (defense-in-depth).
         let ctx = self.require_active_context_mut(context_id)?;
         let proposal =
             ctx.pending_proposals
@@ -5466,19 +6233,7 @@ impl WasmContextManager {
             });
         }
 
-        // SECURITY/§9.9.3: native appends GovernanceVoteWithdrawn with an EMPTY
-        // payload (`append_context_event`, no payload) — match it so the leaf
-        // preimage is byte-identical across platforms. The proposal_id is NOT
-        // part of the canonical leaf; it rides only in the buffer-only
-        // `ContextEvent` (which is not a durable Merkle leaf).
-        ctx.append_log_event(
-            EventType::GovernanceVoteWithdrawn,
-            voter_did,
-            b"",
-            // Committer-assigned: the withdrawing voter's clock, the source of
-            // the withdrawal commit's `created_at` (§7.3.1, §9.9.3).
-            crate::time::now_secs(),
-        );
+        ctx.append_log_event(EventType::GovernanceVoteWithdrawn, voter_did, b"", now_secs);
 
         Ok(serde_json::json!({ "status": "Pending" }))
     }
@@ -5607,14 +6362,7 @@ impl WasmContextManager {
             .collect();
 
         let action_name = proposal.action.variant_name();
-        let status_str = match &proposal.status {
-            ProposalStatus::Pending => "Pending",
-            ProposalStatus::Approved => "Approved",
-            ProposalStatus::Rejected { .. } => "Rejected",
-            ProposalStatus::Expired => "Expired",
-            ProposalStatus::Cancelled => "Cancelled",
-            ProposalStatus::Invalidated { .. } => "Invalidated",
-        };
+        let status_str = Self::proposal_status_label(&proposal.status);
 
         serde_json::json!({
             "proposal_id": proposal_id,
@@ -6615,6 +7363,7 @@ impl WasmContextManager {
             cooldown_until: ctx.cooldown_until.clone(),
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
+            eligible_voters: ctx.eligible_voters.clone(),
             tool_interfaces: ctx.tool_interfaces.clone(),
             governance_freeze: ctx.governance_freeze,
             pruning_policy: ctx.pruning_policy.clone(),
@@ -6919,9 +7668,13 @@ impl WasmContextManager {
         // `role_state.assignments` (assigned role names).
         validate_imported_string(&context_id, "context_id", 256)?;
         validate_imported_did(&snap.role_state.creator_did, "creator_did")?;
-        for did in &snap.role_state.members {
-            validate_imported_did(did, "member DID")?;
-        }
+        // Cap + per-DID-validate the attacker-controlled identity sets
+        // (`role_state.members`, `eligible_voters`, `threshold_signers`) BEFORE
+        // `resolve_governance_config` (below) consumes/clones the governance
+        // sets — so the `WASM_MEMBER_CAP` gate fires ahead of any per-element
+        // resolve/build work, not after it. `members` is otherwise uncapped on
+        // the import path (only the live `add_member` path caps it).
+        validate_imported_governance_and_member_sets(snap)?;
         for assignment in snap.role_state.assignments.values() {
             let role = &assignment.role_name;
             if role.is_empty() || role.len() > 64 {
@@ -6947,10 +7700,28 @@ impl WasmContextManager {
         // Ed25519 envelope signature authenticates ORIGIN, not WELL-FORMEDNESS:
         // a malicious or stale snapshot carrying an unknown governance model
         // (e.g. `"threshhold"`) would be stored verbatim and then silently
-        // collapse to `single_admin` auto-execute in `governance_quorum` — the
-        // exact fail-open the create-path validation closes. Reject it here with
-        // the same rule so import and create agree.
-        validate_governance_model(&snap.governance)?;
+        // collapse to `single_admin` auto-execute (the transient engine's
+        // `_ =>` arm) — the exact fail-open the create-path validation closes.
+        // Reject it here with the same rule so import and create agree.
+        //
+        // Item C: re-RESOLVE the governance config from the UNTRUSTED snapshot
+        // through the same collapse + threshold-floor pipeline `create_context`
+        // uses, rather than trusting the snapshot's stored `governance` /
+        // `threshold_*` / `eligible_voters` verbatim. The Ed25519 envelope
+        // signature authenticates ORIGIN (the creator), not that the creator's
+        // claimed model is internally consistent: a malicious or buggy creator
+        // could sign a snapshot whose `governance == "threshold"` carries an
+        // EMPTY signer set, or a `majority` with empty voters, which — stored
+        // verbatim — would make the transient engine treat it inconsistently.
+        // Re-resolving collapses those to `single_admin`
+        // exactly as create does, and rejects a surviving `threshold` with a
+        // degenerate value. The resolved config is what gets stored.
+        let resolved_governance = resolve_governance_config(
+            &snap.governance,
+            snap.threshold_signers.clone(),
+            snap.threshold_value,
+            snap.eligible_voters.clone(),
+        )?;
 
         // Defense-in-depth: validate and check minProtocolVersion from the
         // imported snapshot's params. Rejects malformed version data and
@@ -7095,7 +7866,10 @@ impl WasmContextManager {
             ceiling_policy: snap.ceiling_policy.clone(),
             ttl_seconds: snap.ttl_seconds,
             promotion_policy: snap.promotion_policy.clone(),
-            governance: snap.governance.clone(),
+            // Item C: store the COLLAPSE-RESOLVED governance model, not the
+            // raw snapshot value (a `threshold`-with-no-signers snapshot is now
+            // `single_admin`).
+            governance: resolved_governance.model.clone(),
             economic_policy: snap.economic_policy.clone(),
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
@@ -7133,8 +7907,9 @@ impl WasmContextManager {
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
             broadcast_context,
             sessions: HashMap::new(),
-            threshold_signers: snap.threshold_signers.clone(),
-            threshold_value: snap.threshold_value,
+            threshold_signers: resolved_governance.threshold_signers.clone(),
+            threshold_value: resolved_governance.threshold_value,
+            eligible_voters: resolved_governance.eligible_voters,
             tool_interfaces: snap.tool_interfaces.clone(),
             governance_freeze: snap.governance_freeze,
             pending_proposals: HashMap::new(),
@@ -7200,8 +7975,66 @@ impl WasmContextManager {
             "imported contexts must start without live MLS crypto (see SECURITY note); a fresh Welcome establishes crypto"
         );
 
+        // Item C: invalidate every IMPORTED resolved proposal whose status is
+        // `Approved`, rather than trusting the snapshot-supplied status verbatim.
+        // The snapshot is authored entirely by its (untrusted) creator; a
+        // malicious creator could declare an `eligible_voters` set of victim DIDs,
+        // fabricate empty-signature `Approved` votes from them, and either bake an
+        // `Approved` status or have a replay re-derive a forged quorum — which the
+        // direct-execute path (`context_execute_governance`) would then run. There
+        // is no trustworthy way to re-derive a quorum from an unsigned snapshot, so
+        // imported `Approved` proposals are unconditionally invalidated (the honest
+        // ones are already in `executed_proposals` and cannot re-run).
+        let mut ctx = ctx;
+        Self::rederive_imported_proposal_statuses(&mut ctx);
+
         self.contexts.insert(context_id.clone(), ctx);
         Ok(context_id)
+    }
+
+    /// Invalidates the status of every IMPORTED resolved proposal that is
+    /// `Approved` — for ALL governance models, `single_admin` AND multi-party.
+    ///
+    /// The imported snapshot is authored entirely by its (untrusted) creator,
+    /// who signs the whole envelope. The carried votes on an imported proposal
+    /// carry NO signatures the keyless `ingest_*` tally can verify, so replaying
+    /// them through a transient engine would let a malicious creator declare an
+    /// `eligible_voters` set of victim DIDs, fabricate empty-signature `Approved`
+    /// votes from those DIDs, and have the engine re-derive a forged quorum that
+    /// then executes via `context_execute_governance`. There is no trustworthy
+    /// way to re-derive a multi-party quorum from a snapshot, so we do not try:
+    /// every imported `Approved` proposal is unconditionally INVALIDATED.
+    ///
+    /// This strands nothing legitimate. A proposal that an honest context
+    /// actually approved and executed is already recorded in the (also-imported)
+    /// `executed_proposals` replay set, so its action cannot re-run regardless of
+    /// status; an honest importer never needs to re-execute an imported proposal.
+    /// `Rejected` / `Invalidated` / `Pending`-equivalent imports are left as-is
+    /// (only `Approved` is the execution risk; pending proposals are not
+    /// imported).
+    fn rederive_imported_proposal_statuses(ctx: &mut PerContextState) {
+        if ctx.resolved_proposals.is_empty() {
+            return;
+        }
+
+        // Collect keys first to avoid borrow conflicts.
+        let keys: Vec<String> = ctx.resolved_proposals.keys().cloned().collect();
+        for key in keys {
+            let Some(p) = ctx.resolved_proposals.get_mut(&key) else {
+                continue;
+            };
+            // Only `Approved` proposals are executable; a `Rejected` /
+            // `Invalidated` / `Pending` import is already non-executable, so
+            // leave it untouched.
+            if !matches!(p.status, ProposalStatus::Approved) {
+                continue;
+            }
+            p.status = ProposalStatus::Invalidated {
+                reason: "imported approved proposal status not re-derivable; \
+                         already guarded by executed_proposals replay set"
+                    .to_owned(),
+            };
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7674,6 +8507,11 @@ struct WasmContextExportSnapshot {
     /// Current threshold value (ADR-031 §4b).
     #[serde(default)]
     threshold_value: u32,
+    /// FROZEN eligible voter set for `majority` / `unanimity` (ADR-031
+    /// §4c/§4d). Mirrors `PerContextState.eligible_voters`; restored verbatim
+    /// so the importer rebuilds the same quorum denominator the exporter used.
+    #[serde(default)]
+    eligible_voters: Vec<String>,
     /// Established tool interface JSON strings (§6.2).
     #[serde(default)]
     tool_interfaces: Vec<String>,
@@ -9078,6 +9916,7 @@ mod tests {
             cooldown_until: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            eligible_voters: Vec::new(),
             tool_interfaces: Vec::new(),
             governance_freeze: false,
             pruning_policy: None,
@@ -9299,6 +10138,49 @@ mod tests {
                     message.contains("exceeds cap"),
                     "unexpected message: {message}"
                 );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// FIX B: `role_state.members.len() > WASM_MEMBER_CAP` → rejected. The
+    /// imported member set is attacker-controlled (the Ed25519 envelope
+    /// authenticates origin, not bounds) and was previously per-DID-validated but
+    /// UNCAPPED on the import path — only the live `add_member` path enforced the
+    /// cap. The consolidated import helper now caps it the same way.
+    #[test]
+    fn validate_governance_and_member_sets_rejects_members_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.role_state.members = (0..=WASM_MEMBER_CAP)
+            .map(|i| format!("did:test:member-{i}"))
+            .collect();
+        let err = validate_imported_governance_and_member_sets(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, codes::CTX_2032);
+                assert!(
+                    message.contains("members") && message.contains("exceeds cap"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// FIX B: an imported member that is not a well-formed DID is rejected by the
+    /// consolidated helper's per-element `validate_imported_did` (defense in
+    /// depth, same as the voter/signer sets).
+    #[test]
+    fn validate_governance_and_member_sets_rejects_invalid_member_did() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.role_state.members = HashSet::from(["not-a-did".to_owned()]);
+        let err = validate_imported_governance_and_member_sets(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref code, .. } => {
+                assert_eq!(code, codes::CTX_2032);
             }
             other => panic!("expected Context error, got: {other:?}"),
         }
@@ -9689,8 +10571,8 @@ mod tests {
     /// A typo'd governance model (`"threshhold"`) is rejected at `create_context`
     /// with `SCP-VALID-7005` (invalid field value) BEFORE any state mutation, and
     /// the context is NOT registered. This is the core fail-open closure: an
-    /// unrecognized model must NOT be silently stored (where `governance_quorum`
-    /// would collapse it to `single_admin` auto-execute).
+    /// unrecognized model must NOT be silently stored (where the transient
+    /// engine's `_ =>` arm would collapse it to `single_admin` auto-execute).
     #[test]
     fn create_context_rejects_unknown_governance_model_wasm() {
         for bad_model in ["threshhold", "majorty", "multisig", "token_voting", "admin"] {
@@ -11882,8 +12764,9 @@ mod tests {
     /// `import_context` with `SCP-VALID-7005`, even though the envelope signature
     /// is VALID (the creator signed it). The Ed25519 snapshot signature
     /// authenticates ORIGIN, not WELL-FORMEDNESS: a malicious or stale snapshot
-    /// could carry a typo'd model (`"threshhold"`) that `governance_quorum` would
-    /// otherwise collapse to `single_admin` auto-execute. Re-validating on import
+    /// could carry a typo'd model (`"threshhold"`) that the transient engine's
+    /// `_ =>` arm would otherwise collapse to `single_admin` auto-execute.
+    /// Re-validating on import
     /// closes that fail-open on the restore path, matching the create-path reject.
     #[test]
     fn import_context_rejects_unknown_governance_model_wasm() {
@@ -13585,6 +14468,1043 @@ mod tests {
             mgr.event_log_leaf_count(context_id),
             Some(leaf_count_before),
             "a rejected non-member removal must append no durable leaf"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-2b: WASM adopts the shared governance engine for quorum.
+    // -----------------------------------------------------------------------
+
+    /// Helper: a 64-char hex proposal id derived from a label byte.
+    #[cfg(test)]
+    fn pr2b_pid(byte: u8) -> String {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        hex::encode(id)
+    }
+
+    /// Count `GovernanceActionExecuted` durable leaves for a context.
+    #[cfg(test)]
+    fn pr2b_executed_leaf_count(mgr: &WasmContextManager, context_id: &str) -> usize {
+        use scp_event_log::EventType;
+        mgr.test_context_event_log_events(context_id)
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceActionExecuted)
+            .count()
+    }
+
+    /// Build a multi-party governance context via the test seams with the given
+    /// model, members (all admin), frozen voter/signer config, and the
+    /// governance capabilities in the ceiling.
+    #[cfg(test)]
+    fn pr2b_multiparty_ctx(
+        context_id: &str,
+        creator: &str,
+        model: &str,
+        members: &[&str],
+    ) -> PerContextState {
+        let mut ctx = make_bare_per_context_state(context_id, creator);
+        ctx.test_set_governance(model);
+        for m in members {
+            if *m != creator {
+                ctx.test_insert_member(m, "admin");
+            }
+        }
+        ctx.test_insert_ceiling("governance:propose");
+        ctx.test_insert_ceiling("governance:vote");
+        ctx.test_insert_ceiling("role:assign");
+        ctx
+    }
+
+    /// A `ChangeRole` action used by several tests (within the `role:assign`
+    /// ceiling, target distinct from voters).
+    #[cfg(test)]
+    fn pr2b_change_role_action(target: &str) -> GovernanceAction {
+        GovernanceAction::ChangeRole {
+            did: DID::from(target.to_owned()),
+            new_role: "observer".to_owned(),
+        }
+    }
+
+    /// Threshold governance with an EMPTY signer set collapses to `single_admin`
+    /// at `create_context`, and a proposal auto-executes immediately (the
+    /// proposer is the sole authority). It must NOT route through a degenerate
+    /// quorum-0 multi-party engine.
+    #[test]
+    fn pr2b_create_threshold_empty_signers_collapses_to_single_admin() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zcreatorcollapse";
+        let context_id = "ctx-pr2b-collapse";
+        let params = serde_json::json!({
+            "mode": "Encrypted",
+            "ceiling": ["role:assign", "governance:propose", "governance:vote"],
+            "ceilingPolicy": "immutable",
+            "governance": "threshold",
+            // No governanceSigners -> collapse.
+            "economicPolicy": free_policy_json(),
+        });
+        mgr.create_context(context_id, creator, &params)
+            .expect("collapse-to-single_admin context must be created");
+
+        // The stored model collapsed.
+        assert_eq!(
+            mgr.contexts.get(context_id).map(|c| c.governance.as_str()),
+            Some("single_admin"),
+            "threshold + empty signers must collapse to single_admin"
+        );
+
+        mgr.test_insert_member_pub(context_id, "did:dht:zTargetCollapse", "member");
+        let action = pr2b_change_role_action("did:dht:zTargetCollapse");
+        let result = mgr
+            .propose_governance_action(context_id, creator, &pr2b_pid(0x11), &action)
+            .expect("single_admin proposal auto-executes");
+        assert_eq!(
+            result.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "collapsed single_admin proposal must auto-approve+execute"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            1,
+            "exactly one GovernanceActionExecuted leaf for the auto-executed action"
+        );
+    }
+
+    /// THE BLACK-HIGH REGRESSION TEST. A 2-of-3 threshold context: the
+    /// proposer's lone vote leaves the proposal Pending (1 < 2); a SECOND
+    /// signer's approval crosses the threshold -> Approved + executed. The
+    /// frozen 3-signer set is the denominator; the engine — not string
+    /// arithmetic — makes the decision.
+    #[test]
+    fn pr2b_threshold_2_of_3_lone_vote_pending_then_quorum_executes() {
+        let creator = "did:dht:zThrA";
+        let signer_b = "did:dht:zThrB";
+        let signer_c = "did:dht:zThrC";
+        let context_id = "ctx-pr2b-thr-2of3";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "threshold",
+            &[creator, signer_b, signer_c],
+        );
+        ctx.test_set_threshold_config(&[creator, signer_b, signer_c], 2);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zThrTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zThrTarget");
+        let pid = pr2b_pid(0x22);
+
+        // Proposer's lone implicit vote: 1 of 3, threshold 2 -> Pending.
+        let r1 = mgr
+            .propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        assert_eq!(
+            r1.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1-of-3 with threshold 2 must stay Pending (BLACK-HIGH: no premature exec)"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "no execution must fire on the proposer's lone vote"
+        );
+
+        // Second signer approves: 2 of 3 -> Approved + executed.
+        let r2 = mgr
+            .approve_governance_proposal(context_id, &pid, signer_b)
+            .expect("approve ok");
+        assert_eq!(
+            r2.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "the threshold-crossing approval must Approve+execute"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            1,
+            "exactly one GovernanceActionExecuted leaf after quorum"
+        );
+    }
+
+    /// Majority frozen denominator: a member ADDED mid-proposal does NOT move
+    /// the quorum bar. A 3-voter majority (quorum = 2 of 3) approves on the 2nd
+    /// vote even though a 4th member joined in between.
+    #[test]
+    fn pr2b_majority_frozen_denominator_ignores_mid_proposal_member_add() {
+        let creator = "did:dht:zMajA";
+        let voter_b = "did:dht:zMajB";
+        let voter_c = "did:dht:zMajC";
+        let context_id = "ctx-pr2b-maj-frozen";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zMajTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zMajTarget");
+        let pid = pr2b_pid(0x33);
+
+        // Proposer's vote: 1 of 3 frozen -> Pending (quorum = 2).
+        let r1 = mgr
+            .propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        assert_eq!(
+            r1.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending")
+        );
+
+        // A NEW member joins mid-proposal. The frozen denominator is still 3.
+        mgr.test_insert_member_pub(context_id, "did:dht:zMajLateJoiner", "admin");
+
+        // Second frozen voter approves: 2 of 3 -> majority -> Approved+executed.
+        // (If the live-members denominator had been used, quorum would be 3 and
+        // this would stay Pending — the bug this test guards against.)
+        let r2 = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve ok");
+        assert_eq!(
+            r2.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "frozen 3-voter denominator: the mid-proposal join must NOT raise the bar"
+        );
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
+    }
+
+    /// Majority EARLY-APPROVE boundary (the ABSOLUTE-majority bar, NOT the
+    /// deadline participation floor). While voting is still open (before the
+    /// deadline), a Majority proposal resolves `Approved` the instant approvals
+    /// cross `approvals * 2 > eligible` against the FROZEN eligible set. With a
+    /// frozen 5-voter set that bar is 3 of 5: 1/5 and 2/5 stay `Pending` (no
+    /// early execution), 3/5 crosses and auto-executes. This is distinct from the
+    /// `min_participation_bps` floor (default 5000 bps), which the engine applies
+    /// only AT/AFTER the deadline to decide `Approved` vs
+    /// `Rejected { InsufficientParticipation }` for a below-quorum turnout — see
+    /// the past-deadline resolution tests. This test matches native's
+    /// `MajorityVoteEngine::new(voters, 86_400, 5000, ..)` wiring (same default,
+    /// not wired configurable on either bridge).
+    #[test]
+    fn pr2b_majority_absolute_majority_boundary_matches_native() {
+        let creator = "did:dht:zMajPA";
+        let voter_b = "did:dht:zMajPB";
+        let voter_c = "did:dht:zMajPC";
+        let voter_d = "did:dht:zMajPD";
+        let voter_e = "did:dht:zMajPE";
+        let context_id = "ctx-pr2b-maj-participation";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        // Frozen 5-voter denominator. The early-approve bar below uses only the
+        // absolute-majority test (`approvals * 2 > eligible`); the engine's
+        // default 5000-bps participation floor governs the SEPARATE deadline
+        // path, exercised by the past-deadline tests.
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zMajPTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zMajPTarget");
+        let pid = pr2b_pid(0x44);
+
+        // 1 of 5 approvals: 2 > 5 is false -> Pending, no execution.
+        let r1 = mgr
+            .propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        assert_eq!(
+            r1.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1/5 turnout is below the majority bar -> Pending"
+        );
+
+        // 2 of 5 approvals: 4 > 5 is false -> still Pending, no execution.
+        let r2 = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve b");
+        assert_eq!(
+            r2.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2/5 turnout is still below the majority bar -> Pending"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "no execution before the majority bar is crossed"
+        );
+
+        // 3 of 5 approvals: 6 > 5 is true -> Approved + executed.
+        let r3 = mgr
+            .approve_governance_proposal(context_id, &pid, voter_c)
+            .expect("approve c");
+        assert_eq!(
+            r3.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "3/5 crosses the absolute-majority bar -> Approved"
+        );
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
+    }
+
+    /// FIX A: a past-deadline APPROVE vote that the engine auto-resolves to
+    /// `Rejected { InsufficientParticipation }` must report the ACTUAL resolved
+    /// status to the caller — not a stale `Pending`. The returned status must
+    /// equal the status persisted on the (now resolved) stored proposal.
+    ///
+    /// Setup: 5-voter Majority, proposer auto-approves (1/5 recorded). We force
+    /// the proposal past its deadline, then a SECOND voter approves. Majority's
+    /// keyless precheck auto-resolves a past-deadline vote WITHOUT recording it,
+    /// so turnout stays 1/5 = 2000 bps < the 5000 floor ->
+    /// `Rejected { InsufficientParticipation }`. Pre-fix this returned
+    /// `"Pending"` while the stored proposal was `Rejected`.
+    #[test]
+    fn pr2b_approve_past_deadline_reports_resolved_rejected_status() {
+        use scp_protocol::context::governance::{ProposalStatus, RejectionReason};
+
+        let creator = "did:dht:zPdaA";
+        let voter_b = "did:dht:zPdaB";
+        let voter_c = "did:dht:zPdaC";
+        let voter_d = "did:dht:zPdaD";
+        let voter_e = "did:dht:zPdaE";
+        let context_id = "ctx-pr2b-approve-past-deadline";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zPdaTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zPdaTarget");
+        let pid = pr2b_pid(0x66);
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+
+        // Force the proposal past its voting deadline (1 = far in the past on the
+        // native test clock, which reads real SystemTime ~1.7e9s).
+        mgr.contexts
+            .get_mut(context_id)
+            .and_then(|c| c.pending_proposals.get_mut(&pid))
+            .expect("proposal pending")
+            .voting_deadline = 1;
+
+        let r = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve past deadline must not error (auto-resolves)");
+
+        // The caller now sees the resolved status, not a stale Pending.
+        assert_eq!(
+            r.get("status").and_then(serde_json::Value::as_str),
+            Some("Rejected"),
+            "past-deadline approve resolving below the floor must report Rejected"
+        );
+
+        // No execution occurred (the proposal was rejected, not approved).
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 0);
+
+        // The returned status matches the STORED resolved status, and the
+        // proposal moved pending -> resolved carrying the engine reason.
+        let stored = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&pid))
+            .expect("proposal moved to resolved");
+        assert_eq!(
+            stored.status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::InsufficientParticipation
+            },
+            "stored status must be the engine-resolved Rejected reason"
+        );
+        // §9.9.3 CONVERGENCE: the past-deadline approve vote was NOT recorded by
+        // the engine (`precheck_vote` auto-resolved before `push_and_resolve`),
+        // so the stored proposal must carry ONLY the proposer's pre-deadline
+        // approval — exactly what native's `engine.get_proposal(...)` holds. A
+        // phantom second approval here (the former optimistic push) is the
+        // native↔WASM vote-vector divergence this fix closes.
+        assert_eq!(
+            stored.approvals.len(),
+            1,
+            "only the pre-deadline proposer approval is recorded; the past-deadline approve is NOT counted (matches native)"
+        );
+        assert_eq!(
+            stored.rejections.len(),
+            0,
+            "no rejections were cast on this proposal"
+        );
+        assert_eq!(
+            r.get("status").and_then(serde_json::Value::as_str),
+            Some(WasmContextManager::proposal_status_label(&stored.status)),
+            "returned status label must equal the stored proposal's status label"
+        );
+        assert!(
+            !mgr.contexts
+                .get(context_id)
+                .is_some_and(|c| c.pending_proposals.contains_key(&pid)),
+            "a resolved proposal must not linger in pending_proposals"
+        );
+    }
+
+    /// FIX A (reject path): a past-deadline REJECT vote whose at-deadline tally
+    /// resolves to `Approved` (turnout meets the participation floor with
+    /// approvals outnumbering rejections) must report the ACTUAL `Approved`
+    /// status — not `Pending` (the pre-fix reject path only special-cased
+    /// `Rejected`). A reject vote NEVER executes the action even when the engine
+    /// reports `Approved`, so no executed leaf is minted.
+    ///
+    /// Setup: 5-voter Majority. Record 2 approvals + 1 rejection while pending
+    /// (participation 3/5 = 6000 bps >= 5000 floor; approvals 2 do not cross the
+    /// absolute-majority early bar since `2 * 2 > 5` is false; 1 rejection is
+    /// below the early-rejection threshold `ceil(5/2) = 3`). Force past the
+    /// deadline, then a fourth eligible voter rejects: the keyless precheck
+    /// auto-resolves on the RECORDED votes -> approvals(2) > rejections(1) ->
+    /// `Approved`.
+    #[test]
+    fn pr2b_reject_past_deadline_reports_resolved_approved_status() {
+        use scp_protocol::context::governance::ProposalStatus;
+
+        let creator = "did:dht:zPdrA";
+        let voter_b = "did:dht:zPdrB";
+        let voter_c = "did:dht:zPdrC";
+        let voter_d = "did:dht:zPdrD";
+        let voter_e = "did:dht:zPdrE";
+        let context_id = "ctx-pr2b-reject-past-deadline";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zPdrTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zPdrTarget");
+        let pid = pr2b_pid(0x77);
+        // creator auto-approves -> 1 approval.
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        // voter_b approves -> 2 approvals (2*2 > 5 is false: still Pending).
+        let r_b = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve b");
+        assert_eq!(
+            r_b.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2/5 approvals stay Pending"
+        );
+        // voter_c rejects -> 1 rejection (1 >= ceil(5/2)=3 is false: still Pending).
+        let r_c = mgr
+            .reject_governance_proposal(context_id, &pid, voter_c)
+            .expect("reject c");
+        assert_eq!(
+            r_c.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1 rejection is below the early-rejection threshold -> Pending"
+        );
+
+        // Force the proposal past its deadline.
+        mgr.contexts
+            .get_mut(context_id)
+            .and_then(|c| c.pending_proposals.get_mut(&pid))
+            .expect("proposal pending")
+            .voting_deadline = 1;
+
+        // voter_d rejects past the deadline -> auto-resolve on recorded votes:
+        // approvals(2) > rejections(1) with quorum met -> Approved.
+        let r_d = mgr
+            .reject_governance_proposal(context_id, &pid, voter_d)
+            .expect("reject past deadline must not error (auto-resolves)");
+        assert_eq!(
+            r_d.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "past-deadline reject resolving to a surviving majority must report Approved"
+        );
+
+        // A reject vote never executes the action, even when the tally is Approved.
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "a reject vote must not execute the governance action"
+        );
+
+        // Returned status matches the stored resolved status, and the proposal
+        // moved pending -> resolved.
+        let stored = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&pid))
+            .expect("proposal moved to resolved");
+        assert_eq!(stored.status, ProposalStatus::Approved);
+        // §9.9.3 CONVERGENCE: the past-deadline reject vote (voter_d) was NOT
+        // recorded by the engine — it auto-resolved on the pre-deadline tally.
+        // The stored proposal must carry exactly the 2 pre-deadline approvals
+        // (creator + voter_b) and the 1 pre-deadline rejection (voter_c) that
+        // native's `engine.get_proposal(...)` holds — NOT a phantom second
+        // rejection from the former optimistic push.
+        assert_eq!(
+            stored.approvals.len(),
+            2,
+            "the 2 pre-deadline approvals are recorded (creator + voter_b)"
+        );
+        assert_eq!(
+            stored.rejections.len(),
+            1,
+            "only the pre-deadline rejection (voter_c) is recorded; the past-deadline reject (voter_d) is NOT counted (matches native)"
+        );
+        assert_eq!(
+            r_d.get("status").and_then(serde_json::Value::as_str),
+            Some(WasmContextManager::proposal_status_label(&stored.status)),
+            "returned status label must equal the stored proposal's status label"
+        );
+        assert!(
+            !mgr.contexts
+                .get(context_id)
+                .is_some_and(|c| c.pending_proposals.contains_key(&pid)),
+            "a resolved proposal must not linger in pending_proposals"
+        );
+    }
+
+    /// §9.9.3 CONVERGENCE (happy path): a NORMAL (pre-deadline) approve records
+    /// EXACTLY ONE additional approval on the stored proposal. This pins the
+    /// other side of the past-deadline regression — the engine-recorded-proposal
+    /// persistence must still count an in-window vote, not silently drop it. A
+    /// 5-voter majority: proposer auto-approves (1), then `voter_b` approves (2,
+    /// still Pending since `2*2 > 5` is false). The stored approvals grow 1 -> 2.
+    #[test]
+    fn pr2b_normal_approve_records_exactly_one_additional_vote() {
+        let creator = "did:dht:zNrmA";
+        let voter_b = "did:dht:zNrmB";
+        let voter_c = "did:dht:zNrmC";
+        let voter_d = "did:dht:zNrmD";
+        let voter_e = "did:dht:zNrmE";
+        let context_id = "ctx-pr2b-normal-approve";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zNrmTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zNrmTarget");
+        let pid = pr2b_pid(0x88);
+
+        // Proposer auto-approves -> 1 recorded approval, still Pending (2*2 > 5 false).
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        let after_propose = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.pending_proposals.get(&pid))
+            .expect("proposal pending after propose")
+            .approvals
+            .len();
+        assert_eq!(
+            after_propose, 1,
+            "the proposer's implicit approval is recorded once"
+        );
+
+        // voter_b approves IN WINDOW -> exactly one more approval; still Pending.
+        let r_b = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve b ok");
+        assert_eq!(
+            r_b.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2-of-5 majority (2*2 > 5 false) stays Pending"
+        );
+        let after_vote = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.pending_proposals.get(&pid))
+            .expect("proposal still pending after in-window vote")
+            .approvals
+            .len();
+        assert_eq!(
+            after_vote, 2,
+            "a normal in-window approve records EXACTLY one additional vote (the engine-recorded proposal is persisted, not dropped)"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "no execution before quorum"
+        );
+    }
+
+    /// Unanimity: every frozen voter must approve. A single rejection defeats it.
+    #[test]
+    fn pr2b_unanimity_all_approve_then_one_reject() {
+        let creator = "did:dht:zUnaA";
+        let voter_b = "did:dht:zUnaB";
+        let voter_c = "did:dht:zUnaC";
+        let context_id = "ctx-pr2b-unanimity";
+
+        // All approve -> Approved + executed.
+        {
+            let mut ctx = pr2b_multiparty_ctx(
+                context_id,
+                creator,
+                "unanimity",
+                &[creator, voter_b, voter_c],
+            );
+            ctx.test_set_eligible_voters(&[creator, voter_b, voter_c]);
+            let mut mgr = WasmContextManager::new();
+            mgr.test_insert_context(context_id, ctx);
+            mgr.test_insert_member_pub(context_id, "did:dht:zUnaTarget", "member");
+            let action = pr2b_change_role_action("did:dht:zUnaTarget");
+            let pid = pr2b_pid(0x55);
+            mgr.propose_governance_action(context_id, creator, &pid, &action)
+                .expect("propose");
+            let r2 = mgr
+                .approve_governance_proposal(context_id, &pid, voter_b)
+                .expect("approve b");
+            assert_eq!(
+                r2.get("status").and_then(serde_json::Value::as_str),
+                Some("Pending"),
+                "2/3 approvals must stay Pending under unanimity"
+            );
+            let r3 = mgr
+                .approve_governance_proposal(context_id, &pid, voter_c)
+                .expect("approve c");
+            assert_eq!(
+                r3.get("status").and_then(serde_json::Value::as_str),
+                Some("Approved"),
+                "all-approve must reach Approved under unanimity"
+            );
+            assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
+        }
+
+        // One reject -> defeated.
+        {
+            let context_id2 = "ctx-pr2b-unanimity-reject";
+            let mut ctx = pr2b_multiparty_ctx(
+                context_id2,
+                creator,
+                "unanimity",
+                &[creator, voter_b, voter_c],
+            );
+            ctx.test_set_eligible_voters(&[creator, voter_b, voter_c]);
+            let mut mgr = WasmContextManager::new();
+            mgr.test_insert_context(context_id2, ctx);
+            mgr.test_insert_member_pub(context_id2, "did:dht:zUnaTarget2", "member");
+            let action = pr2b_change_role_action("did:dht:zUnaTarget2");
+            let pid = pr2b_pid(0x56);
+            mgr.propose_governance_action(context_id2, creator, &pid, &action)
+                .expect("propose");
+            let rr = mgr
+                .reject_governance_proposal(context_id2, &pid, voter_b)
+                .expect("reject b");
+            assert_eq!(
+                rr.get("status").and_then(serde_json::Value::as_str),
+                Some("Rejected"),
+                "a single rejection must defeat a unanimity proposal"
+            );
+            assert_eq!(pr2b_executed_leaf_count(&mgr, context_id2), 0);
+        }
+    }
+
+    /// A surviving threshold (non-empty signers) with threshold == 0 is REJECTED
+    /// at `create_context`, not silently rewritten to auto-execute (item D).
+    #[test]
+    fn pr2b_create_threshold_zero_with_signers_rejected() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zThrZeroCreator";
+        let params = serde_json::json!({
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceilingPolicy": "immutable",
+            "governance": "threshold",
+            "governanceSigners": ["did:dht:zS1", "did:dht:zS2"],
+            "governanceThreshold": 0,
+            "economicPolicy": free_policy_json(),
+        });
+        let err = mgr
+            .create_context("ctx-pr2b-thr-zero", creator, &params)
+            .expect_err("threshold 0 with signers must be rejected");
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(code, codes::VALID_7005);
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+        assert!(
+            !mgr.contexts.contains_key("ctx-pr2b-thr-zero"),
+            "a rejected create must not register the context"
+        );
+    }
+
+    /// A surviving threshold with a populated signer set + valid threshold is
+    /// accepted and stores the frozen signers/value.
+    #[test]
+    fn pr2b_create_threshold_with_signers_stores_frozen_config() {
+        let mut mgr = WasmContextManager::new();
+        let creator = "did:dht:zThrCfgCreator";
+        let context_id = "ctx-pr2b-thr-cfg";
+        let params = serde_json::json!({
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceilingPolicy": "immutable",
+            "governance": "threshold",
+            "governanceSigners": ["did:dht:zS1", "did:dht:zS2", "did:dht:zS3"],
+            "governanceThreshold": 2,
+            "economicPolicy": free_policy_json(),
+        });
+        mgr.create_context(context_id, creator, &params)
+            .expect("valid threshold must be accepted");
+        let ctx = mgr.contexts.get(context_id).expect("registered");
+        assert_eq!(ctx.governance, "threshold");
+        assert_eq!(ctx.threshold_value, 2);
+        assert_eq!(ctx.threshold_signers.len(), 3);
+    }
+
+    /// Importing a threshold-with-empty-signers snapshot collapses it to
+    /// `single_admin` and does NOT produce a quorum-0 auto-execute engine.
+    #[test]
+    fn pr2b_import_threshold_empty_signers_collapses() {
+        let context_id = "ctx-pr2b-import-collapse";
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        // Forge: governance == threshold but NO frozen signers.
+        state.test_set_governance("threshold");
+        src.contexts.insert(context_id.to_owned(), state);
+        let bytes = src.export_context(context_id).expect("export");
+
+        let mut dst = WasmContextManager::new();
+        dst.import_context(&bytes).expect("import must succeed");
+        assert_eq!(
+            dst.contexts.get(context_id).map(|c| c.governance.as_str()),
+            Some("single_admin"),
+            "imported threshold + empty signers must collapse to single_admin"
+        );
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// Importing a snapshot that carries a pre-baked `Approved` resolved
+    /// proposal must NOT leave it blindly executable: the importer re-derives
+    /// the status against the frozen set (or, under `single_admin`, invalidates
+    /// it), so the direct-execute path is refused.
+    #[test]
+    fn pr2b_import_prebaked_approved_proposal_not_executable() {
+        let context_id = "ctx-pr2b-import-prebaked";
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        // single_admin context, but with a FORGED Approved resolved proposal
+        // that no quorum ever reached.
+        state.test_insert_member("did:dht:zPrebakedTarget", "member");
+        state.test_insert_ceiling("role:assign");
+        let forged_pid = pr2b_pid(0x77);
+        let forged = GovernanceProposal {
+            proposal_id: {
+                let bytes = hex::decode(&forged_pid).unwrap();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            },
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(creator.clone()),
+            action: pr2b_change_role_action("did:dht:zPrebakedTarget"),
+            status: ProposalStatus::Approved,
+            created_at: 1_700_000_000,
+            voting_deadline: 1_700_003_600,
+            approvals: vec![SignedVote {
+                voter_did: DID::from(creator.clone()),
+                vote: VoteType::Approve,
+                timestamp: 1_700_000_000,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        state.test_insert_resolved_proposal(forged_pid.clone(), forged);
+        src.contexts.insert(context_id.to_owned(), state);
+        let bytes = src.export_context(context_id).expect("export");
+
+        let mut dst = WasmContextManager::new();
+        dst.import_context(&bytes).expect("import must succeed");
+
+        // The imported proposal's status must NOT be Approved anymore.
+        let imported = dst
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&forged_pid))
+            .expect("proposal imported");
+        assert!(
+            !matches!(imported.status, ProposalStatus::Approved),
+            "a pre-baked Approved single_admin proposal must be invalidated on import"
+        );
+
+        // And the direct-execute path must refuse it.
+        let err = dst
+            .execute_governance_action(context_id, &creator, &creator, &forged_pid)
+            .expect_err("executing a non-Approved imported proposal must be rejected");
+        assert!(
+            format!("{err:?}").contains("not approved"),
+            "execute must reject the non-Approved imported proposal, got: {err:?}"
+        );
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// SECURITY: importing a MULTI-PARTY (majority) snapshot whose creator
+    /// fabricated a quorum must NOT re-derive that quorum. The carried votes on
+    /// an imported proposal carry no verifiable signatures; replaying them would
+    /// let a malicious creator declare an `eligible_voters` set of victim DIDs,
+    /// fabricate empty-signature `Approved` votes from those DIDs, and reach a
+    /// forged quorum. The importer therefore UNCONDITIONALLY invalidates every
+    /// imported `Approved` proposal (`single_admin` AND multi-party), so the
+    /// forged proposal is non-executable.
+    #[test]
+    fn pr2b_import_forged_multiparty_quorum_not_executable() {
+        let context_id = "ctx-pr2b-import-forged-majority";
+        crate::identity::test_helpers::cleanup_identity_registry();
+        let (creator, _ik, _ak, _gk) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+        let victim_a = "did:dht:zForgedVictimA";
+        let victim_b = "did:dht:zForgedVictimB";
+
+        let mut src = WasmContextManager::new();
+        let mut state = make_bare_per_context_state(context_id, &creator);
+        // Majority context whose frozen voter set is the creator + two victims.
+        // A replay of the carried (empty-signature) votes would tally 3/3 and
+        // re-derive Approved — exactly the forgery we must reject.
+        state.test_set_governance("majority");
+        state.test_set_eligible_voters(&[creator.as_str(), victim_a, victim_b]);
+        state.test_insert_member(victim_a, "member");
+        state.test_insert_member(victim_b, "member");
+        state.test_insert_member("did:dht:zForgedTarget", "member");
+        state.test_insert_ceiling("role:assign");
+
+        let forged_pid = pr2b_pid(0x79);
+        let forged = GovernanceProposal {
+            proposal_id: {
+                let bytes = hex::decode(&forged_pid).unwrap();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            },
+            context_id: context_id.to_owned(),
+            proposer_did: DID::from(creator.clone()),
+            action: pr2b_change_role_action("did:dht:zForgedTarget"),
+            status: ProposalStatus::Approved,
+            created_at: 1_700_000_000,
+            voting_deadline: 1_700_003_600,
+            // Fabricated empty-signature approvals from the victim DIDs — these
+            // would re-derive a 3/3 majority quorum if replayed through the
+            // keyless tally. They must NOT be trusted.
+            approvals: vec![
+                SignedVote {
+                    voter_did: DID::from(creator.clone()),
+                    vote: VoteType::Approve,
+                    timestamp: 1_700_000_000,
+                    signature: Vec::new(),
+                },
+                SignedVote {
+                    voter_did: DID::from(victim_a.to_owned()),
+                    vote: VoteType::Approve,
+                    timestamp: 1_700_000_000,
+                    signature: Vec::new(),
+                },
+                SignedVote {
+                    voter_did: DID::from(victim_b.to_owned()),
+                    vote: VoteType::Approve,
+                    timestamp: 1_700_000_000,
+                    signature: Vec::new(),
+                },
+            ],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        state.test_insert_resolved_proposal(forged_pid.clone(), forged);
+        src.contexts.insert(context_id.to_owned(), state);
+        let bytes = src.export_context(context_id).expect("export");
+
+        let mut dst = WasmContextManager::new();
+        dst.import_context(&bytes).expect("import must succeed");
+
+        let imported = dst
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&forged_pid))
+            .expect("proposal imported");
+        assert!(
+            matches!(imported.status, ProposalStatus::Invalidated { .. }),
+            "a forged multi-party Approved proposal must be Invalidated on import, got: {:?}",
+            imported.status
+        );
+
+        let err = dst
+            .execute_governance_action(context_id, &creator, &creator, &forged_pid)
+            .expect_err("executing an invalidated imported proposal must be rejected");
+        assert!(
+            format!("{err:?}").contains("not approved"),
+            "execute must reject the invalidated imported proposal, got: {err:?}"
+        );
+        crate::identity::test_helpers::cleanup_identity_registry();
+    }
+
+    /// Withdraw routes through the engine's gated `withdraw_vote` and re-resolves:
+    /// a withdrawn approval drops the tally back below quorum (proposal stays
+    /// Pending) and the vote is removed from the stored proposal.
+    #[test]
+    fn pr2b_withdraw_via_engine_reresolves() {
+        let creator = "did:dht:zWdA";
+        let signer_b = "did:dht:zWdB";
+        let signer_c = "did:dht:zWdC";
+        let context_id = "ctx-pr2b-withdraw";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "threshold",
+            &[creator, signer_b, signer_c],
+        );
+        // 3-of-3 threshold so a single withdrawal cannot trigger execution.
+        ctx.test_set_threshold_config(&[creator, signer_b, signer_c], 3);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zWdTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zWdTarget");
+        let pid = pr2b_pid(0x88);
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose");
+        // signer_b approves: 2 of 3, still Pending.
+        mgr.approve_governance_proposal(context_id, &pid, signer_b)
+            .expect("approve b");
+
+        // signer_b withdraws: gated withdraw via the engine, re-resolves Pending.
+        let wr = mgr
+            .withdraw_governance_vote(context_id, &pid, signer_b)
+            .expect("withdraw ok");
+        assert_eq!(
+            wr.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "withdrawing one approval (3-of-3) must keep the proposal Pending"
+        );
+        // signer_b's vote is gone from the stored proposal.
+        let p = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.pending_proposals.get(&pid))
+            .expect("still pending");
+        assert!(
+            !p.approvals.iter().any(|v| v.voter_did.0 == signer_b),
+            "the withdrawn approval must be removed from the proposal"
+        );
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 0);
+    }
+
+    /// Withdraw via the engine rejects a NON-eligible withdrawer (frozen set).
+    #[test]
+    fn pr2b_withdraw_rejects_non_eligible() {
+        let creator = "did:dht:zWdNA";
+        let signer_b = "did:dht:zWdNB";
+        let context_id = "ctx-pr2b-withdraw-noteligible";
+        let mut ctx = pr2b_multiparty_ctx(context_id, creator, "threshold", &[creator, signer_b]);
+        ctx.test_set_threshold_config(&[creator, signer_b], 2);
+        // A member who is NOT in the frozen signer set.
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zWdOutsider", "admin");
+        mgr.test_insert_member_pub(context_id, "did:dht:zWdTargetN", "member");
+
+        let action = pr2b_change_role_action("did:dht:zWdTargetN");
+        let pid = pr2b_pid(0x89);
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose");
+        // The outsider never voted and is not a signer -> withdraw rejected.
+        let err = mgr
+            .withdraw_governance_vote(context_id, &pid, "did:dht:zWdOutsider")
+            .expect_err("non-signer withdraw must be rejected by the gated engine");
+        assert!(
+            format!("{err:?}").contains("rejected") || format!("{err:?}").contains("not"),
+            "expected a gated-withdraw rejection, got: {err:?}"
+        );
+    }
+
+    /// Double-execute via a FRESH (non-canonical) proposal id is blocked: the
+    /// replay guard keys on the CANONICAL `compute_proposal_id`, so two tracked
+    /// proposals over the same `(context, proposer, action, created_at)` share one
+    /// replay key (item F).
+    #[test]
+    fn pr2b_double_execute_via_fresh_id_blocked() {
+        let context_id = "ctx-pr2b-replay";
+        let proposer = "did:dht:zReplayProposer";
+        let target = "did:dht:zReplayTarget";
+
+        let mut ctx = make_bare_per_context_state(context_id, proposer);
+        ctx.test_insert_member(target, "member");
+        ctx.test_insert_ceiling("role:assign");
+
+        let action = pr2b_change_role_action(target);
+        let created_at = 1_700_900_000_u64;
+
+        // Two DISTINCT caller hex ids carrying the SAME canonical action.
+        let pid_a = pr2b_pid(0x9a);
+        let pid_b = pr2b_pid(0x9b);
+        for pid in [&pid_a, &pid_b] {
+            let bytes = hex::decode(pid).unwrap();
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let proposal = GovernanceProposal {
+                proposal_id: arr,
+                context_id: context_id.to_owned(),
+                proposer_did: DID::from(proposer.to_owned()),
+                action: action.clone(),
+                status: ProposalStatus::Approved,
+                created_at,
+                voting_deadline: created_at + 3600,
+                approvals: vec![SignedVote {
+                    voter_did: DID::from(proposer.to_owned()),
+                    vote: VoteType::Approve,
+                    timestamp: created_at,
+                    signature: Vec::new(),
+                }],
+                rejections: Vec::new(),
+                created_at_epoch: None,
+            };
+            ctx.test_insert_resolved_proposal((*pid).clone(), proposal);
+        }
+
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+
+        // First execute via pid_a succeeds.
+        mgr.execute_governance_action(context_id, proposer, proposer, &pid_a)
+            .expect("first execute via pid_a succeeds");
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
+
+        // Second execute via the DIFFERENT hex id pid_b — same canonical action —
+        // must be replay-rejected (no second leaf).
+        let err = mgr
+            .execute_governance_action(context_id, proposer, proposer, &pid_b)
+            .expect_err("double-execute via a fresh id must be blocked");
+        assert!(
+            format!("{err:?}").contains("already been executed"),
+            "replay guard must block the fresh-id double-execute, got: {err:?}"
+        );
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            1,
+            "no second GovernanceActionExecuted leaf may be minted"
         );
     }
 }
