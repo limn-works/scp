@@ -1175,6 +1175,47 @@ mod tests {
     }
 
     #[test]
+    fn undecodable_governance_payload_by_subject_still_recorded() {
+        // `0xff` is a MessagePack negative fixint (-1), not a 2-element array,
+        // so `decode_payload::<GovernanceActionExecutedPayload>` returns Err.
+        // The subject is the actor of this leaf, so the action MUST still be
+        // recorded in `governance_actions_by` with a best-effort `None` target
+        // — a naive `let-else` early-return on the decode would wrongly drop it.
+        let events = vec![make_event(
+            EventType::GovernanceActionExecuted,
+            "did:key:alice",
+            1000,
+            0,
+            vec![0xff],
+        )];
+
+        let record = compute_participation_record(
+            &events,
+            "did:key:alice",
+            "ctx-undecodable-by",
+            [0u8; 32],
+            2000,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.governance_actions_by.len(),
+            1,
+            "subject's governance action is recorded even when the payload is undecodable"
+        );
+        assert!(
+            record.governance_actions_by[0].target_did.is_none(),
+            "undecodable governance payload yields no target"
+        );
+        assert_eq!(
+            record.governance_actions_against.len(),
+            0,
+            "the actor isn't its own non-subject target"
+        );
+    }
+
+    #[test]
     fn compute_tracks_governance_actions_against_subject() {
         let events = vec![
             make_event(
