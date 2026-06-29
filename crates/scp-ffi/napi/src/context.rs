@@ -4928,12 +4928,12 @@ mod tests {
     ///
     /// Mechanism: the manager path reads `Supervisor::event_log_entries`. To
     /// seed a `RoleAssigned` leaf into that exact store without driving a full
-    /// governance ChangeRole round-trip (whose key resolver rejects unpublished
+    /// governance `ChangeRole` round-trip (whose key resolver rejects unpublished
     /// in-memory test identities), this appends the typed leaf through the
     /// `testing`-gated `Supervisor::test_append_event_log`, which delegates to
     /// the supervisor-owned event-log provider's `append_event` — the same
     /// provider `event_log_entries` reads. No production wiring is touched.
-    #[cfg(all(feature = "allow_in_memory_custody", feature = "testing"))]
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_manager_path_projects_role_assigned_subject_did() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
