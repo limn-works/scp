@@ -96,9 +96,12 @@ const CONTEXT_ROUTING_DOMAIN_SEPARATOR: &[u8] = b"scp:context-routing:";
 /// domain-separated SHA-256.
 ///
 /// The routing ID is `SHA-256("scp:context-routing:" || context_id)`.
-/// This is distinct from [`context_id_bytes`] (raw `SHA-256(context_id)`)
-/// which is used for internal crypto keying (MLS groups, sender keys, event
-/// logs). The domain separator prevents routing-level collisions with other
+/// This is distinct from [`context_id_bytes`] (raw `SHA-256(context_id)`),
+/// which is the raw routing / synthetic-label primitive — NOT the crypto
+/// keying path for a real context. Per ADR-056, real-context crypto keying
+/// (MLS groups, sender keys, event logs) routes through the canonical
+/// chokepoint resolver `context_id_to_bytes`, which decodes a 64-hex id to its
+/// digest. The domain separator prevents routing-level collisions with other
 /// hash domains.
 ///
 /// Both the send path (`ContextManager::send_message`) and the subscribe

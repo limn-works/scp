@@ -44,9 +44,20 @@ No new hashing is introduced. `generate_context_id` *already* mints `hex(32 CSPR
 
 ### The double-hash trap (invariant)
 
-Canonical context ids are **decoded, never re-hashed.** `scp_protocol::context::context_id_bytes` stays a **pure SHA-256 primitive** used only for synthetic / non-context labels (the resolver's own fallback, and the documented `"identity-private-state"` site). Re-applying it to a real `hex(digest)` id is precisely the bug this ADR fixes; the single-chokepoint discipline plus a closed-allowlist gate (`scripts/check-context-id-keying.sh`) enforce mechanically that no keying site in `scp-runtime` calls the raw primitive on a context id outside the documented allowlist.
+Canonical context ids are **decoded, never re-hashed.** `scp_protocol::context::context_id_bytes` stays a **pure SHA-256 primitive** used only for synthetic / non-context labels (the resolver's own fallback, and the documented `"identity-private-state"` site). Re-applying it to a real `hex(digest)` id is precisely the bug this ADR fixes.
 
-The chokepoint is a **cross-layer** convention, not a runtime-only one. The FFI bridges (PyO3 / NAPI / UniFFI) resolve context-id keying via `scp_core::context::state::context_id_to_bytes` — the same chokepoint, reached through the `scp_core` facade re-export — so an event-log query or Merkle inclusion/absence proof keys the identical digest slot the manager wrote under. (Four FFI event-log sites originally called the raw `scp_core::context::context_id_bytes` re-export, double-hashing every real id and querying an empty slot — a fail-open caught in adversarial review and fixed.) Correspondingly, `scripts/check-context-id-keying.sh` scans **both** `crates/scp-runtime/src` and `crates/scp-ffi`, and matches the `scp_protocol::`, `scp_core::`, and bare/aliased import spellings of the raw primitive. That gate is a **coarse line-based tripwire** for the common accidental-copy regression — defense in depth, **not** the primary guarantee and not a proof of correctness (a multiline-split qualified call is line-evadable, though caught by `cargo fmt --check`). The **principled, compiler-enforced** path is a `ContextDigest` newtype that only the chokepoint can mint, so the raw primitive's bytes can never reach a keying call site; that work is tracked as issue #1931.
+The chokepoint is a **cross-layer** convention, not a runtime-only one. The FFI bridges (PyO3 / NAPI / UniFFI) resolve context-id keying via `scp_core::context::state::context_id_to_bytes` — the same chokepoint, reached through the `scp_core` facade re-export — so an event-log query or Merkle inclusion/absence proof keys the identical digest slot the manager wrote under. (Four FFI event-log sites and six FFI test-harness keying sites originally called the raw `context_id_bytes` re-export, double-hashing every real id and addressing an empty slot — a fail-open caught in adversarial review and rerouted to the chokepoint.)
+
+### Enforcement
+
+The invariant is enforced by:
+
+- **The single chokepoint resolver** `context_id_to_bytes` as the one source of truth — every real-context keying call routes through it, so the decode-not-re-hash discipline lives in exactly one place.
+- **A mutation-resistant unit test** that asserts context creation keys its crypto under the DECODED digest and NOT under `SHA-256(id)` — `create_context_keys_crypto_under_decoded_digest_not_sha256` in `crates/scp-runtime/src/context/builder.rs` — plus the `canonical_context_id_tests` in `state.rs` that pin the resolver's decode/hash branching.
+
+The **principled, sound, permanent** mechanical enforcement is a `ContextDigest` newtype that only the chokepoint can mint, making a raw-primitive keying call a **compile error** — the raw primitive's bytes can never reach a keying call site. That work is tracked as issue #1931.
+
+A source-text (grep/awk) CI gate scanning `scp-runtime` and `scp-ffi` for raw-primitive keying calls was implemented and then **removed**: a regex pseudo-lexer cannot soundly tokenize Rust to track `#[cfg(test)]` scope (lifetimes collide with char-literal stripping, block comments corrupt brace counts, multi-line strings escape line regexes), so the gate was a perpetual fail-open class — each fix surfaced a new bypass. Consistent with the project's preference for compiler/type-system enforcement over source-text gates (cf. the ADR-2E `OwnedIdentityDid` gate, likewise dropped for compiler enforcement in PR #1826), the gate was dropped in favor of the chokepoint + tests above and the forthcoming `ContextDigest` newtype.
 
 ## Rationale
 
@@ -66,7 +77,7 @@ The fix flows the correct direction (code conforms to spec); Option B would flow
 
 ## Consequences
 
-- **Positive:** the registry stays value-agnostic (it keys on whatever 32 bytes the resolver returns); the §6.2.4 saga becomes **committable** with real `generate_context_id` ids; creation, messaging, governance, TTL, key-destruction (ephemeral close no longer fails open under a phantom group), and export/import all key under one canonical digest; the single-chokepoint + closed-allowlist gate make the invariant mechanically enforced rather than documented.
-- **Cost:** one resolver function plus a small CI gate; every keying call site routes through the chokepoint (already the case for the historical `context_id_to_bytes` sites).
+- **Positive:** the registry stays value-agnostic (it keys on whatever 32 bytes the resolver returns); the §6.2.4 saga becomes **committable** with real `generate_context_id` ids; creation, messaging, governance, TTL, key-destruction (ephemeral close no longer fails open under a phantom group), and export/import all key under one canonical digest; the single chokepoint plus the digest-keying unit test (and the forthcoming `ContextDigest` newtype, #1931) make the invariant mechanically enforced rather than documented.
+- **Cost:** one resolver function; every keying call site routes through the chokepoint (already the case for the historical `context_id_to_bytes` sites).
 - **Deferred / tracked separately:** full standing-context (§5.15.8) conformance — the `derive_standing_context_digest` length-prefix migration and the standing-pair creation wiring — is a separate follow-on (#1929 / standing-context work); this ADR governs only the canonical-id resolution and leaves standing display ids on the unchanged hashing fallback.
 - **No migration burden:** SCP is pre-release with no deployed contexts; the resolution is corrected outright with no back-compat shim, per the no-migration-pre-release stance.

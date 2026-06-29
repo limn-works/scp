@@ -310,21 +310,6 @@ jobs:
       - name: Real check
         run: bash scripts/check-saga-gating-granularity.sh
 
-  context-id-keying:
-    needs: check-draft
-    name: Actor / context-id keying chokepoint (ADR-056)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      # Self-test MUST run first: it plants a forbidden production raw-primitive
-      # call (must DENY), two allowlisted sites (must allow), and a test-scope
-      # call (must be exempt) — proving the gate is alive before we trust it on
-      # the real tree.
-      - name: Self-test gate
-        run: bash scripts/check-context-id-keying.sh --self-test
-      - name: Real check
-        run: bash scripts/check-context-id-keying.sh
-
   bridge-instance-lifecycle:
     needs: check-draft
     name: Actor / BridgeInstance lifecycle drift
