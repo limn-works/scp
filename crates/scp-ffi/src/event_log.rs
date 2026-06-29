@@ -259,15 +259,19 @@ fn query_manager_entries(
         let leaf_hash = scp_event_log::tree::leaf_hash(entry)
             .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))?;
         // Project the typed payload's bridge-facing fields (e.g. `target_did`
-        // for governance/access-revocation events) through the single shared
-        // decoder so all four bridges surface byte-identical values. The key is
-        // omitted when the projection yields `None`.
+        // for governance/access-revocation events, `subject_did` for
+        // role/membership events) through the single shared decoder so all four
+        // bridges surface byte-identical values. Each key is omitted when the
+        // projection yields `None`.
         let projection = scp_event_log::payload::project_payload(&entry.event_type, &entry.payload);
         let mut payload_json = serde_json::json!({
             "hash": encode_hex(&leaf_hash),
         });
         if let Some(target_did) = projection.target_did {
             payload_json["target_did"] = serde_json::Value::String(target_did);
+        }
+        if let Some(subject_did) = projection.subject_did {
+            payload_json["subject_did"] = serde_json::Value::String(subject_did);
         }
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
@@ -360,8 +364,8 @@ fn event_log_query_impl(
 /// Returns `Ok(Some(events))` when storage held matching events, `Ok(None)`
 /// when storage is unavailable or held none (so the caller falls through to the
 /// summary event). Mirrors the manager path's payload projection: each event's
-/// bridge-facing fields (e.g. `target_did`) are decoded through the single
-/// shared [`scp_event_log::payload::project_payload`] decoder.
+/// bridge-facing fields (e.g. `target_did`, `subject_did`) are decoded through
+/// the single shared [`scp_event_log::payload::project_payload`] decoder.
 ///
 /// Uses the `Storage` trait directly because the global storage is
 /// `Arc<EncryptingAdapter<InMemoryStorage>>` and `ProtocolRepository` requires
@@ -424,9 +428,10 @@ fn query_storage_fallback(
                 continue;
             }
 
-            // Project the typed payload's bridge-facing fields through the
-            // single shared decoder, agreeing with the manager-path projection.
-            // The key is omitted when the projection yields `None`.
+            // Project the typed payload's bridge-facing fields (`target_did`,
+            // `subject_did`) through the single shared decoder, agreeing with
+            // the manager-path projection. Each key is omitted when the
+            // projection yields `None`.
             let projection =
                 scp_event_log::payload::project_payload(&event.event_type, &event.payload);
             let mut payload_json = serde_json::json!({
@@ -434,6 +439,9 @@ fn query_storage_fallback(
             });
             if let Some(target_did) = projection.target_did {
                 payload_json["target_did"] = serde_json::Value::String(target_did);
+            }
+            if let Some(subject_did) = projection.subject_did {
+                payload_json["subject_did"] = serde_json::Value::String(subject_did);
             }
             let payload = json_to_py_dict(py, &payload_json)?;
 

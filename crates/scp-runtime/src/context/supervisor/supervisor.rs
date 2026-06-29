@@ -10413,6 +10413,50 @@ impl Supervisor {
         })?
     }
 
+    /// Appends a typed event directly to the supervisor-owned event-log
+    /// provider for `context_id` — test-only.
+    ///
+    /// The provider's `event_log_entries` (read by the FFI `event_log_query`
+    /// manager path) is the same store this writes to, so a leaf appended here
+    /// is observable on the manager path without driving a full governance
+    /// round-trip. Used by the NAPI bridge's manager-path projection tests to
+    /// seed a `RoleAssigned`/`GovernanceActionExecuted` leaf carrying a typed
+    /// payload. Synchronous — the provider's `append_event` mutates its own
+    /// shared store and needs no actor mailbox.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no event-log provider is wired.
+    /// - [`ContextError::EventLogFailed`] if the provider has no log for the
+    ///   context or the append fails.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_append_event_log(
+        &self,
+        context_id_bytes: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::test_append_event_log — event_log provider not configured".to_owned(),
+            )
+        })?;
+        event_log
+            .append_event(
+                context_id_bytes,
+                event_type,
+                actor_did,
+                payload,
+                timestamp_secs,
+            )
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
     /// Lists every governance proposal currently tracked by the
     /// context's engine via the actor mailbox.
     ///
