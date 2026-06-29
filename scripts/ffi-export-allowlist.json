@@ -587,6 +587,12 @@
     },
     {
       "name": "__repr__",
+      "path": "crates/scp-ffi/src/trust.rs",
+      "kind": "dunder",
+      "reason": "Python debug-representation dunder on PyParticipationRecord; not a protocol operation."
+    },
+    {
+      "name": "__repr__",
       "path": "crates/scp-ffi/src/ucan.rs",
       "kind": "dunder",
       "reason": "Python debug-representation dunder on bridge result types; not a protocol operation."
