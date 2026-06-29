@@ -3580,6 +3580,12 @@ fn actor_check_proposer_eligibility(
                 &context_id,
                 merkle_root,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             ) {
                 Err(e) => {
                     tracing::warn!(
@@ -4853,6 +4859,12 @@ pub fn finalize_governance_action(
                 context_id,
                 gov_merkle,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             )
             && record.participation_count > 0
         {

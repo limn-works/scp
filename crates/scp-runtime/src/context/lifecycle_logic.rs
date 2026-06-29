@@ -265,6 +265,11 @@ pub fn post_join_bookkeeping(
             context_id,
             merkle_root,
             now,
+            // attestation_count is a credential-layer, verifier-relative fact
+            // (§7.3.2); this lifecycle path gates only on participation_count and
+            // has no attestation-cache access, so it passes an empty accessible-
+            // attestation set (count 0) by design — NOT a stub.
+            &[],
         )
     {
         participation_cache.insert(member_did.to_string(), record);
