@@ -1217,6 +1217,13 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
+            // §7.3.2: empty event log → no recorded participation facts.
+            // Dedicated SCP-CTX-2076 instead of the catch-all so a Swift / Kotlin
+            // caller can distinguish "no facts yet" from a genuine context error.
+            CE::NoParticipationFacts { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2076.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -1760,6 +1767,11 @@ pub struct ParticipationRecordView {
     /// Number of accessible, currently-valid credential-layer attestations
     /// (§7.4) for the subject. Verifier-relative.
     pub attestation_count: u64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+    /// never a context-event-log count (§7.3.2). Parallel of
+    /// `tool_invocation_count_anchored`.
+    pub attestation_count_anchored: bool,
     /// Unix timestamp (seconds) when the record was computed.
     pub computed_at: u64,
     /// Merkle root (hex) of the event log at computation time.
@@ -1778,6 +1790,7 @@ impl From<&scp_core::trust::ParticipationFacts> for ParticipationRecordView {
             context_creation_count: f.context_creation_count,
             role_progression_count: f.role_progression_count,
             attestation_count: f.attestation_count,
+            attestation_count_anchored: f.attestation_count_anchored,
             computed_at: f.computed_at,
             event_log_root: hex::encode(f.event_log_root),
         }
@@ -13325,23 +13338,17 @@ impl Scp {
                             // Project the typed payload's bridge-facing fields
                             // (e.g. `target_did` for governance/access-revocation
                             // events, `subject_did` for role/membership events)
-                            // through the single shared decoder so all four
-                            // bridges surface byte-identical values. Each key is
-                            // omitted when the projection yields `None`.
-                            let projection = scp_event_log::payload::project_payload(
-                                &entry.event_type,
-                                &entry.payload,
-                            );
+                            // through the single shared helper so all bridges
+                            // surface byte-identical values. Each key is omitted
+                            // when the projection yields `None`.
                             let mut payload_value = serde_json::json!({
                                 "hash": hex::encode(leaf_hash),
                             });
-                            if let Some(target_did) = projection.target_did {
-                                payload_value["target_did"] = serde_json::Value::String(target_did);
-                            }
-                            if let Some(subject_did) = projection.subject_did {
-                                payload_value["subject_did"] =
-                                    serde_json::Value::String(subject_did);
-                            }
+                            scp_ffi_common::event_log::inject_projection(
+                                &mut payload_value,
+                                &entry.event_type,
+                                &entry.payload,
+                            );
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,
@@ -13420,28 +13427,15 @@ impl Scp {
                                         });
                                 // Project the typed payload's bridge-facing fields
                                 // (`target_did`, `subject_did`) through the single
-                                // shared decoder, agreeing with the manager-path
+                                // shared helper, agreeing with the manager-path
                                 // projection above. Each key is injected only when
                                 // the surfaced payload is a JSON object and the
                                 // projection yields a value.
-                                let projection = scp_event_log::payload::project_payload(
+                                scp_ffi_common::event_log::inject_projection(
+                                    &mut payload_value,
                                     &evt.event_type,
                                     &evt.payload,
                                 );
-                                if let Some(obj) = payload_value.as_object_mut() {
-                                    if let Some(target_did) = projection.target_did {
-                                        obj.insert(
-                                            "target_did".to_owned(),
-                                            serde_json::Value::String(target_did),
-                                        );
-                                    }
-                                    if let Some(subject_did) = projection.subject_did {
-                                        obj.insert(
-                                            "subject_did".to_owned(),
-                                            serde_json::Value::String(subject_did),
-                                        );
-                                    }
-                                }
                                 let payload_json = payload_value.to_string();
 
                                 results.push(Event {
@@ -13865,13 +13859,14 @@ impl Scp {
     /// additionally require the token grants it. (The enforcing `ucan_validate`
     /// gate keeps a mandatory capability.)
     ///
-    /// WARNING: when `presenting_agent_did` is `None` (or empty) the audience
-    /// defaults to the token's OWN `aud`, making the step-5 audience check a
-    /// tautological self-check (`aud == aud`) that does NOT bind the token to any
-    /// external subject. A caller assessing a SPECIFIC subject MUST pass that
-    /// subject's DID — otherwise a token addressed to someone else would report
-    /// `signatures_valid` (trust inflation). The SDK trust path always passes the
-    /// subject; this default is a convenience for self-evaluation only.
+    /// FAIL CLOSED: `presenting_agent_did` is required (no silent security
+    /// default). When it is `None` or empty this returns a validation error
+    /// rather than defaulting to the token's own `aud` — defaulting would make the
+    /// step-5 audience check a tautological self-check (`aud == aud`) that does NOT
+    /// bind the token to any external subject, so a token addressed to someone
+    /// else would report `signatures_valid` (trust inflation). The SDK trust path
+    /// always passes the subject; raw diagnostic callers must now pass an explicit
+    /// presenting agent.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -13898,6 +13893,21 @@ impl Scp {
                     validate_capability_uri(cap)?;
                 }
 
+                // FAIL CLOSED (no silent security default): require an explicit
+                // presenting agent DID instead of defaulting to the token's own
+                // `aud` (which would make the step-5 audience check tautological
+                // and inflate trust). Validated as a pure input before parse.
+                let agent_did = presenting_agent_did
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|did| !did.is_empty())
+                    .ok_or_else(|| ScpError::Validation {
+                        msg: "presenting_agent_did is required: ucan_evaluate will not default \
+                              to the token's audience"
+                            .to_owned(),
+                        code: codes::VALID_7010.to_owned(),
+                    })?;
+
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
                     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, evaluate_ucan, parse_ucan,
@@ -13917,11 +13927,6 @@ impl Scp {
                             .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))
                     })
                     .transpose()?;
-
-                // Determine the presenting agent DID: explicit parameter or token audience.
-                let agent_did = presenting_agent_did
-                    .as_deref()
-                    .unwrap_or(&parsed_token.payload.aud);
 
                 // Build proof resolver from optional proof tokens.
                 let mut proofs = std::collections::HashMap::new();
@@ -15348,9 +15353,17 @@ impl Scp {
             })?;
         let record = supervisor
             .participation_record(&context_id, &subject_did, &verified)
-            .map_err(|e| ScpError::Context {
-                msg: e.to_string(),
-                code: codes::CTX_2000.to_owned(),
+            .map_err(|e| {
+                // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
+                // the message; genuine failures stay on the generic CTX_2000.
+                let code = match e {
+                    scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
+                    _ => codes::CTX_2000,
+                };
+                ScpError::Context {
+                    msg: e.to_string(),
+                    code: code.to_owned(),
+                }
             })?;
 
         let facts = scp_core::trust::ParticipationFacts::from(&record);
@@ -17273,6 +17286,7 @@ mod tests {
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
+            attestation_count_anchored: false,
             computed_at: 42,
             event_log_root: [7u8; 32],
         };
@@ -17286,6 +17300,7 @@ mod tests {
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
         assert_eq!(view.computed_at, 42);
         assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
     }
@@ -17337,6 +17352,45 @@ mod tests {
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
             pre_rotation_custody,
         })
+    }
+
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted or empty
+    /// `presenting_agent_did` rather than defaulting to the token's own `aud`
+    /// (which would make the step-5 audience check tautological and inflate
+    /// trust). The check is a pure-input gate after handle-affinity and before
+    /// token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_evaluate_requires_presenting_agent_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        let omitted = scp
+            .ucan_evaluate(
+                Arc::clone(&handle),
+                "header.payload.sig".to_owned(),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = scp
+            .ucan_evaluate(
+                handle,
+                "header.payload.sig".to_owned(),
+                None,
+                Some("   ".to_owned()),
+                None,
+            )
+            .await;
+        assert!(
+            empty.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
     }
 
     // ----- Context export signing via sign-only custody (§23.16.8) -----

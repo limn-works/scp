@@ -29,6 +29,30 @@ use super::attestation::{Attestation, RevocationStatus};
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
 
 // ---------------------------------------------------------------------------
+// Anchoring flags — single source of truth
+// ---------------------------------------------------------------------------
+
+/// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+///
+/// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+/// computed from per-author local `ContextEvent`s, not the Merkle log (spec
+/// §7.3.2; ADR-011 amendment exclusion taxonomy). Defined ONCE so the unsigned
+/// [`ParticipationFacts`] view and the signed [`ParticipationProfile`] cannot
+/// drift in what they advertise.
+pub const TOOL_INVOCATION_COUNT_ANCHORED: bool = false;
+
+/// Whether `attestation_count` is anchored in / verifiable against a context
+/// Merkle root.
+///
+/// Always `false`: `attestation_count` is a credential-layer (§7.4),
+/// verifier-relative fact — there is no attestation event type, and each
+/// contributing attestation is verified by its own envelope signature and
+/// revocation status (§7.4.1, §7.4.4), NOT by inclusion in any context Merkle
+/// tree (spec §7.3.2). Distinct from [`TOOL_INVOCATION_COUNT_ANCHORED`], which
+/// flips once ADR-051 lands; this one never does.
+pub const ATTESTATION_COUNT_ANCHORED: bool = false;
+
+// ---------------------------------------------------------------------------
 // ParticipationRecord
 // ---------------------------------------------------------------------------
 
@@ -129,6 +153,13 @@ pub struct ParticipationFacts {
 
     /// Count of governance actions taken against this identity (where the
     /// projected `target_did` is the subject).
+    ///
+    /// This is a LOWER BOUND of adverse actions: only the unambiguously-adverse
+    /// [`ADVERSE_ACTION_TYPES`] are counted. Actions whose adverseness cannot be
+    /// determined without the role delta (e.g. `ChangeRole`, `RemoveSigner`) are
+    /// deliberately excluded to avoid a hostile admin deflating standing with
+    /// beneficial-looking actions (H18), so a genuinely-adverse `ChangeRole` is
+    /// undercounted rather than over-counted.
     pub governance_actions_against: u64,
 
     /// Count of governance actions initiated by this identity.
@@ -157,6 +188,19 @@ pub struct ParticipationFacts {
     /// attestation-cache access honestly yields 0.
     pub attestation_count: u64,
 
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root.
+    ///
+    /// Always `false` ([`ATTESTATION_COUNT_ANCHORED`]): `attestation_count` is a
+    /// credential-layer (§7.4), verifier-relative fact, NOT a context-event-log
+    /// count — there is no attestation event type, and each contributing
+    /// attestation is verified by its own envelope signature/revocation, not by
+    /// Merkle inclusion (spec §7.3.2). The parallel of
+    /// `tool_invocation_count_anchored`, present so the non-anchored,
+    /// verifier-relative nature is mechanically visible to consumers rather than
+    /// implicit.
+    pub attestation_count_anchored: bool,
+
     /// Unix timestamp (seconds) when the underlying record was computed.
     pub computed_at: u64,
 
@@ -182,10 +226,12 @@ impl From<&ParticipationRecord> for ParticipationFacts {
             tool_invocation_count,
             // `tool_invocation_count` is summed from local `ToolInvoked`
             // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
-            tool_invocation_count_anchored: false,
+            tool_invocation_count_anchored: TOOL_INVOCATION_COUNT_ANCHORED,
             context_creation_count: record.context_creation_count,
             role_progression_count: record.role_history.len() as u64,
             attestation_count: record.attestation_history.len() as u64,
+            // Credential-layer / verifier-relative — never Merkle-anchored.
+            attestation_count_anchored: ATTESTATION_COUNT_ANCHORED,
             computed_at: record.computed_at,
             event_log_root: record.event_log_root,
         }
@@ -432,6 +478,13 @@ fn extract_tool_id_from_payload(data: &[u8]) -> ToolId {
 /// issue many beneficial-looking actions to deflate a member's standing
 /// (H18: standing-deflation attack).
 ///
+/// This makes `governance_actions_against` a LOWER BOUND of adverse actions:
+/// action types whose adverseness depends on the role delta — notably
+/// `ChangeRole` (a demotion is adverse, a promotion is not) and `RemoveSigner` —
+/// are intentionally excluded because adverseness is not determinable from the
+/// action type alone. A genuinely-adverse such action is therefore undercounted,
+/// never over-counted; the conservative direction preferred for H18.
+///
 /// When `action_type` is absent from the payload (legacy events written before
 /// H18), the action is conservatively counted as adverse to preserve the
 /// pre-fix behavior.
@@ -531,7 +584,8 @@ pub enum ParticipationFact {
     ContextCreationCount,
     /// Number of role transitions.
     RoleProgressionCount,
-    /// Number of attestation events.
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) — NOT an event-log count (there is no attestation event type).
     AttestationCount,
 }
 
@@ -648,7 +702,9 @@ pub struct ParticipationProfile {
     /// Number of role transitions.
     pub role_progression_count: u64,
 
-    /// Number of attestation events.
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) — NOT an event-log count (there is no attestation event type;
+    /// §7.3.2). Verifier-relative.
     pub attestation_count: u64,
 
     /// Unix timestamp (seconds) of the last update to this profile.

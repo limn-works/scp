@@ -9751,13 +9751,17 @@ impl Supervisor {
         let events = event_log
             .event_log_entries(&context_id_bytes)?
             .unwrap_or_default();
-        // Tolerate an absent log (no Merkle root) the same way every other
-        // participation call site does: an empty log yields `[0u8; 32]` and the
-        // core computation then returns `EmptyEventLog` below — we do not fail
-        // here on a missing-root provider error for a context with no events.
-        let merkle_root = event_log
-            .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
+        // FAIL CLOSED on the Merkle root (white-hat P2). A log that HAS events
+        // must carry a real root: substituting `[0u8; 32]` would emit a record
+        // with real participation facts bound to a zero root, which a verifier
+        // could not distinguish from a genuinely-empty log. Only an empty log
+        // tolerates an absent root — the core computation returns `EmptyEventLog`
+        // for it below regardless, so the substituted zero root is never observed.
+        let merkle_root = match event_log.event_log_merkle_root(&context_id_bytes) {
+            Ok(root) => root,
+            Err(_) if events.is_empty() => [0u8; 32],
+            Err(e) => return Err(e),
+        };
 
         scp_protocol::trust::compute_participation_record(
             &events,
@@ -9767,10 +9771,17 @@ impl Supervisor {
             now_secs,
             accessible_attestations,
         )
-        .map_err(|e| {
-            ContextError::InvalidState(format!(
-                "participation record computation failed for {subject_did}: {e}"
-            ))
+        .map_err(|e| match e {
+            // Empty event log → distinct, machine-detectable variant so the FFI
+            // bridges can surface a stable, dedicated error code instead of
+            // collapsing it with genuine failures (Finding 3). A subject with no
+            // recorded participation facts is a normal, branchable outcome.
+            scp_protocol::trust::TrustError::EmptyEventLog => ContextError::NoParticipationFacts {
+                subject_did: subject_did.to_owned(),
+            },
+            other => ContextError::InvalidState(format!(
+                "participation record computation failed for {subject_did}: {other}"
+            )),
         })
     }
 

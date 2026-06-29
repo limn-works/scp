@@ -270,12 +270,191 @@ fn participation_record_empty_log_errors() {
         test_mls_storage(),
     );
     // No log for this context → empty event set → core returns EmptyEventLog,
-    // surfaced as a ContextError (not a panic, not a silent empty record).
+    // surfaced as the DEDICATED, machine-detectable `NoParticipationFacts`
+    // variant (Finding 3) so the FFI bridges map it to the stable CTX_2076 code
+    // instead of collapsing it with genuine failures — not a panic, not a silent
+    // empty record, and NOT the generic InvalidState catch-all.
     let err = supervisor
         .participation_record("ctx-never-created", SUBJECT, &[])
         .expect_err("empty log must error");
     assert!(
-        format!("{err}").contains("participation record computation failed"),
-        "expected a wrapped computation failure, got: {err}"
+        matches!(
+            err,
+            scp_protocol::context::ContextError::NoParticipationFacts { .. }
+        ),
+        "expected NoParticipationFacts, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("SCP-CTX-2076"),
+        "expected the dedicated SCP-CTX-2076 code in the message, got: {err}"
+    );
+}
+
+/// SECURITY / isolation (white-hat P2, black-hat). A leaf in context B must NOT
+/// contribute to context A's participation record: facts are scoped to the
+/// queried context's own log, so cross-context activity cannot inflate (or
+/// deflate) a subject's standing in an unrelated context.
+#[test]
+fn participation_record_is_context_isolated() {
+    const CONTEXT_B: &str = "ctx-participation-2c1-other";
+
+    let provider = MerkleEventLogProvider::new();
+    let a_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
+    let b_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_B);
+    provider.init_event_log(&a_bytes).expect("init A");
+    provider.init_event_log(&b_bytes).expect("init B");
+
+    // Context A: exactly ONE role assignment for the subject; nothing else.
+    provider
+        .append_event(
+            &a_bytes,
+            EventType::RoleAssigned,
+            ADMIN,
+            role_payload(SUBJECT),
+            100,
+        )
+        .expect("append A role");
+
+    // Context B: the SAME subject is far more active — three role assignments and
+    // an adverse governance action targeting them. None of this may leak into A.
+    for ts in [100u64, 200, 300] {
+        provider
+            .append_event(
+                &b_bytes,
+                EventType::RoleAssigned,
+                ADMIN,
+                role_payload(SUBJECT),
+                ts,
+            )
+            .expect("append B role");
+    }
+    provider
+        .append_event(
+            &b_bytes,
+            EventType::GovernanceActionExecuted,
+            ADMIN,
+            gov_payload(SUBJECT),
+            400,
+        )
+        .expect("append B gov");
+
+    let supervisor = Supervisor::with_providers(
+        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(provider),
+        mock_key_resolver(),
+        None,
+        None,
+        None,
+        None,
+        test_mls_storage(),
+    );
+
+    // A sees ONLY A's single role assignment and none of B's activity.
+    let facts_a = ParticipationFacts::from(
+        &supervisor
+            .participation_record(CONTEXT_ID, SUBJECT, &[])
+            .expect("A record"),
+    );
+    assert_eq!(
+        facts_a.role_progression_count, 1,
+        "context A must count only its own role assignment, not B's"
+    );
+    assert_eq!(
+        facts_a.governance_actions_against, 0,
+        "B's governance action against the subject must not leak into A"
+    );
+
+    // B sees its own (larger) counts — proving the events exist, just scoped to B.
+    let facts_b = ParticipationFacts::from(
+        &supervisor
+            .participation_record(CONTEXT_B, SUBJECT, &[])
+            .expect("B record"),
+    );
+    assert_eq!(facts_b.role_progression_count, 3);
+    assert_eq!(facts_b.governance_actions_against, 1);
+}
+
+/// An event-log provider that HAS events but whose Merkle-root retrieval fails —
+/// models a transient/partial provider fault on the root path while entries are
+/// readable.
+struct EventsButNoRootProvider;
+
+impl ContextEventLogProvider for EventsButNoRootProvider {
+    fn init_event_log(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        _context_id: &[u8; 32],
+        _event_type: EventType,
+        _actor_did: &str,
+        _payload: EventPayload,
+        _timestamp_secs: u64,
+    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn destroy_event_log(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn event_log_entries(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError> {
+        // A single real event so the log is NON-empty.
+        Ok(Some(vec![scp_event_log::Event {
+            event_type: EventType::MessageSent,
+            actor_did: SUBJECT.into(),
+            timestamp: 1000,
+            sequence: 0,
+            payload: EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: vec![0u8; 64],
+        }]))
+    }
+
+    fn event_log_merkle_root(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+        Err(scp_protocol::context::ContextError::EventLogFailed(
+            "simulated root retrieval failure".to_owned(),
+        ))
+    }
+}
+
+/// SECURITY (Finding 4). A NON-empty event log whose Merkle-root retrieval fails
+/// must FAIL CLOSED: the supervisor propagates the provider error instead of
+/// substituting `[0u8; 32]` and emitting real participation facts bound to a zero
+/// root.
+#[test]
+fn participation_record_fails_closed_on_root_error_with_events() {
+    let supervisor = Supervisor::with_providers(
+        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(EventsButNoRootProvider),
+        mock_key_resolver(),
+        None,
+        None,
+        None,
+        None,
+        test_mls_storage(),
+    );
+
+    let err = supervisor
+        .participation_record(CONTEXT_ID, SUBJECT, &[])
+        .expect_err("a root-retrieval failure on a non-empty log must error, not zero-fill");
+    assert!(
+        matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+        "expected the provider's EventLogFailed to propagate, got: {err:?}"
     );
 }

@@ -325,6 +325,13 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
+            // §7.3.2: empty event log → no recorded participation facts.
+            // Dedicated SCP-CTX-2076 instead of the catch-all so a caller can
+            // distinguish "no facts yet" from a genuine context error.
+            CE::NoParticipationFacts { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2076.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
