@@ -1417,25 +1417,35 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
     Ok(())
 }
 
-/// Validates the v3 anti-replay fields (`seen_nonces_v3`,
-/// `executed_proposals`, `resolved_proposals_json`), the `consequence_rules`
-/// vector, and the `cooldown_until` map on an imported snapshot.
+/// Caps and per-element DID-validates the attacker-controlled identity sets on
+/// an imported snapshot: the frozen governance sets (`eligible_voters`,
+/// `threshold_signers`) and the role-state `members`.
 ///
-/// This is defense-in-depth: the envelope HMAC already prevents tampering,
-/// but malformed state (empty nonce strings, `NaN` or unbounded timestamps,
-/// over-cap entries, invalid consequence rules) must fail loud rather than
-/// silently propagate into `PerContextState`.
-/// Caps and per-element DID-validates the frozen governance sets
-/// (`eligible_voters`, `threshold_signers`) on an imported snapshot.
-///
-/// These sets are the governance engine's quorum denominator, and import
-/// re-derivation replays each resolved proposal's carried votes — an
-/// `O(proposals × votes × voters)` cost. An unbounded set, or a set seeded with
-/// junk DIDs, is therefore a denial-of-service vector. We reject an over-cap set
-/// (same closed `WASM_MEMBER_CAP` style as the other imported collections — the
-/// voter/signer set is a subset of members) and validate every entry as a DID
-/// before any of that work runs.
-fn validate_imported_governance_sets(snap: &WasmContextExportSnapshot) -> Result<(), ScpWasmError> {
+/// These sets are fed to the engine builder (`MajorityVoteEngine::new` /
+/// `ThresholdEngine::new`) during live governance ops and consumed by
+/// `resolve_governance_config` at import; `members` additionally seeds the
+/// imported `ContextRoleState`. The Ed25519 envelope signature authenticates
+/// ORIGIN, not bounds — an unbounded set, or one seeded with junk DIDs, is a
+/// denial-of-service vector. We reject any over-cap set (the same closed
+/// `WASM_MEMBER_CAP` gate the live `add_member` path enforces) and validate
+/// every entry as a DID BEFORE the resolve/build step consumes the sets, so the
+/// cap is a true gate rather than a post-hoc check. Run this ahead of
+/// `resolve_governance_config` on the import path.
+fn validate_imported_governance_and_member_sets(
+    snap: &WasmContextExportSnapshot,
+) -> Result<(), ScpWasmError> {
+    if snap.role_state.members.len() > WASM_MEMBER_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} members, exceeds cap {WASM_MEMBER_CAP}",
+                snap.role_state.members.len()
+            ),
+            code: codes::CTX_2032.to_owned(),
+        });
+    }
+    for did in &snap.role_state.members {
+        validate_imported_did(did, "member DID")?;
+    }
     if snap.eligible_voters.len() > WASM_MEMBER_CAP {
         return Err(ScpWasmError::Context {
             message: format!(
@@ -1463,6 +1473,14 @@ fn validate_imported_governance_sets(snap: &WasmContextExportSnapshot) -> Result
     Ok(())
 }
 
+/// Validates the v3 anti-replay fields (`seen_nonces_v3`,
+/// `executed_proposals`, `resolved_proposals_json`), the `consequence_rules`
+/// vector, and the `cooldown_until` map on an imported snapshot.
+///
+/// This is defense-in-depth: the envelope HMAC already prevents tampering,
+/// but malformed state (empty nonce strings, `NaN` or unbounded timestamps,
+/// over-cap entries, invalid consequence rules) must fail loud rather than
+/// silently propagate into `PerContextState`.
 fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<(), ScpWasmError> {
     // Capacity caps — match live `PerContextState` limits. A malicious
     // export cannot bloat the importer beyond its runtime policy.
@@ -1493,7 +1511,6 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
             code: codes::CTX_2032.to_owned(),
         });
     }
-    validate_imported_governance_sets(snap)?;
     if snap.resolved_proposals_json.len() > WASM_RESOLVED_PROPOSAL_CAP {
         return Err(ScpWasmError::Context {
             message: format!(
@@ -1939,11 +1956,13 @@ impl WasmContextManager {
                     .collect()
             })
             .unwrap_or_default();
-        // NOTE: the majority participation floor is NOT read from the wire. It is
-        // a protocol-FIXED constant (5000 bps), applied in
-        // `build_transient_governance_engine` to match native, which exposes no
-        // configurable participation field. (Caller-configurable participation is
-        // tracked separately.)
+        // NOTE: the majority participation floor is NOT read from the wire. It
+        // defaults to 5000 bps, applied in `build_transient_governance_engine`.
+        // Per ADR-031, `min_participation_bps` is a configurable `Majority` field
+        // (range `(0, 10000]`) whose default is 5000; it is simply not wired
+        // configurable on EITHER bridge today (native hardcodes the same
+        // default), so import has nothing to read. Wiring it later must land on
+        // both bridges together to keep the native↔WASM tally convergent.
 
         // Resolve the request into its frozen, collapse-applied configuration
         // (item C collapse + item D threshold==0 reject). An unknown model name
@@ -5406,13 +5425,16 @@ impl WasmContextManager {
             }
             "majority" => {
                 let voters: Vec<DID> = ctx.eligible_voters.iter().map(|s| DID(s.clone())).collect();
-                // The majority participation floor is a PROTOCOL-FIXED constant
-                // (5000 bps = 50%), NOT a caller-configurable field. Native
-                // hardcodes `MajorityVoteEngine::new(voters, 86_400, 5000, ..)`
-                // (scp-runtime/src/context/state.rs); `GovernanceModel::Majority`
-                // exposes no participation field. Using the same literal 5000 (and
-                // the same 86_400 window) keeps the WASM tally byte-for-byte
-                // convergent with native per §9.9.3.
+                // Majority participation floor: 5000 bps (50%). ADR-031 defines
+                // `min_participation_bps` as a CONFIGURABLE `Majority` field in
+                // `(0, 10000]`; 5000 is its DEFAULT, not a protocol invariant.
+                // Neither bridge currently wires it configurable — native
+                // hardcodes the default in `MajorityVoteEngine::new(voters,
+                // 86_400, 5000, ..)` (scp-runtime/src/context/state.rs) and the
+                // WASM path mirrors that same literal (and the same 86_400
+                // window), keeping the WASM tally byte-for-byte convergent with
+                // native per §9.9.3. A future change wiring the field through
+                // must do so on BOTH bridges in lockstep to preserve convergence.
                 let engine =
                     MajorityVoteEngine::new(voters, 86_400, 5000, Self::no_op_key_resolver())
                         .map_err(map_err)?;
@@ -5503,6 +5525,26 @@ impl WasmContextManager {
         }
         .map_err(|e| Self::map_governance_error(&e, error_code))?;
         Ok(status)
+    }
+
+    /// The canonical wire label for a [`ProposalStatus`] returned to JS callers.
+    ///
+    /// Single source of truth for the status string surfaced by the governance
+    /// vote endpoints (`approve`/`reject`/`withdraw`) and `get_proposal`, so the
+    /// label a caller reads is always the proposal's ACTUAL stored status — the
+    /// same value the engine resolved and persisted — never a pre-decision
+    /// placeholder. The terminal variants carry richer detail (`Rejected.reason`,
+    /// `Invalidated.reason`) on the stored proposal; the wire label is the
+    /// coarse lifecycle state, matching native's status surface.
+    fn proposal_status_label(status: &ProposalStatus) -> &'static str {
+        match status {
+            ProposalStatus::Pending => "Pending",
+            ProposalStatus::Approved => "Approved",
+            ProposalStatus::Rejected { .. } => "Rejected",
+            ProposalStatus::Expired => "Expired",
+            ProposalStatus::Cancelled => "Cancelled",
+            ProposalStatus::Invalidated { .. } => "Invalidated",
+        }
     }
 
     /// Maps a shared [`scp_protocol::context::governance::GovernanceError`] to a
@@ -5848,7 +5890,7 @@ impl WasmContextManager {
                 timestamp: now_secs,
                 signature: Vec::new(),
             });
-            proposal.status = post_status;
+            proposal.status = post_status.clone();
         }
 
         // SECURITY/§9.9.3: native appends GovernanceVoteCast with an EMPTY
@@ -5921,7 +5963,23 @@ impl WasmContextManager {
             }
         }
 
-        Ok(serde_json::json!({ "status": "Pending" }))
+        // Not a quorum-crossing approval. The engine may STILL have resolved the
+        // proposal to a terminal non-`Approved` status — e.g. a past-deadline
+        // approve on a Majority proposal below the participation floor resolves
+        // to `Rejected { InsufficientParticipation }` (the engine auto-resolves
+        // without recording the vote). That resolved status was already mirrored
+        // onto the stored proposal above; mirror the reject path and move the now
+        // terminal proposal pending → resolved so retrieval is consistent, then
+        // report the ACTUAL stored status to the caller. A still-`Pending`
+        // proposal stays pending and reports `Pending`.
+        if !matches!(post_status, ProposalStatus::Pending)
+            && let Some(ctx) = self.contexts.get_mut(context_id)
+            && let Some(mut p) = ctx.pending_proposals.remove(&pid)
+        {
+            p.status = post_status.clone();
+            ctx.insert_resolved_proposal(pid.clone(), p);
+        }
+        Ok(serde_json::json!({ "status": Self::proposal_status_label(&post_status) }))
     }
 
     /// Casts a rejection vote on a pending governance proposal.
@@ -6008,21 +6066,26 @@ impl WasmContextManager {
             now_secs,
         );
 
-        // If the engine resolved the proposal as Rejected, move it from pending
-        // to resolved_proposals (carrying the engine's RejectionReason) for
-        // later retrieval. Otherwise it stays pending.
-        if let ProposalStatus::Rejected { .. } = post_status {
-            if let Some(ctx3) = self.contexts.get_mut(context_id)
-                && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
-            {
-                // Preserve the engine-derived status (already set above).
-                p.status = post_status;
-                ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
-            }
-            return Ok(serde_json::json!({ "status": "Rejected" }));
+        // If the engine resolved the proposal to ANY terminal status, move it
+        // from pending to resolved_proposals (carrying the engine's reason, e.g.
+        // a `RejectionReason` or an `Invalidated` reason) for later retrieval.
+        // A reject vote is normally `Pending` or `Rejected`, but a past-deadline
+        // reject can auto-resolve to `Approved` (turnout now meets the
+        // participation floor with a surviving majority) or `Invalidated`; in
+        // every terminal case we report the proposal's ACTUAL stored status, not
+        // a hardcoded label. A still-`Pending` proposal stays pending and
+        // reports `Pending`. (Unlike the approve path's quorum branch, a reject
+        // vote never executes the action — the rejecter is not an executor —
+        // even when the engine reports `Approved`.)
+        if !matches!(post_status, ProposalStatus::Pending)
+            && let Some(ctx3) = self.contexts.get_mut(context_id)
+            && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
+        {
+            // Preserve the engine-derived status (already set above).
+            p.status = post_status.clone();
+            ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
         }
-
-        Ok(serde_json::json!({ "status": "Pending" }))
+        Ok(serde_json::json!({ "status": Self::proposal_status_label(&post_status) }))
     }
 
     /// Withdraws a previously cast vote on a pending governance proposal.
@@ -6085,14 +6148,7 @@ impl WasmContextManager {
                 proposal.status = post_status.clone();
             }
             ctx.append_log_event(EventType::GovernanceVoteWithdrawn, voter_did, b"", now_secs);
-            let status_str = match post_status {
-                ProposalStatus::Pending => "Pending",
-                ProposalStatus::Approved => "Approved",
-                ProposalStatus::Rejected { .. } => "Rejected",
-                ProposalStatus::Expired => "Expired",
-                ProposalStatus::Cancelled => "Cancelled",
-                ProposalStatus::Invalidated { .. } => "Invalidated",
-            };
+            let status_str = Self::proposal_status_label(&post_status);
             return Ok(serde_json::json!({ "status": status_str }));
         }
 
@@ -6257,14 +6313,7 @@ impl WasmContextManager {
             .collect();
 
         let action_name = proposal.action.variant_name();
-        let status_str = match &proposal.status {
-            ProposalStatus::Pending => "Pending",
-            ProposalStatus::Approved => "Approved",
-            ProposalStatus::Rejected { .. } => "Rejected",
-            ProposalStatus::Expired => "Expired",
-            ProposalStatus::Cancelled => "Cancelled",
-            ProposalStatus::Invalidated { .. } => "Invalidated",
-        };
+        let status_str = Self::proposal_status_label(&proposal.status);
 
         serde_json::json!({
             "proposal_id": proposal_id,
@@ -7570,9 +7619,13 @@ impl WasmContextManager {
         // `role_state.assignments` (assigned role names).
         validate_imported_string(&context_id, "context_id", 256)?;
         validate_imported_did(&snap.role_state.creator_did, "creator_did")?;
-        for did in &snap.role_state.members {
-            validate_imported_did(did, "member DID")?;
-        }
+        // Cap + per-DID-validate the attacker-controlled identity sets
+        // (`role_state.members`, `eligible_voters`, `threshold_signers`) BEFORE
+        // `resolve_governance_config` (below) consumes/clones the governance
+        // sets — so the `WASM_MEMBER_CAP` gate fires ahead of any per-element
+        // resolve/build work, not after it. `members` is otherwise uncapped on
+        // the import path (only the live `add_member` path caps it).
+        validate_imported_governance_and_member_sets(snap)?;
         for assignment in snap.role_state.assignments.values() {
             let role = &assignment.role_name;
             if role.is_empty() || role.len() > 64 {
@@ -10036,6 +10089,49 @@ mod tests {
                     message.contains("exceeds cap"),
                     "unexpected message: {message}"
                 );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// FIX B: `role_state.members.len() > WASM_MEMBER_CAP` → rejected. The
+    /// imported member set is attacker-controlled (the Ed25519 envelope
+    /// authenticates origin, not bounds) and was previously per-DID-validated but
+    /// UNCAPPED on the import path — only the live `add_member` path enforced the
+    /// cap. The consolidated import helper now caps it the same way.
+    #[test]
+    fn validate_governance_and_member_sets_rejects_members_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.role_state.members = (0..=WASM_MEMBER_CAP)
+            .map(|i| format!("did:test:member-{i}"))
+            .collect();
+        let err = validate_imported_governance_and_member_sets(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, codes::CTX_2032);
+                assert!(
+                    message.contains("members") && message.contains("exceeds cap"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// FIX B: an imported member that is not a well-formed DID is rejected by the
+    /// consolidated helper's per-element `validate_imported_did` (defense in
+    /// depth, same as the voter/signer sets).
+    #[test]
+    fn validate_governance_and_member_sets_rejects_invalid_member_did() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.role_state.members = HashSet::from(["not-a-did".to_owned()]);
+        let err = validate_imported_governance_and_member_sets(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref code, .. } => {
+                assert_eq!(code, codes::CTX_2032);
             }
             other => panic!("expected Context error, got: {other:?}"),
         }
@@ -14530,16 +14626,20 @@ mod tests {
         assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
     }
 
-    /// Majority uses the PROTOCOL-FIXED participation/majority math (mirroring
-    /// native's `MajorityVoteEngine::new(voters, 86_400, 5000, ..)`): there is no
-    /// caller-configurable participation field on the WASM path. With a frozen
-    /// 5-voter eligible set, the absolute-majority bar is `approvals * 2 >
-    /// eligible` (3 of 5). Below that bar the proposal stays `Pending`; at/above
-    /// it resolves `Approved` — the same boundary native computes from the fixed
-    /// 5000 floor. This proves a turnout below the majority threshold does NOT
-    /// auto-execute.
+    /// Majority EARLY-APPROVE boundary (the ABSOLUTE-majority bar, NOT the
+    /// deadline participation floor). While voting is still open (before the
+    /// deadline), a Majority proposal resolves `Approved` the instant approvals
+    /// cross `approvals * 2 > eligible` against the FROZEN eligible set. With a
+    /// frozen 5-voter set that bar is 3 of 5: 1/5 and 2/5 stay `Pending` (no
+    /// early execution), 3/5 crosses and auto-executes. This is distinct from the
+    /// `min_participation_bps` floor (default 5000 bps), which the engine applies
+    /// only AT/AFTER the deadline to decide `Approved` vs
+    /// `Rejected { InsufficientParticipation }` for a below-quorum turnout — see
+    /// the past-deadline resolution tests. This test matches native's
+    /// `MajorityVoteEngine::new(voters, 86_400, 5000, ..)` wiring (same default,
+    /// not wired configurable on either bridge).
     #[test]
-    fn pr2b_majority_fixed_floor_resolves_at_native_boundary() {
+    fn pr2b_majority_absolute_majority_boundary_matches_native() {
         let creator = "did:dht:zMajPA";
         let voter_b = "did:dht:zMajPB";
         let voter_c = "did:dht:zMajPC";
@@ -14552,8 +14652,10 @@ mod tests {
             "majority",
             &[creator, voter_b, voter_c, voter_d, voter_e],
         );
-        // Frozen 5-voter denominator; the engine is built with the fixed 5000
-        // floor in `build_transient_governance_engine` — no setter exists.
+        // Frozen 5-voter denominator. The early-approve bar below uses only the
+        // absolute-majority test (`approvals * 2 > eligible`); the engine's
+        // default 5000-bps participation floor governs the SEPARATE deadline
+        // path, exercised by the past-deadline tests.
         ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
         let mut mgr = WasmContextManager::new();
         mgr.test_insert_context(context_id, ctx);
@@ -14594,9 +14696,200 @@ mod tests {
         assert_eq!(
             r3.get("status").and_then(serde_json::Value::as_str),
             Some("Approved"),
-            "3/5 crosses the fixed majority bar -> Approved"
+            "3/5 crosses the absolute-majority bar -> Approved"
         );
         assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 1);
+    }
+
+    /// FIX A: a past-deadline APPROVE vote that the engine auto-resolves to
+    /// `Rejected { InsufficientParticipation }` must report the ACTUAL resolved
+    /// status to the caller — not a stale `Pending`. The returned status must
+    /// equal the status persisted on the (now resolved) stored proposal.
+    ///
+    /// Setup: 5-voter Majority, proposer auto-approves (1/5 recorded). We force
+    /// the proposal past its deadline, then a SECOND voter approves. Majority's
+    /// keyless precheck auto-resolves a past-deadline vote WITHOUT recording it,
+    /// so turnout stays 1/5 = 2000 bps < the 5000 floor ->
+    /// `Rejected { InsufficientParticipation }`. Pre-fix this returned
+    /// `"Pending"` while the stored proposal was `Rejected`.
+    #[test]
+    fn pr2b_approve_past_deadline_reports_resolved_rejected_status() {
+        use scp_protocol::context::governance::{ProposalStatus, RejectionReason};
+
+        let creator = "did:dht:zPdaA";
+        let voter_b = "did:dht:zPdaB";
+        let voter_c = "did:dht:zPdaC";
+        let voter_d = "did:dht:zPdaD";
+        let voter_e = "did:dht:zPdaE";
+        let context_id = "ctx-pr2b-approve-past-deadline";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zPdaTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zPdaTarget");
+        let pid = pr2b_pid(0x66);
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+
+        // Force the proposal past its voting deadline (1 = far in the past on the
+        // native test clock, which reads real SystemTime ~1.7e9s).
+        mgr.contexts
+            .get_mut(context_id)
+            .and_then(|c| c.pending_proposals.get_mut(&pid))
+            .expect("proposal pending")
+            .voting_deadline = 1;
+
+        let r = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve past deadline must not error (auto-resolves)");
+
+        // The caller now sees the resolved status, not a stale Pending.
+        assert_eq!(
+            r.get("status").and_then(serde_json::Value::as_str),
+            Some("Rejected"),
+            "past-deadline approve resolving below the floor must report Rejected"
+        );
+
+        // No execution occurred (the proposal was rejected, not approved).
+        assert_eq!(pr2b_executed_leaf_count(&mgr, context_id), 0);
+
+        // The returned status matches the STORED resolved status, and the
+        // proposal moved pending -> resolved carrying the engine reason.
+        let stored = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&pid))
+            .expect("proposal moved to resolved");
+        assert_eq!(
+            stored.status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::InsufficientParticipation
+            },
+            "stored status must be the engine-resolved Rejected reason"
+        );
+        assert_eq!(
+            r.get("status").and_then(serde_json::Value::as_str),
+            Some(WasmContextManager::proposal_status_label(&stored.status)),
+            "returned status label must equal the stored proposal's status label"
+        );
+        assert!(
+            !mgr.contexts
+                .get(context_id)
+                .is_some_and(|c| c.pending_proposals.contains_key(&pid)),
+            "a resolved proposal must not linger in pending_proposals"
+        );
+    }
+
+    /// FIX A (reject path): a past-deadline REJECT vote whose at-deadline tally
+    /// resolves to `Approved` (turnout meets the participation floor with
+    /// approvals outnumbering rejections) must report the ACTUAL `Approved`
+    /// status — not `Pending` (the pre-fix reject path only special-cased
+    /// `Rejected`). A reject vote NEVER executes the action even when the engine
+    /// reports `Approved`, so no executed leaf is minted.
+    ///
+    /// Setup: 5-voter Majority. Record 2 approvals + 1 rejection while pending
+    /// (participation 3/5 = 6000 bps >= 5000 floor; approvals 2 do not cross the
+    /// absolute-majority early bar since `2 * 2 > 5` is false; 1 rejection is
+    /// below the early-rejection threshold `ceil(5/2) = 3`). Force past the
+    /// deadline, then a fourth eligible voter rejects: the keyless precheck
+    /// auto-resolves on the RECORDED votes -> approvals(2) > rejections(1) ->
+    /// `Approved`.
+    #[test]
+    fn pr2b_reject_past_deadline_reports_resolved_approved_status() {
+        use scp_protocol::context::governance::ProposalStatus;
+
+        let creator = "did:dht:zPdrA";
+        let voter_b = "did:dht:zPdrB";
+        let voter_c = "did:dht:zPdrC";
+        let voter_d = "did:dht:zPdrD";
+        let voter_e = "did:dht:zPdrE";
+        let context_id = "ctx-pr2b-reject-past-deadline";
+        let mut ctx = pr2b_multiparty_ctx(
+            context_id,
+            creator,
+            "majority",
+            &[creator, voter_b, voter_c, voter_d, voter_e],
+        );
+        ctx.test_set_eligible_voters(&[creator, voter_b, voter_c, voter_d, voter_e]);
+        let mut mgr = WasmContextManager::new();
+        mgr.test_insert_context(context_id, ctx);
+        mgr.test_insert_member_pub(context_id, "did:dht:zPdrTarget", "member");
+
+        let action = pr2b_change_role_action("did:dht:zPdrTarget");
+        let pid = pr2b_pid(0x77);
+        // creator auto-approves -> 1 approval.
+        mgr.propose_governance_action(context_id, creator, &pid, &action)
+            .expect("propose ok");
+        // voter_b approves -> 2 approvals (2*2 > 5 is false: still Pending).
+        let r_b = mgr
+            .approve_governance_proposal(context_id, &pid, voter_b)
+            .expect("approve b");
+        assert_eq!(
+            r_b.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "2/5 approvals stay Pending"
+        );
+        // voter_c rejects -> 1 rejection (1 >= ceil(5/2)=3 is false: still Pending).
+        let r_c = mgr
+            .reject_governance_proposal(context_id, &pid, voter_c)
+            .expect("reject c");
+        assert_eq!(
+            r_c.get("status").and_then(serde_json::Value::as_str),
+            Some("Pending"),
+            "1 rejection is below the early-rejection threshold -> Pending"
+        );
+
+        // Force the proposal past its deadline.
+        mgr.contexts
+            .get_mut(context_id)
+            .and_then(|c| c.pending_proposals.get_mut(&pid))
+            .expect("proposal pending")
+            .voting_deadline = 1;
+
+        // voter_d rejects past the deadline -> auto-resolve on recorded votes:
+        // approvals(2) > rejections(1) with quorum met -> Approved.
+        let r_d = mgr
+            .reject_governance_proposal(context_id, &pid, voter_d)
+            .expect("reject past deadline must not error (auto-resolves)");
+        assert_eq!(
+            r_d.get("status").and_then(serde_json::Value::as_str),
+            Some("Approved"),
+            "past-deadline reject resolving to a surviving majority must report Approved"
+        );
+
+        // A reject vote never executes the action, even when the tally is Approved.
+        assert_eq!(
+            pr2b_executed_leaf_count(&mgr, context_id),
+            0,
+            "a reject vote must not execute the governance action"
+        );
+
+        // Returned status matches the stored resolved status, and the proposal
+        // moved pending -> resolved.
+        let stored = mgr
+            .contexts
+            .get(context_id)
+            .and_then(|c| c.resolved_proposals.get(&pid))
+            .expect("proposal moved to resolved");
+        assert_eq!(stored.status, ProposalStatus::Approved);
+        assert_eq!(
+            r_d.get("status").and_then(serde_json::Value::as_str),
+            Some(WasmContextManager::proposal_status_label(&stored.status)),
+            "returned status label must equal the stored proposal's status label"
+        );
+        assert!(
+            !mgr.contexts
+                .get(context_id)
+                .is_some_and(|c| c.pending_proposals.contains_key(&pid)),
+            "a resolved proposal must not linger in pending_proposals"
+        );
     }
 
     /// Unanimity: every frozen voter must approve. A single rejection defeats it.
