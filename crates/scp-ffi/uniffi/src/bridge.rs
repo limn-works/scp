@@ -987,6 +987,64 @@ pub enum ScpError {
     /// Input validation failed (malformed data, schema mismatch, constraint violation).
     #[error("validation error [{code}]: {msg}")]
     Validation { msg: String, code: String },
+
+    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+    ///
+    /// Surfaces the `Aborted` terminal of
+    /// `Supervisor::start_cross_context_tool_invocation_saga` (a §6.2.4
+    /// authorization / freshness / rate-limit / co-residency rejection — also
+    /// the §6.2.4 *Caller authentication* mismatch this bridge enforces before
+    /// the saga runs). Carries the rate-limit back-off hint STRUCTURALLY
+    /// (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
+    /// `None` (NEVER `0`) means no precise back-off instant exists (a
+    /// token-bucket hard limit, or a non-rate-limit rejection) — `0` would read
+    /// as "retry immediately" and re-trip the same hard limit. `code` is the
+    /// canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
+    /// / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
+    /// Swift `msg:` label — the `UniFFI` field-name convention every variant
+    /// here follows).
+    #[error("saga aborted [{code}]: {msg}")]
+    SagaAborted {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        msg: String,
+        /// The canonical `SCP-SAGA-13xxx` code.
+        code: String,
+        /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+        retry_after_ms: Option<u64>,
+    },
+
+    /// A §6.2.4 saga exhausted its Commit retries and may have diverged.
+    ///
+    /// Surfaces the `NeedsRepair` terminal (Commit-retry exhausted — the saga
+    /// may have PARTIALLY committed, a divergence; ADR-049 §3a). Carries the
+    /// durable `saga_id` operator-repair handle (`SCP-SAGA-13065`). Maps to
+    /// Swift `ScpError.SagaNeedsRepair` / Kotlin `ScpException.SagaNeedsRepair`.
+    #[error("saga needs repair [{code}]: {msg}")]
+    SagaNeedsRepair {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        msg: String,
+        /// The canonical `SCP-SAGA-13065` code.
+        code: String,
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: String,
+    },
+
+    /// A §6.2.4 saga's participant context set overlapped an in-flight saga.
+    ///
+    /// Surfaces the `Busy` terminal (the participant context set overlapped an
+    /// in-flight saga's set — spec §5.15.4 per-participant-context-set gating;
+    /// retry with back-off). Carries the contended context id
+    /// (`SCP-SAGA-13066`). Maps to Swift `ScpError.SagaBusy` / Kotlin
+    /// `ScpException.SagaBusy`.
+    #[error("saga busy [{code}]: {msg}")]
+    SagaBusy {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        msg: String,
+        /// The canonical `SCP-SAGA-13066` code.
+        code: String,
+        /// The shared context id that forced serialization.
+        contended_context: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,6 +1944,46 @@ pub struct ToolVerificationResult {
     pub passed: bool,
     /// Failure messages for vectors that did not pass. Empty on success.
     pub failures: Vec<String>,
+}
+
+/// The committed terminal of a §6.2.4 cross-context tool-invocation saga
+/// (ADR-049 §3a).
+///
+/// Returned by [`crate::scp::Scp::tool_invoke_cross_context_saga`] on a
+/// `Committed` terminal. Every NON-committed terminal raises one of the typed
+/// saga errors ([`ScpError::SagaAborted`] / [`ScpError::SagaNeedsRepair`] /
+/// [`ScpError::SagaBusy`]) instead.
+///
+/// Carries the supervisor-minted `saga_id` plus — for the committed
+/// cross-context invocation — the target's signed receipt and the captured
+/// tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+/// is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+/// receipt's canonical `output_jcs` bytes (the exact bytes the caller side
+/// recorded a hash of). Both are surfaced as `bytes` (Swift `Data` / Kotlin
+/// `ByteArray`) so a caller can verify the receipt signature and recompute
+/// `output_hash` without a re-serialization step.
+///
+/// Generated as `data class SagaResult` (Kotlin) / `struct SagaResult` (Swift).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SagaResult {
+    /// The durable saga identifier (supervisor-minted, never a caller input).
+    pub saga_id: String,
+    /// The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+    ///
+    /// The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
+    /// Signing Key (the key held by its registered handle on this instance).
+    /// The in-saga receipt verification is INTEGRITY-ONLY: it verifies the
+    /// signature against the very key the saga FSM handed to side B, NOT an
+    /// independent resolution that that key is governance-authorized. A
+    /// consumer that re-presents this `receipt` as cross-node provenance
+    /// therefore MUST independently resolve that the signing key is the target
+    /// context's governance-authorized Active Signing Key — especially once
+    /// cross-node child-bridge transport lands, where a co-resident signer is
+    /// trusted only within this instance.
+    pub receipt: Option<Vec<u8>>,
+    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// or `None`.
+    pub output: Option<Vec<u8>>,
 }
 
 /// Transport connection status.
@@ -5304,6 +5402,135 @@ async fn resolve_uniffi_signing_key(
             .to_owned(),
         code: codes::CTX_2040.to_owned(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — bridge helpers
+// ---------------------------------------------------------------------------
+
+/// Maps a `SagaError` terminal (the typed §6.2.4 terminal space) onto the
+/// bridge's typed saga error variants, reading every structured datum
+/// STRUCTURALLY off the variant — never by re-parsing a message string.
+///
+/// - `Aborted { reason, code, message }` → [`ScpError::SagaAborted`].
+///   `retry_after_ms` is read directly off `SagaAbortReason::RateLimited`
+///   (an `Option<u64>`); a plain `Rejected` carries `None`. `None` is
+///   propagated, NEVER coerced to `0` (a `0` would read as "retry
+///   immediately" and re-trip the same hard limit). `code` is formatted as
+///   the canonical `SCP-SAGA-{code}` string from the numeric discriminant.
+/// - `NeedsRepair { saga_id, message }` → [`ScpError::SagaNeedsRepair`]
+///   carrying the durable operator-repair handle (`SCP-SAGA-13065`).
+/// - `Busy { contended_context, message }` → [`ScpError::SagaBusy`]
+///   (`SCP-SAGA-13066`).
+fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
+    use scp_core::context::supervisor::{SagaAbortReason, SagaError};
+    match err {
+        SagaError::Aborted {
+            reason,
+            code,
+            message,
+        } => {
+            let retry_after_ms = match reason {
+                SagaAbortReason::RateLimited { retry_after_ms } => retry_after_ms,
+                SagaAbortReason::Rejected => None,
+            };
+            ScpError::SagaAborted {
+                msg: message,
+                code: format!("SCP-SAGA-{code}"),
+                retry_after_ms,
+            }
+        }
+        SagaError::NeedsRepair { saga_id, message } => ScpError::SagaNeedsRepair {
+            msg: message,
+            code: codes::SAGA_13065.to_owned(),
+            saga_id: saga_id.0,
+        },
+        SagaError::Busy {
+            contended_context,
+            message,
+        } => ScpError::SagaBusy {
+            msg: message,
+            code: codes::SAGA_13066.to_owned(),
+            contended_context,
+        },
+    }
+}
+
+/// Decodes the §6.2.4 envelope nonce from its canonical 32-char hex form into
+/// the 16-byte value, FAIL-CLOSED.
+///
+/// The nonce is a 16-byte value carried as a hex string — the one canonical
+/// wire form (§6.2.4 wire envelope). Any other length is a malformed envelope,
+/// NOT a "pad it" situation. Both failure modes surface as
+/// [`ScpError::Validation`] (`SCP-VALID-7001`).
+fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError> {
+    let bytes = hex::decode(asserted_nonce_hex).map_err(|e| ScpError::Validation {
+        msg: format!(
+            "asserted_nonce_hex is not valid hex: {e} — supply the 16-byte §6.2.4 envelope \
+             nonce as a 32-char lowercase-hex string"
+        ),
+        code: codes::VALID_7001.to_owned(),
+    })?;
+    <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| ScpError::Validation {
+        msg: format!(
+            "asserted_nonce_hex must decode to exactly 16 bytes (32 hex chars), got {} bytes",
+            bytes.len()
+        ),
+        code: codes::VALID_7001.to_owned(),
+    })
+}
+
+/// Enforces the §6.2.4 *Caller authentication* binding (normative — §6.2.4 +
+/// ADR-049 §3a) BEFORE the saga runs.
+///
+/// `caller_did` / `caller_context_id` MUST be the channel-authenticated
+/// identity of the transport leg, never an envelope-asserted free value. For
+/// the co-resident `UniFFI` bridge the "channel-authenticated principal" is an
+/// identity THIS bridge instance hosts — one present in its per-instance
+/// identity custody registry (populated only by `identity_create*` on this
+/// instance). Both axes are enforced here:
+///
+///   (a) `caller_did` is hosted/authenticated by this bridge instance, AND
+///   (b) `caller_did` is a member of the named `caller_context_id`.
+///
+/// A mismatch on either axis ⇒ a typed `Rejected`-flavored [`ScpError::SagaAborted`]
+/// (the §6.2.4 "mismatch ⇒ Rejected" terminal), carrying the registered
+/// caller-axis code `SCP-SAGA-13050`. The supervisor's own gate 1 ALSO checks
+/// membership, but membership alone is necessary-not-sufficient (it does not
+/// prove the request leg is authenticated AS that member) — so axis (a) is the
+/// load-bearing addition this seam contributes. Enforcing here, before the
+/// entry point, also means the saga never observes an unauthenticated caller.
+async fn enforce_caller_principal_binding(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    caller_context_id: &str,
+    caller_did: &str,
+) -> Result<(), ScpError> {
+    if !identity_custody_registry(bi).contains_key(caller_did) {
+        return Err(ScpError::SagaAborted {
+            msg: format!(
+                "caller_did '{caller_did}' is not an identity hosted by this bridge instance — \
+                 a cross-context saga's caller MUST be the channel-authenticated principal (an \
+                 identity created on this instance), not an envelope-asserted value (§6.2.4 \
+                 Caller authentication)"
+            ),
+            code: codes::SAGA_13050.to_owned(),
+            retry_after_ms: None,
+        });
+    }
+
+    if !supervisor.is_member(caller_context_id, caller_did).await {
+        return Err(ScpError::SagaAborted {
+            msg: format!(
+                "caller_did '{caller_did}' is hosted by this bridge but is not a member of \
+                 caller_context_id '{caller_context_id}' — not authorized to initiate a \
+                 cross-context saga over it (§6.2.4 Caller authentication)"
+            ),
+            code: codes::SAGA_13050.to_owned(),
+            retry_after_ms: None,
+        });
+    }
+    Ok(())
 }
 
 /// Signs the §23.16.8 context-export snapshot digest via the exporter
@@ -12012,6 +12239,229 @@ impl Scp {
             .await
             .map_err(|e| ScpError::Tool {
                 msg: format!("tokio task join error during cross-context invocation: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// (spec §6.2.4, ADR-049 §3a).
+    ///
+    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// single-context-side path), this drives the full §6.2.4 cross-context
+    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
+    /// the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
+    /// side records its own event-log entry. Both contexts MUST be co-resident
+    /// in this bridge instance (the cross-node child-bridge transport is
+    /// separate future work).
+    ///
+    /// # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+    ///
+    /// `caller_did` is bound to the bridge-authenticated principal: it MUST be
+    /// an identity THIS bridge instance hosts (created here via identity
+    /// creation) AND a member of the caller context. A mismatch raises
+    /// [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
+    /// saga never observes an unauthenticated caller. The `asserted_nonce_hex`
+    /// / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
+    /// (the target validates them; they are not minted here).
+    ///
+    /// # Arguments
+    ///
+    /// * `source_handle` — The initiating (caller) context handle.
+    /// * `target_handle` — The executing (target) context handle.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `tool_registration_id` — The tool to invoke across the interface.
+    /// * `input_json` — Tool input as a JSON string (schema-checked
+    ///   target-side); parsed to a JSON value at the boundary.
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+    ///   hex string (the freshness/dedup token).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+    ///   the target re-derives `+1`).
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B. `None` for an ungated tool.
+    ///
+    /// # Returns
+    ///
+    /// A [`SagaResult`] on the committed terminal, carrying the
+    /// supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+    /// captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+    /// never an input.
+    ///
+    /// # Errors
+    ///
+    /// Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
+    /// Prepare-phase rejection — authorization, freshness, rate limit, or
+    /// co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+    /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+    /// handle), or [`ScpError::SagaBusy`] (the participant context set
+    /// overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
+    /// if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
+    /// decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
+    /// JSON.
+    ///
+    /// See spec §6.2.4 and ADR-049 §3a.
+    #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
+    pub async fn tool_invoke_cross_context_saga(
+        &self,
+        source_handle: Arc<ContextHandle>,
+        target_handle: Arc<ContextHandle>,
+        caller_did: String,
+        tool_registration_id: String,
+        input_json: String,
+        asserted_nonce_hex: String,
+        timestamp_ms: u64,
+        chain_depth: u8,
+        ucan_proof_id: Option<String>,
+    ) -> Result<SagaResult, ScpError> {
+        use scp_core::context::supervisor::{CrossContextToolInvocationRequest, SagaSigningKeys};
+
+        // Per-instance handle affinity: both participant handles MUST have been
+        // minted by THIS bridge instance (mirrors `tool_invoke_cross_context`).
+        // A foreign handle maps to `ScpError::Permission` (`SCP-PERM-3030`).
+        self.inner
+            .core
+            .check_handle(source_handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(target_handle.instance_id())
+            .map_err(ScpError::from)?;
+
+        // Derive the participant id strings from the owned, instance-affine
+        // handles — never a caller-asserted free string. The `validate_*`
+        // calls below are harmless defense-in-depth over the derived ids.
+        let caller_context_id = source_handle.context_id.clone();
+        let target_context_id = target_handle.context_id.clone();
+
+        validate_context_id(&caller_context_id)?;
+        validate_context_id(&target_context_id)?;
+        validate_did(&caller_did)?;
+        validate_tool_id(&tool_registration_id)?;
+
+        let asserted_nonce = decode_asserted_nonce(&asserted_nonce_hex)?;
+        let input_value: serde_json::Value =
+            serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                msg: format!("invalid input JSON: {e}"),
+                code: codes::TOOL_6002.to_owned(),
+            })?;
+
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                // Caller-principal binding (§6.2.4 *Caller authentication*) —
+                // BEFORE the saga runs, so the supervisor never observes an
+                // unauthenticated caller. Clone the supervisor `Arc` out of the
+                // borrow so it outlives the later `bi`-borrowing helper calls
+                // and the `'static` executor.
+                let supervisor = Arc::clone(bi.context_manager_or_error()?);
+                enforce_caller_principal_binding(&bi, &supervisor, &caller_context_id, &caller_did)
+                    .await?;
+
+                // ----- Chokepoint (ADR-056): id STRING → [u8; 32] ------------
+                //
+                // MANDATORY: convert via the canonical cross-crate keying
+                // resolver, which decodes a real 64-hex id rather than
+                // re-hashing it. The producer does `hex::encode(wire)` for
+                // actor lookup, so a raw SHA-256 of a 64-hex id here would
+                // double-hash and key the wrong (non-existent) actor slot,
+                // surfacing as a spurious ContextNotRegistered abort.
+                let caller_context_bytes =
+                    scp_core::context::state::context_id_to_bytes(&caller_context_id);
+                let target_context_bytes =
+                    scp_core::context::state::context_id_to_bytes(&target_context_id);
+
+                // ----- Signing keys: each context's Active Signing Key -------
+                //
+                // Resolved DIRECTLY from the owned, instance-affine handles —
+                // no `context_handle_registry` lookup. Each context signs its
+                // own side (target → receipt; each → its own divergence
+                // marker) under its registered Active Signing Key.
+                let target_signing_key = resolve_uniffi_signing_key(&target_handle).await?;
+                let caller_signing_key = resolve_uniffi_signing_key(&source_handle).await?;
+
+                // ----- Executor: snapshot the TARGET context's tool handler --
+                //
+                // Mirrors `tool_invoke_cross_context`: snapshot the registered
+                // handler closure (an `Arc<dyn Fn>` — cloning is a refcount
+                // bump) OUTSIDE the runtime call, then move it into the
+                // `FnOnce` executor the supervisor runs supervisor-side at
+                // Commit-B (off the actor mailbox). Read directly off the
+                // owned `target_handle` — no DashMap `Ref` is held across the
+                // `tool_handlers.lock().await`. Falls back to a schema-only
+                // echo when no handler is registered, matching the synchronous
+                // cross-context path. The supervisor validates the output
+                // against the tool's registered output schema at Commit-B, so
+                // the executor only produces the value.
+                let handler = target_handle
+                    .tool_handlers
+                    .lock()
+                    .await
+                    .get(&tool_registration_id)
+                    .cloned();
+                let tool_id_for_echo = tool_registration_id.clone();
+                let target_ctx_for_echo = target_context_id.clone();
+                let caller_did_for_echo = caller_did.clone();
+                let executor = move |value: serde_json::Value| {
+                    let handler = handler.clone();
+                    let echo_input = value.clone();
+                    async move {
+                        handler.map_or_else(
+                            || {
+                                Ok(serde_json::json!({
+                                    "tool": tool_id_for_echo,
+                                    "target_context": target_ctx_for_echo,
+                                    "caller_did": caller_did_for_echo,
+                                    "status": "validated",
+                                    "input_valid": true,
+                                    "validated_input": echo_input,
+                                }))
+                            },
+                            |h| {
+                                h(value).map_err(|e| {
+                                    format!(
+                                        "cross-context saga tool handler for \
+                                         '{tool_id_for_echo}' failed: {e}"
+                                    )
+                                })
+                            },
+                        )
+                    }
+                };
+
+                let request = CrossContextToolInvocationRequest {
+                    caller_context_id: caller_context_bytes,
+                    target_context_id: target_context_bytes,
+                    caller_did: scp_identity::DID(caller_did),
+                    tool_registration_id,
+                    ucan_proof_id,
+                    input: input_value,
+                    asserted_chain_depth: chain_depth,
+                    asserted_nonce,
+                    asserted_timestamp_ms: timestamp_ms,
+                };
+
+                let output = supervisor
+                    .start_cross_context_tool_invocation_saga(
+                        request,
+                        SagaSigningKeys {
+                            target: &target_signing_key,
+                            caller: &caller_signing_key,
+                        },
+                        executor,
+                    )
+                    .await
+                    .map_err(map_saga_error)?;
+
+                Ok(SagaResult {
+                    saga_id: output.saga_id.0,
+                    receipt: output.receipt,
+                    output: output.output,
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during cross-context saga: {e}"),
                 code: codes::TOOL_6009.to_owned(),
             })?
     }
@@ -19992,5 +20442,937 @@ mod tests {
             err_str.contains(codes::IDENT_1017),
             "expected SCP-IDENT-1017, got: {err_str}"
         );
+    }
+
+    // ====================================================================
+    // Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — UniFFI export
+    // ====================================================================
+    //
+    // The bridge's added responsibilities on top of the supervisor producer
+    // (`start_cross_context_tool_invocation_saga`) are: the typed terminal →
+    // typed `ScpError` mapping (`map_saga_error`), fail-closed nonce decoding
+    // (`decode_asserted_nonce`), and — exercised by the end-to-end test below —
+    // the §6.2.4 *Caller authentication* binding, the ADR-056 chokepoint, and
+    // per-context Active Signing Key resolution, driven to a real `Committed`
+    // terminal through a governance-established `ToolInterface`.
+
+    use scp_core::context::supervisor::{
+        SagaAbortReason, SagaError as CoreSagaError, SagaId as CoreSagaId,
+    };
+
+    /// `map_saga_error` — a rate-limited abort preserves `retry_after_ms =
+    /// Some(ms)` STRUCTURALLY and formats the numeric `code` as the canonical
+    /// `SCP-SAGA-{code}` string. The producer's actual terminal behavior is
+    /// covered in `scp-runtime`; here we test ONLY the bridge's mapping.
+    #[test]
+    fn map_saga_error_rate_limited_preserves_retry_after_ms() {
+        let mapped = map_saga_error(CoreSagaError::Aborted {
+            reason: SagaAbortReason::RateLimited {
+                retry_after_ms: Some(2500),
+            },
+            code: 13026,
+            message: "inbound rate limit exceeded".to_owned(),
+        });
+        match mapped {
+            ScpError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, "SCP-SAGA-13026");
+                assert_eq!(retry_after_ms, Some(2500));
+            }
+            other => panic!("expected SagaAborted, got {other:?}"),
+        }
+    }
+
+    /// `map_saga_error` — a rate-limited abort with NO precise back-off instant
+    /// preserves `retry_after_ms = None`, NEVER coerced to `Some(0)` (a `0`
+    /// would read as "retry immediately" and re-trip the same hard limit).
+    #[test]
+    fn map_saga_error_rate_limited_none_is_not_zero() {
+        let mapped = map_saga_error(CoreSagaError::Aborted {
+            reason: SagaAbortReason::RateLimited {
+                retry_after_ms: None,
+            },
+            code: 13026,
+            message: "hard limit, no precise back-off".to_owned(),
+        });
+        match mapped {
+            ScpError::SagaAborted { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, None, "None must NOT be coerced to Some(0)");
+            }
+            other => panic!("expected SagaAborted, got {other:?}"),
+        }
+    }
+
+    /// `map_saga_error` — a plain (non-rate-limit) `Rejected` abort carries
+    /// `retry_after_ms = None`.
+    #[test]
+    fn map_saga_error_rejected_has_no_retry_hint() {
+        let mapped = map_saga_error(CoreSagaError::Aborted {
+            reason: SagaAbortReason::Rejected,
+            code: 13050,
+            message: "caller not a member".to_owned(),
+        });
+        match mapped {
+            ScpError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, "SCP-SAGA-13050");
+                assert_eq!(retry_after_ms, None);
+            }
+            other => panic!("expected SagaAborted, got {other:?}"),
+        }
+    }
+
+    /// `map_saga_error` — `NeedsRepair` preserves the durable `saga_id`
+    /// operator-repair handle and the fixed terminal code `SCP-SAGA-13065`.
+    #[test]
+    fn map_saga_error_needs_repair_preserves_saga_id() {
+        let mapped = map_saga_error(CoreSagaError::NeedsRepair {
+            saga_id: CoreSagaId("saga-abc-123".to_owned()),
+            message: "commit retries exhausted".to_owned(),
+        });
+        match mapped {
+            ScpError::SagaNeedsRepair { code, saga_id, .. } => {
+                assert_eq!(code, codes::SAGA_13065);
+                assert_eq!(saga_id, "saga-abc-123");
+            }
+            other => panic!("expected SagaNeedsRepair, got {other:?}"),
+        }
+    }
+
+    /// `map_saga_error` — `Busy` preserves the contended context id and the
+    /// fixed terminal code `SCP-SAGA-13066`.
+    #[test]
+    fn map_saga_error_busy_preserves_contended_context() {
+        let mapped = map_saga_error(CoreSagaError::Busy {
+            contended_context: "ctx-shared-99".to_owned(),
+            message: "participant set overlaps an in-flight saga".to_owned(),
+        });
+        match mapped {
+            ScpError::SagaBusy {
+                code,
+                contended_context,
+                ..
+            } => {
+                assert_eq!(code, codes::SAGA_13066);
+                assert_eq!(contended_context, "ctx-shared-99");
+            }
+            other => panic!("expected SagaBusy, got {other:?}"),
+        }
+    }
+
+    /// `decode_asserted_nonce` is fail-closed: a wrong-length input (8 bytes,
+    /// not 16) is a malformed §6.2.4 envelope, surfaced as `ScpError::Validation`
+    /// (`SCP-VALID-7001`) — the bridge does NOT pad, truncate, or accept any
+    /// non-canonical form.
+    #[test]
+    fn decode_asserted_nonce_wrong_length_fails_closed() {
+        // 8 bytes, not 16.
+        let err = decode_asserted_nonce("0011223344556677")
+            .expect_err("a wrong-length nonce must be rejected fail-closed");
+        match err {
+            ScpError::Validation { msg, code } => {
+                assert_eq!(code, codes::VALID_7001);
+                assert!(
+                    msg.contains("16 bytes"),
+                    "message must explain the 16-byte requirement, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `decode_asserted_nonce` is fail-closed on non-hex input too.
+    #[test]
+    fn decode_asserted_nonce_non_hex_fails_closed() {
+        let err = decode_asserted_nonce("not-hex-at-all-zz")
+            .expect_err("non-hex must be rejected fail-closed");
+        match err {
+            ScpError::Validation { code, msg } => {
+                assert_eq!(code, codes::VALID_7001);
+                // VALID_7001 is shared with the wrong-length arm; pin the
+                // non-hex arm specifically (mirrors how the wrong-length test
+                // asserts "16 bytes").
+                assert!(
+                    msg.contains("is not valid hex"),
+                    "must reject for the non-hex arm specifically; got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// A valid 16-byte nonce as a 32-char hex string.
+    fn saga_nonce_hex() -> String {
+        "00112233445566778899aabbccddeeff".to_owned()
+    }
+
+    /// Installs a resolver backed by a caller-retained in-memory DHT client on
+    /// `bi` and returns that client, so the e2e test can seed the owner's DID
+    /// document into the SAME store the supervisor's governance key resolver
+    /// reads from.
+    ///
+    /// Why this is test scaffolding, not a production gap masked: the `UniFFI`
+    /// bridge's `ensure_did_resolver_initialized_on` builds its resolver over a
+    /// FRESH, unretained `InMemoryDhtClient` and `identity_create` publishes the
+    /// minted document only to a throwaway local `DidDht` — in a unit harness
+    /// the bridge op "builds a fresh DHT per call, so its `resolve_did` cannot
+    /// see the create-time publish" (see `rotate_key_signer_is_wired_over_callback_custody`).
+    /// The cross-process E2E covers the wired path. To drive a REAL `Committed`
+    /// terminal in-crate — which requires the supervisor to resolve the
+    /// proposer's published key for governance vote verification — the test must
+    /// itself seed the document into a resolver-visible store, exactly the
+    /// `publish_to_resolver_dht_for` step the PyO3/NAPI production
+    /// `identity_create` performs. Installing the resolver BEFORE the first
+    /// identity creation makes `ensure_did_resolver_initialized_on` a no-op
+    /// (it skips when a resolver is already present), so this client is the one
+    /// the supervisor snapshots.
+    fn install_seedable_resolver(
+        bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    ) -> Arc<scp_identity::InMemoryDhtClient> {
+        let dht_client = Arc::new(scp_identity::InMemoryDhtClient::new());
+        let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
+            Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            Arc::clone(&dht_client),
+            Arc::new(scp_identity::DidCache::new()),
+            Vec::new(),
+        ));
+        bi.set_did_resolver(resolver, tokio::runtime::Handle::current());
+        dht_client
+    }
+
+    /// Publishes `owner_identity`'s DID document into `dht_client` (the
+    /// resolver-visible store) by signing the BEP44 record with the identity's
+    /// in-memory custody. Mirrors the production `publish_to_resolver_dht_for`
+    /// step so the supervisor's governance key resolver can resolve the proposer
+    /// key during single-admin vote verification.
+    async fn seed_owner_document_into_resolver(
+        owner_identity: &Identity,
+        dht_client: &Arc<scp_identity::InMemoryDhtClient>,
+    ) {
+        use scp_identity::dht_client::DhtClient as _;
+        use scp_platform::traits::KeyCustody as _;
+
+        let identity = owner_identity
+            .core_id
+            .as_ref()
+            .expect("in-memory owner retains its ScpIdentity");
+        let document = owner_identity
+            .core_document
+            .as_ref()
+            .expect("in-memory owner retains its DID document");
+        let custody = owner_identity
+            .in_memory_custody
+            .as_ref()
+            .expect("in-memory owner retains its custody");
+
+        let doc_json = document.to_json().expect("document serializes to JSON");
+        let value = doc_json.as_bytes();
+        let public_key =
+            scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
+        let seq: u64 = 1;
+        let signable = scp_identity::dht::bep44_signable(value, seq);
+        let sig_bytes = custody
+            .0
+            .sign(&identity.identity_key, &signable)
+            .await
+            .expect("identity custody signs the BEP44 record")
+            .into_bytes();
+        let signature: [u8; 64] = sig_bytes.try_into().expect("Ed25519 signature is 64 bytes");
+        dht_client
+            .publish(&public_key, &signature, value, seq)
+            .await
+            .expect("publish into the resolver-visible store");
+    }
+
+    /// Builds a `ContextParams` carrying the given capability ceiling under
+    /// single-admin governance (so a governance proposal auto-executes), an
+    /// Encrypted context (the saga chokepoint round-trips a real 64-hex id), and
+    /// otherwise-default fields. Mirrors the `PyO3` e2e's `params_a` / `params_b`.
+    fn saga_context_params(ceiling: &[&str]) -> ContextParams {
+        ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            governance: GovernanceModel::SingleAdmin,
+            memory_scope: MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+            min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
+            economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
+        }
+    }
+
+    /// The numeric `{sum, ok}` output schema the handler-backed e2e uses (2
+    /// output properties — clears the §9.2.1 specificity floor of 2 — so
+    /// Commit-B's output-schema validation accepts the `{sum:42, ok:1}`
+    /// handler response).
+    fn saga_numeric_output_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sum": {"type": "number"},
+                "ok": {"type": "number"}
+            }
+        })
+    }
+
+    /// A PERMISSIVE output schema (2 declared properties drawn from the
+    /// schema-only echo shape — `{status, input_valid}` — and NO `required` /
+    /// `additionalProperties:false`) so the no-handler echo object
+    /// (`{tool, target_context, caller_did, status, input_valid, validated_input}`)
+    /// validates at Commit-B. Used by the echo-fallback Committed test.
+    fn saga_permissive_echo_output_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "input_valid": {"type": "boolean"}
+            }
+        })
+    }
+
+    /// Serializes a `RegisterTool` governance action for the saga tool carrying
+    /// the given `output_schema`. The input schema mirrors the `PyO3` e2e (2
+    /// input properties — clears the §9.2.1 specificity floor of 2).
+    /// `implementation_hash` is a fixed 32-byte array (serde wants a 32-element
+    /// JSON number array — `json!` has no array-repeat sugar).
+    fn saga_register_tool_action_json_with_output(
+        tool_id: &str,
+        tool_name: &str,
+        owner: &str,
+        output_schema: serde_json::Value,
+    ) -> String {
+        let impl_hash = serde_json::Value::from(vec![0u8; 32]);
+        let register_action = serde_json::json!({
+            "RegisterTool": {
+                "registration": {
+                    "tool_id": tool_id,
+                    "name": tool_name,
+                    "description": format!("Tool: {tool_name}"),
+                    "schema": {
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "string"},
+                                "b": {"type": "string"}
+                            }
+                        },
+                        "output_schema": output_schema
+                    },
+                    "implementation_hash": impl_hash,
+                    "test_vectors": [],
+                    "operator_did": owner,
+                    "cost": null,
+                    "registered_at": 0,
+                    "signature": []
+                }
+            }
+        });
+        serde_json::to_string(&register_action).unwrap()
+    }
+
+    /// The handler-backed e2e's `RegisterTool` action (numeric `{sum, ok}`
+    /// output schema).
+    fn saga_register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
+        saga_register_tool_action_json_with_output(
+            tool_id,
+            tool_name,
+            owner,
+            saga_numeric_output_schema(),
+        )
+    }
+
+    /// Serializes the bidirectionally-approved `EstablishToolInterface`
+    /// governance action (externally-tagged `GovernanceAction`; the
+    /// `snake_case` `ToolInterface` `Option` fields render as JSON `null`).
+    fn saga_establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+        let action = serde_json::json!({
+            "EstablishToolInterface": {
+                "interface": {
+                    "source_context": ctx_a,
+                    "target_context": ctx_b,
+                    "tool_id": tool_id,
+                    "rate_limit": null,
+                    "inbound_rate_limit": null,
+                    "per_caller_rate_limit": null,
+                    "approved_by_source": true,
+                    "approved_by_target": true,
+                    "outbound_policy": null,
+                    "inbound_policy": null
+                }
+            }
+        });
+        serde_json::to_string(&action).unwrap()
+    }
+
+    /// Asserts a `governance_propose` result actually EXECUTED its action (not
+    /// merely returned a non-empty JSON — `governance_propose` serializes a
+    /// non-empty `{proposal_id, status, execution_result}` even on a non-executed
+    /// terminal). `governance_propose` serializes `status` as the `Debug` of
+    /// `ProposalStatus`; under single-admin the action auto-executes, so the
+    /// proposal resolves `Approved` and `execution_result` is `Some` (a non-null
+    /// JSON string). Both together prove the interface/registration was
+    /// established, not just proposed.
+    fn assert_governance_executed(propose_result: &str, what: &str) {
+        let parsed: serde_json::Value = serde_json::from_str(propose_result)
+            .unwrap_or_else(|e| panic!("{what}: governance_propose result must be JSON: {e}"));
+        let status = parsed["status"].as_str().unwrap_or_else(|| {
+            panic!("{what}: governance_propose result must carry a string status; got: {parsed}")
+        });
+        assert_eq!(
+            status, "Approved",
+            "{what}: single-admin proposal must auto-execute to Approved; got status {status:?} \
+             in {parsed}"
+        );
+        assert!(
+            !parsed["execution_result"].is_null(),
+            "{what}: an executed proposal must carry a non-null execution_result; got: {parsed}"
+        );
+    }
+
+    /// Full `Committed` terminal through the `UniFFI` bridge: an authenticated
+    /// caller drives the §6.2.4 cross-context tool-invocation saga (ADR-049 §3a)
+    /// to a real commit and the bridge returns the committed receipt + output
+    /// bytes.
+    ///
+    /// The setup mirrors the producer's two authorization axes
+    /// (`start_cross_context_tool_invocation_saga`):
+    ///
+    /// 1. **Caller axis (gate 1).** `caller_did` must be hosted by this bridge
+    ///    AND a member of the CALLER (source) context A. Creating A via
+    ///    `context_create` with `owner` as the single-admin creator satisfies
+    ///    both; creating `owner` via `identity_create` registers its custody
+    ///    (axis (a) of the bridge's caller-principal binding) and publishes its
+    ///    DID document into the per-instance resolver BEFORE the first
+    ///    `context_create` builds the supervisor (which snapshots that resolver
+    ///    for governance vote verification).
+    /// 2. **Target axis (gate 2).** The producer requires a *bidirectionally
+    ///    approved* `ToolInterface` queried against the CALLER context A's actor
+    ///    governance state — so it is established IN A via a governance
+    ///    `EstablishToolInterface` action (auto-executed under `single_admin`; A's
+    ///    ceiling carries `tool:interface` + `governance:propose`).
+    ///
+    /// Context B holds the tool in its ACTOR governance `registered_tools` (via
+    /// a `RegisterTool` action; saga Prepare-B reads it there) plus the FFI-side
+    /// handler the executor snapshots and runs once at Commit-B (returns
+    /// `{sum:42, ok:1}`, validated against the registered numeric output schema).
+    #[tokio::test]
+    async fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        // Install a seedable resolver BEFORE identity creation so its store is
+        // the one the supervisor snapshots; `identity_create`'s own resolver
+        // init then no-ops. See `install_seedable_resolver`.
+        let resolver_dht = install_seedable_resolver(&bi);
+
+        // Owner identity. Registers custody (axis (a) of the caller-principal
+        // binding) and mints the DID document.
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("owner identity creation must succeed");
+        let owner = owner_identity.did.clone();
+
+        // Seed the owner's document into the resolver-visible store so the
+        // supervisor (built at the first `context_create` below) can resolve the
+        // proposer key during single-admin governance vote verification.
+        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
+
+        // Context A (caller/source): ceiling carries `governance:propose` (so
+        // owner-as-admin can propose) and `tool:interface` (required by
+        // `execute_establish_tool_interface`'s ceiling check).
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&[
+                    "governance:propose",
+                    "tool:interface",
+                    "tools:invoke",
+                    "messages:read",
+                    "messages:write",
+                ]),
+            )
+            .await
+            .expect("caller context A must be created");
+        let ctx_a = handle_a.context_id.clone();
+
+        // Context B (target): ceiling carries `governance:propose` and
+        // `tool:register` so the saga tool can be registered into B's ACTOR
+        // governance state.
+        let handle_b = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&["governance:propose", "tool:register"]),
+            )
+            .await
+            .expect("target context B must be created");
+        let ctx_b = handle_b.context_id.clone();
+
+        // The tool id is the deterministic `tool-{name}` form `tool_register`
+        // mints, also keying B's actor `registered_tools` and A's interface.
+        let tool_name = "xctx_saga_commit_tool";
+        let tool_id = format!("tool-{tool_name}");
+
+        // Register the saga tool into B's ACTOR governance state (saga Prepare-B
+        // reads the tool from there).
+        let register_json = saga_register_tool_action_json(&tool_id, tool_name, &owner);
+        let register_result = scp
+            .governance_propose(Arc::clone(&handle_b), owner.clone(), register_json)
+            .await
+            .expect("RegisterTool must auto-execute under single_admin");
+        assert_governance_executed(&register_result, "RegisterTool");
+
+        // Register the tool in B's FFI-side registry too (so the FFI schema
+        // matches the governance registration), then attach the deterministic
+        // handler the executor snapshots at Commit-B.
+        let definition = ToolDefinition {
+            name: tool_name.to_owned(),
+            description: format!("Tool: {tool_name}"),
+            input_schema_json: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"}
+                }
+            })
+            .to_string(),
+            output_schema_json: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "sum": {"type": "number"},
+                    "ok": {"type": "number"}
+                }
+            })
+            .to_string(),
+            operator_did: owner.clone(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            cost: None,
+        };
+        let ffi_tool_id = scp
+            .tool_register(Arc::clone(&handle_b), definition)
+            .await
+            .expect("FFI-side tool registration must succeed");
+        assert_eq!(
+            ffi_tool_id, tool_id,
+            "FFI and governance tool ids must agree (deterministic tool-{{name}})"
+        );
+
+        // Register a real handler returning the numeric {sum, ok} the registered
+        // output schema accepts. In-crate `tool_handlers` access is `pub(crate)`,
+        // which is exactly why this Committed test lives in-crate.
+        let handler: std::sync::Arc<
+            dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync,
+        > = std::sync::Arc::new(|_input: serde_json::Value| {
+            Ok(serde_json::json!({"sum": 42, "ok": 1}))
+        });
+        context_handle_registry(&bi)
+            .get(&ctx_b)
+            .expect("target context B must be registered")
+            .tool_handlers
+            .lock()
+            .await
+            .insert(tool_id.clone(), handler);
+
+        // Establish the bidirectionally-approved interface in A via governance.
+        let establish_json = saga_establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+        let propose_result = scp
+            .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
+            .await
+            .expect("EstablishToolInterface must auto-execute under single_admin");
+        assert_governance_executed(&propose_result, "EstablishToolInterface");
+
+        // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance,
+        // so a fixed historical timestamp would abort.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let input_json = serde_json::json!({"a": "x", "b": "y"}).to_string();
+
+        let result = scp
+            .tool_invoke_cross_context_saga(
+                Arc::clone(&handle_a),
+                Arc::clone(&handle_b),
+                owner,
+                tool_id,
+                input_json,
+                saga_nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .await
+            .expect("saga must reach Committed");
+
+        // Committed terminal: non-empty saga id + a receipt + output bytes.
+        assert!(
+            !result.saga_id.is_empty(),
+            "a committed saga must carry a non-empty saga id"
+        );
+        assert!(
+            result.receipt.is_some(),
+            "committed saga must carry a receipt"
+        );
+        assert!(
+            result.output.is_some(),
+            "committed saga must carry output bytes"
+        );
+
+        // The committed output decodes to the handler's response (numeric, per
+        // the registered output schema). Assert the parsed values, not raw
+        // bytes, so a JCS-canonical encoding still passes.
+        let out: serde_json::Value =
+            serde_json::from_slice(result.output.as_ref().unwrap()).unwrap();
+        assert_eq!(out["sum"], 42, "committed output sum must be the handler's");
+        assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
+    }
+
+    /// Full `Committed` terminal through the executor's NO-HANDLER echo
+    /// fallback. Identical to
+    /// [`xctx_saga_authenticated_caller_commits_via_governance_established_interface`]
+    /// EXCEPT no FFI tool handler is registered on context B — so the executor
+    /// takes its schema-only echo branch
+    /// (`{tool, target_context, caller_did, status, input_valid, validated_input}`).
+    /// The tool is registered with a PERMISSIVE output schema
+    /// (`{status, input_valid}`, no `required`/`additionalProperties:false`) in
+    /// BOTH the `RegisterTool` governance action and the FFI `ToolDefinition`, so
+    /// Commit-B's output-schema validation accepts the echo and the saga reaches
+    /// a real `Committed`. Proves the no-handler echo path commits end-to-end.
+    #[tokio::test]
+    async fn xctx_saga_commits_with_echo_fallback_when_no_handler_registered() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        let resolver_dht = install_seedable_resolver(&bi);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("owner identity creation must succeed");
+        let owner = owner_identity.did.clone();
+
+        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
+
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&[
+                    "governance:propose",
+                    "tool:interface",
+                    "tools:invoke",
+                    "messages:read",
+                    "messages:write",
+                ]),
+            )
+            .await
+            .expect("caller context A must be created");
+        let ctx_a = handle_a.context_id.clone();
+
+        let handle_b = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&["governance:propose", "tool:register"]),
+            )
+            .await
+            .expect("target context B must be created");
+
+        let tool_name = "xctx_saga_echo_tool";
+        let tool_id = format!("tool-{tool_name}");
+
+        // Register the tool into B's ACTOR governance state with the PERMISSIVE
+        // output schema (so Prepare-B reads it AND Commit-B validates the echo
+        // against it).
+        let register_json = saga_register_tool_action_json_with_output(
+            &tool_id,
+            tool_name,
+            &owner,
+            saga_permissive_echo_output_schema(),
+        );
+        let register_result = scp
+            .governance_propose(Arc::clone(&handle_b), owner.clone(), register_json)
+            .await
+            .expect("RegisterTool must auto-execute under single_admin");
+        assert_governance_executed(&register_result, "RegisterTool (echo)");
+
+        // Register the tool in B's FFI-side registry with the SAME permissive
+        // output schema — but DO NOT attach a handler. The absence of a handler
+        // is what drives the executor's schema-only echo branch.
+        let definition = ToolDefinition {
+            name: tool_name.to_owned(),
+            description: format!("Tool: {tool_name}"),
+            input_schema_json: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"}
+                }
+            })
+            .to_string(),
+            output_schema_json: saga_permissive_echo_output_schema().to_string(),
+            operator_did: owner.clone(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            cost: None,
+        };
+        let ffi_tool_id = scp
+            .tool_register(Arc::clone(&handle_b), definition)
+            .await
+            .expect("FFI-side tool registration must succeed");
+        assert_eq!(
+            ffi_tool_id, tool_id,
+            "FFI and governance tool ids must agree (deterministic tool-{{name}})"
+        );
+
+        // NO handler registered on context B: the executor must echo.
+
+        let establish_json =
+            saga_establish_interface_action_json(&ctx_a, &handle_b.context_id, &tool_id);
+        let propose_result = scp
+            .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
+            .await
+            .expect("EstablishToolInterface must auto-execute under single_admin");
+        assert_governance_executed(&propose_result, "EstablishToolInterface (echo)");
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let input_json = serde_json::json!({"a": "x", "b": "y"}).to_string();
+
+        let result = scp
+            .tool_invoke_cross_context_saga(
+                Arc::clone(&handle_a),
+                Arc::clone(&handle_b),
+                owner,
+                tool_id,
+                input_json,
+                saga_nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .await
+            .expect("echo-fallback saga must reach Committed");
+
+        assert!(
+            !result.saga_id.is_empty(),
+            "a committed saga must carry a non-empty saga id"
+        );
+        assert!(
+            result.receipt.is_some(),
+            "committed saga must carry a receipt"
+        );
+        assert!(
+            result.output.is_some(),
+            "committed saga must carry output bytes"
+        );
+
+        // The committed output is the executor's schema-only echo object, NOT a
+        // handler response: parse it and assert the echo-specific fields.
+        let out: serde_json::Value =
+            serde_json::from_slice(result.output.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            out["status"], "validated",
+            "the no-handler echo carries status=\"validated\"; got: {out}"
+        );
+        assert_eq!(
+            out["input_valid"], true,
+            "the no-handler echo carries input_valid=true; got: {out}"
+        );
+    }
+
+    /// Caller-principal binding, axis (a) — an UNHOSTED caller is rejected.
+    ///
+    /// `source_handle` / `target_handle` are REAL registered handles (so the
+    /// per-instance handle-affinity check passes and the
+    /// `context_id_to_bytes`/`is_member` path is reachable), but `caller_did`
+    /// is a syntactically-valid `did:dht:…` string that was NEVER created on
+    /// this instance — so it is absent from the per-instance identity custody
+    /// registry. Axis (a) (`identity_custody_registry.contains_key`) trips
+    /// FIRST and the saga is aborted with `SCP-SAGA-13050` BEFORE the producer
+    /// runs — no governance/resolver scaffolding is needed. A valid nonce hex
+    /// and a near-now timestamp ensure the binding (not nonce/validation) is
+    /// the rejecting gate.
+    #[tokio::test]
+    async fn xctx_saga_unhosted_caller_did_is_rejected_axis_a() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        // Seed a resolver before identity creation so `context_create`'s
+        // supervisor build snapshots a consistent resolver (mirrors the
+        // committed e2e). The binding rejects before any vote verification, so
+        // no document seeding is required for this negative path.
+        let _resolver_dht = install_seedable_resolver(&bi);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("owner identity creation must succeed");
+
+        // A real, registered caller context owned by `owner`.
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&["governance:propose", "tools:invoke"]),
+            )
+            .await
+            .expect("caller context A must be created");
+
+        // A syntactically-valid DID that was NEVER created on this instance —
+        // so it is not in the identity custody registry (axis (a)).
+        let unhosted_caller_did = "did:dht:zzzzunhostedcalleridnevercreated".to_owned();
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // Reuse `handle_a` as the target handle too: the caller axis (a) check
+        // rejects before any target-side resolution, so the target handle is
+        // irrelevant to which axis trips — both handles are real and pass
+        // affinity.
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                Arc::clone(&handle_a),
+                Arc::clone(&handle_a),
+                unhosted_caller_did,
+                "tool-xctx_saga_unhosted".to_owned(),
+                serde_json::json!({"a": "x", "b": "y"}).to_string(),
+                saga_nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .await
+            .expect_err("an unhosted caller_did must be rejected at axis (a)");
+
+        match err {
+            ScpError::SagaAborted { code, msg, .. } => {
+                assert_eq!(
+                    code,
+                    codes::SAGA_13050,
+                    "an unhosted caller (axis a) must abort with SCP-SAGA-13050"
+                );
+                // The supervisor's own gate-1 ALSO emits SCP-SAGA-13050 for a
+                // non-member caller, so the code alone does NOT prove the BRIDGE
+                // axis-(a) custody check ran. Pin the bridge-unique message
+                // substring (absent from the supervisor gate-1 message) so this
+                // test fails if `enforce_caller_principal_binding`'s axis-(a)
+                // check were deleted and the producer's membership gate took over.
+                assert!(
+                    msg.contains("is not an identity hosted by this bridge instance"),
+                    "must be rejected by the bridge axis-(a) custody check, not the producer's \
+                     membership gate; got: {msg}"
+                );
+            }
+            other => panic!("expected SagaAborted (axis a), got {other:?}"),
+        }
+    }
+
+    /// Caller-principal binding, axis (b) — a HOSTED NON-MEMBER caller is
+    /// rejected.
+    ///
+    /// `stranger` IS created on this instance (so axis (a),
+    /// `identity_custody_registry.contains_key`, passes) but is NOT a member of
+    /// the caller context A (owned by `owner`). Axis (b)
+    /// (`supervisor.is_member`) trips and the saga aborts with `SCP-SAGA-13050`
+    /// BEFORE the producer runs.
+    #[tokio::test]
+    async fn xctx_saga_hosted_non_member_caller_is_rejected_axis_b() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        let _resolver_dht = install_seedable_resolver(&bi);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("owner identity creation must succeed");
+
+        // A second hosted identity. `identity_create` registers its custody, so
+        // axis (a) of the binding passes for `stranger`.
+        let stranger_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("stranger identity creation must succeed");
+        let stranger_did = stranger_identity.did.clone();
+
+        // Caller context A is owned by `owner`; `stranger` is NOT a member.
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&["governance:propose", "tools:invoke"]),
+            )
+            .await
+            .expect("caller context A must be created");
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // Reuse `handle_a` as the target handle: axis (b) on the caller context
+        // rejects before any target-side resolution.
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                Arc::clone(&handle_a),
+                Arc::clone(&handle_a),
+                stranger_did,
+                "tool-xctx_saga_non_member".to_owned(),
+                serde_json::json!({"a": "x", "b": "y"}).to_string(),
+                saga_nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .await
+            .expect_err("a hosted non-member caller must be rejected at axis (b)");
+
+        match err {
+            ScpError::SagaAborted { code, msg, .. } => {
+                assert_eq!(
+                    code,
+                    codes::SAGA_13050,
+                    "a hosted non-member caller (axis b) must abort with SCP-SAGA-13050"
+                );
+                // The supervisor's gate-1 ALSO emits SCP-SAGA-13050 for a
+                // non-member caller, so pin the bridge-unique axis-(b) message
+                // substring (absent from the supervisor gate-1 message) to prove
+                // the BRIDGE binding rejected — not the producer's own gate.
+                assert!(
+                    msg.contains("is hosted by this bridge but is not a member of"),
+                    "must be rejected by the bridge axis-(b) binding, not the producer's gate; \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected SagaAborted (axis b), got {other:?}"),
+        }
     }
 }
