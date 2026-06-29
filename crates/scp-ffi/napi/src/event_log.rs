@@ -149,9 +149,10 @@ pub(crate) async fn event_log_query_on(
                 })
             })?;
             // Project the typed payload's bridge-facing fields (e.g.
-            // `target_did` for governance/access-revocation events) through the
-            // single shared decoder so all four bridges surface byte-identical
-            // values. The key is omitted when the projection yields `None`.
+            // `target_did` for governance/access-revocation events,
+            // `subject_did` for role/membership events) through the single
+            // shared decoder so all four bridges surface byte-identical values.
+            // Each key is omitted when the projection yields `None`.
             let projection =
                 scp_event_log::payload::project_payload(&entry.event_type, &entry.payload);
             let mut payload_value = serde_json::json!({
@@ -159,6 +160,9 @@ pub(crate) async fn event_log_query_on(
             });
             if let Some(target_did) = projection.target_did {
                 payload_value["target_did"] = serde_json::Value::String(target_did);
+            }
+            if let Some(subject_did) = projection.subject_did {
+                payload_value["subject_did"] = serde_json::Value::String(subject_did);
             }
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {

@@ -12810,9 +12810,10 @@ impl Scp {
                             })?;
                             // Project the typed payload's bridge-facing fields
                             // (e.g. `target_did` for governance/access-revocation
-                            // events) through the single shared decoder so all
-                            // four bridges surface byte-identical values. The key
-                            // is omitted when the projection yields `None`.
+                            // events, `subject_did` for role/membership events)
+                            // through the single shared decoder so all four
+                            // bridges surface byte-identical values. Each key is
+                            // omitted when the projection yields `None`.
                             let projection = scp_event_log::payload::project_payload(
                                 &entry.event_type,
                                 &entry.payload,
@@ -12822,6 +12823,10 @@ impl Scp {
                             });
                             if let Some(target_did) = projection.target_did {
                                 payload_value["target_did"] = serde_json::Value::String(target_did);
+                            }
+                            if let Some(subject_did) = projection.subject_did {
+                                payload_value["subject_did"] =
+                                    serde_json::Value::String(subject_did);
                             }
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
@@ -12900,21 +12905,28 @@ impl Scp {
                                             })
                                         });
                                 // Project the typed payload's bridge-facing fields
-                                // through the single shared decoder, agreeing with
-                                // the manager-path projection above. The key is
-                                // injected only when the surfaced payload is a JSON
-                                // object and the projection yields a value.
+                                // (`target_did`, `subject_did`) through the single
+                                // shared decoder, agreeing with the manager-path
+                                // projection above. Each key is injected only when
+                                // the surfaced payload is a JSON object and the
+                                // projection yields a value.
                                 let projection = scp_event_log::payload::project_payload(
                                     &evt.event_type,
                                     &evt.payload,
                                 );
-                                if let (Some(obj), Some(target_did)) =
-                                    (payload_value.as_object_mut(), projection.target_did)
-                                {
-                                    obj.insert(
-                                        "target_did".to_owned(),
-                                        serde_json::Value::String(target_did),
-                                    );
+                                if let Some(obj) = payload_value.as_object_mut() {
+                                    if let Some(target_did) = projection.target_did {
+                                        obj.insert(
+                                            "target_did".to_owned(),
+                                            serde_json::Value::String(target_did),
+                                        );
+                                    }
+                                    if let Some(subject_did) = projection.subject_did {
+                                        obj.insert(
+                                            "subject_did".to_owned(),
+                                            serde_json::Value::String(subject_did),
+                                        );
+                                    }
                                 }
                                 let payload_json = payload_value.to_string();
 
@@ -16866,6 +16878,63 @@ mod tests {
             payload_json["target_did"].as_str(),
             Some(target_did),
             "GovernanceActionExecuted leaf projects its target_did"
+        );
+    }
+
+    /// `event_log_query` must project a `RoleAssigned` leaf's `subject_did` (the
+    /// affected member, NOT the governance actor) into the returned event's
+    /// `payload_json`, decoded through the shared
+    /// `scp_event_log::payload::project_payload` so the value is byte-identical
+    /// across all four bridges.
+    #[tokio::test]
+    async fn event_log_query_projects_role_assigned_subject_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let subject_did = "did:dht:z6MkSubjectMember";
+
+        // Register UCAN state and append a RoleAssigned leaf to the per-context
+        // event log (the fallback path event_log_query reads).
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
+            let payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::RoleAssignedPayload {
+                    subject_did: subject_did.to_owned(),
+                    role: "moderator".to_owned(),
+                },
+            )
+            .expect("role payload encodes");
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::RoleAssigned,
+                actor_did: handle.creator_did.clone().into(),
+                timestamp: 1_700_000_000,
+                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
+                payload,
+                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+                signature: Vec::new(),
+            };
+            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
+                .expect("append succeeds");
+        });
+        assert!(append.is_some(), "ucan state must be registered for append");
+
+        let events = scp
+            .event_log_query(Arc::clone(&handle), None)
+            .await
+            .expect("query succeeds");
+        assert_eq!(events.len(), 1, "exactly one event was appended");
+
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
+        assert_eq!(
+            payload_json["subject_did"].as_str(),
+            Some(subject_did),
+            "RoleAssigned leaf projects its subject_did"
+        );
+        // A subject-bearing leaf must NOT surface a target_did key.
+        assert!(
+            payload_json.get("target_did").is_none(),
+            "RoleAssigned leaf carries a subject, not a target"
         );
     }
 

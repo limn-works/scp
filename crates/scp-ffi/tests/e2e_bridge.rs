@@ -638,6 +638,83 @@ fn event_log_query_projects_governance_target_did_from_storage() {
 }
 
 #[test]
+fn event_log_query_projects_role_assigned_subject_did_from_storage() {
+    // Drives the storage-fallback path of `event_log_query`: register FFI state
+    // WITHOUT a supervisor `create_context` (so the manager path returns None),
+    // append one `RoleAssigned` event to the per-context log so `event_count > 0`,
+    // then write the same event to storage. The query must project the event's
+    // `subject_did` (the affected member, NOT the governance actor) into
+    // `payload_json` via the shared `project_payload` decoder, agreeing
+    // byte-for-byte with the other three bridges.
+    use scp_platform::Storage as _;
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+        let did = create_test_identity(bi);
+        let ctx_id = random_context_id();
+        // FFI state only — no supervisor entry, so the manager path is empty.
+        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+
+        let subject_did = "did:key:subject-member";
+        let role_event = scp_event_log::Event {
+            event_type: scp_event_log::EventType::RoleAssigned,
+            actor_did: scp_identity::DID(did),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::RoleAssignedPayload {
+                    subject_did: subject_did.to_owned(),
+                    role: "moderator".to_owned(),
+                },
+            )
+            .unwrap(),
+            prev_hash: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Per-context log must be non-empty so the fallback does not early-return.
+        runtime::with_context(bi, &ctx_id, |rt| {
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &role_event).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Persist the full typed event under the ProtocolRepository key format.
+        let storage = runtime::get_storage(bi).unwrap();
+        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
+        let bytes = rmp_serde::to_vec(&role_event).unwrap();
+        test_runtime()
+            .block_on(storage.store(&key, &bytes))
+            .unwrap();
+
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the stored role-assigned event is returned"
+        );
+
+        let payload = events[0].payload.bind(py);
+        let projected: String = payload
+            .get_item("subject_did")
+            .expect("subject_did key present in projected payload")
+            .extract()
+            .unwrap();
+        assert_eq!(
+            projected, subject_did,
+            "RoleAssigned leaf projects its subject_did"
+        );
+        // A subject-bearing leaf must NOT surface a target_did key — a missing
+        // key raises KeyError (an Err) from PyDict::get_item.
+        assert!(
+            payload.get_item("target_did").is_err(),
+            "RoleAssigned leaf carries a subject, not a target"
+        );
+    });
+}
+
+#[test]
 fn event_log_verify_inclusion_proof_after_append() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
