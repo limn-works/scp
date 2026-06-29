@@ -82,7 +82,7 @@ pub struct ParticipationRecord {
     /// access honestly passes an empty set, yielding an empty history.
     pub attestation_history: Vec<AttestationReference>,
 
-    /// Number of `ContextCreated` events by the subject.
+    /// Number of `ChildContextCreated` events by the subject (§7.3.2).
     pub context_creation_count: u64,
 
     /// Unix timestamp (seconds) when this record was computed.
@@ -1350,6 +1350,31 @@ mod tests {
             record.governance_actions_against.len(),
             0,
             "ApproveSpend must not count against the beneficiary (H18)"
+        );
+    }
+
+    #[test]
+    fn empty_action_type_governance_action_counts_as_adverse() {
+        // A GovernanceActionExecuted leaf whose decoded action_type is empty
+        // cannot be classified as beneficial, so the conservative default is to
+        // count it against the subject. This pins the documented legacy-compat
+        // guarantee: when in doubt, treat a governance action as adverse.
+        let victim = "did:key:victim";
+        let events = vec![make_event(
+            EventType::GovernanceActionExecuted,
+            "did:key:admin",
+            1000,
+            0,
+            make_gov_payload(victim, ""),
+        )];
+
+        let record =
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000, &[]).unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            1,
+            "empty action_type is conservatively adverse (pre-H18 compat)"
         );
     }
 
