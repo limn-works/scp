@@ -2245,4 +2245,116 @@ mod tests {
              message), got: {msg}"
         );
     }
+
+    /// (a, axis-isolated) Caller-principal binding, hosted-here axis as the SOLE
+    /// guard: a `caller_did` that IS a genuine member of `caller_context_id` (so
+    /// the membership axis (b) would PASS) but is NOT an identity hosted by this
+    /// bridge instance is STILL rejected with `SagaAborted` (SCP-SAGA-13050)
+    /// BEFORE the saga runs.
+    ///
+    /// This is the property `xctx_saga_unhosted_caller_rejected_before_saga`
+    /// cannot prove: that test's caller is BOTH unhosted AND a non-member, so
+    /// axis (b) (and the producer's gate 1) would reject it even if axis (a) were
+    /// deleted. Here the caller is inserted as a real member of `caller_ctx` via
+    /// `Supervisor::test_insert_member` (the actor-state membership injection
+    /// that bypasses the MLS Welcome a non-hosted DID could never complete), so
+    /// `supervisor.is_member` returns true and axis (b) passes the caller. The
+    /// ONLY thing that can reject it is axis (a): the caller DID was never
+    /// `identity_create`'d, so it is absent from this instance's identity
+    /// registry. The test therefore fails closed iff the bridge's
+    /// `identity_registry_contains` axis (a) check is removed, and is INDEPENDENT
+    /// of axis (b) by construction.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        // `owner` is a hosted identity used only to create the contexts.
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let handle_a = create_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_saga_context(&bi, &owner_identity).await;
+        let ctx_a = handle_a.context_id();
+        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_member_unhosted_probe");
+
+        // The caller is a syntactically valid DID that is NEVER `identity_create`'d
+        // (so the bridge's identity registry does NOT host it — axis (a) must
+        // reject), yet is injected as a genuine member of `caller_ctx` via the
+        // actor-state membership path (so `supervisor.is_member` returns true and
+        // axis (b) passes). `test_insert_member` is the test-only injection that
+        // records the member into role state exactly as an executed `AddMember`
+        // would, without the MLS Welcome a non-hosted DID could never complete.
+        let member_but_unhosted_caller = "did:dht:z6MkMemberButUnhostedCaller001".to_owned();
+        let supervisor = crate::runtime::supervisor(&bi).expect("supervisor must be initialized");
+        supervisor
+            .test_insert_member(
+                &ctx_a,
+                scp_identity::DID(member_but_unhosted_caller.clone()),
+                "member",
+            )
+            .await
+            .expect("test_insert_member should record the caller into caller_ctx membership");
+
+        // Precondition: the supervisor MUST see the caller as a member of
+        // `caller_ctx` (axis (b) passes), while the bridge's identity registry
+        // does NOT host it (axis (a) is the sole remaining guard).
+        assert!(
+            supervisor
+                .is_member(&ctx_a, &member_but_unhosted_caller)
+                .await,
+            "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
+        );
+        assert!(
+            !crate::runtime::identity_registry_contains(&bi, &member_but_unhosted_caller),
+            "precondition: caller must NOT be hosted so axis (a) is the sole guard"
+        );
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+        // explicitly rather than `expect_err`.
+        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
+            tool_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms,
+            1,
+            None,
+        ))
+        .await
+        else {
+            panic!("a member-but-unhosted caller must be rejected by axis (a) before the saga runs")
+        };
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::SAGA_13050),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // BRIDGE-UNIQUE axis-(a) substring. Because the caller IS a member, the
+        // membership axis (b) and the producer's gate 1 would BOTH pass — so the
+        // axis-(b) message ("is hosted by this bridge but is not a member of") can
+        // never appear here. The ONLY rejection that fits is axis (a). Asserting
+        // its exact substring makes this test fail closed iff
+        // `enforce_caller_principal_binding`'s `identity_registry_contains` check
+        // is removed.
+        assert!(
+            msg.contains("is not an identity hosted by this bridge instance"),
+            "message must be the BRIDGE axis-(a) hosted-here rejection, got: {msg}"
+        );
+    }
 }

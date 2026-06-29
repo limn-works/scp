@@ -1415,6 +1415,106 @@ fn xctx_saga_hosted_non_member_caller_rejected() {
     });
 }
 
+/// (a, axis-isolated) Caller-principal binding, hosted-here axis as the SOLE
+/// guard: a `caller_did` that IS a genuine member of `caller_context_id` (so the
+/// membership axis (b) would PASS) but is NOT an identity hosted by this bridge
+/// instance is STILL rejected with `SagaAbortedError` (SCP-SAGA-13050) BEFORE
+/// the saga runs.
+///
+/// This is the property the `xctx_saga_unhosted_caller_rejected_before_saga`
+/// test cannot prove: that test's caller is BOTH unhosted AND a non-member, so
+/// axis (b) (and the producer's gate 1) would reject it even if axis (a) were
+/// deleted. Here the caller is a real member of `caller_ctx` — it CREATED
+/// `caller_ctx` (the creator is always a member, per
+/// `context_create_establishes_mls_group`), so `supervisor.is_member` returns
+/// true and axis (b) passes the caller. The ONLY thing that can reject it is
+/// axis (a): the caller DID was never `create_test_identity`'d, so it is absent
+/// from this instance's identity registry. The test therefore fails closed iff
+/// the bridge's `identity_registry_contains` axis (a) check is removed, and is
+/// INDEPENDENT of axis (b) by construction.
+#[test]
+fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        // `owner` is a hosted identity used only to create the TARGET context and
+        // register the saga tool (the tool operator must be a member of B).
+        let owner = create_test_identity(bi);
+
+        // The caller is a syntactically valid DID that CREATES `caller_ctx` —
+        // making it a genuine member of `caller_ctx` (the creator is always a
+        // member) so the supervisor's membership axis (b) passes — but is NEVER
+        // registered as a hosted identity on this instance (no
+        // `create_test_identity`), so the bridge's identity registry does NOT
+        // contain it. Axis (a) must reject it.
+        let member_but_unhosted_caller = "did:dht:z6MkMemberButUnhostedCaller001".to_owned();
+
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        // Caller context is CREATED BY the unhosted caller → caller is a member.
+        create_test_context_with_id(bi, &member_but_unhosted_caller, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+
+        // Precondition: the supervisor MUST see the caller as a member of
+        // `caller_ctx` (axis (b) passes), while the bridge's identity registry
+        // does NOT host it (axis (a) is the sole remaining guard).
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        assert!(
+            rt.block_on(supervisor.is_member(&caller_ctx, &member_but_unhosted_caller)),
+            "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
+        );
+        assert!(
+            !runtime::identity_registry_contains(bi, &member_but_unhosted_caller),
+            "precondition: caller must NOT be hosted so axis (a) is the sole guard"
+        );
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                &member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
+                &tool_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err(
+                "a member-but-unhosted caller must be rejected by axis (a) before the saga",
+            );
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13050"),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // BRIDGE-UNIQUE axis-(a) substring. Because the caller IS a member, the
+        // membership axis (b) and the producer's gate 1 would BOTH pass — so the
+        // axis-(b) message ("is hosted by this bridge but is not a member of") can
+        // never appear here. The ONLY rejection that fits is axis (a). Asserting
+        // its exact substring makes this test fail closed iff
+        // `enforce_caller_principal_binding`'s `identity_registry_contains` check
+        // is removed.
+        assert!(
+            msg.contains("not an identity hosted by this bridge instance"),
+            "message must be the BRIDGE axis-(a) hosted-here rejection, got: {msg}"
+        );
+    });
+}
+
 /// (c)+(e) Chokepoint + target-axis authorization: an authenticated caller
 /// (hosted + member) over REAL 64-hex contexts passes the bridge's
 /// channel-auth binding and the chokepoint round-trips to the actor — the saga

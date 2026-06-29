@@ -21362,4 +21362,129 @@ mod tests {
             other => panic!("expected SagaAborted (axis b), got {other:?}"),
         }
     }
+
+    /// Caller-principal binding, axis (a) as the SOLE guard — a MEMBER-but-
+    /// UNHOSTED caller is STILL rejected by axis (a).
+    ///
+    /// This is the property `xctx_saga_unhosted_caller_did_is_rejected_axis_a`
+    /// cannot prove: that test's caller is BOTH unhosted AND a non-member, so
+    /// axis (b) (and the producer's gate 1) would reject it even if axis (a) were
+    /// deleted. Here the caller is injected as a genuine member of the caller
+    /// context via `Supervisor::test_insert_member` (the actor-state membership
+    /// injection that bypasses the MLS Welcome a non-hosted DID could never
+    /// complete), so `supervisor.is_member` returns true and axis (b) PASSES the
+    /// caller. The ONLY thing that can reject it is axis (a): the caller DID was
+    /// never `identity_create`'d, so it is absent from this instance's identity
+    /// custody registry. The test therefore fails closed iff the bridge's
+    /// `identity_custody_registry.contains_key` axis (a) check is removed, and is
+    /// INDEPENDENT of axis (b) by construction.
+    #[tokio::test]
+    async fn xctx_saga_member_but_unhosted_caller_is_rejected_axis_a() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        let _resolver_dht = install_seedable_resolver(&bi);
+
+        // `owner` is a hosted identity used only to create the caller context.
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("owner identity creation must succeed");
+
+        // A real, registered caller context owned by `owner`.
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&owner_identity),
+                saga_context_params(&["governance:propose", "tools:invoke"]),
+            )
+            .await
+            .expect("caller context A must be created");
+        let ctx_a = handle_a.context_id.clone();
+
+        // The caller is a syntactically-valid DID that is NEVER `identity_create`'d
+        // (so the identity custody registry does NOT host it — axis (a) must
+        // reject), yet is injected as a genuine member of the caller context via
+        // the actor-state membership path (so `supervisor.is_member` returns true
+        // and axis (b) passes). `test_insert_member` records the member into role
+        // state exactly as an executed `AddMember` would, without the MLS Welcome
+        // a non-hosted DID could never complete.
+        let member_but_unhosted_caller = "did:dht:zzzzmemberbutunhostedcaller00001".to_owned();
+        let supervisor = Arc::clone(
+            bi.context_manager_or_error()
+                .expect("supervisor must be initialized"),
+        );
+        supervisor
+            .test_insert_member(
+                &ctx_a,
+                scp_identity::DID(member_but_unhosted_caller.clone()),
+                "member",
+            )
+            .await
+            .expect("test_insert_member should record the caller into caller_ctx membership");
+
+        // Precondition: the supervisor MUST see the caller as a member of the
+        // caller context (axis (b) passes), while the identity custody registry
+        // does NOT host it (axis (a) is the sole remaining guard).
+        assert!(
+            supervisor
+                .is_member(&ctx_a, &member_but_unhosted_caller)
+                .await,
+            "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
+        );
+        assert!(
+            !identity_custody_registry(&bi).contains_key(&member_but_unhosted_caller),
+            "precondition: caller must NOT be hosted so axis (a) is the sole guard"
+        );
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // Reuse `handle_a` as the target handle too: the caller axis (a) check
+        // rejects before any target-side resolution, so the target handle is
+        // irrelevant to which axis trips — both handles are real and pass
+        // affinity.
+        let err = scp
+            .tool_invoke_cross_context_saga(
+                Arc::clone(&handle_a),
+                Arc::clone(&handle_a),
+                member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
+                "tool-xctx_saga_member_unhosted".to_owned(),
+                serde_json::json!({"a": "x", "b": "y"}).to_string(),
+                saga_nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .await
+            .expect_err("a member-but-unhosted caller must be rejected at axis (a)");
+
+        match err {
+            ScpError::SagaAborted { code, msg, .. } => {
+                assert_eq!(
+                    code,
+                    codes::SAGA_13050,
+                    "a member-but-unhosted caller (axis a) must abort with SCP-SAGA-13050"
+                );
+                // BRIDGE-UNIQUE axis-(a) substring. Because the caller IS a
+                // member, the membership axis (b) and the producer's gate 1 would
+                // BOTH pass — so the axis-(b) message ("is hosted by this bridge
+                // but is not a member of") can never appear here. The ONLY
+                // rejection that fits is axis (a). Asserting its exact substring
+                // makes this test fail closed iff
+                // `enforce_caller_principal_binding`'s
+                // `identity_custody_registry.contains_key` check is removed.
+                assert!(
+                    msg.contains("is not an identity hosted by this bridge instance"),
+                    "must be rejected by the bridge axis-(a) custody check (the sole guard for a \
+                     member caller), not the producer; got: {msg}"
+                );
+            }
+            other => panic!("expected SagaAborted (axis a), got {other:?}"),
+        }
+    }
 }
