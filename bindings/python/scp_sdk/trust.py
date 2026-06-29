@@ -16,7 +16,7 @@ an SCP context.  Trust evaluation is a four-layer model:
 See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 ``.docs/adrs/phase-3.md`` ADR-014 for the SDK design. The structured
 ``ucan_evaluate`` consumption (Layer 1 / :class:`CapabilityValidation`) is
-governed by ``.docs/adrs/phase-2.md`` ADR-055 and
+governed by ``.docs/adrs/phase-2.md`` ADR-057 and
 ``.docs/specs/07-trust-validation-and-capabilities.md`` §7.2.4: the SDK
 consumes the typed per-stage result and never reverse-engineers which check
 failed by parsing error prose.
@@ -69,7 +69,7 @@ class CapabilityValidation:
     protocol-compliant.
 
     These six per-stage booleans are the canonical structured result of
-    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-055):
+    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-057):
     one boolean per pipeline-stage group of the 11-step ADR-016 pipeline.
     They are populated directly from the bridge's structured result --
     never reverse-engineered by parsing error prose. The result is
@@ -579,7 +579,7 @@ def _structured_to_capability_validation(result: Any) -> CapabilityValidation:
     ``PyCapabilityValidation``) exposes the same six snake_case booleans as
     the SDK :class:`CapabilityValidation`. This reads them directly -- the
     per-check breakdown comes from the structured record, never from parsing
-    error prose (spec §7.2.4, ADR-055 Decision 3).
+    error prose (spec §7.2.4, ADR-057 Decision 3).
     """
     return CapabilityValidation(
         tokens_valid=bool(result.tokens_valid),
@@ -615,7 +615,7 @@ async def evaluate_trust(
     4. **Trust evaluation inputs** — gathers endorsements, challenge
        results, and consequence structures.
 
-    Layer 1 consumes the structured bridge result directly (ADR-055): it
+    Layer 1 consumes the structured bridge result directly (ADR-057): it
     does not reverse-engineer *which* check failed by parsing error prose.
     The diagnostic is non-throwing for capability outcomes; it raises only
     for malformed FFI inputs (e.g. a ``context_id`` with control
@@ -679,7 +679,7 @@ async def evaluate_trust(
             # specific capability. Passing a concrete URI here (or the old
             # ``"*"`` sentinel, which the real bridge rejects) would wrongly
             # impose an invoked-capability grant-match the caller never asked
-            # for. See ADR-055 / spec §7.2.4: the diagnostic's challenge
+            # for. See ADR-057 / spec §7.2.4: the diagnostic's challenge
             # capability is optional, and ``None`` means intrinsic-validity.
             #
             # ``subject_did`` is passed as the presenting agent so the step-5

@@ -1304,8 +1304,8 @@
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-055 Decision-5 and the per-SDK-idiom lesson.",
-            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-055 Decision-5 and the per-SDK-idiom lesson."
+            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-057 Decision-5 and the per-SDK-idiom lesson.",
+            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet. Kotlin/Swift idiomatic wrappers are tracked separately per ADR-057 Decision-5 and the per-SDK-idiom lesson."
           }
         },
         {

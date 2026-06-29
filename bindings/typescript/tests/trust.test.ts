@@ -1,5 +1,5 @@
 /**
- * Tests for the structured trust-signal consumer (ADR-055, spec §7.2.4).
+ * Tests for the structured trust-signal consumer (ADR-057, spec §7.2.4).
  *
  * `scp.ucanEvaluate` is the read-only, structured diagnostic counterpart to
  * `ucanValidate`: it returns six per-stage `CapabilityValidation` booleans
@@ -15,7 +15,7 @@
  * not a nonce-consuming gate), which is what lets `evaluateTrust` be
  * idempotent.
  *
- * See `.docs/adrs/phase-2.md` ADR-055 and `.docs/specs/07-trust-validation-and-capabilities.md` §7.2.4.
+ * See `.docs/adrs/phase-2.md` ADR-057 and `.docs/specs/07-trust-validation-and-capabilities.md` §7.2.4.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";

@@ -647,7 +647,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanRevoke(ctx, token.encoded, admin.did);
     });
 
-    // C3c (ADR-055, §7.2.4): structured read-only diagnostic.
+    // C3c (ADR-057, §7.2.4): structured read-only diagnostic.
     test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
@@ -739,7 +739,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(allValid(omitted)).toBe(true);
     });
 
-    // C3c (ADR-055 / §7.2.4): evaluateTrust assesses each token's GENERAL
+    // C3c (ADR-057 / §7.2.4): evaluateTrust assesses each token's GENERAL
     // (intrinsic) validity — it must NOT impose an invoked-capability
     // grant-match. The previous implementation passed a `"*"` sentinel that the
     // real bridge rejects ("missing scp:ctx: prefix"); the fix passes no
@@ -1089,7 +1089,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // Without it the bridge would default the presenting agent to the token's
     // OWN `aud` (`aud == aud` always true), inflating trust for a token
     // addressed to someone else. This guards a future edit that drops
-    // `subjectDid` from `evaluateTrust` (ADR-055 / §7.2.4).
+    // `subjectDid` from `evaluateTrust` (ADR-057 / §7.2.4).
     test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
       const admin = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");

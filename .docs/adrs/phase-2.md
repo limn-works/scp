@@ -1958,9 +1958,9 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 - **ADR-042 (Broadcast Content Delivery):** the publish path the BUNDLED participant drives.
 - **ADR-052 (Unified Construction Pattern):** the participant and node are both constructed via flat config; a node config never carries "participate as self" — participation is always a separate `Supervisor` construction.
 
-## ADR-055: Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose
+## ADR-057: Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose
 
-> **Note:** ADR-055 is numbered sequentially after ADR-054 but, like ADR-032/035/042/052/053, lives in the Phase 2 document by *subject*, not by number: it governs the capability/trust-validation surface (§7.2, Phase 2 — Context + Transport) as it crosses the FFI bridges into the language SDKs. Its scope is cross-cutting — it constrains every bridge that returns a validation outcome and every SDK that consumes one.
+> **Note:** ADR-057 is numbered sequentially after ADR-056 but, like ADR-032/035/042/052/053, lives in the Phase 2 document by *subject*, not by number: it governs the capability/trust-validation surface (§7.2, Phase 2 — Context + Transport) as it crosses the FFI bridges into the language SDKs. Its scope is cross-cutting — it constrains every bridge that returns a validation outcome and every SDK that consumes one.
 
 **Status:** Decided
 

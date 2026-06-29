@@ -606,7 +606,7 @@ class TestUcan:
         Closes the coverage gap where only mocks exercised ``evaluate_trust``.
         Mints a valid token, then runs ``evaluate_trust`` (which drives the
         read-only ``ucan_evaluate`` diagnostic with NO challenge capability —
-        intrinsic-validity mode, ADR-055 / §7.2.4) and asserts the structured
+        intrinsic-validity mode, ADR-057 / §7.2.4) and asserts the structured
         Layer-1 booleans. A freshly minted, well-signed, in-ceiling token must
         report all six per-stage checks ``True``.
         """
@@ -666,7 +666,7 @@ class TestUcan:
         ``aud`` (``aud == aud`` always true), reporting ``signatures_valid`` for
         a token addressed to someone else (trust inflation). Mints a token for
         Bob, then evaluates trust for Carol against that token and asserts the
-        structured ``signatures_valid`` is False (ADR-055 / §7.2.4).
+        structured ``signatures_valid`` is False (ADR-057 / §7.2.4).
         """
         from scp_sdk.trust import evaluate_trust
 
@@ -720,7 +720,7 @@ class TestUcan:
         before the core diagnostic, so an empty or whitespace-only capability
         string is treated as "no challenge" — identical to omitting it. A bare
         ``"*"`` is NOT this (it is a malformed capability URI the bridge
-        rejects); absence is expressed by emptiness/omission only (ADR-055 /
+        rejects); absence is expressed by emptiness/omission only (ADR-057 /
         §7.2.4). This pins the PyO3 bridge's coercion so the cross-bridge
         parity test (TS real-napi sibling) and this one cannot diverge.
         """
@@ -775,7 +775,7 @@ class TestUcan:
         an empty capability must STILL report ``signatures_valid`` False --
         coercion to no-challenge cannot be mistaken for a validity shortcut. The
         sibling parity test only covered a VALID token; this pins the INVALID
-        case (ADR-055 / §7.2.4). TS sibling: the real-napi forged-token coercion
+        case (ADR-057 / §7.2.4). TS sibling: the real-napi forged-token coercion
         test.
         """
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
