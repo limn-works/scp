@@ -1840,7 +1840,7 @@ mod tests {
     ///
     /// Why this is necessary (test hermeticity): the production
     /// `ensure_did_resolver_initialized_on` path stores its `InMemoryDhtClient`
-    /// in the process-wide `SHARED_DHT_CLIENT` `OnceLock` (#1144, so
+    /// in the process-wide `SHARED_DHT_CLIENT` `OnceLock` (so
     /// cross-identity flows in one process share a DHT). The three co-located
     /// `xctx_saga` tests run concurrently under the default test harness; a
     /// sibling can win the `SHARED_DHT_CLIENT.set` (or mutate the shared DHT)
