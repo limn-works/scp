@@ -1716,107 +1716,118 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // End-to-end Committed terminal through the NAPI bridge.
-    //
-    // Mirrors the PyO3 e2e: an authenticated caller drives the §6.2.4
-    // cross-context tool-invocation saga to a real Committed terminal and the
-    // bridge returns the committed receipt + output bytes. The setup wires the
-    // two producer authorization axes:
-    //
-    //   1. Caller axis (gate 1): caller_did is hosted by this instance AND a
-    //      member of the CALLER (source) context A — satisfied by creating A
-    //      via the real context-create path with `owner` as single-admin.
-    //   2. Target axis (gate 2): a bidirectionally-approved ToolInterface
-    //      (approved_by_source && approved_by_target, source=A, target=B), which
-    //      the producer queries against A's actor governance state, established
-    //      IN A via a governance EstablishToolInterface action (auto-executed
-    //      under single_admin).
-    //
-    // Context B holds the tool registered into its ACTOR governance state (via a
-    // RegisterTool governance action — the saga's Prepare-B reads it from there)
-    // PLUS the FFI-side handler the executor snapshots and runs once at Commit-B.
-    // The handler returns `{"sum":42,"ok":1}`, which Commit-B validates against
-    // the registered numeric `{sum, ok}` output schema before committing.
-    //
-    // For hermeticity against the process-global `SHARED_DHT_CLIENT` `OnceLock`,
-    // the test installs its OWN per-instance resolver (over a caller-retained
-    // in-memory DHT) BEFORE the first `identity_create`, then explicitly seeds
-    // the owner's DID document into that resolver-visible store. The supervisor
-    // (built lazily on first `context_create_on`) snapshots that resolver, so
-    // governance vote verification resolves the proposer key through it without
-    // racing a concurrent sibling on the global. Prepare-B enforces a §9.14
-    // ±5min timestamp skew, so the invocation uses `SystemTime::now()`.
-    // ------------------------------------------------------------------
+    /// All §6.2.4 cross-context-tool saga binding tests and their pure-string /
+    /// DHT / governance helpers live in this single submodule gated on
+    /// `allow_in_memory_custody`. Gating the module (rather than each item)
+    /// covers every helper AND every future saga test added here by
+    /// construction, closing the no-feature `function is never used` regression
+    /// class: a saga test added without an explicit per-item `#[cfg(...)]` can
+    /// no longer silently reintroduce the no-feature compile warning.
+    #[cfg(feature = "allow_in_memory_custody")]
+    mod xctx_saga_tests {
+        use super::*;
 
-    /// Serializes a `RegisterTool` governance action for the saga tool. Mirrors
-    /// the registered schema: 2 input + 2 output properties (clears the §9.2.1
-    /// specificity floor of 2), numeric `{sum, ok}` output so Commit-B's
-    /// output-schema validation accepts the handler's response.
-    fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
-        let impl_hash = serde_json::Value::from(vec![0u8; 32]);
-        let register_action = serde_json::json!({
-            "RegisterTool": {
-                "registration": {
-                    "tool_id": tool_id,
-                    "name": tool_name,
-                    "description": format!("Tool: {tool_name}"),
-                    "schema": {
-                        "input_schema": {
-                            "type": "object",
-                            "properties": {
-                                "a": {"type": "string"},
-                                "b": {"type": "string"}
+        // ------------------------------------------------------------------
+        // End-to-end Committed terminal through the NAPI bridge.
+        //
+        // Mirrors the PyO3 e2e: an authenticated caller drives the §6.2.4
+        // cross-context tool-invocation saga to a real Committed terminal and the
+        // bridge returns the committed receipt + output bytes. The setup wires the
+        // two producer authorization axes:
+        //
+        //   1. Caller axis (gate 1): caller_did is hosted by this instance AND a
+        //      member of the CALLER (source) context A — satisfied by creating A
+        //      via the real context-create path with `owner` as single-admin.
+        //   2. Target axis (gate 2): a bidirectionally-approved ToolInterface
+        //      (approved_by_source && approved_by_target, source=A, target=B), which
+        //      the producer queries against A's actor governance state, established
+        //      IN A via a governance EstablishToolInterface action (auto-executed
+        //      under single_admin).
+        //
+        // Context B holds the tool registered into its ACTOR governance state (via a
+        // RegisterTool governance action — the saga's Prepare-B reads it from there)
+        // PLUS the FFI-side handler the executor snapshots and runs once at Commit-B.
+        // The handler returns `{"sum":42,"ok":1}`, which Commit-B validates against
+        // the registered numeric `{sum, ok}` output schema before committing.
+        //
+        // For hermeticity against the process-global `SHARED_DHT_CLIENT` `OnceLock`,
+        // the test installs its OWN per-instance resolver (over a caller-retained
+        // in-memory DHT) BEFORE the first `identity_create`, then explicitly seeds
+        // the owner's DID document into that resolver-visible store. The supervisor
+        // (built lazily on first `context_create_on`) snapshots that resolver, so
+        // governance vote verification resolves the proposer key through it without
+        // racing a concurrent sibling on the global. Prepare-B enforces a §9.14
+        // ±5min timestamp skew, so the invocation uses `SystemTime::now()`.
+        // ------------------------------------------------------------------
+
+        /// Serializes a `RegisterTool` governance action for the saga tool. Mirrors
+        /// the registered schema: 2 input + 2 output properties (clears the §9.2.1
+        /// specificity floor of 2), numeric `{sum, ok}` output so Commit-B's
+        /// output-schema validation accepts the handler's response.
+        fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
+            let impl_hash = serde_json::Value::from(vec![0u8; 32]);
+            let register_action = serde_json::json!({
+                "RegisterTool": {
+                    "registration": {
+                        "tool_id": tool_id,
+                        "name": tool_name,
+                        "description": format!("Tool: {tool_name}"),
+                        "schema": {
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "a": {"type": "string"},
+                                    "b": {"type": "string"}
+                                }
+                            },
+                            "output_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "sum": {"type": "number"},
+                                    "ok": {"type": "number"}
+                                }
                             }
                         },
-                        "output_schema": {
-                            "type": "object",
-                            "properties": {
-                                "sum": {"type": "number"},
-                                "ok": {"type": "number"}
-                            }
-                        }
-                    },
-                    "implementation_hash": impl_hash,
-                    "test_vectors": [],
-                    "operator_did": owner,
-                    "cost": null,
-                    "registered_at": 0,
-                    "signature": []
+                        "implementation_hash": impl_hash,
+                        "test_vectors": [],
+                        "operator_did": owner,
+                        "cost": null,
+                        "registered_at": 0,
+                        "signature": []
+                    }
                 }
-            }
-        });
-        serde_json::to_string(&register_action).unwrap()
-    }
+            });
+            serde_json::to_string(&register_action).unwrap()
+        }
 
-    /// Serializes the bidirectionally-approved `EstablishToolInterface`
-    /// governance action (source=A, target=B, BOTH approvals true).
-    fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
-        let action = serde_json::json!({
-            "EstablishToolInterface": {
-                "interface": {
-                    "source_context": ctx_a,
-                    "target_context": ctx_b,
-                    "tool_id": tool_id,
-                    "rate_limit": null,
-                    "inbound_rate_limit": null,
-                    "per_caller_rate_limit": null,
-                    "approved_by_source": true,
-                    "approved_by_target": true,
-                    "outbound_policy": null,
-                    "inbound_policy": null
+        /// Serializes the bidirectionally-approved `EstablishToolInterface`
+        /// governance action (source=A, target=B, BOTH approvals true).
+        fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+            let action = serde_json::json!({
+                "EstablishToolInterface": {
+                    "interface": {
+                        "source_context": ctx_a,
+                        "target_context": ctx_b,
+                        "tool_id": tool_id,
+                        "rate_limit": null,
+                        "inbound_rate_limit": null,
+                        "per_caller_rate_limit": null,
+                        "approved_by_source": true,
+                        "approved_by_target": true,
+                        "outbound_policy": null,
+                        "inbound_policy": null
+                    }
                 }
-            }
-        });
-        serde_json::to_string(&action).unwrap()
-    }
+            });
+            serde_json::to_string(&action).unwrap()
+        }
 
-    /// The registered tool registration definition for context B's FFI-side
-    /// registry, matching the governance `RegisterTool` schema (2-in/2-out,
-    /// numeric `{sum, ok}` output) so the deterministic id agrees and the
-    /// handler's response validates at Commit-B.
-    fn build_napi_tool_def(tool_name: &str, owner: &str) -> NapiToolDefinition {
-        NapiToolDefinition {
+        /// The registered tool registration definition for context B's FFI-side
+        /// registry, matching the governance `RegisterTool` schema (2-in/2-out,
+        /// numeric `{sum, ok}` output) so the deterministic id agrees and the
+        /// handler's response validates at Commit-B.
+        fn build_napi_tool_def(tool_name: &str, owner: &str) -> NapiToolDefinition {
+            NapiToolDefinition {
             name: tool_name.to_owned(),
             description: format!("Tool: {tool_name}"),
             input_schema_json:
@@ -1830,531 +1841,535 @@ mod tests {
             operator_did: owner.to_owned(),
             cost: None,
         }
-    }
+        }
 
-    /// Installs a per-instance DID resolver backed by a caller-retained
-    /// in-memory DHT client on `bi` and returns that client, so the committed
-    /// e2e test can seed the owner's DID document into the SAME store the
-    /// supervisor's governance key resolver reads from — WITHOUT depending on
-    /// the process-global `SHARED_DHT_CLIENT` `OnceLock`.
-    ///
-    /// Why this is necessary (test hermeticity): the production
-    /// `ensure_did_resolver_initialized_on` path stores its `InMemoryDhtClient`
-    /// in the process-wide `SHARED_DHT_CLIENT` `OnceLock` (so
-    /// cross-identity flows in one process share a DHT). The three co-located
-    /// `xctx_saga` tests run concurrently under the default test harness; a
-    /// sibling can win the `SHARED_DHT_CLIENT.set` (or mutate the shared DHT)
-    /// first, so this test's owner DID document lands in / is read from a
-    /// resolver the committed test does not control, and governance vote
-    /// verification fails with `[SCP-CTX-2041] unknown voter: cannot resolve
-    /// public key for DID …`. Installing a FRESH per-instance resolver here,
-    /// BEFORE the first identity creation, makes `ensure_did_resolver_initialized_on`
-    /// a no-op (it short-circuits when a resolver is already present), so this
-    /// retained client is the one the supervisor snapshots — fully isolated from
-    /// the global. Mirrors the `UniFFI` bridge's `install_seedable_resolver`.
-    #[cfg(feature = "allow_in_memory_custody")]
-    fn install_seedable_resolver(
-        bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
-    ) -> std::sync::Arc<scp_identity::InMemoryDhtClient> {
-        let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
-        let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
-            std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
-            std::sync::Arc::clone(&dht_client),
-            std::sync::Arc::new(scp_identity::DidCache::new()),
-            Vec::new(),
-        ));
-        crate::runtime::init_did_resolver(bi, resolver, tokio::runtime::Handle::current());
-        dht_client
-    }
+        /// Installs a per-instance DID resolver backed by a caller-retained
+        /// in-memory DHT client on `bi` and returns that client, so the committed
+        /// e2e test can seed the owner's DID document into the SAME store the
+        /// supervisor's governance key resolver reads from — WITHOUT depending on
+        /// the process-global `SHARED_DHT_CLIENT` `OnceLock`.
+        ///
+        /// Why this is necessary (test hermeticity): the production
+        /// `ensure_did_resolver_initialized_on` path stores its `InMemoryDhtClient`
+        /// in the process-wide `SHARED_DHT_CLIENT` `OnceLock` (so
+        /// cross-identity flows in one process share a DHT). The three co-located
+        /// `xctx_saga` tests run concurrently under the default test harness; a
+        /// sibling can win the `SHARED_DHT_CLIENT.set` (or mutate the shared DHT)
+        /// first, so this test's owner DID document lands in / is read from a
+        /// resolver the committed test does not control, and governance vote
+        /// verification fails with `[SCP-CTX-2041] unknown voter: cannot resolve
+        /// public key for DID …`. Installing a FRESH per-instance resolver here,
+        /// BEFORE the first identity creation, makes `ensure_did_resolver_initialized_on`
+        /// a no-op (it short-circuits when a resolver is already present), so this
+        /// retained client is the one the supervisor snapshots — fully isolated from
+        /// the global. Mirrors the `UniFFI` bridge's `install_seedable_resolver`.
+        fn install_seedable_resolver(
+            bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+        ) -> std::sync::Arc<scp_identity::InMemoryDhtClient> {
+            let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
+            let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
+                std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
+                std::sync::Arc::clone(&dht_client),
+                std::sync::Arc::new(scp_identity::DidCache::new()),
+                Vec::new(),
+            ));
+            crate::runtime::init_did_resolver(bi, resolver, tokio::runtime::Handle::current());
+            dht_client
+        }
 
-    /// Publishes `owner_identity`'s DID document into `dht_client` (the
-    /// resolver-visible store installed by [`install_seedable_resolver`]) by
-    /// signing the BEP44 record with the identity's retained in-memory custody.
-    /// Mirrors the production `publish_to_shared_dht_for` step so the
-    /// supervisor's governance key resolver can resolve the proposer key during
-    /// single-admin vote verification.
-    #[cfg(feature = "allow_in_memory_custody")]
-    async fn seed_owner_document_into_resolver(
-        owner_identity: &crate::identity::NapiIdentity,
-        dht_client: &std::sync::Arc<scp_identity::InMemoryDhtClient>,
-    ) {
-        use scp_identity::DhtClient as _;
-        use scp_platform::traits::KeyCustody as _;
+        /// Publishes `owner_identity`'s DID document into `dht_client` (the
+        /// resolver-visible store installed by [`install_seedable_resolver`]) by
+        /// signing the BEP44 record with the identity's retained in-memory custody.
+        /// Mirrors the production `publish_to_shared_dht_for` step so the
+        /// supervisor's governance key resolver can resolve the proposer key during
+        /// single-admin vote verification.
+        async fn seed_owner_document_into_resolver(
+            owner_identity: &crate::identity::NapiIdentity,
+            dht_client: &std::sync::Arc<scp_identity::InMemoryDhtClient>,
+        ) {
+            use scp_identity::DhtClient as _;
+            use scp_platform::traits::KeyCustody as _;
 
-        let inner = &owner_identity.inner;
-        let identity = inner
-            .scp_identity
-            .as_ref()
-            .expect("in-memory owner retains its ScpIdentity");
-        let document = inner
-            .document
-            .as_ref()
-            .expect("in-memory owner retains its DID document");
-        let custody = inner
-            .in_memory_custody
-            .as_ref()
-            .expect("in-memory owner retains its custody");
+            let inner = &owner_identity.inner;
+            let identity = inner
+                .scp_identity
+                .as_ref()
+                .expect("in-memory owner retains its ScpIdentity");
+            let document = inner
+                .document
+                .as_ref()
+                .expect("in-memory owner retains its DID document");
+            let custody = inner
+                .in_memory_custody
+                .as_ref()
+                .expect("in-memory owner retains its custody");
 
-        let doc_json = document.to_json().expect("document serializes to JSON");
-        let value = doc_json.as_bytes();
-        let public_key =
-            scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
-        let seq: u64 = 1;
-        let signable = scp_identity::dht::bep44_signable(value, seq);
-        let sig_bytes = custody
-            .sign(&identity.identity_key, &signable)
-            .await
-            .expect("identity custody signs the BEP44 record")
-            .into_bytes();
-        let signature: [u8; 64] = sig_bytes.try_into().expect("Ed25519 signature is 64 bytes");
-        dht_client
-            .publish(&public_key, &signature, value, seq)
-            .await
-            .expect("publish into the resolver-visible store");
-    }
+            let doc_json = document.to_json().expect("document serializes to JSON");
+            let value = doc_json.as_bytes();
+            let public_key =
+                scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
+            let seq: u64 = 1;
+            let signable = scp_identity::dht::bep44_signable(value, seq);
+            let sig_bytes = custody
+                .sign(&identity.identity_key, &signable)
+                .await
+                .expect("identity custody signs the BEP44 record")
+                .into_bytes();
+            let signature: [u8; 64] = sig_bytes.try_into().expect("Ed25519 signature is 64 bytes");
+            dht_client
+                .publish(&public_key, &signature, value, seq)
+                .await
+                .expect("publish into the resolver-visible store");
+        }
 
-    /// Full `Committed` terminal through the NAPI bridge: an authenticated
-    /// caller drives the §6.2.4 cross-context tool-invocation saga to a real
-    /// commit and the bridge returns the committed receipt + output bytes.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
-        let scp = crate::scp::Scp::new_in_memory_for_test();
-        let bi = std::sync::Arc::clone(&scp.inner);
+        /// Full `Committed` terminal through the NAPI bridge: an authenticated
+        /// caller drives the §6.2.4 cross-context tool-invocation saga to a real
+        /// commit and the bridge returns the committed receipt + output bytes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
 
-        // Install a per-instance, caller-retained DID resolver BEFORE the first
-        // identity creation, so this test is hermetic against the process-global
-        // `SHARED_DHT_CLIENT` `OnceLock` a concurrent sibling `xctx_saga` test
-        // could win first (which otherwise leaves this owner's DID unresolvable
-        // → `[SCP-CTX-2041] unknown voter`). See `install_seedable_resolver`.
-        let resolver_dht = install_seedable_resolver(&bi);
+            // Install a per-instance, caller-retained DID resolver BEFORE the first
+            // identity creation, so this test is hermetic against the process-global
+            // `SHARED_DHT_CLIENT` `OnceLock` a concurrent sibling `xctx_saga` test
+            // could win first (which otherwise leaves this owner's DID unresolvable
+            // → `[SCP-CTX-2041] unknown voter`). See `install_seedable_resolver`.
+            let resolver_dht = install_seedable_resolver(&bi);
 
-        // Owner via the real identity-create path so it retains a real
-        // `ScpIdentity`, custody, and DID document. MUST precede the first
-        // context_create (which lazily builds the supervisor + snapshots the
-        // resolver installed above).
-        let owner_identity = scp
-            .identity_create("in_memory".to_owned(), None)
-            .await
-            .expect("identity_create should succeed");
-        let owner = owner_identity.inner.did.clone();
+            // Owner via the real identity-create path so it retains a real
+            // `ScpIdentity`, custody, and DID document. MUST precede the first
+            // context_create (which lazily builds the supervisor + snapshots the
+            // resolver installed above).
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner = owner_identity.inner.did.clone();
 
-        // Seed the owner's DID document into the per-instance resolver's store
-        // so governance vote verification (RegisterTool / EstablishToolInterface
-        // auto-execute under single_admin) can resolve the proposer's public
-        // key. Without this the resolver is empty and the propose below fails.
-        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
+            // Seed the owner's DID document into the per-instance resolver's store
+            // so governance vote verification (RegisterTool / EstablishToolInterface
+            // auto-execute under single_admin) can resolve the proposer's public
+            // key. Without this the resolver is empty and the propose below fails.
+            seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
 
-        // Context A (caller/source): ceiling carries governance:propose (so the
-        // admin can propose) and tool:interface (required by
-        // execute_establish_tool_interface's ceiling check).
-        let params_a = serde_json::json!({
-            "ceiling": [
-                "governance:propose",
-                "tool:interface",
-                "tools:invoke",
-                "messages:read",
-                "messages:write"
-            ],
-            "governance": "single_admin",
-            "memoryScope": "ephemeral",
-        })
-        .to_string();
-        let handle_a = crate::context::context_create_on(&bi, &owner_identity, params_a)
-            .await
-            .expect("context_create A should succeed");
-        let ctx_a = handle_a.context_id();
+            // Context A (caller/source): ceiling carries governance:propose (so the
+            // admin can propose) and tool:interface (required by
+            // execute_establish_tool_interface's ceiling check).
+            let params_a = serde_json::json!({
+                "ceiling": [
+                    "governance:propose",
+                    "tool:interface",
+                    "tools:invoke",
+                    "messages:read",
+                    "messages:write"
+                ],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            let handle_a = crate::context::context_create_on(&bi, &owner_identity, params_a)
+                .await
+                .expect("context_create A should succeed");
+            let ctx_a = handle_a.context_id();
 
-        // Context B (target): ceiling carries governance:propose and
-        // tool:register so the saga tool can be registered into B's ACTOR
-        // governance state (the saga's Prepare-B reads it from there).
-        let params_b = serde_json::json!({
-            "ceiling": ["governance:propose", "tool:register"],
-            "governance": "single_admin",
-            "memoryScope": "ephemeral",
-        })
-        .to_string();
-        let handle_b = crate::context::context_create_on(&bi, &owner_identity, params_b)
-            .await
-            .expect("context_create B should succeed");
-        let ctx_b = handle_b.context_id();
+            // Context B (target): ceiling carries governance:propose and
+            // tool:register so the saga tool can be registered into B's ACTOR
+            // governance state (the saga's Prepare-B reads it from there).
+            let params_b = serde_json::json!({
+                "ceiling": ["governance:propose", "tool:register"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            let handle_b = crate::context::context_create_on(&bi, &owner_identity, params_b)
+                .await
+                .expect("context_create B should succeed");
+            let ctx_b = handle_b.context_id();
 
-        // Deterministic tool id shared across the actor registry, the interface,
-        // and the FFI-side handler.
-        let tool_name = "xctx_saga_commit_tool";
-        let tool_id = scp_ffi_common::tool_id::generate_tool_id(tool_name);
+            // Deterministic tool id shared across the actor registry, the interface,
+            // and the FFI-side handler.
+            let tool_name = "xctx_saga_commit_tool";
+            let tool_id = scp_ffi_common::tool_id::generate_tool_id(tool_name);
 
-        // Register the tool into B's ACTOR governance state.
-        let register_json = register_tool_action_json(&tool_id, tool_name, &owner);
-        crate::context::context_governance_propose_on(&bi, &handle_b, register_json, owner.clone())
+            // Register the tool into B's ACTOR governance state.
+            let register_json = register_tool_action_json(&tool_id, tool_name, &owner);
+            crate::context::context_governance_propose_on(
+                &bi,
+                &handle_b,
+                register_json,
+                owner.clone(),
+            )
             .await
             .expect("RegisterTool must auto-execute under single_admin");
 
-        // Register the tool into B's FFI-side registry (so register_tool_handler
-        // accepts it) and attach the deterministic handler the executor runs at
-        // Commit-B.
-        let ffi_tool_id = tool_register_on(&bi, &handle_b, build_napi_tool_def(tool_name, &owner))
-            .await
-            .expect("FFI tool_register should succeed");
-        assert_eq!(
-            ffi_tool_id, tool_id,
-            "FFI and governance tool ids must agree (deterministic generate_tool_id)"
-        );
-        let handler: crate::runtime::ToolHandler =
-            std::sync::Arc::new(|_input: serde_json::Value| {
-                Ok(serde_json::json!({"sum": 42, "ok": 1}))
-            });
-        crate::runtime::register_tool_handler(&bi, &ctx_b, &tool_id, handler)
-            .expect("register_tool_handler should succeed");
+            // Register the tool into B's FFI-side registry (so register_tool_handler
+            // accepts it) and attach the deterministic handler the executor runs at
+            // Commit-B.
+            let ffi_tool_id =
+                tool_register_on(&bi, &handle_b, build_napi_tool_def(tool_name, &owner))
+                    .await
+                    .expect("FFI tool_register should succeed");
+            assert_eq!(
+                ffi_tool_id, tool_id,
+                "FFI and governance tool ids must agree (deterministic generate_tool_id)"
+            );
+            let handler: crate::runtime::ToolHandler =
+                std::sync::Arc::new(|_input: serde_json::Value| {
+                    Ok(serde_json::json!({"sum": 42, "ok": 1}))
+                });
+            crate::runtime::register_tool_handler(&bi, &ctx_b, &tool_id, handler)
+                .expect("register_tool_handler should succeed");
 
-        // Establish the bidirectionally-approved interface in A via governance.
-        let interface_json = establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
-        let propose_result = crate::context::context_governance_propose_on(
-            &bi,
-            &handle_a,
-            interface_json,
-            owner.clone(),
-        )
-        .await
-        .expect("EstablishToolInterface must auto-execute under single_admin");
-        assert!(
-            !propose_result.is_empty(),
-            "governance_propose must return a non-empty result JSON"
-        );
-
-        // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance.
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-        // A 16-byte nonce as 32 lowercase-hex chars.
-        let nonce_hex = "0123456789abcdef0123456789abcdef".to_owned();
-
-        let result = Box::pin(tool_invoke_cross_context_saga_on(
-            &bi,
-            &handle_a,
-            &handle_b,
-            owner.clone(),
-            tool_id.clone(),
-            r#"{"a":"x","b":"y"}"#.to_owned(),
-            nonce_hex,
-            now_ms,
-            1,
-            None,
-        ))
-        .await
-        .expect("saga must reach Committed");
-
-        // Committed terminal: non-empty saga id + a receipt + output bytes.
-        assert!(
-            !result.saga_id.is_empty(),
-            "a committed saga must carry a non-empty saga id"
-        );
-        let receipt = result.receipt.expect("committed saga must carry a receipt");
-        assert!(!receipt.is_empty(), "receipt bytes must be non-empty");
-        let output_buf = result
-            .output
-            .expect("committed saga must carry output bytes");
-
-        // The committed output decodes to the handler's response (numeric, per
-        // the registered output schema). Assert the parsed values, not raw
-        // bytes, so a JCS-canonical encoding still passes.
-        let out: serde_json::Value =
-            serde_json::from_slice(output_buf.as_ref()).expect("output must be valid JSON");
-        assert_eq!(out["sum"], 42, "committed output sum must be the handler's");
-        assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
-    }
-
-    // ------------------------------------------------------------------
-    // Caller-principal binding (§6.2.4 *Caller authentication*) — the two
-    // axes `enforce_caller_principal_binding` enforces at the NAPI seam,
-    // BEFORE the saga runs. These are the behavioral counterparts of the
-    // PyO3 `e2e_bridge.rs` axis-(a)/axis-(b) tests.
-    //
-    // MUTATION-RESISTANCE: the producer's own gate 1 ALSO rejects a
-    // non-member caller with SCP-SAGA-13050. Asserting only the code (as the
-    // TS addon test does) would PASS even if this bridge's binding were
-    // removed — the producer would surface 13050 anyway. So each test asserts
-    // the BRIDGE-UNIQUE message substring that `enforce_caller_principal_binding`
-    // emits and the producer never does:
-    //   axis (a): "is not an identity hosted by this bridge instance"
-    //   axis (b): "is hosted by this bridge but is not a member of"
-    // The producer's gate-1 message is "... is not a member of caller context
-    // '...' — not authorized to initiate over it", which contains neither.
-    // ------------------------------------------------------------------
-
-    /// Creates an ephemeral single-admin context owned by `owner_identity` whose
-    /// ceiling carries the saga-relevant capabilities. Mirrors the e2e setup but
-    /// without the tool/interface wiring the two binding-rejection tests never
-    /// reach (they abort at the caller gate before the producer runs).
-    #[cfg(feature = "allow_in_memory_custody")]
-    async fn create_saga_context(
-        bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
-        owner_identity: &crate::identity::NapiIdentity,
-    ) -> crate::context::NapiContextHandle {
-        let params = serde_json::json!({
-            "ceiling": [
-                "governance:propose",
-                "tool:interface",
-                "tool:register",
-                "tools:invoke",
-                "messages:read",
-                "messages:write"
-            ],
-            "governance": "single_admin",
-            "memoryScope": "ephemeral",
-        })
-        .to_string();
-        crate::context::context_create_on(bi, owner_identity, params)
-            .await
-            .expect("context_create should succeed")
-    }
-
-    /// (a) Caller-principal binding, hosted axis: a `caller_did` this bridge
-    /// instance does NOT host is rejected with `SagaAborted` (SCP-SAGA-13050)
-    /// BEFORE the saga runs. Asserts the bridge-unique axis-(a) substring so the
-    /// test fails if `enforce_caller_principal_binding`'s registry check is
-    /// removed (the producer's gate-1 message never carries this phrasing).
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_saga_unhosted_caller_rejected_before_saga() {
-        let scp = crate::scp::Scp::new_in_memory_for_test();
-        let bi = std::sync::Arc::clone(&scp.inner);
-
-        let owner_identity = scp
-            .identity_create("in_memory".to_owned(), None)
-            .await
-            .expect("identity_create should succeed");
-
-        let handle_a = create_saga_context(&bi, &owner_identity).await;
-        let handle_b = create_saga_context(&bi, &owner_identity).await;
-        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_unhosted_probe");
-
-        // A syntactically valid DID that was never created on this instance.
-        let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001".to_owned();
-
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-
-        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
-        // explicitly rather than `expect_err`.
-        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
-            &bi,
-            &handle_a,
-            &handle_b,
-            unhosted_caller,
-            tool_id,
-            r#"{"a":"x","b":"y"}"#.to_owned(),
-            "0123456789abcdef0123456789abcdef".to_owned(),
-            now_ms,
-            1,
-            None,
-        ))
-        .await
-        else {
-            panic!("an unhosted caller_did must be rejected before the saga runs")
-        };
-
-        let msg = format!("{err}");
-        assert!(
-            msg.contains(codes::SAGA_13050),
-            "expected caller-axis SCP-SAGA-13050, got: {msg}"
-        );
-        // BRIDGE-UNIQUE axis-(a) substring — the producer never emits it.
-        assert!(
-            msg.contains("is not an identity hosted by this bridge instance"),
-            "message must be the BRIDGE axis-(a) hosted-principal rejection (not a producer \
-             message), got: {msg}"
-        );
-    }
-
-    /// (b) Caller-principal binding, membership axis: a `caller_did` that IS
-    /// hosted by this bridge but is NOT a member of `caller_context_id` is
-    /// rejected with `SagaAborted` (SCP-SAGA-13050) BEFORE the saga runs. Asserts
-    /// the bridge-unique axis-(b) substring so the test fails if the bridge's
-    /// `is_member` check is removed — the producer's gate-1 message shares only
-    /// the bare "not a member of" phrasing, not this prefix.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_saga_hosted_non_member_caller_rejected() {
-        let scp = crate::scp::Scp::new_in_memory_for_test();
-        let bi = std::sync::Arc::clone(&scp.inner);
-
-        let owner_identity = scp
-            .identity_create("in_memory".to_owned(), None)
-            .await
-            .expect("identity_create should succeed");
-
-        // A SECOND hosted identity that is NOT a member of the caller context.
-        let stranger_identity = scp
-            .identity_create("in_memory".to_owned(), None)
-            .await
-            .expect("identity_create should succeed");
-        let stranger = stranger_identity.inner.did.clone();
-
-        // Contexts created by `owner` ⇒ `stranger` is hosted but not a member.
-        let handle_a = create_saga_context(&bi, &owner_identity).await;
-        let handle_b = create_saga_context(&bi, &owner_identity).await;
-        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_nonmember_probe");
-
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-
-        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
-        // explicitly rather than `expect_err`.
-        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
-            &bi,
-            &handle_a,
-            &handle_b,
-            stranger, // hosted, but not a member of caller context A
-            tool_id,
-            r#"{"a":"x","b":"y"}"#.to_owned(),
-            "0123456789abcdef0123456789abcdef".to_owned(),
-            now_ms,
-            1,
-            None,
-        ))
-        .await
-        else {
-            panic!("a hosted non-member caller must be rejected before the saga runs")
-        };
-
-        let msg = format!("{err}");
-        assert!(
-            msg.contains(codes::SAGA_13050),
-            "expected caller-axis SCP-SAGA-13050, got: {msg}"
-        );
-        // BRIDGE-UNIQUE axis-(b) substring — the producer's gate-1 message
-        // carries only the bare "not a member of" phrasing, not this prefix.
-        assert!(
-            msg.contains("is hosted by this bridge but is not a member of"),
-            "message must be the BRIDGE axis-(b) membership rejection (not the producer gate-1 \
-             message), got: {msg}"
-        );
-    }
-
-    /// (a, axis-isolated) Caller-principal binding, hosted-here axis as the SOLE
-    /// guard: a `caller_did` that IS a genuine member of `caller_context_id` (so
-    /// the membership axis (b) would PASS) but is NOT an identity hosted by this
-    /// bridge instance is STILL rejected with `SagaAborted` (SCP-SAGA-13050)
-    /// BEFORE the saga runs.
-    ///
-    /// This is the property `xctx_saga_unhosted_caller_rejected_before_saga`
-    /// cannot prove: that test's caller is BOTH unhosted AND a non-member, so
-    /// axis (b) (and the producer's gate 1) would reject it even if axis (a) were
-    /// deleted. Here the caller is inserted as a real member of `caller_ctx` via
-    /// `Supervisor::test_insert_member` (the actor-state membership injection
-    /// that bypasses the MLS Welcome a non-hosted DID could never complete), so
-    /// `supervisor.is_member` returns true and axis (b) passes the caller. The
-    /// ONLY thing that can reject it is axis (a): the caller DID was never
-    /// `identity_create`'d, so it is absent from this instance's identity
-    /// registry. The test therefore fails closed iff the bridge's
-    /// `identity_registry_contains` axis (a) check is removed, and is INDEPENDENT
-    /// of axis (b) by construction.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
-        let scp = crate::scp::Scp::new_in_memory_for_test();
-        let bi = std::sync::Arc::clone(&scp.inner);
-
-        // `owner` is a hosted identity used only to create the contexts.
-        let owner_identity = scp
-            .identity_create("in_memory".to_owned(), None)
-            .await
-            .expect("identity_create should succeed");
-
-        let handle_a = create_saga_context(&bi, &owner_identity).await;
-        let handle_b = create_saga_context(&bi, &owner_identity).await;
-        let ctx_a = handle_a.context_id();
-        let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_member_unhosted_probe");
-
-        // The caller is a syntactically valid DID that is NEVER `identity_create`'d
-        // (so the bridge's identity registry does NOT host it — axis (a) must
-        // reject), yet is injected as a genuine member of `caller_ctx` via the
-        // actor-state membership path (so `supervisor.is_member` returns true and
-        // axis (b) passes). `test_insert_member` is the test-only injection that
-        // records the member into role state exactly as an executed `AddMember`
-        // would, without the MLS Welcome a non-hosted DID could never complete.
-        let member_but_unhosted_caller = "did:dht:z6MkMemberButUnhostedCaller001".to_owned();
-        let supervisor = crate::runtime::supervisor(&bi).expect("supervisor must be initialized");
-        supervisor
-            .test_insert_member(
-                &ctx_a,
-                scp_identity::DID(member_but_unhosted_caller.clone()),
-                "member",
+            // Establish the bidirectionally-approved interface in A via governance.
+            let interface_json = establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+            let propose_result = crate::context::context_governance_propose_on(
+                &bi,
+                &handle_a,
+                interface_json,
+                owner.clone(),
             )
             .await
-            .expect("test_insert_member should record the caller into caller_ctx membership");
+            .expect("EstablishToolInterface must auto-execute under single_admin");
+            assert!(
+                !propose_result.is_empty(),
+                "governance_propose must return a non-empty result JSON"
+            );
 
-        // Precondition: the supervisor MUST see the caller as a member of
-        // `caller_ctx` (axis (b) passes), while the bridge's identity registry
-        // does NOT host it (axis (a) is the sole remaining guard).
-        assert!(
+            // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance.
+            let now_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+            // A 16-byte nonce as 32 lowercase-hex chars.
+            let nonce_hex = "0123456789abcdef0123456789abcdef".to_owned();
+
+            let result = Box::pin(tool_invoke_cross_context_saga_on(
+                &bi,
+                &handle_a,
+                &handle_b,
+                owner.clone(),
+                tool_id.clone(),
+                r#"{"a":"x","b":"y"}"#.to_owned(),
+                nonce_hex,
+                now_ms,
+                1,
+                None,
+            ))
+            .await
+            .expect("saga must reach Committed");
+
+            // Committed terminal: non-empty saga id + a receipt + output bytes.
+            assert!(
+                !result.saga_id.is_empty(),
+                "a committed saga must carry a non-empty saga id"
+            );
+            let receipt = result.receipt.expect("committed saga must carry a receipt");
+            assert!(!receipt.is_empty(), "receipt bytes must be non-empty");
+            let output_buf = result
+                .output
+                .expect("committed saga must carry output bytes");
+
+            // The committed output decodes to the handler's response (numeric, per
+            // the registered output schema). Assert the parsed values, not raw
+            // bytes, so a JCS-canonical encoding still passes.
+            let out: serde_json::Value =
+                serde_json::from_slice(output_buf.as_ref()).expect("output must be valid JSON");
+            assert_eq!(out["sum"], 42, "committed output sum must be the handler's");
+            assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
+        }
+
+        // ------------------------------------------------------------------
+        // Caller-principal binding (§6.2.4 *Caller authentication*) — the two
+        // axes `enforce_caller_principal_binding` enforces at the NAPI seam,
+        // BEFORE the saga runs. These are the behavioral counterparts of the
+        // PyO3 `e2e_bridge.rs` axis-(a)/axis-(b) tests.
+        //
+        // MUTATION-RESISTANCE: the producer's own gate 1 ALSO rejects a
+        // non-member caller with SCP-SAGA-13050. Asserting only the code (as the
+        // TS addon test does) would PASS even if this bridge's binding were
+        // removed — the producer would surface 13050 anyway. So each test asserts
+        // the BRIDGE-UNIQUE message substring that `enforce_caller_principal_binding`
+        // emits and the producer never does:
+        //   axis (a): "is not an identity hosted by this bridge instance"
+        //   axis (b): "is hosted by this bridge but is not a member of"
+        // The producer's gate-1 message is "... is not a member of caller context
+        // '...' — not authorized to initiate over it", which contains neither.
+        // ------------------------------------------------------------------
+
+        /// Creates an ephemeral single-admin context owned by `owner_identity` whose
+        /// ceiling carries the saga-relevant capabilities. Mirrors the e2e setup but
+        /// without the tool/interface wiring the two binding-rejection tests never
+        /// reach (they abort at the caller gate before the producer runs).
+        async fn create_saga_context(
+            bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+            owner_identity: &crate::identity::NapiIdentity,
+        ) -> crate::context::NapiContextHandle {
+            let params = serde_json::json!({
+                "ceiling": [
+                    "governance:propose",
+                    "tool:interface",
+                    "tool:register",
+                    "tools:invoke",
+                    "messages:read",
+                    "messages:write"
+                ],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            crate::context::context_create_on(bi, owner_identity, params)
+                .await
+                .expect("context_create should succeed")
+        }
+
+        /// (a) Caller-principal binding, hosted axis: a `caller_did` this bridge
+        /// instance does NOT host is rejected with `SagaAborted` (SCP-SAGA-13050)
+        /// BEFORE the saga runs. Asserts the bridge-unique axis-(a) substring so the
+        /// test fails if `enforce_caller_principal_binding`'s registry check is
+        /// removed (the producer's gate-1 message never carries this phrasing).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn xctx_saga_unhosted_caller_rejected_before_saga() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+
+            let handle_a = create_saga_context(&bi, &owner_identity).await;
+            let handle_b = create_saga_context(&bi, &owner_identity).await;
+            let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_unhosted_probe");
+
+            // A syntactically valid DID that was never created on this instance.
+            let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001".to_owned();
+
+            let now_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+
+            // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+            // explicitly rather than `expect_err`.
+            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+                &bi,
+                &handle_a,
+                &handle_b,
+                unhosted_caller,
+                tool_id,
+                r#"{"a":"x","b":"y"}"#.to_owned(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                now_ms,
+                1,
+                None,
+            ))
+            .await
+            else {
+                panic!("an unhosted caller_did must be rejected before the saga runs")
+            };
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(codes::SAGA_13050),
+                "expected caller-axis SCP-SAGA-13050, got: {msg}"
+            );
+            // BRIDGE-UNIQUE axis-(a) substring — the producer never emits it.
+            assert!(
+                msg.contains("is not an identity hosted by this bridge instance"),
+                "message must be the BRIDGE axis-(a) hosted-principal rejection (not a producer \
+             message), got: {msg}"
+            );
+        }
+
+        /// (b) Caller-principal binding, membership axis: a `caller_did` that IS
+        /// hosted by this bridge but is NOT a member of `caller_context_id` is
+        /// rejected with `SagaAborted` (SCP-SAGA-13050) BEFORE the saga runs. Asserts
+        /// the bridge-unique axis-(b) substring so the test fails if the bridge's
+        /// `is_member` check is removed — the producer's gate-1 message shares only
+        /// the bare "not a member of" phrasing, not this prefix.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn xctx_saga_hosted_non_member_caller_rejected() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+
+            // A SECOND hosted identity that is NOT a member of the caller context.
+            let stranger_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let stranger = stranger_identity.inner.did.clone();
+
+            // Contexts created by `owner` ⇒ `stranger` is hosted but not a member.
+            let handle_a = create_saga_context(&bi, &owner_identity).await;
+            let handle_b = create_saga_context(&bi, &owner_identity).await;
+            let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_nonmember_probe");
+
+            let now_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+
+            // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+            // explicitly rather than `expect_err`.
+            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+                &bi,
+                &handle_a,
+                &handle_b,
+                stranger, // hosted, but not a member of caller context A
+                tool_id,
+                r#"{"a":"x","b":"y"}"#.to_owned(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                now_ms,
+                1,
+                None,
+            ))
+            .await
+            else {
+                panic!("a hosted non-member caller must be rejected before the saga runs")
+            };
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(codes::SAGA_13050),
+                "expected caller-axis SCP-SAGA-13050, got: {msg}"
+            );
+            // BRIDGE-UNIQUE axis-(b) substring — the producer's gate-1 message
+            // carries only the bare "not a member of" phrasing, not this prefix.
+            assert!(
+                msg.contains("is hosted by this bridge but is not a member of"),
+                "message must be the BRIDGE axis-(b) membership rejection (not the producer gate-1 \
+             message), got: {msg}"
+            );
+        }
+
+        /// (a, axis-isolated) Caller-principal binding, hosted-here axis as the SOLE
+        /// guard: a `caller_did` that IS a genuine member of `caller_context_id` (so
+        /// the membership axis (b) would PASS) but is NOT an identity hosted by this
+        /// bridge instance is STILL rejected with `SagaAborted` (SCP-SAGA-13050)
+        /// BEFORE the saga runs.
+        ///
+        /// This is the property `xctx_saga_unhosted_caller_rejected_before_saga`
+        /// cannot prove: that test's caller is BOTH unhosted AND a non-member, so
+        /// axis (b) (and the producer's gate 1) would reject it even if axis (a) were
+        /// deleted. Here the caller is inserted as a real member of `caller_ctx` via
+        /// `Supervisor::test_insert_member` (the actor-state membership injection
+        /// that bypasses the MLS Welcome a non-hosted DID could never complete), so
+        /// `supervisor.is_member` returns true and axis (b) passes the caller. The
+        /// ONLY thing that can reject it is axis (a): the caller DID was never
+        /// `identity_create`'d, so it is absent from this instance's identity
+        /// registry. The test therefore fails closed iff the bridge's
+        /// `identity_registry_contains` axis (a) check is removed, and is INDEPENDENT
+        /// of axis (b) by construction.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            // `owner` is a hosted identity used only to create the contexts.
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+
+            let handle_a = create_saga_context(&bi, &owner_identity).await;
+            let handle_b = create_saga_context(&bi, &owner_identity).await;
+            let ctx_a = handle_a.context_id();
+            let tool_id =
+                scp_ffi_common::tool_id::generate_tool_id("xctx_saga_member_unhosted_probe");
+
+            // The caller is a syntactically valid DID that is NEVER `identity_create`'d
+            // (so the bridge's identity registry does NOT host it — axis (a) must
+            // reject), yet is injected as a genuine member of `caller_ctx` via the
+            // actor-state membership path (so `supervisor.is_member` returns true and
+            // axis (b) passes). `test_insert_member` is the test-only injection that
+            // records the member into role state exactly as an executed `AddMember`
+            // would, without the MLS Welcome a non-hosted DID could never complete.
+            let member_but_unhosted_caller = "did:dht:z6MkMemberButUnhostedCaller001".to_owned();
+            let supervisor =
+                crate::runtime::supervisor(&bi).expect("supervisor must be initialized");
             supervisor
-                .is_member(&ctx_a, &member_but_unhosted_caller)
-                .await,
-            "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
-        );
-        assert!(
-            !crate::runtime::identity_registry_contains(&bi, &member_but_unhosted_caller),
-            "precondition: caller must NOT be hosted so axis (a) is the sole guard"
-        );
+                .test_insert_member(
+                    &ctx_a,
+                    scp_identity::DID(member_but_unhosted_caller.clone()),
+                    "member",
+                )
+                .await
+                .expect("test_insert_member should record the caller into caller_ctx membership");
 
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
+            // Precondition: the supervisor MUST see the caller as a member of
+            // `caller_ctx` (axis (b) passes), while the bridge's identity registry
+            // does NOT host it (axis (a) is the sole remaining guard).
+            assert!(
+                supervisor
+                    .is_member(&ctx_a, &member_but_unhosted_caller)
+                    .await,
+                "precondition: caller must be a genuine member of caller_ctx so axis (b) passes"
+            );
+            assert!(
+                !crate::runtime::identity_registry_contains(&bi, &member_but_unhosted_caller),
+                "precondition: caller must NOT be hosted so axis (a) is the sole guard"
+            );
 
-        // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
-        // explicitly rather than `expect_err`.
-        let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
-            &bi,
-            &handle_a,
-            &handle_b,
-            member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
-            tool_id,
-            r#"{"a":"x","b":"y"}"#.to_owned(),
-            "0123456789abcdef0123456789abcdef".to_owned(),
-            now_ms,
-            1,
-            None,
-        ))
-        .await
-        else {
-            panic!("a member-but-unhosted caller must be rejected by axis (a) before the saga runs")
-        };
+            let now_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
 
-        let msg = format!("{err}");
-        assert!(
-            msg.contains(codes::SAGA_13050),
-            "expected caller-axis SCP-SAGA-13050, got: {msg}"
-        );
-        // BRIDGE-UNIQUE axis-(a) substring. Because the caller IS a member, the
-        // membership axis (b) and the producer's gate 1 would BOTH pass — so the
-        // axis-(b) message ("is hosted by this bridge but is not a member of") can
-        // never appear here. The ONLY rejection that fits is axis (a). Asserting
-        // its exact substring makes this test fail closed iff
-        // `enforce_caller_principal_binding`'s `identity_registry_contains` check
-        // is removed.
-        assert!(
-            msg.contains("is not an identity hosted by this bridge instance"),
-            "message must be the BRIDGE axis-(a) hosted-here rejection, got: {msg}"
-        );
+            // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
+            // explicitly rather than `expect_err`.
+            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+                &bi,
+                &handle_a,
+                &handle_b,
+                member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
+                tool_id,
+                r#"{"a":"x","b":"y"}"#.to_owned(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                now_ms,
+                1,
+                None,
+            ))
+            .await
+            else {
+                panic!(
+                    "a member-but-unhosted caller must be rejected by axis (a) before the saga runs"
+                )
+            };
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(codes::SAGA_13050),
+                "expected caller-axis SCP-SAGA-13050, got: {msg}"
+            );
+            // BRIDGE-UNIQUE axis-(a) substring. Because the caller IS a member, the
+            // membership axis (b) and the producer's gate 1 would BOTH pass — so the
+            // axis-(b) message ("is hosted by this bridge but is not a member of") can
+            // never appear here. The ONLY rejection that fits is axis (a). Asserting
+            // its exact substring makes this test fail closed iff
+            // `enforce_caller_principal_binding`'s `identity_registry_contains` check
+            // is removed.
+            assert!(
+                msg.contains("is not an identity hosted by this bridge instance"),
+                "message must be the BRIDGE axis-(a) hosted-here rejection, got: {msg}"
+            );
+        }
     }
 }
