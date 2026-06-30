@@ -287,8 +287,10 @@ class TestMultiTokenAndAggregation:
         assert "*" not in call.kwargs.values()
         # The diagnostic is called for general validity with the challenge
         # capability None and the subject DID passed as the presenting agent
-        # (so the audience check evaluates against the DID under assessment, not
-        # the tautological token-own-aud default). Signature is
+        # (so the audience check evaluates against the DID under assessment; the
+        # bridge requires it fail-closed and rejects an absent/empty value
+        # rather than falling back to a tautological token-own-aud check).
+        # Signature is
         # ucan_evaluate(context_id, token, capability, presenting_agent_did).
         assert positional == ("ctx-test", "only-token", None, "did:dht:z6MkBob")
         assert "capability" not in call.kwargs

@@ -1120,9 +1120,10 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // `aud` differs from the evaluated subject must report `signaturesValid:
     // false` — `evaluateTrust` passes `subjectDid` as the presenting agent so
     // the step-5 audience check evaluates against the DID under assessment.
-    // Without it the bridge would default the presenting agent to the token's
-    // OWN `aud` (`aud == aud` always true), inflating trust for a token
-    // addressed to someone else. This guards a future edit that drops
+    // `presentingAgentDid` is fail-closed: the bridge REJECTS an absent or empty
+    // value rather than defaulting the presenting agent to the token's OWN `aud`
+    // (which would make `aud == aud` always true, inflating trust for a token
+    // addressed to someone else). This guards a future edit that drops
     // `subjectDid` from `evaluateTrust` (ADR-057 / §7.2.4).
     test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
       const admin = await napi.identityCreate("in_memory");

@@ -723,13 +723,15 @@ async def evaluate_trust(
             #
             # ``subject_did`` is passed as the presenting agent so the step-5
             # audience check evaluates the token against the DID under
-            # assessment. Omitting it makes the bridge default the presenting
-            # agent to the token's OWN ``aud`` (crates/scp-ffi/src/ucan.rs),
-            # turning the audience check into the tautology ``aud == aud`` —
-            # which would report ``signatures_valid`` for a token addressed to
-            # someone else (trust inflation). The TS canonical API passes the
-            # subject the same way; this keeps an identical shape across
-            # bindings (Agent-first API design tenet).
+            # assessment. ``presenting_agent_did`` is REQUIRED and fail-closed:
+            # the bridge REJECTS an absent or empty value with a validation error
+            # rather than defaulting to the token's OWN ``aud``
+            # (crates/scp-ffi/src/ucan.rs). Defaulting would turn the audience
+            # check into the tautology ``aud == aud`` — reporting
+            # ``signatures_valid`` for a token addressed to someone else (trust
+            # inflation) — so the bridge refuses to assume it. The TS canonical
+            # API passes the subject the same way; this keeps an identical shape
+            # across bindings (Agent-first API design tenet).
             result = await asyncio.to_thread(
                 instance.ucan_evaluate, context_id, token, None, subject_did
             )

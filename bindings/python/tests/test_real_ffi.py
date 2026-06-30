@@ -688,11 +688,13 @@ class TestUcan:
         Regression guard for the audience tautology: ``evaluate_trust`` must
         pass the ``subject_did`` to the diagnostic as the presenting agent so
         the step-5 audience check evaluates against the DID under assessment.
-        Without it the bridge defaults the presenting agent to the token's OWN
-        ``aud`` (``aud == aud`` always true), reporting ``signatures_valid`` for
-        a token addressed to someone else (trust inflation). Mints a token for
-        Bob, then evaluates trust for Carol against that token and asserts the
-        structured ``signatures_valid`` is False (ADR-057 / §7.2.4).
+        ``presenting_agent_did`` is fail-closed: the bridge REJECTS an absent or
+        empty value rather than defaulting the presenting agent to the token's
+        OWN ``aud`` (which would make ``aud == aud`` always true, reporting
+        ``signatures_valid`` for a token addressed to someone else — trust
+        inflation). Mints a token for Bob, then evaluates trust for Carol
+        against that token and asserts the structured ``signatures_valid`` is
+        False (ADR-057 / §7.2.4).
         """
         from scp_sdk.trust import evaluate_trust
 
