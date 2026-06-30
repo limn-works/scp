@@ -9005,7 +9005,7 @@ impl Scp {
                 // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so
                 // they embed in `scp://context/<context_id_hex>` URIs. The
                 // shared helper in `scp-ffi-common` is the single source of
-                // truth for all four bridges — see ADR-048 §7a.
+                // truth for all three bridges — see ADR-048 §7a.
                 let context_id = scp_ffi_common::generate_context_id();
 
                 // Convert bridge ContextParams to scp-core ContextParams.
@@ -14178,7 +14178,7 @@ impl Scp {
     /// `TransportManager` handle, not on the bridge instance, so it
     /// is only observable via [`Self::transport_status`]). The
     /// disconnected shape — the only shape the parity harness
-    /// exercises — is `(false, None, None)` across all four bridges.
+    /// exercises — is `(false, None, None)` across all three bridges.
     ///
     /// Since the result is stateless as far as the bridge is
     /// concerned (no cross-instance handle is passed in), there is no

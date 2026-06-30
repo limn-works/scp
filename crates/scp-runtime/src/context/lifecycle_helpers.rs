@@ -1815,7 +1815,7 @@ pub async fn import_context(
     // A broadcast-mode export has no per-member pseudonym (spec §5.14) and
     // cannot be re-homed as encrypted without silently fabricating routing
     // state, so reject it loudly with the canonical SCP-CTX-2092 envelope
-    // rather than accepting it and degrading the routing axis. All four bridges
+    // rather than accepting it and degrading the routing axis. All three bridges
     // therefore fail import on a broadcast export identically (by `.code`).
     if matches!(
         export.snapshot.context_params.mode,

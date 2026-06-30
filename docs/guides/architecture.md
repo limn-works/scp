@@ -183,7 +183,7 @@ HTTP/3 (QUIC-based HTTP) serves two roles: as the relay's HTTP upgrade path for 
 2. **WebSocket** -- fall back to `new WebSocket("wss://<host>/scp/v1")`. Mandatory baseline.
 3. **Error** -- if WebSocket also fails, report connection failure.
 
-The fallback is transparent to `TransportAdapter` callers. The WASM binding wraps both transports behind the same adapter interface. Mid-session upgrade from WebSocket to WebTransport is supported when the relay advertises WebTransport via `Alt-Svc`.
+The fallback is transparent to `TransportAdapter` callers. The browser client transport wraps both transports behind the same adapter interface. Mid-session upgrade from WebSocket to WebTransport is supported when the relay advertises WebTransport via `Alt-Svc`.
 
 ### Constrained Device Transport (SS10.16)
 

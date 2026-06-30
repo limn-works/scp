@@ -985,7 +985,7 @@ All relay HTTP endpoints benefit from HTTP/3:
 
 WebTransport is the browser-facing equivalent of §10.14 (QUIC), using the WebTransport API over HTTP/3.
 
-**Distinction from QUIC.** WebTransport is mediated by the browser's network stack. The SCP WASM binding uses the `WebTransport` API. Non-browser clients use QUIC directly (§10.14). Server-side, the relay handles both — QUIC connections and WebTransport sessions are both QUIC underneath, sharing the same subscription registry and blob storage.
+**Distinction from QUIC.** WebTransport is mediated by the browser's network stack. The SCP browser client transport uses the `WebTransport` API. Non-browser clients use QUIC directly (§10.14). Server-side, the relay handles both — QUIC connections and WebTransport sessions are both QUIC underneath, sharing the same subscription registry and blob storage.
 
 **Connection model:**
 1. Browser opens `new WebTransport("https://<host>/scp/v1")` — establishes HTTP/3 + WebTransport session.
@@ -1006,7 +1006,7 @@ Browser clients follow this transport selection order:
 2. **WebSocket** — fall back to `new WebSocket("wss://<host>/scp/v1")`. This is the mandatory baseline that all relays support.
 3. **Error** — if WebSocket also fails, report connection failure.
 
-The fallback is transparent to `TransportAdapter` callers. The WASM binding wraps both transports behind the same adapter interface. The WASM binding MAY switch from WebSocket to WebTransport mid-session if the relay advertises WebTransport support via `Alt-Svc`. This involves establishing a new WebTransport session and re-opening subscription streams (same gap-fill strategy as reconnection), not an in-place protocol upgrade.
+The fallback is transparent to `TransportAdapter` callers. The browser client transport wraps both transports behind the same adapter interface. The browser client transport MAY switch from WebSocket to WebTransport mid-session if the relay advertises WebTransport support via `Alt-Svc`. This involves establishing a new WebTransport session and re-opening subscription streams (same gap-fill strategy as reconnection), not an in-place protocol upgrade.
 
 ## 10.16 Constrained Device Transport
 

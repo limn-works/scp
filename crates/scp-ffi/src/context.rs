@@ -1946,7 +1946,7 @@ impl crate::scp::PyScp {
 
         // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
         // embed in `scp://context/<context_id_hex>` URIs. The shared helper
-        // in `scp-ffi-common` is the single source of truth for all four
+        // in `scp-ffi-common` is the single source of truth for all three
         // bridges — see ADR-048 §7a.
         let context_id = scp_ffi_common::generate_context_id();
 

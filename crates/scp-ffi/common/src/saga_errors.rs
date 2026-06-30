@@ -25,8 +25,8 @@
 //!
 //! `SagaError` lives in `scp-core` (re-exported from `scp-runtime`), so this
 //! module is behind the `resolvers` feature — the same gate as the other
-//! scp-core-dependent shared adapters. WASM has no `Supervisor` and never
-//! drives the saga (ADR-034), so it does not compile this module.
+//! scp-core-dependent shared adapters. Only bridges that build against scp-core
+//! (and therefore drive the `Supervisor`) compile this module.
 //!
 //! Provenance: §6.2.4 (cross-context tool-invocation saga) + ADR-049 §3a
 //! (atomic cross-context invocation, `RateLimited { retry_after_ms }` /

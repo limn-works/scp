@@ -300,7 +300,7 @@ async fn context_create_returns_active_context() {
         !handle.context_id().is_empty(),
         "Context ID should be non-empty"
     );
-    // Per commit 509fd2fed, all four FFI bridges now emit spec-compliant
+    // Per commit 509fd2fed, all three FFI bridges now emit spec-compliant
     // 64-char lowercase hex context IDs (spec §18.4.1), replacing the
     // old `ctx-<random>` format. Pin the new format so regressions are
     // caught.

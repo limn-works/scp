@@ -2638,7 +2638,7 @@ fn pure_helpers_detector_accepts_self_type_references() {
 // cross-bridge parity op (it exists in the other bridges too) but simply
 // never got an alias entry, the forward tests stay green while the operation
 // silently lacks parity tracking. That is exactly how an unregistered op can
-// hide — e.g. an op exported in all four bridges but absent from the alias
+// hide — e.g. an op exported in all three bridges but absent from the alias
 // table is invisible to every forward gate.
 //
 // This reverse gate enumerates EVERY exported fn under each bridge crate's
@@ -2833,7 +2833,7 @@ fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
 /// file rides the registered name to stay green).
 ///
 /// A registered name found at >1 path cannot have its canonical site derived
-/// unambiguously. STEP-1 empirical scan of all four bridges found ZERO such
+/// unambiguously. STEP-1 empirical scan of all three bridges found ZERO such
 /// names (every registered name maps to exactly one export path), so this
 /// allowlist starts EMPTY. It exists so that IF a legitimate multi-path
 /// registered name ever appears (e.g. a getter name that genuinely collides

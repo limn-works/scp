@@ -3116,7 +3116,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `TransportManager` handle, not on the bridge instance, so it
      * is only observable via [`Self::transport_status`]). The
      * disconnected shape — the only shape the parity harness
-     * exercises — is `(false, None, None)` across all four bridges.
+     * exercises — is `(false, None, None)` across all three bridges.
      *
      * Since the result is stateless as far as the bridge is
      * concerned (no cross-instance handle is passed in), there is no
@@ -6150,7 +6150,7 @@ open func transportDisconnect(manager: TransportManager)async throws   {
      * `TransportManager` handle, not on the bridge instance, so it
      * is only observable via [`Self::transport_status`]). The
      * disconnected shape — the only shape the parity harness
-     * exercises — is `(false, None, None)` across all four bridges.
+     * exercises — is `(false, None, None)` across all three bridges.
      *
      * Since the result is stateless as far as the bridge is
      * concerned (no cross-instance handle is passed in), there is no

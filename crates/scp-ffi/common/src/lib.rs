@@ -126,8 +126,8 @@ pub mod trust_store;
 // UniFFI. Pins the `RateLimited → Option<u64>` read, the `None`-never-`0` rule,
 // and the `SCP-SAGA-{code}` formatting in ONE place so the three bridges'
 // `map_saga_error` cannot drift. Requires scp-core for
-// `scp_core::context::supervisor::SagaError` (behind `resolvers` feature). WASM
-// has no Supervisor and never drives the saga (ADR-034).
+// `scp_core::context::supervisor::SagaError`, so it sits behind the `resolvers`
+// feature alongside the other scp-core-dependent adapters.
 #[cfg(feature = "resolvers")]
 pub mod saga_errors;
 

@@ -135,7 +135,7 @@ echo "Checked $CHECKED error code occurrences."
 # Test files, assertions, and comment-only lines are excluded.
 #
 # Same code for same purpose across bridges is fine (e.g. SCP-VALID-7120 =
-# "lock poisoned" in all 4 bridges). Different messages for the same code
+# "lock poisoned" in all 3 bridges). Different messages for the same code
 # signals a collision.
 # ---------------------------------------------------------------------------
 

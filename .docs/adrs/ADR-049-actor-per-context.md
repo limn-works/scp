@@ -3,7 +3,8 @@
 **Status:** Proposed
 **Date:** 2026-04-19
 **Phase:** Runtime concurrency redesign
-**Related:** ADR-034 (WASM Constraints), ADR-046 (Bridge Parity Harness), ADR-047 (Bridge Symmetry Enforcement), ADR-048 (SCP Multi-Instance). Plan: `~/.claude/plans/generic-moseying-lightning.md`.
+**Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`). The §10 note about a WASM-specific `scp_init` panic-hook in the now-deleted `crates/scp-ffi/wasm/src/lib.rs`, and the dead `cargo check -p scp-ffi-wasm` verification command, have been removed. The actor/watchdog model and its native payload-free panic-redaction principle are unchanged; `scp-protocol` still compiles to `wasm32-unknown-unknown` (it is the pure sync core, not the deleted bridge), so that compile check stays.
+**Related:** ADR-034 (WASM Constraints), ADR-046 (Bridge Parity Harness), ADR-047 (Bridge Symmetry Enforcement), ADR-048 (SCP Multi-Instance), ADR-055 (WASM bridge removal). Plan: `~/.claude/plans/generic-moseying-lightning.md`.
 
 ## Context
 
@@ -74,7 +75,7 @@ Commit 11 landed `Supervisor::start_saga -> SagaOutput { saga_id }` in-core, wit
 
 **Wait model — block-until-terminal.** The saga is interactive and request-scoped; the FFI worker blocks one bounded saga (≤~95s worst case across phases plus retries) and returns after `Committed` / `Aborted` / `NeedsRepair`. No async / poll / `saga_state` model is needed (that was only ever contemplated for the now-cut cross-identity custody handover).
 
-**`SagaId` wire encoding plus authority.** A `SagaId` is a UUIDv4 rendered as the canonical 36-character lowercase hyphenated string (matching the in-core `SagaId(pub String)` / `Uuid::new_v4().to_string()`); it is a plain UTF-8 string at every bridge (PyO3 `str`, NAPI/TS `string`, UniFFI `String`, WASM `string`). It is **always supervisor-minted (`SagaId::new()`), NEVER accepted as caller input on any bridge** — a caller cannot supply or choose a `SagaId`, so it cannot poison the by-`SagaId` Commit idempotency de-dup or collide with another saga's id. Block-until-terminal returns the result inline, so no `saga_state` status query is exposed; **if** one is ever added, it MUST authorize the calling identity as a saga participant before returning state — a `SagaId` is an unguessable *handle*, not a capability. It is not a secret-at-rest and needs no compaction.
+**`SagaId` wire encoding plus authority.** A `SagaId` is a UUIDv4 rendered as the canonical 36-character lowercase hyphenated string (matching the in-core `SagaId(pub String)` / `Uuid::new_v4().to_string()`); it is a plain UTF-8 string at every bridge (PyO3 `str`, NAPI/TS `string`, UniFFI `String`). It is **always supervisor-minted (`SagaId::new()`), NEVER accepted as caller input on any bridge** — a caller cannot supply or choose a `SagaId`, so it cannot poison the by-`SagaId` Commit idempotency de-dup or collide with another saga's id. Block-until-terminal returns the result inline, so no `saga_state` status query is exposed; **if** one is ever added, it MUST authorize the calling identity as a saga participant before returning state — a `SagaId` is an unguessable *handle*, not a capability. It is not a secret-at-rest and needs no compaction.
 
 **Saga concurrency — per-context-pair (not per-supervisor).** `SagaBusy` is raised only when the new saga's participant context set *overlaps* an in-flight saga's set; disjoint sets run concurrently. The as-built single supervisor-wide `AtomicBool` (`supervisor.rs`) is an implementation-PR replacement target — it must become per-participant-set gating so one slow or stuck saga cannot deny the whole instance. `NeedsRepair` **releases** the concurrency reservation (an operator still resolves the divergence, but unrelated sagas must not block — `NeedsRepair` is non-terminal for repair purposes, and a tool-invoke divergence can stay unresolved until operator repair).
 
@@ -214,8 +215,6 @@ The distinction between Class S and Class M is *where the state lives across the
 
 **Panic detection + payload-free logging.** `actor_watchdog` awaits the actor `JoinHandle` and inspects the `JoinError` ONLY via `is_panic()` (a bool). A clean return (`Ok`) or a non-panic `JoinError` (cancellation/abort) is not a crash. A panic records a crash and logs `actor_kind`, `context_id`, `crash_count`, `poisoned`, and `panic_location = "unknown"`. The panic payload itself is NEVER read or formatted (`into_panic()` / `payload()` / `{:?}` on the `JoinError` are forbidden) — Rust panic messages interpolate locals via `format!`, and an MLS-encrypt or key-derivation panic could otherwise spill plaintext or key bytes. `panic_location` is hardcoded `"unknown"`: a process-global "last panic location" store would be racy across threads and multiple supervisors AND a mutable global (forbidden by the `check-no-mutable-globals` gate), so the payload-free floor is chosen deliberately over a racy, possibly-wrong location. CI enforces this ban across the FULL set of code reachable SYNCHRONOUSLY on the actor task, via `scripts/check-handler-no-panic.sh`, in two concentric scopes. (1) The actor **handlers** (`crates/scp-runtime/src/context/actor/handlers/`) and the **dispatch hub** (`crates/scp-runtime/src/context/actor/mod.rs`) ban the FULL panic family outside `#[cfg(test)]` — `panic!`, `unreachable!`, `unimplemented!`, `todo!`, AND `assert*!`/`debug_assert*!` — because a panic there unwinds the actor task directly. (2) The **synchronously-reachable per-context dispatch layer** — EVERY `.rs` file under `crates/scp-runtime/src/context/`, scanned RECURSIVELY (the `*_helpers.rs`/`*_logic.rs` dispatch transitives and `execute_*` governance leaves, plus the submodule leaves a handler calls synchronously: `governance/timeout.rs` (governance timeout tick), `tools/invoke.rs` + `tools/session.rs` (tool dispatch), and `ttl.rs` (TTL leaf)) — bans the REACHABLE-panic family only (`panic!`/`unreachable!`/`unimplemented!`/`todo!`); a reachable panic in any of these unwinds the SAME actor task as a handler panic (Seam-3). The `assert*!`/`debug_assert*!` family is NOT banned in this second layer: a `debug_assert!` is release-stripped and is legitimately used as a tripwire. Test/testing code (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `#[cfg(any(test, ..))]`, `#[cfg(feature = "testing")]`) is excluded in both scopes. The single allowed production exception is the `#[cfg(feature = "testing")]` `TestInducePanic` fault-injection seam in `actor/mod.rs`, which exists solely to exercise the watchdog deterministically and cannot exist in a production build.
 
-A complementary, payload-free hardening on the ADR-034 WASM crypto path: the `scp_init` panic hook in `crates/scp-ffi/wasm/src/lib.rs` redacts the panic message before it reaches the browser console, extending this section's payload-free principle (panic payloads may interpolate plaintext or key bytes) to the WASM bindings, which run outside the actor/watchdog model.
-
 **Respawn budget + poison.** 3 crashes within a sliding 60s window poisons the context (the budget is the `CrashWindow` per-context state, keyed in the supervisor's lock-free `crash_windows` `DashMap`). Below the threshold the watchdog respawns from the persisted snapshot via `respawn_from_snapshot`, which reuses the shared `restore_context` primitive to rehydrate the FULL `PerContextState` (governance, MLS crypto, §9.10.4 routing/pseudonym registry, rate-limit). A failed respawn (lost/corrupt snapshot) is itself counted as a crash so a reliably-failing snapshot poisons rather than looping forever, and sets a per-context `last_respawn_failed` flag so a per-context lookup-miss surfaces `ActorCrashed` (SCP-CTX-2135) rather than a misleading `ContextNotRegistered`. Once poisoned, the actor is despawned and stays dormant; `read_context_state` reports `Poisoned` (read from the sticky `crash_windows` flag, since the actor is gone), and any per-context dispatch surfaces `ContextPoisoned` (SCP-CTX-2134). No infinite respawn loop; recovery is operator-driven (`SupervisorHandle::clear_poison`, which clears the window and attempts one respawn) or a process restart (which re-runs `restore_all_contexts`; the poison record is in-memory and does not survive a restart).
 
 **Recovery-surface honesty (mirrors §12a's webhook-deferral disclosure).** `SupervisorHandle::clear_poison` is a Rust-core recovery primitive that is **not yet wired to an FFI/operator-facing surface** — no bridge exports it and no SDK wrapper calls it. The complete, tested end-to-end recovery path available to a deployed node today is therefore a **process restart** (which re-runs `restore_all_contexts` and drops the in-memory poison record). `clear_poison` is exercised by Rust-core tests and is ready for an operator surface to call, but until that surface lands, "operator-driven recovery" in production means restart. This asymmetry is recorded here in the system of record rather than only in code comments, exactly as the §12a webhook-target deferral is.
@@ -247,7 +246,7 @@ This boundary is the same shape as §12a's webhook-target deferral: the durable,
 
 ### 11. `BridgeInstanceCore` lifecycle methods are default trait impls
 
-Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a `BridgeInstanceCore` trait. This ADR extends `BridgeInstanceCore` with default trait methods for `suspend()`, `resume()`, `shutdown()`. Per-bridge structs override only bridge-specific cleanup hooks (`pre_suspend_hook`, `post_suspend_hook`, etc.). All three non-WASM bridges share one implementation. Cross-bridge consistency check (#1543) extends to verify all bridges use the defaults.
+Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a `BridgeInstanceCore` trait. This ADR extends `BridgeInstanceCore` with default trait methods for `suspend()`, `resume()`, `shutdown()`. Per-bridge structs override only bridge-specific cleanup hooks (`pre_suspend_hook`, `post_suspend_hook`, etc.). All three bridges share one implementation. Cross-bridge consistency check (#1543) extends to verify all bridges use the defaults.
 
 ### 12. Lock-free read invariant
 
@@ -321,7 +320,7 @@ Symmetric with per-context actor; would own KeyPackage pool, wrapping keys, reco
 
 ### `RuntimeAdapter` trait abstracting tokio/WASM runtime primitives
 
-Proposed trait with `spawn`, `channel`, `sleep`, `interval` methods, two impls (native/WASM). Rejected because `scp-runtime` remains native-only per ADR-034, the adapter has exactly one real implementation, and WASM consumers continue through `scp-ffi/wasm`'s re-implementation path. Direct `tokio::*` calls are simpler. If a second runtime target ever enters scope, introduction is a mechanical refactor at that point.
+Proposed trait with `spawn`, `channel`, `sleep`, `interval` methods, two impls (native/WASM). Rejected because `scp-runtime` remains native-only per ADR-034, the adapter has exactly one real implementation, and (at the time) WASM consumers ran through `scp-ffi/wasm`'s re-implementation path. (Historical: per ADR-055 the WASM bridge has since been removed and browser clients are remote thin clients to a server-side `scp-node`, so there is no second runtime target — this reinforces the rejection.) Direct `tokio::*` calls are simpler. If a second runtime target ever enters scope, introduction is a mechanical refactor at that point.
 
 ### Preserve `ContextManager` as a facade over `Supervisor`
 
@@ -357,7 +356,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
   - The `MlsBackend` injection seam (`with_backends`) exists in the type surface but is **operationally dead**: no production or test path swaps a backend through it; the only coverage is `Arc::ptr_eq` identity asserts proving the seam wires the same instance. It is retained as a future injection point, not an active mock surface. Any future work that needs per-primitive crypto error injection should revive this seam rather than reintroduce a `ContextCryptoProvider`-style omnibus mock.
 - **~13 internal commits.** Large single atomic PR; expected 6–12 full-roster review rounds to double-zero.
 
-**WASM.** Unchanged. `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity; `scp-ffi/wasm` continues its re-implementation path.
+**WASM (historical — superseded by ADR-055).** `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity. At the time of this ADR, `scp-ffi/wasm` carried a re-implementation path; per ADR-055 that WASM bridge has since been removed and browser clients are remote thin clients to a server-side `scp-node`, so there is no browser-side actor re-implementation to keep in parity.
 
 **Bindings.** Every FFI bridge and language SDK rewires from `ContextManager` (deleted) to `Supervisor` (new). SCP class surface (post-ADR-048) is unchanged — the refactor is internal to `scp-runtime`.
 
@@ -377,7 +376,6 @@ Executable checks (each must pass on every commit of the implementation series):
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings
 cargo check -p scp-protocol --target wasm32-unknown-unknown
-cargo check -p scp-ffi-wasm --target wasm32-unknown-unknown
 DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") cargo test --workspace
 python3.12 scripts/check-protocol-sync.py
 bash scripts/check-protocol-deps.sh
@@ -389,7 +387,7 @@ cargo test -p scp-runtime --test cancel_safety
 cargo test -p scp-runtime --test shuttle_actor --features shuttle
 ```
 
-Plus existing E2E test suites across all four bindings.
+Plus existing E2E test suites across all three bindings.
 
 Invariants to verify (documented in plan):
 

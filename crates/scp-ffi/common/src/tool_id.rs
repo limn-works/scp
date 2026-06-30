@@ -13,7 +13,7 @@
 
 /// Derives the canonical tool ID from a user-supplied tool name.
 ///
-/// Contract (pinned by `OP_TOOL_REGISTER` across all four bridges):
+/// Contract (pinned by `OP_TOOL_REGISTER` across all three bridges):
 ///
 /// * Prepends the literal prefix `tool-`.
 /// * Splits on Unicode whitespace (`str::split_whitespace`) — ASCII

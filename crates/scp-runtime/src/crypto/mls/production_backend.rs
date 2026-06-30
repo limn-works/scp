@@ -70,7 +70,7 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// supervisor-owned `mls_storage` is available — the provider (carrying this
 /// backend) is passed INTO `Supervisor::with_providers`, which only then has
 /// the storage to wire. A construction-time required parameter is thus
-/// impossible without inverting that ordering across all four FFI bridges.
+/// impossible without inverting that ordering across all three FFI bridges.
 /// Instead the store is a [`OnceLock`] set once after construction, and
 /// `join_from_welcome` **fails CLOSED** when it is still unset (deny-by-default)
 /// — the single-use backstop never silently vanishes.

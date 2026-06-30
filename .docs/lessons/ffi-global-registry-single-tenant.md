@@ -1,5 +1,7 @@
 # FFI Global Registry: Single-Tenant Limitation (RED-017)
 
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge (and `WasmContextHandle`) are historical. The three bridges are PyO3, NAPI, UniFFI; the browser is a remote thin client. The per-instance lesson below remains evergreen — and the PyO3 single-tenant gap it describes has since been closed (PyO3 now uses per-instance `BridgeInstance` state, not process-global registries).
+
 ## Problem
 
 The PyO3 FFI bridge (`crates/scp-ffi/src/runtime.rs`) uses process-global static registries (`OnceLock<DashMap<...>>`) for context state, known-context discovery metadata, relay connections, and identity routing secrets. In multi-tenant deployments (e.g., a Django or FastAPI server serving multiple SCP users in the same process), all tenants share these registries. Tenant A's context IDs, identity DIDs, and routing secrets are accessible to Tenant B.
@@ -13,7 +15,7 @@ The PyO3 FFI bridge (`crates/scp-ffi/src/runtime.rs`) uses process-global static
 
 ## Why Only PyO3
 
-The NAPI (Node.js), UniFFI (Swift/Kotlin), and WASM bridges use per-instance opaque handle objects (`NapiContextHandle`, `ContextHandle`, `WasmContextHandle`) instead of global registries. Each handle carries its own state. The PyO3 bridge predates this pattern and uses a flat function surface with string-keyed global lookups.
+The NAPI (Node.js) and UniFFI (Swift/Kotlin) bridges use per-instance opaque handle objects (`NapiContextHandle`, `ContextHandle`) instead of global registries. Each handle carries its own state. The PyO3 bridge predates this pattern and uses a flat function surface with string-keyed global lookups.
 
 ## Impact
 
@@ -28,8 +30,8 @@ Doc comments on all four statics warn about the single-tenant limitation. The Py
 
 ## Resolution (SCP-228)
 
-Replace global registries with per-instance `ScpRuntime` objects. Each tenant creates its own runtime instance with isolated context, identity, and relay state. The Python SDK wraps the runtime in a class that serves as the entry point for all operations. This matches the pattern used by the NAPI, UniFFI, and WASM bridges.
+Replace global registries with per-instance `ScpRuntime` objects. Each tenant creates its own runtime instance with isolated context, identity, and relay state. The Python SDK wraps the runtime in a class that serves as the entry point for all operations. This matches the pattern used by the NAPI and UniFFI bridges.
 
 ## Lesson
 
-Process-global statics in FFI bridges create implicit coupling between all callers in the same process. For protocol libraries that may be embedded in multi-tenant servers, prefer per-instance state from the start. The other three bridges (NAPI, UniFFI, WASM) got this right by using opaque handle objects.
+Process-global statics in FFI bridges create implicit coupling between all callers in the same process. For protocol libraries that may be embedded in multi-tenant servers, prefer per-instance state from the start. The other bridges (NAPI, UniFFI) got this right by using opaque handle objects.

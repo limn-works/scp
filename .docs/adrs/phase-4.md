@@ -908,7 +908,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 ## ADR-022: TypeScript SDK (Dual-Target Architecture)
 
-**Status:** Decided
+**Status:** Superseded by ADR-055 (2026-06-29). The dual-target (wasm-bindgen browser bridge + napi-rs server bridge) architecture is removed; the WASM bridge is deleted and `@limn-works/scp-ts` now ships a single napi-rs backend, with browser clients running as remote thin clients to a server-side `scp-node`. The architecture, API surface, and rationale below are retained as the historical record that motivated the supersession — the runtime-detection dispatch, `internal/wasm.ts` backend, wasm-pack build step, and browser platform adapters described here no longer exist.
 
 ### Context
 
@@ -1641,6 +1641,8 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 **Status:** Decided
 
+> **Amended by ADR-055 (2026-06-29):** the WASM bridge was removed; the scope-registration FFI surface below now spans the three remaining bridges (PyO3, NAPI, UniFFI), and the WASM-local constraint-reimplementation clause no longer applies. The browser is a remote thin client.
+
 ### Context
 
 SCP's human-readable addressing system (§22) defines handle tools (`handle_register`, `handle_lookup`, `handle_deregister`) that map human-readable names to DIDs or context IDs within a context's handle registry. The addressing system also defines "scopes" — the part after `@` in addresses like `alice@cooking-community` — which currently resolve via a client-side mapping of scope names to context IDs (§22.3.2). There is no protocol-level mechanism to register, look up, or deregister scope-to-context mappings.
@@ -1720,7 +1722,6 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 | `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
 | `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
 | `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
-| `crates/scp-ffi/wasm/` | WASM bridge — re-implements constraint logic locally per ADR-034 |
 | `bindings/python/` | Python SDK wrapper |
 | `bindings/typescript/` | TypeScript SDK wrapper |
 | `bindings/swift/` | Swift SDK wrapper |
@@ -1787,6 +1788,6 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 
 7. **Separate `ScopeRegistry` storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. Constraint enforcement (`validate_scope_name()`, context-only targets via `ScopeTarget`) is built into `ScopeRegistry::register()`. Since `ScopeTarget` is context-only by construction, the identity ownership check from `HandleRegistry` does not apply — there is no DID-to-handle binding to verify at registration time. Deregistration still verifies that the requester's DID matches the entry's `owner_did`.
 
-8. **FFI bridges.** All four bridges (PyO3, NAPI, UniFFI, WASM) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`. The WASM bridge re-implements the constraint logic locally per ADR-034.
+8. **FFI bridges.** All three bridges (PyO3, NAPI, UniFFI) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`.
 
 9. **Resolution integration.** Each FFI bridge's `address_resolve` function builds `known_contexts` from scope entries (all scope entries are context targets by `ScopeTarget` construction) in the scope registries, in addition to existing handle registry keys.

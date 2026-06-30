@@ -866,7 +866,7 @@ pub fn validate_attestation_fields(
 /// Narrows a byte slice to a fixed-length `[u8; N]` array, returning a
 /// human-readable message on length mismatch.
 ///
-/// All four FFI bridges narrow caller-supplied `Vec<u8>` / `Buffer` /
+/// All three FFI bridges narrow caller-supplied `Vec<u8>` / `Buffer` /
 /// `Uint8Array` parameters to fixed-length arrays (most commonly the
 /// 32-byte `testing_seed`). This helper centralizes the `TryFrom` +
 /// length-mismatch-message pattern so bridges agree on wording — each

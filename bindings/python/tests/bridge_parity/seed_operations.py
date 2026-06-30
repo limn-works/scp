@@ -100,7 +100,7 @@ from .normalizer import FieldSpec, OpSchema
 # zbase32 alphabet (RFC draft): ybndrfg8ejkmcpqxot1uwisza345h769
 DID_DHT_PATTERN = r"did:dht:z[ybndrfg8ejkmcpqxot1uwisza345h769]{40,200}"
 
-# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. All four bridges
+# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. All three bridges
 # (PyO3, NAPI, UniFFI) now emit spec-compliant hex IDs via
 # `hex::encode(32 random bytes)` — regex is fully anchored to reject any
 # non-conformant format (e.g. the legacy `ctx-<uuidv4>` shape the parity
@@ -254,7 +254,7 @@ PARITY_SEED_HEX = "7b" * 32
 
 # Expected outputs under `PARITY_SEED_HEX`. These are the ground truth
 # the bridges are being held to. If legitimate key-derivation changes
-# (e.g. StdRng algorithm update) require moving these, update all four
+# (e.g. StdRng algorithm update) require moving these, update all three
 # bridges AND these constants in the same PR.
 #
 # Derivation: `SigningKey::from_bytes(StdRng::from_seed([0x7b; 32])
@@ -322,7 +322,7 @@ OP_IDENTITY_CREATE = OpSpec(
 # Random context ID per bridge, freshly-created identity per bridge.
 # Compare shapes plus the deterministic `mode` echo. The context_id
 # regex is anchored to the spec-compliant hex form per §18.4.1 — all
-# four bridges (PyO3, NAPI, UniFFI) emit `hex::encode(32 random
+# three bridges (PyO3, NAPI, UniFFI) emit `hex::encode(32 random
 # bytes)`.
 # ---------------------------------------------------------------------------
 
@@ -420,7 +420,7 @@ OP_INVALID_CAPABILITY = OpSpec(
 # Cross-bridge exposed path: create a context, then query the event log.
 # Compare event count + first event type + starting sequence exactly.
 #
-# All four bridges (PyO3, NAPI, UniFFI) emit a `ContextCreated`
+# All three bridges (PyO3, NAPI, UniFFI) emit a `ContextCreated`
 # event at context-create time via `builder_create_context` in scp-runtime.
 # The PyO3 bridge was previously wired to `NoOpEventLogProvider` and so
 # returned an empty log for this path; it now uses `MerkleEventLogProvider`
@@ -643,7 +643,7 @@ OP_TOOL_REGISTER = OpSpec(
 # op 7: ucan_mint
 #
 # Mint a UCAN in a freshly created context with a pinned member DID and
-# capability set. All four bridges return metadata — issuer, audience,
+# capability set. All three bridges return metadata — issuer, audience,
 # capabilities — byte-exactly under those inputs. The encoded JWT is
 # NOT compared: PyO3's PyUcanToken intentionally does not expose the
 # JWT (see crates/scp-ffi/src/ucan.rs), and both the signature and the
@@ -976,7 +976,7 @@ OP_TRANSPORT_STATUS = OpSpec(
 # op 10: event_log_query_filtered
 #
 # Create a context (emits ContextCreated), then query the event log
-# with an `event_type=ContextCreated` filter. All four bridges support
+# with an `event_type=ContextCreated` filter. All three bridges support
 # this filter key and must return exactly one event whose type matches
 # the filter. This locks in the filter semantics independently of op 4,
 # which does an unfiltered query.
