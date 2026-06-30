@@ -44,8 +44,8 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, QueriesCommand, StandingCommand, ToolsCommand, TrustRecoveryCommand,
-    TtlCloseCommand,
+    MessagingCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
+    StandingCommand, ToolsCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -421,6 +421,13 @@ struct RunSagaError {
     error: ContextError,
     /// `true` iff the FSM journaled `NeedsRepair` (commit-retry exhaustion).
     needs_repair: bool,
+    /// The canonical `SCP-SAGA-13xxx` discriminant of a §6.2.4 Prepare-axis
+    /// POLICY reject, carried STRUCTURALLY off the reject path (via
+    /// [`SagaReject`]) so the boundary lift reads it without parsing the message
+    /// string. `None` for a codeless terminal — a mailbox / transport / journal
+    /// failure or a `NeedsRepair` — which lifts to the generic saga-abort code
+    /// `13067` (`NeedsRepair` ignores it: it lifts to `13065`).
+    saga_code: Option<u16>,
 }
 
 /// The non-`Send` tool executor the supervisor FSM runs supervisor-side
@@ -5642,16 +5649,20 @@ impl Supervisor {
     ///   is propagated, never coerced to `0` (a `0` would read as "retry
     ///   immediately" and re-trip the same hard limit). Every other
     ///   `ContextError` is a [`SagaAbortReason::Rejected`]. `code` is the
-    ///   numeric `SCP-SAGA-13xxx`
-    ///   discriminant parsed ONCE here in core from the message's canonical
-    ///   prefix (so the bridge reads the typed `code` rather than re-parsing),
-    ///   falling back to the generic saga-abort code `13067` (prefix-less
-    ///   aborts such as a Prepare-phase timeout or journal I/O — the message
-    ///   string carries the specific cause) when the error carries no saga code.
+    ///   numeric `SCP-SAGA-13xxx` discriminant carried STRUCTURALLY off the
+    ///   reject path (the [`SagaReject`] the Prepare-axis sites build via the
+    ///   `saga_reject!` macro, threaded through [`RunSagaError::saga_code`]), so
+    ///   the lift reads the typed `code` WITHOUT parsing the message string (and
+    ///   the bridge reads it structurally in turn), falling back to the generic
+    ///   saga-abort code `13067` (codeless aborts such as a Prepare-phase
+    ///   timeout, a token-bucket ECON rate limit, or journal I/O — the message
+    ///   string carries the specific cause) when the terminal carries no saga
+    ///   code.
     fn lift_run_saga_error(saga_id: SagaId, run_err: RunSagaError) -> SagaError {
         let RunSagaError {
             error,
             needs_repair,
+            saga_code,
         } = run_err;
         let message = error.to_string();
         if needs_repair {
@@ -5663,13 +5674,14 @@ impl Supervisor {
             },
             _ => SagaAbortReason::Rejected,
         };
-        // Prefix-less aborts (e.g. a Prepare-phase `TransportTimeout` or a
-        // journal-I/O `InvalidState`) carry no `SCP-SAGA-` prefix, so they fall
-        // back to the generic saga-abort code `13067` rather than `13050` (which
-        // is the SPECIFIC caller-membership-gate reject and must not be
-        // synthesized for an authorization failure that never occurred). The
-        // message string carries the specific cause.
-        let code = saga_code_from_message(&message).unwrap_or(13067);
+        // The code is read STRUCTURALLY off the reject path (`saga_code`), never
+        // parsed from the message. Codeless aborts (e.g. a Prepare-phase
+        // `TransportTimeout`, a token-bucket ECON `RateLimited`, or a journal-I/O
+        // `InvalidState`) carry `None` and fall back to the generic saga-abort
+        // code `13067` rather than `13050` (the SPECIFIC caller-membership-gate
+        // reject, which must not be synthesized for a failure that never
+        // occurred). The message string still carries the specific cause.
+        let code = saga_code.unwrap_or(13067);
         SagaError::Aborted {
             reason,
             code,
@@ -5780,13 +5792,16 @@ impl Supervisor {
                     output,
                 })
             }
-            // Carry the FSM's `ContextError` plus the `needs_repair` flag up to
-            // the boundary. `start_saga` (generic) discards the flag and
-            // propagates the `ContextError`; the cross-context entry point lifts
-            // both into the typed [`SagaError`].
-            Err(error) => Err(RunSagaError {
-                error,
+            // Carry the FSM's reject (its `ContextError` + the structural
+            // `SCP-SAGA-13xxx` `code` off the [`SagaReject`] path) plus the
+            // `needs_repair` flag up to the boundary. `start_saga` (generic)
+            // discards both extras and propagates the `ContextError`; the
+            // cross-context entry point lifts all three into the typed
+            // [`SagaError`] (reading the code structurally, no message parse).
+            Err(rej) => Err(RunSagaError {
+                error: rej.error,
                 needs_repair,
+                saga_code: rej.code,
             }),
         }
     }
@@ -6810,7 +6825,12 @@ impl Supervisor {
         participants: Vec<String>,
         secret_bearing: bool,
         mut xctx: Option<&mut CrossContextSagaCtx<'_>>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<(), SagaReject> {
+        // Infrastructure `?` paths (journal append, abort, commit) carry a bare
+        // `ContextError` and auto-wrap via `From<ContextError> for SagaReject`
+        // (codeless → `None` → generic `13067`). A §6.2.4 POLICY reject arrives
+        // already-typed as a `SagaReject` (its structural `SCP-SAGA-13xxx` code
+        // preserved) from `dispatch_prepare_phase`.
         // 1. Initiated
         self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
             .await?;
@@ -6901,12 +6921,18 @@ impl Supervisor {
             .await;
         match commit_result {
             Ok(()) => {
+                // Commit-phase terminal: any error here (e.g. a failed terminal
+                // `mark_resolved` journal write) is a codeless infrastructure
+                // failure — wrap via `From` (`None` → generic `13067`; the Ok
+                // arm sets `reached_needs_repair` so the boundary lifts it to
+                // `NeedsRepair` regardless of the code).
                 self.resolve_committed_or_needs_repair(
                     &saga_id,
                     secret_bearing,
                     xctx.as_deref_mut(),
                 )
                 .await
+                .map_err(SagaReject::from)
             }
             Err(err) => {
                 // Commit retry exhausted — NeedsRepair (spec §6.2.4
@@ -6962,7 +6988,10 @@ impl Supervisor {
                         );
                     }
                 }
-                Err(err)
+                // Codeless commit-exhaustion terminal: wrap via `From` (`None` →
+                // generic `13067`). `reached_needs_repair` is already set, so the
+                // boundary lifts this to `NeedsRepair` (code `13065`) regardless.
+                Err(err.into())
             }
         }
     }
@@ -6983,18 +7012,22 @@ impl Supervisor {
         input: &SagaInput,
         phase: SagaPhase,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<(), SagaReject> {
         const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         let dispatch_fut = async {
             match input {
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
-                        return Err(ContextError::InvalidState(format!(
-                            "SCP-SAGA-13051: saga Prepare{phase:?} — CrossContextToolInvocation \
-                             requires the supervisor-side executor + signing key; call \
-                             start_cross_context_tool_invocation_saga, not start_saga"
-                        )));
+                        // Supervisor-axis reject (code known locally): 13051.
+                        return Err(saga_reject!(
+                            13051,
+                            InvalidState,
+                            "saga Prepare{:?} — CrossContextToolInvocation requires the \
+                             supervisor-side executor + signing key; call \
+                             start_cross_context_tool_invocation_saga, not start_saga",
+                            phase
+                        ));
                     };
                     match phase {
                         SagaPhase::A => self.dispatch_xctx_prepare_a(saga_id, ctx).await,
@@ -7011,9 +7044,12 @@ impl Supervisor {
 
         match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
             Ok(r) => r,
-            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+            // A phase timeout is a CODELESS transport failure (no saga policy
+            // code) — wrap via `From` so the boundary lifts it to the generic
+            // saga-abort code `13067`.
+            Err(_elapsed) => Err(SagaReject::from(ContextError::TransportTimeout(format!(
                 "saga Prepare{phase:?} exceeded 30s phase budget"
-            ))),
+            )))),
         }
     }
 
@@ -7024,15 +7060,19 @@ impl Supervisor {
         &self,
         saga_id: &SagaId,
         ctx: &mut CrossContextSagaCtx<'_>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<(), SagaReject> {
         use crate::context::actor::commands::SagaPhaseMessage;
 
         let caller_hex = hex::encode(ctx.caller_context_id);
+        // Supervisor-axis reject (code known locally): 13052.
         let actor = self.lookup(&caller_hex).ok_or_else(|| {
-            ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13052: cross-context saga Prepare-A — caller context '{caller_hex}' \
-                 is not a co-resident actor (cross-node child-bridge transport is future work)"
-            ))
+            saga_reject!(
+                13052,
+                ContextNotRegistered,
+                "cross-context saga Prepare-A — caller context '{}' is not a co-resident actor \
+                 (cross-node child-bridge transport is future work)",
+                caller_hex
+            )
         })?;
 
         let saga_id = saga_id.clone();
@@ -7040,7 +7080,11 @@ impl Supervisor {
         let caller_did = ctx.caller_did.clone();
         let tool_registration_id = ctx.tool_registration_id.clone();
 
-        let prepared = actor
+        // The mailbox `send` reply is `Result<PrepareAOutcome, ContextError>`: a
+        // dropped receiver / mailbox failure auto-wraps codeless via `From`; a
+        // §6.2.4 POLICY reject rides `Ok(Rejected(SagaReject))` carrying the
+        // structural code.
+        let outcome = actor
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA {
                     saga_id,
@@ -7051,8 +7095,13 @@ impl Supervisor {
                 })
             })
             .await?;
-        ctx.prepared_a = Some(prepared);
-        Ok(())
+        match outcome {
+            PrepareAOutcome::Prepared(prepared) => {
+                ctx.prepared_a = Some(prepared);
+                Ok(())
+            }
+            PrepareAOutcome::Rejected(reject) => Err(reject),
+        }
     }
 
     /// Prepare-B (target side, spec §6.2.4): resolve the co-resident target
@@ -7062,15 +7111,19 @@ impl Supervisor {
         &self,
         saga_id: &SagaId,
         ctx: &mut CrossContextSagaCtx<'_>,
-    ) -> Result<(), ContextError> {
+    ) -> Result<(), SagaReject> {
         use crate::context::actor::commands::SagaPhaseMessage;
 
         let target_hex = hex::encode(ctx.target_context_id);
+        // Supervisor-axis reject (code known locally): 13053.
         let actor = self.lookup(&target_hex).ok_or_else(|| {
-            ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13053: cross-context saga Prepare-B — target context '{target_hex}' \
-                 is not a co-resident actor (cross-node child-bridge transport is future work)"
-            ))
+            saga_reject!(
+                13053,
+                ContextNotRegistered,
+                "cross-context saga Prepare-B — target context '{}' is not a co-resident actor \
+                 (cross-node child-bridge transport is future work)",
+                target_hex
+            )
         })?;
 
         let saga_id = saga_id.clone();
@@ -7085,7 +7138,10 @@ impl Supervisor {
         let asserted_timestamp_ms = ctx.asserted_timestamp_ms;
         let caller_source_role = ctx.caller_source_role.clone();
 
-        let prepared = actor
+        // The mailbox `send` reply is `Result<PrepareBOutcome, ContextError>`: a
+        // mailbox failure auto-wraps codeless via `From`; a §6.2.4 POLICY reject
+        // rides `Ok(Rejected(SagaReject))` carrying the structural code.
+        let outcome = actor
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB {
                     saga_id,
@@ -7103,8 +7159,13 @@ impl Supervisor {
                 })
             })
             .await?;
-        ctx.prepared_b = Some(prepared);
-        Ok(())
+        match outcome {
+            PrepareBOutcome::Prepared(prepared) => {
+                ctx.prepared_b = Some(prepared);
+                Ok(())
+            }
+            PrepareBOutcome::Rejected(reject) => Err(reject),
+        }
     }
 
     /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error after
@@ -11091,24 +11152,6 @@ impl Drop for SagaSetReservation<'_> {
 enum SagaPhase {
     A,
     B,
-}
-
-/// Extract the numeric `SCP-SAGA-13xxx` discriminant from a saga reject
-/// message, parsed ONCE here in core so the typed [`SagaError::Aborted`] carries
-/// `code` and the FFI bridge reads it structurally rather than re-parsing the
-/// message string (the agent-first API tenet). Reads the run of ASCII digits
-/// immediately after the canonical `SCP-SAGA-` prefix. Returns `None` when the
-/// message carries no saga code (e.g. a co-residency / journal `ContextError`),
-/// or when the digits overflow `u16` — the caller substitutes the generic
-/// supervisor-reject code.
-fn saga_code_from_message(message: &str) -> Option<u16> {
-    const PREFIX: &str = "SCP-SAGA-";
-    let start = message.find(PREFIX)? + PREFIX.len();
-    let digits: String = message[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse::<u16>().ok()
 }
 
 /// Participant identifiers extracted from a [`SagaInput`] for journal
@@ -16792,29 +16835,71 @@ mod tests {
         drop(held);
     }
 
-    /// `saga_code_from_message` extracts the `SCP-SAGA-13xxx` discriminant a
-    /// reject message embeds, so the typed `SagaError::Aborted.code` is read
-    /// once in core (the bridge never re-parses the message). A message with no
-    /// saga code yields `None` (the lift then substitutes the generic
-    /// supervisor-reject code).
+    /// `lift_run_saga_error` reads the `SCP-SAGA-13xxx` `code` STRUCTURALLY off
+    /// `RunSagaError::saga_code` (carried from the [`SagaReject`] reject path) —
+    /// it NEVER parses the message string. This pins the parse-removal: the
+    /// `error` message here deliberately embeds a DIFFERENT but otherwise VALID
+    /// `SCP-SAGA-` token than the structural `saga_code`, and a `None` structural
+    /// code with a code-bearing message still lifts to the generic `13067`. If
+    /// any string parse were reintroduced, the asserted codes would change.
     #[test]
-    fn saga_code_from_message_extracts_canonical_discriminant() {
-        assert_eq!(
-            super::saga_code_from_message(
-                "SCP-SAGA-13013: UCAN re-validation failed (confused-deputy)"
-            ),
-            Some(13013)
+    fn lift_reads_saga_code_structurally_not_from_message() {
+        // Structural code wins even when the MESSAGE bears a different token.
+        //
+        // The decoy token MUST be a VALID `u16` code (`13050 < u16::MAX`) that
+        // DIFFERS from the structural `13013`. A token like `99999` would not
+        // exercise this assertion: codes are `u16`, so a reintroduced
+        // `parse::<u16>()` on `99999` would OVERFLOW → `None` → fall back to the
+        // structural `13013` for the WRONG reason (parse failure, not "we never
+        // parse"). `13050` parses cleanly to a value `≠ 13013`, so a message-first
+        // parse would yield `13050` and this assert would catch the regression.
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-structural".to_owned()),
+            RunSagaError {
+                error: ContextError::PermissionDenied(
+                    "SCP-SAGA-13050: a message whose embedded token is NOT the real code"
+                        .to_owned(),
+                ),
+                needs_repair: false,
+                saga_code: Some(13013),
+            },
         );
-        assert_eq!(
-            super::saga_code_from_message(
-                "SCP-SAGA-13026: per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B"
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13013,
+                    ..
+                }
             ),
-            Some(13026)
+            "the lift must read the STRUCTURAL saga_code (13013), never the message's token (13050)"
         );
-        // No saga code in the message ⇒ None (co-residency / journal failures).
-        assert_eq!(
-            super::saga_code_from_message("context 'abc' is not a co-resident actor"),
-            None
+
+        // A `None` structural code falls back to the generic `13067` EVEN WHEN
+        // the message embeds a `SCP-SAGA-` token (a re-introduced parse would
+        // wrongly recover 13050 here).
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-none".to_owned()),
+            RunSagaError {
+                error: ContextError::InvalidState(
+                    "SCP-SAGA-13050: a codeless terminal whose message happens to embed a token"
+                        .to_owned(),
+                ),
+                needs_repair: false,
+                saga_code: None,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    ..
+                }
+            ),
+            "a None structural code must fall back to 13067, never parse 13050 out of the message"
         );
     }
 
@@ -16832,6 +16917,7 @@ mod tests {
             RunSagaError {
                 error: ContextError::InvalidState("commit retries exhausted".to_owned()),
                 needs_repair: true,
+                saga_code: None,
             },
         );
         match lifted {
@@ -16839,16 +16925,19 @@ mod tests {
             other => panic!("expected NeedsRepair, got {other:?}"),
         }
 
-        // A RateLimited abort surfaces the structured retry_after_ms + saga code.
+        // A RateLimited abort surfaces the structured retry_after_ms + the
+        // STRUCTURAL saga code (the message carries no SCP-SAGA token — the code
+        // rides `saga_code`).
         let lifted = Supervisor::lift_run_saga_error(
             SagaId("saga-rl".to_owned()),
             RunSagaError {
                 error: ContextError::RateLimited {
                     resource: "tool_interface".to_owned(),
-                    message: "SCP-SAGA-13023: per-interface rate limit exceeded".to_owned(),
+                    message: "per-interface rate limit exceeded".to_owned(),
                     retry_after_ms: Some(4500),
                 },
                 needs_repair: false,
+                saga_code: Some(13023),
             },
         );
         assert!(
@@ -16865,12 +16954,13 @@ mod tests {
             "RateLimited abort must carry structured retry_after_ms + code 13023"
         );
 
-        // Any other reject ⇒ Aborted/Rejected carrying the message's code.
+        // Any other reject ⇒ Aborted/Rejected carrying the STRUCTURAL code.
         let lifted = Supervisor::lift_run_saga_error(
             SagaId("saga-rej".to_owned()),
             RunSagaError {
-                error: ContextError::PermissionDenied("SCP-SAGA-13013: confused-deputy".to_owned()),
+                error: ContextError::PermissionDenied("confused-deputy".to_owned()),
                 needs_repair: false,
+                saga_code: Some(13013),
             },
         );
         assert!(
@@ -16882,7 +16972,7 @@ mod tests {
                     ..
                 }
             ),
-            "non-rate-limit reject must lift to Aborted/Rejected with the message's code"
+            "non-rate-limit reject must lift to Aborted/Rejected with the structural code"
         );
 
         // A genuinely-reachable prefix-less abort — the Prepare-phase 30s
@@ -16898,6 +16988,7 @@ mod tests {
                     "saga PrepareA exceeded 30s phase budget".to_owned(),
                 ),
                 needs_repair: false,
+                saga_code: None,
             },
         );
         assert!(
@@ -16950,6 +17041,7 @@ mod tests {
             RunSagaError {
                 error: ContextError::InvalidState(mark_resolved_msg.clone()),
                 needs_repair: false,
+                saga_code: None,
             },
         );
         assert!(
@@ -16974,6 +17066,7 @@ mod tests {
             RunSagaError {
                 error: ContextError::InvalidState(mark_resolved_msg),
                 needs_repair: true,
+                saga_code: None,
             },
         );
         match repaired {
@@ -17003,6 +17096,11 @@ mod tests {
                     retry_after_ms: None,
                 },
                 needs_repair: false,
+                // Token-bucket ECON hard limit is CODELESS at the saga layer —
+                // it stays on the `Err(ContextError)` channel and lifts to 13067
+                // (reason RateLimited via the variant; the §6.2.0.2 sliding-
+                // window saga rejects, by contrast, carry Some(130xx)).
+                saga_code: None,
             },
         );
         assert!(

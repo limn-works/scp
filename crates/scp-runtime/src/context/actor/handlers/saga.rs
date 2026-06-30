@@ -64,7 +64,8 @@ use scp_protocol::context::tools::cross_context_saga::{
 
 use crate::context::actor::commands::{
     CommitBReserveOutcome, CommitBReserveReply, CommitBSettleOutcome, CommitBSettleReply,
-    PreparedAFields, PreparedBFields, SagaPhaseMessage, SigningKeyBytes,
+    PrepareAOutcome, PrepareBOutcome, PreparedAFields, PreparedBFields, SagaPhaseMessage,
+    SagaReject, SigningKeyBytes, saga_reject,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
@@ -405,7 +406,7 @@ async fn prepare_a(
     caller_context_id: &[u8; 32],
     caller_did: &DID,
     tool_registration_id: &str,
-    reply: tokio::sync::oneshot::Sender<Result<PreparedAFields, ContextError>>,
+    reply: tokio::sync::oneshot::Sender<Result<PrepareAOutcome, ContextError>>,
 ) -> Outcome<()> {
     let context_id_hex = hex_context_id(caller_context_id);
 
@@ -429,9 +430,16 @@ async fn prepare_a(
     //    surface (`member_has_capability`) and the `OutboundPolicy.allowed_callers`
     //    enforcement shape `invoke_cross_context` uses for the single-context path.
     // `&*cell` deref-coerces &mut ClassSCell → &PerContextState (read-only gate).
-    if let Err(err) = validate_outbound_caller(&*cell, caller_did, tool_registration_id) {
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
+    //
+    // A §6.2.4 POLICY reject replies `Ok(PrepareAOutcome::Rejected(SagaReject))`
+    // — carrying the structural `SCP-SAGA-13xxx` code on the SUCCESS channel —
+    // yet still returns `Outcome::err` so the actor's own Class-S persistence
+    // accounting records the reject. The two are intentionally ORTHOGONAL: the
+    // reply payload is the saga FSM's typed terminal; `Outcome::err` drives the
+    // actor-local accounting and is unrelated to how the FSM lifts the reject.
+    if let Err(rej) = validate_outbound_caller(&*cell, caller_did, tool_registration_id) {
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareAOutcome::Rejected(rej)));
         return Outcome::err(sketch);
     }
 
@@ -447,7 +455,7 @@ async fn prepare_a(
     //    sagas burns its own quota. REUSES the same `RateLimit` /
     //    `PerCallerRateLimit::check_and_increment` sliding-window mechanism the
     //    single-context `invoke_cross_context` path consumes (spec §6.2.0.2).
-    if let Err(err) = consume_outbound_interface_rate_limit(
+    if let Err(rej) = consume_outbound_interface_rate_limit(
         cell.class_c_view(),
         deps,
         caller_did,
@@ -460,9 +468,14 @@ async fn prepare_a(
         // partial increment durably lands (fail-closed direction), then reply.
         // `persist_state_fail_closed` reads a shared `&PerContextState` via the
         // cell `Deref` (`&*cell`) — no `state_mut()`.
+        //
+        // POLICY reject ⇒ `Ok(PrepareAOutcome::Rejected(SagaReject))` on the
+        // SUCCESS channel (structural code), but `Outcome::err_mutated` for the
+        // actor's Class-S accounting — the reply payload and the Outcome are
+        // intentionally orthogonal (see the validate_outbound_caller reject).
         let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex);
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareAOutcome::Rejected(rej)));
         return Outcome::err_mutated(sketch);
     }
 
@@ -582,11 +595,13 @@ async fn prepare_a(
     // balance the ticket only, and let the abort's record path own the single
     // local reversal.
     // `reply.send(Ok(prepared))` returns `Err(Ok(prepared))` if the receiver is
-    // gone (the sent value — an `Ok(PreparedAFields)` — handed back). The inner
-    // `Ok` destructure recovers the carrier; it always matches because we sent an
-    // `Ok`.
-    if let Err(returned_prepared) = reply.send(Ok(PreparedAFields { reservation }))
-        && let Ok(PreparedAFields { reservation }) = returned_prepared
+    // gone (the sent value — an `Ok(PrepareAOutcome::Prepared)` — handed back).
+    // The inner `Ok(Prepared(..))` destructure recovers the carrier; it always
+    // matches because we sent an `Ok(Prepared(..))`.
+    if let Err(returned_prepared) = reply.send(Ok(PrepareAOutcome::Prepared(PreparedAFields {
+        reservation,
+    }))) && let Ok(PrepareAOutcome::Prepared(PreparedAFields { reservation })) =
+        returned_prepared
     {
         tracing::warn!(
             saga_id = %saga_id.0,
@@ -613,7 +628,7 @@ fn validate_outbound_caller(
     state: &PerContextState,
     caller_did: &DID,
     tool_registration_id: &str,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     use scp_protocol::context::roles::Capability;
 
     // `tool:interface` capability (the caller is authorized to USE interfaces).
@@ -621,10 +636,12 @@ fn validate_outbound_caller(
         .role_state
         .member_has_capability(caller_did.as_ref(), &Capability::ToolInterface)
     {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13010: caller '{caller_did}' lacks tool:interface capability \
-             for cross-context invocation"
-        )));
+        return Err(saga_reject!(
+            13010,
+            PermissionDenied,
+            "caller '{}' lacks tool:interface capability for cross-context invocation",
+            caller_did
+        ));
     }
 
     // Outbound policy: the interface whose source tool is this registration.
@@ -638,10 +655,13 @@ fn validate_outbound_caller(
         && !outbound.allowed_callers.is_empty()
         && !outbound.allowed_callers.contains(caller_did)
     {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13011: caller '{caller_did}' not in outbound allowed_callers \
-             for tool '{tool_registration_id}'"
-        )));
+        return Err(saga_reject!(
+            13011,
+            PermissionDenied,
+            "caller '{}' not in outbound allowed_callers for tool '{}'",
+            caller_did,
+            tool_registration_id
+        ));
     }
 
     Ok(())
@@ -670,7 +690,7 @@ fn consume_outbound_interface_rate_limit(
     deps: &ActorDeps,
     caller_did: &DID,
     tool_registration_id: &str,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     let clock = deps.clock.as_ref();
 
     // The §6.2.0.2 outbound window lives on `governance.tool_interfaces` — a
@@ -695,14 +715,16 @@ fn consume_outbound_interface_rate_limit(
         && !rate_limit.check_and_increment(clock)
     {
         let retry_after_secs = rate_limit.retry_after_secs(clock);
-        return Err(ContextError::RateLimited {
-            resource: "tool_interface".to_owned(),
-            message: format!(
-                "SCP-SAGA-13023: per-interface §6.2.0.2 rate limit exceeded for tool \
-                 '{tool_registration_id}' (retry after {retry_after_secs}s)"
-            ),
-            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
-        });
+        return Err(saga_reject!(
+            13023,
+            RateLimited {
+                resource: "tool_interface".to_owned(),
+                retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
+            },
+            "per-interface §6.2.0.2 rate limit exceeded for tool '{}' (retry after {}s)",
+            tool_registration_id,
+            retry_after_secs
+        ));
     }
 
     // Per-caller sliding window, independent of the per-interface window.
@@ -710,15 +732,17 @@ fn consume_outbound_interface_rate_limit(
         && !per_caller.check_and_increment(caller_did, clock)
     {
         let retry_after_secs = per_caller.retry_after_secs_for(caller_did, clock);
-        return Err(ContextError::RateLimited {
-            resource: "tool_interface_caller".to_owned(),
-            message: format!(
-                "SCP-SAGA-13024: per-caller §6.2.0.2 rate limit exceeded for caller \
-                 '{caller_did}' on tool '{tool_registration_id}' (retry after \
-                 {retry_after_secs}s)"
-            ),
-            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
-        });
+        return Err(saga_reject!(
+            13024,
+            RateLimited {
+                resource: "tool_interface_caller".to_owned(),
+                retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
+            },
+            "per-caller §6.2.0.2 rate limit exceeded for caller '{}' on tool '{}' (retry after {}s)",
+            caller_did,
+            tool_registration_id,
+            retry_after_secs
+        ));
     }
 
     Ok(())
@@ -755,7 +779,7 @@ fn consume_inbound_interface_rate_limit(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     tool_registration_id: &str,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     use scp_protocol::context::tools::interface::{DEFAULT_WINDOW_SECONDS, RateLimit};
 
     let clock = deps.clock.as_ref();
@@ -785,12 +809,16 @@ fn consume_inbound_interface_rate_limit(
     // capacity (below the ≥2× margin) would let in-budget traffic evict a
     // still-within-TTL nonce. Reject such an interface rather than admit it.
     if max_per_min > MAX_SAFE_INBOUND_CALLS_PER_MINUTE {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13027: interface inbound rate {max_per_min}/min for tool \
-             '{tool_registration_id}' exceeds the cache-eviction-safe ceiling \
-             ({MAX_SAFE_INBOUND_CALLS_PER_MINUTE}/min): its dedup-TTL-window volume would \
-             approach the nonce-dedup capacity and erode the §6.2.4 replay bound"
-        )));
+        return Err(saga_reject!(
+            13027,
+            PermissionDenied,
+            "interface inbound rate {}/min for tool '{}' exceeds the cache-eviction-safe ceiling \
+             ({}/min): its dedup-TTL-window volume would approach the nonce-dedup capacity and \
+             erode the §6.2.4 replay bound",
+            max_per_min,
+            tool_registration_id,
+            MAX_SAFE_INBOUND_CALLS_PER_MINUTE
+        ));
     }
 
     // Materialize the inbound window lazily from the inbound policy (same
@@ -805,14 +833,17 @@ fn consume_inbound_interface_rate_limit(
 
     if !window.check_and_increment(clock) {
         let retry_after_secs = window.retry_after_secs(clock);
-        return Err(ContextError::RateLimited {
-            resource: "tool_interface_inbound".to_owned(),
-            message: format!(
-                "SCP-SAGA-13026: per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B \
-                 for tool '{tool_registration_id}' (retry after {retry_after_secs}s)"
-            ),
-            retry_after_ms: Some(retry_after_secs.saturating_mul(1000)),
-        });
+        return Err(saga_reject!(
+            13026,
+            RateLimited {
+                resource: "tool_interface_inbound".to_owned(),
+                retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
+            },
+            "per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B for tool '{}' \
+             (retry after {}s)",
+            tool_registration_id,
+            retry_after_secs
+        ));
     }
 
     Ok(())
@@ -855,7 +886,7 @@ async fn prepare_b(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     req: PrepareBRequest,
-    reply: tokio::sync::oneshot::Sender<Result<PreparedBFields, ContextError>>,
+    reply: tokio::sync::oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
 ) -> Outcome<()> {
     // ── PREPARE-B-CHECKS (read-only gate through `&*cell`) ───────────────────
     // The validation gate (checks 1–6) is now fully READ-ONLY: check 5
@@ -870,9 +901,13 @@ async fn prepare_b(
     // cell's shared-read `Deref` (`&*cell`), not `state_mut()`. The step-7
     // inbound-rate consume (the ONLY Class-C mutation) is HOISTED OUT to run
     // through `class_c_view()` below.
-    if let Err(err) = run_prepare_b_checks(&*cell, deps, &req) {
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
+    // A §6.2.4 POLICY reject replies `Ok(PrepareBOutcome::Rejected(SagaReject))`
+    // (structural `SCP-SAGA-13xxx` code on the SUCCESS channel) yet returns
+    // `Outcome::err` for the actor's Class-S accounting — the reply payload and
+    // the Outcome are intentionally orthogonal.
+    if let Err(rej) = run_prepare_b_checks(&*cell, deps, &req) {
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareBOutcome::Rejected(rej)));
         return Outcome::err(sketch);
     }
 
@@ -888,11 +923,13 @@ async fn prepare_b(
     //     `Outcome::err` (no slot staged), DISTINCT from a later persist failure's
     //     `Outcome::err_mutated`. The over-budget / over-ceiling reject paths do
     //     NOT mutate (no increment), so an un-persisted `Outcome::err` is correct.
-    if let Err(err) =
+    if let Err(rej) =
         consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.tool_registration_id)
     {
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
+        // POLICY reject ⇒ `Ok(Rejected)` (structural code) on the SUCCESS
+        // channel; `Outcome::err` for the actor's Class-S accounting (orthogonal).
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareBOutcome::Rejected(rej)));
         return Outcome::err(sketch);
     }
 
@@ -988,11 +1025,11 @@ async fn prepare_b(
         return Outcome::err_mutated(sketch);
     }
 
-    let _ = reply.send(Ok(PreparedBFields {
+    let _ = reply.send(Ok(PrepareBOutcome::Prepared(PreparedBFields {
         recorded_timestamp_ms,
         recorded_nonce,
         recorded_chain_depth,
-    }));
+    })));
     Outcome::ok_mutated(())
 }
 
@@ -1012,7 +1049,7 @@ fn run_prepare_b_checks(
     state: &PerContextState,
     deps: &ActorDeps,
     req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     // (1) Confused-deputy: resolve the UCAN proof from B's OWN store and re-run
     //     full §7 validation RE-BOUND to caller_did + tool_registration_id.
     validate_ucan_rebind(state, deps, req)?;
@@ -1032,12 +1069,13 @@ fn run_prepare_b_checks(
     // (4) Target-context binding: the asserted target_context_id MUST equal B's
     //     own context (spec §6.2.4 "Target-context binding").
     if req.target_context_id != state.context_id {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13014: target_context_id mismatch — invocation targets a \
-             different context than this executing actor (tool \
-             '{}')",
+        return Err(saga_reject!(
+            13014,
+            PermissionDenied,
+            "target_context_id mismatch — invocation targets a different context than this \
+             executing actor (tool '{}')",
             req.tool_registration_id
-        )));
+        ));
     }
 
     // (5) Freshness / anti-replay: reject if the asserted send-time is outside
@@ -1072,7 +1110,7 @@ fn validate_ucan_rebind(
     state: &PerContextState,
     deps: &ActorDeps,
     req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     use scp_protocol::crypto::ucan::capability::CapabilityUri;
     use scp_protocol::crypto::ucan::validate::{ProofResolver, validate_ucan};
 
@@ -1085,10 +1123,13 @@ fn validate_ucan_rebind(
         .xctx_ucan_proofs
         .resolve_proof(proof_id)
         .map_err(|e| {
-            ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13012: ucan_proof_id '{proof_id}' not resolvable in target \
-                 UCAN store: {e}"
-            ))
+            saga_reject!(
+                13012,
+                PermissionDenied,
+                "ucan_proof_id '{}' not resolvable in target UCAN store: {}",
+                proof_id,
+                e
+            )
         })?;
 
     // Required capability bound to B's OWN context + THIS tool + tool_invoke.
@@ -1133,11 +1174,14 @@ fn validate_ucan_rebind(
     };
 
     validate_ucan(&token, &required_cap, &mut ctx).map_err(|e| {
-        ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13013: UCAN re-validation failed (re-bound to caller_did \
-             '{}' + tool '{}'): {e}",
-            req.caller_did, req.tool_registration_id
-        ))
+        saga_reject!(
+            13013,
+            PermissionDenied,
+            "UCAN re-validation failed (re-bound to caller_did '{}' + tool '{}'): {}",
+            req.caller_did,
+            req.tool_registration_id,
+            e
+        )
     })
 }
 
@@ -1160,7 +1204,7 @@ fn validate_ucan_rebind(
 fn validate_inbound_policy(
     state: &PerContextState,
     req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     let Some(interface) = state
         .governance
         .tool_interfaces
@@ -1181,25 +1225,27 @@ fn validate_inbound_policy(
             .as_ref()
             .is_some_and(|role| inbound.allowed_source_roles.iter().any(|r| r == role));
         if !role_allowed {
-            return Err(ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13025: caller role {} is not in inbound allowed_source_roles \
-                 for tool '{}'",
+            return Err(saga_reject!(
+                13025,
+                PermissionDenied,
+                "caller role {} is not in inbound allowed_source_roles for tool '{}'",
                 req.caller_source_role
                     .as_deref()
                     .map_or_else(|| "<none>".to_owned(), |r| format!("'{r}'")),
                 req.tool_registration_id
-            )));
+            ));
         }
     }
 
     // `require_spending_ucan`: a gated interface demands a proof (validated in
     // step (1) when present).
     if inbound.require_spending_ucan && req.ucan_proof_id.is_none() {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13015: inbound policy requires a spending UCAN but none was \
-             carried for tool '{}'",
+        return Err(saga_reject!(
+            13015,
+            PermissionDenied,
+            "inbound policy requires a spending UCAN but none was carried for tool '{}'",
             req.tool_registration_id
-        )));
+        ));
     }
 
     Ok(())
@@ -1215,7 +1261,7 @@ fn validate_inbound_policy(
 fn validate_input_specificity(
     state: &PerContextState,
     req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     use scp_protocol::context::tools::schema::{
         validate_specificity_floor, validate_value_against_schema,
     };
@@ -1226,10 +1272,12 @@ fn validate_input_specificity(
         .iter()
         .find(|t| t.tool_id == req.tool_registration_id)
     else {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13016: tool '{}' not found in target registry",
+        return Err(saga_reject!(
+            13016,
+            PermissionDenied,
+            "tool '{}' not found in target registry",
             req.tool_registration_id
-        )));
+        ));
     };
 
     // Floor: degenerate broad-schema tools are rejected (independent of the
@@ -1239,21 +1287,26 @@ fn validate_input_specificity(
         &registration.schema.output_schema,
     )
     .map_err(|(side, fields)| {
-        ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13017: input schema specificity floor not met for tool '{}' \
-             ({side} schema has {fields} fields)",
-            req.tool_registration_id
-        ))
+        saga_reject!(
+            13017,
+            PermissionDenied,
+            "input schema specificity floor not met for tool '{}' ({} schema has {} fields)",
+            req.tool_registration_id,
+            side,
+            fields
+        )
     })?;
 
     // Conformance: the carried input value MUST validate against the registered
     // input schema (§6.2.4 normative (2)).
     validate_value_against_schema(&req.input, &registration.schema.input_schema).map_err(|msg| {
-        ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13021: input does not conform to registered schema for tool \
-             '{}': {msg}",
-            req.tool_registration_id
-        ))
+        saga_reject!(
+            13021,
+            PermissionDenied,
+            "input does not conform to registered schema for tool '{}': {}",
+            req.tool_registration_id,
+            msg
+        )
     })
 }
 
@@ -1288,16 +1341,19 @@ fn validate_freshness(
     state: &PerContextState,
     deps: &ActorDeps,
     req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+) -> Result<(), SagaReject> {
     let now_ms = deps.clock.now_millis();
     let skew_ms = DEFAULT_CLOCK_SKEW_TOLERANCE_SECS.saturating_mul(1000);
     let delta_ms = now_ms.abs_diff(req.asserted_timestamp_ms);
     if delta_ms > skew_ms {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13018: invocation timestamp outside §9.14 skew tolerance \
-             (Δ={delta_ms}ms > {skew_ms}ms) for tool '{}'",
+        return Err(saga_reject!(
+            13018,
+            PermissionDenied,
+            "invocation timestamp outside §9.14 skew tolerance (Δ={}ms > {}ms) for tool '{}'",
+            delta_ms,
+            skew_ms,
             req.tool_registration_id
-        )));
+        ));
     }
 
     // PURE READ (ADR-049 §9): the replay decision uses `is_replayed_read`
@@ -1314,11 +1370,12 @@ fn validate_freshness(
         .xctx_nonce_dedup
         .is_replayed_read(&req.asserted_nonce, now_secs)
     {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13019: invocation nonce already seen in target dedup cache \
-             (replay) for tool '{}'",
+        return Err(saga_reject!(
+            13019,
+            PermissionDenied,
+            "invocation nonce already seen in target dedup cache (replay) for tool '{}'",
             req.tool_registration_id
-        )));
+        ));
     }
     Ok(())
 }
@@ -1327,20 +1384,20 @@ fn validate_freshness(
 /// depth (`asserted + 1`) would exceed the context-configured `max_chain_depth`
 /// (default 8 via
 /// [`effective_max_chain_depth`](scp_protocol::provenance::attach::effective_max_chain_depth)).
-fn validate_chain_depth(
-    state: &PerContextState,
-    req: &PrepareBRequest,
-) -> Result<(), ContextError> {
+fn validate_chain_depth(state: &PerContextState, req: &PrepareBRequest) -> Result<(), SagaReject> {
     use scp_protocol::provenance::attach::effective_max_chain_depth;
 
     let max_depth = effective_max_chain_depth(state.handle.params().max_chain_depth);
     // B re-derives depth = incoming + 1; reject if that would exceed the cap.
     if u16::from(req.asserted_chain_depth) + 1 > u16::from(max_depth) {
-        return Err(ContextError::PermissionDenied(format!(
-            "SCP-SAGA-13020: chain depth {} +1 exceeds max_chain_depth {max_depth} \
-             for tool '{}'",
-            req.asserted_chain_depth, req.tool_registration_id
-        )));
+        return Err(saga_reject!(
+            13020,
+            PermissionDenied,
+            "chain depth {} +1 exceeds max_chain_depth {} for tool '{}'",
+            req.asserted_chain_depth,
+            max_depth,
+            req.tool_registration_id
+        ));
     }
     Ok(())
 }
@@ -2491,6 +2548,68 @@ mod tests {
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
     const TOOL: &str = "calculator-v1";
 
+    /// Destructure a Prepare-A reply expecting a §6.2.4 POLICY reject. A policy
+    /// reject rides `Ok(PrepareAOutcome::Rejected(SagaReject))` on the SUCCESS
+    /// channel (NOT `Err`), so the structural `SCP-SAGA-13xxx` code can be read
+    /// without parsing the message. Returns the [`SagaReject`] for the per-site
+    /// `code` + `error` assertions.
+    fn expect_prepare_a_reject(reply: Result<PrepareAOutcome, ContextError>) -> SagaReject {
+        match reply.expect("a §6.2.4 Prepare-A policy reject replies Ok(Rejected), never Err") {
+            PrepareAOutcome::Rejected(reject) => reject,
+            PrepareAOutcome::Prepared(prepared) => {
+                // Should never happen in a reject test. The carrier holds a
+                // `#[must_use]` ToolEconomyTicket whose drop guard would panic
+                // under `--features testing`; forget it so the assertion failure
+                // (not a double-panic) is what surfaces.
+                std::mem::forget(prepared);
+                panic!("expected a §6.2.4 Prepare-A policy reject, got Prepared");
+            }
+        }
+    }
+
+    /// Destructure a Prepare-B reply expecting a §6.2.4 POLICY reject (the
+    /// target-side sibling of [`expect_prepare_a_reject`]).
+    fn expect_prepare_b_reject(reply: Result<PrepareBOutcome, ContextError>) -> SagaReject {
+        match reply.expect("a §6.2.4 Prepare-B policy reject replies Ok(Rejected), never Err") {
+            PrepareBOutcome::Rejected(reject) => reject,
+            PrepareBOutcome::Prepared(prepared) => {
+                panic!("expected a §6.2.4 Prepare-B policy reject, got Prepared: {prepared:?}")
+            }
+        }
+    }
+
+    /// Destructure a SUCCESSFUL Prepare-A reply, returning the staged
+    /// [`PreparedAFields`] reservation carrier. `context` labels the call site.
+    fn expect_prepared_a(
+        reply: Result<PrepareAOutcome, ContextError>,
+        context: &str,
+    ) -> PreparedAFields {
+        match reply
+            .unwrap_or_else(|e| panic!("Prepare-A ({context}) must reply Ok, got Err: {e:?}"))
+        {
+            PrepareAOutcome::Prepared(prepared) => prepared,
+            PrepareAOutcome::Rejected(reject) => {
+                panic!("Prepare-A ({context}) must succeed, got reject {reject:?}")
+            }
+        }
+    }
+
+    /// Destructure a SUCCESSFUL Prepare-B reply, returning B's recorded
+    /// [`PreparedBFields`] provenance.
+    fn expect_prepared_b(
+        reply: Result<PrepareBOutcome, ContextError>,
+        context: &str,
+    ) -> PreparedBFields {
+        match reply
+            .unwrap_or_else(|e| panic!("Prepare-B ({context}) must reply Ok, got Err: {e:?}"))
+        {
+            PrepareBOutcome::Prepared(prepared) => prepared,
+            PrepareBOutcome::Rejected(reject) => {
+                panic!("Prepare-B ({context}) must succeed, got reject {reject:?}")
+            }
+        }
+    }
+
     /// Defense-in-depth (PER-INTERFACE bound only): the §6.2.4 per-target nonce
     /// dedup cache ([`PerContextState::xctx_nonce_dedup`]) should be bounded by
     /// its TTL (`SAGA_NONCE_DEDUP_TTL_SECS`), not by capacity eviction, for a
@@ -3146,7 +3265,7 @@ mod tests {
         )
         .await;
         assert!(out.result.is_ok(), "prepare_a outcome: {:?}", out.result);
-        let prepared = rx.await.unwrap().expect("prepared-A");
+        let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // The reservation handle is the Send carrier the FSM holds; the FSM
         // settles it on Commit-A or releases it on a terminal non-commit path.
         // This test stands in for that terminal release (RAII contract,
@@ -3189,8 +3308,11 @@ mod tests {
             tx,
         )
         .await;
-        let err = rx.await.unwrap().expect_err("must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13010")));
+        let reject = expect_prepare_a_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13010));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13010"))
+        );
     }
 
     #[tokio::test]
@@ -3234,8 +3356,11 @@ mod tests {
             tx,
         )
         .await;
-        let err = rx.await.unwrap().expect_err("must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13011")));
+        let reject = expect_prepare_a_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13011));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13011"))
+        );
     }
 
     #[tokio::test]
@@ -3306,7 +3431,7 @@ mod tests {
         )
         .await;
         assert!(out.result.is_ok(), "prepare_a outcome: {:?}", out.result);
-        let prepared = rx.await.unwrap().expect("prepared-A");
+        let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         // The registered cost is 0, so the budget is untouched — no
         // caller-asserted positive cost was reserved.
@@ -3382,10 +3507,12 @@ mod tests {
             tx,
         )
         .await;
-        let err = rx.await.unwrap().expect_err("over-budget must reject");
+        let reject = expect_prepare_a_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13023));
         assert!(
-            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13023")),
-            "expected per-interface §6.2.0.2 RateLimited (SCP-SAGA-13023), got {err:?}"
+            matches!(&reject.error, ContextError::RateLimited { message, .. } if message.contains("SCP-SAGA-13023")),
+            "expected per-interface §6.2.0.2 RateLimited (SCP-SAGA-13023), got {:?}",
+            reject.error
         );
     }
 
@@ -3433,13 +3560,12 @@ mod tests {
             tx,
         )
         .await;
-        let err = rx
-            .await
-            .unwrap()
-            .expect_err("over-caller-budget must reject");
+        let reject = expect_prepare_a_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13024));
         assert!(
-            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13024")),
-            "expected per-caller §6.2.0.2 RateLimited (SCP-SAGA-13024), got {err:?}"
+            matches!(&reject.error, ContextError::RateLimited { message, .. } if message.contains("SCP-SAGA-13024")),
+            "expected per-caller §6.2.0.2 RateLimited (SCP-SAGA-13024), got {:?}",
+            reject.error
         );
     }
 
@@ -3469,7 +3595,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
-        let fields = rx.await.unwrap().expect("prepared-B");
+        let fields = expect_prepared_b(rx.await.unwrap(), "prepared-B");
 
         // B re-derived chain depth = incoming(2) + 1.
         assert_eq!(fields.recorded_chain_depth, 3);
@@ -3534,13 +3660,12 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx
-            .await
-            .unwrap()
-            .expect_err("disallowed source role must reject");
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13025));
         assert!(
-            matches!(err, ContextError::PermissionDenied(ref m) if m.contains("SCP-SAGA-13025")),
-            "expected allowed_source_roles rejection (SCP-SAGA-13025), got {err:?}"
+            matches!(&reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13025")),
+            "expected allowed_source_roles rejection (SCP-SAGA-13025), got {:?}",
+            reject.error
         );
         // Nothing was staged.
         assert!(
@@ -3587,7 +3712,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
-        rx.await.unwrap().expect("an allowed role must be admitted");
+        expect_prepared_b(rx.await.unwrap(), "an allowed role must be admitted");
     }
 
     /// Push a `TOOL` interface with the given inbound `max_calls_per_minute`
@@ -3639,11 +3764,13 @@ mod tests {
                 .unwrap_or_else(|e| panic!("call {i} within budget must be admitted: {e:?}"));
         }
         // The next consume exhausts the window ⇒ typed SCP-SAGA-13026.
-        let err = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
             .expect_err("inbound window exhausted must reject");
+        assert_eq!(reject.code, Some(13026));
         assert!(
-            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13026")),
-            "expected inbound-rate rejection (SCP-SAGA-13026), got {err:?}"
+            matches!(&reject.error, ContextError::RateLimited { message, .. } if message.contains("SCP-SAGA-13026")),
+            "expected inbound-rate rejection (SCP-SAGA-13026), got {:?}",
+            reject.error
         );
     }
 
@@ -3671,11 +3798,13 @@ mod tests {
         .await;
 
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        let err = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
             .expect_err("an inbound ceiling above the eviction-safe limit must reject");
+        assert_eq!(reject.code, Some(13027));
         assert!(
-            matches!(err, ContextError::PermissionDenied(ref m) if m.contains("SCP-SAGA-13027")),
-            "expected cache-eviction config-guard rejection (SCP-SAGA-13027), got {err:?}"
+            matches!(&reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13027")),
+            "expected cache-eviction config-guard rejection (SCP-SAGA-13027), got {:?}",
+            reject.error
         );
         // The guard fires BEFORE materializing the window — nothing was created.
         let iface = st_cell
@@ -3734,7 +3863,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
-        rx.await.unwrap().expect("prepared-B");
+        expect_prepared_b(rx.await.unwrap(), "prepared-B");
 
         // The inbound window was materialized and one unit consumed.
         let iface = st_cell
@@ -3784,10 +3913,12 @@ mod tests {
             out.result.is_err(),
             "confused-deputy proof must be rejected"
         );
-        let err = rx.await.unwrap().expect_err("must reject");
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13013));
         assert!(
-            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13013")),
-            "expected SCP-SAGA-13013 confused-deputy rejection, got {err:?}"
+            matches!(&reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13013")),
+            "expected SCP-SAGA-13013 confused-deputy rejection, got {:?}",
+            reject.error
         );
         // Nothing staged — the slot stays empty on rejection.
         assert!(st_cell.class_s.saga_pending.is_empty());
@@ -3811,8 +3942,11 @@ mod tests {
         let req = prepare_b_request(0x55, None, 1, stale_ms);
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx.await.unwrap().expect_err("stale ts must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13018")));
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13018));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13018"))
+        );
     }
 
     #[tokio::test]
@@ -3835,8 +3969,11 @@ mod tests {
         let req = prepare_b_request(0x66, None, 1, now_ms);
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx.await.unwrap().expect_err("dup nonce must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019")));
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13019));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019"))
+        );
     }
 
     /// FIX 4 (BLACK-624-01): the nonce-dedup replay protection SURVIVES a crash.
@@ -3872,7 +4009,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_b(&mut st_cell, &deps, first, tx).await;
         assert!(out.result.is_ok(), "first prepare_b: {:?}", out.result);
-        rx.await.unwrap().expect("first prepare_b accepts");
+        expect_prepared_b(rx.await.unwrap(), "first prepare_b accepts");
         assert!(
             st_cell
                 .class_s
@@ -3910,9 +4047,10 @@ mod tests {
         let mut restored_cell = crate::context::actor::class_s::ClassSCell::new(restored);
         let out = prepare_b(&mut restored_cell, &deps, replay, tx).await;
         assert!(out.result.is_err(), "fresh-SagaId replay must be rejected");
-        let err = rx.await.unwrap().expect_err("replay rejected");
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13019));
         assert!(
-            matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019")),
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019")),
             "the rehydrated nonce-dedup cache MUST reject the cross-crash fresh-SagaId replay"
         );
     }
@@ -3942,7 +4080,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0x6B; 32], &caller, TOOL, tx).await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         let staged = st_cell
             .class_s
             .xctx_caller_reservations
@@ -4001,8 +4139,11 @@ mod tests {
         let req = prepare_b_request(0x77, None, 8, now_ms);
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx.await.unwrap().expect_err("depth overflow must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13020")));
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13020));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13020"))
+        );
     }
 
     #[tokio::test]
@@ -4023,8 +4164,11 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx.await.unwrap().expect_err("target mismatch must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13014")));
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13014));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13014"))
+        );
     }
 
     #[tokio::test]
@@ -4054,11 +4198,11 @@ mod tests {
         let req = prepare_b_request(0x99, None, 1, now_ms);
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let _ = prepare_b(&mut st_cell, &deps, req, tx).await;
-        let err = rx
-            .await
-            .unwrap()
-            .expect_err("degenerate schema must reject");
-        assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13017")));
+        let reject = expect_prepare_b_reject(rx.await.unwrap());
+        assert_eq!(reject.code, Some(13017));
+        assert!(
+            matches!(reject.error, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13017"))
+        );
     }
 
     #[tokio::test]
@@ -4133,7 +4277,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let out = prepare_b(cell, deps, req, tx).await;
         assert!(out.result.is_ok(), "stage prepare_b: {:?}", out.result);
-        rx.await.unwrap().expect("prepared-B staged");
+        expect_prepared_b(rx.await.unwrap(), "prepared-B staged");
     }
 
     #[tokio::test]
@@ -4309,7 +4453,7 @@ mod tests {
             tx,
         )
         .await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         let nonce = [0x42; 16];
         let req = CommitARequest {
@@ -4342,7 +4486,7 @@ mod tests {
             tx2,
         )
         .await;
-        let replay_reservation = rx2.await.unwrap().expect("prepared-A replay");
+        let replay_reservation = expect_prepared_a(rx2.await.unwrap(), "prepared-A replay");
         let replay_req = CommitARequest {
             saga_id: saga.clone(),
             reservation: replay_reservation,
@@ -4397,7 +4541,7 @@ mod tests {
             tx,
         )
         .await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         // Commit-A deps: a counting event log (observes the A-side append) + a
         // persistence whose FIRST call (the Commit-A witness persist) FAILS. The
@@ -4516,7 +4660,7 @@ mod tests {
             tx,
         )
         .await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         // No staged slot on A (B stages the slot); abort releases the held
         // escrow/rate-limit reservation via the rollback path and acks.
@@ -4575,7 +4719,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xC8; 32], &caller, TOOL, tx).await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         // Reserve actually moved owned economy state (else the test proves
         // nothing): the hard-rate-limit token bucket dropped exactly one token
@@ -4685,7 +4829,7 @@ mod tests {
             tx,
         )
         .await;
-        let prepared_match = rx.await.unwrap().expect("prepared-A (match)");
+        let prepared_match = expect_prepared_a(rx.await.unwrap(), "prepared-A (match)");
         let gen_match = prepared_match.reservation.generation;
         assert_eq!(
             gen_match, st_cell.generation,
@@ -4715,7 +4859,7 @@ mod tests {
             tx,
         )
         .await;
-        let prepared_stale = rx.await.unwrap().expect("prepared-A (stale)");
+        let prepared_stale = expect_prepared_a(rx.await.unwrap(), "prepared-A (stale)");
         let stale_gen = prepared_stale.reservation.generation;
         st_cell.set_generation_for_test(st_cell.generation.wrapping_add(1));
         assert_ne!(
@@ -4787,7 +4931,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD2; 32], &caller, TOOL, tx).await;
-        let prepared = rx.await.unwrap().expect("prepared-A");
+        let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // Prepare-A staged the durable record + moved owned economy.
         assert!(
             st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
@@ -5345,7 +5489,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xD8; 32], &caller, TOOL, tx).await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // The durable record landed.
         assert!(
             st_cell.class_s.xctx_caller_reservations.contains_key(&saga),
@@ -5559,7 +5703,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDA; 32], &caller, TOOL, tx).await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
 
         // Live abort via the carrier.
@@ -5639,7 +5783,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         prepare_a(&mut st_cell, &deps, &saga, &[0xDB; 32], &caller, TOOL, tx).await;
-        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
         // After Prepare-A the hard-rate-limit token is consumed (below burst).
         let hrl_after_reserve = st_cell
