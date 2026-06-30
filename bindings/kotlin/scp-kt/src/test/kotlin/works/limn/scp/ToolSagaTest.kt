@@ -18,7 +18,7 @@
 //     (argument forwarding + BridgeException propagation), and
 //   - end-to-end argument forwarding through the real UniFFI bridge.
 //
-// Provenance: #1939 PR-6c slice 4/4. §6.2.4 / ADR-049 §3a. ADR-026/ADR-028.
+// Provenance: PR-6c slice 4/4. §6.2.4 / ADR-049 §3a. ADR-026/ADR-028.
 
 package works.limn.scp
 
