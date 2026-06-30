@@ -302,7 +302,7 @@ private class TestNativeBindings : NativeBindings {
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) { /* no-op */ }
     override fun ucanMint(contextHandle: Long, memberDid: String, capabilitiesJson: String): String = ""

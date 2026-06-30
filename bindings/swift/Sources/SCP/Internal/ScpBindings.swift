@@ -2792,6 +2792,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
     
     /**
+     * Computes the structured participation record (§7.3.2) for `subject_did`
+     * in `context_id`.
+     *
+     * Sources the subject's accessible, currently-valid attestations from THIS
+     * instance's `ProtocolRepository` variant (populating any caller-supplied
+     * `cached_attestations_json` first, exactly as `aggregate_trust_input`
+     * does) — the REAL credential-layer source, not `&[]`. The shared
+     * Supervisor gathers the FULL event log + Merkle root for every other fact.
+     * Returns the flattened typed [`ParticipationRecordView`] so the
+     * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
+     */
+    func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String) throws  -> ParticipationRecordView
+    
+    /**
      * Applies a serialized petname event to the owner's petname map.
      *
      * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
@@ -3250,10 +3264,25 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
      *
+     * `capability` is OPTIONAL: omit it (or pass an empty string) to evaluate
+     * the token's intrinsic validity with no invoked-capability grant-match
+     * challenge — the mode the SDK trust signal uses. Supply a capability to
+     * additionally require the token grants it. (The enforcing `ucan_validate`
+     * gate keeps a mandatory capability.)
+     *
+     * FAIL CLOSED: `presenting_agent_did` is required (no silent security
+     * default). When it is `None` or empty this returns a validation error
+     * rather than defaulting to the token's own `aud` — defaulting would make the
+     * step-5 audience check a tautological self-check (`aud == aud`) that does NOT
+     * bind the token to any external subject, so a token addressed to someone
+     * else would report `signatures_valid` (trust inflation). The SDK trust path
+     * always passes the subject; raw diagnostic callers must now pass an explicit
+     * presenting agent.
+     *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-    func ucanEvaluate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws  -> CapabilityValidationRecord
+    func ucanEvaluate(handle: ContextHandle, token: String, capability: String?, presentingAgentDid: String, proofTokens: [String]?) async throws  -> CapabilityValidationRecord
     
     /**
      * Per-instance equivalent of the free-function `ucan_mint`.
@@ -3274,10 +3303,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `ucan_validate`.
      *
+     * FAIL CLOSED: `presenting_agent_did` is required (no silent security
+     * default). When it is `None` or empty this returns a validation error
+     * rather than defaulting to the token's own `aud` — defaulting would make
+     * the step-5 audience check a tautological self-check (`aud == aud`) that
+     * does NOT bind the token to any external subject (trust inflation). Mirrors
+     * the diagnostic `ucan_evaluate` gate.
+     *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws 
+    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String, proofTokens: [String]?) async throws 
     
 }
 /**
@@ -5490,6 +5526,28 @@ open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: Strin
 }
     
     /**
+     * Computes the structured participation record (§7.3.2) for `subject_did`
+     * in `context_id`.
+     *
+     * Sources the subject's accessible, currently-valid attestations from THIS
+     * instance's `ProtocolRepository` variant (populating any caller-supplied
+     * `cached_attestations_json` first, exactly as `aggregate_trust_input`
+     * does) — the REAL credential-layer source, not `&[]`. The shared
+     * Supervisor gathers the FULL event log + Merkle root for every other fact.
+     * Returns the flattened typed [`ParticipationRecordView`] so the
+     * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
+     */
+open func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String)throws  -> ParticipationRecordView  {
+    return try  FfiConverterTypeParticipationRecordView_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_participation_record(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(subjectDid),
+        FfiConverterString.lower(cachedAttestationsJson),$0
+    )
+})
+}
+    
+    /**
      * Applies a serialized petname event to the owner's petname map.
      *
      * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
@@ -6458,16 +6516,31 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
      *
+     * `capability` is OPTIONAL: omit it (or pass an empty string) to evaluate
+     * the token's intrinsic validity with no invoked-capability grant-match
+     * challenge — the mode the SDK trust signal uses. Supply a capability to
+     * additionally require the token grants it. (The enforcing `ucan_validate`
+     * gate keeps a mandatory capability.)
+     *
+     * FAIL CLOSED: `presenting_agent_did` is required (no silent security
+     * default). When it is `None` or empty this returns a validation error
+     * rather than defaulting to the token's own `aud` — defaulting would make the
+     * step-5 audience check a tautological self-check (`aud == aud`) that does NOT
+     * bind the token to any external subject, so a token addressed to someone
+     * else would report `signatures_valid` (trust inflation). The SDK trust path
+     * always passes the subject; raw diagnostic callers must now pass an explicit
+     * presenting agent.
+     *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-open func ucanEvaluate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws  -> CapabilityValidationRecord  {
+open func ucanEvaluate(handle: ContextHandle, token: String, capability: String?, presentingAgentDid: String, proofTokens: [String]?)async throws  -> CapabilityValidationRecord  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_ucan_evaluate(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterOptionString.lower(capability),FfiConverterString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6527,16 +6600,23 @@ open func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String)as
     /**
      * Per-instance equivalent of the free-function `ucan_validate`.
      *
+     * FAIL CLOSED: `presenting_agent_did` is required (no silent security
+     * default). When it is `None` or empty this returns a validation error
+     * rather than defaulting to the token's own `aud` — defaulting would make
+     * the step-5 audience check a tautological self-check (`aud == aud`) that
+     * does NOT bind the token to any external subject (trust inflation). Mirrors
+     * the diagnostic `ucan_evaluate` gate.
+     *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
      */
-open func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws   {
+open func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String, proofTokens: [String]?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_ucan_validate(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -9651,6 +9731,249 @@ public func FfiConverterTypeMessage_lift(_ buf: RustBuffer) throws -> Message {
 #endif
 public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
     return FfiConverterTypeMessage.lower(value)
+}
+
+
+/**
+ * Structured participation facts (§7.3.2) for a subject DID in a context.
+ *
+ * The scalar projection of scp-core's `ParticipationRecord`, produced by
+ * `aggregate.participation_record`. Counts are flattened ONCE in the shared
+ * Rust core (`ParticipationFacts`) so the Swift/Kotlin SDKs RECEIVE the facts
+ * rather than re-aggregating event-log collections — eliminating cross-binding
+ * divergence by construction. See ADR-017.
+ */
+public struct ParticipationRecordView {
+    /**
+     * The DID whose participation is summarized.
+     */
+    public var subjectDid: String
+    /**
+     * Total seconds of context participation (§7.3.2).
+     */
+    public var participationDurationSecs: UInt64
+    /**
+     * Count of governance actions taken against this identity (projected
+     * `target_did` is the subject).
+     */
+    public var governanceActionsAgainst: UInt64
+    /**
+     * Count of governance actions initiated by this identity.
+     */
+    public var governanceActionsBy: UInt64
+    /**
+     * Total tool invocations across all tool types.
+     */
+    public var toolInvocationCount: UInt64
+    /**
+     * Whether `tool_invocation_count` is anchored in the canonical Merkle log
+     * (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
+     */
+    public var toolInvocationCountAnchored: Bool
+    /**
+     * Number of contexts created by the subject (`ChildContextCreated`).
+     */
+    public var contextCreationCount: UInt64
+    /**
+     * Number of role transitions for the subject.
+     */
+    public var roleProgressionCount: UInt64
+    /**
+     * Number of accessible, currently-valid credential-layer attestations
+     * (§7.4) for the subject. Verifier-relative.
+     */
+    public var attestationCount: UInt64
+    /**
+     * Whether `attestation_count` is anchored in / verifiable against a context
+     * Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+     * never a context-event-log count (§7.3.2). Parallel of
+     * `tool_invocation_count_anchored`.
+     */
+    public var attestationCountAnchored: Bool
+    /**
+     * Unix timestamp (seconds) when the record was computed.
+     */
+    public var computedAt: UInt64
+    /**
+     * Merkle root (hex) of the event log at computation time.
+     */
+    public var eventLogRoot: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The DID whose participation is summarized.
+         */subjectDid: String, 
+        /**
+         * Total seconds of context participation (§7.3.2).
+         */participationDurationSecs: UInt64, 
+        /**
+         * Count of governance actions taken against this identity (projected
+         * `target_did` is the subject).
+         */governanceActionsAgainst: UInt64, 
+        /**
+         * Count of governance actions initiated by this identity.
+         */governanceActionsBy: UInt64, 
+        /**
+         * Total tool invocations across all tool types.
+         */toolInvocationCount: UInt64, 
+        /**
+         * Whether `tool_invocation_count` is anchored in the canonical Merkle log
+         * (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
+         */toolInvocationCountAnchored: Bool, 
+        /**
+         * Number of contexts created by the subject (`ChildContextCreated`).
+         */contextCreationCount: UInt64, 
+        /**
+         * Number of role transitions for the subject.
+         */roleProgressionCount: UInt64, 
+        /**
+         * Number of accessible, currently-valid credential-layer attestations
+         * (§7.4) for the subject. Verifier-relative.
+         */attestationCount: UInt64, 
+        /**
+         * Whether `attestation_count` is anchored in / verifiable against a context
+         * Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+         * never a context-event-log count (§7.3.2). Parallel of
+         * `tool_invocation_count_anchored`.
+         */attestationCountAnchored: Bool, 
+        /**
+         * Unix timestamp (seconds) when the record was computed.
+         */computedAt: UInt64, 
+        /**
+         * Merkle root (hex) of the event log at computation time.
+         */eventLogRoot: String) {
+        self.subjectDid = subjectDid
+        self.participationDurationSecs = participationDurationSecs
+        self.governanceActionsAgainst = governanceActionsAgainst
+        self.governanceActionsBy = governanceActionsBy
+        self.toolInvocationCount = toolInvocationCount
+        self.toolInvocationCountAnchored = toolInvocationCountAnchored
+        self.contextCreationCount = contextCreationCount
+        self.roleProgressionCount = roleProgressionCount
+        self.attestationCount = attestationCount
+        self.attestationCountAnchored = attestationCountAnchored
+        self.computedAt = computedAt
+        self.eventLogRoot = eventLogRoot
+    }
+}
+
+#if compiler(>=6)
+extension ParticipationRecordView: Sendable {}
+#endif
+
+
+extension ParticipationRecordView: Equatable, Hashable {
+    public static func ==(lhs: ParticipationRecordView, rhs: ParticipationRecordView) -> Bool {
+        if lhs.subjectDid != rhs.subjectDid {
+            return false
+        }
+        if lhs.participationDurationSecs != rhs.participationDurationSecs {
+            return false
+        }
+        if lhs.governanceActionsAgainst != rhs.governanceActionsAgainst {
+            return false
+        }
+        if lhs.governanceActionsBy != rhs.governanceActionsBy {
+            return false
+        }
+        if lhs.toolInvocationCount != rhs.toolInvocationCount {
+            return false
+        }
+        if lhs.toolInvocationCountAnchored != rhs.toolInvocationCountAnchored {
+            return false
+        }
+        if lhs.contextCreationCount != rhs.contextCreationCount {
+            return false
+        }
+        if lhs.roleProgressionCount != rhs.roleProgressionCount {
+            return false
+        }
+        if lhs.attestationCount != rhs.attestationCount {
+            return false
+        }
+        if lhs.attestationCountAnchored != rhs.attestationCountAnchored {
+            return false
+        }
+        if lhs.computedAt != rhs.computedAt {
+            return false
+        }
+        if lhs.eventLogRoot != rhs.eventLogRoot {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(subjectDid)
+        hasher.combine(participationDurationSecs)
+        hasher.combine(governanceActionsAgainst)
+        hasher.combine(governanceActionsBy)
+        hasher.combine(toolInvocationCount)
+        hasher.combine(toolInvocationCountAnchored)
+        hasher.combine(contextCreationCount)
+        hasher.combine(roleProgressionCount)
+        hasher.combine(attestationCount)
+        hasher.combine(attestationCountAnchored)
+        hasher.combine(computedAt)
+        hasher.combine(eventLogRoot)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeParticipationRecordView: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ParticipationRecordView {
+        return
+            try ParticipationRecordView(
+                subjectDid: FfiConverterString.read(from: &buf), 
+                participationDurationSecs: FfiConverterUInt64.read(from: &buf), 
+                governanceActionsAgainst: FfiConverterUInt64.read(from: &buf), 
+                governanceActionsBy: FfiConverterUInt64.read(from: &buf), 
+                toolInvocationCount: FfiConverterUInt64.read(from: &buf), 
+                toolInvocationCountAnchored: FfiConverterBool.read(from: &buf), 
+                contextCreationCount: FfiConverterUInt64.read(from: &buf), 
+                roleProgressionCount: FfiConverterUInt64.read(from: &buf), 
+                attestationCount: FfiConverterUInt64.read(from: &buf), 
+                attestationCountAnchored: FfiConverterBool.read(from: &buf), 
+                computedAt: FfiConverterUInt64.read(from: &buf), 
+                eventLogRoot: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ParticipationRecordView, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.subjectDid, into: &buf)
+        FfiConverterUInt64.write(value.participationDurationSecs, into: &buf)
+        FfiConverterUInt64.write(value.governanceActionsAgainst, into: &buf)
+        FfiConverterUInt64.write(value.governanceActionsBy, into: &buf)
+        FfiConverterUInt64.write(value.toolInvocationCount, into: &buf)
+        FfiConverterBool.write(value.toolInvocationCountAnchored, into: &buf)
+        FfiConverterUInt64.write(value.contextCreationCount, into: &buf)
+        FfiConverterUInt64.write(value.roleProgressionCount, into: &buf)
+        FfiConverterUInt64.write(value.attestationCount, into: &buf)
+        FfiConverterBool.write(value.attestationCountAnchored, into: &buf)
+        FfiConverterUInt64.write(value.computedAt, into: &buf)
+        FfiConverterString.write(value.eventLogRoot, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParticipationRecordView_lift(_ buf: RustBuffer) throws -> ParticipationRecordView {
+    return try FfiConverterTypeParticipationRecordView.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParticipationRecordView_lower(_ value: ParticipationRecordView) -> RustBuffer {
+    return FfiConverterTypeParticipationRecordView.lower(value)
 }
 
 
@@ -16273,6 +16596,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 20243) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_apply_event() != 32223) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16408,7 +16734,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 64259) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
@@ -16417,7 +16743,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_revoke() != 34885) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 38327) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 28821) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {

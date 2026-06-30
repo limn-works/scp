@@ -1124,7 +1124,11 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/ucanValidate`` on ``inner``.
-    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws {
+    ///
+    /// `presentingAgentDid` is REQUIRED: the bridge fails closed on an absent
+    /// presenter rather than defaulting to the token's own `aud` (which would
+    /// make the audience check the tautology `aud == aud` and inflate trust).
+    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String, proofTokens: [String]?) async throws {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 

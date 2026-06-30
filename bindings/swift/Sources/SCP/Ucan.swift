@@ -64,14 +64,18 @@ public extension SCP {
     ///   - handle: The ``ContextHandle`` for the context.
     ///   - encoded: The encoded UCAN token string.
     ///   - capability: The required capability string to validate against.
-    ///   - presenterDid: Optional DID of the agent presenting the token.
+    ///   - presenterDid: DID of the agent presenting the token. REQUIRED: the
+    ///     bridge fails closed on an absent presenter (it will not default to
+    ///     the token's own `aud`, which would make the audience check the
+    ///     tautology `aud == aud` and inflate trust). Pass the DID the token
+    ///     must be addressed to.
     ///   - proofTokens: Optional proof delegation chain tokens.
     /// - Returns: A ``UcanValidationResult`` indicating success or failure.
     func validateUcanWithResult(
         handle: ContextHandle,
         encoded: String,
         capability: String,
-        presenterDid: String? = nil,
+        presenterDid: String,
         proofTokens: [String]? = nil
     ) async -> UcanValidationResult {
         do {

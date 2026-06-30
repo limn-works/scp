@@ -1702,12 +1702,18 @@ class SCP internal constructor(
         revokerDid = revokerDid,
     )
 
-    /** Forwards to [NativeScp.ucanValidate] on [inner]. */
+    /**
+     * Forwards to [NativeScp.ucanValidate] on [inner].
+     *
+     * [presentingAgentDid] is REQUIRED: the bridge fails closed on an absent
+     * presenter rather than defaulting to the token's own `aud` (which would
+     * make the audience check the tautology `aud == aud` and inflate trust).
+     */
     suspend fun ucanValidate(
         handle: ContextHandle,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) = inner.ucanValidate(
         handle = handle,
