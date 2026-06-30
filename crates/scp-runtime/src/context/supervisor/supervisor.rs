@@ -2410,8 +2410,8 @@ impl Supervisor {
         Ok(self.dispatch_queries_direct(cmd))
     }
 
-    /// Dispatch a mutating [`MessagingCommand`] through the migration
-    /// shim (ADR-049 commit 8 / plan row 8).
+    /// Dispatch a mutating [`MessagingCommand`] to its per-context
+    /// actor's mailbox (ADR-049 commit 8 / plan row 8).
     ///
     /// Routes the command through the per-context actor's mailbox via
     /// [`Self::dispatch_via_mailbox`]. The actor's `run()` loop pulls
@@ -2958,23 +2958,23 @@ impl Supervisor {
         }
     }
 
-    /// Dispatch a mutating [`TtlCloseCommand`] through the migration
-    /// shim (ADR-049 commit 9 / plan row 9).
+    /// Dispatch a mutating [`TtlCloseCommand`] to its per-context
+    /// actor's mailbox (ADR-049 commit 9 / plan row 9).
     ///
-    /// Same shape as [`Self::dispatch_lifecycle_command`] — handlers
-    /// take the attached manager directly, wrap delegated
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) calls
-    /// in [`tokio::time::timeout`] with a 30s budget, and relay the
-    /// typed result through the variant's oneshot.
+    /// Routes the command through the per-context actor's mailbox via
+    /// [`Self::dispatch_via_mailbox`]. The actor's `run()` loop pulls the
+    /// command and dispatches it via the actor-shape `dispatch(state,
+    /// deps, cmd)` entry point. The handler wraps delegated
+    /// [`Supervisor`](crate::context::supervisor::Supervisor) calls in
+    /// [`tokio::time::timeout`] with a 30s budget, and relays the typed
+    /// result through the variant's oneshot.
     ///
     /// # TTL-timer ownership
     ///
-    /// The post-refactor architecture turns the TTL timer into a
-    /// `select!` arm in the actor's `run()` loop. Commit 9 keeps the
-    /// timer spawned inside the legacy `ContextManager`; this dispatch
-    /// method routes caller-initiated extend/reset/finalize/explicit-
-    /// expiry commands synchronously. Full timer-owning actor logic
-    /// arrives with plan row 11.
+    /// The TTL timer is a `select!` arm in the actor's `run()` loop.
+    /// This dispatch method routes caller-initiated
+    /// extend/reset/finalize/explicit-expiry commands through that
+    /// actor's mailbox.
     ///
     /// # Errors
     ///
@@ -4842,7 +4842,7 @@ impl Supervisor {
     /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
     /// references that cannot move into a `'static` mailbox message,
     /// even though its executor is itself `Send + 'static`. Note that
-    /// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
+    /// [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
     /// is not migrated here for a distinct reason: its generic executor
     /// closure carries no `Send` bound, so it cannot cross the actor
     /// mailbox at all.
@@ -8505,9 +8505,9 @@ impl Supervisor {
     // every context (`flush_all_*`, `restore_all_contexts`,
     // `shutdown_all_contexts`).
     //
-    // Each method is a thin shim — it resolves the attached manager
-    // and forwards. Deleted in commit 12 alongside the rest of the
-    // shim when the supervisor owns these surfaces directly.
+    // Each method forwards to its `*_helpers` free function
+    // (`queries_helpers` / `lifecycle_helpers`), which holds the
+    // supervisor-wide implementation. There is no manager indirection.
     // ---------------------------------------------------------------
 
     /// Register a DID as locally controlled by this node / SDK.
@@ -8862,21 +8862,17 @@ impl Supervisor {
     // -------------------------------------------------------------------
     // ADR-049 commit 12c.9g.3 — FFI passthrough surface.
     //
-    // The 4 FFI bridges (PyO3, NAPI, UniFFI, common) used to dereference
-    // an `Arc<ContextManager>` and invoke methods directly. After commit
-    // 12c.9g.3 they hold an `Arc<Supervisor>` only. The methods below
-    // mirror the small subset of `ContextManager` methods that the
-    // bridge functions actually call (membership queries, event-log
-    // probes, hard-rate-limit consumption, broadcast key resolution,
-    // tool invocation, lifecycle creation in tests).
+    // The 4 FFI bridges (PyO3, NAPI, UniFFI, common) hold an
+    // `Arc<Supervisor>` and invoke the methods below directly. They cover
+    // the small subset of supervisor operations the bridge functions
+    // actually call (membership queries, event-log probes, hard-rate-
+    // limit consumption, broadcast key resolution, tool invocation,
+    // lifecycle creation in tests).
     //
     // Each method is intentionally a thin one-liner over the equivalent
-    // `*_helpers::X(&self, ...)` free function or the legacy
-    // `ContextManager::X` method (resolved via
-    // `with_providers()`). The thin layer keeps the FFI rewire
-    // mechanical: bridge call sites change exactly one identifier
-    // (`mgr.X` → `supervisor.X`). When `manager/` is deleted in commit
-    // 12c.9g.4, the manager-fallback methods below become direct helper
+    // `*_helpers::X(&self, ...)` free function (or, where the op has a
+    // per-context actor, the mailbox-routed dispatch). There is no
+    // `ContextManager` indirection — these are direct helper / mailbox
     // calls.
     // -------------------------------------------------------------------
 
@@ -11337,14 +11333,13 @@ impl SagaJournal for NoopSagaJournal {
 }
 
 // ---------------------------------------------------------------------------
-// Shim helpers — synthesise the "context unknown" fallback reply for each
-// query variant. Matches the legacy `ContextManager::foo()` defaults
-// byte-for-byte. Deleted in commit 12 with the shim itself.
+// Soft-default helpers — synthesise the "context unknown" reply for each
+// query variant when no per-context actor is registered.
 // ---------------------------------------------------------------------------
 
-/// Send the legacy soft-default reply on a query variant's oneshot when
-/// the context isn't registered. Mirrors each legacy method's
-/// unknown-context return value exactly.
+/// Send the "context unknown" soft-default reply on a query variant's
+/// oneshot when the context isn't registered. Synthesises the documented
+/// unknown-context return value for each query variant.
 #[allow(clippy::cognitive_complexity)] // flat variant dispatch
 fn reply_with_soft_default(cmd: QueriesCommand) {
     match cmd {

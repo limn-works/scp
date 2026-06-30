@@ -74,8 +74,8 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// See `Supervisor::start_saga`. Commit 6: always
-    /// [`ContextError::NotImplemented`].
+    /// Errors propagate from `Supervisor::start_saga` — the saga
+    /// terminal/abort mapping.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         self.supervisor.start_saga(input).await
     }
@@ -400,9 +400,8 @@ impl SupervisorHandle {
     /// in [`crate::context::lifecycle_helpers`] (`create_context`,
     /// `restore_context`, `import_context`) call this after building the
     /// actor-shape state so production paths populate
-    /// `Supervisor::actors` instead of going through the legacy
-    /// contexts-map insert. Subsequent finalization commits delete the
-    /// legacy DashMap once every consumer is ported.
+    /// `Supervisor::actors`, the sole context registry; there is no
+    /// legacy contexts-map.
     ///
     /// # Visibility
     ///
@@ -703,8 +702,8 @@ impl SupervisorHandle {
 //
 // Any method added to this impl that returns `ContextActorHandle`,
 // `Arc<Supervisor>`, `&Supervisor`, or `&mut Supervisor` breaks the
-// capability-reduction contract. Plan §"Mechanical enforcement" adds a
-// CI grep-ban against those return types in this file in commit 12.
+// capability-reduction contract. The contract is maintained by this
+// documented rule plus review — there is no CI grep-ban for it.
 
 // ---------------------------------------------------------------------------
 // Forbidden trait impls — compile-time checklist
@@ -717,8 +716,8 @@ impl SupervisorHandle {
 //   Arc out past the capability boundary.
 //
 // These are documentation, not static assertions — Rust has no
-// "forbid impl of trait X" attribute. The CI grep-ban landing in
-// commit 12 is the mechanical enforcement.
+// "forbid impl of trait X" attribute. The rule is upheld by review,
+// not a CI grep-ban.
 
 // Compile-time witness that `SupervisorHandle` is `Send + Sync` — the
 // handle rides inside `ActorDeps`, which is moved into `tokio::spawn`.

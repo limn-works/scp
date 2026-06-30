@@ -486,9 +486,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 }
 
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "LifecycleCommand::Placeholder — placeholder variant; \
-                       real variants land in commit 9 / Phase 2A.9 of \
-                       ADR-049";
+    const MSG: &str = "LifecycleCommand::Placeholder — placeholder handshake \
+                       variant; real lifecycle command handling is not routed \
+                       through this arm";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }
