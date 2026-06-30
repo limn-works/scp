@@ -16536,8 +16536,6 @@ mod tests {
         }
     }
 
-    use crate::context::test_support::VoidCountingPaymentAdapter;
-
     /// Build a `with_providers_and_journal` supervisor over a caller-supplied
     /// saga `journal` + `mls_storage` view + optional `persistence` /
     /// `payment_adapter`, with a key_resolver mapping `creator_did → creator_key`
@@ -16602,25 +16600,20 @@ mod tests {
     /// Drive a real two-actor cross-context saga whose Commit-B settle persist
     /// ALWAYS fails — exhausting `commit_with_retry` (the 500ms/1s/2s back-off)
     /// into the `NeedsRepair` terminal — over a caller-supplied `journal`.
-    /// Returns the lifted saga result and the number of external-escrow `void`
-    /// calls the caller-side [`VoidCountingPaymentAdapter`] observed. The shared
-    /// body of the Err-arm test's two variants (production journal vs a
-    /// [`FailingSagaJournal`] that faults the seq-4 `NeedsRepair` append).
+    /// Returns the lifted saga result. The shared body of the Err-arm test's two
+    /// variants (production journal vs a [`FailingSagaJournal`] that faults the
+    /// seq-4 `NeedsRepair` append).
     async fn drive_commit_exhaustion(
         journal: Arc<dyn SagaJournal>,
         creator_did: &str,
         creator_key_seed: u8,
         caller_did: &str,
         nonce: [u8; 16],
-    ) -> (Result<SagaOutput, SagaError>, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    ) -> Result<SagaOutput, SagaError> {
+        use std::sync::atomic::AtomicUsize;
 
         let creator_key =
             ed25519_dalek::SigningKey::from_bytes(&[creator_key_seed; 32]).verifying_key();
-        let voided = Arc::new(AtomicUsize::new(0));
-        let payment: Arc<dyn PaymentAdapterDyn> = Arc::new(VoidCountingPaymentAdapter {
-            voided: Arc::clone(&voided),
-        });
         let persistence = FailContextPersistOncePersistence {
             target_hex: hex::encode(XCTX_TARGET),
             fail_on_call: 2, // Prepare-B = call 1 (succeeds); every Commit-B settle fails.
@@ -16639,7 +16632,11 @@ mod tests {
             journal,
             mls_storage,
             Some(Box::new(persistence)),
-            Some(payment),
+            // The live §6.2.4 xctx outbound path stages NO caller-side external
+            // escrow (Prepare-A presents no outbound spending UCAN), so this
+            // saga drives to NeedsRepair without ever touching a payment
+            // adapter — a plain absent adapter is the faithful production shape.
+            None,
         );
         let caller_state = xctx_caller_state(caller_did, creator_did).await;
         let target_state = xctx_target_state(caller_did, creator_did).await;
@@ -16653,7 +16650,7 @@ mod tests {
             Ok(serde_json::json!({ "result": a + b }))
         };
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
-        let result = supervisor
+        supervisor
             .start_cross_context_tool_invocation_saga(
                 xctx_request(caller_did, now_ms, nonce, 2),
                 SagaSigningKeys {
@@ -16662,16 +16659,13 @@ mod tests {
                 },
                 executor,
             )
-            .await;
-        (result, voided.load(Ordering::SeqCst))
+            .await
     }
 
     /// LIVE Err-arm coverage (spec §6.2.4 "commit_with_retry exhausts (3×) →
     /// NeedsRepair"): a real two-actor cross-context saga whose Commit-B settle
-    /// persist ALWAYS fails drives `commit_with_retry` to exhaust its budget, the
-    /// FSM transitions to `NeedsRepair`, and the caller-side Prepare-A escrow is
-    /// HELD for operator repair (NOT auto-voided — that would be a free-execution
-    /// refund of a possibly-committed side).
+    /// persist ALWAYS fails drives `commit_with_retry` to exhaust its budget and
+    /// the FSM lifts the saga to `NeedsRepair`.
     ///
     /// Two variants over the SAME always-fail Commit-B seam:
     ///
@@ -16684,13 +16678,24 @@ mod tests {
     ///   durable journal stays at `Committing` — proving the terminal
     ///   classification is independent of the journal append's success.
     ///
+    /// What this test deliberately does NOT assert: that the caller-side
+    /// Prepare-A external escrow is HELD (not auto-voided) on the `NeedsRepair`
+    /// terminal. On the live §6.2.4 xctx outbound path the caller-side external
+    /// escrow is ALWAYS absent — Prepare-A presents no outbound spending UCAN, so
+    /// no escrow is ever staged; a paid policy would abort at Prepare (never
+    /// reaching `NeedsRepair`). The hold-vs-void distinction is therefore
+    /// trivially unobservable here (every terminal voids zero escrows). Exercising
+    /// the genuine held-not-voided property requires a test-only escrow seam that
+    /// injects a non-empty external reservation, and is covered by a separate
+    /// follow-up rather than mis-asserted on this path.
+    ///
     /// `#[test]` + a MANUALLY-built `start_paused` current-thread runtime so the
     /// 500ms/1s/2s commit back-off auto-advances (the only timer; actor
     /// message-passing wakes via wakers, not timers) AND the operator metric is
     /// captured through a THREAD-LOCAL recorder (the process-global tracing/metrics
     /// cache is poisoned across the parallel test binary).
     #[test]
-    fn xctx_saga_err_arm_commit_exhaustion_needs_repair_escrow_held() {
+    fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
@@ -16709,7 +16714,7 @@ mod tests {
                 let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
                     Arc::new(InMemoryStorage::new()),
                 ));
-                let (result, voided) = Box::pin(drive_commit_exhaustion(
+                let result = Box::pin(drive_commit_exhaustion(
                     Arc::clone(&journal),
                     "did:dht:z6MkXctxErrArmCreator",
                     5,
@@ -16722,11 +16727,6 @@ mod tests {
                 assert!(
                     matches!(err, SagaError::NeedsRepair { .. }),
                     "commit-retry exhaustion must lift to NeedsRepair, got {err:?}"
-                );
-                assert_eq!(
-                    voided, 0,
-                    "the NeedsRepair terminal MUST HOLD the Prepare-A escrow for operator repair \
-                     (hold_external_for_repair), never void it"
                 );
                 let unresolved = journal.load_unresolved().await.unwrap();
                 let entry = unresolved
@@ -16748,7 +16748,7 @@ mod tests {
                     Some(crate::context::supervisor::saga_journal::SagaState::NeedsRepair),
                     false,
                 ));
-                let (result2, voided2) = Box::pin(drive_commit_exhaustion(
+                let result2 = Box::pin(drive_commit_exhaustion(
                     Arc::clone(&journal2),
                     "did:dht:z6MkXctxErrArmFaultCreator",
                     6,
@@ -16764,10 +16764,6 @@ mod tests {
                     "a NeedsRepair journal-append fault MUST NOT downgrade the terminal \
                      classification (reached_needs_repair is set before the fallible append), \
                      got {err2:?}"
-                );
-                assert_eq!(
-                    voided2, 0,
-                    "escrow held even when the NeedsRepair journal append faults"
                 );
                 let unresolved2 = journal2.load_unresolved().await.unwrap();
                 let entry2 = unresolved2
