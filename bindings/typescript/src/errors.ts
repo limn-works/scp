@@ -329,11 +329,11 @@ export function mapSagaError(error: unknown): ScpError {
       return new SagaAbortedError(message, code, retryAfterMs);
     }
     case "needs repair": {
-      const m = /\(saga_id=([^)]*)\)\s*$/.exec(message);
+      const m = /\(saga_id=([^()]*)\)\s*$/.exec(message);
       return new SagaNeedsRepairError(message, code, m?.[1] ?? "");
     }
     case "busy": {
-      const m = /\(contended_context=([^)]*)\)\s*$/.exec(message);
+      const m = /\(contended_context=([^()]*)\)\s*$/.exec(message);
       return new SagaBusyError(message, code, m?.[1] ?? "");
     }
     default:
