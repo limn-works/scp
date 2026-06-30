@@ -2890,7 +2890,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
-     * Routes through `&*self.inner`.
+     * Routes through `&*self.inner` and the supervisor-scope
+     * `restore_on_startup` (ADR-049), which restores contexts BEFORE
+     * replaying any crash-orphaned saga journal entries in the
+     * §17.16.4-required restore-then-replay order.
      */
     func restoreAllContexts() async throws  -> String
     
@@ -2904,8 +2907,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Resumes a suspended bridge instance.
      *
-     * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the `BridgeInstanceCore::resume` override (transport reconnect
+     * Clears the suspended flag, then runs the async work in the
+     * `BridgeInstanceCore::resume` default body (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -3041,6 +3044,91 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
     
     /**
+     * Invokes a tool across context boundaries as an atomic two-phase saga
+     * (spec §6.2.4, ADR-049 §3a).
+     *
+     * Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+     * single-context-side path), this drives the full §6.2.4 cross-context
+     * tool-invocation saga over the two CO-RESIDENT participant contexts
+     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
+     * the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
+     * side records its own event-log entry. Both contexts MUST be co-resident
+     * in this bridge instance (the cross-node child-bridge transport is
+     * separate future work).
+     *
+     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+     *
+     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
+     * an identity THIS bridge instance hosts (created here via identity
+     * creation) AND a member of the caller context. A mismatch raises
+     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
+     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
+     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
+     * (the target validates them; they are not minted here).
+     *
+     * # Trust boundary (co-resident single-tenant only)
+     *
+     * The caller-principal binding (`enforce_caller_principal_binding`) treats
+     * "hosted in this bridge instance's identity custody registry" as the
+     * channel-authenticated principal. That equivalence holds ONLY for a
+     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+     * across a trust boundary within one process: a multi-tenant host loading
+     * multiple users' identities into one bridge instance could assert any
+     * hosted `caller_did`, since the registry cannot distinguish which tenant
+     * is making the call. The future cross-node leg needs real channel auth
+     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+     * the authenticated-principal proof.
+     *
+     * The caller/target context-id axes are bound by the instance-affine
+     * handle pre-check: `source_handle` / `target_handle` must have been minted
+     * by THIS bridge instance (a foreign handle is rejected) before the
+     * supervisor membership / tool-interface gates run.
+     *
+     * The receipt's signer-authorization — that the target key is
+     * governance-authorized to act for the target context (§6.2.4 "Signer
+     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+     * when the receipt is consumed, NOT enforced at this export.
+     *
+     * # Arguments
+     *
+     * * `source_handle` — The initiating (caller) context handle.
+     * * `target_handle` — The executing (target) context handle.
+     * * `caller_did` — The initiator DID (bound to the bridge principal).
+     * * `tool_registration_id` — The tool to invoke across the interface.
+     * * `input_json` — Tool input as a JSON string (schema-checked
+     * target-side); parsed to a JSON value at the boundary.
+     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+     * hex string (the freshness/dedup token).
+     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+     * the target re-derives `+1`).
+     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+     * target-side at Prepare-B. `None` for an ungated tool.
+     *
+     * # Returns
+     *
+     * A [`SagaResult`] on the committed terminal, carrying the
+     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+     * captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+     * never an input.
+     *
+     * # Errors
+     *
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
+     * Prepare-phase rejection — authorization, freshness, rate limit, or
+     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+     * handle), or [`ScpError::SagaBusy`] (the participant context set
+     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
+     * if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
+     * decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
+     * JSON.
+     *
+     * See spec §6.2.4 and ADR-049 §3a.
+     */
+    func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws  -> SagaResult
+    
+    /**
      * Per-instance equivalent of the free-function `tool_register`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -3153,6 +3241,19 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
+    
+    /**
+     * Diagnostic, read-only evaluation of a UCAN token.
+     *
+     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * pipeline via `evaluate_ucan` but returns a structured
+     * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
+     * first error, and never records the token's nonce (read-only probe).
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func ucanEvaluate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws  -> CapabilityValidationRecord
     
     /**
      * Per-instance equivalent of the free-function `ucan_mint`.
@@ -5616,7 +5717,10 @@ open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
     /**
      * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
-     * Routes through `&*self.inner`.
+     * Routes through `&*self.inner` and the supervisor-scope
+     * `restore_on_startup` (ADR-049), which restores contexts BEFORE
+     * replaying any crash-orphaned saga journal entries in the
+     * §17.16.4-required restore-then-replay order.
      */
 open func restoreAllContexts()async throws  -> String  {
     return
@@ -5660,8 +5764,8 @@ open func restoreContext(contextId: String)async throws   {
     /**
      * Resumes a suspended bridge instance.
      *
-     * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the `BridgeInstanceCore::resume` override (transport reconnect
+     * Clears the suspended flag, then runs the async work in the
+     * `BridgeInstanceCore::resume` default body (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -5970,6 +6074,106 @@ open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Cont
 }
     
     /**
+     * Invokes a tool across context boundaries as an atomic two-phase saga
+     * (spec §6.2.4, ADR-049 §3a).
+     *
+     * Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+     * single-context-side path), this drives the full §6.2.4 cross-context
+     * tool-invocation saga over the two CO-RESIDENT participant contexts
+     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
+     * the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
+     * side records its own event-log entry. Both contexts MUST be co-resident
+     * in this bridge instance (the cross-node child-bridge transport is
+     * separate future work).
+     *
+     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+     *
+     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
+     * an identity THIS bridge instance hosts (created here via identity
+     * creation) AND a member of the caller context. A mismatch raises
+     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
+     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
+     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
+     * (the target validates them; they are not minted here).
+     *
+     * # Trust boundary (co-resident single-tenant only)
+     *
+     * The caller-principal binding (`enforce_caller_principal_binding`) treats
+     * "hosted in this bridge instance's identity custody registry" as the
+     * channel-authenticated principal. That equivalence holds ONLY for a
+     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+     * across a trust boundary within one process: a multi-tenant host loading
+     * multiple users' identities into one bridge instance could assert any
+     * hosted `caller_did`, since the registry cannot distinguish which tenant
+     * is making the call. The future cross-node leg needs real channel auth
+     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+     * the authenticated-principal proof.
+     *
+     * The caller/target context-id axes are bound by the instance-affine
+     * handle pre-check: `source_handle` / `target_handle` must have been minted
+     * by THIS bridge instance (a foreign handle is rejected) before the
+     * supervisor membership / tool-interface gates run.
+     *
+     * The receipt's signer-authorization — that the target key is
+     * governance-authorized to act for the target context (§6.2.4 "Signer
+     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+     * when the receipt is consumed, NOT enforced at this export.
+     *
+     * # Arguments
+     *
+     * * `source_handle` — The initiating (caller) context handle.
+     * * `target_handle` — The executing (target) context handle.
+     * * `caller_did` — The initiator DID (bound to the bridge principal).
+     * * `tool_registration_id` — The tool to invoke across the interface.
+     * * `input_json` — Tool input as a JSON string (schema-checked
+     * target-side); parsed to a JSON value at the boundary.
+     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+     * hex string (the freshness/dedup token).
+     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+     * the target re-derives `+1`).
+     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+     * target-side at Prepare-B. `None` for an ungated tool.
+     *
+     * # Returns
+     *
+     * A [`SagaResult`] on the committed terminal, carrying the
+     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+     * captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+     * never an input.
+     *
+     * # Errors
+     *
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
+     * Prepare-phase rejection — authorization, freshness, rate limit, or
+     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+     * handle), or [`ScpError::SagaBusy`] (the participant context set
+     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
+     * if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
+     * decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
+     * JSON.
+     *
+     * See spec §6.2.4 and ADR-049 §3a.
+     */
+open func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?)async throws  -> SagaResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke_cross_context_saga(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(toolRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionString.lower(ucanProofId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSagaResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `tool_register`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -6242,6 +6446,34 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeUcanToken_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Diagnostic, read-only evaluation of a UCAN token.
+     *
+     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * pipeline via `evaluate_ucan` but returns a structured
+     * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
+     * first error, and never records the token's nonce (read-only probe).
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func ucanEvaluate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws  -> CapabilityValidationRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_ucan_evaluate(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCapabilityValidationRecord_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -7461,6 +7693,161 @@ public func FfiConverterTypeBridgeRegistrationResult_lift(_ buf: RustBuffer) thr
 #endif
 public func FfiConverterTypeBridgeRegistrationResult_lower(_ value: BridgeRegistrationResult) -> RustBuffer {
     return FfiConverterTypeBridgeRegistrationResult.lower(value)
+}
+
+
+/**
+ * Structured, side-effect-free result of evaluating a UCAN token.
+ *
+ * Mirrors scp-core's `CapabilityValidation` — the diagnostic counterpart to
+ * the fail-closed `ucan_validate` gate. Each boolean reflects whether the
+ * corresponding pipeline stage ran and passed; the pipeline short-circuits, so
+ * a field is `true` only if its stage AND every prior stage passed.
+ *
+ * Unlike `ucan_validate`, evaluation records NO state (the nonce is probed
+ * read-only, never recorded). See ADR-016.
+ */
+public struct CapabilityValidationRecord {
+    /**
+     * Step 1: the token parsed and its header/attestation set validated.
+     */
+    public var tokensValid: Bool
+    /**
+     * Steps 2-7: signature, delegation chain, root issuer, audience, key
+     * scope, capability grant-match, Category-A enforcement, and attenuation
+     * all passed (whole-chain).
+     */
+    public var signaturesValid: Bool
+    /**
+     * Step 8: every granted capability is within the context's ceiling.
+     */
+    public var withinCeiling: Bool
+    /**
+     * Step 9: nonce format, freshness, and uniqueness passed (probed
+     * read-only — the nonce is NOT recorded).
+     */
+    public var nonceValid: Bool
+    /**
+     * Step 10: the token's revocation CID is not on the revocation list.
+     */
+    public var notRevoked: Bool
+    /**
+     * Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance).
+     */
+    public var timeBoundsValid: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Step 1: the token parsed and its header/attestation set validated.
+         */tokensValid: Bool, 
+        /**
+         * Steps 2-7: signature, delegation chain, root issuer, audience, key
+         * scope, capability grant-match, Category-A enforcement, and attenuation
+         * all passed (whole-chain).
+         */signaturesValid: Bool, 
+        /**
+         * Step 8: every granted capability is within the context's ceiling.
+         */withinCeiling: Bool, 
+        /**
+         * Step 9: nonce format, freshness, and uniqueness passed (probed
+         * read-only — the nonce is NOT recorded).
+         */nonceValid: Bool, 
+        /**
+         * Step 10: the token's revocation CID is not on the revocation list.
+         */notRevoked: Bool, 
+        /**
+         * Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance).
+         */timeBoundsValid: Bool) {
+        self.tokensValid = tokensValid
+        self.signaturesValid = signaturesValid
+        self.withinCeiling = withinCeiling
+        self.nonceValid = nonceValid
+        self.notRevoked = notRevoked
+        self.timeBoundsValid = timeBoundsValid
+    }
+}
+
+#if compiler(>=6)
+extension CapabilityValidationRecord: Sendable {}
+#endif
+
+
+extension CapabilityValidationRecord: Equatable, Hashable {
+    public static func ==(lhs: CapabilityValidationRecord, rhs: CapabilityValidationRecord) -> Bool {
+        if lhs.tokensValid != rhs.tokensValid {
+            return false
+        }
+        if lhs.signaturesValid != rhs.signaturesValid {
+            return false
+        }
+        if lhs.withinCeiling != rhs.withinCeiling {
+            return false
+        }
+        if lhs.nonceValid != rhs.nonceValid {
+            return false
+        }
+        if lhs.notRevoked != rhs.notRevoked {
+            return false
+        }
+        if lhs.timeBoundsValid != rhs.timeBoundsValid {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tokensValid)
+        hasher.combine(signaturesValid)
+        hasher.combine(withinCeiling)
+        hasher.combine(nonceValid)
+        hasher.combine(notRevoked)
+        hasher.combine(timeBoundsValid)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCapabilityValidationRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CapabilityValidationRecord {
+        return
+            try CapabilityValidationRecord(
+                tokensValid: FfiConverterBool.read(from: &buf), 
+                signaturesValid: FfiConverterBool.read(from: &buf), 
+                withinCeiling: FfiConverterBool.read(from: &buf), 
+                nonceValid: FfiConverterBool.read(from: &buf), 
+                notRevoked: FfiConverterBool.read(from: &buf), 
+                timeBoundsValid: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CapabilityValidationRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.tokensValid, into: &buf)
+        FfiConverterBool.write(value.signaturesValid, into: &buf)
+        FfiConverterBool.write(value.withinCeiling, into: &buf)
+        FfiConverterBool.write(value.nonceValid, into: &buf)
+        FfiConverterBool.write(value.notRevoked, into: &buf)
+        FfiConverterBool.write(value.timeBoundsValid, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCapabilityValidationRecord_lift(_ buf: RustBuffer) throws -> CapabilityValidationRecord {
+    return try FfiConverterTypeCapabilityValidationRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCapabilityValidationRecord_lower(_ value: CapabilityValidationRecord) -> RustBuffer {
+    return FfiConverterTypeCapabilityValidationRecord.lower(value)
 }
 
 
@@ -9729,6 +10116,146 @@ public func FfiConverterTypeReliabilityScoreRecord_lower(_ value: ReliabilitySco
 
 
 /**
+ * The committed terminal of a §6.2.4 cross-context tool-invocation saga
+ * (ADR-049 §3a).
+ *
+ * Returned by [`crate::scp::Scp::tool_invoke_cross_context_saga`] on a
+ * `Committed` terminal. Every NON-committed terminal raises one of the typed
+ * saga errors ([`ScpError::SagaAborted`] / [`ScpError::SagaNeedsRepair`] /
+ * [`ScpError::SagaBusy`]) instead.
+ *
+ * Carries the supervisor-minted `saga_id` plus — for the committed
+ * cross-context invocation — the target's signed receipt and the captured
+ * tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+ * is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+ * receipt's canonical `output_jcs` bytes (the exact bytes the caller side
+ * recorded a hash of). Both are surfaced as `bytes` (Swift `Data` / Kotlin
+ * `ByteArray`) so a caller can verify the receipt signature and recompute
+ * `output_hash` without a re-serialization step.
+ *
+ * Generated as `data class SagaResult` (Kotlin) / `struct SagaResult` (Swift).
+ */
+public struct SagaResult {
+    /**
+     * The durable saga identifier (supervisor-minted, never a caller input).
+     */
+    public var sagaId: String
+    /**
+     * The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+     *
+     * The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
+     * Signing Key (the key held by its registered handle on this instance).
+     * The in-saga receipt verification is INTEGRITY-ONLY: it verifies the
+     * signature against the very key the saga FSM handed to side B, NOT an
+     * independent resolution that that key is governance-authorized. A
+     * consumer that re-presents this `receipt` as cross-node provenance
+     * therefore MUST independently resolve that the signing key is the target
+     * context's governance-authorized Active Signing Key — especially once
+     * cross-node child-bridge transport lands, where a co-resident signer is
+     * trusted only within this instance.
+     */
+    public var receipt: Data?
+    /**
+     * The captured tool output bytes (the receipt's canonical `output_jcs`),
+     * or `None`.
+     */
+    public var output: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The durable saga identifier (supervisor-minted, never a caller input).
+         */sagaId: String, 
+        /**
+         * The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+         *
+         * The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
+         * Signing Key (the key held by its registered handle on this instance).
+         * The in-saga receipt verification is INTEGRITY-ONLY: it verifies the
+         * signature against the very key the saga FSM handed to side B, NOT an
+         * independent resolution that that key is governance-authorized. A
+         * consumer that re-presents this `receipt` as cross-node provenance
+         * therefore MUST independently resolve that the signing key is the target
+         * context's governance-authorized Active Signing Key — especially once
+         * cross-node child-bridge transport lands, where a co-resident signer is
+         * trusted only within this instance.
+         */receipt: Data?, 
+        /**
+         * The captured tool output bytes (the receipt's canonical `output_jcs`),
+         * or `None`.
+         */output: Data?) {
+        self.sagaId = sagaId
+        self.receipt = receipt
+        self.output = output
+    }
+}
+
+#if compiler(>=6)
+extension SagaResult: Sendable {}
+#endif
+
+
+extension SagaResult: Equatable, Hashable {
+    public static func ==(lhs: SagaResult, rhs: SagaResult) -> Bool {
+        if lhs.sagaId != rhs.sagaId {
+            return false
+        }
+        if lhs.receipt != rhs.receipt {
+            return false
+        }
+        if lhs.output != rhs.output {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sagaId)
+        hasher.combine(receipt)
+        hasher.combine(output)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSagaResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SagaResult {
+        return
+            try SagaResult(
+                sagaId: FfiConverterString.read(from: &buf), 
+                receipt: FfiConverterOptionData.read(from: &buf), 
+                output: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SagaResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sagaId, into: &buf)
+        FfiConverterOptionData.write(value.receipt, into: &buf)
+        FfiConverterOptionData.write(value.output, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSagaResult_lift(_ buf: RustBuffer) throws -> SagaResult {
+    return try FfiConverterTypeSagaResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSagaResult_lower(_ value: SagaResult) -> RustBuffer {
+    return FfiConverterTypeSagaResult.lower(value)
+}
+
+
+/**
  * Shadow identity result record.
  *
  * Returned by `bridge_create_shadow`. Contains the details of a shadow
@@ -11632,6 +12159,73 @@ public enum ScpError: Swift.Error {
      */
     case Validation(msg: String, code: String
     )
+    /**
+     * A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+     *
+     * Surfaces the `Aborted` terminal of
+     * `Supervisor::start_cross_context_tool_invocation_saga` (a §6.2.4
+     * authorization / freshness / rate-limit / co-residency rejection — also
+     * the §6.2.4 *Caller authentication* mismatch this bridge enforces before
+     * the saga runs). Carries the rate-limit back-off hint STRUCTURALLY
+     * (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
+     * `None` (NEVER `0`) means no precise back-off instant exists (a
+     * token-bucket hard limit, or a non-rate-limit rejection) — `0` would read
+     * as "retry immediately" and re-trip the same hard limit. `code` is the
+     * canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
+     * / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
+     * Swift `msg:` label — the `UniFFI` field-name convention every variant
+     * here follows).
+     */
+    case SagaAborted(
+        /**
+         * Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+         */msg: String, 
+        /**
+         * The canonical `SCP-SAGA-13xxx` code.
+         */code: String, 
+        /**
+         * Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+         */retryAfterMs: UInt64?
+    )
+    /**
+     * A §6.2.4 saga exhausted its Commit retries and may have diverged.
+     *
+     * Surfaces the `NeedsRepair` terminal (Commit-retry exhausted — the saga
+     * may have PARTIALLY committed, a divergence; ADR-049 §3a). Carries the
+     * durable `saga_id` operator-repair handle (`SCP-SAGA-13065`). Maps to
+     * Swift `ScpError.SagaNeedsRepair` / Kotlin `ScpException.SagaNeedsRepair`.
+     */
+    case SagaNeedsRepair(
+        /**
+         * Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+         */msg: String, 
+        /**
+         * The canonical `SCP-SAGA-13065` code.
+         */code: String, 
+        /**
+         * The durable saga identifier — the operator-repair handle.
+         */sagaId: String
+    )
+    /**
+     * A §6.2.4 saga's participant context set overlapped an in-flight saga.
+     *
+     * Surfaces the `Busy` terminal (the participant context set overlapped an
+     * in-flight saga's set — spec §5.15.4 per-participant-context-set gating;
+     * retry with back-off). Carries the contended context id
+     * (`SCP-SAGA-13066`). Maps to Swift `ScpError.SagaBusy` / Kotlin
+     * `ScpException.SagaBusy`.
+     */
+    case SagaBusy(
+        /**
+         * Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+         */msg: String, 
+        /**
+         * The canonical `SCP-SAGA-13066` code.
+         */code: String, 
+        /**
+         * The shared context id that forced serialization.
+         */contendedContext: String
+    )
 }
 
 
@@ -11675,6 +12269,21 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
         case 7: return .Validation(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .SagaAborted(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf), 
+            retryAfterMs: try FfiConverterOptionUInt64.read(from: &buf)
+            )
+        case 9: return .SagaNeedsRepair(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf), 
+            sagaId: try FfiConverterString.read(from: &buf)
+            )
+        case 10: return .SagaBusy(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf), 
+            contendedContext: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -11728,6 +12337,27 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
+            
+        
+        case let .SagaAborted(msg,code,retryAfterMs):
+            writeInt(&buf, Int32(8))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            FfiConverterOptionUInt64.write(retryAfterMs, into: &buf)
+            
+        
+        case let .SagaNeedsRepair(msg,code,sagaId):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            FfiConverterString.write(sagaId, into: &buf)
+            
+        
+        case let .SagaBusy(msg,code,contendedContext):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            FfiConverterString.write(contendedContext, into: &buf)
             
         }
     }
@@ -15511,7 +16141,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 25225) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 22488) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
@@ -15688,13 +16318,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 43499) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 32770) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_context() != 6223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 24128) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 42440) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_deregister() != 49133) {
@@ -15739,6 +16369,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 59585) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15760,7 +16393,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_disconnect() != 45973) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_manager_status() != 45644) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_manager_status() != 44390) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
@@ -15773,6 +16406,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 64259) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
