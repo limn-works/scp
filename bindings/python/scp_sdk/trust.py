@@ -623,8 +623,8 @@ def structured_to_capability_validation(result: Any) -> CapabilityValidation:
 
 async def evaluate_trust(
     scp: SCP,
-    subject_did: str,
     context_id: str,
+    subject_did: str,
     capability_tokens: list[str] | None = None,
 ) -> TrustEvaluation:
     """Evaluate the trustworthiness of a participant in a context.
@@ -667,8 +667,8 @@ async def evaluate_trust(
 
     Args:
         scp: The :class:`~scp_sdk.SCP` instance to dispatch bridge calls on.
-        subject_did: The DID of the participant to evaluate.
         context_id: The ID of the context to evaluate trust within.
+        subject_did: The DID of the participant to evaluate.
         capability_tokens: Optional list of UCAN token strings to
             evaluate as part of the evaluation.
 

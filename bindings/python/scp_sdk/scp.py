@@ -1881,8 +1881,8 @@ class SCP:
 
     async def evaluate_trust(
         self,
-        subject_did: str,
         context_id: str,
+        subject_did: str,
         capability_tokens: list[str] | None = None,
     ) -> TrustEvaluation:
         """Evaluate the trustworthiness of a participant in a context.
@@ -1900,7 +1900,7 @@ class SCP:
         """
         from scp_sdk.trust import evaluate_trust as _evaluate_trust
 
-        return await _evaluate_trust(self, subject_did, context_id, capability_tokens)
+        return await _evaluate_trust(self, context_id, subject_did, capability_tokens)
 
     async def participation_record(
         self,
