@@ -5279,8 +5279,12 @@ mod tests {
     // every terminal path") — the PreparingB-crash over-charge / escrow-leak fix.
     // -----------------------------------------------------------------------
 
-    /// A `PaymentAdapter` that counts `void` calls, so the crash-recovery and
-    /// reversal tests can assert the external escrow hold was actually voided.
+    /// A [`PaymentAdapter`](crate::economy::adapter::PaymentAdapter) that counts
+    /// `void` calls so cross-context-saga reversal / `NeedsRepair` tests can assert
+    /// whether an external escrow hold was voided
+    /// ([`void_external_and_consume`](crate::context::tools_helpers::ToolEconomyTicket::void_external_and_consume))
+    /// or held for operator repair
+    /// ([`hold_external_for_repair`](crate::context::tools_helpers::ToolEconomyTicket::hold_external_for_repair)).
     struct VoidCountingPaymentAdapter {
         voided: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -5342,8 +5346,8 @@ mod tests {
                 timestamp: 1_000_001,
                 signature: vec![],
                 // Synthetic test receipt: never appended to the canonical Merkle
-                // log, so it is not anchored (matches `PaymentReceipt`'s
-                // unanchored default; the field lies outside the signed payload).
+                // log, so it is not anchored (matches `PaymentReceipt`'s unanchored
+                // default; the field lies outside the signed payload).
                 anchored: false,
             })
         }
