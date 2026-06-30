@@ -194,7 +194,7 @@ def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
     of the three saga terminals (so the caller re-raises it unchanged).
     """
     args = exc.args
-    message = str(args[0]) if args else str(exc)
+    message = str(args[0]) if len(args) > 0 else str(exc)
     code = args[1] if len(args) > 1 and isinstance(args[1], str) else None
     datum = args[2] if len(args) > 2 else None
 
