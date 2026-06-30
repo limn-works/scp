@@ -643,9 +643,14 @@ fn participation_record_impl(
             )
         }
     }
-    .map_err(|e| crate::error::ScpPyError::ValidationError {
+    // An error from `verified_attestations` is an INFRA fault (trust-store read,
+    // signature-verification infrastructure) — NOT a caller-input validation
+    // error. Code it as a context-layer fault (CTX_2000), consistent with the
+    // generic-failure arm of `participation_record` below, and keep it propagating
+    // (fail-closed): it must never be folded into the empty-log CTX_2076 path.
+    .map_err(|e| crate::error::ScpPyError::ContextError {
         message: e.to_string(),
-        code: scp_ffi_common::error_codes::VALID_7059.to_owned(),
+        code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
     })?;
 
     let record = crate::runtime::supervisor(bi)?

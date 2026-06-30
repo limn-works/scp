@@ -571,13 +571,6 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
-            // §7.3.2: empty event log → no recorded participation facts. Dedicated
-            // SCP-CTX-2076 instead of the catch-all so a caller can distinguish
-            // "no facts yet" from a genuine context error.
-            CE::NoParticipationFacts { .. } => Self::ContextError {
-                message: format!("{e}"),
-                code: codes::CTX_2076.to_owned(),
-            },
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),

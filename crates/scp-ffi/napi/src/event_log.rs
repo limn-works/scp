@@ -151,8 +151,10 @@ pub(crate) async fn event_log_query_on(
             // Project the typed payload's bridge-facing fields (e.g.
             // `target_did` for governance/access-revocation events,
             // `subject_did` for role/membership events) through the single
-            // shared decoder so all three native bridges surface byte-identical values.
-            // Each key is omitted when the projection yields `None`.
+            // shared `scp_event_log::payload::project_payload` decoder (via the
+            // `inject_projection` helper) so all three native bridges surface
+            // byte-identical values. Each key is omitted when the projection
+            // yields `None`.
             let mut payload_value = serde_json::json!({
                 "hash": hex::encode(leaf_hash),
             });

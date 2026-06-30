@@ -470,10 +470,15 @@ pub(crate) fn participation_record_on(
             )
         }
     }
+    // An error from `verified_attestations` is an INFRA fault (trust-store read,
+    // signature-verification infrastructure) — NOT caller-input validation. Code
+    // it as a context-layer fault (CTX_2000), consistent with the generic-failure
+    // arm of `participation_record` below, and keep it propagating (fail-closed):
+    // it must never be folded into the empty-log CTX_2076 path.
     .map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
+        napi::Error::from(ScpNapiError::Context {
             message: e.to_string(),
-            code: codes::VALID_7059.to_owned(),
+            code: codes::CTX_2000.to_owned(),
         })
     })?;
 

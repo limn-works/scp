@@ -1217,13 +1217,6 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
-            // §7.3.2: empty event log → no recorded participation facts.
-            // Dedicated SCP-CTX-2076 instead of the catch-all so a Swift / Kotlin
-            // caller can distinguish "no facts yet" from a genuine context error.
-            CE::NoParticipationFacts { .. } => Self::Context {
-                msg: format!("{e}"),
-                code: codes::CTX_2076.to_owned(),
-            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -13748,7 +13741,7 @@ impl Scp {
         handle: Arc<ContextHandle>,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> Result<(), ScpError> {
         self.inner
@@ -13761,21 +13754,25 @@ impl Scp {
                 validate_ucan_token(&token)?;
                 validate_capability_uri(&capability)?;
 
-                // FAIL CLOSED (no silent security default): require an explicit
-                // presenting agent DID instead of defaulting to the token's own
-                // `aud` (which would make the step-5 audience check tautological
-                // and inflate trust). Validated as a pure input before token
-                // parse — mirrors `ucan_evaluate`.
-                let agent_did = presenting_agent_did
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|did| !did.is_empty())
-                    .ok_or_else(|| ScpError::Validation {
-                        msg: "presenting_agent_did is required: ucan_validate will not default \
-                              to the token's audience"
-                            .to_owned(),
-                        code: codes::VALID_7010.to_owned(),
-                    })?;
+                // FAIL CLOSED (no silent security default): `presenting_agent_did`
+                // is a REQUIRED non-empty value (typed `String`, so Swift/Kotlin
+                // surface it as non-nullable). An empty/whitespace value is
+                // rejected rather than defaulting to the token's own `aud` (which
+                // would make the step-5 audience check tautological and inflate
+                // trust). Validated as a pure input before token parse — mirrors
+                // `ucan_evaluate`.
+                let agent_did = {
+                    let trimmed = presenting_agent_did.trim();
+                    if trimmed.is_empty() {
+                        return Err(ScpError::Validation {
+                            msg: "presenting_agent_did is required: ucan_validate will not \
+                                  default to the token's audience"
+                                .to_owned(),
+                            code: codes::VALID_7010.to_owned(),
+                        });
+                    }
+                    trimmed
+                };
                 // Input hygiene parity with the PyO3 reference: validate the
                 // trimmed presenting agent DID before any token parse / state
                 // lookup.
@@ -13897,7 +13894,7 @@ impl Scp {
         handle: Arc<ContextHandle>,
         token: String,
         capability: Option<String>,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> Result<CapabilityValidationRecord, ScpError> {
         self.inner
@@ -13915,20 +13912,24 @@ impl Scp {
                     validate_capability_uri(cap)?;
                 }
 
-                // FAIL CLOSED (no silent security default): require an explicit
-                // presenting agent DID instead of defaulting to the token's own
-                // `aud` (which would make the step-5 audience check tautological
-                // and inflate trust). Validated as a pure input before parse.
-                let agent_did = presenting_agent_did
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|did| !did.is_empty())
-                    .ok_or_else(|| ScpError::Validation {
-                        msg: "presenting_agent_did is required: ucan_evaluate will not default \
-                              to the token's audience"
-                            .to_owned(),
-                        code: codes::VALID_7010.to_owned(),
-                    })?;
+                // FAIL CLOSED (no silent security default): `presenting_agent_did`
+                // is a REQUIRED non-empty value (typed `String`, so Swift/Kotlin
+                // surface it as non-nullable). An empty/whitespace value is
+                // rejected rather than defaulting to the token's own `aud` (which
+                // would make the step-5 audience check tautological and inflate
+                // trust). Validated as a pure input before parse.
+                let agent_did = {
+                    let trimmed = presenting_agent_did.trim();
+                    if trimmed.is_empty() {
+                        return Err(ScpError::Validation {
+                            msg: "presenting_agent_did is required: ucan_evaluate will not \
+                                  default to the token's audience"
+                                .to_owned(),
+                            code: codes::VALID_7010.to_owned(),
+                        });
+                    }
+                    trimmed
+                };
                 // Input hygiene parity with the PyO3 reference: validate the
                 // trimmed presenting agent DID before any token parse / state
                 // lookup.
@@ -15364,9 +15365,15 @@ impl Scp {
                 )
             }
         }
-        .map_err(|e| ScpError::Validation {
+        // An error from `verified_attestations` is an INFRA fault (trust-store
+        // read, signature-verification infrastructure) — NOT caller-input
+        // validation. Code it as a context-layer fault (CTX_2000), consistent
+        // with the generic-failure arm of `participation_record` below, and keep
+        // it propagating (fail-closed): it must never be folded into the empty-log
+        // CTX_2076 path.
+        .map_err(|e| ScpError::Context {
             msg: e.to_string(),
-            code: codes::VALID_7059.to_owned(),
+            code: codes::CTX_2000.to_owned(),
         })?;
 
         let supervisor = self
@@ -17380,36 +17387,24 @@ mod tests {
         })
     }
 
-    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted or empty
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an empty/whitespace
     /// `presenting_agent_did` rather than defaulting to the token's own `aud`
     /// (which would make the step-5 audience check tautological and inflate
-    /// trust). The check is a pure-input gate after handle-affinity and before
-    /// token parse, so a dummy token suffices.
+    /// trust). OMISSION is now a COMPILE error — the parameter is a required
+    /// `String`, not `Option<String>` — so only the empty-value runtime gate is
+    /// testable here. The check is a pure-input gate after handle-affinity and
+    /// before token parse, so a dummy token suffices.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_evaluate_requires_presenting_agent_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-
-        let omitted = scp
-            .ucan_evaluate(
-                Arc::clone(&handle),
-                "header.payload.sig".to_owned(),
-                None,
-                None,
-                None,
-            )
-            .await;
-        assert!(
-            omitted.is_err(),
-            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
-        );
 
         let empty = scp
             .ucan_evaluate(
                 handle,
                 "header.payload.sig".to_owned(),
                 None,
-                Some("   ".to_owned()),
+                "   ".to_owned(),
                 None,
             )
             .await;
@@ -17420,34 +17415,21 @@ mod tests {
     }
 
     /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
-    /// MUST reject an omitted or empty `presenting_agent_did` rather than
-    /// defaulting to the token's own `aud`. Pure-input gate before token parse,
-    /// so a dummy token suffices.
+    /// MUST reject an empty/whitespace `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. OMISSION is now a COMPILE error (the
+    /// parameter is a required `String`), so only the empty-value runtime gate is
+    /// testable. Pure-input gate before token parse, so a dummy token suffices.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_validate_requires_presenting_agent_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-
-        let omitted = scp
-            .ucan_validate(
-                Arc::clone(&handle),
-                "header.payload.sig".to_owned(),
-                "messages:write".to_owned(),
-                None,
-                None,
-            )
-            .await;
-        assert!(
-            omitted.is_err(),
-            "ucan_validate must fail closed when presenting_agent_did is omitted"
-        );
 
         let empty = scp
             .ucan_validate(
                 handle,
                 "header.payload.sig".to_owned(),
                 "messages:write".to_owned(),
-                Some("   ".to_owned()),
+                "   ".to_owned(),
                 None,
             )
             .await;
