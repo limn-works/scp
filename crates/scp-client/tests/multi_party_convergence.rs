@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use scp_client::{LocalSigner, MemoryStorage, ScpClient, Storage};
+use scp_client::{ClientError, LocalSigner, MemoryStorage, ScpClient, Storage};
 use scp_primitives::{Clock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
@@ -288,4 +288,158 @@ fn reciprocal_send_converges_via_transported_timestamp() {
         }
         other => panic!("expected MessageReceived, got {other:?}"),
     }
+}
+
+#[test]
+fn remove_commit_is_rejected_fail_closed_without_skew() {
+    // The regression test for Fix 1: a Remove-bearing Commit must be rejected by
+    // `receive_message` AND must leave the receiver's MLS group + SCP membership +
+    // event log mutually consistent (pre-remove). `scp-mls` now inspects the
+    // staged commit's Remove proposals and drops the StagedCommit WITHOUT merging,
+    // so the MLS epoch never half-advances while the SCP membership/log stay put.
+    //
+    // ADR-057 Slice 2 deliberately gives the participant `ScpClient` NO remove op
+    // (there is no convergent removal-leaf transport yet). To manufacture the very
+    // Remove-bearing Commit the driver must reject, this test drives ALICE as a
+    // raw `scp-mls` group (a dev-dependency) — exactly the wire bytes a hostile or
+    // out-of-scope committer could put on the wire — while BOB is a real
+    // `ScpClient` whose `receive_message` is the unit under test.
+    use openmls::prelude::{BasicCredential, KeyPackageIn};
+    use scp_mls::group::{add_member, create_group, generate_key_package, remove_member};
+    use scp_mls::{ScpCredential, SignatureKeyPair};
+    use scp_primitives::SigningKeyId;
+    use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+
+    let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)
+        .expect("alice credential");
+    let mut alice_group = create_group(&alice_cred).expect("Alice's raw MLS group");
+
+    let mut bob = client_for(BOB_DID, 1_650_000_000);
+
+    // Bob's ScpClient mints its join KeyPackage (private half retained inside the
+    // client). Alice (raw group) adds Bob from that KeyPackage and Bob joins via
+    // the resulting Welcome, starting from an empty replay log.
+    let bob_kp_bytes = bob
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).expect("bob kp deserialize");
+    let add_bob = add_member(&mut alice_group, bob_kp_in).expect("Alice adds Bob");
+    let bob_welcome = add_bob
+        .welcome
+        .tls_serialize_detached()
+        .expect("welcome bytes");
+    bob.join_context_encrypted(CTX, &bob_welcome, &[], &[ALICE_DID.to_owned()])
+        .expect("Bob joins Alice's raw group");
+
+    // Alice (raw group) adds Carol — a raw `scp-mls` member that exists only so
+    // Alice has someone to remove. Bob applies the add-Carol Commit through his
+    // ScpClient so Bob and Alice share the post-add epoch and Bob records Carol.
+    let carol_cred = ScpCredential::new(CAROL_DID.to_owned(), None, SigningKeyId::Active)
+        .expect("carol credential");
+    let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
+        generate_key_package(&carol_cred).expect("carol key package");
+    let carol_kp_in = KeyPackageIn::tls_deserialize(
+        &mut &*carol_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("carol kp bytes"),
+    )
+    .expect("carol kp deserialize");
+    let add_carol = add_member(&mut alice_group, carol_kp_in).expect("Alice adds Carol");
+    let add_carol_commit = add_carol
+        .commit
+        .tls_serialize_detached()
+        .expect("add-carol commit bytes");
+    // Convergent timestamp the committer would have stamped (any value — this is
+    // the add path, which DOES converge and append a MemberJoined leaf on Bob).
+    let add_carol_ts = 1_700_000_500u64;
+    bob.receive_message(CTX, &add_carol_commit, add_carol_ts)
+        .expect("Bob processes the add-Carol commit");
+
+    // Snapshot Bob's pre-remove state: MLS epoch, SCP membership, log leaf count,
+    // and Merkle root. After the rejected remove these must ALL be unchanged.
+    let bob_epoch_before = bob.mls_epoch(CTX).expect("bob epoch");
+    let bob_leaf_count_before = bob.event_log_leaf_count(CTX);
+    let bob_root_before = bob.event_log_root(CTX);
+    let mut bob_members_before = bob.member_dids(CTX).expect("bob members");
+    bob_members_before.sort();
+    assert!(
+        bob_members_before.contains(&CAROL_DID.to_owned()),
+        "pre-remove: Carol is in Bob's membership set"
+    );
+
+    // Alice (raw group) builds a Commit removing Carol by her leaf index.
+    let carol_leaf = alice_group
+        .members()
+        .expect("alice members")
+        .into_iter()
+        .find(|m| {
+            BasicCredential::try_from(m.credential.clone())
+                .ok()
+                .and_then(|basic| ScpCredential::from_bytes(basic.identity()).ok())
+                .is_some_and(|cred| cred.did == CAROL_DID)
+        })
+        .map(|m| m.index)
+        .expect("Carol's leaf index");
+    let remove_carol = remove_member(&mut alice_group, carol_leaf).expect("Alice removes Carol");
+    let remove_carol_commit = remove_carol
+        .commit
+        .tls_serialize_detached()
+        .expect("remove-carol commit bytes");
+
+    // Bob receives the remove Commit. The committer timestamp is irrelevant — the
+    // Commit is rejected before any leaf would be stamped — so pass an arbitrary
+    // value to prove it is never consumed on the reject path.
+    let result = bob.receive_message(CTX, &remove_carol_commit, 1_700_000_999);
+
+    // (1) FAIL-LOUD: the driver surfaces UnsupportedMembershipChange naming Carol.
+    match result {
+        Err(ClientError::UnsupportedMembershipChange(msg)) => {
+            assert!(
+                msg.contains(CAROL_DID),
+                "the error must name the removed member, got: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedMembershipChange, got {other:?}"),
+    }
+
+    // (2) NO SKEW: Bob's MLS group did NOT half-advance — the Remove-bearing
+    // Commit was dropped BEFORE `merge_staged_commit`, so the MLS epoch is
+    // exactly what it was before. This is the crux of Fix 1: pre-fix the group
+    // merged (epoch advanced, Carol evicted from the tree) and only then errored,
+    // leaving MLS ahead of the SCP layer.
+    assert_eq!(
+        bob.mls_epoch(CTX).expect("bob epoch after"),
+        bob_epoch_before,
+        "a rejected remove must NOT advance Bob's MLS epoch (no half-merge)"
+    );
+
+    // (3) NO SKEW: Bob's SCP membership set is unchanged (Carol still listed —
+    // the driver did not evict her, since it never applied the Commit).
+    let mut bob_members_after = bob.member_dids(CTX).expect("bob members after");
+    bob_members_after.sort();
+    assert_eq!(
+        bob_members_after, bob_members_before,
+        "a rejected remove must NOT mutate Bob's SCP membership set"
+    );
+
+    // (4) NO SKEW: Bob's event log is unchanged (same leaf count, same root) —
+    // no membership leaf was appended or dropped.
+    assert_eq!(
+        bob.event_log_leaf_count(CTX),
+        bob_leaf_count_before,
+        "a rejected remove must NOT change Bob's event-log leaf count"
+    );
+    assert_eq!(
+        bob.event_log_root(CTX),
+        bob_root_before,
+        "a rejected remove must NOT change Bob's event-log Merkle root"
+    );
+
+    // The four no-skew assertions above prove the crux of Fix 1: MLS state and
+    // SCP state are LEFT MUTUALLY CONSISTENT (both pre-remove), because the
+    // Remove-bearing Commit was dropped before `merge_staged_commit` rather than
+    // merged-then-errored. (That the group also stays *encryptable* on its
+    // unchanged epoch after a rejected remove is proven at the MLS layer by the
+    // `scp-mls` unit test `decrypt_with_membership_changes_rejects_remove_without_merging`.)
 }

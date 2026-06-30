@@ -417,13 +417,29 @@ impl ScpClient {
     /// ([`SendOutput::committer_timestamp_secs`]), or on the `MemberJoined`
     /// leaf for an add Commit ([`AddMemberOutput::committer_timestamp_secs`]).
     ///
+    // SECURITY (ADR-057, leaf-signing/custody slice): `committer_timestamp_secs`
+    // is presently an UNAUTHENTICATED value transported alongside the ciphertext.
+    // It is NOT bound to the MLS ciphertext (it is not part of the §9.16 AEAD
+    // AAD) and the event-log leaves it stamps are unsigned, so a hostile relay
+    // (or any in-path attacker) could forge or alter it and drive this receiver's
+    // `MessageSent` / `MemberJoined` leaf — and thus its Merkle root — away from
+    // the honest committer's, breaking convergence. The MVP "dumb pipe" is a
+    // trusted in-process test harness, so this is acceptable ONLY until a real
+    // relay/transport is wired. Before that wiring, this timestamp MUST be bound
+    // into a signed leaf or a signed transport envelope (so a recipient verifies
+    // the committer's signature over the timestamp) rather than trusted on the
+    // wire.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
     /// [`ClientError::UnsupportedMembershipChange`] if the Commit removes a
-    /// member (Slice 2 has no convergent removal-leaf transport — the driver
-    /// refuses to merge silently rather than diverge), or a crypto/leaf error
-    /// on failure.
+    /// member (Slice 2 has no convergent removal-leaf transport). In that case
+    /// `scp-mls` rejected the Commit *before* merging, so the context's MLS
+    /// epoch, SCP membership, and event log are left mutually consistent
+    /// (pre-remove) and the context stays usable — the driver surfaces the gap
+    /// rather than half-applying it. Otherwise returns a crypto/leaf error on
+    /// failure.
     pub fn receive_message(
         &mut self,
         context_id: &str,
@@ -448,9 +464,8 @@ impl ScpClient {
                 });
                 Ok(true)
             }
-            Inbound::Commit {
-                sender_did: committer_did,
-                added_dids,
+            Inbound::UnsupportedMembershipChange {
+                sender_did: _committer_did,
                 removed_dids,
             } => {
                 // Slice 2 is the participant add path. A Commit that EVICTS a
@@ -460,19 +475,27 @@ impl ScpClient {
                 // transports one for adds). Merging it while dropping the
                 // membership leaf would silently diverge this member's log from
                 // the committer's — exactly the bug this method fixes for adds.
-                // Refuse loudly instead. Note the MLS group has ALREADY merged
-                // the commit inside `decrypt_message`; the context is left in a
-                // deliberately-failed state so the caller surfaces the gap
-                // rather than proceeding on a diverged log.
-                if !removed_dids.is_empty() {
-                    return Err(ClientError::UnsupportedMembershipChange(format!(
-                        "received a Commit removing {} member(s) ({}); convergent \
-                         removal is out of ADR-057 Slice 2 scope",
-                        removed_dids.len(),
-                        removed_dids.join(", ")
-                    )));
-                }
-
+                //
+                // FAIL-CLOSED WITHOUT SKEW: `scp-mls` already REJECTED this
+                // Commit *before* merging (it inspected the staged commit's
+                // Remove proposals and dropped the StagedCommit), so the MLS
+                // group is still on its pre-Commit epoch and this context's MLS
+                // state, SCP membership set, and event log all remain mutually
+                // consistent (pre-remove). The context is left fully usable; we
+                // simply surface the gap to the caller rather than silently
+                // diverging. The caller may keep using the context on the old
+                // epoch.
+                Err(ClientError::UnsupportedMembershipChange(format!(
+                    "received a Commit removing {} member(s) ({}); convergent \
+                     removal is out of ADR-057 Slice 2 scope",
+                    removed_dids.len(),
+                    removed_dids.join(", ")
+                )))
+            }
+            Inbound::Commit {
+                sender_did: committer_did,
+                added_dids,
+            } => {
                 // For each added member, append the identical convergent
                 // `MemberJoined` leaf the committer appended: actor = committer
                 // DID, timestamp = transported convergent T, empty payload. The
@@ -603,6 +626,25 @@ impl ScpClient {
         self.contexts
             .get(context_id)
             .map(PerContextState::event_log_leaf_hashes)
+    }
+
+    /// Returns the MLS group epoch for `context_id`.
+    ///
+    /// The MLS epoch advances on every applied Commit. It is exposed so callers
+    /// (and convergence/consistency tests) can observe that the MLS layer and the
+    /// SCP layer stay in step — e.g. that a rejected (Remove-bearing) Commit did
+    /// NOT half-advance the epoch while leaving membership/log behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
+    /// [`ClientError::Mls`] if the MLS group has been destroyed.
+    pub fn mls_epoch(&self, context_id: &str) -> Result<u64, ClientError> {
+        let state = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
+        Ok(state.crypto.mls_group.epoch()?)
     }
 }
 

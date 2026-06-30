@@ -54,14 +54,16 @@ pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 ///
 /// Distinguishes an application message (carrying recovered plaintext and the
 /// sender DID) from a control message. A control message is further split into
-/// a **membership-changing Commit** (carrying the DIDs the Commit added/removed,
-/// recovered from the staged commit before merge — see
-/// [`decrypt_with_membership_changes`]) and a bare proposal. The driver maps an
-/// application message into a `MessageReceived` event, mirrors a Commit's
-/// membership changes onto its event log + membership set (so existing members
-/// converge with the committer and the new joiner), and treats a proposal as a
-/// silent cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// an **add-only membership-changing Commit** (carrying the DIDs the Commit
+/// added, recovered from the staged commit before merge — see
+/// [`decrypt_with_membership_changes`]), an **unsupported (Remove-bearing)
+/// Commit** that `scp-mls` rejected *without merging* (leaving MLS + SCP state
+/// consistent), and a bare proposal. The driver maps an application message into
+/// a `MessageReceived` event, mirrors an add Commit's membership change onto its
+/// event log + membership set (so existing members converge with the committer
+/// and the new joiner), maps the unsupported variant to a fail-closed error, and
+/// treats a proposal as a silent cache.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// An application message: recovered plaintext plus the sender's DID.
     Application {
@@ -70,16 +72,27 @@ pub enum Inbound {
         /// The fully decrypted plaintext.
         plaintext: Vec<u8>,
     },
-    /// A Commit that advanced the group epoch. `scp-mls` has already merged it;
-    /// `added_dids` / `removed_dids` are the SCP DIDs the Commit's Add/Remove
-    /// proposals add and evict (in proposal order), for the driver to mirror
-    /// onto its SCP-layer membership + event log.
+    /// An **add-only** Commit that advanced the group epoch. `scp-mls` has
+    /// already merged it; `added_dids` are the SCP DIDs the Commit's Add
+    /// proposals add (in proposal order), for the driver to mirror onto its
+    /// SCP-layer membership + event log.
     Commit {
         /// The committer's DID, extracted from the MLS credential.
         sender_did: String,
         /// DIDs added by this Commit's Add proposals.
         added_dids: Vec<String>,
-        /// DIDs removed by this Commit's Remove proposals.
+    },
+    /// A Commit carrying one or more Remove proposals, which the participant
+    /// driver does not converge. `scp-mls` **dropped the staged commit without
+    /// merging**, so the MLS group is still on its pre-Commit epoch and remains
+    /// consistent with the driver's SCP-layer state. The driver maps this to a
+    /// fail-closed [`ClientError::UnsupportedMembershipChange`] without further
+    /// mutating state.
+    UnsupportedMembershipChange {
+        /// The committer's DID, extracted from the MLS credential.
+        sender_did: String,
+        /// DIDs the rejected Commit's Remove proposals would evict, read from
+        /// the pre-merge tree.
         removed_dids: Vec<String>,
     },
     /// A bare proposal cached by `scp-mls`; no membership change is committed.
@@ -87,6 +100,51 @@ pub enum Inbound {
         /// The sender's DID, extracted from the MLS credential.
         sender_did: String,
     },
+}
+
+impl std::fmt::Debug for Inbound {
+    /// Manual `Debug` that REDACTS the decrypted plaintext.
+    ///
+    /// Per ADR-057 the tab boundary is the plaintext boundary: a
+    /// `{:?}`-formatted [`Inbound::Application`] must never leak the recovered
+    /// cleartext into logs, panics, or test output. Only the byte length is
+    /// printed; the control variants forward their (non-secret) fields. Mirrors
+    /// the redacting `Debug` on the underlying [`InboundChange`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Application {
+                sender_did,
+                plaintext,
+            } => f
+                .debug_struct("Application")
+                .field("sender_did", sender_did)
+                .field(
+                    "plaintext",
+                    &format_args!("<redacted {} bytes>", plaintext.len()),
+                )
+                .finish(),
+            Self::Commit {
+                sender_did,
+                added_dids,
+            } => f
+                .debug_struct("Commit")
+                .field("sender_did", sender_did)
+                .field("added_dids", added_dids)
+                .finish(),
+            Self::UnsupportedMembershipChange {
+                sender_did,
+                removed_dids,
+            } => f
+                .debug_struct("UnsupportedMembershipChange")
+                .field("sender_did", sender_did)
+                .field("removed_dids", removed_dids)
+                .finish(),
+            Self::Proposal { sender_did } => f
+                .debug_struct("Proposal")
+                .field("sender_did", sender_did)
+                .finish(),
+        }
+    }
 }
 
 /// Combined MLS + sender-key state for a single context.
@@ -207,10 +265,14 @@ impl ContextCryptoState {
     /// pipeline, classifying it as application, membership-changing Commit, or
     /// bare proposal.
     ///
-    /// For a Commit or proposal the group state is advanced/cached by `scp-mls`
-    /// (a Commit is merged; its Add/Remove DIDs are recovered from the staged
-    /// commit before merge) and an [`Inbound::Commit`] / [`Inbound::Proposal`]
-    /// is returned immediately — the sender-key layer is not involved.
+    /// For a control message the sender-key layer is not involved:
+    /// - an **add-only Commit** is merged by `scp-mls` (its added DIDs recovered
+    ///   from the staged commit before merge) and [`Inbound::Commit`] is
+    ///   returned;
+    /// - a **Remove-bearing Commit** is rejected by `scp-mls` *without merging*
+    ///   (the group stays on its current epoch, MLS + SCP state consistent) and
+    ///   [`Inbound::UnsupportedMembershipChange`] is returned;
+    /// - a bare proposal is cached and [`Inbound::Proposal`] is returned.
     ///
     /// For an application message:
     /// 1. Parse the 16-byte `epoch || sequence` header — authoritative.
@@ -239,11 +301,18 @@ impl ContextCryptoState {
             InboundChange::Commit {
                 sender_did,
                 added_dids,
-                removed_dids,
             } => {
                 return Ok(Inbound::Commit {
                     sender_did,
                     added_dids,
+                });
+            }
+            InboundChange::UnsupportedMembershipChange {
+                sender_did,
+                removed_dids,
+            } => {
+                return Ok(Inbound::UnsupportedMembershipChange {
+                    sender_did,
                     removed_dids,
                 });
             }
@@ -411,11 +480,9 @@ mod tests {
             Inbound::Commit {
                 sender_did,
                 added_dids,
-                removed_dids,
             } => {
                 assert_eq!(sender_did, ALICE, "committer is Alice");
                 assert_eq!(added_dids, vec![BOB.to_owned()], "Bob's DID surfaced");
-                assert!(removed_dids.is_empty());
             }
             other => panic!("expected Inbound::Commit, got {other:?}"),
         }
@@ -485,6 +552,31 @@ mod tests {
         assert!(
             !bob.recv_sequence_tracker.contains_key(ALICE),
             "a ceiling-rejected message must not advance the replay tracker"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_application_plaintext() {
+        // ADR-057: the tab boundary is the plaintext boundary. A `{:?}`-formatted
+        // Inbound::Application must print the byte length, NEVER the cleartext.
+        let secret = b"TOP-SECRET-PLAINTEXT-NEVER-LOG-ME";
+        let inbound = Inbound::Application {
+            sender_did: ALICE.to_owned(),
+            plaintext: secret.to_vec(),
+        };
+        let rendered = format!("{inbound:?}");
+        assert!(
+            !rendered.contains("TOP-SECRET-PLAINTEXT-NEVER-LOG-ME"),
+            "Debug must NOT leak the decrypted plaintext, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted") && rendered.contains(&format!("{} bytes", secret.len())),
+            "Debug must report a redacted byte length, got: {rendered}"
+        );
+        // The sender DID is not secret and may be shown.
+        assert!(
+            rendered.contains(ALICE),
+            "sender DID may appear: {rendered}"
         );
     }
 }
