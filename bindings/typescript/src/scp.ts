@@ -43,11 +43,11 @@ import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
 import type {
-	BehavioralRecord,
-	CachedAttestation,
-	CapabilityValidation,
-	SagaResult,
-	TrustEvaluation,
+  BehavioralRecord,
+  CachedAttestation,
+  CapabilityValidation,
+  SagaResult,
+  TrustEvaluation,
 } from "./types";
 
 /**

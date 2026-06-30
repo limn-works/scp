@@ -143,6 +143,17 @@ class CapabilityValidation:
         booleans with a logical AND so consumers do not hand-roll the
         conjunction (and cannot silently omit a field when a new stage is
         added). A token is protocol-compliant only when all six are ``True``.
+
+        SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It
+        reports that the UCAN tokens are *intrinsically well-formed and valid*;
+        it does NOT authorize any action. In intrinsic mode (no challenge
+        capability supplied — the mode :func:`evaluate_trust` uses), the
+        invoked-capability grant-match (step 6) is SKIPPED, so ``all_valid``
+        being ``True`` does NOT assert that any specific capability is granted.
+        To gate an action, pass the concrete capability to ``ucan_evaluate``
+        (which then includes grant-match in ``signatures_valid``) — or use the
+        enforcing UCAN validation path. Treating ``all_valid`` as
+        "the agent may do X" is a security error.
         """
         return (
             self.tokens_valid

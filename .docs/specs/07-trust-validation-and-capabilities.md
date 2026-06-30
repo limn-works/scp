@@ -249,11 +249,12 @@ ParticipationProfile {
     context_creation_count: u64,       // contexts created
     role_progression_count: u64,       // role transitions
     attestation_count: u64,            // credential-layer count (§7.4): endorsements issued/received the signer can access, currently-valid (non-revoked) — NOT a context-event count, NOT verifiable against event_log_root
+    attestation_count_anchored: bool,  // PERMANENTLY false — the parallel of tool_invocation_count_anchored: attestation_count is a verifier-relative credential-layer claim count, never Merkle-anchored (no attestation event type; §7.4). A consumer-facing projection flag, NOT part of the signed preimage.
     updated_at: u64,                   // timestamp of last update
     event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (tool_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
     // NOTE: no context_id — this is the privacy guarantee
     signer_public_key: [u8; 32],      // context-specific signing key
-    signature: Ed25519Signature,       // over all fields above
+    signature: Ed25519Signature,       // over all signed fields above (excludes attestation_count_anchored, a non-signed consumer-facing projection flag)
 }
 ```
 
@@ -809,6 +810,8 @@ RevocationStatus = Active
 The envelope is the same regardless of attestation type. Verification of the envelope (signature, expiry, revocation status) is automated and mechanical. Interpretation of the claim content depends on the type.
 
 **Authenticity is not Sybil resistance.** The envelope check proves an attestation was really issued by its stated issuer; it does NOT bound how many distinct real-world principals stand behind a set of attestations. A single operator can self-issue (or mutually co-issue across DIDs it controls) arbitrarily many *authentic* attestations. A raw count of authentic attestations — notably `attestation_count` (§7.3.2) — is therefore a credential-layer **claim count**, NOT a standalone trust score, and MUST NOT be treated as one. Sybil resistance comes from the threshold/independence path (§7.3.5) and DeviceAttestation binding (§9.3), which constrain *who* may contribute and bind contributors to distinct hardware — not from the count itself.
+
+**Authenticity is not authorization (verifiers and signers).** The same caveat applies, symmetrically, to challenge verifications (§7.3.4) and participation profiles (§7.3.2.1). Verify-on-ingest (`verify_challenge_verification`) proves the verifier *signed* the result and binds it to the target context and expiry; it does NOT prove the verifier is *authorized or trusted*. Because a `verifier_did` is self-certifying, a subject can self-issue a genuinely-signed challenge result from a DID it controls — so a valid signature is a necessary, not sufficient, condition. Likewise, `verify_participation_requirements`/`check_capability_requirements` verify signature authenticity over caller-supplied participation profiles, but the `signer_public_key` is self-certifying: a subject can mint genuinely-signed profiles from signers it controls (the colluding-contexts forgery of §7.3.2.1). A consumer MUST establish verifier/signer legitimacy SEPARATELY — e.g. a context-membership proof, a trusted-signer set, or the threshold/independence path (§7.3.5) — and MUST NOT treat a passing signature check as an authorization decision.
 
 ### 7.4.2 Attestation Types
 
