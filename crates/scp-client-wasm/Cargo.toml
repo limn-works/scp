@@ -1,0 +1,74 @@
+[package]
+name = "scp-client-wasm"
+version = "0.1.0-beta.2"
+description = "wasm-bindgen browser surface over scp-client — keys on-device, single-threaded participant driver (ADR-057 Slice 3)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+# `cdylib` is the wasm-pack / wasm-bindgen output artifact; `rlib` lets the
+# native host test (`tests/wasm_surface_exchange.rs`) link the exposed surface
+# and drive it with in-memory adapters where no JS runtime exists.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enables non-production DID formats (did:key:, did:test:) in the underlying
+# driver, mirroring scp-client/scp-mls `testing`. Used by the native-surface
+# integration test, which builds did:key fixtures.
+testing = ["scp-client/testing"]
+
+[dependencies]
+# The browser surface is a THIN translation layer over scp-client; it
+# re-derives no protocol logic. It depends ONLY on the wasm-safe shared crates
+# plus the wasm-bindgen stack — and MUST NOT depend on scp-runtime,
+# scp-identity, or tokio (the ADR-057 mechanical fence; verified via
+# `cargo tree`). The openmls wire types arrive transitively through scp-client.
+scp-client = { path = "../scp-client", version = "=0.1.0-beta.2" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
+
+# MessagePack is the codebase's name-tagged, width-/endianness-independent wire
+# form (ADR-057). The surface serializes the adder's event-log stream with it so
+# the joiner can replay an identical sequence across the JS boundary.
+rmp-serde = { workspace = true }
+
+# wasm-bindgen is needed on BOTH targets: on wasm32 it generates the real JS
+# glue; on native it provides an inert `JsValue` / `#[wasm_bindgen]` so the
+# exposed surface still compiles and the host test can link it. The JS-extern
+# adapters (captured Date.now, JsStorage, JsKeyCustody) that genuinely require a
+# browser are additionally `cfg(target_arch = "wasm32")`-gated inside the crate.
+wasm-bindgen = { workspace = true }
+
+# Browser-only: js-sys / web-sys / serde-wasm-bindgen are wasm32-only because
+# they bind real browser globals. The native build (workspace clippy) does not
+# pull them in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = ["console"] }
+serde-wasm-bindgen = { workspace = true }
+# wasm32 randomness + uuid backends, mirroring scp-client/scp-mls so the
+# transitive openmls stack has a getrandom backend under wasm32.
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+# The host-surface integration test drives did:key fixtures through the exposed
+# WasmScpClient, so it needs the testing DID formats enabled.
+scp-client = { path = "../scp-client", features = ["testing"] }
+scp-primitives = { path = "../scp-primitives", features = ["testing"] }
+
+# wasm-bindgen-test is only meaningful under wasm32 (it needs a wasm test
+# runner). It is declared so a `wasm-pack test` / `wasm32` `cargo test` can pick
+# up the `#[wasm_bindgen_test]` cases; the host `cargo test` runs the native
+# integration test instead.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+[lints]
+workspace = true

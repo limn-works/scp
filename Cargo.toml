@@ -8,6 +8,7 @@ members = [
     "crates/scp-protocol",
     "crates/scp-mls",
     "crates/scp-client",
+    "crates/scp-client-wasm",
     "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",
@@ -77,6 +78,15 @@ futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 static_assertions = "1.1"
+# wasm-bindgen stack for the browser participant surface (ADR-057 Slice 3).
+# Only the wasm32-targeted crate (scp-client-wasm) consumes these; they are
+# declared at the workspace level so the version pins stay single-sourced.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+web-sys = "0.3"
+serde-wasm-bindgen = "0.6"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
