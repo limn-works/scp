@@ -57,7 +57,12 @@ if TYPE_CHECKING:
     # (trust.py imports SCP). With ``from __future__ import annotations`` the
     # annotation is a lazy string, so the name need only resolve for type
     # checkers, not at import time.
-    from scp_sdk.trust import BehavioralRecord, CachedAttestation, CapabilityValidation
+    from scp_sdk.trust import (
+        BehavioralRecord,
+        CachedAttestation,
+        CapabilityValidation,
+        TrustEvaluation,
+    )
 
 logger = logging.getLogger("scp_sdk")
 
@@ -1874,6 +1879,29 @@ class SCP:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
 
+    async def evaluate_trust(
+        self,
+        subject_did: str,
+        context_id: str,
+        capability_tokens: list[str] | None = None,
+    ) -> TrustEvaluation:
+        """Evaluate the trustworthiness of a participant in a context.
+
+        Delegates to :func:`scp_sdk.trust.evaluate_trust` (the canonical
+        four-layer trust evaluation), so Python matches the TypeScript, Swift,
+        and Kotlin SDKs, which all expose ``scp.evaluateTrust(...)``. The
+        module-level function remains the implementation.
+
+        SECURITY: the result is data for the caller's judgment, NEVER an
+        authorization verdict. The behavioral record's ``attestation_count``
+        (and any challenge results) are authentic-but-self-mintable and MUST
+        NOT be a sole trust or admission factor (use the threshold/independence
+        path, §7.3.5).
+        """
+        from scp_sdk.trust import evaluate_trust as _evaluate_trust
+
+        return await _evaluate_trust(self, subject_did, context_id, capability_tokens)
+
     async def participation_record(
         self,
         context_id: str,
@@ -1884,7 +1912,7 @@ class SCP:
 
         Delegates to :func:`scp_sdk.trust.participation_record`, which calls the
         typed PyO3 ``participation_record`` op and returns a
-        :class:`~scp_sdk.trust.BehavioralRecord` of the eleven flattened facts.
+        :class:`~scp_sdk.trust.BehavioralRecord` of the twelve flattened facts.
         The shared Rust core gathers the full event log and computes the record
         ONCE; the SDK RECEIVES it rather than recomputing Layer 2 client-side.
         ``attestation_count`` is a credential-layer fact (§7.4), verifier-

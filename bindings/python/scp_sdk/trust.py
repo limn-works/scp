@@ -10,8 +10,11 @@ an SCP context.  Trust evaluation is a four-layer model:
    (participation history, governance actions, tool usage).
 3. **Attestation Authenticity** -- verified signatures and evidence
    freshness from attestations.
-4. **Trust Evaluation Inputs** -- endorsements, challenge results,
-   and consequence structures for agent judgment.
+
+:func:`evaluate_trust` returns these first three layers as a
+:class:`TrustEvaluation` (the same shape across all four SDKs). The Layer-4
+trust-evaluation inputs (endorsements, challenge results, consequence
+structures) are gathered separately via :func:`aggregate_trust_input`.
 
 See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 ``.docs/adrs/phase-3.md`` ADR-014 for the SDK design. The structured
@@ -146,14 +149,19 @@ class CapabilityValidation:
 
         SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It
         reports that the UCAN tokens are *intrinsically well-formed and valid*;
-        it does NOT authorize any action. In intrinsic mode (no challenge
-        capability supplied — the mode :func:`evaluate_trust` uses), the
-        invoked-capability grant-match (step 6) is SKIPPED, so ``all_valid``
-        being ``True`` does NOT assert that any specific capability is granted.
-        To gate an action, pass the concrete capability to ``ucan_evaluate``
-        (which then includes grant-match in ``signatures_valid``) — or use the
-        enforcing UCAN validation path. Treating ``all_valid`` as
-        "the agent may do X" is a security error.
+        it does NOT authorize any action. In intrinsic mode (capability =
+        ``None`` — no challenge capability supplied, the mode
+        :func:`evaluate_trust` uses), the invoked-capability grant-match
+        (step 6) is SKIPPED, so ``all_valid`` (and ``signatures_valid`` /
+        ``within_ceiling``) being ``True`` does NOT assert that any specific
+        capability is granted. The diagnostic is also read-only: the nonce is
+        probed but NOT consumed, so the evaluated tokens remain replayable
+        against the enforcing path — another reason this is never an
+        authorization decision. To gate an action, pass the concrete capability
+        to ``ucan_evaluate`` (which then includes grant-match in
+        ``signatures_valid``) — or use the enforcing UCAN validation path
+        (which consumes the nonce). Treating ``all_valid`` as "the agent may
+        do X" is a security error.
         """
         return (
             self.tokens_valid
@@ -234,64 +242,42 @@ class BehavioralRecord:
 
 
 @dataclass
-class Attestation:
-    """Layer 3: A single verified attestation."""
+class AttestationSummary:
+    """Layer 3: A summary of an attestation for the subject.
 
-    #: Attestation type identifier.
+    The canonical 4-field shape shared 1:1 with the TypeScript, Swift, and
+    Kotlin SDKs' ``AttestationSummary`` — identical across all four bindings
+    (Agent-first API design tenet).
+    """
+
+    #: Attestation type.
     type: str
 
-    #: Whether the attestation signature is valid.
-    signature_valid: bool
+    #: Issuer DID.
+    issuer: str
 
-    #: Whether the evidence is valid (if applicable).
-    evidence_valid: bool | None = None
+    #: Whether the attestation is currently valid.
+    valid: bool
 
-    #: Whether the attestation is within its renewal interval.
-    fresh: bool = False
-
-    #: DID of the attestation issuer.
-    issuer: str = ""
-
-    #: The claim content.
-    claim: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Endorsement:
-    """Layer 4: An endorsement from another participant."""
-
-    #: DID of the endorser.
-    from_did: str
-
-    #: The capability being endorsed.
-    capability: str
-
-    #: Behavioral summary of the endorser.
-    endorser_behavioral_record: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ChallengeResult:
-    """Layer 4: Result of a capability challenge."""
-
-    #: The capability that was challenged.
-    capability: str
-
-    #: Whether the challenge was passed.
-    passed: bool
-
-    #: ISO 8601 timestamp when the challenge was verified.
-    verified_at: str = ""
+    #: Whether the attestation has been revoked.
+    revoked: bool
 
 
 @dataclass
 class TrustEvaluation:
     """Complete trust evaluation result for a subject in a context.
 
-    Contains the four-layer trust model: protocol enforcement,
-    behavioral validation, attestation authenticity, and trust
-    evaluation inputs.  The agent/client decides what to do with this
-    information -- the protocol provides the data, not the verdict.
+    Surfaces the first three layers of the trust model: protocol enforcement
+    (Layer 1), behavioral validation (Layer 2), and attestation authenticity
+    (Layer 3). The agent/client decides what to do with this information — the
+    protocol provides the data, not the verdict. This shape is identical across
+    all four SDKs (Python/TypeScript/Swift/Kotlin) for the ``evaluate_trust``
+    op (Agent-first API design tenet).
+
+    The Layer-4 trust-evaluation inputs (endorsements, challenge results,
+    consequence structures) are NOT part of this op's result — they are gathered
+    separately via :func:`aggregate_trust_input`, which returns the raw
+    ``TrustInput`` the core aggregates.
 
     See ``.docs/sketch.md`` section ``SCP.Trust.evaluate``.
     """
@@ -315,16 +301,7 @@ class TrustEvaluation:
     behavioral_record: BehavioralRecord = field(default_factory=BehavioralRecord)
 
     #: Layer 3: Attestation authenticity (verified signatures).
-    attestations: list[Attestation] = field(default_factory=list)
-
-    #: Layer 4: Endorsements from other participants.
-    endorsements: list[Endorsement] = field(default_factory=list)
-
-    #: Layer 4: Challenge results.
-    challenge_results: list[ChallengeResult] = field(default_factory=list)
-
-    #: Layer 4: Consequence rules defined by the context.
-    consequence_structure: list[dict[str, Any]] | None = None
+    attestations: list[AttestationSummary] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -665,8 +642,17 @@ async def evaluate_trust(
        subject's participation history.
     3. **Attestation authenticity** — verifies signatures and evidence
        freshness for any attestations the subject presents.
-    4. **Trust evaluation inputs** — gathers endorsements, challenge
-       results, and consequence structures.
+
+    The returned :class:`TrustEvaluation` surfaces these three layers (the
+    same shape across all four SDKs). The Layer-4 trust-evaluation inputs
+    (endorsements, challenge results, consequence structures) are gathered
+    separately via :func:`aggregate_trust_input`.
+
+    SECURITY: the behavioral record's ``attestation_count`` (and challenge
+    results, where consumed) are authentic-but-self-mintable signals — an
+    issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+    controls. They MUST NOT be a sole trust or admission factor; use the
+    threshold/independence path (§7.3.5) for Sybil resistance.
 
     Layer 1 consumes the structured bridge result directly (ADR-057): it
     does not reverse-engineer *which* check failed by parsing error prose.
@@ -687,7 +673,7 @@ async def evaluate_trust(
             evaluate as part of the evaluation.
 
     Returns:
-        A :class:`TrustEvaluation` with all four layers populated.
+        A :class:`TrustEvaluation` with Layers 1-3 populated.
     """
     logger.debug(
         "Evaluating trust for %s in context %s",
@@ -1091,13 +1077,11 @@ def verify_participation_requirements(
 __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
-    "Attestation",
+    "AttestationSummary",
     "BehavioralRecord",
     "CachedAttestation",
     "CachedAttestationEnvelope",
     "CapabilityValidation",
-    "ChallengeResult",
-    "Endorsement",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",

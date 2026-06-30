@@ -24,13 +24,11 @@ import pytest
 
 from scp_sdk.errors import ContextError
 from scp_sdk.trust import (
-    Attestation,
+    AttestationSummary,
     BehavioralRecord,
     CachedAttestation,
     CachedAttestationEnvelope,
     CapabilityValidation,
-    ChallengeResult,
-    Endorsement,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
@@ -682,37 +680,17 @@ class TestParticipationRecordWrapper:
         assert excinfo.value.code == "SCP-CTX-2076"
 
 
-class TestAttestation:
-    """Tests for the Attestation dataclass."""
+class TestAttestationSummary:
+    """Tests for the AttestationSummary dataclass (canonical 4-field shape)."""
 
     def test_construction(self) -> None:
-        att = Attestation(type="identity", signature_valid=True)
+        att = AttestationSummary(
+            type="identity", issuer="did:dht:zIssuer", valid=True, revoked=False
+        )
         assert att.type == "identity"
-        assert att.signature_valid is True
-        assert att.evidence_valid is None
-        assert att.fresh is False
-        assert att.issuer == ""
-        assert att.claim == {}
-
-
-class TestEndorsement:
-    """Tests for the Endorsement dataclass."""
-
-    def test_construction(self) -> None:
-        end = Endorsement(from_did="did:dht:zAlice", capability="messages:write")
-        assert end.from_did == "did:dht:zAlice"
-        assert end.capability == "messages:write"
-        assert end.endorser_behavioral_record == {}
-
-
-class TestChallengeResult:
-    """Tests for the ChallengeResult dataclass."""
-
-    def test_construction(self) -> None:
-        cr = ChallengeResult(capability="tool_invoke:assistant", passed=True)
-        assert cr.capability == "tool_invoke:assistant"
-        assert cr.passed is True
-        assert cr.verified_at == ""
+        assert att.issuer == "did:dht:zIssuer"
+        assert att.valid is True
+        assert att.revoked is False
 
 
 class TestTrustEvaluation:
@@ -732,10 +710,13 @@ class TestTrustEvaluation:
         assert te.behavioral_record.subject_did == ""
         assert te.behavioral_record.participation_duration_secs == 0
         assert te.behavioral_record.attestation_count_anchored is False
+        # Canonical shape across all four SDKs: Layers 1-3 only. The Layer-4
+        # fields (endorsements, challenge_results, consequence_structure) are
+        # NOT part of this op's result.
         assert te.attestations == []
-        assert te.endorsements == []
-        assert te.challenge_results == []
-        assert te.consequence_structure is None
+        assert not hasattr(te, "endorsements")
+        assert not hasattr(te, "challenge_results")
+        assert not hasattr(te, "consequence_structure")
 
 
 # -----------------------------------------------------------------------
