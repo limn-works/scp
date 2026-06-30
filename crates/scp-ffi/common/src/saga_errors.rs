@@ -48,10 +48,10 @@ pub enum SagaErrorKind {
     ///
     /// `retry_after_ms` is read off the back-off-carrying
     /// `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit
-    /// `SagaAbortReason::MailboxSaturated` (no precise drain instant) and a plain
-    /// `Rejected` both carry `None`. `None` is propagated, NEVER coerced to
+    /// `SagaAbortReason::ParticipantUnavailable` (no precise drain instant) and a
+    /// plain `Rejected` both carry `None`. `None` is propagated, NEVER coerced to
     /// `Some(0)` — a `0` would read as "retry immediately" and re-trip the same
-    /// hard limit / re-saturate the same mailbox.
+    /// hard limit / re-hit the same unavailable participant actor.
     Aborted {
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -96,7 +96,7 @@ pub struct SagaErrorParts {
 /// - `Aborted { reason, code, message }` → `kind = Aborted { retry_after_ms }`
 ///   where `retry_after_ms` is read off the back-off-carrying
 ///   `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit
-///   `SagaAbortReason::MailboxSaturated` and a plain `Rejected` both carry
+///   `SagaAbortReason::ParticipantUnavailable` and a plain `Rejected` both carry
 ///   `None`. `None` is propagated, NEVER coerced to `Some(0)`. `code` is
 ///   formatted as the canonical `SCP-SAGA-{code}` string from the numeric
 ///   discriminant.
@@ -114,9 +114,9 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
         } => {
             let retry_after_ms = match reason {
                 SagaAbortReason::RateLimited { retry_after_ms } => retry_after_ms,
-                // The unit `MailboxSaturated` (no precise drain instant) and a
-                // plain `Rejected` both carry no back-off hint.
-                SagaAbortReason::MailboxSaturated | SagaAbortReason::Rejected => None,
+                // The unit `ParticipantUnavailable` (no precise drain instant)
+                // and a plain `Rejected` both carry no back-off hint.
+                SagaAbortReason::ParticipantUnavailable | SagaAbortReason::Rejected => None,
             };
             SagaErrorParts {
                 kind: SagaErrorKind::Aborted { retry_after_ms },
@@ -189,14 +189,14 @@ mod tests {
         );
     }
 
-    /// The transient unit `MailboxSaturated` abort decomposes to the retryable
-    /// `Aborted` kind carrying `retry_after_ms = None` (the variant has no
-    /// precise drain instant to surface, so it carries no hint) and formats the
-    /// dedicated `SCP-SAGA-13068` code from the numeric discriminant.
+    /// The transient unit `ParticipantUnavailable` abort decomposes to the
+    /// retryable `Aborted` kind carrying `retry_after_ms = None` (the variant has
+    /// no precise drain instant to surface, so it carries no hint) and formats
+    /// the dedicated `SCP-SAGA-13068` code from the numeric discriminant.
     #[test]
-    fn mailbox_saturated_decomposes_to_retryable_aborted_kind_and_formats_code() {
+    fn participant_unavailable_decomposes_to_retryable_aborted_kind_and_formats_code() {
         let parts = decompose_saga_error(SagaError::Aborted {
-            reason: SagaAbortReason::MailboxSaturated,
+            reason: SagaAbortReason::ParticipantUnavailable,
             code: 13068,
             message: "participant actor inbox closed during Prepare".to_owned(),
         });
@@ -206,7 +206,7 @@ mod tests {
             SagaErrorKind::Aborted {
                 retry_after_ms: None,
             },
-            "the unit MailboxSaturated must decompose to the retryable Aborted kind with no back-off hint"
+            "the unit ParticipantUnavailable must decompose to the retryable Aborted kind with no back-off hint"
         );
     }
 

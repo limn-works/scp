@@ -2061,7 +2061,7 @@ class SCP:
 
         - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
           a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-          participant-mailbox saturation), distinguished by the
+          participant actor unavailable), distinguished by the
           ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
           ``0``, when no precise back-off exists).
         - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries

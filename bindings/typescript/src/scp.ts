@@ -1755,7 +1755,7 @@ export class SCP {
    * saga errors:
    *
    * - {@link SagaAbortedError} — a Prepare-phase abort: a PERMANENT rejection
-   *   OR a RETRYABLE transient (rate limit / participant-mailbox saturation),
+   *   OR a RETRYABLE transient (rate limit / participant actor unavailable),
    *   distinguished by the `SCP-SAGA-*` code; carries `retryAfterMs` (`null`,
    *   never `0`, when no precise back-off exists).
    * - {@link SagaNeedsRepairError} — Commit retries exhausted; carries the

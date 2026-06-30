@@ -1565,7 +1565,7 @@ class SCP internal constructor(
      * never synthesized), or throws a typed [uniffi.scp.ScpException] for a
      * non-committed terminal — `ScpException.SagaAborted` (a Prepare-phase
      * abort: a PERMANENT rejection OR a RETRYABLE transient — rate limit or
-     * participant-mailbox saturation — distinguished by the `SCP-SAGA-*` code;
+     * participant actor unavailable — distinguished by the `SCP-SAGA-*` code;
      * carries an optional `retryAfterMs` back-off hint),
      * `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
      * the durable `sagaId` operator-repair handle), or `ScpException.SagaBusy`

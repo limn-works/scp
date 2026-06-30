@@ -267,7 +267,7 @@ public extension Context {
     ///
     /// - ``ScpError/SagaAborted(msg:code:retryAfterMs:)`` — a Prepare-phase
     ///   abort: a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-    ///   participant-mailbox saturation), distinguished by the `SCP-SAGA-*`
+    ///   participant actor unavailable), distinguished by the `SCP-SAGA-*`
     ///   code. `retryAfterMs` is the limiter's computed back-off, or `nil`
     ///   (never `0`) when no precise back-off instant exists.
     /// - ``ScpError/SagaNeedsRepair(msg:code:sagaId:)`` — Commit retries
