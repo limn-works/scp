@@ -614,7 +614,7 @@ class RequireParticipation:
         }
 
 
-def _structured_to_capability_validation(result: Any) -> CapabilityValidation:
+def structured_to_capability_validation(result: Any) -> CapabilityValidation:
     """Map a bridge ``CapabilityValidation`` record onto the SDK dataclass.
 
     The bridge's structured ``ucan_evaluate`` result (PyO3
@@ -736,7 +736,7 @@ async def evaluate_trust(
             result = await asyncio.to_thread(
                 instance.ucan_evaluate, context_id, token, None, subject_did
             )
-            per_token = _structured_to_capability_validation(result)
+            per_token = structured_to_capability_validation(result)
             cap_validation.tokens_valid &= per_token.tokens_valid
             cap_validation.signatures_valid &= per_token.signatures_valid
             cap_validation.within_ceiling &= per_token.within_ceiling

@@ -153,17 +153,14 @@ pub(crate) async fn event_log_query_on(
             // `subject_did` for role/membership events) through the single
             // shared decoder so all three native bridges surface byte-identical values.
             // Each key is omitted when the projection yields `None`.
-            let projection =
-                scp_event_log::payload::project_payload(&entry.event_type, &entry.payload);
             let mut payload_value = serde_json::json!({
                 "hash": hex::encode(leaf_hash),
             });
-            if let Some(target_did) = projection.target_did {
-                payload_value["target_did"] = serde_json::Value::String(target_did);
-            }
-            if let Some(subject_did) = projection.subject_did {
-                payload_value["subject_did"] = serde_json::Value::String(subject_did);
-            }
+            scp_ffi_common::event_log::inject_projection(
+                &mut payload_value,
+                &entry.event_type,
+                &entry.payload,
+            );
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {
                 event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),

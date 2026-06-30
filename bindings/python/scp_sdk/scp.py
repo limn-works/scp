@@ -1151,7 +1151,7 @@ class SCP:
         ``did``); capability/signature/expiry outcomes are reported via the
         returned booleans, never as exceptions.
         """
-        from scp_sdk.trust import CapabilityValidation
+        from scp_sdk.trust import structured_to_capability_validation
 
         raw = await asyncio.to_thread(
             self._native.ucan_evaluate,
@@ -1161,14 +1161,9 @@ class SCP:
             presenting_agent_did,
             proof_tokens,
         )
-        return CapabilityValidation(
-            tokens_valid=bool(raw.tokens_valid),
-            signatures_valid=bool(raw.signatures_valid),
-            within_ceiling=bool(raw.within_ceiling),
-            nonce_valid=bool(raw.nonce_valid),
-            not_revoked=bool(raw.not_revoked),
-            time_bounds_valid=bool(raw.time_bounds_valid),
-        )
+        # Shared six-field projection — pins the canonical CapabilityValidation
+        # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
+        return structured_to_capability_validation(raw)
 
     # endregion UCAN
 
