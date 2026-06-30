@@ -76,6 +76,9 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    SagaAbortedError,
+    SagaBusyError,
+    SagaNeedsRepairError,
     ScpError,
     ToolError,
     TransportError,
@@ -136,6 +139,7 @@ from scp_sdk.scp import (
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
+    SagaResult,
     TestVector,
     ToolCost,
     ToolDefinition,
@@ -227,6 +231,10 @@ __all__ = [
     "Relay",
     "RequireParticipation",
     "RevocationStatus",
+    "SagaAbortedError",
+    "SagaBusyError",
+    "SagaNeedsRepairError",
+    "SagaResult",
     "ScpError",
     "ScpIdAuthentication",
     "ScpIdChallenge",

@@ -101,6 +101,120 @@ class ValidationError(ScpError):
 
 
 # ---------------------------------------------------------------------------
+# Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
+# ---------------------------------------------------------------------------
+#
+# These three subclasses surface the typed terminal space of the §6.2.4
+# cross-context tool-invocation saga. Each carries the structured terminal
+# datum the contract makes load-bearing as a NAMED attribute, read
+# structurally from the bridge exception's ``args`` (never re-parsed from
+# the message text). The bridge (``_scp_core``) raises exception classes
+# that share these names; :func:`_saga_terminal_from_bridge` translates a
+# bridge terminal into the matching SDK class below, preserving the datum.
+
+
+class SagaAbortedError(ToolError):
+    """A §6.2.4 saga aborted at a Prepare phase (authorization, freshness,
+    rate limit, or co-residency).
+
+    Attributes:
+        retry_after_ms: Rate-limit back-off hint in milliseconds when the
+            tripped limiter can compute one, or ``None`` when no precise
+            back-off instant exists. NEVER ``0`` — ``0`` would read as
+            "retry immediately" and re-trip the same hard limit.
+    """
+
+    _default_code: str = "SCP-SAGA-13067"
+
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        retry_after_ms: int | None = None,
+    ) -> None:
+        super().__init__(message, code)
+        #: Rate-limit back-off hint in ms, or ``None`` (never ``0``).
+        self.retry_after_ms: int | None = retry_after_ms
+
+
+class SagaNeedsRepairError(ToolError):
+    """A §6.2.4 saga exhausted its Commit retries and may have diverged
+    (a partial commit requiring operator repair).
+
+    Attributes:
+        saga_id: The durable operator-repair handle for the diverged saga.
+    """
+
+    _default_code: str = "SCP-SAGA-13065"
+
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        saga_id: str = "",
+    ) -> None:
+        super().__init__(message, code)
+        #: Durable operator-repair handle for the diverged saga.
+        self.saga_id: str = saga_id
+
+
+class SagaBusyError(ToolError):
+    """A §6.2.4 saga's participant context set overlapped an in-flight saga
+    (per-participant-context-set gating, §5.15.4).
+
+    Attributes:
+        contended_context: The shared context id that overlapped an
+            in-flight saga.
+    """
+
+    _default_code: str = "SCP-SAGA-13066"
+
+    def __init__(
+        self,
+        message: str,
+        code: str | None = None,
+        contended_context: str = "",
+    ) -> None:
+        super().__init__(message, code)
+        #: The shared context id that overlapped an in-flight saga.
+        self.contended_context: str = contended_context
+
+
+def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
+    """Translate a bridge saga terminal exception into its SDK class.
+
+    Dispatches on the bridge exception's class *name* (so a mocked bridge
+    works without the native extension) and reads the structured terminal
+    datum positionally from ``exc.args`` — ``args[0]`` is the message,
+    ``args[1]`` the ``SCP-SAGA-13xxx`` code, and ``args[2]`` the typed
+    datum (``retry_after_ms`` / ``saga_id`` / ``contended_context``). The
+    datum is read STRUCTURALLY, never parsed from the message string.
+
+    Returns the matching SDK exception, or ``None`` if ``exc`` is not one
+    of the three saga terminals (so the caller re-raises it unchanged).
+    """
+    args = exc.args
+    message = str(args[0]) if len(args) > 0 else str(exc)
+    code = args[1] if len(args) > 1 and isinstance(args[1], str) else None
+    datum = args[2] if len(args) > 2 else None
+
+    name = type(exc).__name__
+    if name == "SagaAbortedError":
+        # retry_after_ms is an int of milliseconds or None (never 0).
+        retry_after_ms = datum if isinstance(datum, int) and not isinstance(datum, bool) else None
+        return SagaAbortedError(message, code=code, retry_after_ms=retry_after_ms)
+    if name == "SagaNeedsRepairError":
+        return SagaNeedsRepairError(
+            message, code=code, saga_id=str(datum) if datum is not None else ""
+        )
+    if name == "SagaBusyError":
+        return SagaBusyError(
+            message, code=code, contended_context=str(datum) if datum is not None else ""
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Mapping from bridge error variant names to SDK exceptions.
 # ---------------------------------------------------------------------------
 
@@ -123,6 +237,9 @@ __all__ = [
     "ContextError",
     "CryptoError",
     "IdentityError",
+    "SagaAbortedError",
+    "SagaBusyError",
+    "SagaNeedsRepairError",
     "ScpError",
     "ToolError",
     "TransportError",
