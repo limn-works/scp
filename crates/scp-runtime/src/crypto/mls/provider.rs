@@ -350,7 +350,7 @@ struct PendingJoinState {
     /// [`ScpMlsGroup::signer`]).
     signer: super::group::EagerDropSigner,
     /// The MLS provider holding the key package's private state.
-    provider: super::storage::InMemoryMlsProvider,
+    provider: crate::crypto::mls::InMemoryMlsProvider,
 }
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
@@ -884,7 +884,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}")))?;
 
         // Validate ciphersuite and signature.
-        let provider = super::storage::InMemoryMlsProvider::default();
+        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
         let verified = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
@@ -966,7 +966,7 @@ impl MlsCryptoProvider {
             KeyPackageIn::tls_deserialize(&mut &*bytes)
                 .ok()
                 .and_then(|kp_in| {
-                    let provider_tmp = super::storage::InMemoryMlsProvider::default();
+                    let provider_tmp = crate::crypto::mls::InMemoryMlsProvider::default();
                     kp_in
                         .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
                         .ok()
@@ -1940,17 +1940,17 @@ impl MlsCryptoProvider {
         let state = entry.value();
 
         // Extract the MLS group and signer, both required for restore.
+        // Reads go through `scp_mls::ScpMlsGroup`'s public snapshot accessors
+        // (ADR-057): the group's internal fields live in another crate now.
         let group = state
             .mls_group
-            .group
-            .as_ref()
-            .ok_or_else(|| ContextError::CryptoFailed("MLS group destroyed".to_string()))?;
+            .inner()
+            .map_err(|_| ContextError::CryptoFailed("MLS group destroyed".to_string()))?;
 
         let signer = state
             .mls_group
-            .signer
-            .as_ref()
-            .ok_or_else(|| ContextError::CryptoFailed("MLS signer destroyed".to_string()))?;
+            .signer_key_pair()
+            .map_err(|_| ContextError::CryptoFailed("MLS signer destroyed".to_string()))?;
 
         let group_id = group.group_id().as_slice().to_vec();
 
@@ -1966,7 +1966,7 @@ impl MlsCryptoProvider {
         let mls_storage_entries = {
             let values = state
                 .mls_group
-                .provider
+                .provider()
                 .storage()
                 .values
                 .read()
@@ -2071,7 +2071,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
         // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
-        let provider = super::storage::InMemoryMlsProvider::default();
+        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
         {
             let mut values =
                 provider.storage().values.write().map_err(|e| {
@@ -2179,12 +2179,9 @@ impl MlsCryptoProvider {
         let member_wrapping_keys: HashMap<String, [u8; 32]> =
             snapshot.member_wrapping_keys.drain(..).collect();
 
-        let scp_group = ScpMlsGroup {
-            group: Some(mls_group),
-            provider,
-            signer: super::group::EagerDropSigner::new(signer),
-            destroyed: false,
-        };
+        // Rebuild the live group via `scp_mls::ScpMlsGroup`'s public restore
+        // constructor (the struct's fields are in another crate now; ADR-057).
+        let scp_group = ScpMlsGroup::from_parts(mls_group, provider, signer);
 
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot

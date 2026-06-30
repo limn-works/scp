@@ -14,7 +14,7 @@ categories = ["cryptography", "network-programming"]
 # Enables non-standard did:key:{hex} DID format acceptance. Only for
 # integration tests that run outside `#[cfg(test)]`. Production builds
 # must never enable this feature. See issue #128.
-testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing"]
+testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
 # requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
@@ -44,6 +44,7 @@ rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
@@ -77,6 +78,7 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }

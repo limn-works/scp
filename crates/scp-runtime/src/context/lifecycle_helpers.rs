@@ -1499,7 +1499,10 @@ pub async fn create_context(
         epoch: EpochState {
             mls_epoch: 0,
             coordinator: EpochCoordinator::new(),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
+                std::sync::Arc::new(scp_primitives::SystemClock),
+            ),
             needs_reconnect: false,
         },
         access: AccessControlState {
@@ -2168,7 +2171,10 @@ pub async fn import_context(
                 export.snapshot.epoch_coordination_records,
                 &context_id,
             ),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
+                std::sync::Arc::new(scp_primitives::SystemClock),
+            ),
             needs_reconnect: false,
         },
         access: AccessControlState {

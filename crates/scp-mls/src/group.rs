@@ -18,9 +18,9 @@
 
 use std::ops::Deref;
 
-use super::credential::ScpCredential;
-use super::error::MlsError;
-use super::storage::InMemoryMlsProvider;
+use crate::InMemoryMlsProvider;
+use crate::credential::ScpCredential;
+use crate::error::MlsError;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -47,8 +47,7 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// the zeroization gap and ensures eager drop semantics.
 ///
 /// `SignatureKeyPair` stores its Ed25519 private key in a plain `Vec<u8>` and
-/// does not implement [`Zeroize`](zeroize::Zeroize) or
-/// [`ZeroizeOnDrop`](zeroize::ZeroizeOnDrop). The `private` field is not
+/// does not implement `Zeroize` or `ZeroizeOnDrop`. The `private` field is not
 /// publicly accessible (only available behind the `test-utils` feature), so
 /// we cannot zeroize it from outside the crate without `unsafe` code.
 ///
@@ -68,23 +67,27 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 ///
 /// **Upstream limitation:** Full zeroization requires `openmls_basic_credential`
 /// to implement `Zeroize` on `SignatureKeyPair`. See issue #82.
-pub(crate) struct EagerDropSigner(Option<SignatureKeyPair>);
+pub struct EagerDropSigner(Option<SignatureKeyPair>);
 
 impl EagerDropSigner {
     /// Wraps a `SignatureKeyPair` in an eager-drop wrapper.
-    pub(crate) const fn new(inner: SignatureKeyPair) -> Self {
+    #[must_use]
+    pub const fn new(inner: SignatureKeyPair) -> Self {
         Self(Some(inner))
     }
 
     /// Returns a reference to the inner `SignatureKeyPair`, or `None` after
     /// destruction.
-    const fn as_ref(&self) -> Option<&SignatureKeyPair> {
+    #[must_use]
+    pub const fn as_ref(&self) -> Option<&SignatureKeyPair> {
         self.0.as_ref()
     }
 
     /// Takes the inner `SignatureKeyPair` out, leaving `None`. Used by
-    /// `destroy_group` for eager cleanup.
-    pub(crate) const fn take(&mut self) -> Option<SignatureKeyPair> {
+    /// `destroy_group` for eager cleanup, and by the runtime's persistent
+    /// provider when consuming a pending-join signer (ADR-057).
+    #[must_use = "the taken signing key should be used or explicitly dropped"]
+    pub const fn take(&mut self) -> Option<SignatureKeyPair> {
         self.0.take()
     }
 }
@@ -142,6 +145,42 @@ impl ScpMlsGroup {
     #[must_use]
     pub const fn provider(&self) -> &InMemoryMlsProvider {
         &self.provider
+    }
+
+    /// Returns a reference to the local member's `SignatureKeyPair`.
+    ///
+    /// Exposed for the native runtime's persistent provider, which serializes
+    /// the signer into the durable MLS crypto snapshot (ADR-057). The signing
+    /// key never leaves the device; this is an in-process read for the snapshot
+    /// path only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed
+    /// (the signer is taken on destruction for eager zeroization).
+    pub fn signer_key_pair(&self) -> Result<&SignatureKeyPair, MlsError> {
+        self.signer.as_ref().ok_or(MlsError::GroupDestroyed)
+    }
+
+    /// Reconstructs an `ScpMlsGroup` from its constituent parts.
+    ///
+    /// Used by the native runtime's persistent provider to rebuild a live group
+    /// from a durable MLS crypto snapshot (the inverse of reading
+    /// [`inner`](Self::inner) / [`provider`](Self::provider) /
+    /// [`signer_key_pair`](Self::signer_key_pair)) after a restart (ADR-057).
+    /// The resulting group is active (`destroyed = false`).
+    #[must_use]
+    pub const fn from_parts(
+        group: MlsGroup,
+        provider: InMemoryMlsProvider,
+        signer: SignatureKeyPair,
+    ) -> Self {
+        Self {
+            group: Some(group),
+            provider,
+            signer: EagerDropSigner::new(signer),
+            destroyed: false,
+        }
     }
 
     /// Returns the group's current epoch number.
@@ -313,10 +352,10 @@ pub fn create_group_with_wrapping_key(
     // If a wrapping key is provided, declare the extension type in
     // capabilities and include the wrapping key in the LeafNode extensions.
     if let Some(pubkey) = wrapping_pubkey {
-        let caps = super::wrapping_extension::scp_capabilities_with_wrapping_key();
+        let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
         builder = builder.capabilities(caps);
 
-        let ext = super::wrapping_extension::make_wrapping_key_extension(pubkey);
+        let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
         let leaf_extensions = Extensions::<LeafNode>::single(ext)
             .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
         builder = builder
@@ -326,6 +365,9 @@ pub fn create_group_with_wrapping_key(
 
     let group_create_config = builder.build();
 
+    // SECURITY (ADR-057 §Prereq-1): the creator's own `LeafNode` lifetime is
+    // likewise stamped by openmls's internal (wasm: unhardened) clock — see the
+    // `KeyPackage::builder().build()` note in `generate_key_package_with_wrapping_key`.
     // Create the MLS group with the creator as the sole member.
     let group = MlsGroup::new(
         &provider,
@@ -596,16 +638,30 @@ pub fn generate_key_package_with_wrapping_key(
     let mut builder = KeyPackage::builder();
 
     if let Some(pubkey) = wrapping_pubkey {
-        let caps = super::wrapping_extension::scp_capabilities_with_wrapping_key();
+        let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
         builder = builder.leaf_node_capabilities(caps);
 
-        let ext = super::wrapping_extension::make_wrapping_key_extension(pubkey);
+        let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
         let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
         })?;
         builder = builder.leaf_node_extensions(leaf_extensions);
     }
 
+    // SECURITY (ADR-057 §Prereq-1): `KeyPackage::builder().build()` stamps the
+    // KeyPackage `Lifetime` (`not_before`/`not_after`) by reading openmls's
+    // INTERNAL clock — `openmls::key_packages::lifetime::Lifetime::new`, which
+    // calls `SystemTime::now()`. Under the wasm `js` feature that `SystemTime`
+    // is `fluvio_wasm_timer::SystemTime`, a *second, unhardened* clock reading
+    // a live, attacker-overridable `Date.now()` — distinct from the SCP-layer
+    // hardened `Clock` injected elsewhere (e.g. `EpochGraceStore`). A hostile
+    // same-origin script could thus mint KeyPackages with forged `Lifetime`s.
+    // openmls 0.8 exposes NO builder/API seam to inject a clock into `Lifetime`
+    // (the now-read is internal to `Lifetime::new`), so routing it through the
+    // hardened `Clock` requires an upstream openmls change and is tracked as a
+    // follow-up — it is NOT silently accepted. The same applies to the
+    // validation side (`Lifetime::is_valid`, read during add_member / Welcome
+    // processing).
     let key_package_bundle = builder
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
         .map_err(|e| MlsError::KeyPackageGenerationFailed(e.to_string()))?;
@@ -712,7 +768,7 @@ mod tests {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_primitives::SigningKeyId::Active,
         )
         .unwrap()
     }

@@ -5,7 +5,7 @@
 //! blocking on key generation.
 //!
 //! The [`KeyPackageBuffer`] wraps the existing [`generate_key_package`] function
-//! from [`super::group`] and maintains a pre-generated pool of key packages,
+//! from [`crate::group`] and maintains a pre-generated pool of key packages,
 //! automatically replenishing when the buffer drops below a threshold.
 //!
 //! # Buffer defaults (ADR-001, criterion 8)
@@ -13,15 +13,15 @@
 //! - Minimum buffer size: 10 key packages per identity
 //! - Replenish threshold: 5 (replenish when buffer drops below 5)
 //!
-//! [`generate_key_package`]: super::group::generate_key_package
+//! [`generate_key_package`]: crate::group::generate_key_package
 
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 
-use super::credential::ScpCredential;
-use super::error::MlsError;
-use super::group::generate_key_package;
-use super::storage::InMemoryMlsProvider;
+use crate::InMemoryMlsProvider;
+use crate::credential::ScpCredential;
+use crate::error::MlsError;
+use crate::group::generate_key_package;
 
 /// Default minimum buffer size: 10 key packages per identity.
 const DEFAULT_MIN_BUFFER: usize = 10;
@@ -186,14 +186,14 @@ impl KeyPackageBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::mls::group::SCP_CIPHERSUITE;
+    use crate::group::SCP_CIPHERSUITE;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_primitives::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -303,18 +303,14 @@ mod tests {
 
         // Create a group and add the buffered key package's owner.
         let alice_cred = test_credential("alice");
-        let mut alice_group = crate::crypto::mls::group::create_group(&alice_cred).unwrap();
+        let mut alice_group = crate::group::create_group(&alice_cred).unwrap();
 
         let kp_in: KeyPackageIn = entry.bundle.key_package().clone().into();
-        let add_result = crate::crypto::mls::group::add_member(&mut alice_group, kp_in).unwrap();
+        let add_result = crate::group::add_member(&mut alice_group, kp_in).unwrap();
 
         // Bob joins using the Welcome, with the provider and signer from the buffer entry.
-        let bob_group = crate::crypto::mls::group::join_group(
-            &add_result.welcome,
-            entry.provider,
-            entry.signer,
-        )
-        .unwrap();
+        let bob_group =
+            crate::group::join_group(&add_result.welcome, entry.provider, entry.signer).unwrap();
 
         assert_eq!(bob_group.epoch().unwrap(), 1, "Bob should join at epoch 1");
     }
