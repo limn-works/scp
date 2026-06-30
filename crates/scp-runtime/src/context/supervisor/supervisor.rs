@@ -3843,17 +3843,11 @@ impl Supervisor {
     /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
     /// (ADR-049 commit 12).
     ///
-    /// This is the post-refactor spawn path: the supervisor's caller
-    /// drains state from the legacy `ContextManager` and
-    /// `MlsCryptoProvider` via
-    /// [`crate::context::supervisor::Supervisor::take_context_state`]
-    /// +
-    /// [`crate::crypto::mls::provider::MlsCryptoProvider::take_crypto_state`],
-    /// assembles the actor-side `PerContextState` using the drained
-    /// fields, and hands the state + deps bundle into this method.
-    /// The spawned actor becomes the sole owner; subsequent
-    /// manager/provider calls for the same context return the typed
-    /// "taken by actor" errors.
+    /// This is the owned-state spawn path. The lifecycle bootstrap caller
+    /// (create / restore / import in
+    /// [`crate::context::lifecycle_helpers`]) builds a fresh actor-shape
+    /// `PerContextState` and hands the state + deps bundle into this
+    /// method. The spawned actor becomes the sole owner of that state.
     ///
     /// The returned [`ContextActorHandle`] is registered in the
     /// supervisor's `actors` map under the same `write_lock` that
