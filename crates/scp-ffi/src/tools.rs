@@ -1918,8 +1918,10 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Raises one of the typed saga exceptions — `SagaAbortedError` (a
-    /// Prepare-phase rejection — authorization, freshness, rate limit, or
-    /// co-residency; carries `retry_after_ms`), `SagaNeedsRepairError`
+    /// Prepare-phase abort that may be a permanent rejection — authorization,
+    /// freshness, rate limit, or co-residency — OR a retryable transient: a rate
+    /// limit, or a participant actor unavailable to complete the Prepare
+    /// exchange; carries `retry_after_ms`), `SagaNeedsRepairError`
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or `SagaBusyError` (the participant context set overlapped an
     /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/tool-id

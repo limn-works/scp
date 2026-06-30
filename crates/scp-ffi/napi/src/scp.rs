@@ -2921,9 +2921,11 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase
-    /// rejection — authorization, freshness, rate limit, or co-residency;
-    /// carries `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
+    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase abort
+    /// that may be a permanent rejection — authorization, freshness, rate limit,
+    /// or co-residency — OR a retryable transient: a rate limit, or a
+    /// participant actor unavailable to complete the Prepare exchange; carries
+    /// `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
     /// carries the durable `saga_id`), or `SagaBusy` (the participant context
     /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
     /// error if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not

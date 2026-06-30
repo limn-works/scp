@@ -2059,9 +2059,11 @@ class SCP:
         receipt and captured output bytes — or reaches a typed terminal,
         which is re-raised as one of the SDK saga exceptions:
 
-        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase
-          rejection; carries ``retry_after_ms`` (``None``, never ``0``,
-          when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
+          a PERMANENT rejection OR a RETRYABLE transient (rate limit /
+          participant actor unavailable), distinguished by the
+          ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
+          ``0``, when no precise back-off exists).
         - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
           exhausted; carries the durable ``saga_id`` repair handle.
         - :class:`~scp_sdk.errors.SagaBusyError` — the participant context

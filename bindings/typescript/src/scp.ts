@@ -1754,8 +1754,10 @@ export class SCP {
    * output bytes — or reaches a typed terminal, which rejects as one of the
    * saga errors:
    *
-   * - {@link SagaAbortedError} — a Prepare-phase rejection; carries
-   *   `retryAfterMs` (`null`, never `0`, when no precise back-off exists).
+   * - {@link SagaAbortedError} — a Prepare-phase abort: a PERMANENT rejection
+   *   OR a RETRYABLE transient (rate limit / participant actor unavailable),
+   *   distinguished by the `SCP-SAGA-*` code; carries `retryAfterMs` (`null`,
+   *   never `0`, when no precise back-off exists).
    * - {@link SagaNeedsRepairError} — Commit retries exhausted; carries the
    *   durable `sagaId` repair handle.
    * - {@link SagaBusyError} — the participant context set overlapped an

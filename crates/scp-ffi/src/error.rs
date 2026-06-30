@@ -87,12 +87,14 @@ pyo3::create_exception!(
 // makes load-bearing as a positional Python exception argument (read from
 // `e.args`, never re-parsed from the message text):
 //
-// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase
-//   rejection (§6.2.4). `retry_after_ms` is the rate-limit back-off hint:
+// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase abort
+//   (§6.2.4) that may be a permanent rejection OR a retryable transient (rate
+//   limit / participant actor unavailable), distinguished by the `SCP-SAGA-*`
+//   code. `retry_after_ms` is the rate-limit back-off hint:
 //   an `int` of milliseconds when the tripped limiter can compute one, or
 //   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
-//   read as "retry immediately" and re-trip the same hard limit. A plain
-//   (non-rate-limit) rejection also carries `None`.
+//   read as "retry immediately" and re-trip the same hard limit. An unavailable
+//   participant actor or a plain (non-rate-limit) rejection also carries `None`.
 // - `SagaNeedsRepairError(message, code, saga_id)` — Commit-retry exhausted;
 //   the saga may have partially committed (a divergence). `saga_id` is the
 //   durable operator-repair handle.
@@ -188,10 +190,13 @@ pub enum ScpPyError {
     },
     /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
     ///
-    /// Maps to the Python `SagaAbortedError`. Carries the rate-limit back-off
-    /// hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is the limiter's
-    /// computed cooldown; `None` (NEVER `0`) means no precise back-off instant
-    /// (a token-bucket hard limit, or a non-rate-limit rejection).
+    /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
+    /// rejection OR a retryable transient (rate limit / participant actor
+    /// unavailable), distinguished by the `SCP-SAGA-*` code. Carries the
+    /// rate-limit back-off hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is
+    /// the limiter's computed cooldown; `None` (NEVER `0`) means no precise
+    /// back-off instant (a token-bucket hard limit, an unavailable participant
+    /// actor, or a permanent rejection).
     SagaAborted {
         /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
         message: String,

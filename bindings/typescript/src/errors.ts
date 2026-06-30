@@ -177,7 +177,11 @@ export class EconomyError extends ScpError {
 
 /**
  * A §6.2.4 saga aborted at a Prepare phase (authorization, freshness, rate
- * limit, or co-residency).
+ * limit, co-residency, or a transiently-unavailable participant actor).
+ *
+ * An `Aborted` terminal may be a PERMANENT rejection the caller must not
+ * blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
+ * unavailable); the two are distinguished by the `SCP-SAGA-*` code.
  */
 export class SagaAbortedError extends ToolError {
   /**

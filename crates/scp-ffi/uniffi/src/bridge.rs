@@ -991,14 +991,18 @@ pub enum ScpError {
     /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
     ///
     /// Surfaces the `Aborted` terminal of
-    /// `Supervisor::start_cross_context_tool_invocation_saga` (a §6.2.4
-    /// authorization / freshness / rate-limit / co-residency rejection — also
-    /// the §6.2.4 *Caller authentication* mismatch this bridge enforces before
-    /// the saga runs). Carries the rate-limit back-off hint STRUCTURALLY
+    /// `Supervisor::start_cross_context_tool_invocation_saga`. This terminal may
+    /// be a PERMANENT rejection (authorization / freshness / rate-limit /
+    /// co-residency policy denial, or the §6.2.4 *Caller authentication*
+    /// mismatch this bridge enforces before the saga runs) OR a RETRYABLE
+    /// transient (a rate-limit back-off, or a participant actor unavailable to
+    /// complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+    /// Carries the rate-limit back-off hint STRUCTURALLY
     /// (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
     /// `None` (NEVER `0`) means no precise back-off instant exists (a
-    /// token-bucket hard limit, or a non-rate-limit rejection) — `0` would read
-    /// as "retry immediately" and re-trip the same hard limit. `code` is the
+    /// token-bucket hard limit, an unavailable participant actor, or a permanent
+    /// rejection) — `0` would read as "retry immediately" and re-trip the same
+    /// hard limit. `code` is the
     /// canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
     /// / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
     /// Swift `msg:` label — the `UniFFI` field-name convention every variant
@@ -12301,8 +12305,10 @@ impl Scp {
     /// # Errors
     ///
     /// Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-    /// Prepare-phase rejection — authorization, freshness, rate limit, or
-    /// co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+    /// Prepare-phase abort that may be a permanent rejection — authorization,
+    /// freshness, rate limit, or co-residency — OR a retryable transient: a rate
+    /// limit, or a participant actor unavailable to complete the Prepare
+    /// exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or [`ScpError::SagaBusy`] (the participant context set
     /// overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
