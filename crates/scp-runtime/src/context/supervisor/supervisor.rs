@@ -22,14 +22,13 @@
 //!   the above. Reads are lock-free; the mutex prevents lost writes
 //!   when two callers race a `store` on the same `ArcSwap`.
 //!
-//! # Commit 6 scope
+//! # Scope
 //!
-//! The struct lands with `new`, `lookup`, `spawn_actor`, and the saga
-//! `start_saga` entry point. Every method that migrates the real
-//! semantics lives behind a
-//! [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-//! stub — saga orchestration migrates with `handlers/standing.rs` and
-//! the related cross-context paths in commit 11.
+//! The supervisor implements the actor registry (`new`, `lookup`,
+//! `spawn_actor`) and the saga coordinator (`start_saga` → `run_saga` →
+//! `run_saga_fsm`) per ADR-049. Per-context operations dispatch through
+//! the per-context actor mailbox; cross-context tool invocation runs as a
+//! durable-journalled saga FSM. No migration stubs remain.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -729,9 +728,10 @@ fn decode_repair_records_evidence(bytes: &[u8]) -> Result<Vec<SagaDivergenceRepa
 // Supervisor configuration + crash tracking
 // ---------------------------------------------------------------------------
 
-/// Supervisor configuration. Cheap defaults for commit 6; real fields
-/// (saga phase timeouts, respawn budget windows) materialize alongside
-/// the saga migration in commit 11.
+/// Supervisor configuration. Currently a reserved placeholder with no
+/// tunables wired; saga phase timeouts and respawn-budget windows are
+/// derived from associated constants on [`Supervisor`] rather than this
+/// struct.
 #[derive(Clone, Debug, Default)]
 pub struct SupervisorConfig {
     /// Reserved for future configuration; placeholder field so the
@@ -969,17 +969,6 @@ fn spawn_kp_actor_watchdog_task(
     });
 }
 
-/// Placeholder saga state stored in `pending_sagas` between Prepare and
-/// Commit/Abort. Commit 6 keeps this opaque; the real state shape lives
-/// in the per-saga-type `SagaPreparedState` variants.
-#[derive(Debug)]
-pub struct PendingSagaProjection {
-    /// Reserved; the real in-memory projection of the saga FSM lands
-    /// alongside the handler migrations in commit 11.
-    #[allow(dead_code)]
-    reserved: (),
-}
-
 /// Flat, named-field request for
 /// [`Supervisor::start_cross_context_tool_invocation_saga`] (spec §6.2.4).
 ///
@@ -1152,12 +1141,6 @@ pub struct Supervisor {
     /// Lock order is always `bootstrap_spawn_lock` → `write_lock`, never the
     /// reverse.
     pub(crate) bootstrap_spawn_lock: tokio::sync::Mutex<()>,
-    /// Pending sagas keyed by saga ID; projection of the durable
-    /// journal for fast lookup.
-    // Operational in Phase 2 of post-review-round-1 plan (saga FSM real
-    // Prepare/Commit dispatch + watchdog).
-    #[allow(dead_code)]
-    pub(in crate::context::supervisor) pending_sagas: DashMap<SagaId, PendingSagaProjection>,
     /// Durable saga journal (plan §"Cross-context saga protocol").
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
@@ -1515,7 +1498,6 @@ impl Supervisor {
             persistence,
             write_lock: tokio::sync::Mutex::new(()),
             bootstrap_spawn_lock: tokio::sync::Mutex::new(()),
-            pending_sagas: DashMap::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
             health_config,
@@ -8869,21 +8851,6 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Persist supervisor-level state (standing_contexts, local_dids,
-    /// wrapping_keys) ahead of a shutdown or resume. Commit 6 stubs;
-    /// full path lands with the `BridgeInstance` integration in commit
-    /// 11.
-    ///
-    /// # Errors
-    ///
-    /// Commit 6: always `ContextError::NotImplemented`.
-    #[allow(clippy::unused_async)] // signature matches the real commit-11 handler's shape
-    pub async fn persist_state(&self) -> Result<(), ContextError> {
-        Err(ContextError::NotImplemented(
-            "Supervisor::persist_state — migrates in commit 11 of ADR-049".to_owned(),
-        ))
-    }
-
     // -------------------------------------------------------------------
     // ADR-049 commit 12c.9g.3 — FFI passthrough surface.
     //
@@ -10388,15 +10355,14 @@ impl Supervisor {
     /// stamp can never disagree with the key that signed. Every send path
     /// requires a key, so the signer is non-optional.
     ///
-    /// Phase 2A finalization — every per-context method on `Supervisor`
-    /// builds a typed `ContextCommand` carrying an embedded reply
-    /// oneshot, enqueues it via [`Self::dispatch_command`], and awaits
-    /// the actor's typed reply. The dispatch helper routes through the
-    /// per-context actor mailbox when one is registered, falling back
-    /// to the legacy lock-and-call shim during the migration window
-    /// when no actor has been spawned yet (a state that disappears once
-    /// the legacy `*_helpers_legacy::*_legacy` bodies are deleted in
-    /// the next session).
+    /// Every per-context method on `Supervisor` builds a typed
+    /// `ContextCommand` carrying an embedded reply oneshot, enqueues it
+    /// via [`Self::dispatch_command`], and awaits the actor's typed
+    /// reply. Dispatch is mailbox-only: the command routes through the
+    /// per-context actor mailbox, and when no actor is registered for the
+    /// target context the call returns a lookup-miss
+    /// [`ContextError`](scp_protocol::context::ContextError) on the reply
+    /// oneshot rather than mutating supervisor state directly.
     ///
     /// # Errors
     ///
@@ -11848,20 +11814,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_state_returns_not_implemented() {
-        let s = test_supervisor();
-        let err = s.persist_state().await.unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
-    }
-
-    #[tokio::test]
     async fn spawn_actor_registers_handle_under_write_lock() {
         let s = test_supervisor();
         let _handle = s.spawn_actor("ctx-42".to_owned(), None).await;
         assert!(s.lookup("ctx-42").is_some());
-        // Second spawn with the same ID overwrites (commit 6 semantics —
-        // duplicate-spawn detection is a watchdog responsibility and
-        // lands with the panic-recovery path in commit 11).
+        // Second spawn with the same ID overwrites: duplicate-spawn
+        // overwrite is intentional, and duplicate-spawn detection is a
+        // watchdog responsibility (ADR-049 §10).
         let _handle2 = s.spawn_actor("ctx-42".to_owned(), None).await;
         assert!(s.lookup("ctx-42").is_some());
     }
