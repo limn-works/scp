@@ -248,6 +248,15 @@ impl From<&ParticipationRecord> for ParticipationFacts {
 /// all events in the provided slice and extracts participation facts for the
 /// given `subject_did`.
 ///
+/// SECURITY (trust boundary): this function does NOT verify anything. It trusts
+/// `events` as the authoritative convergent log and trusts
+/// `accessible_attestations` as ALREADY-VERIFIED credentials (signature, expiry,
+/// revocation). The verification boundary is the FFI ingest path
+/// (`verify_and_cache` / `verify_attestation_with_revocation`), which is what
+/// sources `accessible_attestations`; passing unverified attestations here would
+/// inflate `attestation_count` with forged credentials. Callers MUST supply only
+/// verified inputs.
+///
 /// Facts are keyed on the canonical subject-bearing leaves the runtime emits
 /// (ADR-011 amendment, §7.3.2): governance/access facts on the projected
 /// `target_did`, role/membership facts on the projected `subject_did`. The
@@ -901,6 +910,15 @@ pub enum ParticipationAdmissionError {
 
 /// Verifies a set of [`ParticipationProfile`] statements against a context's
 /// participation admission requirements.
+///
+/// SECURITY (authenticity, not authorization): this verifies the AUTHENTICITY of
+/// each caller-supplied profile — its Ed25519 signature over `signable_bytes`
+/// against the `signer_public_key` carried IN the profile. The signer key is
+/// therefore self-certifying: a valid signature proves the profile was not
+/// tampered with, NOT that the signer is a legitimate context. A subject could
+/// present genuinely-signed profiles from signers it controls and inflate
+/// `min_contexts`. Consumers MUST establish signer legitimacy separately (e.g. a
+/// trusted-signer set or a context-membership proof). See spec §7.4.
 ///
 /// For each requirement, the function:
 /// 1. Verifies each statement's Ed25519 signature against its
