@@ -233,6 +233,46 @@ class ToolSagaTest {
         }
 
     /**
+     * The optional `ucanProofId` is forwarded verbatim when absent: a `null`
+     * proof reaches the bridge as `null` (recorded by the stub as the literal
+     * `"null"` via `toString()`), never coerced to an empty or sentinel proof.
+     * The other eight arguments still forward in order.
+     */
+    @Test
+    fun `invokeCrossContextSaga forwards null ucanProofId`() =
+        runTest(testDispatcher) {
+            stubBindings.toolInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
+            val result =
+                bridge.tools.invokeCrossContextSaga(
+                    sourceContextHandle = 1L,
+                    targetContextHandle = 2L,
+                    callerDid = "did:key:zCaller",
+                    toolRegistrationId = "reg-001",
+                    inputJson = """{"city":"Berlin"}""",
+                    assertedNonceHex = NONCE_HEX,
+                    timestampMs = 1_700_000_000_000L,
+                    chainDepth = 0,
+                    ucanProofId = null,
+                )
+
+            assertEquals("""{"saga_id":"saga-xyz"}""", result)
+            assertEquals(
+                listOf(
+                    "1",
+                    "2",
+                    "did:key:zCaller",
+                    "reg-001",
+                    """{"city":"Berlin"}""",
+                    NONCE_HEX,
+                    "1700000000000",
+                    "0",
+                    "null",
+                ),
+                stubBindings.lastSagaArgs,
+            )
+        }
+
+    /**
      * A configured bridge error propagates out of the coverage symbol as a
      * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
      */
