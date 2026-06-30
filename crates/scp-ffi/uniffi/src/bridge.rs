@@ -13316,6 +13316,10 @@ impl Scp {
                             .to_owned(),
                         code: codes::VALID_7010.to_owned(),
                     })?;
+                // Input hygiene parity with the PyO3 reference: validate the
+                // trimmed presenting agent DID before any token parse / state
+                // lookup.
+                validate_did(agent_did)?;
 
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
@@ -13465,6 +13469,10 @@ impl Scp {
                             .to_owned(),
                         code: codes::VALID_7010.to_owned(),
                     })?;
+                // Input hygiene parity with the PyO3 reference: validate the
+                // trimmed presenting agent DID before any token parse / state
+                // lookup.
+                validate_did(agent_did)?;
 
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
