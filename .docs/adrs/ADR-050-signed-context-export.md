@@ -3,7 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-06-08
 **Phase:** Phase 6 (production readiness, security)
-**Related:** ADR-029 (Offline/Sync — defines `ContextSnapshot` and the sync tiers), ADR-031 (Multi-Admin Governance — defines the governance model config, threshold quorum, and consequence rules carried in the snapshot), ADR-038 (Content Access Key Layer — the access-key store carried in the snapshot), ADR-039 (Multi-Key Verification Methods — `#active`/`#agent` key selection), ADR-034 (WASM Constraints — the reference signed-export implementation lives in the WASM bridge)
+**Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`); the reference signed-export construction is now the native runtime implementation `ContextExport::canonical_snapshot_hash` (`crates/scp-runtime/src/context/export_import.rs`). The signing construction below — domain separator, scope-tag byte, full-JCS digest, Ed25519 over `creator_did`'s `#active`/`#agent` key, verify-before-restore — is unchanged; references below to a separate WASM reference bridge and its JSON-envelope variant are historical (the cross-family JSON-vs-MessagePack divergence no longer exists with a single native serializer).
+**Related:** ADR-029 (Offline/Sync — defines `ContextSnapshot` and the sync tiers), ADR-031 (Multi-Admin Governance — defines the governance model config, threshold quorum, and consequence rules carried in the snapshot), ADR-038 (Content Access Key Layer — the access-key store carried in the snapshot), ADR-039 (Multi-Key Verification Methods — `#active`/`#agent` key selection), ADR-055 (WASM bridge removal — the reference signed-export implementation is the native runtime)
 
 ## Context
 
@@ -30,7 +31,7 @@ The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is its OWN separator, del
 - **Wiped fields:** per-instance anti-abuse and accounting state (`approved_proposals`, `next_proposal_seq`, `budget_tracker`, `participation_cache`, spending-nonce tracker, `proposal_timestamps`, and anti-spam hard-rate-limit / velocity / `cooldown_until` state) is signed but intentionally wiped or sanitized on import (`lifecycle_helpers.rs:1518-1632`). The signature proves these were not tampered in transit; the wipe ensures a hostile exporter cannot pre-load enforcement state regardless.
 - **Distinct from §23.16.4:** the §23.16.4 enumerated-subset recipe remains unchanged and continues to govern the Tier-2 sync `ContextSnapshot` delta type only. It MUST NOT be used to sign a `ContextExport`.
 
-The reference construction already exists in the WASM bridge (`crates/scp-ffi/wasm/src/manager.rs`, helper `wasm_export_snapshot_digest`): serialize the snapshot to canonical JSON via `serde_json_canonicalizer`, hash `domain-bytes || scope-tag-byte || snapshot-json` (the single export-scope discriminant byte sits immediately after the domain separator and before the JCS bytes), sign the digest.
+The reference construction is the native runtime implementation (`crates/scp-runtime/src/context/export_import.rs`, helper `ContextExport::canonical_snapshot_hash`): serialize the snapshot to canonical JSON via `serde_json_canonicalizer`, hash `domain-bytes || scope-tag-byte || snapshot-json` (the single export-scope discriminant byte sits immediately after the domain separator and before the JCS bytes), sign the digest.
 
 The native export format `version` is **4** (it incremented from 3, which signed the full snapshot but left the scope discriminant out of the preimage). The WASM bridge's JSON envelope `version` is an independent per-serializer integer (currently **5**); the two counters need not match. What converges across implementations is the *construction*, not the envelope integer.
 
@@ -72,6 +73,6 @@ Restore optimistically and undo if verification fails. **Rejected:** verify-befo
 - Spec §23.17 (Snapshot Sequence-Floor Invariants) — additional import enforcement.
 - Spec §9.18.2 — domain separator registry (signed export uses `SCP-CONTEXT-EXPORT-V1:`, distinct from the §23.16.4 sync-delta `SCP-CONTEXT-SNAPSHOT-V1:`).
 - ADR-039 — `#active`/`#agent` verification-method selection.
-- `crates/scp-ffi/wasm/src/manager.rs:5152-5181` — reference full-JCS signed-export construction.
+- `crates/scp-runtime/src/context/export_import.rs` — `ContextExport::canonical_snapshot_hash`, the reference full-JCS signed-export construction.
 - `crates/scp-runtime/src/context/lifecycle_helpers.rs:1309-1691` — `import_context` verbatim-restore and per-instance-field wipe behavior.
 - ADR-011 AC1 (Amendment, native↔WASM event-log unification) — the signed `event_log_merkle_root` is the RFC 6962 `tree::root` over typed-event leaves; import recomputes `tree::root` and rejects any log whose leaf set differs (prefix, suffix, interior, or forged).

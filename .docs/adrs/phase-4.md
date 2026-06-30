@@ -908,7 +908,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 ## ADR-022: TypeScript SDK (Dual-Target Architecture)
 
-**Status:** Decided
+**Status:** Superseded by ADR-055 (2026-06-29). The dual-target (wasm-bindgen browser bridge + napi-rs server bridge) architecture is removed; the WASM bridge is deleted and `@limn-works/scp-ts` now ships a single napi-rs backend, with browser clients running as remote thin clients to a server-side `scp-node`. The architecture, API surface, and rationale below are retained as the historical record that motivated the supersession — the runtime-detection dispatch, `internal/wasm.ts` backend, wasm-pack build step, and browser platform adapters described here no longer exist.
 
 ### Context
 
@@ -1720,7 +1720,6 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 | `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
 | `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
 | `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
-| `crates/scp-ffi/wasm/` | WASM bridge — re-implements constraint logic locally per ADR-034 |
 | `bindings/python/` | Python SDK wrapper |
 | `bindings/typescript/` | TypeScript SDK wrapper |
 | `bindings/swift/` | Swift SDK wrapper |

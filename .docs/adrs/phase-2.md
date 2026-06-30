@@ -1669,7 +1669,6 @@ Both options: no persistent subscriptions (poll via QUERY), no cover traffic, si
 | `crates/scp-transport/src/native/server.rs` | Multi-transport listener (WebSocket + QUIC + WebTransport + UDP/DTLS) |
 | `crates/scp-node/src/well_known.rs` | `transports` field in `.well-known/scp` response |
 | `crates/scp-node/src/http.rs` | HTTP/3 via ALPN, `Alt-Svc` header |
-| `crates/scp-ffi/wasm/src/transport.rs` | WebTransport API usage with WebSocket fallback |
 
 **Estimated functions:** ~40-50 public functions, ~30-40 internal helpers across all new and modified files.
 
@@ -1797,7 +1796,6 @@ Key design choices:
 | `crates/scp-ffi/src/context.rs` | PyO3 bridge exports for `broadcastPublishAsset`, `broadcastPublishAssets` |
 | `crates/scp-ffi/napi/src/context.rs` | NAPI bridge exports |
 | `crates/scp-ffi/uniffi/src/bridge.rs` | UniFFI bridge exports |
-| `crates/scp-ffi/wasm/src/context.rs` | WASM bridge exports (`ContentPath`/`MimeType` validation reimplemented locally per ADR-034) |
 | `bindings/typescript/src/context.ts` | `broadcastPublishAsset`, `broadcastPublishAssets` |
 | `bindings/python/scp_sdk/context.py` | `broadcast_publish_asset`, `broadcast_publish_assets` |
 

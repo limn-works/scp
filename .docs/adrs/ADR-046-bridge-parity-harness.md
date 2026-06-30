@@ -3,17 +3,17 @@
 **Status:** Accepted
 **Date:** 2026-04-17
 **Phase:** Phase 6 (production readiness, enforcement)
-**Related:** ADR-022 (language bindings), ADR-034 (WASM constraints), ADR-045 (fuzzing infra), ADR-047 (bridge symmetry enforcement — static surface-area parity; complements this ADR's runtime parity)
+**Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`); the parity harness is now a three-bridge invariant (PyO3, UniFFI, napi-rs). References below to a fourth `wasm-bindgen` bridge, the `mode="wasm"` runner path, the `@limn-works/scp-ts-wasm` package, and the `wasm-pack` CI build step are historical — the WASM bridge and its harness wiring were removed with it. The decision and rationale below are otherwise unchanged.
+**Related:** ADR-022 (language bindings), ADR-034 (WASM constraints), ADR-045 (fuzzing infra), ADR-047 (bridge symmetry enforcement — static surface-area parity; complements this ADR's runtime parity), ADR-055 (WASM bridge removal)
 
 ## Context
 
-SCP ships four production FFI bridges over the same Rust core:
+SCP ships three production FFI bridges over the same Rust core:
 
 | Bridge       | Host                 | Mechanism       | Reference       |
 |--------------|----------------------|-----------------|-----------------|
 | PyO3         | Python (CPython)     | `pyo3 0.24`     | `crates/scp-ffi/src/` |
 | NAPI         | Node.js / Bun        | `napi-rs`       | `crates/scp-ffi/napi/` |
-| WASM         | Browser JS           | `wasm-bindgen`  | `crates/scp-ffi/wasm/` |
 | UniFFI       | Swift / Kotlin       | `uniffi`        | `crates/scp-ffi/uniffi/` |
 
 Layers A and B already enforce **structural parity** — that every operation is
@@ -305,6 +305,5 @@ deliberate test-time affordance, not a production pattern:
 
 - `.docs/adrs/phase-4.md` § ADR-022 — language bindings architecture
 - `.docs/adrs/phase-6.md` § ADR-034 — WASM constraint boundary
-- `crates/scp-ffi/CLAUDE.md`, `crates/scp-ffi/napi/CLAUDE.md`,
-  `crates/scp-ffi/wasm/CLAUDE.md` — bridge-specific design notes
+- `crates/scp-ffi/CLAUDE.md`, `crates/scp-ffi/napi/CLAUDE.md` — bridge-specific design notes
 - `bindings/python/tests/bridge_parity/` — harness implementation
