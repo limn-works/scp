@@ -921,7 +921,11 @@ def participation_record(
     not the count itself. Separately, the membership/role-derived facts
     (participation duration, governance actions, role progression) are
     committer-local — verifier-relative, not independently Merkle-verifiable —
-    until ADR-051 receive-side replication lands.
+    until ADR-051 receive-side replication lands. In particular,
+    ``participation_duration_secs`` for the context creator (founder) is
+    derived from the creator-assigned context-creation timestamp — it is
+    creator-timestamp-trusting and committer-local until that replication
+    lands (no independent receiver corroborates the creator's clock).
 
     Args:
         scp: The :class:`~scp_sdk.SCP` instance to dispatch the bridge call on.

@@ -184,7 +184,7 @@ Facts derived from convergent events — participation duration (`MemberJoined`/
 
 1. **Enumerate contexts.** List all context logs the computing agent can access that contain membership events for the target DID.
 2. **Per-context extraction.** For each context log, scan events matching the target DID and extract:
-   - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's DID in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself.
+   - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's DID in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself. For the context creator (founder), the seeding `MemberJoined` leaf timestamp is the creator-assigned context-creation timestamp — so the founder's duration is creator-timestamp-trusting, and like every membership-derived fact it is committer-local until ADR-051 receive-side membership replication lands (no independent receiver corroborates the creator's clock before then).
    - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` whose leaf **`target_did`** equals the target DID. `target_did` is the *targeted* member, carried in `GovernanceActionExecutedPayload` (and `AccessRevokedPayload` for access-revocation events) and surfaced by the projection's `target_did` field (ADR-011) — a field distinct from the role/membership `subject_did` field below: governance/access facts key on `target_did`, role/membership facts key on `subject_did`.
    - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` whose leaf `actor_did` equals the target DID.
    - `tool_invocation_count`: Count of events with type `ToolInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `ToolInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
@@ -216,13 +216,13 @@ RequireParticipation {
 
 **`ParticipationFact` categories** (corresponding to `ParticipationRecord` fields):
 
-- `ParticipationDuration` — Total seconds of context participation (`participation_duration_seconds`).
-- `GovernanceActionsAgainst` — Count of governance actions taken against the identity (`governance_actions_against.len()`).
-- `GovernanceActionsBy` — Count of governance actions initiated by the identity (`governance_actions_by.len()`).
-- `ToolInvocationCount` — Total tool invocations across all tool types (`tool_invocations.values().sum()`).
+- `ParticipationDuration` — Total seconds of context participation (`participation_duration_secs`).
+- `GovernanceActionsAgainst` — Count of governance actions taken against the identity (`governance_actions_against`).
+- `GovernanceActionsBy` — Count of governance actions initiated by the identity (`governance_actions_by`).
+- `ToolInvocationCount` — Total tool invocations across all tool types (`tool_invocation_count`).
 - `ContextCreationCount` — Number of contexts created (`context_creation_count`).
-- `RoleProgressionCount` — Number of role transitions (`role_history.len()`).
-- `AttestationCount` — Number of currently-valid endorsements the verifying agent can access for the subject from the credential layer (`attestation_history.len()`; §7.4, not a context-event count — see `attestation_count` in §7.3.2).
+- `RoleProgressionCount` — Number of role transitions (`role_progression_count`).
+- `AttestationCount` — Number of currently-valid endorsements the verifying agent can access for the subject from the credential layer (`attestation_count`; §7.4, not a context-event count — see `attestation_count` in §7.3.2).
 
 **`ParticipationThreshold` operators:**
 

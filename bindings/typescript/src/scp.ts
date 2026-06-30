@@ -2569,7 +2569,11 @@ export class SCP {
    * count itself. Separately, the membership/role-derived facts (participation
    * duration, governance actions, role progression) are committer-local —
    * verifier-relative, not independently Merkle-verifiable — until ADR-051
-   * receive-side replication lands.
+   * receive-side replication lands. In particular, `participationDurationSecs`
+   * for the context creator (founder) is derived from the creator-assigned
+   * context-creation timestamp — it is creator-timestamp-trusting and
+   * committer-local until that replication lands (no independent receiver
+   * corroborates the creator's clock).
    *
    * @param contextId The context the participation is scoped to.
    * @param subjectDid The DID whose participation facts are computed.
