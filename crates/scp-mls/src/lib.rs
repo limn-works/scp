@@ -46,7 +46,7 @@ pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
 pub use credential::ScpCredential;
-pub use encrypt::DecryptedContent;
+pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
 
 // The MLS signing key pair appears in this crate's public op signatures

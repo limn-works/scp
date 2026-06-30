@@ -30,7 +30,9 @@
 use std::collections::HashMap;
 
 use scp_mls::ScpMlsGroup;
-use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did, encrypt, serialize_ciphertext};
+use scp_mls::encrypt::{
+    InboundChange, decrypt_with_membership_changes, encrypt, serialize_ciphertext,
+};
 use scp_protocol::crypto::sender_keys::encrypt::{
     build_sender_header, decrypt_sender_layer, encrypt_sender_layer, parse_sender_header,
 };
@@ -51,10 +53,14 @@ pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 /// The outcome of decrypting an inbound MLS message.
 ///
 /// Distinguishes an application message (carrying recovered plaintext and the
-/// sender DID) from a control message (a commit/proposal that advanced or
-/// proposed group state but produced no user payload). The driver maps the
-/// former into a `MessageReceived` event and treats the latter as a silent
-/// group-state advance.
+/// sender DID) from a control message. A control message is further split into
+/// a **membership-changing Commit** (carrying the DIDs the Commit added/removed,
+/// recovered from the staged commit before merge — see
+/// [`decrypt_with_membership_changes`]) and a bare proposal. The driver maps an
+/// application message into a `MessageReceived` event, mirrors a Commit's
+/// membership changes onto its event log + membership set (so existing members
+/// converge with the committer and the new joiner), and treats a proposal as a
+/// silent cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// An application message: recovered plaintext plus the sender's DID.
@@ -64,9 +70,20 @@ pub enum Inbound {
         /// The fully decrypted plaintext.
         plaintext: Vec<u8>,
     },
-    /// A control message (commit/proposal). The group state has already been
-    /// advanced/cached by `scp-mls`; no plaintext is produced.
-    Control {
+    /// A Commit that advanced the group epoch. `scp-mls` has already merged it;
+    /// `added_dids` / `removed_dids` are the SCP DIDs the Commit's Add/Remove
+    /// proposals add and evict (in proposal order), for the driver to mirror
+    /// onto its SCP-layer membership + event log.
+    Commit {
+        /// The committer's DID, extracted from the MLS credential.
+        sender_did: String,
+        /// DIDs added by this Commit's Add proposals.
+        added_dids: Vec<String>,
+        /// DIDs removed by this Commit's Remove proposals.
+        removed_dids: Vec<String>,
+    },
+    /// A bare proposal cached by `scp-mls`; no membership change is committed.
+    Proposal {
         /// The sender's DID, extracted from the MLS credential.
         sender_did: String,
     },
@@ -187,11 +204,13 @@ impl ContextCryptoState {
     }
 
     /// Decrypts an inbound MLS message through the full double-decryption
-    /// pipeline, classifying it as application or control.
+    /// pipeline, classifying it as application, membership-changing Commit, or
+    /// bare proposal.
     ///
-    /// For a control message (commit/proposal) the group state is advanced by
-    /// `scp-mls` and [`Inbound::Control`] is returned immediately — the
-    /// sender-key layer is not involved.
+    /// For a Commit or proposal the group state is advanced/cached by `scp-mls`
+    /// (a Commit is merged; its Add/Remove DIDs are recovered from the staged
+    /// commit before merge) and an [`Inbound::Commit`] / [`Inbound::Proposal`]
+    /// is returned immediately — the sender-key layer is not involved.
     ///
     /// For an application message:
     /// 1. Parse the 16-byte `epoch || sequence` header — authoritative.
@@ -209,15 +228,27 @@ impl ContextCryptoState {
     /// verification fails.
     pub fn decrypt_message(&mut self, ciphertext: &[u8]) -> Result<Inbound, ClientError> {
         // Layer 2 (outer): MLS decrypt + classify. `scp-mls` merges any staged
-        // commit internally and surfaces the sender DID from the credential.
-        let decrypted = decrypt_with_sender_did(&mut self.mls_group, ciphertext)?;
+        // commit internally (recovering its Add/Remove DIDs before the merge)
+        // and surfaces the sender DID from the credential.
+        let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext)?;
         let (sender_did, framed) = match decrypted {
-            DecryptedContent::Application {
+            InboundChange::Application {
                 plaintext,
                 sender_did,
             } => (sender_did, plaintext),
-            DecryptedContent::Commit { sender_did } | DecryptedContent::Proposal { sender_did } => {
-                return Ok(Inbound::Control { sender_did });
+            InboundChange::Commit {
+                sender_did,
+                added_dids,
+                removed_dids,
+            } => {
+                return Ok(Inbound::Commit {
+                    sender_did,
+                    added_dids,
+                    removed_dids,
+                });
+            }
+            InboundChange::Proposal { sender_did } => {
+                return Ok(Inbound::Proposal { sender_did });
             }
         };
 
@@ -335,9 +366,59 @@ mod tests {
                 assert_eq!(sender_did, ALICE);
                 assert_eq!(plaintext, b"hello bob");
             }
-            Inbound::Control { .. } => panic!("expected an application message"),
+            other => panic!("expected an application message, got {other:?}"),
         }
         assert_eq!(bob.recv_sequence_tracker.get(ALICE), Some(&(1u64, 0u64)));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_classifies_add_commit_with_added_did() {
+        // An EXISTING member decrypting an add-Commit must classify it as
+        // Inbound::Commit carrying the added DID, so the driver can mirror the
+        // MemberJoined leaf. Setup: Alice creates, adds Carol (Carol joins as
+        // the existing member), then Alice adds Bob and Carol processes that
+        // second Commit.
+        const CAROL: &str = "did:key:z6MkCarolCryptoStateUnitFixtureCCCCCCCCC";
+
+        let mut alice =
+            ContextCryptoState::from_group(CTX, create_group(&credential(ALICE)).unwrap());
+
+        // Carol joins as an existing member.
+        let (carol_bundle, carol_signer, carol_provider): (_, SignatureKeyPair, _) =
+            generate_key_package(&credential(CAROL)).unwrap();
+        let carol_kp_in = KeyPackageIn::tls_deserialize(
+            &mut &*carol_bundle.key_package().tls_serialize_detached().unwrap(),
+        )
+        .unwrap();
+        let add_carol = add_member(&mut alice.mls_group, carol_kp_in).unwrap();
+        let mut carol = ContextCryptoState::from_group(
+            CTX,
+            join_group(&add_carol.welcome, carol_provider, carol_signer).unwrap(),
+        );
+
+        // Alice adds Bob; Carol (existing member) processes the Commit.
+        let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
+            generate_key_package(&credential(BOB)).unwrap();
+        let bob_kp_in = KeyPackageIn::tls_deserialize(
+            &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
+        )
+        .unwrap();
+        let add_bob = add_member(&mut alice.mls_group, bob_kp_in).unwrap();
+        let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
+
+        match carol.decrypt_message(&commit_bytes).unwrap() {
+            Inbound::Commit {
+                sender_did,
+                added_dids,
+                removed_dids,
+            } => {
+                assert_eq!(sender_did, ALICE, "committer is Alice");
+                assert_eq!(added_dids, vec![BOB.to_owned()], "Bob's DID surfaced");
+                assert!(removed_dids.is_empty());
+            }
+            other => panic!("expected Inbound::Commit, got {other:?}"),
+        }
     }
 
     #[test]

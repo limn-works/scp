@@ -61,17 +61,29 @@ struct PendingJoin {
 /// plus the convergent committer timestamp the adder stamped on its
 /// `MemberJoined` leaf.
 ///
-/// `commit` goes to all *existing* members (they apply it via
-/// [`ScpClient::receive_message`], which classifies it as a control message and
-/// advances their MLS epoch). `welcome` goes to the *new* member (they apply it
-/// via [`ScpClient::join_context_encrypted`], passing `committer_timestamp_secs`
-/// so their mirrored `MemberJoined` leaf converges with the adder's).
+/// `commit` goes to all *existing* members. They apply it via
+/// [`ScpClient::receive_message`], which classifies it as a membership-changing
+/// Commit, advances their MLS epoch, and — using `committer_timestamp_secs`
+/// transported here exactly as [`SendOutput::committer_timestamp_secs`] is for
+/// messages — appends the identical `MemberJoined` leaf so their event log and
+/// membership set converge with the committer's and the joiner's.
+///
+/// `welcome` goes to the *new* member, who applies it via
+/// [`ScpClient::join_context_encrypted`] and replays `event_log` (which already
+/// contains the committer-stamped `MemberJoined` leaf), so the joiner's log is
+/// byte-identical to the committer's.
 #[derive(Debug, Clone)]
 pub struct AddMemberOutput {
     /// TLS-serialized MLS Commit for existing members.
     pub commit: Vec<u8>,
     /// TLS-serialized MLS Welcome for the new member.
     pub welcome: Vec<u8>,
+    /// The convergent committer timestamp (Unix seconds) the adder stamped on
+    /// its `MemberJoined` leaf. Transported to existing members alongside
+    /// `commit` so their mirrored `MemberJoined` leaf carries the SAME
+    /// timestamp and converges byte-for-byte (§9.9.3). The joiner does not need
+    /// it separately — its copy already rides inside `event_log`.
+    pub committer_timestamp_secs: u64,
     /// The adder's full event-log stream AFTER the add (the prior context
     /// history plus the new `MemberJoined` leaf). The joiner replays this
     /// verbatim to reconstruct a byte-identical log and converge to the same
@@ -272,6 +284,7 @@ impl ScpClient {
         Ok(AddMemberOutput {
             commit,
             welcome,
+            committer_timestamp_secs: timestamp,
             event_log: state.events(),
             members: state.members.clone(),
         })
@@ -381,27 +394,36 @@ impl ScpClient {
         })
     }
 
-    /// Receives an inbound MLS message in `context_id`: decrypts it (or applies
-    /// it as a control commit), and buffers the resulting event.
+    /// Receives an inbound MLS message in `context_id`: decrypts an application
+    /// message, or applies a membership-changing Commit, converging the event
+    /// log either way.
     ///
-    /// An application message produces a `MessageReceived` event (buffered for
-    /// [`Self::drain_events`]) and appends a `MessageSent` leaf stamped with the
-    /// supplied committer timestamp, so the receiver's log converges with the
-    /// sender's. A control message (commit/proposal) advances the MLS group
-    /// silently and produces no buffered event and no leaf (the membership leaf
-    /// for an add is recorded by the joiner's own join path).
+    /// - **Application message** → produces a `MessageReceived` event (buffered
+    ///   for [`Self::drain_events`]) and appends a `MessageSent` leaf stamped
+    ///   with the supplied `committer_timestamp_secs`, so the receiver's log
+    ///   converges with the sender's. Returns `true`.
+    /// - **Membership-changing Commit (add)** → advances the MLS epoch and, for
+    ///   each member the Commit adds, appends the SAME convergent
+    ///   `MemberJoined` leaf the committer appended — committer DID + the
+    ///   transported `committer_timestamp_secs` ([`AddMemberOutput::committer_timestamp_secs`])
+    ///   — and records the added member. This is what makes an EXISTING member's
+    ///   log and membership set converge with the committer's and the new
+    ///   joiner's in a multi-party context (§9.9.3). Returns `false` (no
+    ///   application payload was produced).
+    /// - **Bare proposal** → cached by `scp-mls`; no leaf, returns `false`.
     ///
-    /// `committer_timestamp_secs` is the convergent timestamp the sender stamped
-    /// on its `MessageSent` leaf (transported alongside the ciphertext). For a
-    /// control message it is ignored.
-    ///
-    /// Returns `true` if an application message was decrypted and buffered,
-    /// `false` for a control message.
+    /// `committer_timestamp_secs` is the convergent timestamp the committer
+    /// stamped: on a `MessageSent` leaf for an application message
+    /// ([`SendOutput::committer_timestamp_secs`]), or on the `MemberJoined`
+    /// leaf for an add Commit ([`AddMemberOutput::committer_timestamp_secs`]).
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held, or a
-    /// crypto/leaf error on failure.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::UnsupportedMembershipChange`] if the Commit removes a
+    /// member (Slice 2 has no convergent removal-leaf transport — the driver
+    /// refuses to merge silently rather than diverge), or a crypto/leaf error
+    /// on failure.
     pub fn receive_message(
         &mut self,
         context_id: &str,
@@ -426,7 +448,50 @@ impl ScpClient {
                 });
                 Ok(true)
             }
-            Inbound::Control { .. } => Ok(false),
+            Inbound::Commit {
+                sender_did: committer_did,
+                added_dids,
+                removed_dids,
+            } => {
+                // Slice 2 is the participant add path. A Commit that EVICTS a
+                // member has no convergent removal-leaf transport yet (there is
+                // no committer-side op that stamps a `MemberLeft` leaf with a
+                // convergent timestamp to transport, the way `add_member`
+                // transports one for adds). Merging it while dropping the
+                // membership leaf would silently diverge this member's log from
+                // the committer's — exactly the bug this method fixes for adds.
+                // Refuse loudly instead. Note the MLS group has ALREADY merged
+                // the commit inside `decrypt_message`; the context is left in a
+                // deliberately-failed state so the caller surfaces the gap
+                // rather than proceeding on a diverged log.
+                if !removed_dids.is_empty() {
+                    return Err(ClientError::UnsupportedMembershipChange(format!(
+                        "received a Commit removing {} member(s) ({}); convergent \
+                         removal is out of ADR-057 Slice 2 scope",
+                        removed_dids.len(),
+                        removed_dids.join(", ")
+                    )));
+                }
+
+                // For each added member, append the identical convergent
+                // `MemberJoined` leaf the committer appended: actor = committer
+                // DID, timestamp = transported convergent T, empty payload. The
+                // sequence + prev_hash are recomputed from this member's
+                // current log, which (by the convergence invariant) is at the
+                // same state the committer's was before the add — so the leaf is
+                // byte-identical. Then record the member in the membership set.
+                for added_did in &added_dids {
+                    state.append_log_event(
+                        EventType::MemberJoined,
+                        &committer_did,
+                        Vec::new(),
+                        committer_timestamp_secs,
+                    )?;
+                    state.add_member_record(added_did);
+                }
+                Ok(false)
+            }
+            Inbound::Proposal { .. } => Ok(false),
         }
     }
 

@@ -37,10 +37,13 @@ pub enum ClientError {
     #[error("context already exists: {0}")]
     ContextAlreadyExists(String),
 
-    /// The decrypted MLS message was not an application message (it was a
-    /// commit or proposal) when an application message was expected.
-    #[error("expected application message, got control message")]
-    NotApplicationMessage,
+    /// A received Commit carried a membership change the Slice 2 participant
+    /// driver does not converge — specifically a member removal, for which
+    /// there is no convergent removal-leaf transport yet. The driver returns
+    /// this rather than silently merging and diverging its event log from the
+    /// committer's (ADR-057 Slice 2 scope).
+    #[error("unsupported membership change: {0}")]
+    UnsupportedMembershipChange(String),
 
     /// A driver invariant was violated (e.g. missing sender key for a member
     /// that is in the membership set, or a malformed driver argument).

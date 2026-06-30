@@ -341,22 +341,16 @@ pub fn decrypt_with_sender_did(
     // Look up the sender's credential from the group member list and parse
     // the SCP credential to extract the DID.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_did = g
+    let sender_credential = g
         .members()
         .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.credential)
         .ok_or_else(|| {
             MlsError::DecryptionFailed(format!(
                 "sender leaf index {sender_leaf_index:?} not found in group members"
             ))
-        })
-        .and_then(|m| {
-            let basic_cred = BasicCredential::try_from(m.credential).map_err(|e| {
-                MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}"))
-            })?;
-            let scp_cred = crate::credential::ScpCredential::from_bytes(basic_cred.identity())
-                .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
-            Ok(scp_cred.did)
         })?;
+    let sender_did = credential_to_did(&sender_credential)?;
 
     // Dispatch based on the processed message content type.
     match processed.into_content() {
@@ -380,6 +374,204 @@ pub fn decrypt_with_sender_did(
             // Proposals are cached by OpenMLS automatically during
             // process_message — no explicit action needed.
             Ok(DecryptedContent::Proposal { sender_did })
+        }
+    }
+}
+
+/// The membership changes an existing member observes when it processes an
+/// inbound MLS message.
+///
+/// Returned by [`decrypt_with_membership_changes`]. For an application message
+/// the change is [`InboundChange::Application`]. For a Commit the change is
+/// [`InboundChange::Commit`], carrying the DIDs added and removed by the
+/// Commit's Add/Remove proposals — recovered from the staged commit *before* it
+/// is merged, so an existing member can mirror the committer's membership-leaf
+/// appends and converge. For a bare Proposal the change is
+/// [`InboundChange::Proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundChange {
+    /// An application message carrying user plaintext and the sender DID.
+    Application {
+        /// The decrypted payload bytes.
+        plaintext: Vec<u8>,
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+    /// A Commit that advanced the group epoch. `merge_staged_commit` has
+    /// already been called. `added_dids` and `removed_dids` are the SCP DIDs of
+    /// the members the Commit's Add/Remove proposals add and evict, recovered
+    /// from the staged commit (Add proposals' `KeyPackage` leaf credentials and
+    /// Remove proposals' pre-merge leaf credentials) before the merge.
+    Commit {
+        /// The committer's DID string extracted from the MLS credential.
+        sender_did: String,
+        /// DIDs added by this Commit's Add proposals, in proposal order.
+        added_dids: Vec<String>,
+        /// DIDs removed by this Commit's Remove proposals, in proposal order.
+        removed_dids: Vec<String>,
+    },
+    /// A Proposal cached by `OpenMLS` during `process_message`. No plaintext and
+    /// no committed membership change yet.
+    Proposal {
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+}
+
+/// Parses the SCP DID out of an MLS [`Credential`] (a `BasicCredential` whose
+/// identity payload is a `MessagePack`-encoded [`crate::credential::ScpCredential`]).
+///
+/// Shared by the sender-resolution paths and the membership-change recovery in
+/// [`decrypt_with_membership_changes`], so every place that names a member from
+/// an MLS leaf parses the credential identically.
+fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
+    let basic = BasicCredential::try_from(credential.clone())
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}")))?;
+    let scp_cred = crate::credential::ScpCredential::from_bytes(basic.identity())
+        .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
+    Ok(scp_cred.did)
+}
+
+/// Decrypts an inbound MLS message and, for a Commit, surfaces the membership
+/// changes it carries so an existing member can converge its SCP-layer state.
+///
+/// This is the existing-member counterpart of the joiner's
+/// [`crate::group::add_member`] path: the committer (adder) appends a
+/// `MemberJoined` event-log leaf and hands the new member the full log, while
+/// **existing** members learn of the add only by processing the Commit. To
+/// append the identical convergent membership leaf, an existing member needs
+/// the added member's DID — which [`decrypt_with_sender_did`] discarded. This
+/// function recovers it.
+///
+/// # Message Type Handling
+///
+/// - **`ApplicationMessage`** → [`InboundChange::Application`] (plaintext +
+///   sender DID), identical to [`decrypt_with_sender_did`].
+/// - **`StagedCommitMessage`** → the Add/Remove proposal DIDs are extracted from
+///   the staged commit **before** `merge_staged_commit` consumes it (the
+///   removed members' leaf credentials are still present in the *current* group
+///   tree pre-merge, and the added members' credentials are read from the Add
+///   proposals' `KeyPackage`s). The commit is then merged and
+///   [`InboundChange::Commit`] is returned. The `KeyPackage`s inside the Add
+///   proposals were already validated by `process_message` (it rejects a Commit
+///   carrying an invalid Add), so the recovered added DIDs are authenticated.
+/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** →
+///   [`InboundChange::Proposal`]; `OpenMLS` caches the proposal, no membership
+///   change is committed yet.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
+/// [`MlsError::DecryptionFailed`] if decryption or credential parsing fails, or
+/// [`MlsError::CommitProcessingFailed`] if the staged commit cannot be merged.
+pub fn decrypt_with_membership_changes(
+    group: &mut ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<InboundChange, MlsError> {
+    if group.group.is_none() {
+        return Err(MlsError::GroupDestroyed);
+    }
+
+    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
+
+    let protocol_message = message_in
+        .try_into_protocol_message()
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
+    // must use `panic=unwind` (see the `decrypt` note above).
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+
+    // Resolve the sender DID from their leaf credential before consuming the
+    // ProcessedMessage.
+    let sender = processed.sender().clone();
+    let Sender::Member(sender_leaf_index) = sender else {
+        return Err(MlsError::DecryptionFailed(
+            "sender is not a group member".to_string(),
+        ));
+    };
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let sender_credential = g
+        .members()
+        .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.credential)
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} not found in group members"
+            ))
+        })?;
+    let sender_did = credential_to_did(&sender_credential)?;
+
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(InboundChange::Application {
+            plaintext: app_msg.into_bytes(),
+            sender_did,
+        }),
+        ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // Recover the added DIDs from the Add proposals' KeyPackage leaf
+            // credentials. These KeyPackages were validated by process_message
+            // (a Commit carrying an invalid Add is rejected above), so the DIDs
+            // are cryptographically authenticated, not advisory.
+            let mut added_dids = Vec::new();
+            for add in staged_commit.add_proposals() {
+                let did =
+                    credential_to_did(add.add_proposal().key_package().leaf_node().credential())?;
+                added_dids.push(did);
+            }
+
+            // Recover the removed DIDs by mapping each Remove proposal's leaf
+            // index to that member's credential in the CURRENT tree — the
+            // removed leaf is still present until merge_staged_commit runs, so
+            // this lookup must happen BEFORE the merge below.
+            let mut removed_dids = Vec::new();
+            {
+                let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+                for remove in staged_commit.remove_proposals() {
+                    let removed_index = remove.remove_proposal().removed();
+                    let credential = g
+                        .members()
+                        .find(|m| m.index == removed_index)
+                        .map(|m| m.credential)
+                        .ok_or_else(|| {
+                            MlsError::DecryptionFailed(format!(
+                                "removed leaf index {removed_index:?} not found in group members"
+                            ))
+                        })?;
+                    removed_dids.push(credential_to_did(&credential)?);
+                }
+            }
+
+            // Merge the staged commit to advance the group epoch (mirrors
+            // decrypt_with_sender_did — without this the group is corrupted).
+            let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+            g.merge_staged_commit(&group.provider, *staged_commit)
+                .map_err(|e| {
+                    MlsError::CommitProcessingFailed(format!("merging staged commit: {e}"))
+                })?;
+
+            Ok(InboundChange::Commit {
+                sender_did,
+                added_dids,
+                removed_dids,
+            })
+        }
+        ProcessedMessageContent::ProposalMessage(_)
+        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+            Ok(InboundChange::Proposal { sender_did })
         }
     }
 }
@@ -727,6 +919,133 @@ mod tests {
         );
         if let DecryptedContent::Application { plaintext: pt, .. } = content {
             assert_eq!(pt, plaintext, "must decrypt after Commit processing");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_surfaces_added_did() {
+        // Alice creates, adds Bob, then adds Carol. The existing member Bob
+        // processes Alice's add-Carol Commit and the seam must surface Carol's
+        // DID (recovered from the Add proposal's KeyPackage), so an existing
+        // member can mirror the committer's MemberJoined leaf and converge.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
+        let add_bob = add_member(&mut alice_group, bob_kp).unwrap();
+        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _carol_signer, _carol_provider) =
+            generate_key_package(&carol_cred).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        let add_carol = add_member(&mut alice_group, carol_kp).unwrap();
+
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
+
+        match change {
+            InboundChange::Commit {
+                sender_did,
+                added_dids,
+                removed_dids,
+            } => {
+                assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
+                assert_eq!(
+                    added_dids,
+                    vec!["did:dht:z6Mkcarol".to_owned()],
+                    "the seam surfaces Carol's DID from the Add proposal"
+                );
+                assert!(removed_dids.is_empty(), "no removes in an add-only commit");
+            }
+            other => panic!("expected Commit change, got {other:?}"),
+        }
+
+        // The merge advanced Bob's epoch (proves the commit was applied).
+        assert_eq!(bob_group.epoch().unwrap(), 2, "two adds → epoch 2");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_surfaces_removed_did() {
+        // Alice creates, adds Bob and Carol, then removes Carol. The existing
+        // member Bob processes the remove Commit; the seam must surface Carol's
+        // DID from the pre-merge tree (the removed leaf is still present until
+        // the merge).
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let add_bob =
+            add_member(&mut alice_group, bob_kp_bundle.key_package().clone().into()).unwrap();
+        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _carol_signer, _carol_provider) =
+            generate_key_package(&carol_cred).unwrap();
+        let add_carol = add_member(
+            &mut alice_group,
+            carol_kp_bundle.key_package().clone().into(),
+        )
+        .unwrap();
+        let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+        // Bob processes the add-Carol commit so his tree contains Carol.
+        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes).unwrap();
+
+        // Alice removes Carol.
+        let alice_own = alice_group.own_leaf_index().unwrap();
+        let members = alice_group.members().unwrap();
+        let carol_member = members
+            .iter()
+            .find(|m| {
+                m.index != alice_own && {
+                    let bc = BasicCredential::try_from(m.credential.clone()).unwrap();
+                    let sc = crate::credential::ScpCredential::from_bytes(bc.identity()).unwrap();
+                    sc.did == "did:dht:z6Mkcarol"
+                }
+            })
+            .unwrap();
+        let remove = crate::group::remove_member(&mut alice_group, carol_member.index).unwrap();
+        let remove_bytes = remove.commit.tls_serialize_detached().unwrap();
+
+        let change = decrypt_with_membership_changes(&mut bob_group, &remove_bytes).unwrap();
+        match change {
+            InboundChange::Commit {
+                added_dids,
+                removed_dids,
+                ..
+            } => {
+                assert!(added_dids.is_empty(), "no adds in a remove-only commit");
+                assert_eq!(
+                    removed_dids,
+                    vec!["did:dht:z6Mkcarol".to_owned()],
+                    "the seam surfaces Carol's DID from the pre-merge tree"
+                );
+            }
+            other => panic!("expected Commit change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_application_variant() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let ct = encrypt(&mut alice_group, b"hi").unwrap();
+        let ct_bytes = serialize_ciphertext(&ct).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &ct_bytes).unwrap();
+        match change {
+            InboundChange::Application {
+                plaintext,
+                sender_did,
+            } => {
+                assert_eq!(plaintext, b"hi");
+                assert!(sender_did.starts_with("did:dht:z6Mk"));
+            }
+            other => panic!("expected Application change, got {other:?}"),
         }
     }
 

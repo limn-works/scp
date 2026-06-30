@@ -461,29 +461,33 @@ pub fn add_member(
     })
 }
 
-/// Extracts the SCP DID embedded in a `KeyPackage`'s leaf credential.
+/// Extracts the SCP DID embedded in a fully-validated `KeyPackage`'s leaf
+/// credential.
 ///
-/// Reads the (unverified) `BasicCredential` from the key package's leaf node
-/// and parses it as an [`ScpCredential`] to recover the DID, validating only
-/// the protocol version first. This lets a driver name the member a key
-/// package belongs to *before* consuming the package in [`add_member`], so the
-/// membership record and the MLS leaf cannot disagree.
+/// Runs `OpenMLS`'s full [`KeyPackageIn::validate`] — which verifies the leaf
+/// node signature, the key package signature, the protocol version, and the
+/// `Lifetime` — and only then reads the `BasicCredential` from the verified
+/// leaf node and parses it as an [`ScpCredential`] to recover the DID. The
+/// returned DID is therefore cryptographically authenticated: it is bound to a
+/// leaf node whose signature has been checked against the key package's own
+/// signature key, not merely deserialized from untrusted bytes. This lets a
+/// driver name the member a key package belongs to *before* consuming the
+/// package in [`add_member`], so the membership record and the MLS leaf cannot
+/// disagree.
 ///
 /// This is the standalone counterpart of the credential extraction
 /// `add_member` and `decrypt_with_sender_did` already perform internally; it
 /// exists so an in-browser participant driver (ADR-057) can read the joiner's
 /// DID off the wire-delivered key package without trusting a separately
-/// supplied DID.
-///
-/// The credential is read from the *unverified* key package. The DID is only
-/// as trustworthy as the subsequent [`add_member`] validation makes it: a
-/// malformed or mis-signed key package is rejected when it is actually added.
-/// Callers must treat the returned DID as advisory until the add succeeds.
+/// supplied DID. Because validation is identical to the one `add_member`
+/// performs, a key package this function accepts is one `add_member` will also
+/// accept (and vice versa) — there is no weaker "advisory" window.
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::AddMemberFailed`] if the key package fails protocol
-/// version validation, [`MlsError::CredentialSerializationFailed`] if the leaf
+/// Returns [`MlsError::AddMemberFailed`] if the key package fails validation
+/// (bad signature, wrong protocol version, or an invalid/expired `Lifetime`),
+/// or [`MlsError::CredentialSerializationFailed`] if the validated leaf
 /// credential is not a parseable SCP `BasicCredential`.
 pub fn key_package_in_did(
     key_package: &KeyPackageIn,
