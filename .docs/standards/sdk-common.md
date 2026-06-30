@@ -115,6 +115,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13065` | supervisor | `NeedsRepair` terminal — Commit-retry exhausted; saga diverged and requires operator repair (carries `saga_id`) |
 | `SCP-SAGA-13066` | supervisor | `Busy` terminal — participant context set overlaps an in-flight saga (per-participant-context-set gating, §5.15.4) |
 | `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
+| `SCP-SAGA-13068` | supervisor | `MailboxSaturated` — Prepare-phase abort: target participant actor mailbox saturated or closed (transient, retryable) |
 
 ### Registered SCP-ATTEST- codes
 
