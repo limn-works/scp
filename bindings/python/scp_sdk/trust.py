@@ -913,6 +913,16 @@ def participation_record(
     default (``None`` → ``"[]"``) honestly reports only what the bridge's trust
     store already holds — it never fabricates attestations.
 
+    THREAT MODEL: ``attestation_count`` is Sybil-inflatable by self-issuance —
+    one operator can self-issue (or co-issue across DIDs it controls)
+    arbitrarily many *authentic* attestations. It is a credential-layer claim
+    count, NOT a standalone trust score; Sybil resistance comes from the
+    threshold/independence path (§7.3.5) and DeviceAttestation binding (§9.3),
+    not the count itself. Separately, the membership/role-derived facts
+    (participation duration, governance actions, role progression) are
+    committer-local — verifier-relative, not independently Merkle-verifiable —
+    until ADR-051 receive-side replication lands.
+
     Args:
         scp: The :class:`~scp_sdk.SCP` instance to dispatch the bridge call on.
         context_id: The context the participation is scoped to.

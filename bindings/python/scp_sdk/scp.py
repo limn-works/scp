@@ -1134,6 +1134,13 @@ class SCP:
         diagnostic snapshot, not a promise that a later ``ucan_validate``
         will accept the token.
 
+        NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate.
+        Only :meth:`ucan_validate` (with its mandatory challenge capability)
+        authorizes an action. A no-capability (intrinsic-validity) result skips
+        the invoked-capability grant-match, so an all-``True`` result does NOT
+        establish the token grants any particular capability — re-run
+        :meth:`ucan_validate` with the concrete capability to authorize.
+
         ``presenting_agent_did`` is REQUIRED (no silent security default): the
         bridge rejects an absent or empty value rather than defaulting the
         presenting agent to the token's own ``aud`` (which would make the
