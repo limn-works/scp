@@ -387,9 +387,11 @@ pub enum SagaError {
 }
 
 /// The structured reason a §6.2.4 saga reached the `Aborted` terminal — carried
-/// by [`SagaError::Aborted`] so the FFI surface reads the back-off hint
-/// structurally (ADR-049 §3a "abort reason `RateLimited` carrying
-/// `retry_after_ms`, or `Rejected`"), never by re-parsing the message.
+/// by [`SagaError::Aborted`] so the FFI surface reads the reason structurally
+/// (ADR-049 §3a), never by re-parsing the message. The reason is one of
+/// `RateLimited` (carrying `retry_after_ms`), `ParticipantUnavailable`, or
+/// `Rejected`; each variant's own rustdoc below is the authoritative home of its
+/// rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SagaAbortReason {
     /// The abort was a rate-limit rejection. `retry_after_ms` carries the
@@ -5695,20 +5697,9 @@ impl Supervisor {
         if needs_repair {
             return SagaError::NeedsRepair { saga_id, message };
         }
-        // Resolve the abort reason AND the code together by STRUCTURAL variant
-        // match (never by parsing the message string). A Prepare-phase
-        // `ActorBusy` gets the dedicated retryable `ParticipantUnavailable` +
-        // code `13068` BEFORE the generic `unwrap_or(13067)` fallback (the
-        // transient / neither-committed / commit-phase-unreachable rationale
-        // lives on `SagaAbortReason::ParticipantUnavailable`'s rustdoc).
-        // `RateLimited` reads its `retry_after_ms` off the variant; every other
-        // `ContextError` is a `Rejected`. The code otherwise rides `saga_code`
-        // off the reject path; codeless aborts (e.g. a Prepare-phase
-        // `TransportTimeout`, a token-bucket ECON `RateLimited`, or a journal-I/O
-        // `InvalidState`) carry `None` and fall back to the generic saga-abort
-        // code `13067` rather than `13050` (the SPECIFIC caller-membership-gate
-        // reject, which must not be synthesized for a failure that never
-        // occurred). The message string still carries the specific cause.
+        // Ordering note: `ActorBusy` resolves to `ParticipantUnavailable` /
+        // code `13068` BEFORE the generic `unwrap_or(13067)` fallback below.
+        // Rationale lives on `SagaAbortReason::ParticipantUnavailable`'s rustdoc.
         let fallback_code = saga_code.unwrap_or(13067);
         let (reason, code) = match &error {
             ContextError::ActorBusy(_) => (SagaAbortReason::ParticipantUnavailable, 13068),
