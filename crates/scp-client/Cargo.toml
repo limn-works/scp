@@ -1,0 +1,58 @@
+[package]
+name = "scp-client"
+version = "0.1.0-beta.2"
+description = "Single-threaded SCP participant driver over scp-mls — wasm32-safe, keys on-device (ADR-057 Slice 2)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+# Enables non-production DID formats (did:key:, did:test:) in credential
+# construction, mirroring scp-mls/scp-protocol `testing`. Used by the
+# integration tests.
+testing = [
+    "scp-mls/testing",
+    "scp-protocol/testing",
+    "scp-primitives/testing",
+]
+
+[dependencies]
+# scp-client depends ONLY on the wasm-safe shared crates plus the openmls
+# stack. It MUST NOT depend on scp-runtime (tokio/actor orchestration) or
+# scp-identity (tokio-coupled custody/DHT) — the ADR-057 mechanical fence that
+# keeps the participant driver compilable to wasm32-unknown-unknown. All
+# protocol logic is called through scp-mls / scp-protocol / scp-event-log; this
+# crate re-derives nothing.
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
+scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
+
+# openmls is needed directly for the wire (de)serialization of KeyPackages and
+# MLS messages at the driver boundary (KeyPackageIn::tls_deserialize and
+# friends); scp-mls exposes its op surface in terms of these openmls types.
+openmls = { workspace = true, features = ["libcrux-provider", "js"] }
+tls_codec = "0.4"
+
+thiserror = { workspace = true }
+
+# wasm32 backends: mirror scp-mls/Cargo.toml so the driver compiles to wasm32.
+# The root .cargo/config.toml already sets getrandom_backend="wasm_js"
+# globally for the wasm32 target. See ADR-057 Prerequisite 1.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# getrandom 0.4 arrives transitively via the openmls libcrux provider and needs
+# its own wasm_js backend enabled (openmls's `js` feature only wires 0.3).
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+uuid = { version = "1", features = ["v4", "js"] }
+
+[dev-dependencies]
+scp-primitives = { path = "../scp-primitives", features = ["testing"] }
+scp-protocol = { path = "../scp-protocol", features = ["testing"] }
+scp-mls = { path = "../scp-mls", features = ["testing"] }
+
+[lints]
+workspace = true

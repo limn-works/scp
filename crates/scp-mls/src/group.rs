@@ -461,6 +461,50 @@ pub fn add_member(
     })
 }
 
+/// Extracts the SCP DID embedded in a `KeyPackage`'s leaf credential.
+///
+/// Reads the (unverified) `BasicCredential` from the key package's leaf node
+/// and parses it as an [`ScpCredential`] to recover the DID, validating only
+/// the protocol version first. This lets a driver name the member a key
+/// package belongs to *before* consuming the package in [`add_member`], so the
+/// membership record and the MLS leaf cannot disagree.
+///
+/// This is the standalone counterpart of the credential extraction
+/// `add_member` and `decrypt_with_sender_did` already perform internally; it
+/// exists so an in-browser participant driver (ADR-057) can read the joiner's
+/// DID off the wire-delivered key package without trusting a separately
+/// supplied DID.
+///
+/// The credential is read from the *unverified* key package. The DID is only
+/// as trustworthy as the subsequent [`add_member`] validation makes it: a
+/// malformed or mis-signed key package is rejected when it is actually added.
+/// Callers must treat the returned DID as advisory until the add succeeds.
+///
+/// # Errors
+///
+/// Returns [`MlsError::AddMemberFailed`] if the key package fails protocol
+/// version validation, [`MlsError::CredentialSerializationFailed`] if the leaf
+/// credential is not a parseable SCP `BasicCredential`.
+pub fn key_package_in_did(
+    key_package: &KeyPackageIn,
+    protocol_version: ProtocolVersion,
+) -> Result<String, MlsError> {
+    // A fresh in-memory provider supplies the crypto backend for validation;
+    // it holds no group state and is discarded.
+    let provider = InMemoryMlsProvider::default();
+    let verified = key_package
+        .clone()
+        .validate(provider.crypto(), protocol_version)
+        .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
+
+    let credential = verified.leaf_node().credential().clone();
+    let basic = BasicCredential::try_from(credential).map_err(|e| {
+        MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
+    })?;
+    let scp_cred = ScpCredential::from_bytes(basic.identity())?;
+    Ok(scp_cred.did)
+}
+
 /// The result of removing a member from an MLS group.
 ///
 /// Contains the Commit message that must be distributed to remaining members
@@ -983,5 +1027,24 @@ mod tests {
             SCP_CIPHERSUITE,
             "key package must use SCP ciphersuite"
         );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn key_package_in_did_recovers_embedded_did() {
+        // The DID a `key_package_in_did` reads must equal the DID the key
+        // package was generated for — proving a driver can name the joiner from
+        // the wire-delivered package without a separately supplied DID.
+        let cred = ScpCredential::new(
+            "did:dht:z6MkKeyPackageDidExtractFixture".to_string(),
+            None,
+            scp_primitives::SigningKeyId::Active,
+        )
+        .unwrap();
+        let (kp_bundle, _signer, _provider) = generate_key_package(&cred).unwrap();
+        let kp_in: KeyPackageIn = kp_bundle.key_package().clone().into();
+
+        let did = key_package_in_did(&kp_in, ProtocolVersion::Mls10).unwrap();
+        assert_eq!(did, "did:dht:z6MkKeyPackageDidExtractFixture");
     }
 }

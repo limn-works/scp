@@ -48,11 +48,17 @@ pub mod wrapping_extension;
 pub use credential::ScpCredential;
 pub use encrypt::DecryptedContent;
 pub use error::MlsError;
+
+// The MLS signing key pair appears in this crate's public op signatures
+// (`generate_key_package` returns it; `join_group` consumes it). Re-export it so
+// consumers — notably the in-browser participant driver (ADR-057) — can name
+// the type without taking a direct dependency on `openmls_basic_credential`.
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
     create_group_with_wrapping_key, destroy_group, generate_key_package,
-    generate_key_package_with_wrapping_key, join_group, remove_member,
+    generate_key_package_with_wrapping_key, join_group, key_package_in_did, remove_member,
 };
+pub use openmls_basic_credential::SignatureKeyPair;
 pub use wrapping_extension::{
     SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
     extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,
