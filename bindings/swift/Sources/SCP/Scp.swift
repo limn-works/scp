@@ -1044,6 +1044,14 @@ public extension SCP {
         try await inner.toolInvokeCrossContext(sourceHandle: sourceHandle, targetHandle: targetHandle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, chainDepth: chainDepth, proofTokens: proofTokens)
     }
 
+    // swiftlint:disable function_parameter_count
+    /// Forwards to ``Scp/toolInvokeCrossContextSaga`` on ``inner``.
+    func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws -> SagaResult {
+        try await inner.toolInvokeCrossContextSaga(sourceHandle: sourceHandle, targetHandle: targetHandle, callerDid: callerDid, toolRegistrationId: toolRegistrationId, inputJson: inputJson, assertedNonceHex: assertedNonceHex, timestampMs: timestampMs, chainDepth: chainDepth, ucanProofId: ucanProofId)
+    }
+
+    // swiftlint:enable function_parameter_count
+
     /// Forwards to ``Scp/toolRegister`` on ``inner``.
     func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws -> String {
         try await inner.toolRegister(handle: handle, definition: definition)
