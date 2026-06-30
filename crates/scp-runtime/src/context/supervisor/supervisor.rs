@@ -16472,7 +16472,6 @@ mod tests {
     /// over the SAME inner storage observes the real durable state.
     struct FailingSagaJournal {
         inner: ProtocolRepositorySagaJournal<InMemoryStorage>,
-        append_calls: std::sync::atomic::AtomicUsize,
         fail_append_on_state: Option<crate::context::supervisor::saga_journal::SagaState>,
         fail_mark_resolved_committed: std::sync::atomic::AtomicBool,
     }
@@ -16485,7 +16484,6 @@ mod tests {
         ) -> Self {
             Self {
                 inner: ProtocolRepositorySagaJournal::new(storage),
-                append_calls: std::sync::atomic::AtomicUsize::new(0),
                 fail_append_on_state,
                 fail_mark_resolved_committed: std::sync::atomic::AtomicBool::new(
                     fail_mark_resolved_committed,
@@ -16500,8 +16498,6 @@ mod tests {
             &self,
             entry: crate::context::supervisor::saga_journal::JournalEntry,
         ) -> Result<(), crate::context::supervisor::saga_journal::JournalError> {
-            self.append_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_append_on_state == Some(entry.state) {
                 return Err(crate::context::supervisor::saga_journal::JournalError::Io(
                     "injected saga-journal append fault".to_owned(),
@@ -16540,119 +16536,7 @@ mod tests {
         }
     }
 
-    /// A `PaymentAdapter` that counts `void` calls, so the NeedsRepair-arm tests
-    /// can assert the external escrow hold was HELD for operator repair
-    /// (`hold_external_for_repair`), NOT voided (`void_external_and_consume`).
-    /// Mirrors the adapter the actor-level reversal tests use.
-    struct VoidCountingPaymentAdapter {
-        voided: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl crate::economy::adapter::PaymentAdapter for VoidCountingPaymentAdapter {
-        fn adapter_id(&self) -> &'static str {
-            "void-counting"
-        }
-        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-            crate::economy::adapter::AdapterCapabilities {
-                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
-                supports_streaming: false,
-                supports_batch_auth: false,
-                supports_single_step: false,
-                min_amount: None,
-                max_amount: None,
-                typical_settlement_ms: 0,
-                requires_facilitator: false,
-            }
-        }
-        async fn authorize(
-            &self,
-            from_did: &DID,
-            to_did: &DID,
-            amount: scp_protocol::economy::types::Amount,
-            currency: scp_protocol::economy::types::CurrencyCode,
-            _metadata: crate::economy::adapter::PaymentMetadata,
-        ) -> Result<
-            crate::economy::adapter::PaymentAuthorization,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::PaymentAuthorization {
-                auth_id: [7u8; 32],
-                payer: from_did.clone(),
-                payee: to_did.clone(),
-                amount,
-                currency,
-                adapter_id: "void-counting".to_owned(),
-                created_at: 1_000_000,
-                expires_at: 2_000_000,
-                adapter_state: vec![],
-            })
-        }
-        async fn capture(
-            &self,
-            auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
-        {
-            Ok(crate::economy::adapter::PaymentReceipt {
-                receipt_id: [9u8; 32],
-                payer: auth.payer.clone(),
-                payee: auth.payee.clone(),
-                amount: auth.amount,
-                currency: auth.currency,
-                action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
-                context_id: None,
-                adapter_id: "void-counting".to_owned(),
-                adapter_proof: vec![],
-                timestamp: 1_000_001,
-                signature: vec![],
-                anchored: false,
-            })
-        }
-        async fn void(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            self.voided
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        async fn verify_authorization(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            Ok(())
-        }
-        async fn verify(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-        ) -> Result<
-            crate::economy::adapter::VerificationResult,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::VerificationResult {
-                valid: true,
-                adapter_id: "void-counting".to_owned(),
-                verified_amount: scp_protocol::economy::types::Amount(0),
-                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                verification_timestamp: 1_000_002,
-            })
-        }
-        async fn refund(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-            _amount: Option<scp_protocol::economy::types::Amount>,
-        ) -> Result<
-            crate::economy::adapter::RefundConfirmation,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::RefundConfirmation {
-                refund_id: [0u8; 32],
-                original_receipt_id: [9u8; 32],
-                refunded_amount: scp_protocol::economy::types::Amount(0),
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                adapter_proof: vec![],
-            })
-        }
-    }
+    use crate::context::test_support::VoidCountingPaymentAdapter;
 
     /// Build a `with_providers_and_journal` supervisor over a caller-supplied
     /// saga `journal` + `mls_storage` view + optional `persistence` /
@@ -16715,6 +16599,73 @@ mod tests {
         }
     }
 
+    /// Drive a real two-actor cross-context saga whose Commit-B settle persist
+    /// ALWAYS fails — exhausting `commit_with_retry` (the 500ms/1s/2s back-off)
+    /// into the `NeedsRepair` terminal — over a caller-supplied `journal`.
+    /// Returns the lifted saga result and the number of external-escrow `void`
+    /// calls the caller-side [`VoidCountingPaymentAdapter`] observed. The shared
+    /// body of the Err-arm test's two variants (production journal vs a
+    /// [`FailingSagaJournal`] that faults the seq-4 `NeedsRepair` append).
+    async fn drive_commit_exhaustion(
+        journal: Arc<dyn SagaJournal>,
+        creator_did: &str,
+        creator_key_seed: u8,
+        caller_did: &str,
+        nonce: [u8; 16],
+    ) -> (Result<SagaOutput, SagaError>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_key =
+            ed25519_dalek::SigningKey::from_bytes(&[creator_key_seed; 32]).verifying_key();
+        let voided = Arc::new(AtomicUsize::new(0));
+        let payment: Arc<dyn PaymentAdapterDyn> = Arc::new(VoidCountingPaymentAdapter {
+            voided: Arc::clone(&voided),
+        });
+        let persistence = FailContextPersistOncePersistence {
+            target_hex: hex::encode(XCTX_TARGET),
+            fail_on_call: 2, // Prepare-B = call 1 (succeeds); every Commit-B settle fails.
+            always: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = xctx_supervisor_with_journal(
+            creator_did.to_owned(),
+            creator_key,
+            journal,
+            mls_storage,
+            Some(Box::new(persistence)),
+            Some(payment),
+        );
+        let caller_state = xctx_caller_state(caller_did, creator_did).await;
+        let target_state = xctx_target_state(caller_did, creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let executor = move |input: serde_json::Value| async move {
+            let a = input["a"].as_i64().unwrap_or(0);
+            let b = input["b"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({ "result": a + b }))
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let result = supervisor
+            .start_cross_context_tool_invocation_saga(
+                xctx_request(caller_did, now_ms, nonce, 2),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await;
+        (result, voided.load(Ordering::SeqCst))
+    }
+
     /// LIVE Err-arm coverage (spec §6.2.4 "commit_with_retry exhausts (3×) →
     /// NeedsRepair"): a real two-actor cross-context saga whose Commit-B settle
     /// persist ALWAYS fails drives `commit_with_retry` to exhaust its budget, the
@@ -16739,10 +16690,8 @@ mod tests {
     /// captured through a THREAD-LOCAL recorder (the process-global tracing/metrics
     /// cache is poisoned across the parallel test binary).
     #[test]
-    #[allow(clippy::too_many_lines)] // two FSM-driven variants + setup in one metric-recorder scope
     fn xctx_saga_err_arm_commit_exhaustion_needs_repair_escrow_held() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -16754,80 +16703,31 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(async {
-                // ---- Variant 1: production journal records the NeedsRepair terminal ----
-                let creator_did = "did:dht:z6MkXctxErrArmCreator".to_owned();
-                let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
-                let journal_storage = Arc::new(InMemoryStorage::new());
+                // Variant 1: the production journal records the seq-4 NeedsRepair
+                // terminal durably; the saga surfaces from load_unresolved at
+                // NeedsRepair, and the operator metric fires.
                 let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
-                    Arc::clone(&journal_storage),
+                    Arc::new(InMemoryStorage::new()),
                 ));
-                let voided = Arc::new(AtomicUsize::new(0));
-                let payment: Arc<dyn PaymentAdapterDyn> = Arc::new(VoidCountingPaymentAdapter {
-                    voided: Arc::clone(&voided),
-                });
-                let persistence = FailContextPersistOncePersistence {
-                    target_hex: hex::encode(XCTX_TARGET),
-                    fail_on_call: 2, // Prepare-B = call 1 (succeeds); every Commit-B settle fails.
-                    always: true,
-                    calls: Arc::new(AtomicUsize::new(0)),
-                };
-                let mls_storage: Arc<
-                    dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
-                > = Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
-                let supervisor = xctx_supervisor_with_journal(
-                    creator_did.clone(),
-                    creator_key,
+                let (result, voided) = Box::pin(drive_commit_exhaustion(
                     Arc::clone(&journal),
-                    mls_storage,
-                    Some(Box::new(persistence)),
-                    Some(payment),
-                );
-                let caller_did = "did:dht:z6MkXctxErrArmCaller";
-                let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-                let target_state = xctx_target_state(caller_did, &creator_did).await;
-                Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
-
-                let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-                let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
-                let calls = Arc::new(AtomicUsize::new(0));
-                let calls_for_exec = Arc::clone(&calls);
-                let executor = move |input: serde_json::Value| {
-                    let calls = Arc::clone(&calls_for_exec);
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let a = input["a"].as_i64().unwrap_or(0);
-                        let b = input["b"].as_i64().unwrap_or(0);
-                        Ok(serde_json::json!({ "result": a + b }))
-                    }
-                };
-                let now_ms = supervisor.clock_ref().expect("clock").now_millis();
-                let err = supervisor
-                    .start_cross_context_tool_invocation_saga(
-                        xctx_request(caller_did, now_ms, [0x42u8; 16], 2),
-                        SagaSigningKeys {
-                            target: &target_signing,
-                            caller: &caller_signing,
-                        },
-                        executor,
-                    )
-                    .await
+                    "did:dht:z6MkXctxErrArmCreator",
+                    5,
+                    "did:dht:z6MkXctxErrArmCaller",
+                    [0x42u8; 16],
+                ))
+                .await;
+                let err = result
                     .expect_err("an always-failing Commit-B settle must exhaust → NeedsRepair");
-
                 assert!(
                     matches!(err, SagaError::NeedsRepair { .. }),
                     "commit-retry exhaustion must lift to NeedsRepair, got {err:?}"
                 );
                 assert_eq!(
-                    voided.load(Ordering::SeqCst),
-                    0,
+                    voided, 0,
                     "the NeedsRepair terminal MUST HOLD the Prepare-A escrow for operator repair \
                      (hold_external_for_repair), never void it"
                 );
-                // The production journal recorded the seq-4 NeedsRepair terminal durably.
                 let unresolved = journal.load_unresolved().await.unwrap();
                 let entry = unresolved
                     .first()
@@ -16838,76 +16738,27 @@ mod tests {
                     "the durable journal must record the NeedsRepair terminal, got {entry:?}"
                 );
 
-                // ---- Variant 2: the journal FAULTS the NeedsRepair append ----
-                // The append fault must NOT downgrade the in-memory terminal: the FSM
-                // sets reached_needs_repair=true BEFORE the fallible seq-4 append.
-                let creator_did2 = "did:dht:z6MkXctxErrArmFaultCreator".to_owned();
-                let creator_key2 =
-                    ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key();
-                let journal_storage2 = Arc::new(InMemoryStorage::new());
+                // Variant 2: a FailingSagaJournal faults the seq-4 NeedsRepair
+                // append; the lift STILL returns NeedsRepair (reached_needs_repair
+                // is set BEFORE the fallible append) and the durable journal stays
+                // at Committing — the terminal classification is independent of the
+                // journal append's success.
                 let journal2: Arc<dyn SagaJournal> = Arc::new(FailingSagaJournal::new(
-                    Arc::clone(&journal_storage2),
+                    Arc::new(InMemoryStorage::new()),
                     Some(crate::context::supervisor::saga_journal::SagaState::NeedsRepair),
                     false,
                 ));
-                let voided2 = Arc::new(AtomicUsize::new(0));
-                let payment2: Arc<dyn PaymentAdapterDyn> = Arc::new(VoidCountingPaymentAdapter {
-                    voided: Arc::clone(&voided2),
-                });
-                let persistence2 = FailContextPersistOncePersistence {
-                    target_hex: hex::encode(XCTX_TARGET),
-                    fail_on_call: 2,
-                    always: true,
-                    calls: Arc::new(AtomicUsize::new(0)),
-                };
-                let mls_storage2: Arc<
-                    dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
-                > = Arc::new(
-                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-                        Arc::new(InMemoryStorage::new()),
-                    ),
-                );
-                let supervisor2 = xctx_supervisor_with_journal(
-                    creator_did2.clone(),
-                    creator_key2,
+                let (result2, voided2) = Box::pin(drive_commit_exhaustion(
                     Arc::clone(&journal2),
-                    mls_storage2,
-                    Some(Box::new(persistence2)),
-                    Some(payment2),
+                    "did:dht:z6MkXctxErrArmFaultCreator",
+                    6,
+                    "did:dht:z6MkXctxErrArmFaultCaller",
+                    [0x43u8; 16],
+                ))
+                .await;
+                let err2 = result2.expect_err(
+                    "commit exhaustion → NeedsRepair even when the journal append faults",
                 );
-                let caller_did2 = "did:dht:z6MkXctxErrArmFaultCaller";
-                let caller_state2 = xctx_caller_state(caller_did2, &creator_did2).await;
-                let target_state2 = xctx_target_state(caller_did2, &creator_did2).await;
-                Box::pin(spawn_xctx_pair(&supervisor2, caller_state2, target_state2)).await;
-
-                let target_signing2 = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-                let caller_signing2 = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
-                let calls2 = Arc::new(AtomicUsize::new(0));
-                let calls_for_exec2 = Arc::clone(&calls2);
-                let executor2 = move |input: serde_json::Value| {
-                    let calls = Arc::clone(&calls_for_exec2);
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let a = input["a"].as_i64().unwrap_or(0);
-                        let b = input["b"].as_i64().unwrap_or(0);
-                        Ok(serde_json::json!({ "result": a + b }))
-                    }
-                };
-                let now_ms2 = supervisor2.clock_ref().expect("clock").now_millis();
-                let err2 = supervisor2
-                    .start_cross_context_tool_invocation_saga(
-                        xctx_request(caller_did2, now_ms2, [0x43u8; 16], 2),
-                        SagaSigningKeys {
-                            target: &target_signing2,
-                            caller: &caller_signing2,
-                        },
-                        executor2,
-                    )
-                    .await
-                    .expect_err(
-                        "commit exhaustion → NeedsRepair even when the journal append faults",
-                    );
-
                 assert!(
                     matches!(err2, SagaError::NeedsRepair { .. }),
                     "a NeedsRepair journal-append fault MUST NOT downgrade the terminal \
@@ -16915,12 +16766,9 @@ mod tests {
                      got {err2:?}"
                 );
                 assert_eq!(
-                    voided2.load(Ordering::SeqCst),
-                    0,
+                    voided2, 0,
                     "escrow held even when the NeedsRepair journal append faults"
                 );
-                // The NeedsRepair append faulted, so the durable journal's latest entry
-                // stays at Committing (seq-3) — the terminal lived only in memory.
                 let unresolved2 = journal2.load_unresolved().await.unwrap();
                 let entry2 = unresolved2
                     .first()

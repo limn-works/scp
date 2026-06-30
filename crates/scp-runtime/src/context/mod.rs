@@ -444,3 +444,8 @@ mod tests {
 // items sit together at the tail of the module.
 #[cfg(test)]
 mod agent_binding_pipeline_tests;
+
+// Crate-internal test-support fixtures shared across more than one in-crate
+// `#[cfg(test)]` module (the whole file is `#![cfg(test)]`).
+#[cfg(test)]
+pub(crate) mod test_support;
