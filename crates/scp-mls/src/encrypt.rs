@@ -341,22 +341,16 @@ pub fn decrypt_with_sender_did(
     // Look up the sender's credential from the group member list and parse
     // the SCP credential to extract the DID.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_did = g
+    let sender_credential = g
         .members()
         .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.credential)
         .ok_or_else(|| {
             MlsError::DecryptionFailed(format!(
                 "sender leaf index {sender_leaf_index:?} not found in group members"
             ))
-        })
-        .and_then(|m| {
-            let basic_cred = BasicCredential::try_from(m.credential).map_err(|e| {
-                MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}"))
-            })?;
-            let scp_cred = crate::credential::ScpCredential::from_bytes(basic_cred.identity())
-                .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
-            Ok(scp_cred.did)
         })?;
+    let sender_did = credential_to_did(&sender_credential)?;
 
     // Dispatch based on the processed message content type.
     match processed.into_content() {
@@ -380,6 +374,308 @@ pub fn decrypt_with_sender_did(
             // Proposals are cached by OpenMLS automatically during
             // process_message — no explicit action needed.
             Ok(DecryptedContent::Proposal { sender_did })
+        }
+    }
+}
+
+/// The membership changes an existing member observes when it processes an
+/// inbound MLS message.
+///
+/// Returned by [`decrypt_with_membership_changes`]. For an application message
+/// the change is [`InboundChange::Application`]. For an **add-only** Commit the
+/// change is [`InboundChange::Commit`], carrying the DIDs added by the Commit's
+/// Add proposals — recovered from the staged commit *before* it is merged, then
+/// merged — so an existing member can mirror the committer's membership-leaf
+/// appends and converge. For a Commit that carries any **Remove** proposal the
+/// change is [`InboundChange::UnsupportedMembershipChange`]: the staged commit
+/// is dropped **without merging**, so the MLS group stays on its current epoch
+/// and remains consistent with the caller's SCP-layer state (fail-closed, not
+/// half-applied). For a bare Proposal the change is [`InboundChange::Proposal`].
+#[derive(Clone, PartialEq, Eq)]
+pub enum InboundChange {
+    /// An application message carrying user plaintext and the sender DID.
+    Application {
+        /// The decrypted payload bytes.
+        plaintext: Vec<u8>,
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+    /// An **add-only** Commit that advanced the group epoch.
+    /// `merge_staged_commit` has already been called. `added_dids` are the SCP
+    /// DIDs of the members the Commit's Add proposals add, recovered from the
+    /// staged commit's Add proposals' `KeyPackage` leaf credentials before the
+    /// merge.
+    ///
+    /// A Commit carrying any Remove proposal never reaches this variant — it is
+    /// surfaced as [`InboundChange::UnsupportedMembershipChange`] *without*
+    /// merging, so this variant only ever describes an applied, add-only epoch
+    /// advance.
+    Commit {
+        /// The committer's DID string extracted from the MLS credential.
+        sender_did: String,
+        /// DIDs added by this Commit's Add proposals, in proposal order.
+        added_dids: Vec<String>,
+    },
+    /// A Commit that carries one or more Remove proposals, which this seam does
+    /// not converge.
+    ///
+    /// The staged commit was **dropped without merging**: the MLS group is left
+    /// on its current (pre-Commit) epoch, so MLS state and the caller's
+    /// SCP-layer state remain mutually consistent (pre-remove) rather than
+    /// half-advanced. The caller maps this to a fail-closed error; the group
+    /// stays usable on the old epoch.
+    ///
+    /// `removed_dids` are the SCP DIDs the Remove proposals would have evicted,
+    /// recovered from the *current* (pre-merge) group tree, so the caller can
+    /// report which members the rejected Commit targeted.
+    UnsupportedMembershipChange {
+        /// The committer's DID string extracted from the MLS credential.
+        sender_did: String,
+        /// DIDs the rejected Commit's Remove proposals would evict, in proposal
+        /// order, read from the pre-merge tree.
+        removed_dids: Vec<String>,
+    },
+    /// A Proposal cached by `OpenMLS` during `process_message`. No plaintext and
+    /// no committed membership change yet.
+    Proposal {
+        /// The sender's DID string extracted from the MLS credential.
+        sender_did: String,
+    },
+}
+
+impl std::fmt::Debug for InboundChange {
+    /// Manual `Debug` that REDACTS the decrypted plaintext.
+    ///
+    /// Per ADR-057 the tab boundary is the plaintext boundary: a
+    /// `{:?}`-formatted [`InboundChange::Application`] must never leak the
+    /// recovered cleartext into logs, panics, or test output. Only the byte
+    /// length is printed; the control variants forward their (non-secret)
+    /// fields.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Application {
+                plaintext,
+                sender_did,
+            } => f
+                .debug_struct("Application")
+                .field(
+                    "plaintext",
+                    &format_args!("<redacted {} bytes>", plaintext.len()),
+                )
+                .field("sender_did", sender_did)
+                .finish(),
+            Self::Commit {
+                sender_did,
+                added_dids,
+            } => f
+                .debug_struct("Commit")
+                .field("sender_did", sender_did)
+                .field("added_dids", added_dids)
+                .finish(),
+            Self::UnsupportedMembershipChange {
+                sender_did,
+                removed_dids,
+            } => f
+                .debug_struct("UnsupportedMembershipChange")
+                .field("sender_did", sender_did)
+                .field("removed_dids", removed_dids)
+                .finish(),
+            Self::Proposal { sender_did } => f
+                .debug_struct("Proposal")
+                .field("sender_did", sender_did)
+                .finish(),
+        }
+    }
+}
+
+/// Parses the SCP DID out of an MLS [`Credential`] (a `BasicCredential` whose
+/// identity payload is a `MessagePack`-encoded [`crate::credential::ScpCredential`]).
+///
+/// Shared by the sender-resolution paths and the membership-change recovery in
+/// [`decrypt_with_membership_changes`], so every place that names a member from
+/// an MLS leaf parses the credential identically.
+fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
+    let basic = BasicCredential::try_from(credential.clone())
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}")))?;
+    let scp_cred = crate::credential::ScpCredential::from_bytes(basic.identity())
+        .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
+    Ok(scp_cred.did)
+}
+
+/// Decrypts an inbound MLS message and, for a Commit, surfaces the membership
+/// changes it carries so an existing member can converge its SCP-layer state.
+///
+/// This is the existing-member counterpart of the joiner's
+/// [`crate::group::add_member`] path: the committer (adder) appends a
+/// `MemberJoined` event-log leaf and hands the new member the full log, while
+/// **existing** members learn of the add only by processing the Commit. To
+/// append the identical convergent membership leaf, an existing member needs
+/// the added member's DID — which [`decrypt_with_sender_did`] discarded. This
+/// function recovers it.
+///
+/// # Message Type Handling
+///
+/// - **`ApplicationMessage`** → [`InboundChange::Application`] (plaintext +
+///   sender DID), identical to [`decrypt_with_sender_did`].
+/// - **`StagedCommitMessage`, add-only** → the added members' DIDs are read
+///   from the Add proposals' `KeyPackage` leaf credentials **before**
+///   `merge_staged_commit` consumes the staged commit, the commit is then
+///   merged, and [`InboundChange::Commit`] is returned. The `KeyPackage`s inside
+///   the Add proposals were already validated by `process_message` (it rejects a
+///   Commit carrying an invalid Add), so the recovered added DIDs are
+///   authenticated.
+/// - **`StagedCommitMessage` carrying any Remove** → the staged commit is
+///   **dropped without merging** and [`InboundChange::UnsupportedMembershipChange`]
+///   is returned. The removed members' DIDs are recovered from the *current*
+///   (pre-merge) tree for reporting, but `merge_staged_commit` is **never
+///   called**, so the MLS group stays on its current epoch and remains
+///   consistent with the caller's SCP-layer state (fail-closed, not
+///   half-applied). The caller can keep using the group on the old epoch.
+/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** →
+///   [`InboundChange::Proposal`]; `OpenMLS` caches the proposal, no membership
+///   change is committed yet.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
+/// [`MlsError::DecryptionFailed`] if decryption or credential parsing fails, or
+/// [`MlsError::CommitProcessingFailed`] if an add-only staged commit cannot be
+/// merged. A Remove-bearing Commit does not error here — it is surfaced as
+/// [`InboundChange::UnsupportedMembershipChange`] without merging, leaving the
+/// group consistent.
+pub fn decrypt_with_membership_changes(
+    group: &mut ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<InboundChange, MlsError> {
+    if group.group.is_none() {
+        return Err(MlsError::GroupDestroyed);
+    }
+
+    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
+
+    let protocol_message = message_in
+        .try_into_protocol_message()
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
+    // must use `panic=unwind` (see the `decrypt` note above).
+    let process_result = catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(&group.provider, protocol_message)
+    }));
+
+    let processed = match process_result {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+
+    // Resolve the sender DID from their leaf credential before consuming the
+    // ProcessedMessage.
+    let sender = processed.sender().clone();
+    let Sender::Member(sender_leaf_index) = sender else {
+        return Err(MlsError::DecryptionFailed(
+            "sender is not a group member".to_string(),
+        ));
+    };
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let sender_credential = g
+        .members()
+        .find(|m| m.index == sender_leaf_index)
+        .map(|m| m.credential)
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} not found in group members"
+            ))
+        })?;
+    let sender_did = credential_to_did(&sender_credential)?;
+
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(InboundChange::Application {
+            plaintext: app_msg.into_bytes(),
+            sender_did,
+        }),
+        ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // Inspect the staged commit's proposals BEFORE merging. openmls lets
+            // us read `add_proposals()` / `remove_proposals()` off the
+            // StagedCommit while the group is still on its current epoch, so we
+            // can decide whether to merge WITHOUT first mutating MLS state.
+
+            // Recover the removed DIDs by mapping each Remove proposal's leaf
+            // index to that member's credential in the CURRENT tree — the
+            // removed leaf is still present pre-merge, and (critically) is read
+            // here BEFORE any merge so this lookup is valid whether or not we go
+            // on to merge.
+            let mut removed_dids = Vec::new();
+            {
+                let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+                for remove in staged_commit.remove_proposals() {
+                    let removed_index = remove.remove_proposal().removed();
+                    let credential = g
+                        .members()
+                        .find(|m| m.index == removed_index)
+                        .map(|m| m.credential)
+                        .ok_or_else(|| {
+                            MlsError::DecryptionFailed(format!(
+                                "removed leaf index {removed_index:?} not found in group members"
+                            ))
+                        })?;
+                    removed_dids.push(credential_to_did(&credential)?);
+                }
+            }
+
+            // FAIL-CLOSED: a Remove-bearing Commit is unsupported by this seam.
+            // Reject it WITHOUT merging — drop the StagedCommit here, leaving the
+            // MLS group on its current epoch. MLS state and the caller's
+            // SCP-layer state stay mutually consistent (pre-remove); the group
+            // remains usable. Merging first and rejecting afterwards would
+            // advance the MLS epoch + evict the leaf while the caller's
+            // membership/log stayed put — an internal MLS-vs-SCP skew. We do not
+            // merge before we have decided the Commit is one we can converge.
+            if !removed_dids.is_empty() {
+                // `staged_commit` is dropped at the end of this block without
+                // ever being passed to `merge_staged_commit`, so the group is
+                // unchanged.
+                return Ok(InboundChange::UnsupportedMembershipChange {
+                    sender_did,
+                    removed_dids,
+                });
+            }
+
+            // Add-only Commit: recover the added DIDs from the Add proposals'
+            // KeyPackage leaf credentials. These KeyPackages were validated by
+            // process_message (a Commit carrying an invalid Add is rejected
+            // above), so the DIDs are cryptographically authenticated, not
+            // advisory.
+            let mut added_dids = Vec::new();
+            for add in staged_commit.add_proposals() {
+                let did =
+                    credential_to_did(add.add_proposal().key_package().leaf_node().credential())?;
+                added_dids.push(did);
+            }
+
+            // Only now — having confirmed the change is add-only and supported —
+            // merge the staged commit to advance the group epoch (mirrors
+            // decrypt_with_sender_did — without this the group is corrupted).
+            let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+            g.merge_staged_commit(&group.provider, *staged_commit)
+                .map_err(|e| {
+                    MlsError::CommitProcessingFailed(format!("merging staged commit: {e}"))
+                })?;
+
+            Ok(InboundChange::Commit {
+                sender_did,
+                added_dids,
+            })
+        }
+        ProcessedMessageContent::ProposalMessage(_)
+        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+            Ok(InboundChange::Proposal { sender_did })
         }
     }
 }
@@ -728,6 +1024,172 @@ mod tests {
         if let DecryptedContent::Application { plaintext: pt, .. } = content {
             assert_eq!(pt, plaintext, "must decrypt after Commit processing");
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_surfaces_added_did() {
+        // Alice creates, adds Bob, then adds Carol. The existing member Bob
+        // processes Alice's add-Carol Commit and the seam must surface Carol's
+        // DID (recovered from the Add proposal's KeyPackage), so an existing
+        // member can mirror the committer's MemberJoined leaf and converge.
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
+        let add_bob = add_member(&mut alice_group, bob_kp).unwrap();
+        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _carol_signer, _carol_provider) =
+            generate_key_package(&carol_cred).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        let add_carol = add_member(&mut alice_group, carol_kp).unwrap();
+
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
+
+        match change {
+            InboundChange::Commit {
+                sender_did,
+                added_dids,
+            } => {
+                assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
+                assert_eq!(
+                    added_dids,
+                    vec!["did:dht:z6Mkcarol".to_owned()],
+                    "the seam surfaces Carol's DID from the Add proposal"
+                );
+            }
+            other => panic!("expected Commit change, got {other:?}"),
+        }
+
+        // The merge advanced Bob's epoch (proves the commit was applied).
+        assert_eq!(bob_group.epoch().unwrap(), 2, "two adds → epoch 2");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_rejects_remove_without_merging() {
+        // Alice creates, adds Bob and Carol, then removes Carol. The existing
+        // member Bob processes the remove Commit; the seam must REJECT it as
+        // UnsupportedMembershipChange (surfacing Carol's DID from the pre-merge
+        // tree) WITHOUT merging — so Bob's MLS group stays on its current epoch
+        // and is left consistent (fail-closed, not half-applied).
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(&alice_cred).unwrap();
+
+        let bob_cred = test_credential("bob");
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let add_bob =
+            add_member(&mut alice_group, bob_kp_bundle.key_package().clone().into()).unwrap();
+        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _carol_signer, _carol_provider) =
+            generate_key_package(&carol_cred).unwrap();
+        let add_carol = add_member(
+            &mut alice_group,
+            carol_kp_bundle.key_package().clone().into(),
+        )
+        .unwrap();
+        let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+        // Bob processes the add-Carol commit so his tree contains Carol.
+        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes).unwrap();
+
+        // Alice removes Carol.
+        let alice_own = alice_group.own_leaf_index().unwrap();
+        let members = alice_group.members().unwrap();
+        let carol_member = members
+            .iter()
+            .find(|m| {
+                m.index != alice_own && {
+                    let bc = BasicCredential::try_from(m.credential.clone()).unwrap();
+                    let sc = crate::credential::ScpCredential::from_bytes(bc.identity()).unwrap();
+                    sc.did == "did:dht:z6Mkcarol"
+                }
+            })
+            .unwrap();
+        let remove = crate::group::remove_member(&mut alice_group, carol_member.index).unwrap();
+        let remove_bytes = remove.commit.tls_serialize_detached().unwrap();
+
+        // Bob is on epoch 2 (create + add-Bob + add-Carol = two epoch advances
+        // since his epoch-0 join: join epoch 1, add-Carol epoch 2). Capture it
+        // so we can prove the rejected remove did NOT advance it.
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let change = decrypt_with_membership_changes(&mut bob_group, &remove_bytes).unwrap();
+        match change {
+            InboundChange::UnsupportedMembershipChange {
+                sender_did,
+                removed_dids,
+            } => {
+                assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
+                assert_eq!(
+                    removed_dids,
+                    vec!["did:dht:z6Mkcarol".to_owned()],
+                    "the seam surfaces Carol's DID from the pre-merge tree"
+                );
+            }
+            other => panic!("expected UnsupportedMembershipChange, got {other:?}"),
+        }
+
+        // FAIL-CLOSED, NOT half-applied: the remove Commit was dropped without
+        // merging, so Bob's MLS group is still on the SAME epoch it was before.
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a rejected remove-Commit must NOT advance the MLS epoch (no half-merge)"
+        );
+
+        // The group is still usable on the old epoch: Bob can still decrypt an
+        // application message Alice (still on the pre-remove epoch herself, since
+        // she committed the remove but Bob never applied it) — prove via a fresh
+        // Bob-side encrypt/serialize roundtrip that his group is intact.
+        let still_works = encrypt(&mut bob_group, b"post-reject").unwrap();
+        let _ = serialize_ciphertext(&still_works).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_application_variant() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let ct = encrypt(&mut alice_group, b"hi").unwrap();
+        let ct_bytes = serialize_ciphertext(&ct).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &ct_bytes).unwrap();
+        match change {
+            InboundChange::Application {
+                plaintext,
+                sender_did,
+            } => {
+                assert_eq!(plaintext, b"hi");
+                assert!(sender_did.starts_with("did:dht:z6Mk"));
+            }
+            other => panic!("expected Application change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_change_debug_redacts_application_plaintext() {
+        // ADR-057: a `{:?}`-formatted InboundChange::Application must print the
+        // byte length, NEVER the decrypted cleartext (the tab is the plaintext
+        // boundary).
+        let secret = b"DO-NOT-LOG-THIS-DECRYPTED-PAYLOAD";
+        let change = InboundChange::Application {
+            plaintext: secret.to_vec(),
+            sender_did: "did:dht:z6Mkalice".to_owned(),
+        };
+        let rendered = format!("{change:?}");
+        assert!(
+            !rendered.contains("DO-NOT-LOG-THIS-DECRYPTED-PAYLOAD"),
+            "Debug must NOT leak the decrypted plaintext, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted") && rendered.contains(&format!("{} bytes", secret.len())),
+            "Debug must report a redacted byte length, got: {rendered}"
+        );
     }
 
     mod proptest_tests {
