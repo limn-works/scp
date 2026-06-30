@@ -404,10 +404,11 @@ pub enum SagaAbortReason {
         /// limiter can compute it; `None` for the token-bucket hard limit.
         retry_after_ms: Option<u64>,
     },
-    /// A TRANSIENT, retryable abort: the target participant actor's mailbox was
+    /// A TRANSIENT, retryable abort: a participant actor's mailbox was
     /// saturated or closed during the Prepare phase (a `ContextError::ActorBusy`
-    /// on a Prepare-phase send — the command was never delivered and NEITHER
-    /// side committed), so the saga aborted cleanly and the caller should retry
+    /// on a Prepare-phase send — NEITHER side committed, since the Prepare-phase
+    /// reservation is released on every terminal path via its RAII guard), so the
+    /// saga aborted cleanly and the caller should retry
     /// after a back-off. Distinct from [`Self::Rejected`] (a permanent policy
     /// reject the caller must NOT blindly retry) and from a commit-phase
     /// `ActorBusy` (which exhausts the commit-retry budget and lifts to
@@ -5669,8 +5670,9 @@ impl Supervisor {
     ///   is propagated, never coerced to `0` (a `0` would read as "retry
     ///   immediately" and re-trip the same hard limit). A
     ///   [`ContextError::ActorBusy`] — a TRANSIENT Prepare-phase
-    ///   participant-mailbox saturation/closure (the command was never
-    ///   delivered, neither side committed) — becomes
+    ///   participant-mailbox saturation/closure (neither side committed — the
+    ///   Prepare-phase reservation is released on every terminal path via its
+    ///   RAII guard) — becomes
     ///   [`SagaAbortReason::MailboxSaturated`] carrying `retry_after_ms: None`
     ///   (no precise drain instant; conservative caller back-off) and the
     ///   dedicated retryable code `13068`, distinguishing it from a permanent
@@ -5701,8 +5703,9 @@ impl Supervisor {
         }
         // Resolve the abort reason AND the code together by STRUCTURAL variant
         // match (never by parsing the message string). A Prepare-phase
-        // `ActorBusy` is a TRANSIENT mailbox saturation/closure — the command
-        // was never delivered, neither side committed — so it gets the dedicated
+        // `ActorBusy` is a TRANSIENT mailbox saturation/closure — neither side
+        // committed (the Prepare-phase reservation is released on every terminal
+        // path via its RAII guard) — so it gets the dedicated
         // retryable reason + code `13068` BEFORE the generic `unwrap_or(13067)`
         // fallback, distinguishing it from a permanent reject. (A commit-phase
         // `ActorBusy` cannot reach here: it sets `needs_repair` and
@@ -17285,8 +17288,10 @@ mod tests {
     }
 
     /// A Prepare-phase `ContextError::ActorBusy` — a TRANSIENT
-    /// participant-mailbox saturation/closure (full or closed inbox; the command
-    /// was never delivered, so NEITHER side committed) — MUST lift to the
+    /// participant-mailbox saturation/closure (full or closed inbox, or a
+    /// dropped reply channel; NEITHER side committed, since the Prepare-phase
+    /// reservation is released on every terminal path via its RAII guard) — MUST
+    /// lift to the
     /// dedicated retryable `SagaAbortReason::MailboxSaturated` terminal carrying
     /// the new code `13068`, NOT the permanent `Rejected` reason and NOT the
     /// generic `13067` abort fallback.

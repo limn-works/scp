@@ -187,15 +187,20 @@ mod tests {
         );
     }
 
-    /// A transient `MailboxSaturated` abort surfaces its conservative
-    /// `retry_after_ms` STRUCTURALLY through the same `Aborted { retry_after_ms }`
-    /// kind as `RateLimited` (the retryable wrapper), formatting the dedicated
-    /// `SCP-SAGA-13068` code.
+    /// A transient `MailboxSaturated` abort surfaces its `retry_after_ms`
+    /// back-off hint STRUCTURALLY through the same `Aborted { retry_after_ms }`
+    /// kind as `RateLimited` (the retryable wrapper): a clearly-nonzero hint
+    /// flows through UNCHANGED, pinning the structural pass-through of the
+    /// `RateLimited | MailboxSaturated` fold (an always-`None` feed could not
+    /// distinguish that pass-through from a hardcoded `None`). The dedicated
+    /// `SCP-SAGA-13068` code is formatted from the numeric discriminant. (That
+    /// production `MailboxSaturated` always carries `None` is pinned separately
+    /// by the supervisor-side lift keystone.)
     #[test]
     fn mailbox_saturated_surfaces_retry_hint_and_formats_code() {
         let parts = decompose_saga_error(SagaError::Aborted {
             reason: SagaAbortReason::MailboxSaturated {
-                retry_after_ms: None,
+                retry_after_ms: Some(1234),
             },
             code: 13068,
             message: "participant actor mailbox saturated during Prepare".to_owned(),
@@ -204,9 +209,9 @@ mod tests {
         assert_eq!(
             parts.kind,
             SagaErrorKind::Aborted {
-                retry_after_ms: None,
+                retry_after_ms: Some(1234),
             },
-            "MailboxSaturated must surface through the retryable Aborted kind, None never coerced"
+            "MailboxSaturated must surface its back-off hint UNCHANGED through the retryable Aborted kind"
         );
     }
 
