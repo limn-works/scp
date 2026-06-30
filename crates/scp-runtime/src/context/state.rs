@@ -1483,7 +1483,11 @@ impl EpochState {
         Self {
             mls_epoch: 0,
             coordinator: EpochCoordinator::from_records(Vec::new(), context_id),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock; an in-browser
+            // client injects its hardened clock (ADR-057 §Prereq-2).
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
+                std::sync::Arc::new(scp_primitives::SystemClock),
+            ),
             needs_reconnect: false,
         }
     }
@@ -1790,7 +1794,10 @@ pub(crate) fn restore_grace_store_from_snapshot(
     context_id: &str,
     snapshot: &ContextSnapshot,
 ) -> (crate::crypto::mls::epoch_grace::EpochGraceStore, bool) {
-    let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+    // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+    let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
+        std::sync::Arc::new(scp_primitives::SystemClock),
+    );
     let mut needs_reconnect = snapshot.needs_reconnect;
 
     if !snapshot.grace_entries.is_empty() {

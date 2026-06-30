@@ -27,8 +27,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use openmls::prelude::*;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
-use super::error::MlsError;
-use super::group::ScpMlsGroup;
+use crate::error::MlsError;
+use crate::group::ScpMlsGroup;
 
 /// The result of decrypting an MLS protocol message.
 ///
@@ -141,6 +141,14 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     // (e.g., corrupted authentication tags). We guard against this with
     // catch_unwind to convert the panic into an MlsError::DecryptionFailed,
     // preventing a malicious relay from crashing the client process (DoS).
+    //
+    // NOTE (ADR-057 §Prereq-4): `catch_unwind` is INERT under the wasm default
+    // `panic=abort` — a single attacker-delivered tampered ciphertext would
+    // abort the whole tab (a remote-triggerable availability hit, worse than
+    // native). The browser target MUST therefore build with `panic=unwind`, and
+    // the wasm unwind-ABI panic-safety of openmls/RustCrypto across these
+    // `AssertUnwindSafe` boundaries must be re-validated — not "accept the
+    // no-op." This applies to every `catch_unwind` site in this file.
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
@@ -212,6 +220,8 @@ pub fn decrypt_with_sender_key(
     //
     // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts.
     // We guard against this with catch_unwind (same as in `decrypt`).
+    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
+    // must use `panic=unwind` (see the `decrypt` note above).
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
@@ -304,6 +314,8 @@ pub fn decrypt_with_sender_did(
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
+    // must use `panic=unwind` (see the `decrypt` note above).
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
     }));
@@ -341,7 +353,7 @@ pub fn decrypt_with_sender_did(
             let basic_cred = BasicCredential::try_from(m.credential).map_err(|e| {
                 MlsError::DecryptionFailed(format!("extracting BasicCredential: {e}"))
             })?;
-            let scp_cred = super::credential::ScpCredential::from_bytes(basic_cred.identity())
+            let scp_cred = crate::credential::ScpCredential::from_bytes(basic_cred.identity())
                 .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
             Ok(scp_cred.did)
         })?;
@@ -390,15 +402,15 @@ pub fn serialize_ciphertext(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::mls::credential::ScpCredential;
-    use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+    use crate::credential::ScpCredential;
+    use crate::group::{add_member, create_group, generate_key_package, join_group};
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_primitives::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -509,7 +521,7 @@ mod tests {
     fn encrypt_on_destroyed_group_fails() {
         let (mut alice_group, _bob_group) = setup_alice_bob();
 
-        super::super::group::destroy_group(&mut alice_group).unwrap();
+        crate::group::destroy_group(&mut alice_group).unwrap();
 
         let result = encrypt(&mut alice_group, b"should fail");
         assert!(result.is_err(), "encrypt must fail on destroyed group");
@@ -523,7 +535,7 @@ mod tests {
         let ciphertext_msg = encrypt(&mut alice_group, b"hello").unwrap();
         let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
 
-        super::super::group::destroy_group(&mut bob_group).unwrap();
+        crate::group::destroy_group(&mut bob_group).unwrap();
 
         let result = decrypt(&mut bob_group, &ciphertext_bytes);
         assert!(result.is_err(), "decrypt must fail on destroyed group");

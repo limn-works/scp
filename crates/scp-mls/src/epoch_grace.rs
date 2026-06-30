@@ -63,11 +63,10 @@
 //! a slice of expired epoch numbers.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
 
-use scp_primitives::Clock;
+use scp_primitives::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 /// Callback type invoked when epochs are expired or evicted from the grace store.
 ///
@@ -102,11 +101,12 @@ pub struct GraceEntry {
     pub expires_at_unix_secs: u64,
 }
 
-/// Hard ceiling for the epoch grace window: 30 seconds.
+/// Hard ceiling for the epoch grace window: 30 seconds, expressed in
+/// milliseconds for wall-clock deadline arithmetic.
 ///
 /// This bounds the forward secrecy window. It is intentionally not
 /// configurable — see ADR-001 criterion 6.
-const GRACE_WINDOW_DURATION: Duration = Duration::from_secs(30);
+const GRACE_WINDOW_MILLIS: u64 = 30_000;
 
 /// Maximum number of epochs the grace store will track simultaneously.
 ///
@@ -143,12 +143,22 @@ pub const MAX_GRACE_EPOCHS: usize = 100;
 /// This type is **not** `Sync`. It is intended to be used behind a mutex or
 /// owned by a single task.
 pub struct EpochGraceStore {
-    /// Map from epoch number to its grace window deadline.
-    epochs: HashMap<u64, Instant>,
+    /// Map from epoch number to its grace window deadline, stored as an
+    /// absolute wall-clock timestamp in **milliseconds** since the Unix epoch
+    /// (read from the injected [`Clock`]). Wall-clock (not monotonic
+    /// `Instant`) so the store carries no platform-clock dependency and
+    /// compiles to `wasm32` (ADR-057 §Prereq-2). The browser injects a
+    /// hardened `Clock`; the native runtime injects [`SystemClock`], giving
+    /// identical behavior.
+    epochs: HashMap<u64, u64>,
     /// Maximum number of epochs this store will track.
     max_capacity: usize,
     /// Optional callback invoked when epochs are expired or evicted.
     on_epoch_expired: Option<OnEpochExpired>,
+    /// Injected time source. Native runtime uses [`SystemClock`]; the browser
+    /// client injects its single hardened clock so the grace window cannot be
+    /// driven by a second, unhardened time source (ADR-057 §Prereq-1/§Prereq-2).
+    clock: Arc<dyn Clock>,
 }
 
 // Manual Debug impl because OnEpochExpired (Box<dyn FnMut>) doesn't impl Debug.
@@ -161,31 +171,52 @@ impl std::fmt::Debug for EpochGraceStore {
                 "on_epoch_expired",
                 &self.on_epoch_expired.as_ref().map(|_| "<callback>"),
             )
+            .field("clock", &"<clock>")
             .finish()
     }
 }
 
 impl EpochGraceStore {
     /// Creates a new, empty grace store with the default maximum capacity
-    /// of [`MAX_GRACE_EPOCHS`].
+    /// of [`MAX_GRACE_EPOCHS`], backed by the production [`SystemClock`].
+    ///
+    /// Use [`with_clock`](Self::with_clock) to inject a different time source
+    /// (e.g., the browser client's hardened clock, or a `TestClock`).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            epochs: HashMap::new(),
-            max_capacity: MAX_GRACE_EPOCHS,
-            on_epoch_expired: None,
-        }
+        Self::with_clock_and_capacity(Arc::new(SystemClock), MAX_GRACE_EPOCHS)
     }
 
-    /// Creates a new, empty grace store with a custom maximum capacity.
+    /// Creates a new, empty grace store with a custom maximum capacity, backed
+    /// by the production [`SystemClock`].
     ///
     /// Use this in tests to verify capacity enforcement with smaller limits.
     #[must_use]
     pub fn with_max_capacity(max_capacity: usize) -> Self {
+        Self::with_clock_and_capacity(Arc::new(SystemClock), max_capacity)
+    }
+
+    /// Creates a new, empty grace store backed by the given [`Clock`], with the
+    /// default maximum capacity of [`MAX_GRACE_EPOCHS`].
+    ///
+    /// The native runtime injects [`SystemClock`] (identical to [`new`](Self::new));
+    /// an in-browser client injects its single hardened clock so that the grace
+    /// window is governed by the same time source as the rest of the protocol
+    /// (ADR-057 §Prereq-1/§Prereq-2), never a hidden second clock.
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self::with_clock_and_capacity(clock, MAX_GRACE_EPOCHS)
+    }
+
+    /// Creates a new, empty grace store with both an injected [`Clock`] and a
+    /// custom maximum capacity.
+    #[must_use]
+    pub fn with_clock_and_capacity(clock: Arc<dyn Clock>, max_capacity: usize) -> Self {
         Self {
             epochs: HashMap::new(),
             max_capacity,
             on_epoch_expired: None,
+            clock,
         }
     }
 
@@ -231,10 +262,18 @@ impl EpochGraceStore {
             return expired;
         }
 
-        // If still at capacity after time-based purge, evict oldest by deadline.
+        // If still at capacity after time-based purge, evict oldest by
+        // deadline. Deadlines are wall-clock millis, so epochs added in the
+        // same millisecond tie; break ties by lowest epoch number (= entered
+        // grace earliest) for deterministic, insertion-order eviction. (The
+        // previous monotonic-`Instant` deadlines were strictly increasing per
+        // add, so this preserves that "oldest = added-earliest" behavior
+        // without depending on sub-millisecond clock resolution.)
         if self.epochs.len() >= self.max_capacity
-            && let Some((&oldest_epoch, _)) =
-                self.epochs.iter().min_by_key(|(_, deadline)| **deadline)
+            && let Some((&oldest_epoch, _)) = self
+                .epochs
+                .iter()
+                .min_by_key(|&(&epoch, &deadline)| (deadline, epoch))
         {
             self.epochs.remove(&oldest_epoch);
             expired.push(oldest_epoch);
@@ -245,9 +284,16 @@ impl EpochGraceStore {
             }
         }
 
-        self.epochs
-            .entry(epoch)
-            .or_insert_with(|| Instant::now() + GRACE_WINDOW_DURATION);
+        // Deadlines are absolute wall-clock millis (injected `Clock`), not a
+        // monotonic `Instant`: wasm32 has no monotonic source. A backward host
+        // clock jump after insertion can extend an epoch's grace window slightly;
+        // forward-secrecy exposure stays bounded by `MAX_GRACE_EPOCHS` capacity
+        // eviction regardless. This inherits the protocol-wide host-clock trust
+        // assumption (see `scp_primitives::time`); on the browser target the
+        // grace window is governed by the same single hardened `Clock` as the
+        // rest of the protocol (ADR-057 §Prereq-1/2), not a hidden second source.
+        let deadline = self.clock.now_millis().saturating_add(GRACE_WINDOW_MILLIS);
+        self.epochs.entry(epoch).or_insert(deadline);
 
         expired
     }
@@ -257,9 +303,10 @@ impl EpochGraceStore {
     /// Returns `false` if the epoch was never tracked or its window has expired.
     #[must_use]
     pub fn is_in_grace(&self, epoch: u64) -> bool {
+        let now = self.clock.now_millis();
         self.epochs
             .get(&epoch)
-            .is_some_and(|deadline| Instant::now() < *deadline)
+            .is_some_and(|deadline| now < *deadline)
     }
 
     /// Removes all epochs whose grace windows have expired.
@@ -276,7 +323,7 @@ impl EpochGraceStore {
     /// `delete_previous_epoch_keypairs()` (called automatically during commit
     /// merges) and its bounded `MessageSecretsStore`.
     pub fn expire_old_epochs(&mut self) -> Vec<u64> {
-        let now = Instant::now();
+        let now = self.clock.now_millis();
         let mut expired = Vec::new();
         self.epochs.retain(|&epoch, deadline| {
             if now < *deadline {
@@ -334,8 +381,9 @@ impl EpochGraceStore {
     /// Converts the current in-memory state to a list of persistable
     /// [`GraceEntry`] values.
     ///
-    /// Each entry's `expires_at_unix_secs` is computed by adding the remaining
-    /// grace duration (from `Instant::now()`) to the current wall-clock time.
+    /// Deadlines are already stored as absolute wall-clock millis (from the
+    /// injected [`Clock`]), so each entry's `expires_at_unix_secs` is simply
+    /// the deadline truncated to seconds — no monotonic-to-wall conversion.
     /// Epochs whose grace window has already expired are excluded.
     ///
     /// Called by the persistence layer after each epoch advance: the returned
@@ -344,19 +392,17 @@ impl EpochGraceStore {
     /// [`restore_from_entries`](Self::restore_from_entries).
     #[must_use]
     pub fn to_grace_entries(&self) -> Vec<GraceEntry> {
-        let now_instant = Instant::now();
-        let now_unix = unix_now_secs();
+        let now_millis = self.clock.now_millis();
         self.epochs
             .iter()
-            .filter_map(|(&epoch, &deadline)| {
-                if now_instant >= deadline {
+            .filter_map(|(&epoch, &deadline_millis)| {
+                if now_millis >= deadline_millis {
                     // Already expired — do not persist.
                     return None;
                 }
-                let remaining = deadline.duration_since(now_instant);
                 Some(GraceEntry {
                     epoch,
-                    expires_at_unix_secs: now_unix.saturating_add(remaining.as_secs()),
+                    expires_at_unix_secs: deadline_millis / 1000,
                 })
             })
             .collect()
@@ -380,8 +426,7 @@ impl EpochGraceStore {
     /// prevents unbounded growth from stale persisted data.
     ///
     pub fn restore_from_entries(&mut self, entries: &[GraceEntry]) -> Vec<u64> {
-        let now_unix = unix_now_secs();
-        let now_instant = Instant::now();
+        let now_unix = self.clock.now_secs();
         let mut expired = Vec::new();
 
         for entry in entries {
@@ -390,17 +435,22 @@ impl EpochGraceStore {
                 // requires immediate destruction.
                 expired.push(entry.epoch);
             } else {
-                let remaining_secs = entry.expires_at_unix_secs.saturating_sub(now_unix);
-                let deadline = now_instant + Duration::from_secs(remaining_secs);
+                // Deadlines are absolute wall-clock millis; the persisted form
+                // is wall-clock secs, so re-hydrate by promoting to millis.
+                // Preserves the absolute expiry across the crash boundary.
+                let deadline_millis = entry.expires_at_unix_secs.saturating_mul(1000);
                 // Only insert if not already present (idempotent restore).
-                self.epochs.entry(entry.epoch).or_insert(deadline);
+                self.epochs.entry(entry.epoch).or_insert(deadline_millis);
             }
         }
 
         // Enforce max_capacity: evict oldest by deadline until within bounds.
+        // Break deadline ties by lowest epoch number (see `add_epoch`).
         while self.epochs.len() > self.max_capacity {
-            if let Some((&oldest_epoch, _)) =
-                self.epochs.iter().min_by_key(|(_, deadline)| **deadline)
+            if let Some((&oldest_epoch, _)) = self
+                .epochs
+                .iter()
+                .min_by_key(|&(&epoch, &deadline)| (deadline, epoch))
             {
                 self.epochs.remove(&oldest_epoch);
                 expired.push(oldest_epoch);
@@ -439,17 +489,22 @@ pub struct StaleEpochMessage {
     pub epoch: u64,
 }
 
-/// Returns the current wall-clock time as Unix seconds using [`scp_primitives::SystemClock`].
-///
-/// Used by persistence methods to convert between `tokio::time::Instant`
-/// (monotonic, not persistable) and absolute timestamps that survive restarts.
-fn unix_now_secs() -> u64 {
-    scp_primitives::SystemClock.now_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Current wall-clock time in milliseconds, matching the deadline units
+    /// used internally by [`EpochGraceStore`] (all tests use the default
+    /// [`SystemClock`], so test fixtures that poke `store.epochs` directly must
+    /// build deadlines from the same clock).
+    fn test_now_millis() -> u64 {
+        SystemClock.now_millis()
+    }
+
+    /// Current wall-clock time in seconds, for building [`GraceEntry`] fixtures.
+    fn test_now_secs() -> u64 {
+        SystemClock.now_secs()
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]
@@ -537,17 +592,13 @@ mod tests {
     fn expire_old_epochs_removes_expired_and_returns_them() {
         let mut store = EpochGraceStore::new();
         // Manually insert an epoch with an already-expired deadline.
-        store
-            .epochs
-            .insert(0, Instant::now() - std::time::Duration::from_secs(1));
+        store.epochs.insert(0, test_now_millis() - 1000);
         store.add_epoch(1); // This one should still be valid.
 
         // Store has the manually-inserted epoch 0 + epoch 1 from add_epoch.
         // add_epoch(1) calls expire_old_epochs first, which would have
         // expired epoch 0. So we re-insert it to test expire directly.
-        store
-            .epochs
-            .insert(0, Instant::now() - std::time::Duration::from_secs(1));
+        store.epochs.insert(0, test_now_millis() - 1000);
         assert_eq!(store.len(), 2);
 
         let expired = store.expire_old_epochs();
@@ -572,9 +623,7 @@ mod tests {
     fn is_in_grace_returns_false_for_expired_epoch() {
         let mut store = EpochGraceStore::new();
         // Insert with past deadline.
-        store
-            .epochs
-            .insert(5, Instant::now() - std::time::Duration::from_secs(1));
+        store.epochs.insert(5, test_now_millis() - 1000);
         assert!(!store.is_in_grace(5));
     }
 
@@ -615,9 +664,7 @@ mod tests {
     fn add_epoch_calls_expire_before_insert() {
         let mut store = EpochGraceStore::new();
         // Manually insert an expired epoch.
-        store
-            .epochs
-            .insert(0, Instant::now() - std::time::Duration::from_secs(1));
+        store.epochs.insert(0, test_now_millis() - 1000);
         assert_eq!(store.len(), 1);
 
         // Adding a new epoch should expire epoch 0 first.
@@ -662,15 +709,9 @@ mod tests {
 
         // Insert epochs with progressively later deadlines.
         // Epoch 10 gets the earliest deadline, epoch 12 the latest.
-        store
-            .epochs
-            .insert(10, Instant::now() + std::time::Duration::from_secs(5));
-        store
-            .epochs
-            .insert(11, Instant::now() + std::time::Duration::from_secs(15));
-        store
-            .epochs
-            .insert(12, Instant::now() + std::time::Duration::from_secs(25));
+        store.epochs.insert(10, test_now_millis() + 5 * 1000);
+        store.epochs.insert(11, test_now_millis() + 15 * 1000);
+        store.epochs.insert(12, test_now_millis() + 25 * 1000);
         assert_eq!(store.len(), 3);
 
         // Adding epoch 13 should evict epoch 10 (oldest deadline).
@@ -743,9 +784,7 @@ mod tests {
         }));
 
         // Insert an already-expired epoch.
-        store
-            .epochs
-            .insert(5, Instant::now() - std::time::Duration::from_secs(1));
+        store.epochs.insert(5, test_now_millis() - 1000);
 
         // expire_old_epochs should fire the callback with epoch 5.
         let expired = store.expire_old_epochs();
@@ -814,15 +853,9 @@ mod tests {
         let mut store = EpochGraceStore::with_max_capacity(3);
 
         // Two expired epochs and one valid.
-        store
-            .epochs
-            .insert(0, Instant::now() - std::time::Duration::from_secs(1));
-        store
-            .epochs
-            .insert(1, Instant::now() - std::time::Duration::from_secs(1));
-        store
-            .epochs
-            .insert(2, Instant::now() + std::time::Duration::from_secs(25));
+        store.epochs.insert(0, test_now_millis() - 1000);
+        store.epochs.insert(1, test_now_millis() - 1000);
+        store.epochs.insert(2, test_now_millis() + 25 * 1000);
         assert_eq!(store.len(), 3);
 
         // Adding epoch 3: time-expired purge removes 0 and 1, making room
@@ -859,9 +892,7 @@ mod tests {
         // Insert a live epoch.
         store.add_epoch(5);
         // Insert an expired epoch.
-        store
-            .epochs
-            .insert(3, Instant::now() - Duration::from_secs(1));
+        store.epochs.insert(3, test_now_millis() - 1000);
 
         let entries = store.to_grace_entries();
         let epochs: Vec<u64> = entries.iter().map(|e| e.epoch).collect();
@@ -882,7 +913,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].epoch, 10);
         // The expiration should be roughly now + 30s.
-        let now = unix_now_secs();
+        let now = test_now_secs();
         let diff = entries[0].expires_at_unix_secs.saturating_sub(now);
         assert!(
             diff <= 31,
@@ -898,7 +929,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn restore_from_entries_retains_live_entries() {
         let mut store = EpochGraceStore::new();
-        let now = unix_now_secs();
+        let now = test_now_secs();
 
         let entries = vec![GraceEntry {
             epoch: 7,
@@ -915,7 +946,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn restore_from_entries_expires_old_entries() {
         let mut store = EpochGraceStore::new();
-        let now = unix_now_secs();
+        let now = test_now_secs();
 
         let entries = vec![GraceEntry {
             epoch: 3,
@@ -933,7 +964,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn restore_from_entries_mixed_live_and_expired() {
         let mut store = EpochGraceStore::new();
-        let now = unix_now_secs();
+        let now = test_now_secs();
 
         let entries = vec![
             GraceEntry {
@@ -967,7 +998,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn restore_is_idempotent() {
         let mut store = EpochGraceStore::new();
-        let now = unix_now_secs();
+        let now = test_now_secs();
 
         let entries = vec![GraceEntry {
             epoch: 5,
@@ -1018,7 +1049,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn restore_from_entries_caps_at_max_capacity() {
         let mut store = EpochGraceStore::with_max_capacity(3);
-        let now = unix_now_secs();
+        let now = test_now_secs();
 
         // Feed 5 live entries into a store with max_capacity=3.
         let entries: Vec<GraceEntry> = (0..5)

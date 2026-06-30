@@ -6,10 +6,15 @@
 //! an MLS `BasicCredential` identity payload. See ADR-001 and spec section
 //! 9.7.1 for the credential design, and ADR-039 for the signing key model.
 
-use scp_identity::{DidDocument, SigningKeyId, decode_multibase_key};
+// DID-document types come from `scp-protocol` directly (Slice 1a moved them
+// there for wasm32-safety), NOT from the tokio-coupled `scp-identity` — keeping
+// `scp-mls` inside the ADR-057 mechanical fence. `SigningKeyId` is hosted in
+// `scp-primitives`.
+use scp_primitives::SigningKeyId;
+use scp_protocol::identity::document::{DidDocument, decode_multibase_key};
 use serde::{Deserialize, Serialize};
 
-use super::error::MlsError;
+use crate::error::MlsError;
 
 /// Returns the default `SigningKeyId` (`Active`) for serde deserialization of
 /// credentials that predate the `signing_key_id` field (backward compat).
@@ -377,7 +382,7 @@ mod tests {
         let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
 
         if let Some(agent_pk) = agent_key {
-            let agent_vm = scp_identity::document::VerificationMethod {
+            let agent_vm = scp_protocol::identity::document::VerificationMethod {
                 id: format!("{TEST_DID}#agent"),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
                 controller: TEST_DID.to_owned(),

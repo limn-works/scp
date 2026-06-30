@@ -5,6 +5,8 @@
 
 pub mod attestation;
 pub mod block_list;
+pub mod did_attestation;
+pub mod document;
 pub mod private_state;
 pub mod private_state_events;
 pub mod scpid;

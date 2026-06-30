@@ -59,8 +59,7 @@ use scp_core::trust::{
     produce_participation_profile, verify_participation_requirements,
 };
 use scp_event_log::{Event, EventPayload, EventType};
-use scp_identity::IdentityError;
-use scp_identity::document::{DidDocument, VerificationMethod};
+use scp_identity::document::{DidDocument, DidDocumentError, VerificationMethod};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_testing::relay::behavior::{EquivocationConfig, ReplayConfig, SuppressionConfig};
@@ -352,7 +351,7 @@ async fn fabricated_did_document_agent_keys() {
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(err, IdentityError::MultipleAgentKeys { count: 2 }),
+        matches!(err, DidDocumentError::MultipleAgentKeys { count: 2 }),
         "expected MultipleAgentKeys with count=2, got: {err:?}"
     );
 }

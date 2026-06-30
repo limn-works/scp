@@ -40,8 +40,9 @@ use super::credential::ScpCredential;
 use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use super::error::MlsError;
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use super::storage::{InMemoryMlsProvider, new_provider};
+use super::storage::new_provider;
 use super::storage_adapter::OpenMlsStorageAdapter;
+use crate::crypto::mls::InMemoryMlsProvider;
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`

@@ -1,44 +1,47 @@
 //! MLS (Messaging Layer Security) wrapper for SCP.
 //!
-//! This module wraps `OpenMLS` to provide SCP-specific MLS group operations.
-//! Every SCP context maps to one MLS group. The wrapper exposes SCP-specific
-//! lifecycle operations and hides `OpenMLS` internals behind a clean interface.
+//! The **synchronous** MLS state machine (`group`, `encrypt`, `ratchet`,
+//! `credential`, `key_package`, `error`, `wrapping_extension`, `epoch_grace`,
+//! and the `InMemoryMlsProvider` alias) was lifted into the wasm32-safe
+//! [`scp_mls`] crate (ADR-057) so it can be shared by both the native node
+//! runtime and in-browser SCP clients. This module re-exports those items
+//! under their historical `crate::crypto::mls::*` paths so the rest of
+//! `scp-runtime` compiles unchanged, and keeps the **async durable-storage
+//! bridge** (`storage`, `provider`, `backend`, `production_backend`,
+//! `storage_adapter`) — the `block_in_place`/`ScpMlsProvider<S>` parts that are
+//! tokio-coupled and node-only.
 //!
 //! # Ciphersuite
 //!
 //! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (no
 //! ciphersuite negotiation). See ADR-001 for the rationale.
 //!
-//! # Modules
-//!
-//! - [`group`] — Group lifecycle: create, add member, remove member, destroy.
-//! - [`credential`] — SCP credential type (DID + UCAN) for MLS `LeafNode` fields.
-//! - [`storage`] — `StorageProvider` bridge to scp-platform storage adapters.
-//! - [`error`] — MLS-specific error types.
-//!
-//! # Phase 1 Scope
-//!
-//! Phase 1 implements group lifecycle (create, add, remove, destroy) with
-//! in-memory storage. Encrypt/decrypt (SCP-004) and ratcheting/key packages
-//! (SCP-005) are separate stories.
-//!
-//! See ADR-001 in `.docs/adrs/phase-1.md` for the full MLS wrapper design.
+//! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
+//! ADR-057 for the `scp-mls` extraction.
 
+// Runtime-coupled tests for `scp_mls::wrapping_extension` that exercise the
+// node-only sender-key protocol (carved out of the moved file; ADR-057).
+#[cfg(test)]
+mod wrapping_extension_runtime_tests;
+
+// Async durable-storage bridge — stays in scp-runtime (tokio-coupled, node-only).
 pub mod backend;
-pub mod credential;
-pub mod encrypt;
-pub mod epoch_grace;
-pub mod error;
-pub mod group;
-pub mod key_package;
 pub mod production_backend;
 pub mod provider;
-pub mod ratchet;
 pub mod storage;
 pub mod storage_adapter;
-pub mod wrapping_extension;
 
-// Re-export primary public API types for convenience.
+// Synchronous MLS state machine — re-exported from the wasm32-safe `scp-mls`
+// crate under the historical module paths (ADR-057). Existing call sites that
+// reference `crate::crypto::mls::{group, encrypt, ratchet, credential,
+// key_package, error, wrapping_extension, epoch_grace}::*` resolve unchanged.
+pub use scp_mls::{
+    InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package, ratchet,
+    wrapping_extension,
+};
+
+// Re-export primary public API types for convenience (mirrors the pre-extraction
+// flat re-exports so `crate::crypto::mls::{ScpCredential, MlsError, ...}` resolve).
 pub use credential::ScpCredential;
 pub use encrypt::DecryptedContent;
 pub use error::MlsError;
@@ -48,9 +51,7 @@ pub use group::{
     generate_key_package_with_wrapping_key, join_group, remove_member,
 };
 pub use provider::MlsCryptoProvider;
-pub use storage::{
-    InMemoryMlsProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, new_provider,
-};
+pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};
 pub use wrapping_extension::{
     SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
     extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,

@@ -34,9 +34,57 @@
 //!
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
-use super::IdentityError;
-use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
+use super::did_attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
+
+/// Synchronous, wasm-safe errors produced by the DID-document, verification-
+/// method, attestation, and multibase-decoding closure (ADR-057 Slice 1a).
+///
+/// These variants live in `scp-protocol` — not `scp-identity` — because the
+/// types that construct them ([`DidDocument`], the DID
+/// [`VerificationMethod`], [`super::did_attestation`], and
+/// [`decode_multibase_key`]) must compile to `wasm32-unknown-unknown` to back
+/// the in-browser client (ADR-057). `scp-identity`'s `IdentityError`, which
+/// also carries `tokio`/`scp-platform`-coupled custody and DHT variants,
+/// `#[from]`-wraps this type and re-exports the moved DID types, so every
+/// existing `scp_identity` consumer compiles unchanged.
+///
+/// Only the variants the moved closure actually constructs live here. The
+/// async/custody/DHT/relay variants stay in `scp_identity::IdentityError`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DidDocumentError {
+    /// The DID string (or a multibase key payload) has an invalid format.
+    #[error("invalid DID format: {0}")]
+    InvalidDidFormat(String),
+
+    /// DID document serialization failed.
+    #[error("document serialization error: {0}")]
+    DocumentSerializationError(String),
+
+    /// The resolved DID document (or an embedded service entry) could not be
+    /// deserialized.
+    #[error("DID document deserialization error: {0}")]
+    DocumentDeserializationError(String),
+
+    /// An invalid relay URL was provided (must use wss:// scheme and /scp/v1 path).
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(String),
+
+    /// An `#agent` verification method already exists in the DID document.
+    #[error("agent key already exists in DID document")]
+    AgentKeyAlreadyExists,
+
+    /// No `#agent` verification method exists in the DID document.
+    #[error("no agent key exists in DID document")]
+    AgentKeyNotFound,
+
+    /// The DID document contains multiple `#agent` verification methods.
+    #[error("DID document contains {count} #agent verification methods, expected at most 1")]
+    MultipleAgentKeys {
+        /// The number of `#agent` VMs found.
+        count: usize,
+    },
+}
 
 /// Custom serde helpers for hex-encoded fixed-size byte arrays.
 ///
@@ -384,16 +432,16 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::InvalidRelayUrl`] if the URL does not use
+    /// Returns [`DidDocumentError::InvalidRelayUrl`] if the URL does not use
     /// `wss://` scheme or does not contain the `/scp/v1` path.
-    pub fn add_relay_service(&mut self, url: &str) -> Result<(), IdentityError> {
+    pub fn add_relay_service(&mut self, url: &str) -> Result<(), DidDocumentError> {
         if !url.starts_with(SCP_RELAY_SCHEME) {
-            return Err(IdentityError::InvalidRelayUrl(format!(
+            return Err(DidDocumentError::InvalidRelayUrl(format!(
                 "URL must use wss:// scheme, got: {url}"
             )));
         }
         if !url.ends_with(SCP_RELAY_PATH) {
-            return Err(IdentityError::InvalidRelayUrl(format!(
+            return Err(DidDocumentError::InvalidRelayUrl(format!(
                 "URL must end with /scp/v1 path, got: {url}"
             )));
         }
@@ -439,18 +487,18 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
+    /// Returns [`DidDocumentError::InvalidRelayUrl`] if any URL fails validation.
     /// On error, no entries are modified (all-or-nothing).
-    pub fn set_relay_services(&mut self, urls: &[&str]) -> Result<(), IdentityError> {
+    pub fn set_relay_services(&mut self, urls: &[&str]) -> Result<(), DidDocumentError> {
         // Validate all URLs before modifying state (all-or-nothing).
         for url in urls {
             if !url.starts_with(SCP_RELAY_SCHEME) {
-                return Err(IdentityError::InvalidRelayUrl(format!(
+                return Err(DidDocumentError::InvalidRelayUrl(format!(
                     "URL must use wss:// scheme, got: {url}"
                 )));
             }
             if !url.ends_with(SCP_RELAY_PATH) {
-                return Err(IdentityError::InvalidRelayUrl(format!(
+                return Err(DidDocumentError::InvalidRelayUrl(format!(
                     "URL must end with /scp/v1 path, got: {url}"
                 )));
             }
@@ -597,9 +645,11 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DocumentDeserializationError`] if a custody
+    /// Returns [`DidDocumentError::DocumentDeserializationError`] if a custody
     /// attestation service entry exists but contains invalid data.
-    pub fn custody_attestation(&self) -> Result<Option<ScpKeyCustodyAttestation>, IdentityError> {
+    pub fn custody_attestation(
+        &self,
+    ) -> Result<Option<ScpKeyCustodyAttestation>, DidDocumentError> {
         let entry = self
             .service
             .iter()
@@ -618,12 +668,12 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DocumentSerializationError`] if the attestation
+    /// Returns [`DidDocumentError::DocumentSerializationError`] if the attestation
     /// cannot be serialized (should not happen for well-formed data).
     pub fn set_custody_attestation(
         &mut self,
         attestation: &ScpKeyCustodyAttestation,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<(), DidDocumentError> {
         // Remove any existing custody attestation entry.
         self.service
             .retain(|s| s.service_type != "ScpKeyCustodyAttestation");
@@ -665,13 +715,13 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DocumentSerializationError`] if adding this entry
+    /// Returns [`DidDocumentError::DocumentSerializationError`] if adding this entry
     /// would exceed the maximum of 10 identity link attestation entries (§3.5.3).
     pub fn set_identity_link_attestation(
         &mut self,
         platform: &str,
         attestation_id: &str,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<(), DidDocumentError> {
         // Check if an entry with this exact attestation_id already exists — replace it.
         let existing_pos = self.service.iter().position(|s| {
             s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE
@@ -699,7 +749,7 @@ impl DidDocument {
             .count();
 
         if current_count >= MAX_IDENTITY_LINK_ATTESTATIONS {
-            return Err(IdentityError::DocumentSerializationError(format!(
+            return Err(DidDocumentError::DocumentSerializationError(format!(
                 "maximum of {MAX_IDENTITY_LINK_ATTESTATIONS} identity link attestation entries exceeded"
             )));
         }
@@ -755,9 +805,9 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DocumentDeserializationError`] if a device
+    /// Returns [`DidDocumentError::DocumentDeserializationError`] if a device
     /// attestation service entry exists but the endpoint cannot be base64-decoded.
-    pub fn device_attestation_token(&self) -> Result<Option<Vec<u8>>, IdentityError> {
+    pub fn device_attestation_token(&self) -> Result<Option<Vec<u8>>, DidDocumentError> {
         use base64::Engine;
 
         let entry = self
@@ -771,7 +821,7 @@ impl DidDocument {
                 let token_bytes = base64::engine::general_purpose::STANDARD
                     .decode(&service.service_endpoint)
                     .map_err(|e| {
-                        IdentityError::DocumentDeserializationError(format!(
+                        DidDocumentError::DocumentDeserializationError(format!(
                             "failed to decode device attestation token from base64: {e}"
                         ))
                     })?;
@@ -879,7 +929,8 @@ impl DidDocument {
     /// continues to authorize `alsoKnownAs` republishes, and the
     /// retired-key history remains auditable.
     ///
-    /// Used by [`DidDht::migrate_identity`] when republishing the
+    /// Used by `DidDht::migrate_identity` (in the downstream `scp-identity`
+    /// crate) when republishing the
     /// OLD DID document with `alsoKnownAs` pointing at the new
     /// identity. After migration the OLD document's purpose is
     /// forwarding only; leaving `#active` / `#agent` listed as
@@ -940,11 +991,11 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::AgentKeyAlreadyExists`] if an `#agent` VM
+    /// Returns [`DidDocumentError::AgentKeyAlreadyExists`] if an `#agent` VM
     /// is already present.
-    pub fn add_agent_key(&mut self, public_key: &[u8]) -> Result<(), IdentityError> {
+    pub fn add_agent_key(&mut self, public_key: &[u8]) -> Result<(), DidDocumentError> {
         if self.has_agent_key() {
-            return Err(IdentityError::AgentKeyAlreadyExists);
+            return Err(DidDocumentError::AgentKeyAlreadyExists);
         }
 
         let did = &self.id;
@@ -975,10 +1026,10 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
-    pub fn remove_agent_key(&mut self) -> Result<(), IdentityError> {
+    /// Returns [`DidDocumentError::AgentKeyNotFound`] if no `#agent` VM exists.
+    pub fn remove_agent_key(&mut self) -> Result<(), DidDocumentError> {
         if !self.has_agent_key() {
-            return Err(IdentityError::AgentKeyNotFound);
+            return Err(DidDocumentError::AgentKeyNotFound);
         }
 
         self.verification_method
@@ -1012,14 +1063,14 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
+    /// Returns [`DidDocumentError::AgentKeyNotFound`] if no `#agent` VM exists.
     pub fn rotate_agent_key(
         &mut self,
         new_public_key: &[u8],
         sequence: u64,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<(), DidDocumentError> {
         if !self.has_agent_key() {
-            return Err(IdentityError::AgentKeyNotFound);
+            return Err(DidDocumentError::AgentKeyNotFound);
         }
 
         let did = &self.id;
@@ -1056,9 +1107,9 @@ impl DidDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::MultipleAgentKeys`] if more than one `#agent`
+    /// Returns [`DidDocumentError::MultipleAgentKeys`] if more than one `#agent`
     /// VM is found.
-    pub fn validate_agent_keys(&self) -> Result<(), IdentityError> {
+    pub fn validate_agent_keys(&self) -> Result<(), DidDocumentError> {
         let agent_count = self
             .verification_method
             .iter()
@@ -1066,7 +1117,7 @@ impl DidDocument {
             .count();
 
         if agent_count > 1 {
-            return Err(IdentityError::MultipleAgentKeys { count: agent_count });
+            return Err(DidDocumentError::MultipleAgentKeys { count: agent_count });
         }
 
         Ok(())
@@ -1210,6 +1261,59 @@ fn multibase_encode(bytes: &[u8]) -> String {
 /// Base58btc encoding (Bitcoin alphabet) via the `bs58` crate.
 fn base58btc_encode(input: &[u8]) -> String {
     bs58::encode(input).into_string()
+}
+
+/// Decodes a multibase-encoded public key (z-prefix = base58btc).
+///
+/// Beyond the encoding check, the decoded 32-byte payload is validated
+/// as an Ed25519 Edwards-curve point via
+/// `ed25519_dalek::VerifyingKey::from_bytes`. This rejects non-curve
+/// payloads only (ZIP-215 rules) — low-order / small-subgroup points
+/// are NOT rejected here; they are caught at signature verification
+/// time via `verify_strict`. Matches the `from_did`
+/// curve-point gate so both decoding entry points behave consistently.
+///
+/// # Errors
+///
+/// Returns [`DidDocumentError::InvalidDidFormat`] if the key is not properly
+/// base58btc encoded, not exactly 32 bytes, or does not decompress to a
+/// valid Ed25519 Edwards-curve point.
+pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], DidDocumentError> {
+    let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
+        DidDocumentError::InvalidDidFormat(
+            "multibase key must start with 'z' (base58btc)".to_owned(),
+        )
+    })?;
+
+    let decoded = base58btc_decode(b58_str)
+        .map_err(|e| DidDocumentError::InvalidDidFormat(format!("base58btc decode failed: {e}")))?;
+
+    let decoded_array: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        DidDocumentError::InvalidDidFormat(format!("expected 32-byte key, got {} bytes", v.len()))
+    })?;
+
+    // Curve-point validation: `ed25519_dalek::VerifyingKey::from_bytes`
+    // rejects byte strings that don't decompress to an Edwards-curve
+    // point (ZIP-215 rules). Low-order / small-subgroup points are NOT
+    // rejected here — they are caught at signature verification time
+    // via `verify_strict`. Matches the `from_did_inner` gate so
+    // both decoding entry points reject non-curve payloads early.
+    ed25519_dalek::VerifyingKey::from_bytes(&decoded_array).map_err(|e| {
+        DidDocumentError::InvalidDidFormat(format!(
+            "multibase key payload is not a valid Ed25519 public key: {e}"
+        ))
+    })?;
+
+    Ok(decoded_array)
+}
+
+/// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
+///
+/// Inverse of the `base58btc_encode` function above.
+fn base58btc_decode(input: &str) -> Result<Vec<u8>, String> {
+    bs58::decode(input)
+        .into_vec()
+        .map_err(|e| format!("base58btc decode error: {e}"))
 }
 
 /// Parses an `SCPBroadcastContext` service endpoint string into
@@ -2086,7 +2190,9 @@ mod tests {
 
     #[test]
     fn did_document_set_and_get_custody_attestation() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::identity::did_attestation::{
+            KeyCustodyModel, Platform, ScpKeyCustodyAttestation,
+        };
 
         let did = "did:dht:zWithAttestation";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
@@ -2107,7 +2213,9 @@ mod tests {
 
     #[test]
     fn did_document_set_custody_attestation_replaces_existing() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::identity::did_attestation::{
+            KeyCustodyModel, Platform, ScpKeyCustodyAttestation,
+        };
 
         let did = "did:dht:zReplaceAttestation";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
@@ -2146,7 +2254,9 @@ mod tests {
 
     #[test]
     fn did_document_custody_attestation_preserves_other_services() {
-        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+        use crate::identity::did_attestation::{
+            KeyCustodyModel, Platform, ScpKeyCustodyAttestation,
+        };
 
         let did = "did:dht:zPreserveServices";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
@@ -2171,7 +2281,7 @@ mod tests {
 
     #[test]
     fn did_document_custody_attestation_survives_json_roundtrip() {
-        use crate::attestation::{
+        use crate::identity::did_attestation::{
             AttestationPlatform, KeyCustodyModel, Platform, PlatformAttestation,
             ScpKeyCustodyAttestation,
         };
@@ -2530,5 +2640,96 @@ mod tests {
             "assertionMethod must drop #active; got: {:?}",
             doc.assertion_method
         );
+    }
+
+    // --- decode_multibase_key / base58btc_decode (moved from scp-identity::dht
+    //     per ADR-057 Slice 1a; these test the inverse of base58btc_encode) ---
+
+    #[test]
+    fn base58btc_decode_roundtrip() {
+        let original = [42u8; 32];
+        // Use the document module's encode (via the multibase_encode path).
+        let encoded = DidDocument::new("did:dht:zTest", &original, &[0u8; 32], &[0u8; 32]);
+        let vm = encoded.verification_method_by_fragment("0").unwrap();
+        let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// `decode_multibase_key` MUST reject payloads that don't decompress
+    /// to a valid Ed25519 Edwards-curve point. ed25519-dalek's
+    /// `from_bytes` enforces ZIP-215 curve-point decompression. About
+    /// half of random 32-byte strings fail this check, so we search for
+    /// one rather than hardcoding a specific value. Matches the
+    /// `from_did_rejects_non_ed25519_curve_point` guard so
+    /// both decoding entry points reject non-curve payloads early.
+    #[test]
+    fn decode_multibase_key_rejects_non_curve_point() {
+        use rand::RngCore;
+
+        // Search for a 32-byte payload that fails Ed25519 decompression.
+        let non_curve_bytes: [u8; 32] = {
+            let mut found: Option<[u8; 32]> = None;
+            for _ in 0..512 {
+                let mut candidate = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut candidate);
+                if ed25519_dalek::VerifyingKey::from_bytes(&candidate).is_err() {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.expect(
+                "should find a non-curve 32-byte payload within 512 tries (~50% rejection rate)",
+            )
+        };
+
+        // base58btc-encode the non-curve payload and prefix with `z`
+        // (matches the on-the-wire multibase form).
+        let encoded = format!("z{}", bs58::encode(&non_curve_bytes).into_string());
+
+        let err = decode_multibase_key(&encoded).expect_err("non-curve payload must be rejected");
+        match err {
+            DidDocumentError::InvalidDidFormat(msg) => {
+                assert!(
+                    msg.contains("not a valid Ed25519 public key"),
+                    "expected curve-point error message; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidDidFormat, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base58btc_decode_known_vector() {
+        // "JxF12TrwUP45BMd" is the base58btc encoding of "Hello World".
+        let decoded = base58btc_decode("JxF12TrwUP45BMd").unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn base58btc_decode_leading_ones() {
+        // Leading '1' characters map to leading zero bytes.
+        let decoded = base58btc_decode("112").unwrap();
+        assert_eq!(decoded, vec![0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn base58btc_decode_empty_input() {
+        let decoded = base58btc_decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn base58btc_decode_rejects_invalid_characters() {
+        // '0', 'O', 'I', 'l' are not in the Bitcoin base58 alphabet.
+        assert!(base58btc_decode("0OIl").is_err());
+    }
+
+    #[test]
+    fn base58btc_roundtrip_32_byte_key() {
+        // Direct roundtrip: encode with bs58, then decode with our function.
+        let key = [0xABu8; 32];
+        let encoded = bs58::encode(&key).into_string();
+        let decoded = base58btc_decode(&encoded).unwrap();
+        assert_eq!(decoded, key);
     }
 }

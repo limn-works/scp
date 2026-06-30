@@ -1025,26 +1025,20 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
 // Legacy in-memory provider support
 // ---------------------------------------------------------------------------
 
-/// The in-memory MLS provider type for backward compatibility.
-///
-/// Phase 1 code uses this type alias. New code should prefer
-/// [`ScpMlsProvider<S>`] for persistent storage.
-///
-/// See ADR-001 and ADR-006 for the storage provider strategy.
-pub type InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto;
-
 /// Creates a new in-memory MLS provider instance.
 ///
 /// Each provider instance has independent storage. This is retained for
-/// backward compatibility with existing tests and Phase 1 code.
+/// backward compatibility with existing tests and Phase 1 code. The
+/// `InMemoryMlsProvider` type alias itself now lives in the `scp-mls` crate
+/// (ADR-057); it is re-exported from `crate::crypto::mls`.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let provider = scp_runtime::crypto::mls::storage::new_provider();
+/// let provider = crate::crypto::mls::storage::new_provider();
 /// ```
 #[must_use]
-pub fn new_provider() -> InMemoryMlsProvider {
+pub(crate) fn new_provider() -> scp_mls::InMemoryMlsProvider {
     openmls_rust_crypto::OpenMlsRustCrypto::default()
 }
 

@@ -305,7 +305,7 @@ mod seal_open_tests {
         provenance: Option<Provenance>,
     ) -> InnerEnvelope {
         // Extract the MLS signer's private key bytes.
-        let signer = group.signer.as_ref().expect("group must have a signer");
+        let signer = group.signer_key_pair().expect("group must have a signer");
         let private_key_bytes: [u8; 32] = signer
             .private()
             .try_into()
@@ -583,7 +583,9 @@ mod seal_open_tests {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
 
         // Extract Alice's MLS signer key to create a properly signed inner.
-        let signer = alice_group.signer.as_ref().expect("group must have signer");
+        let signer = alice_group
+            .signer_key_pair()
+            .expect("group must have a signer");
         let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
         let members = alice_group.members().unwrap();
         let own_index = alice_group.own_leaf_index().unwrap();
@@ -903,7 +905,9 @@ mod seal_open_tests {
         // Create an inner envelope with a DID that is NOT in the group.
         // Sign with Alice's MLS signer key so signature verification would
         // pass, but the DID check should fail first.
-        let signer = alice_group.signer.as_ref().expect("group must have signer");
+        let signer = alice_group
+            .signer_key_pair()
+            .expect("group must have a signer");
         let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
 
         let custody = InMemoryKeyCustody::new();

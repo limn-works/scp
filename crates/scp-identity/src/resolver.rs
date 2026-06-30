@@ -35,11 +35,9 @@ use tracing::{debug, info, warn};
 
 use crate::IdentityError;
 use crate::cache::{Clock, DidCache, SystemClock};
-use crate::dht::{
-    decode_multibase_key, extract_public_key, verify_bep44_signature, verify_self_certification,
-};
+use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
 use crate::dht_client::{DhtClient, DhtRecord};
-use crate::document::DidDocument;
+use crate::document::{DidDocument, decode_multibase_key};
 use crate::republish::RelayPublisher;
 use crate::resolution::did_routing_id;
 

@@ -17,9 +17,9 @@
 use openmls::prelude::*;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
-use super::epoch_grace::EpochGraceStore;
-use super::error::MlsError;
-use super::group::ScpMlsGroup;
+use crate::epoch_grace::EpochGraceStore;
+use crate::error::MlsError;
+use crate::group::ScpMlsGroup;
 
 /// Processes an incoming Commit message, advancing the group to a new epoch.
 ///
@@ -175,7 +175,7 @@ pub fn propose_update_with_wrapping_key(
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
 
     let leaf_params =
-        super::wrapping_extension::leaf_node_params_with_wrapping_key(wrapping_pubkey)?;
+        crate::wrapping_extension::leaf_node_params_with_wrapping_key(wrapping_pubkey)?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let bundle = g
@@ -194,7 +194,7 @@ pub fn propose_update_with_wrapping_key(
 /// Serializes an [`MlsMessageOut`] to bytes for transmission.
 ///
 /// Convenience function for converting any MLS message (Commit, Welcome, etc.)
-/// from [`propose_update`] or [`add_member`](super::group::add_member) into
+/// from [`propose_update`] or [`add_member`](crate::group::add_member) into
 /// byte vectors suitable for transport.
 ///
 /// # Errors
@@ -209,15 +209,15 @@ pub fn serialize_mls_message(message: &MlsMessageOut) -> Result<Vec<u8>, MlsErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::mls::credential::ScpCredential;
-    use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+    use crate::credential::ScpCredential;
+    use crate::group::{add_member, create_group, generate_key_package, join_group};
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_primitives::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -318,7 +318,7 @@ mod tests {
         let commit = propose_update(&mut alice_group).unwrap();
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
-        crate::crypto::mls::group::destroy_group(&mut bob_group).unwrap();
+        crate::group::destroy_group(&mut bob_group).unwrap();
 
         let result = process_commit(&mut bob_group, &commit_bytes, &mut grace_store);
         assert!(
@@ -331,7 +331,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn propose_update_on_destroyed_group_fails() {
         let (mut alice_group, _bob_group) = setup_alice_bob();
-        crate::crypto::mls::group::destroy_group(&mut alice_group).unwrap();
+        crate::group::destroy_group(&mut alice_group).unwrap();
 
         let result = propose_update(&mut alice_group);
         assert!(
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn grace_window_old_epoch_ciphertext_decryptable_within_window() {
-        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+        use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn forward_secrecy_epoch_n_undecryptable_after_three_advances() {
-        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+        use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn grace_window_epoch_n_still_decryptable_after_two_advances() {
-        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+        use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
