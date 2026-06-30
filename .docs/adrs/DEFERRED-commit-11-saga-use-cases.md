@@ -40,6 +40,15 @@ reclassified as single-context async creation, also not a saga.)*
 - Supervisor-wide `saga_pending_guard` atomic bool — a concurrent
   `start_saga` while one is in flight returns
   `ContextError::ActorBusy("SagaBusy ...")`.
+  *(Superseded — see ADR-049 §3a, retained for historical provenance
+  only. The instance-wide `saga_pending_guard` AtomicBool was replaced
+  by per-participant-context-set reservation
+  (`reserved_saga_contexts: Mutex<HashSet<String>>` in `supervisor.rs`):
+  an instance-wide guard is exactly what §3a now **forbids** and
+  `scripts/check-saga-gating-granularity.sh` enforces against. A saga is
+  now rejected with `SagaBusy` only when its participant context set
+  overlaps an in-flight saga's set — not whenever any saga is in
+  flight — so disjoint sagas run concurrently.)*
 - Shim-parity integration tests for all 3 new dispatch methods
   (`actor_{standing,tools,broadcast}_shim.rs`).
 - Generic coordinator FSM tests exercising journal write ordering,
@@ -73,14 +82,22 @@ not specify (note: the original "§5.15.7" citation here was phantom —
   or does the commit-12 actor state reconciler do it on next boot.
 - Interaction with `register_standing_context` under replay.
 
-**Current placeholder.** `StandingCommand::InitiateStandingPairCreate`
-returns `ContextError::NotImplemented` referencing this gap. Non-saga
-`StandingContext` (get-or-create, idempotent) still routes through
-the legacy direct path.
+**Status (resolved).** The saga apparatus is removed: the
+`StandingCommand::InitiateStandingPairCreate` variant (and its
+`NotImplemented` reply) no longer exists, and the two-phase
+`CreationReceipt`-commitment / `StandingPairCreate` saga machinery has
+been deleted — standing-pair creation is **not** a saga (see the Gap-1
+Resolution blockquote above). Per §5.15.8 it is single-context async
+creation (`create` + `add_member` + Welcome, with the consent gate
+applied by the joining peer on Welcome receipt), reached via the
+idempotent `standing_context` get-or-create path. The spec leads the
+implementation, so this single-context-async creation path **is not yet
+wired** (§5.15.8: "the standing-pair creation path is not yet wired") —
+the saga-shaped `InitiateStandingPairCreate` variant and its `NotImplemented` reply are gone; the surviving not-yet-wired surface is the single-context-async creation path itself (its `reply_not_implemented` placeholder in `handlers/standing.rs`, pending wiring — consistent with exit criterion 2 below).
 
 ## Gap 2 — Cross-context tool invocation transport
 
-> **RESOLVED (2026-06-26).** The dead `ToolsCommand::InitiateCrossContextToolInvocation` mailbox variant that represented this "deferral" has been deleted. The §6.2.4 cross-context tool-invocation saga is produced supervisor-side by `Supervisor::start_cross_context_tool_invocation_saga`, not via the actor mailbox (its borrowed, non-`'static` `SagaSigningKeys` cannot move into a `'static` mailbox message). The saga's remaining surfaces — its FFI export (ADR-049 §3a) and cross-node wire transport (the current path drives co-resident target actors in-process) — are tracked in the saga workstream. The present-tense text below is the original problem statement, retained for historical provenance only.
+> **RESOLVED (2026-06-26).** The dead `ToolsCommand::InitiateCrossContextToolInvocation` mailbox variant that represented this "deferral" has been deleted. The §6.2.4 cross-context tool-invocation saga is produced supervisor-side by `Supervisor::start_cross_context_tool_invocation_saga`, not via the actor mailbox (its borrowed, non-`'static` `SagaSigningKeys` cannot move into a `'static` mailbox message). The saga's remaining surface — cross-node wire transport (the current path drives co-resident target actors in-process) — is tracked in the saga workstream. Its FFI export (ADR-049 §3a) has since shipped (see Gap-5 / exit criterion 4). The present-tense text below is the original problem statement, retained for historical provenance only.
 
 **What's missing.** The spec (§6.2) defines tool invocation within a
 context but not the cross-context forwarding path:
@@ -134,13 +151,16 @@ broadcast context:
 - Abort-on-rate-limit-exceeded semantics.
 - Snapshot format for the host's accepted-subscriber list.
 
-**Current placeholder.**
-`BroadcastCommand::InitiateBroadcastHostingHandshake` returns
-`ContextError::NotImplemented`.
+**Status (withdrawn).** WITHDRAWN — there is no placeholder. The
+`BroadcastCommand::InitiateBroadcastHostingHandshake` variant,
+`SagaInput::BroadcastHostingHandshake`, `broadcast/hosting_handshake.rs`,
+and the `SCP-SAGA-13100..13102` codes are all deleted; broadcast hosting
+handshake is a category error, not a saga (see the Gap-3 Resolution
+blockquote above and ADR-049 §3b). No `NotImplemented` reply remains.
 
 ## Gap 4 — Migration CustodyHandover envelope
 
-> **RESOLVED-AS-WITHDRAWN — see "Resolution (commit 11.5)" below. This operation does not exist; the cross-identity custody handover is a security violation (§5.11A.6) and `SagaInput::ContextMigration` / `ContextMigrationPrepared` are slated for deletion in a separate code-correctness PR. The present-tense text below is the original problem statement, retained for historical provenance only.**
+> **RESOLVED-AS-WITHDRAWN — see "Resolution (commit 11.5)" below. This operation does not exist; the cross-identity custody handover is a security violation (§5.11A.6) and `SagaInput::ContextMigration` / `ContextMigrationPrepared` were removed in a separate code-correctness PR (the types are now deleted — no FSM routing, no secret-bearing journal path). The present-tense text below is the original problem statement, retained for historical provenance only.**
 
 **What's missing.** Spec §9.4.3 describes the migration flow at a high
 level and defines the saga evidence bytes discipline (SHA-256
@@ -164,11 +184,14 @@ itself is underspecified:
 - Target-side Commit verification: must recompute the commitment and
   fail fast on mismatch.
 
-**Current placeholder.** The supervisor's
-`SagaInput::ContextMigration` variant routes through the FSM and
-journals as secret-bearing (`mark_resolved` is called with
-`secret_bearing = true` on Committed / Aborted). Prepare-A / Prepare-B
-dispatch returns `NotImplemented`.
+**Status (withdrawn).** WITHDRAWN — the `SagaInput::ContextMigration` /
+`ContextMigrationPrepared` types are deleted, so there is no FSM routing
+and no secret-bearing saga journal path. Context migration is a
+single-context governance action — `GovernanceAction::ProposeContextMigration`
+/ `CancelContextMigration`, with read-state via the
+`GovernanceCommand::MigrationState` query — **not** a saga (see the Gap-4
+Resolution blockquote above and ADR-049 §3 / §9.4.3). No `NotImplemented`
+dispatch remains.
 
 ## Gap 5 — FFI SagaId wire format (block-until-terminal vs async)
 
@@ -193,9 +216,20 @@ The saga surface requires a decision on the caller's wait model:
 - Timeout / cancellation semantics: what happens if the caller's
   FFI handle is dropped while a saga is in flight.
 
-**Current placeholder.** No FFI bridges currently expose `SagaId`
-at all. The supervisor's `start_saga` returns `SagaOutput { saga_id }`
-synchronously; commit 11.5 defines the FFI surface.
+**Status (resolved).** RESOLVED — the FFI saga surface is shipped. Each
+bridge (PyO3, UniFFI, napi) exposes the block-until-terminal public method
+`tool_invoke_cross_context_saga` for the sole live saga (§6.2.4). This is
+the public FFI entry; it drives the supervisor's internal
+`start_cross_context_tool_invocation_saga` and returns only after the saga
+reaches a terminal state. On the committed terminal it returns a
+`SagaResult` struct carrying the supervisor-minted `SagaId` (UUIDv4 string —
+the gap's subject) plus the target's signed receipt bytes and the captured
+tool-output bytes (every non-committed terminal raises a typed saga error
+instead); the `crates/scp-ffi/common/src/saga_errors.rs` module and the
+`SCP-SAGA-*` taxonomy map each terminal state to a language-native error.
+There is **no** `saga_state` status query (the async/poll wait model was
+withdrawn with Gap 4). See the Gap-5 Resolution blockquote above and
+ADR-049 §3a.
 
 ## Commit 11.5 exit criteria
 
@@ -205,6 +239,19 @@ are WITHDRAWN, so the criteria cover **2 spec gaps** — **1 saga**
 (cross-context tool invocation) plus the §5.15.8 single-context-async
 standing-pair spec, **not** 4 — and there is no `saga_state` export, the
 async/poll wait model having been withdrawn with Gap 4 per ADR-049 §3a.)
+
+> **Status — mostly satisfied as of the resolutions above.** This list is
+> the frozen definition-of-done, retained verbatim. Met: criterion 1 (both
+> spec gaps landed — §5.15.8 single-context-async standing-pair and §6.2.4
+> cross-context tool-invocation saga); criterion 4 (the FFI saga export —
+> `tool_invoke_cross_context_saga`, block-until-terminal, in all three
+> bridges); criterion 5 (SDK wrappers for each language target); and the
+> saga side of criterion 3 (the §6.2.4 integration tests). **Pending:** the
+> single-context-async standing-pair **wiring** — criterion 2's replacement
+> of the `reply_not_implemented` placeholder in `handlers/standing.rs`, plus
+> its criterion-3 test — remains unwired by design (the spec leads; §5.15.8
+> records "the standing-pair creation path is not yet wired," so there is no
+> live divergence to reconcile).
 
 1. A spec update (.docs/specs/ or a new ADR) filling in the **2** spec
    gaps (Gaps 1–2) with canonical wire formats and state-machine tables —
@@ -313,10 +360,11 @@ downstream PR):
   models as single-context governance (§7.3.2.1's "Seed custody and
   admin rotation" paragraph re-wraps the participation signing seed to the incoming admin's `#0` via
   HPKE; §5.15.5 "governance never requires cross-context
-  coordination"). `SagaInput::ContextMigration` has zero callers. The
-  `SagaInput::ContextMigration` / `ContextMigrationPrepared` types and
-  the §9.4.3 secret-bearing journal path are **to be deleted in the
-  code task** — this gap is NOT specced. The downward correction lands
+  coordination"). The `SagaInput::ContextMigration` /
+  `ContextMigrationPrepared` types are **removed** — the type no longer
+  exists anywhere in `crates/`, so the §9.4.3 secret-bearing journal
+  path has no migration variant to route — this gap is NOT specced. The
+  downward correction landed
   in ADR-049 §3 (enumeration drops "context migration") and §4
   (withdrawn), §5.15.4 / §5.15.6 (no migration saga), and §9.4.3
   (re-scoped to "no live instance").
