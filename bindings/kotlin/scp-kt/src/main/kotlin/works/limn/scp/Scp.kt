@@ -1563,9 +1563,11 @@ class SCP internal constructor(
      * [SagaResult] on commit (carrying the supervisor-minted `sagaId` plus the
      * target's signed receipt and captured output, each `null` when absent and
      * never synthesized), or throws a typed [uniffi.scp.ScpException] for a
-     * non-committed terminal — `ScpException.SagaAborted` (the saga was
-     * rejected before running; carries an optional `retryAfterMs` back-off
-     * hint), `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
+     * non-committed terminal — `ScpException.SagaAborted` (a Prepare-phase
+     * abort: a PERMANENT rejection OR a RETRYABLE transient — rate limit or
+     * participant-mailbox saturation — distinguished by the `SCP-SAGA-*` code;
+     * carries an optional `retryAfterMs` back-off hint),
+     * `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
      * the durable `sagaId` operator-repair handle), or `ScpException.SagaBusy`
      * (the participant context set is contended; carries the
      * `contendedContext` id). Bridge-surfaced `ScpException.Validation` and

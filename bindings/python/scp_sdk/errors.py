@@ -115,7 +115,12 @@ class ValidationError(ScpError):
 
 class SagaAbortedError(ToolError):
     """A §6.2.4 saga aborted at a Prepare phase (authorization, freshness,
-    rate limit, or co-residency).
+    rate limit, co-residency, or transient participant-mailbox
+    saturation/unavailability).
+
+    An ``Aborted`` terminal may be a PERMANENT rejection the caller must not
+    blindly retry, OR a RETRYABLE transient (rate limit / mailbox saturation);
+    the two are distinguished by the ``SCP-SAGA-*`` code.
 
     Attributes:
         retry_after_ms: Rate-limit back-off hint in milliseconds when the

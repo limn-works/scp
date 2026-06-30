@@ -46,12 +46,12 @@ use scp_core::context::supervisor::{SagaAbortReason, SagaError};
 pub enum SagaErrorKind {
     /// A Prepare-phase abort (spec §6.2.4) — neither side committed.
     ///
-    /// `retry_after_ms` is read directly off the back-off-carrying reasons —
-    /// `SagaAbortReason::RateLimited` and `SagaAbortReason::MailboxSaturated`
-    /// (each an `Option<u64>`); a plain `Rejected` carries `None`. `None` is
-    /// propagated, NEVER coerced to `Some(0)` — a `0` would read as "retry
-    /// immediately" and re-trip the same hard limit / re-saturate the same
-    /// mailbox.
+    /// `retry_after_ms` is read off the back-off-carrying
+    /// `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit
+    /// `SagaAbortReason::MailboxSaturated` (no precise drain instant) and a plain
+    /// `Rejected` both carry `None`. `None` is propagated, NEVER coerced to
+    /// `Some(0)` — a `0` would read as "retry immediately" and re-trip the same
+    /// hard limit / re-saturate the same mailbox.
     Aborted {
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -94,11 +94,12 @@ pub struct SagaErrorParts {
 /// This is the SINGLE home of the saga-error classification:
 ///
 /// - `Aborted { reason, code, message }` → `kind = Aborted { retry_after_ms }`
-///   where `retry_after_ms` is read directly off the back-off-carrying reasons
-///   `SagaAbortReason::RateLimited` / `SagaAbortReason::MailboxSaturated` (each
-///   an `Option<u64>`) and a plain `Rejected` carries `None`. `None` is
-///   propagated, NEVER coerced to `Some(0)`. `code` is formatted as the
-///   canonical `SCP-SAGA-{code}` string from the numeric discriminant.
+///   where `retry_after_ms` is read off the back-off-carrying
+///   `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit
+///   `SagaAbortReason::MailboxSaturated` and a plain `Rejected` both carry
+///   `None`. `None` is propagated, NEVER coerced to `Some(0)`. `code` is
+///   formatted as the canonical `SCP-SAGA-{code}` string from the numeric
+///   discriminant.
 /// - `NeedsRepair { saga_id, message }` → `kind = NeedsRepair { saga_id }`,
 ///   `code = SCP-SAGA-13065` (the durable operator-repair terminal).
 /// - `Busy { contended_context, message }` → `kind = Busy { contended_context }`,
@@ -112,9 +113,10 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
             message,
         } => {
             let retry_after_ms = match reason {
-                SagaAbortReason::RateLimited { retry_after_ms }
-                | SagaAbortReason::MailboxSaturated { retry_after_ms } => retry_after_ms,
-                SagaAbortReason::Rejected => None,
+                SagaAbortReason::RateLimited { retry_after_ms } => retry_after_ms,
+                // The unit `MailboxSaturated` (no precise drain instant) and a
+                // plain `Rejected` both carry no back-off hint.
+                SagaAbortReason::MailboxSaturated | SagaAbortReason::Rejected => None,
             };
             SagaErrorParts {
                 kind: SagaErrorKind::Aborted { retry_after_ms },
@@ -187,31 +189,24 @@ mod tests {
         );
     }
 
-    /// A transient `MailboxSaturated` abort surfaces its `retry_after_ms`
-    /// back-off hint STRUCTURALLY through the same `Aborted { retry_after_ms }`
-    /// kind as `RateLimited` (the retryable wrapper): a clearly-nonzero hint
-    /// flows through UNCHANGED, pinning the structural pass-through of the
-    /// `RateLimited | MailboxSaturated` fold (an always-`None` feed could not
-    /// distinguish that pass-through from a hardcoded `None`). The dedicated
-    /// `SCP-SAGA-13068` code is formatted from the numeric discriminant. (That
-    /// production `MailboxSaturated` always carries `None` is pinned separately
-    /// by the supervisor-side lift keystone.)
+    /// The transient unit `MailboxSaturated` abort decomposes to the retryable
+    /// `Aborted` kind carrying `retry_after_ms = None` (the variant has no
+    /// precise drain instant to surface, so it carries no hint) and formats the
+    /// dedicated `SCP-SAGA-13068` code from the numeric discriminant.
     #[test]
-    fn mailbox_saturated_surfaces_retry_hint_and_formats_code() {
+    fn mailbox_saturated_decomposes_to_retryable_aborted_kind_and_formats_code() {
         let parts = decompose_saga_error(SagaError::Aborted {
-            reason: SagaAbortReason::MailboxSaturated {
-                retry_after_ms: Some(1234),
-            },
+            reason: SagaAbortReason::MailboxSaturated,
             code: 13068,
-            message: "participant actor mailbox saturated during Prepare".to_owned(),
+            message: "participant actor inbox closed during Prepare".to_owned(),
         });
         assert_eq!(parts.code, "SCP-SAGA-13068");
         assert_eq!(
             parts.kind,
             SagaErrorKind::Aborted {
-                retry_after_ms: Some(1234),
+                retry_after_ms: None,
             },
-            "MailboxSaturated must surface its back-off hint UNCHANGED through the retryable Aborted kind"
+            "the unit MailboxSaturated must decompose to the retryable Aborted kind with no back-off hint"
         );
     }
 

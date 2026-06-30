@@ -357,8 +357,9 @@ pub enum SagaError {
     /// `SCP-SAGA-13xxx` discriminant of the underlying reject.
     #[error("SCP-SAGA-{code}: saga aborted: {message}")]
     Aborted {
-        /// Structured abort reason — `RateLimited { retry_after_ms }` or
-        /// `Rejected` — so the bridge reads the back-off hint without parsing.
+        /// Structured abort reason — `RateLimited { retry_after_ms }`,
+        /// `MailboxSaturated`, or `Rejected` — so the bridge reads the back-off
+        /// hint without parsing.
         reason: SagaAbortReason,
         /// The numeric `SCP-SAGA-13xxx` discriminant of the underlying reject.
         code: u16,
@@ -404,27 +405,22 @@ pub enum SagaAbortReason {
         /// limiter can compute it; `None` for the token-bucket hard limit.
         retry_after_ms: Option<u64>,
     },
-    /// A TRANSIENT, retryable abort: a participant actor's mailbox was
-    /// saturated or closed during the Prepare phase (a `ContextError::ActorBusy`
-    /// on a Prepare-phase send — NEITHER side committed, since the Prepare-phase
-    /// reservation is released on every terminal path via its RAII guard), so the
-    /// saga aborted cleanly and the caller should retry
-    /// after a back-off. Distinct from [`Self::Rejected`] (a permanent policy
-    /// reject the caller must NOT blindly retry) and from a commit-phase
-    /// `ActorBusy` (which exhausts the commit-retry budget and lifts to
-    /// `NeedsRepair`, not an abort). `retry_after_ms` carries an optional
-    /// conservative back-off hint: `None` means there is no precise back-off
-    /// instant to surface (mailbox saturation has no exact drain time) and the
-    /// caller should apply its own conservative back-off — mirroring the
-    /// token-bucket `RateLimited { None }` rationale on [`Self::RateLimited`].
-    /// Never coerced to `0`, since `0` would read as "retry immediately" and
-    /// re-saturate the same mailbox.
-    MailboxSaturated {
-        /// Conservative back-off hint in milliseconds; `None` (the saturation
-        /// case has no precise drain instant) — the caller applies its own
-        /// conservative back-off. Never coerced to `0`.
-        retry_after_ms: Option<u64>,
-    },
+    /// A TRANSIENT, retryable abort raised when a participant actor's inbox is
+    /// closed/terminated mid-saga during the Prepare phase, yielding an immediate
+    /// `ContextError::ActorBusy` on a Prepare-phase send. NEITHER side committed
+    /// (the Prepare-phase reservation is released or reconciled on every terminal
+    /// path), so the saga aborted cleanly and the caller should retry after its
+    /// own conservative back-off — there is no precise drain instant to surface,
+    /// so the variant carries no `retry_after_ms` hint (the authoritative
+    /// rationale for this terminal lives here; the lift and its tests reference
+    /// it rather than re-deriving). Reliably reached only for the
+    /// closed/terminated-inbox subcase: a transiently-full-but-OPEN mailbox may
+    /// instead race the phase timeout and surface as a generic Prepare timeout
+    /// abort. Distinct from [`Self::Rejected`] (a permanent policy reject the
+    /// caller must NOT blindly retry) and from a commit-phase `ActorBusy` (which
+    /// exhausts the commit-retry budget and lifts to `NeedsRepair`, not an
+    /// abort).
+    MailboxSaturated,
     /// Any other Prepare-phase rejection (authorization, freshness, schema,
     /// co-residency) — no back-off hint applies.
     Rejected,
@@ -5670,11 +5666,10 @@ impl Supervisor {
     ///   is propagated, never coerced to `0` (a `0` would read as "retry
     ///   immediately" and re-trip the same hard limit). A
     ///   [`ContextError::ActorBusy`] — a TRANSIENT Prepare-phase
-    ///   participant-mailbox saturation/closure (neither side committed — the
-    ///   Prepare-phase reservation is released on every terminal path via its
-    ///   RAII guard) — becomes
-    ///   [`SagaAbortReason::MailboxSaturated`] carrying `retry_after_ms: None`
-    ///   (no precise drain instant; conservative caller back-off) and the
+    ///   participant-inbox closure (neither side committed — the Prepare-phase
+    ///   reservation is released or reconciled on every terminal path) — becomes
+    ///   the unit [`SagaAbortReason::MailboxSaturated`] (see its doc for the
+    ///   reachability and back-off rationale) and the
     ///   dedicated retryable code `13068`, distinguishing it from a permanent
     ///   `Rejected`. (A COMMIT-phase `ActorBusy` cannot reach this block: it
     ///   exhausts the commit-retry budget, sets `needs_repair`, and
@@ -5703,9 +5698,10 @@ impl Supervisor {
         }
         // Resolve the abort reason AND the code together by STRUCTURAL variant
         // match (never by parsing the message string). A Prepare-phase
-        // `ActorBusy` is a TRANSIENT mailbox saturation/closure — neither side
-        // committed (the Prepare-phase reservation is released on every terminal
-        // path via its RAII guard) — so it gets the dedicated
+        // `ActorBusy` is a TRANSIENT participant-inbox closure — neither side
+        // committed (the Prepare-phase reservation is released or reconciled on
+        // every terminal path; see `SagaAbortReason::MailboxSaturated` for the
+        // authoritative rationale) — so it gets the dedicated
         // retryable reason + code `13068` BEFORE the generic `unwrap_or(13067)`
         // fallback, distinguishing it from a permanent reject. (A commit-phase
         // `ActorBusy` cannot reach here: it sets `needs_repair` and
@@ -5719,12 +5715,7 @@ impl Supervisor {
         // must not be synthesized for a failure that never occurred). The
         // message string still carries the specific cause.
         let (reason, code) = match &error {
-            ContextError::ActorBusy(_) => (
-                SagaAbortReason::MailboxSaturated {
-                    retry_after_ms: None,
-                },
-                13068,
-            ),
+            ContextError::ActorBusy(_) => (SagaAbortReason::MailboxSaturated, 13068),
             ContextError::RateLimited { retry_after_ms, .. } => (
                 SagaAbortReason::RateLimited {
                     retry_after_ms: *retry_after_ms,
@@ -16791,9 +16782,7 @@ mod tests {
             matches!(
                 &err,
                 SagaError::Aborted {
-                    reason: SagaAbortReason::MailboxSaturated {
-                        retry_after_ms: None
-                    },
+                    reason: SagaAbortReason::MailboxSaturated,
                     code: 13068,
                     ..
                 }
@@ -17164,9 +17153,7 @@ mod tests {
             matches!(
                 lifted,
                 SagaError::Aborted {
-                    reason: SagaAbortReason::MailboxSaturated {
-                        retry_after_ms: None
-                    },
+                    reason: SagaAbortReason::MailboxSaturated,
                     code: 13068,
                     ..
                 }
@@ -17288,10 +17275,9 @@ mod tests {
     }
 
     /// A Prepare-phase `ContextError::ActorBusy` — a TRANSIENT
-    /// participant-mailbox saturation/closure (full or closed inbox, or a
-    /// dropped reply channel; NEITHER side committed, since the Prepare-phase
-    /// reservation is released on every terminal path via its RAII guard) — MUST
-    /// lift to the
+    /// participant-inbox closure (a closed/terminated inbox or a dropped reply
+    /// channel; NEITHER side committed, since the Prepare-phase reservation is
+    /// released or reconciled on every terminal path) — MUST lift to the
     /// dedicated retryable `SagaAbortReason::MailboxSaturated` terminal carrying
     /// the new code `13068`, NOT the permanent `Rejected` reason and NOT the
     /// generic `13067` abort fallback.
@@ -17319,9 +17305,7 @@ mod tests {
             matches!(
                 &lifted,
                 SagaError::Aborted {
-                    reason: SagaAbortReason::MailboxSaturated {
-                        retry_after_ms: None
-                    },
+                    reason: SagaAbortReason::MailboxSaturated,
                     code: 13068,
                     ..
                 }
