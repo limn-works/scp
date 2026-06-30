@@ -286,7 +286,9 @@ public extension Context {
     ///     authenticated FFI identity by the bridge).
     ///   - toolRegistrationId: The target tool's registration id.
     ///   - input: The tool input as serialized JSON data.
-    ///   - assertedNonceHex: The caller-asserted freshness nonce (hex).
+    ///   - assertedNonceHex: The caller-asserted freshness nonce, as 32 hex
+    ///     characters (16 bytes); the bridge rejects other lengths with a
+    ///     `Validation` error.
     ///   - timestampMs: The caller-asserted freshness timestamp
     ///     (milliseconds since epoch).
     ///   - chainDepth: The caller-asserted inbound chain depth (0 for a
@@ -301,6 +303,8 @@ public extension Context {
     ///   terminal; ``ScpError/Context(msg:code:)`` (`SCP-CTX-2001`) if the
     ///   source context is not active; ``ScpError/Tool(msg:code:)``
     ///   (`SCP-TOOL-6001`) if the input is not valid UTF-8;
+    ///   ``ScpError/Tool(msg:code:)`` (`SCP-TOOL-6002`, propagated from the
+    ///   bridge) if `input` is valid UTF-8 but not valid JSON;
     ///   ``ScpError/Validation(msg:code:)`` (propagated from the bridge) if
     ///   `assertedNonceHex` is not 16-byte hex, or `callerDid` /
     ///   `toolRegistrationId` is malformed; ``ScpError/Permission(msg:code:)``

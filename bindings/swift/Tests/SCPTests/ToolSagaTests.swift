@@ -61,8 +61,8 @@ final class ToolSagaTests: XCTestCase {
         try await Context.create(scp: scp, identity: identity, params: makeParams())
     }
 
-    /// 64 hex chars = 32 bytes — a well-formed asserted-nonce input.
-    private let nonceHex = String(repeating: "ab", count: 32)
+    /// 32 hex chars = 16 bytes — a well-formed §6.2.4 asserted-nonce input.
+    private let nonceHex = String(repeating: "ab", count: 16)
 
     private func nowMs() -> UInt64 {
         UInt64(Date().timeIntervalSince1970 * 1000)
