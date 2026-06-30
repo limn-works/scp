@@ -1719,6 +1719,11 @@ class SCP internal constructor(
      * accessible attestations as [cachedAttestations] to populate it; the default
      * (empty) honestly reports only what the bridge's trust store already holds.
      *
+     * SECURITY: `attestationCount` is authentic-but-self-mintable — an issuer is
+     * self-certifying, so a subject can mint endorsements from DIDs it controls.
+     * It MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
+     *
      * An empty event log surfaces as [uniffi.scp.ScpException.Context] carrying
      * [NO_PARTICIPATION_FACTS_CODE]; callers wanting the empty-log case as a
      * zeroed record (rather than an exception) should use [evaluateTrust].
@@ -1757,6 +1762,12 @@ class SCP internal constructor(
      * The evaluation is labeled with the context the layers were computed against
      * — the handle's resolved [ContextHandle.contextId] — so it is never silently
      * mislabeled.
+     *
+     * SECURITY: the behavioral record's `attestationCount` (and any challenge
+     * results, where consumed) are authentic-but-self-mintable signals — an
+     * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+     * controls. They MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
      */
     suspend fun evaluateTrust(
         handle: ContextHandle,

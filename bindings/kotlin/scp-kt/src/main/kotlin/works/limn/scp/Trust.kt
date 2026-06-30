@@ -90,13 +90,17 @@ data class CapabilityValidation(
      *
      * SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It reports
      * that the UCAN tokens are *intrinsically well-formed and valid*; it does NOT
-     * authorize any action. In intrinsic mode (no challenge capability supplied —
-     * the mode [SCP.evaluateTrust] uses), the invoked-capability grant-match
-     * (step 6) is SKIPPED, so [allValid] being `true` does NOT assert that any
-     * specific capability is granted. To gate an action, pass the concrete
-     * capability to [SCP.ucanEvaluate] (which then includes grant-match in
-     * [signaturesValid]) — or use the enforcing UCAN validation path. Treating
-     * [allValid] as "the agent may do X" is a security error.
+     * authorize any action. In intrinsic mode (capability = `null` — no challenge
+     * capability supplied, the mode [SCP.evaluateTrust] uses), the
+     * invoked-capability grant-match (step 6) is SKIPPED, so [allValid] (and
+     * [signaturesValid] / [withinCeiling]) being `true` does NOT assert that any
+     * specific capability is granted. The diagnostic is also read-only: the nonce
+     * is probed but NOT consumed, so the evaluated tokens remain replayable
+     * against the enforcing path — another reason this is never an authorization
+     * decision. To gate an action, pass the concrete capability to
+     * [SCP.ucanEvaluate] (which then includes grant-match in [signaturesValid]) —
+     * or use the enforcing UCAN validation path (which consumes the nonce).
+     * Treating [allValid] as "the agent may do X" is a security error.
      */
     val allValid: Boolean
         get() =

@@ -112,14 +112,17 @@ public nonisolated struct CapabilityValidation: Sendable, Equatable {
     ///
     /// SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It
     /// reports that the UCAN tokens are *intrinsically well-formed and valid*;
-    /// it does NOT authorize any action. In intrinsic mode (no challenge
-    /// capability supplied — the mode `evaluateTrust` uses), the
-    /// invoked-capability grant-match (step 6) is SKIPPED, so `allValid` being
-    /// `true` does NOT assert that any specific capability is granted. To gate
-    /// an action, pass the concrete capability to `ucanEvaluate` (which then
-    /// includes grant-match in `signaturesValid`) — or use the enforcing UCAN
-    /// validation path. Treating `allValid` as "the agent may do X" is a
-    /// security error.
+    /// it does NOT authorize any action. In intrinsic mode (capability = `nil` —
+    /// no challenge capability supplied, the mode `evaluateTrust` uses), the
+    /// invoked-capability grant-match (step 6) is SKIPPED, so `allValid` (and
+    /// `signaturesValid` / `withinCeiling`) being `true` does NOT assert that any
+    /// specific capability is granted. The diagnostic is also read-only: the
+    /// nonce is probed but NOT consumed, so the evaluated tokens remain replayable
+    /// against the enforcing path — another reason this is never an authorization
+    /// decision. To gate an action, pass the concrete capability to
+    /// `ucanEvaluate` (which then includes grant-match in `signaturesValid`) — or
+    /// use the enforcing UCAN validation path (which consumes the nonce). Treating
+    /// `allValid` as "the agent may do X" is a security error.
     public var allValid: Bool {
         tokensValid
             && signaturesValid
@@ -683,6 +686,11 @@ public extension SCP {
     /// honestly reports only what the bridge's trust store already holds — it
     /// never fabricates attestations.
     ///
+    /// SECURITY: `attestationCount` is authentic-but-self-mintable — an issuer is
+    /// self-certifying, so a subject can mint endorsements from DIDs it controls.
+    /// It MUST NOT be a sole trust or admission factor; use the
+    /// threshold/independence path (§7.3.5) for Sybil resistance.
+    ///
     /// - Throws: ``ScpError`` on malformed FFI input or a behavioral compute
     ///   failure. An empty event log surfaces as ``ScpError/Context(msg:code:)``
     ///   carrying ``noParticipationFactsCode`` — callers wanting the empty-log
@@ -726,6 +734,12 @@ public extension SCP {
     /// The evaluation is labeled with the context the layers were computed
     /// against — the handle's resolved `contextId()` — so the result is never
     /// silently mislabeled.
+    ///
+    /// SECURITY: the behavioral record's `attestationCount` (and any challenge
+    /// results, where consumed) are authentic-but-self-mintable signals — an
+    /// issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+    /// controls. They MUST NOT be a sole trust or admission factor; use the
+    /// threshold/independence path (§7.3.5) for Sybil resistance.
     ///
     /// - Parameters:
     ///   - handle: The context handle to evaluate within.
