@@ -3237,4 +3237,65 @@ mod tests {
         // Tool count is never Merkle-anchored until ADR-051.
         assert!(!facts.tool_invocation_count_anchored);
     }
+
+    #[test]
+    fn adverse_action_types_pin_governance_variant_names() {
+        // Pins the `ADVERSE_ACTION_TYPES` string literals to the actual
+        // `GovernanceAction::variant_name()` output. The literals are matched
+        // against `variant_name()` at runtime in `is_adverse_action_type`, but
+        // nothing else binds the two; a future variant rename would silently
+        // make `governance_actions_against` stop counting that action. This test
+        // constructs every adverse variant and asserts the correspondence in
+        // both directions.
+        use crate::context::governance::{AccessScope, GovernanceAction};
+        use scp_primitives::DID;
+
+        let target = || DID::from("did:dht:z6MkAdverseTarget");
+
+        let adverse: &[GovernanceAction] = &[
+            GovernanceAction::SuspendCapability {
+                did: target(),
+                capabilities: vec![],
+            },
+            GovernanceAction::SuspendAccess { did: target() },
+            GovernanceAction::RevokeAccess {
+                did: target(),
+                access: AccessScope::Both,
+            },
+            GovernanceAction::RemoveMember {
+                did: target(),
+                reason: None,
+            },
+            GovernanceAction::ResetMember {
+                did: target(),
+                reason: String::new(),
+            },
+        ];
+
+        // Forward: every constructed adverse variant's name is in the set.
+        for action in adverse {
+            let name = action.variant_name();
+            assert!(
+                ADVERSE_ACTION_TYPES.contains(&name),
+                "GovernanceAction variant_name {name:?} is absent from \
+                 ADVERSE_ACTION_TYPES — a rename desynced the adverse-action \
+                 set; governance_actions_against would stop counting it",
+            );
+            // And the runtime classifier agrees.
+            assert!(is_adverse_action_type(name));
+        }
+
+        // Reverse: every literal in the set is produced by some constructed
+        // adverse variant, so a stale literal (renamed/removed variant) is
+        // also caught.
+        let produced: Vec<&str> = adverse.iter().map(GovernanceAction::variant_name).collect();
+        for literal in ADVERSE_ACTION_TYPES {
+            assert!(
+                produced.contains(literal),
+                "ADVERSE_ACTION_TYPES literal {literal:?} is not produced by \
+                 any constructed adverse GovernanceAction variant — it is \
+                 stale",
+            );
+        }
+    }
 }
