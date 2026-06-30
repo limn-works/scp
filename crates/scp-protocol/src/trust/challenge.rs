@@ -384,6 +384,17 @@ const DOMAIN_CHALLENGE_VERIFY_V1: &[u8] = b"SCP-CHALLENGE-VERIFY-V1:";
 /// verification should be re-issued.
 const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
 
+/// Maximum tolerated clock skew (in seconds) for a challenge response's
+/// `completed_at` timestamp relative to the verifier's clock.
+///
+/// A response claiming to have been completed meaningfully in the FUTURE is
+/// implausible (the verifier cannot have observed a response that has not
+/// happened yet) and is rejected — without this bound, the lower freshness
+/// bound (`completed_at >= now - timeout`) could be evaded by stamping an
+/// arbitrarily far-future `completed_at`. Set to 5 minutes to match the
+/// protocol-wide clock-skew tolerance (spec §9.14).
+const MAX_COMPLETION_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
 // ---------------------------------------------------------------------------
 // Canonical byte construction
 // ---------------------------------------------------------------------------
@@ -460,7 +471,7 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Ve
 ///
 /// # Errors
 ///
-/// Returns [`TrustError::ChallengeSigningFailed`] if the canonical hash cannot be
+/// Returns [`TrustError::CanonicalizationFailed`] if the canonical hash cannot be
 /// constructed.
 pub fn canonical_challenge_verification_bytes(
     verification: &ChallengeVerification,
@@ -496,7 +507,7 @@ pub fn canonical_challenge_verification_bytes(
     }
 
     canonical_hash_bytes(DOMAIN_CHALLENGE_VERIFY_V1, &fields).map_err(|e| {
-        TrustError::ChallengeSigningFailed {
+        TrustError::CanonicalizationFailed {
             reason: format!("canonical hash failed: {e}"),
         }
     })
@@ -632,9 +643,11 @@ pub fn issue_challenge(
 /// 2. **Responder identity:** The response's `responder_did` must match the
 ///    request's `subject_did` (the challenged entity must be the one
 ///    responding).
-/// 3. **Timeout:** The response's `completed_at` must be within the
-///    challenge's timeout window (relative to the current clock time minus
-///    the timeout duration).
+/// 3. **Freshness window:** The response's `completed_at` must be within the
+///    challenge's timeout window (not older than `now - timeout`) AND not
+///    implausibly in the future (not newer than `now + clock-skew tolerance`).
+///    A far-future `completed_at` is rejected so it cannot evade the lower
+///    staleness bound.
 /// 4. **Signature:** Verifies the Ed25519 signature against the responder's
 ///    public key, resolved via the provided [`DidPublicKeyResolver`].
 ///
@@ -685,13 +698,20 @@ pub fn verify_challenge_response(
     verify_ed25519_signature(&challenger_pk, &request_canonical, &request.signature)
         .map_err(|reason| TrustError::ChallengeRequestSignatureInvalid { reason })?;
 
-    // 3. Check timeout: response must not have been completed after the
-    //    deadline. We define the deadline as now (verification time).
-    //    The completed_at must be within the timeout window relative to the
-    //    current time, i.e., completed_at >= (now - timeout_secs).
+    // 3. Check the freshness window: `completed_at` must fall within the
+    //    acceptable band around the verifier's clock.
+    //    - Lower bound: not older than the timeout, i.e.
+    //      `completed_at >= now - timeout_secs`.
+    //    - Upper bound: not implausibly in the future, i.e.
+    //      `completed_at <= now + MAX_COMPLETION_FUTURE_SKEW_SECS`. Without this,
+    //      a far-future `completed_at` trivially satisfies the lower bound and a
+    //      stale/forged response could be replayed forever.
     let now = clock.now_secs();
     let timeout_secs = request.timeout.as_secs();
-    if now > timeout_secs && response.completed_at < (now - timeout_secs) {
+    let too_old = now > timeout_secs && response.completed_at < (now - timeout_secs);
+    let too_far_future =
+        response.completed_at > now.saturating_add(MAX_COMPLETION_FUTURE_SKEW_SECS);
+    if too_old || too_far_future {
         return Err(TrustError::ChallengeTimeout {
             challenge_id: request.challenge_id.clone(),
             timeout_secs,
@@ -1438,6 +1458,90 @@ mod tests {
             Err(TrustError::ChallengeTimeout { .. }) => {}
             other => panic!("expected ChallengeTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_challenge_response_rejects_far_future_completed_at() {
+        let (challenger_key, challenger_pubkey) = test_keypair();
+        let (subject_key, subject_pubkey) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let clock = TestClock::new(1000);
+
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
+        resolver.add_key("did:key:subject", subject_pubkey);
+
+        let request = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::schema_validation(),
+            TEST_CAPABILITY_URI.to_owned(),
+            serde_json::json!({}),
+            Duration::from_mins(1),
+            &signer,
+        )
+        .unwrap();
+
+        // completed_at is far in the future (now = 1000, skew bound = 300s).
+        // 1000 + 300 = 1300; completed_at = 100_000 is well past that, so the
+        // upper freshness bound rejects it even though it trivially satisfies the
+        // lower (staleness) bound.
+        let response = make_signed_response(
+            &subject_key,
+            &request.challenge_id,
+            "did:key:subject",
+            serde_json::json!({}),
+            100_000,
+        );
+
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
+        match result {
+            Err(TrustError::ChallengeTimeout { completed_at, .. }) => {
+                assert_eq!(completed_at, 100_000);
+            }
+            other => panic!("expected ChallengeTimeout for far-future completed_at, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_challenge_response_accepts_completed_at_within_future_skew() {
+        let (challenger_key, challenger_pubkey) = test_keypair();
+        let (subject_key, subject_pubkey) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let clock = TestClock::new(1000);
+
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
+        resolver.add_key("did:key:subject", subject_pubkey);
+
+        let request = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::schema_validation(),
+            TEST_CAPABILITY_URI.to_owned(),
+            serde_json::json!({}),
+            Duration::from_mins(5),
+            &signer,
+        )
+        .unwrap();
+
+        // completed_at slightly ahead of `now` (within the 300s skew tolerance):
+        // 1000 + 60 = 1060 <= 1000 + 300, so a small benign skew is accepted.
+        let response = make_signed_response(
+            &subject_key,
+            &request.challenge_id,
+            "did:key:subject",
+            serde_json::json!({}),
+            1060,
+        );
+
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
+        assert!(
+            result.is_ok(),
+            "expected Ok within skew tolerance, got {result:?}"
+        );
     }
 
     #[test]

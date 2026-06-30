@@ -48,9 +48,9 @@ fn lock_error() -> TrustError {
     // A poisoned lock is an INFRA fault, not a credential rejection. It must map
     // to a variant OUTSIDE the verify-on-ingest rejection allowlist
     // (`is_verification_rejection`) so it propagates rather than being silently
-    // swallowed as a dropped entry. `StoreError` is that variant;
-    // `InvalidEventData` is reserved for canonicalization failures (which ARE
-    // rejections), so the two must not share a variant.
+    // swallowed as a dropped entry. `StoreError` is that variant; the dedicated
+    // `CanonicalizationFailed` variant is the only canonicalization-rejection
+    // signal, so an infra fault can never collide with a rejection here.
     TrustError::StoreError {
         reason: "lock poisoned".to_owned(),
     }
@@ -167,13 +167,15 @@ impl AttestationRevocationChecker for RevocationStateChecker<'_> {
 /// dropping every credential on a transient backend error would zero a subject's
 /// trust without signal. Closed allowlist of rejection variants (white-hat P2-d).
 ///
-/// `InvalidEventData` / `ChallengeSigningFailed` are the canonicalization-failure
-/// variants raised by `canonical_attestation_bytes` /
-/// `canonical_challenge_verification_bytes`: a credential whose own bytes cannot
-/// be canonicalized cannot be authenticated, so it is a REJECTION of that one
-/// entry (drop it), not an infra fault. This relies on infra store faults using
-/// a DIFFERENT variant: `lock_error` maps a poisoned lock to `StoreError` (not
-/// `InvalidEventData`) precisely so the two never collide here.
+/// `CanonicalizationFailed` is the dedicated canonicalization-failure variant
+/// raised by `canonical_attestation_bytes` / `canonical_challenge_verification_bytes`:
+/// a credential whose own bytes cannot be canonicalized cannot be authenticated,
+/// so it is a REJECTION of that one entry (drop it), not an infra fault. It is
+/// purpose-built so the allowlist is closed by construction — no infrastructure
+/// path produces it, and it is NOT overloaded onto a general-purpose variant.
+/// `InvalidEventData` / `ChallengeSigningFailed` are deliberately EXCLUDED: they
+/// are no longer used by the ingest canonicalization paths, so treating them as
+/// rejections would risk silently swallowing an unrelated fault.
 const fn is_verification_rejection(err: &TrustError) -> bool {
     matches!(
         err,
@@ -185,8 +187,7 @@ const fn is_verification_rejection(err: &TrustError) -> bool {
             | TrustError::ChallengeVerificationSignatureInvalid { .. }
             | TrustError::ChallengeVerificationExpired { .. }
             | TrustError::ChallengeContextMismatch { .. }
-            | TrustError::InvalidEventData { .. }
-            | TrustError::ChallengeSigningFailed { .. }
+            | TrustError::CanonicalizationFailed { .. }
     )
 }
 
@@ -564,6 +565,21 @@ mod tests {
         }
     }
 
+    /// Resolver that returns the public key for the verifier DID used by
+    /// [`make_genuinely_signed_challenge_with`] (signing key `[3u8; 32]`), so a
+    /// genuinely-signed challenge result re-validates on the aggregation read
+    /// path (Fix 1). Fresh cached attestations are not re-verified, so the
+    /// resolver is only consulted for the challenge result here.
+    struct GenuineVerifierResolver;
+    impl scp_core::trust::attestation::DidPublicKeyResolver for GenuineVerifierResolver {
+        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+            Ok(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec())
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Integration test: full aggregation pipeline
     // -----------------------------------------------------------------------
@@ -584,7 +600,9 @@ mod tests {
         let context_id = "ctx-integration";
         let subject_did = "did:key:alice";
         let clock = TestClock::new(2000);
-        let resolver = NoOpResolver;
+        // Resolves the genuine challenge verifier key so the read-path
+        // re-validation (Fix 1) keeps the genuinely-signed challenge result.
+        let resolver = GenuineVerifierResolver;
 
         // --- Populate the store ---
         let store = InMemoryFfiTrustStore::new();
@@ -598,7 +616,9 @@ mod tests {
             .store_cached_attestation(context_id, cached_att)
             .unwrap();
 
-        let cr = make_challenge_result("cv-1", subject_did, context_id);
+        // A genuinely verifier-signed, in-context challenge result so it survives
+        // the aggregation read-path re-validation.
+        let cr = make_genuinely_signed_challenge(subject_did, context_id);
         store.store_challenge_result(context_id, &cr).unwrap();
 
         // --- Build events ---
@@ -664,7 +684,7 @@ mod tests {
         );
 
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].verification_id, "cv-1");
+        assert_eq!(input.challenge_results[0].verification_id, "genuine-cv-1");
         assert!(input.challenge_results[0].passed);
         assert_eq!(input.challenge_results[0].score, Some(95));
 
@@ -674,7 +694,7 @@ mod tests {
         // Verify JSON serialization (as the FFI bridges do).
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("att-integration-1"));
-        assert!(json.contains("cv-1"));
+        assert!(json.contains("genuine-cv-1"));
     }
 
     /// Builds a caller-supplied attestation that an attacker has marked "fresh"
@@ -1133,18 +1153,17 @@ mod tests {
         );
     }
 
-    /// Fix C (classifier). Canonicalization-failure variants are classified as
-    /// verify-on-ingest REJECTIONS (drop the one entry), while infra store faults
-    /// are NOT (they propagate). Pins the closed allowlist's membership.
+    /// Fix C (classifier). The dedicated `CanonicalizationFailed` variant is
+    /// classified as a verify-on-ingest REJECTION (drop the one entry), while
+    /// infra store faults are NOT (they propagate). The previously-overloaded
+    /// `InvalidEventData` / `ChallengeSigningFailed` variants are EXCLUDED so the
+    /// rejection set is closed by construction. Pins the closed allowlist's
+    /// membership.
     #[test]
     fn canonicalization_failures_are_rejections_infra_is_not() {
-        assert!(is_verification_rejection(&TrustError::InvalidEventData {
-            sequence: 0,
-            reason: "claim serialization failed".to_owned(),
-        }));
         assert!(is_verification_rejection(
-            &TrustError::ChallengeSigningFailed {
-                reason: "canonical hash failed".to_owned(),
+            &TrustError::CanonicalizationFailed {
+                reason: "claim serialization failed".to_owned(),
             }
         ));
         // Infra store fault (e.g. poisoned lock) must remain non-rejection so it
@@ -1152,6 +1171,18 @@ mod tests {
         assert!(!is_verification_rejection(&TrustError::StoreError {
             reason: "lock poisoned".to_owned(),
         }));
+        // The previously-overloaded variants are no longer rejections: they are
+        // not produced by the ingest canonicalization paths, so they must
+        // propagate rather than silently drop an entry.
+        assert!(!is_verification_rejection(&TrustError::InvalidEventData {
+            sequence: 0,
+            reason: "unrelated".to_owned(),
+        }));
+        assert!(!is_verification_rejection(
+            &TrustError::ChallengeSigningFailed {
+                reason: "unrelated".to_owned(),
+            }
+        ));
     }
 
     /// Fix C (behavioral). An invalid caller credential drops ONLY itself and

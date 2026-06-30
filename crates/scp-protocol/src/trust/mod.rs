@@ -153,9 +153,11 @@ pub enum TrustError {
         got: String,
     },
 
-    /// The challenge response was completed after the timeout window.
+    /// The challenge response's `completed_at` falls outside the acceptable
+    /// freshness window: either older than the timeout, or implausibly far in
+    /// the future relative to the verifier's clock (clock-skew bound).
     #[error(
-        "challenge {challenge_id}: timed out (timeout {timeout_secs}s, completed at \
+        "challenge {challenge_id}: outside freshness window (timeout {timeout_secs}s, completed at \
          {completed_at})"
     )]
     ChallengeTimeout {
@@ -179,6 +181,25 @@ pub enum TrustError {
     /// Signing a challenge request failed.
     #[error("challenge signing failed: {reason}")]
     ChallengeSigningFailed {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// Constructing the canonical signing/verification bytes for a
+    /// caller-supplied credential failed (e.g. evidence / claim / revocation
+    /// serialization or the canonical hash itself).
+    ///
+    /// Purpose-built so the verify-on-ingest rejection allowlist
+    /// (`is_verification_rejection`) can be keyed on a variant that NO
+    /// infrastructure path ever produces — a credential whose own bytes cannot
+    /// be canonicalized cannot be authenticated, so it is a REJECTION of that one
+    /// entry (drop it), never a transient backend fault (which uses
+    /// [`TrustError::StoreError`]). Keeping this distinct from
+    /// [`TrustError::InvalidEventData`] / [`TrustError::ChallengeSigningFailed`]
+    /// makes the rejection set closed by construction: those variants are no
+    /// longer overloaded to mean "drop one entry".
+    #[error("canonicalization failed: {reason}")]
+    CanonicalizationFailed {
         /// Human-readable description of the failure.
         reason: String,
     },
