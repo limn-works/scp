@@ -1469,7 +1469,7 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 > **Note:** ADR-055 is numbered sequentially but lives in the Phase 4 document by *subject*, not by number: it supersedes ADR-034 (WASM bridge re-implementation), which lives here. Its scope is the protocol's browser story and the FFI bridge set.
 
-**Status:** Decided. **Supersedes:** ADR-034. **Amended by:** ADR-055 §browser-deployment is revised by **ADR-057** (in-browser clients over a shared `scp-mls` crate, keys on-device) — the WASM *bridge* removal below stands; the conclusion that a browser must be a *remote thin client with no in-browser protocol execution* is superseded by the finding that the protocol compiles to wasm32 as *shared* code (no re-implementation, no parity tax).
+**Status:** Decided. **Supersedes:** ADR-034. **Amended by:** **ADR-057** (in-browser clients over a shared `scp-mls` crate, keys on-device) — the WASM *bridge* removal below stands; the conclusion that a browser must be a *remote thin client with no in-browser protocol execution* is revised by ADR-057's finding that the protocol compiles to wasm32 as *shared* code (no re-implementation, no parity tax). ADR-057 is a *constrained* form of this ADR's rejected alternative #3 (in-browser engine): it runs shared code rather than a re-implementation, and it *participates without coordinating* (scope-fenced), which is what defeats the maintenance-tax objection that drove this ADR.
 
 ### Context
 
