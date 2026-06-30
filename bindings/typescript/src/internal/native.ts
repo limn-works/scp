@@ -35,6 +35,7 @@ import type {
   MemberRole,
   Message,
   Proof,
+  SagaResult,
   ToolDefinition,
   ToolVerificationResult,
   TransportStatus,
@@ -904,6 +905,51 @@ export function createNativeBridge(scp: SCP): Bridge {
         chainDepth,
         proofTokens,
       );
+    },
+
+    // The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a)
+    async toolInvokeCrossContextSaga(
+      sourceHandle: BridgeContextHandle,
+      targetHandle: BridgeContextHandle,
+      callerDid: string,
+      toolRegistrationId: string,
+      inputJson: string,
+      assertedNonceHex: string,
+      timestampMs: bigint,
+      chainDepth: number,
+      ucanProofId?: string,
+    ): Promise<SagaResult> {
+      // `NapiSagaResult` arrives camelCase with `receipt`/`output` as a native
+      // `Buffer` (a faithful `Uint8Array` subtype) or `undefined`. Normalize the
+      // absent case to `null` — a faithful pass-through, never synthesized.
+      const raw = await (
+        native.toolInvokeCrossContextSaga as (
+          s: BridgeContextHandle,
+          t: BridgeContextHandle,
+          caller: string,
+          tool: string,
+          input: string,
+          nonce: string,
+          ts: bigint,
+          depth: number,
+          proof: string | undefined,
+        ) => Promise<{ sagaId: string; receipt?: Uint8Array; output?: Uint8Array }>
+      )(
+        sourceHandle,
+        targetHandle,
+        callerDid,
+        toolRegistrationId,
+        inputJson,
+        assertedNonceHex,
+        timestampMs,
+        chainDepth,
+        ucanProofId,
+      );
+      return {
+        sagaId: raw.sagaId,
+        receipt: raw.receipt ?? null,
+        output: raw.output ?? null,
+      };
     },
 
     // Stateful tool sessions (spec section 6.2.1)

@@ -14,7 +14,11 @@ import {
   IdentityError,
   McpError,
   mapBridgeError,
+  mapSagaError,
   PermissionError,
+  SagaAbortedError,
+  SagaBusyError,
+  SagaNeedsRepairError,
   ScpError,
   StorageError,
   ToolError,
@@ -311,5 +315,101 @@ describe("PreRotationCustodyError typed codes round-trip", () => {
     const mapped = mapBridgeError(bridgeError);
     expect(mapped).toBeInstanceOf(IdentityError);
     expect(mapped.code).toBe("SCP-IDENT-1001");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mapSagaError — §6.2.4 saga terminal Display-string reversal
+// ---------------------------------------------------------------------------
+
+describe("mapSagaError", () => {
+  it("maps a saga-aborted Display string to SagaAbortedError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13067] saga aborted: rate limited (retry_after_ms=2500)"),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-SAGA-13067");
+    expect((err as SagaAbortedError).retryAfterMs).toBe(2500);
+  });
+
+  it("maps a saga-needs-repair Display string to SagaNeedsRepairError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: diverged (saga_id=repair-77)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect(err.code).toBe("SCP-SAGA-13065");
+    expect((err as SagaNeedsRepairError).sagaId).toBe("repair-77");
+  });
+
+  it("maps a saga-busy Display string to SagaBusyError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13066] saga busy: overlap (contended_context=ctx-shared)"),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-SAGA-13066");
+    expect((err as SagaBusyError).contendedContext).toBe("ctx-shared");
+  });
+
+  it("reads the LAST retry_after_ms, ignoring a decoy embedded in the message", () => {
+    // The Display suffix is always terminal, so the end-anchored regex is
+    // last-anchored: a decoy `(retry_after_ms=999)` inside `{message}` is
+    // non-terminal and cannot match — only the genuine trailing 2500 does.
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13026] saga aborted: limiter (retry_after_ms=999) tripped (retry_after_ms=2500)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBe(2500);
+  });
+
+  it("reads the LAST saga_id, ignoring a decoy embedded in the message", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: id (saga_id=decoy) here (saga_id=real-88)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("real-88");
+  });
+
+  it("reads the LAST contended_context, ignoring a decoy embedded in the message", () => {
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13066] saga busy: ctx (contended_context=decoy) then (contended_context=real-ctx)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect((err as SagaBusyError).contendedContext).toBe("real-ctx");
+  });
+
+  it("maps a null retry_after_ms suffix to retryAfterMs null (never 0)", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13067] saga aborted: hard limit (retry_after_ms=null)"),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("maps an absent retry_after_ms suffix to retryAfterMs null", () => {
+    // Defensive: even if the suffix is somehow missing, the datum is null,
+    // never 0 (a `0` would read as "retry immediately" and re-trip the limit).
+    const err = mapSagaError(new Error("[SCP-SAGA-13067] saga aborted: no suffix"));
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("delegates a non-saga error to mapBridgeError", () => {
+    const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: target not active"));
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-TOOL-6011");
+  });
+
+  it("delegates a code-less string to mapBridgeError", () => {
+    const err = mapSagaError("something went wrong");
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-UNKNOWN-0000");
   });
 });

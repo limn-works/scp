@@ -37,10 +37,11 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
-import { ValidationError } from "./errors";
+import { mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
+import type { SagaResult } from "./types";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -1743,6 +1744,87 @@ export class SCP {
       chainDepth,
       proofTokens,
     );
+  }
+
+  /**
+   * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+   *
+   * The saga either commits — resolving to a {@link SagaResult} carrying the
+   * supervisor-minted `sagaId` plus the target's signed receipt and captured
+   * output bytes — or reaches a typed terminal, which rejects as one of the
+   * saga errors:
+   *
+   * - {@link SagaAbortedError} — a Prepare-phase rejection; carries
+   *   `retryAfterMs` (`null`, never `0`, when no precise back-off exists).
+   * - {@link SagaNeedsRepairError} — Commit retries exhausted; carries the
+   *   durable `sagaId` repair handle.
+   * - {@link SagaBusyError} — the participant context set overlapped an
+   *   in-flight saga; carries `contendedContext`.
+   *
+   * `timestampMs` is a JS `bigint` (the bridge's `u64` freshness field) and
+   * must be non-negative. `chainDepth` is the caller-asserted inbound
+   * provenance depth and must be an integer in the closed range `0..255` (the
+   * bridge's `u8`). Both are validated before the native dispatch (fail-fast).
+   *
+   * See spec §6.2.4 and ADR-049 §3a.
+   */
+  async toolInvokeCrossContextSaga(
+    sourceHandle: unknown,
+    targetHandle: unknown,
+    callerDid: string,
+    toolRegistrationId: string,
+    inputJson: string,
+    assertedNonceHex: string,
+    timestampMs: bigint,
+    chainDepth: number,
+    ucanProofId?: string,
+  ): Promise<SagaResult> {
+    if (typeof timestampMs !== "bigint" || timestampMs < 0n) {
+      throw new ValidationError(
+        `timestampMs must be a non-negative bigint, got ${String(timestampMs)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    if (!Number.isInteger(chainDepth) || chainDepth < 0 || chainDepth > 255) {
+      throw new ValidationError(
+        `chainDepth must be an integer in range 0-255, got ${String(chainDepth)}`,
+        "SCP-VALID-7002",
+      );
+    }
+
+    let raw: { sagaId: string; receipt?: Uint8Array; output?: Uint8Array };
+    try {
+      raw = await (
+        this.#native.toolInvokeCrossContextSaga as (
+          s: unknown,
+          t: unknown,
+          caller: string,
+          tool: string,
+          input: string,
+          nonce: string,
+          ts: bigint,
+          depth: number,
+          proof: string | undefined,
+        ) => Promise<{ sagaId: string; receipt?: Uint8Array; output?: Uint8Array }>
+      )(
+        sourceHandle,
+        targetHandle,
+        callerDid,
+        toolRegistrationId,
+        inputJson,
+        assertedNonceHex,
+        timestampMs,
+        chainDepth,
+        ucanProofId,
+      );
+    } catch (e) {
+      throw mapSagaError(e);
+    }
+    return {
+      sagaId: raw.sagaId,
+      receipt: raw.receipt ?? null,
+      output: raw.output ?? null,
+    };
   }
 
   async toolSessionCreate(

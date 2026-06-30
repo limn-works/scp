@@ -14,9 +14,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { ValidationError } from "../src/errors";
+import {
+  SagaAbortedError,
+  SagaBusyError,
+  SagaNeedsRepairError,
+  ToolError,
+  ValidationError,
+} from "../src/errors";
 import type { SCP } from "../src/scp";
 import { defineToolDefinition } from "../src/tools";
+import type { SagaResult } from "../src/types";
 import { type MockNativeScp, mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -366,6 +373,169 @@ describe("scp.toolInvokeCrossContext", () => {
         0,
       ),
     ).rejects.toThrow(/SCP-TOOL-6011/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §6.2.4 cross-context tool-invocation saga via scp.toolInvokeCrossContextSaga
+// ---------------------------------------------------------------------------
+
+const NONCE_HEX = "00".repeat(16);
+const TS_MS = 1_700_000_000_000n;
+
+describe("scp.toolInvokeCrossContextSaga", () => {
+  let scp: SCP;
+  let native: MockNativeScp;
+
+  beforeEach(() => {
+    const mount = mountMockScp();
+    scp = mount.scp;
+    native = mount.native;
+    installToolStubs(native);
+  });
+
+  afterEach(async () => {
+    await scp.shutdown(1);
+  });
+
+  /** Creates source + target context handles and returns the dispatch args. */
+  async function handles(): Promise<{ did: string; source: unknown; target: unknown }> {
+    const identity = await scp.identityCreate("in_memory");
+    const sourceHandle = await scp.contextCreate(identity, "{}");
+    const targetHandle = await scp.contextCreate(identity, "{}");
+    return { did: identity.did, source: sourceHandle._rawHandle, target: targetHandle._rawHandle };
+  }
+
+  /** Invokes the saga with all-valid args, overriding only what a test cares about. */
+  async function invoke(overrides: {
+    source?: unknown;
+    target?: unknown;
+    timestampMs?: bigint;
+    chainDepth?: number;
+  }): Promise<SagaResult> {
+    const { did, source, target } = await handles();
+    return await scp.toolInvokeCrossContextSaga(
+      overrides.source ?? source,
+      overrides.target ?? target,
+      did,
+      "tool-reg-1",
+      '{"a":1}',
+      NONCE_HEX,
+      overrides.timestampMs ?? TS_MS,
+      overrides.chainDepth ?? 0,
+    );
+  }
+
+  it("commits and returns sagaId plus receipt/output bytes", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({
+      sagaId: "saga-abc",
+      receipt: Buffer.from([1, 2, 3]),
+      output: Buffer.from([4, 5, 6]),
+    }));
+
+    const result = await invoke({});
+    expect(result.sagaId).toBe("saga-abc");
+    expect(result.receipt).not.toBeNull();
+    expect(result.output).not.toBeNull();
+    expect(Array.from(result.receipt as Uint8Array)).toEqual([1, 2, 3]);
+    expect(Array.from(result.output as Uint8Array)).toEqual([4, 5, 6]);
+  });
+
+  it("surfaces an omitted receipt as null (never synthesized)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({
+      sagaId: "saga-noreceipt",
+      output: Buffer.from([9]),
+    }));
+
+    const result = await invoke({});
+    expect(result.sagaId).toBe("saga-noreceipt");
+    expect(result.receipt).toBeNull();
+    expect(result.output).not.toBeNull();
+  });
+
+  it("accepts chainDepth at the u8 bounds (0 and 255)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
+
+    expect((await invoke({ chainDepth: 0 })).sagaId).toBe("ok");
+    expect((await invoke({ chainDepth: 255 })).sagaId).toBe("ok");
+  });
+
+  it("rejects chainDepth above the u8 range (256)", async () => {
+    const err = await invoke({ chainDepth: 256 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+  });
+
+  it("rejects negative chainDepth", async () => {
+    const err = await invoke({ chainDepth: -1 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+  });
+
+  it("rejects a negative bigint timestampMs", async () => {
+    const err = await invoke({ timestampMs: -1n }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+  });
+
+  it("rejects a non-bigint timestampMs", async () => {
+    // The signature demands a bigint; a numeric caller is a type error the
+    // runtime guard still rejects (parity with Python's lower-bound shape).
+    const err = await invoke({ timestampMs: 123 as unknown as bigint }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+  });
+
+  it("maps the aborted Display string to SagaAbortedError with retryAfterMs", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-SAGA-13067] saga aborted: rate limited (retry_after_ms=2500)");
+    });
+
+    const err = await invoke({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBe(2500);
+  });
+
+  it("maps a null retry_after_ms suffix to retryAfterMs null (never 0)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-SAGA-13067] saga aborted: hard limit (retry_after_ms=null)");
+    });
+
+    const err = await invoke({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("maps the needs-repair Display string to SagaNeedsRepairError with sagaId", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-SAGA-13065] saga needs repair: diverged (saga_id=repair-77)");
+    });
+
+    const err = await invoke({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("repair-77");
+  });
+
+  it("maps the busy Display string to SagaBusyError with contendedContext", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-SAGA-13066] saga busy: overlap (contended_context=ctx-shared)");
+    });
+
+    const err = await invoke({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect((err as SagaBusyError).contendedContext).toBe("ctx-shared");
+  });
+
+  it("maps a non-saga bridge error to ToolError (not a saga subclass)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-TOOL-6011] tool error: target context is not active");
+    });
+
+    const err = await invoke({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaBusyError);
   });
 });
 

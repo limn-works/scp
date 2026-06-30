@@ -657,6 +657,32 @@ export interface CrossContextInvocationResult {
   readonly timestamp: number;
 }
 
+/**
+ * The committed terminal of a §6.2.4 cross-context tool-invocation saga
+ * (ADR-049 §3a).
+ *
+ * Returned by `SCP.toolInvokeCrossContextSaga` only on a `Committed` terminal —
+ * every non-committed terminal rejects with a typed saga error
+ * (`SagaAbortedError`, `SagaNeedsRepairError`, or `SagaBusyError`) instead.
+ *
+ * `receipt` and `output` are a faithful pass-through of the bridge result:
+ * surfaced exactly as the bridge returns them (`null` when the bridge omits
+ * them — never synthesized). The bytes arrive as a native `Buffer`, a faithful
+ * `Uint8Array` subtype, so a caller can verify the receipt signature and
+ * recompute the output hash without re-serialization. See spec §6.2.4.
+ */
+export interface SagaResult {
+  /** The durable saga identifier (supervisor-minted, never a caller input). */
+  readonly sagaId: string;
+  /** The target's signed `CrossContextToolReceipt` bytes (JCS), or `null`. */
+  readonly receipt: Uint8Array | null;
+  /**
+   * The captured tool output bytes (the receipt's canonical `output_jcs`),
+   * or `null`.
+   */
+  readonly output: Uint8Array | null;
+}
+
 // ---------------------------------------------------------------------------
 // UCAN
 // ---------------------------------------------------------------------------

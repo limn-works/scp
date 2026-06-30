@@ -164,6 +164,67 @@ export class EconomyError extends ScpError {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors
+// ---------------------------------------------------------------------------
+//
+// These three subclasses surface the typed terminal space of the §6.2.4
+// cross-context tool-invocation saga. They extend `ToolError` (the saga is a
+// tool operation) and each carries the structured terminal datum the contract
+// makes load-bearing as a NAMED, read-only field. The napi bridge collapses the
+// typed `SagaError` into a single `Error` whose only payload is the
+// `ScpNapiError` Display string; `mapSagaError` reverses that string back into
+// the matching class below, preserving the datum.
+
+/**
+ * A §6.2.4 saga aborted at a Prepare phase (authorization, freshness, rate
+ * limit, or co-residency).
+ */
+export class SagaAbortedError extends ToolError {
+  /**
+   * Rate-limit back-off hint in milliseconds when the tripped limiter can
+   * compute one, or `null` when no precise back-off instant exists. NEVER `0`
+   * — a `0` would read as "retry immediately" and re-trip the same hard limit.
+   */
+  readonly retryAfterMs: number | null;
+
+  constructor(message: string, code = "SCP-SAGA-13067", retryAfterMs: number | null = null) {
+    super(message, code);
+    this.name = "SagaAbortedError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/**
+ * A §6.2.4 saga exhausted its Commit retries and may have diverged (a partial
+ * commit requiring operator repair).
+ */
+export class SagaNeedsRepairError extends ToolError {
+  /** The durable operator-repair handle for the diverged saga. */
+  readonly sagaId: string;
+
+  constructor(message: string, code = "SCP-SAGA-13065", sagaId = "") {
+    super(message, code);
+    this.name = "SagaNeedsRepairError";
+    this.sagaId = sagaId;
+  }
+}
+
+/**
+ * A §6.2.4 saga's participant context set overlapped an in-flight saga
+ * (per-participant-context-set gating, §5.15.4).
+ */
+export class SagaBusyError extends ToolError {
+  /** The shared context id that overlapped an in-flight saga. */
+  readonly contendedContext: string;
+
+  constructor(message: string, code = "SCP-SAGA-13066", contendedContext = "") {
+    super(message, code);
+    this.name = "SagaBusyError";
+    this.contendedContext = contendedContext;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Error parsing — bridge error message to typed ScpError
 // ---------------------------------------------------------------------------
 
@@ -215,4 +276,64 @@ export function mapBridgeError(error: unknown): ScpError {
   }
 
   return new ScpError(message, code);
+}
+
+/**
+ * Maps a §6.2.4 cross-context tool-invocation saga terminal error onto its SDK
+ * exception class.
+ *
+ * The napi bridge collapses the typed `SagaError` terminal into a single
+ * `Error` whose only payload is the `ScpNapiError` Display string:
+ *
+ *   - `[{code}] saga aborted: {message} (retry_after_ms={null|<u64>})`
+ *   - `[{code}] saga needs repair: {message} (saga_id={saga_id})`
+ *   - `[{code}] saga busy: {message} (contended_context={contended_context})`
+ *
+ * where `{code}` is a `SCP-SAGA-#####` code. This function reverses the
+ * structured terminal datum out of that suffix. The Display suffix is ALWAYS
+ * terminal, so the datum regexes are end-anchored (`\s*$`); end-anchored is
+ * therefore last-anchored — a decoy `(retry_after_ms=…)` embedded inside
+ * `{message}` is non-terminal and cannot match, so only the genuine trailing
+ * datum is read.
+ *
+ * Errors that do not carry a `SCP-SAGA-` code are not saga terminals; they
+ * delegate to {@link mapBridgeError} unchanged.
+ *
+ * @param error - The raw error from the bridge layer (Error, string, or unknown).
+ * @returns A typed saga `ScpError` subclass, or whatever `mapBridgeError` yields.
+ */
+export function mapSagaError(error: unknown): ScpError {
+  const message = error instanceof Error ? error.message : String(error);
+
+  // Saga codes are `SCP-SAGA-#####`. Anchor at the start so a `SCP-SAGA-`
+  // appearing only inside `{message}` text cannot masquerade as the code.
+  const codeMatch = /^\s*\[(SCP-SAGA-\d+)\]/.exec(message);
+  const code = codeMatch?.[1];
+  if (code === undefined) {
+    // Not a saga terminal — defer to the generic bridge error mapping.
+    return mapBridgeError(error);
+  }
+
+  // Dispatch on the literal Display phrase. The datum regexes are end-anchored
+  // (`\s*$`) and the Display suffix is always terminal, so end-anchored ==
+  // last-anchored: only the genuine trailing datum can match.
+  if (message.includes("] saga aborted:")) {
+    const m = /\(retry_after_ms=(null|\d+)\)\s*$/.exec(message);
+    const datum = m?.[1];
+    // null / absent ⇒ null, NEVER 0 (a `0` would read as "retry immediately").
+    const retryAfterMs = datum === undefined || datum === "null" ? null : Number(datum);
+    return new SagaAbortedError(message, code, retryAfterMs);
+  }
+  if (message.includes("] saga needs repair:")) {
+    const m = /\(saga_id=([^)]*)\)\s*$/.exec(message);
+    return new SagaNeedsRepairError(message, code, m?.[1] ?? "");
+  }
+  if (message.includes("] saga busy:")) {
+    const m = /\(contended_context=([^)]*)\)\s*$/.exec(message);
+    return new SagaBusyError(message, code, m?.[1] ?? "");
+  }
+
+  // A `SCP-SAGA-` code with an unrecognized phrase: surface as a `ToolError`
+  // carrying the saga code rather than silently dropping the classification.
+  return new ToolError(message, code);
 }
