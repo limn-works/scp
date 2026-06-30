@@ -24,7 +24,8 @@ pub use attestation::{
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-    issue_challenge, verify_challenge_response, verify_challenge_verification,
+    canonical_challenge_verification_bytes, issue_challenge, verify_challenge_response,
+    verify_challenge_verification,
 };
 pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
@@ -230,6 +231,36 @@ pub enum TrustError {
         verification_id: String,
         /// Human-readable description of the failure.
         reason: String,
+    },
+
+    /// The challenge verification record has expired (`expires_at <= now`).
+    /// Challenges are repeatable (spec §7.3.4); an expired verification must be
+    /// re-challenged and MUST NOT be consumed as a current trust signal.
+    #[error("challenge verification {verification_id}: expired at {expires_at} (now {now})")]
+    ChallengeVerificationExpired {
+        /// The verification record ID.
+        verification_id: String,
+        /// The Unix timestamp (seconds) at which the verification expired.
+        expires_at: u64,
+        /// The current Unix timestamp (seconds) at evaluation.
+        now: u64,
+    },
+
+    /// The challenge verification record is not bound to the context it is being
+    /// ingested/consumed under. A verifier-signed result for context A (or a
+    /// context-agnostic `None` result) MUST NOT be replayed into context B's
+    /// aggregation — `context_id` is a signed field, so the binding is
+    /// cryptographically authentic but must still match the target context.
+    #[error(
+        "challenge verification {verification_id}: context mismatch (record {record_context:?}, expected {expected_context})"
+    )]
+    ChallengeContextMismatch {
+        /// The verification record ID.
+        verification_id: String,
+        /// The `context_id` carried by the record (`None` if context-agnostic).
+        record_context: Option<String>,
+        /// The target context the record is being consumed under.
+        expected_context: String,
     },
 
     /// The requested DID is not a member of the context.

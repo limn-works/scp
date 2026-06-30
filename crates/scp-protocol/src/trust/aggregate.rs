@@ -132,6 +132,36 @@ pub trait TrustProtocolRepository: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// RevocationMapChecker
+// ---------------------------------------------------------------------------
+
+/// [`AttestationRevocationChecker`] backed by a context's persisted revocation
+/// list — an `attestation_id -> revoked` map from
+/// [`TrustProtocolRepository::get_revocation_state`].
+///
+/// Used by [`AttestationCache::get_verified_attestations`] so the READ path
+/// enforces context revocation, not only the ingest path: a cached attestation
+/// that is later context-revoked is dropped on read (even while still inside its
+/// cache TTL) rather than continuing to inflate trust until TTL expiry.
+struct RevocationMapChecker<'a> {
+    /// `attestation_id -> revoked` for the context.
+    revoked: &'a HashMap<String, bool>,
+}
+
+impl AttestationRevocationChecker for RevocationMapChecker<'_> {
+    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_primitives::DID) -> Option<u64> {
+        // The list stores only a boolean per id (no timestamp); report `0` as the
+        // revocation time when listed. That value only populates a dropped-entry
+        // log line, not a user-facing field.
+        if self.revoked.get(attestation_id).copied().unwrap_or(false) {
+            Some(0)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CachedAttestation
 // ---------------------------------------------------------------------------
 
@@ -218,6 +248,16 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
     /// `verified_attestations` / `populate_and_aggregate` helpers), which is what
     /// keeps a forged, freshly-marked entry from ever being returned here.
     ///
+    /// SECURITY (read-path revocation): the cached-but-fresh invariant says
+    /// nothing about revocations that happen AFTER an entry is cached. The
+    /// signature/expiry stamp does not capture a later context revocation. This
+    /// method therefore consults the context revocation list
+    /// ([`TrustProtocolRepository::get_revocation_state`]) on EVERY read and
+    /// drops any revoked entry on BOTH the fresh-return path and the stale
+    /// re-verification path. Without this, a cached attestation that is later
+    /// context-revoked would keep inflating `attestation_count` / trust until its
+    /// cache TTL expired (fail-open). The lookup is O(1) per entry.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustError`] if the store is unavailable or a verification
@@ -233,12 +273,26 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
             .store
             .get_cached_attestations(context_id, subject_did)?;
         let now = clock.now_secs();
+
+        // Build the context revocation checker once; applied to every entry on
+        // both the fresh and stale paths so a post-cache revocation is honored.
+        let revoked = self.store.get_revocation_state(context_id)?;
+        let revocation_checker = RevocationMapChecker { revoked: &revoked };
+
         let mut result = Vec::new();
 
         for entry in cached {
             if entry.is_expired(now) {
-                // Re-verify the attestation.
-                if verify_attestation(&entry.attestation, resolver, clock).is_ok() {
+                // Re-verify the attestation, consulting the context revocation
+                // list (a context-revoked entry fails here and is discarded).
+                if verify_attestation_with_revocation(
+                    &entry.attestation,
+                    resolver,
+                    clock,
+                    Some(&revocation_checker),
+                )
+                .is_ok()
+                {
                     // Update cache with new verified_at.
                     let refreshed = CachedAttestation {
                         attestation: entry.attestation.clone(),
@@ -249,7 +303,12 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                     result.push(entry.attestation);
                 }
                 // If verification fails, the entry is silently discarded.
-            } else {
+            } else if revocation_checker
+                .check_revocation(&entry.attestation.id, &entry.attestation.issuer)
+                .is_none()
+            {
+                // Fresh entry: still verified within TTL, but drop it if it has
+                // since been context-revoked.
                 result.push(entry.attestation);
             }
         }

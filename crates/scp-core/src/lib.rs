@@ -136,8 +136,8 @@ pub mod trust {
     };
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-        VerificationMethod, issue_challenge, verify_challenge_response,
-        verify_challenge_verification,
+        VerificationMethod, canonical_challenge_verification_bytes, issue_challenge,
+        verify_challenge_response, verify_challenge_verification,
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,

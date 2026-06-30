@@ -452,7 +452,17 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Ve
 /// The domain separator prevents cross-protocol signature confusion.
 /// All fields including `score` and `context_id` are bound into the
 /// signature to prevent post-signing modification.
-fn canonical_challenge_verification_bytes(
+///
+/// Public (mirroring [`canonical_attestation_bytes`](super::canonical_attestation_bytes))
+/// so verifiers can compute the exact bytes a `verifier_signature` covers — both
+/// to mint a record (sign these bytes with the verifier key) and to independently
+/// re-derive them when auditing one.
+///
+/// # Errors
+///
+/// Returns [`TrustError::ChallengeSigningFailed`] if the canonical hash cannot be
+/// constructed.
+pub fn canonical_challenge_verification_bytes(
     verification: &ChallengeVerification,
 ) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
@@ -763,7 +773,7 @@ pub fn verify_challenge_response(
 // ---------------------------------------------------------------------------
 
 /// Verifies the verifier's Ed25519 signature over a [`ChallengeVerification`]
-/// record.
+/// record AND binds it to the target context and the current time.
 ///
 /// A `ChallengeVerification` carries a caller-controlled `passed`/`score` trust
 /// signal that is only trustworthy because the verifier signs it (spec
@@ -773,9 +783,23 @@ pub fn verify_challenge_response(
 /// `test_count`, `pass_count`, `context_id`) via
 /// [`canonical_challenge_verification_bytes`], so a valid signature proves the
 /// record was not forged or post-signing modified. This is the verify-on-ingest
-/// gate for caller-supplied challenge results crossing the FFI boundary: the
-/// verifier's public key is resolved from `verifier_did` and the signature is
-/// checked before `passed`/`score` may be consumed as an admission/trust signal.
+/// gate for caller-supplied challenge results crossing the FFI boundary.
+///
+/// Beyond signature authenticity, this gate enforces the two bindings a
+/// signature alone does NOT provide for a context-scoped store — a genuinely
+/// verifier-signed result is still authentic when replayed into another context
+/// or after it expires, so the signature does not stop replay:
+///
+/// 1. **Context binding.** The record's signed `context_id` must equal
+///    `target_context_id`. A `None` (context-agnostic) result is REJECTED for a
+///    context-scoped store, and a genuine result minted for context A cannot be
+///    replayed into context B's aggregation
+///    ([`TrustError::ChallengeContextMismatch`]).
+/// 2. **Expiry.** Challenges are repeatable (spec §7.3.4); a record whose signed
+///    `expires_at <= now` is REJECTED
+///    ([`TrustError::ChallengeVerificationExpired`]) so a stale verification is
+///    never consumed as a current trust signal. `now` is read from the injected
+///    `clock`, matching the attestation ingest path.
 ///
 /// # Errors
 ///
@@ -783,9 +807,14 @@ pub fn verify_challenge_response(
 ///   resolved from `verifier_did`.
 /// - [`TrustError::ChallengeVerificationSignatureInvalid`] if the signature does
 ///   not verify against the resolved verifier key.
+/// - [`TrustError::ChallengeContextMismatch`] if the record's `context_id` is
+///   not `Some(target_context_id)`.
+/// - [`TrustError::ChallengeVerificationExpired`] if `expires_at <= now`.
 pub fn verify_challenge_verification(
     verification: &ChallengeVerification,
     resolver: &(impl DidPublicKeyResolver + ?Sized),
+    target_context_id: &str,
+    clock: &(impl Clock + ?Sized),
 ) -> Result<(), TrustError> {
     let verifier_pk = resolver.resolve_public_key(&verification.verifier_did)?;
     let canonical = canonical_challenge_verification_bytes(verification)?;
@@ -794,7 +823,32 @@ pub fn verify_challenge_verification(
             verification_id: verification.verification_id.clone(),
             reason,
         },
-    )
+    )?;
+
+    // Context binding: reject a `None` (context-agnostic) result for a
+    // context-scoped store, and reject a genuine result minted for another
+    // context. `context_id` is a signed field, so this comparison is over
+    // authenticated data.
+    if verification.context_id.as_deref() != Some(target_context_id) {
+        return Err(TrustError::ChallengeContextMismatch {
+            verification_id: verification.verification_id.clone(),
+            record_context: verification.context_id.clone(),
+            expected_context: target_context_id.to_owned(),
+        });
+    }
+
+    // Expiry: challenges are repeatable; an expired verification is not a
+    // current trust signal.
+    let now = clock.now_secs();
+    if verification.expires_at <= now {
+        return Err(TrustError::ChallengeVerificationExpired {
+            verification_id: verification.verification_id.clone(),
+            expires_at: verification.expires_at,
+            now,
+        });
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

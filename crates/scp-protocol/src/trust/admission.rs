@@ -90,23 +90,33 @@ pub enum AdmissionError {
 /// - `agent_capabilities` — The agent's self-attested capability URIs.
 /// - `challenge_verifications` — The agent's challenge verification records.
 /// - `current_time` — Unix timestamp (seconds) for expiry comparison.
+/// - `context_id` — The context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value: a result minted for another context (or a
+///   context-agnostic `None` result) MUST NOT satisfy admission here, mirroring
+///   the verify-on-ingest context binding in
+///   [`verify_challenge_verification`](crate::trust::verify_challenge_verification).
 ///
 /// # Errors
 ///
 /// Returns [`AdmissionError::MissingCapability`] if a self-attested capability
 /// is not declared, or [`AdmissionError::VerificationRequired`] if a
-/// challenge-verified capability lacks a valid (passed, non-expired)
-/// verification record.
+/// challenge-verified capability lacks a valid (passed, non-expired,
+/// in-context) verification record.
 pub fn check_capability_requirements(
     requirements: &[CapabilityRequirement],
     agent_capabilities: &[CapabilityUri],
     challenge_verifications: &[ChallengeVerification],
     current_time: u64,
+    context_id: &str,
 ) -> Result<(), AdmissionError> {
     for req in requirements {
         let has_verification = challenge_verifications.iter().any(|cv| {
             let ChallengeType::Uri(ref uri) = cv.challenge_type;
-            *uri == req.capability && cv.passed && cv.expires_at > current_time
+            *uri == req.capability
+                && cv.passed
+                && cv.expires_at > current_time
+                && cv.context_id.as_deref() == Some(context_id)
         });
 
         match req.verification_level {
@@ -160,7 +170,7 @@ mod tests {
             completed_at: 1_700_000_000,
             verified_at: 1_700_000_000,
             expires_at: 1_700_086_400,
-            context_id: None,
+            context_id: Some(CTX.to_owned()),
             verifier_signature: Vec::new(),
         }
     }
@@ -172,9 +182,14 @@ mod tests {
     /// A current time that is before the verification's `expires_at`.
     const NOW: u64 = 1_700_000_100;
 
+    /// The context all admission checks below are evaluated under. The
+    /// verification records produced by `make_verification` are bound to this
+    /// context (their signed `context_id`), so they satisfy requirements here.
+    const CTX: &str = "ctx-admission";
+
     #[test]
     fn empty_requirements_always_passes() {
-        let result = check_capability_requirements(&[], &[], &[], NOW);
+        let result = check_capability_requirements(&[], &[], &[], NOW, CTX);
         assert!(result.is_ok());
     }
 
@@ -186,7 +201,7 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[uri], &[], NOW);
+        let result = check_capability_requirements(&reqs, &[uri], &[], NOW, CTX);
         assert!(result.is_ok());
     }
 
@@ -198,7 +213,7 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[], &[], NOW);
+        let result = check_capability_requirements(&reqs, &[], &[], NOW, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -215,7 +230,7 @@ mod tests {
         }];
 
         let verifications = vec![make_verification(&uri)];
-        let result = check_capability_requirements(&reqs, &[], &verifications, NOW);
+        let result = check_capability_requirements(&reqs, &[], &verifications, NOW, CTX);
         assert!(result.is_ok());
     }
 
@@ -228,7 +243,7 @@ mod tests {
         }];
 
         // Even if agent claims the capability, ChallengeVerified requires a record.
-        let result = check_capability_requirements(&reqs, &[uri], &[], NOW);
+        let result = check_capability_requirements(&reqs, &[uri], &[], NOW, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { ref uri })
@@ -252,7 +267,7 @@ mod tests {
         ];
 
         // Agent has uri_a but not uri_b.
-        let result = check_capability_requirements(&reqs, &[uri_a], &[], NOW);
+        let result = check_capability_requirements(&reqs, &[uri_a], &[], NOW, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -270,7 +285,7 @@ mod tests {
 
         // Agent does NOT have it in capabilities, but has a verification record.
         let verifications = vec![make_verification(&uri)];
-        let result = check_capability_requirements(&reqs, &[], &verifications, NOW);
+        let result = check_capability_requirements(&reqs, &[], &verifications, NOW, CTX);
         assert!(result.is_ok());
     }
 
@@ -290,7 +305,7 @@ mod tests {
         ];
 
         let verifications = vec![make_verification(&uri_b)];
-        let result = check_capability_requirements(&reqs, &[uri_a], &verifications, NOW);
+        let result = check_capability_requirements(&reqs, &[uri_a], &verifications, NOW, CTX);
         assert!(result.is_ok());
     }
 
@@ -304,7 +319,7 @@ mod tests {
 
         let verifications = vec![make_verification(&uri)];
         // expires_at is 1_700_086_400 — use a time after that.
-        let result = check_capability_requirements(&reqs, &[], &verifications, 1_700_086_401);
+        let result = check_capability_requirements(&reqs, &[], &verifications, 1_700_086_401, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })
@@ -321,7 +336,7 @@ mod tests {
 
         let mut cv = make_verification(&uri);
         cv.passed = false;
-        let result = check_capability_requirements(&reqs, &[], &[cv], NOW);
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })
@@ -339,10 +354,48 @@ mod tests {
         // Verification exists but passed=false — should NOT satisfy self-attested.
         let mut cv = make_verification(&uri);
         cv.passed = false;
-        let result = check_capability_requirements(&reqs, &[], &[cv], NOW);
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW, CTX);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn verification_for_other_context_does_not_satisfy_challenge_verified() {
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::ChallengeVerified,
+        }];
+
+        // A genuine, passed, unexpired verification — but minted for a DIFFERENT
+        // context. It must NOT satisfy admission to CTX (replay across contexts).
+        let mut cv = make_verification(&uri);
+        cv.context_id = Some("ctx-other".to_owned());
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW, CTX);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::VerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn context_agnostic_verification_does_not_satisfy_challenge_verified() {
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::ChallengeVerified,
+        }];
+
+        // A `None` (context-agnostic) verification must not satisfy a
+        // context-scoped admission requirement.
+        let mut cv = make_verification(&uri);
+        cv.context_id = None;
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW, CTX);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::VerificationRequired { .. })
         ));
     }
 }
