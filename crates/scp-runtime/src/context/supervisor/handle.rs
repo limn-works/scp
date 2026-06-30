@@ -60,15 +60,11 @@ pub struct SupervisorHandle {
 
 impl SupervisorHandle {
     /// Wrap an `Arc<Supervisor>`. Visible only to supervisor-module
-    /// code; the bridge instance constructs one at actor spawn time
-    /// (commit 11 wires this through), and handlers receive the handle
-    /// via `ActorDeps` at dispatch time.
-    ///
-    /// `dead_code` allow: commit 6 lands the constructor; the first
-    /// production caller lands with the `BridgeInstance` integration
-    /// in commit 11. The allow is removed then.
+    /// code; the supervisor constructs one in
+    /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
+    /// at actor-spawn time, and handlers receive the handle via
+    /// `ActorDeps` at dispatch time.
     #[must_use]
-    #[allow(dead_code)]
     pub(in crate::context::supervisor) const fn wrap(supervisor: Arc<Supervisor>) -> Self {
         Self { supervisor }
     }

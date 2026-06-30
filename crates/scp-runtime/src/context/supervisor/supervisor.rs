@@ -730,8 +730,9 @@ fn decode_repair_records_evidence(bytes: &[u8]) -> Result<Vec<SagaDivergenceRepa
 
 /// Supervisor configuration. Currently a reserved placeholder with no
 /// tunables wired; saga phase timeouts and respawn-budget windows are
-/// derived from associated constants on [`Supervisor`] rather than this
-/// struct.
+/// derived from code constants (`Supervisor::LIFECYCLE_TIMEOUT`, the
+/// function-local `PHASE_TIMEOUT`, and the module-level
+/// [`CRASH_WINDOW_MS`]) rather than this struct.
 #[derive(Clone, Debug, Default)]
 pub struct SupervisorConfig {
     /// Reserved for future configuration; placeholder field so the
@@ -1554,10 +1555,12 @@ impl Supervisor {
     /// factory once at construction time; the returned `Arc<Supervisor>`
     /// is the only handle they hold.
     ///
-    /// Saga journal + supervisor-level persistence wire to no-op stubs
-    /// the test-only `for_query_shim` path uses — saga orchestration
-    /// is not yet active (it lands with Phase 2's actor wiring), and
-    /// the supervisor's own persistence slot is wired to a no-op
+    /// This test/legacy constructor wires a no-op saga journal
+    /// ([`NoopSagaJournal`]), so the saga coordinator runs but never
+    /// durably journals — durable saga journalling requires
+    /// [`Self::with_providers_and_journal`] (the path every production
+    /// bridge takes). The supervisor's own persistence slot is wired to a
+    /// no-op
     /// [`NoopContextPersistence`](crate::context::persistence::NoopContextPersistence)
     /// when `persistence` is `None`.
     ///
@@ -2460,10 +2463,11 @@ impl Supervisor {
     /// - **Bootstrap variants** (`CreateContext`, `ImportContext`,
     ///   `RestoreContext`) always route through
     ///   [`Self::dispatch_lifecycle_direct`], which delegates to the
-    ///   designated-legacy `&Supervisor`-shape helpers in
-    ///   [`crate::context::lifecycle_helpers_legacy`]. These helpers
-    ///   construct fresh `PerContextState` and (on dual-write) spawn
-    ///   the per-context actor as part of the bootstrap handshake.
+    ///   actor-shape helpers in
+    ///   [`crate::context::lifecycle_helpers`]. These helpers
+    ///   construct fresh `PerContextState` and spawn the per-context
+    ///   actor as part of the bootstrap handshake (the actor owns the
+    ///   state; there is no legacy `contexts` `DashMap` write).
     /// - **Per-context variants** (`JoinContext`, `LeaveContext`,
     ///   `CloseContext`, `ExportContext`,
     ///   `GenerateContextAccessKey`, `RevokeContextAccessKey`,
@@ -2495,7 +2499,7 @@ impl Supervisor {
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A finalization — bootstrap variants always
         // route through `dispatch_lifecycle_direct`. They construct
-        // fresh state (and, on dual-write, spawn the actor); the
+        // fresh state and spawn the per-context actor; the
         // mailbox-first check would either no-op for a fresh context
         // (no actor yet) or recurse against the existing actor on a
         // re-create attempt — neither produces correct semantics. The
@@ -2512,7 +2516,7 @@ impl Supervisor {
         // Per-context variants (Join / Leave / Close / Export +
         // access-key generate / revoke / restore + Placeholder) all
         // carry a `context_id` and have a registered actor after
-        // bootstrap dual-write. Mailbox-first routes to the actor's
+        // bootstrap spawn. Mailbox-first routes to the actor's
         // `dispatch_state` loop which executes the actor-shape handler.
         if let Some(ctx_id) = Self::lifecycle_command_context_id(&cmd)
             && let Some(actor) = self.lookup(ctx_id)
@@ -2521,7 +2525,7 @@ impl Supervisor {
         }
         // Per-context variant for which no actor is registered — the
         // `Supervisor::contexts` DashMap fallback (and its handler-side
-        // `dispatch_from_shim`) were deleted in this session. Surface
+        // `dispatch_from_shim`) were deleted in Phase 2A finalization. Surface
         // the typed error on the reply oneshot via the direct path's
         // unreachable-arm sketch so the caller gets a defined response.
         Ok(Box::pin(self.dispatch_lifecycle_direct(cmd)).await)
@@ -2544,17 +2548,17 @@ impl Supervisor {
     /// get-or-spawned, both since the storage-foundation reshape) and
     /// delegate to the actor-shape helpers in
     /// [`crate::context::lifecycle_helpers`]. Those helpers spawn the
-    /// per-context actor (`spawn_actor_for_context`) while continuing to
-    /// dual-write the legacy `contexts` `DashMap` during the ADR-049
-    /// Phase 2A transition window. Building deps requires
+    /// per-context actor that OWNS the freshly built `PerContextState`
+    /// and register its handle in the supervisor registry — there is no
+    /// legacy `contexts` `DashMap` write. Building deps requires
     /// `self: &Arc<Self>` so the spawned actor and its handle wrap the
     /// same supervisor instance.
     ///
     /// **Per-context variants** (Join / Leave / Close / Export +
-    /// access-key generate / revoke / restore) still delegate to the
-    /// designated-legacy `&Supervisor`-shape helpers in
-    /// [`crate::context::lifecycle_helpers_legacy`]; they reach this
-    /// method only when no actor is registered for the target context.
+    /// access-key generate / revoke / restore) reach this method only
+    /// when no actor is registered for the target context; their arms
+    /// surface `ContextNotRegistered` on the variant's oneshot, since
+    /// post-Step-B every valid context has a registered actor.
     #[allow(clippy::too_many_lines)] // flat match over every lifecycle variant
     async fn dispatch_lifecycle_direct(self: &Arc<Self>, cmd: LifecycleCommand) -> Outcome<()> {
         // Single source of truth: derive from the associated `Self::
@@ -2590,7 +2594,8 @@ impl Supervisor {
                 // supervisor's provider slots, scoped to the creator's
                 // identity for KeyPackageStore resolution) and delegates
                 // to `lifecycle_helpers::create_context`, which spawns the
-                // per-context actor (and dual-writes the legacy DashMap).
+                // per-context actor that OWNS the fresh state (no legacy
+                // `contexts` DashMap write).
                 let deps = match self.build_actor_deps(&p.creator_did).await {
                     Ok(deps) => deps,
                     Err(e) => {
@@ -3002,7 +3007,7 @@ impl Supervisor {
         Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await
     }
 
-    /// Dispatch a [`GovernanceCommand`] through the migration shim
+    /// Dispatch a [`GovernanceCommand`] to its per-context actor's mailbox
     /// (ADR-049 commit 10 / plan row 10).
     ///
     /// Contract (byte-identical to the legacy
@@ -3060,7 +3065,7 @@ impl Supervisor {
         Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await
     }
 
-    /// Dispatch an [`EconomyCommand`] through the migration shim
+    /// Dispatch an [`EconomyCommand`] to its per-context actor's mailbox
     /// (ADR-049 commit 10 / plan row 10).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. The
@@ -3226,7 +3231,7 @@ impl Supervisor {
         }
     }
 
-    /// Dispatch a [`TrustRecoveryCommand`] through the migration shim
+    /// Dispatch a [`TrustRecoveryCommand`] to its per-context actor's mailbox
     /// (ADR-049 commit 10 / plan row 10).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
@@ -3246,10 +3251,12 @@ impl Supervisor {
         // Phase 2A.1 of ADR-049 — trust_recovery is the first migrated
         // helper domain. Route per-context variants to the per-context
         // actor mailbox when one is registered; otherwise fall through
-        // to `dispatch_trust_recovery_direct` which delegates to the
-        // designated-legacy lock-shaped helpers. The cross-context
+        // to `dispatch_trust_recovery_direct`, whose per-context arms
+        // surface `ContextNotRegistered` (post-Step-B every valid
+        // context has a registered actor). The cross-context
         // `RecoveryNotifyContact` variant has no `context_id` to look
-        // up — it always flows through the direct fan-out path.
+        // up — it always flows through the direct fan-out path
+        // (`recovery_notify_contact`).
         //
         // `Box::pin` — `CreateGovernanceCheckpoint`'s payload carries
         // multiple 32-byte hashes + a variable-length Ed25519 signature
@@ -3750,16 +3757,15 @@ impl Supervisor {
     /// through `SupervisorHandle`; see plan §"ActorDeps and
     /// SupervisorHandle".
     ///
-    /// `dead_code` allow: the first production call site is commit 7's
-    /// query-path migration, which routes FFI-bridge lookups through
-    /// `Supervisor::lookup(ctx).send(QueriesCommand::...)`.
+    /// Every per-context dispatch method routes through this accessor
+    /// (`self.lookup(ctx).send(...)`), as do the per-actor sweep entry
+    /// points in `governance_helpers` / `lifecycle_helpers`.
     ///
     /// Visibility widened to `pub(in crate::context)` at Phase 2A
     /// finalization (sweep helper relocation) so the sweep entry
     /// points in `governance_helpers` / `lifecycle_helpers` can route
     /// per-actor sweep commands through the mailbox.
     #[must_use]
-    #[allow(dead_code)]
     pub(in crate::context) fn lookup(&self, ctx_id: &str) -> Option<ContextActorHandle> {
         self.actors.get(ctx_id).map(|r| r.value().clone())
     }
@@ -3774,9 +3780,9 @@ impl Supervisor {
     /// this once per sweep and dispatch one command per `context_id`.
     ///
     /// Added at Phase 2A finalization (sweep helper relocation) so the
-    /// sweep entry points have a way to enumerate the actor registry
-    /// without reaching for the legacy `contexts` DashMap (which is
-    /// scheduled for deletion in a subsequent session).
+    /// sweep entry points enumerate the actor registry directly. The
+    /// actor registry is the only context map — there is no legacy
+    /// `contexts` DashMap.
     #[must_use]
     pub(in crate::context) fn actor_ids(&self) -> Vec<String> {
         self.actors.iter().map(|e| e.key().clone()).collect()
@@ -3791,14 +3797,15 @@ impl Supervisor {
     /// `create_context` / `restore_context` time. Code outside
     /// `crate::context::` has no way to spawn an actor.
     ///
-    /// Commit 6 delivers the mailbox wiring; the actor's `run()` body
-    /// uses the stubbed dispatch in
-    /// [`crate::context::actor::ContextActor`]. Commit 7 onward
-    /// replaces the stubs with real handlers.
+    /// This is the no-state SKELETON spawn path: it constructs the actor
+    /// via [`ContextActor::new_skeleton`], whose `run()` loop drains the
+    /// mailbox and ACKs every command through `skeleton_dispatch`
+    /// (`NotImplemented`). The real per-domain handlers run on the
+    /// state-owning actor spawned via [`Self::spawn_actor_with_state`].
     ///
-    /// `dead_code` allow: the first production call site is commit 9's
-    /// lifecycle handler (create_context spawns an actor). Until then
-    /// only the unit tests here exercise the method.
+    /// `dead_code` allow: production bootstrap uses
+    /// [`Self::spawn_actor_with_state`], so this skeleton spawn is
+    /// exercised only by the unit tests in this module.
     #[allow(dead_code)]
     pub(in crate::context) async fn spawn_actor(
         &self,
@@ -3857,23 +3864,22 @@ impl Supervisor {
     /// # Visibility
     ///
     /// `pub(in crate::context)` — the only production caller is the
-    /// lifecycle handler's create / restore / import path (landing
-    /// in commit 12b.2b). External callers (FFI bridges,
-    /// downstream crates) reach the actor through
+    /// lifecycle handler's create / restore / import path. External
+    /// callers (FFI bridges, downstream crates) reach the actor through
     /// [`Self::dispatch_command`] or the
     /// [`crate::context::supervisor::handle::SupervisorHandle`] /
     /// [`crate::context::actor::deps::ActorDeps::supervisor`]
     /// capabilities — never directly.
     ///
-    /// # Scope — infrastructure only
+    /// # Dispatch
     ///
-    /// Commit 12b.2a wires the signature and registry insertion.
-    /// The spawned actor's `run()` loop currently delegates every
-    /// command variant to the skeleton dispatch (same fallback as
-    /// [`ContextActor::new_skeleton`]) — migrating real handler
-    /// bodies onto `&mut self.state` + `&self.deps` is 12b.2b's
-    /// atomic transition across all nine handler submodules.
-    ///
+    /// The spawned actor OWNS its `PerContextState` + `ActorDeps`, so its
+    /// `run()` loop dispatches every command variant to the real
+    /// per-domain handlers via
+    /// [`ContextActor::dispatch_state`](crate::context::actor::ContextActor)
+    /// (`&mut self.state` + `&self.deps`) — not the skeleton dispatch
+    /// path, which is reserved for the no-state
+    /// [`ContextActor::new_skeleton`] actors.
     ///
     /// # Errors
     ///
@@ -4693,8 +4699,10 @@ impl Supervisor {
         self.crash_windows.remove(context_id);
     }
 
-    /// Dispatch a [`StandingCommand`] through the migration shim
-    /// (ADR-049 commit 11 / plan row 11).
+    /// Dispatch a [`StandingCommand`] — mailbox-first for variants that
+    /// map to an existing per-context actor, otherwise the supervisor-
+    /// scoped `dispatch_standing_direct` path (ADR-049 commit 11 / plan
+    /// row 11).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
     /// contact-graph (standing context) paths from spec §5.12.4.
@@ -4822,7 +4830,7 @@ impl Supervisor {
         }
     }
 
-    /// Dispatch a [`ToolsCommand`] through the migration shim
+    /// Dispatch a [`ToolsCommand`] to its per-context actor's mailbox
     /// (ADR-049 commit 11 / plan row 11).
     ///
     /// Covers the hard-rate-limit consume / refund helpers that FFI
@@ -11818,9 +11826,11 @@ mod tests {
         let s = test_supervisor();
         let _handle = s.spawn_actor("ctx-42".to_owned(), None).await;
         assert!(s.lookup("ctx-42").is_some());
-        // Second spawn with the same ID overwrites: duplicate-spawn
-        // overwrite is intentional, and duplicate-spawn detection is a
-        // watchdog responsibility (ADR-049 §10).
+        // Second spawn with the same ID overwrites: the skeleton
+        // `spawn_actor` overwrites by design. Duplicate-spawn rejection
+        // is enforced in the owned-state `spawn_actor_with_state` path
+        // (first-writer-wins `CreationFailed`), covered by
+        // `spawn_actor_with_state_rejects_duplicate_context_id`.
         let _handle2 = s.spawn_actor("ctx-42".to_owned(), None).await;
         assert!(s.lookup("ctx-42").is_some());
     }

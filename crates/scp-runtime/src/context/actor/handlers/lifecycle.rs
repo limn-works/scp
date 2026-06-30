@@ -17,8 +17,8 @@
 //! construct fresh `PerContextState` and cannot be routed against a
 //! per-context actor that does not yet exist. They are handled by
 //! [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
-//! which delegates to the designated-legacy bootstrap helpers in
-//! [`crate::context::lifecycle_helpers_legacy`]. If a bootstrap variant
+//! which delegates to the actor-shape bootstrap helpers in
+//! [`crate::context::lifecycle_helpers`]. If a bootstrap variant
 //! reaches this actor-shape dispatch (because an actor is already
 //! registered for the target context_id — a re-create attempt), the
 //! handler surfaces `ContextError::InvalidState` on the reply oneshot.
