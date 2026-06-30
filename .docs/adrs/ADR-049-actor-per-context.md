@@ -75,7 +75,7 @@ Commit 11 landed `Supervisor::start_saga -> SagaOutput { saga_id }` in-core, wit
 
 **Wait model — block-until-terminal.** The saga is interactive and request-scoped; the FFI worker blocks one bounded saga (≤~95s worst case across phases plus retries) and returns after `Committed` / `Aborted` / `NeedsRepair`. No async / poll / `saga_state` model is needed (that was only ever contemplated for the now-cut cross-identity custody handover).
 
-**`SagaId` wire encoding plus authority.** A `SagaId` is a UUIDv4 rendered as the canonical 36-character lowercase hyphenated string (matching the in-core `SagaId(pub String)` / `Uuid::new_v4().to_string()`); it is a plain UTF-8 string at every bridge (PyO3 `str`, NAPI/TS `string`, UniFFI `String`, WASM `string`). It is **always supervisor-minted (`SagaId::new()`), NEVER accepted as caller input on any bridge** — a caller cannot supply or choose a `SagaId`, so it cannot poison the by-`SagaId` Commit idempotency de-dup or collide with another saga's id. Block-until-terminal returns the result inline, so no `saga_state` status query is exposed; **if** one is ever added, it MUST authorize the calling identity as a saga participant before returning state — a `SagaId` is an unguessable *handle*, not a capability. It is not a secret-at-rest and needs no compaction.
+**`SagaId` wire encoding plus authority.** A `SagaId` is a UUIDv4 rendered as the canonical 36-character lowercase hyphenated string (matching the in-core `SagaId(pub String)` / `Uuid::new_v4().to_string()`); it is a plain UTF-8 string at every bridge (PyO3 `str`, NAPI/TS `string`, UniFFI `String`). It is **always supervisor-minted (`SagaId::new()`), NEVER accepted as caller input on any bridge** — a caller cannot supply or choose a `SagaId`, so it cannot poison the by-`SagaId` Commit idempotency de-dup or collide with another saga's id. Block-until-terminal returns the result inline, so no `saga_state` status query is exposed; **if** one is ever added, it MUST authorize the calling identity as a saga participant before returning state — a `SagaId` is an unguessable *handle*, not a capability. It is not a secret-at-rest and needs no compaction.
 
 **Saga concurrency — per-context-pair (not per-supervisor).** `SagaBusy` is raised only when the new saga's participant context set *overlaps* an in-flight saga's set; disjoint sets run concurrently. The as-built single supervisor-wide `AtomicBool` (`supervisor.rs`) is an implementation-PR replacement target — it must become per-participant-set gating so one slow or stuck saga cannot deny the whole instance. `NeedsRepair` **releases** the concurrency reservation (an operator still resolves the divergence, but unrelated sagas must not block — `NeedsRepair` is non-terminal for repair purposes, and a tool-invoke divergence can stay unresolved until operator repair).
 
@@ -246,7 +246,7 @@ This boundary is the same shape as §12a's webhook-target deferral: the durable,
 
 ### 11. `BridgeInstanceCore` lifecycle methods are default trait impls
 
-Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a `BridgeInstanceCore` trait. This ADR extends `BridgeInstanceCore` with default trait methods for `suspend()`, `resume()`, `shutdown()`. Per-bridge structs override only bridge-specific cleanup hooks (`pre_suspend_hook`, `post_suspend_hook`, etc.). All three non-WASM bridges share one implementation. Cross-bridge consistency check (#1543) extends to verify all bridges use the defaults.
+Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a `BridgeInstanceCore` trait. This ADR extends `BridgeInstanceCore` with default trait methods for `suspend()`, `resume()`, `shutdown()`. Per-bridge structs override only bridge-specific cleanup hooks (`pre_suspend_hook`, `post_suspend_hook`, etc.). All three bridges share one implementation. Cross-bridge consistency check (#1543) extends to verify all bridges use the defaults.
 
 ### 12. Lock-free read invariant
 
@@ -320,7 +320,7 @@ Symmetric with per-context actor; would own KeyPackage pool, wrapping keys, reco
 
 ### `RuntimeAdapter` trait abstracting tokio/WASM runtime primitives
 
-Proposed trait with `spawn`, `channel`, `sleep`, `interval` methods, two impls (native/WASM). Rejected because `scp-runtime` remains native-only per ADR-034, the adapter has exactly one real implementation, and WASM consumers continue through `scp-ffi/wasm`'s re-implementation path. Direct `tokio::*` calls are simpler. If a second runtime target ever enters scope, introduction is a mechanical refactor at that point.
+Proposed trait with `spawn`, `channel`, `sleep`, `interval` methods, two impls (native/WASM). Rejected because `scp-runtime` remains native-only per ADR-034, the adapter has exactly one real implementation, and (at the time) WASM consumers ran through `scp-ffi/wasm`'s re-implementation path. (Historical: per ADR-055 the WASM bridge has since been removed and browser clients are remote thin clients to a server-side `scp-node`, so there is no second runtime target — this reinforces the rejection.) Direct `tokio::*` calls are simpler. If a second runtime target ever enters scope, introduction is a mechanical refactor at that point.
 
 ### Preserve `ContextManager` as a facade over `Supervisor`
 
@@ -356,7 +356,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
   - The `MlsBackend` injection seam (`with_backends`) exists in the type surface but is **operationally dead**: no production or test path swaps a backend through it; the only coverage is `Arc::ptr_eq` identity asserts proving the seam wires the same instance. It is retained as a future injection point, not an active mock surface. Any future work that needs per-primitive crypto error injection should revive this seam rather than reintroduce a `ContextCryptoProvider`-style omnibus mock.
 - **~13 internal commits.** Large single atomic PR; expected 6–12 full-roster review rounds to double-zero.
 
-**WASM.** Unchanged. `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity; `scp-ffi/wasm` continues its re-implementation path.
+**WASM (historical — superseded by ADR-055).** `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity. At the time of this ADR, `scp-ffi/wasm` carried a re-implementation path; per ADR-055 that WASM bridge has since been removed and browser clients are remote thin clients to a server-side `scp-node`, so there is no browser-side actor re-implementation to keep in parity.
 
 **Bindings.** Every FFI bridge and language SDK rewires from `ContextManager` (deleted) to `Supervisor` (new). SCP class surface (post-ADR-048) is unchanged — the refactor is internal to `scp-runtime`.
 

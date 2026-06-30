@@ -3,7 +3,8 @@
 **Status:** Proposed
 **Date:** 2026-06-14
 **Phase:** Phase 6 (production readiness, security)
-**Related:** ADR-003 (Identity Key Rotation & Migration — defines the pre-rotation reveal/commitment flow, §4b), ADR-021 (UniFFI Bridge — defines the `KeyCustodyProvider` callback-interface pattern used by mobile platforms), ADR-025 (Apple Platform Adapter — sibling platform-keystore integration), spec §9.7.4.1 (Pre-Rotation Key Custody), §9.12 (Identity Key Migration & Recovery)
+**Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`). Pre-rotation custody is therefore not an in-browser concern: a browser client has no in-process MLS or custody substrate, so its pre-rotation key is held server-side by the `scp-node` it connects to, governed by that node's platform custody (the rows/questions below for native bridges). The "Cross-language impact" WASM table row and Open Question 1 (browser pre-rotation custody / WASM custody story) have been reconciled to this thin-client model. No other current-state design content changes.
+**Related:** ADR-003 (Identity Key Rotation & Migration — defines the pre-rotation reveal/commitment flow, §4b), ADR-021 (UniFFI Bridge — defines the `KeyCustodyProvider` callback-interface pattern used by mobile platforms), ADR-025 (Apple Platform Adapter — sibling platform-keystore integration), ADR-055 (WASM bridge removal), spec §9.7.4.1 (Pre-Rotation Key Custody), §9.12 (Identity Key Migration & Recovery)
 
 ## Context
 
@@ -80,7 +81,7 @@ This is a **breaking addition to the FFI surface** (a new callback interface), s
 | PyO3 (`crates/scp-ffi/src/`) | `PyPreRotationCustodyProvider` (`Py<PyAny>` adapter); thread it through `identity_create*` / `identity_migrate`; remove the `InMemoryPreRotationCustody` default on the callback path. |
 | NAPI (`crates/scp-ffi/napi/src/`) | Threadsafe-function adapter for the provider record (`{ generate, publicKey, importSeedBytes, consume }`). |
 | UniFFI (`crates/scp-ffi/uniffi/src/`) | New `[Trait, WithForeign]` interface; replace `generate_ephemeral_ed25519_seed` → in-memory routing; implement `import_ed25519_signing_key` via `import_seed_bytes` (removes the current `Unsupported` block). |
-| WASM | Per ADR-034, no platform keystore; WASM keeps an explicit, documented limitation (browser pre-rotation custody is its own constrained story — likely WebAuthn/passkey-PRF wrapping). |
+| Browser (thin client, ADR-055) | No in-browser custody substrate: a browser is a remote thin client to a server-side `scp-node`, so pre-rotation custody is held server-side by that node and governed by the node's platform (the PyO3/UniFFI/NAPI rows above), not in the browser. No browser-side change. |
 | Swift / Kotlin SDKs | Implement `PreRotationCustodyProvider` against Keychain/Keystore/Secure Enclave/FIDO2; implement the §5 selection ceremony. |
 | Python / TypeScript SDKs | Implement the cross-platform offline/Shamir/BIP39 backends for server and parity testing. |
 | Capability matrix | New operations registered across bridges; `check-sdk-coverage` (now fail-closed) enforces parity. |
@@ -116,6 +117,6 @@ The `CallbackPreRotationCustody` adapter derives its foreign-call names from the
 
 ## Open questions (for review)
 
-1. **WASM scope.** Is browser pre-rotation custody (WebAuthn/passkey-PRF) in scope for this ADR, or a separate ADR gated on the WASM custody story (ADR-034)?
+1. **Browser scope (resolved by ADR-055).** Browser pre-rotation custody is out of scope for this ADR and is not a separate in-browser custody story: per ADR-055 the WASM bridge is removed and browser clients are remote thin clients to a server-side `scp-node`. A browser holds no pre-rotation key locally; its pre-rotation custody is the server-side `scp-node`'s custody (the PyO3/UniFFI/NAPI provider work in this ADR). There is no WebAuthn/passkey-PRF in-browser substrate to gate on.
 2. **Backend minimum.** Which §4 backends are mandatory for v1 per platform vs. additive (e.g., is encrypted-offline a sufficient floor for all SDKs, with hardware backends additive)?
 3. **Spec clause.** Does §9.7.4.1 need an explicit "callback-custody pre-rotation provider" sub-clause, or is the existing §3 normative text sufficient to govern the implementation? (If a clause is needed, the spec change lands before code, per artifact flow.)

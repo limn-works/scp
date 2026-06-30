@@ -1340,5 +1340,5 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 16. `ScpKeyCustodyAttestation` type published in DID document service entries.
 17. `ScpCustodyViolationAttestation` type for permanently recording unambiguous violations.
 18. `CounterAttestation` type for reputation restoration.
-19. All FFI bridges (PyO3, NAPI, UniFFI, WASM) expose agent key creation, rotation, and status.
+19. All FFI bridges (PyO3, NAPI, UniFFI) expose agent key creation, rotation, and status.
 20. Integration test: create identity with agent key → mint scoped UCAN → join MLS group with agent credential → send message → verify at recipient → rotate agent key → verify credential update.
