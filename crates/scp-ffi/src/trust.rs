@@ -436,46 +436,74 @@ fn aggregate_with_storage(
         ))
     })?;
     let handle = crate::runtime()?.handle().clone();
-    match provider {
+    // The aggregation logic lives ONCE in `run_aggregation` (generic over the
+    // concrete `EncryptedStorage` backend). The match is pure type dispatch: the
+    // sealed `EncryptedStorage` bound on `ProtocolRepository::new` cannot be
+    // satisfied by the `StorageProvider` enum itself (the marker trait lives in
+    // `scp-platform`), so the concrete `Arc<S>` must be recovered per variant.
+    // Both arms route through the single generic body — no duplicated logic.
+    let inputs = AggregationInputs {
+        context_id,
+        subject_did,
+        cached_attestations,
+        challenge_results,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+    };
+    let result = match provider {
         StorageProvider::InMemoryEncrypted(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            run_aggregation(Arc::clone(storage), handle, inputs)
         }
-        StorageProvider::Sqlite(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-        }
-    }
+        StorageProvider::Sqlite(storage) => run_aggregation(Arc::clone(storage), handle, inputs),
+    };
+    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Owned + borrowed inputs for [`run_aggregation`], grouped to keep the generic
+/// helper's signature manageable.
+struct AggregationInputs<'a> {
+    context_id: &'a str,
+    subject_did: &'a str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &'a [scp_core::trust::ChallengeVerification],
+    events: &'a [scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &'a [scp_core::trust::ConsequenceRule],
+    threshold_requirements: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and runs `populate_and_aggregate`. Single source of truth for the per-backend
+/// aggregation path (both `StorageProvider` variants route through this).
+fn run_aggregation<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    inputs: AggregationInputs<'_>,
+) -> Result<String, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::populate_and_aggregate(
+        bridge,
+        inputs.context_id,
+        inputs.subject_did,
+        inputs.cached_attestations,
+        inputs.challenge_results,
+        inputs.events,
+        inputs.merkle_root,
+        inputs.consequence_rules,
+        inputs.threshold_requirements,
+        inputs.attestor_sets,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -614,34 +642,28 @@ fn participation_record_impl(
         })?;
 
     // Source verified attestations from this instance's persistent trust store
-    // (same backend as context/event-log writes — issue #502).
+    // (same backend as context/event-log writes — issue #502). The sourcing
+    // logic lives ONCE in `run_verified_attestations` (generic over the concrete
+    // `EncryptedStorage` backend); the match is pure type dispatch because the
+    // sealed `EncryptedStorage` bound cannot be satisfied by the `StorageProvider`
+    // enum itself. Both arms route through the single generic body.
     let provider = crate::runtime::get_storage(bi)?;
     let handle = crate::runtime()?.handle().clone();
     let verified = match provider {
-        StorageProvider::InMemoryEncrypted(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::verified_attestations(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-            )
-        }
-        StorageProvider::Sqlite(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::verified_attestations(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-            )
-        }
+        StorageProvider::InMemoryEncrypted(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
+        StorageProvider::Sqlite(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
     }
     // An error from `verified_attestations` is an INFRA fault (trust-store read,
     // signature-verification infrastructure) — NOT a caller-input validation
@@ -675,6 +697,27 @@ fn participation_record_impl(
 
     let facts = scp_core::trust::ParticipationFacts::from(&record);
     Ok(PyParticipationRecord::from(&facts))
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and reads back the subject's verified attestations. Single source of truth for
+/// the per-backend attestation-sourcing path (both `StorageProvider` variants
+/// route through this).
+fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
 }
 
 // ---------------------------------------------------------------------------
