@@ -186,6 +186,18 @@ pub struct ParticipationFacts {
     /// Number of accessible, currently-valid credential-layer attestations
     /// (§7.4) for the subject. Verifier-relative — a caller with no
     /// attestation-cache access honestly yields 0.
+    ///
+    /// SECURITY (issuer legitimacy): this is a raw count of authentic-but-self-
+    /// issuable endorsements. Each contributing attestation's signature is
+    /// verified, but authenticity is NOT authorization: an issuer is
+    /// self-certifying, so a subject can mint endorsements from issuer DIDs it
+    /// controls and inflate this count (a Sybil endorsement ring). It carries NO
+    /// issuer-independence / Sybil-resistance guarantee. Consumers MUST NOT use
+    /// `attestation_count` as a sole trust or admission factor; an admission gate
+    /// needing Sybil resistance must use the independence-scored threshold path
+    /// ([`check_threshold_attestation`](super::attestation::check_threshold_attestation)),
+    /// not this count (mirrors the §7.4.1 self-certification caveat on challenge
+    /// results and the `ParticipationProfile` signer).
     pub attestation_count: u64,
 
     /// Whether `attestation_count` is anchored in / verifiable against a context
@@ -413,6 +425,12 @@ pub fn compute_participation_record(
 /// Builds the credential-layer attestation history (§7.4) for a subject from a
 /// set of accessible attestations.
 ///
+/// SECURITY (issuer legitimacy): the resulting length feeds `attestation_count`,
+/// a raw count of authentic-but-self-issuable endorsements. Each attestation's
+/// signature is verified upstream, but authenticity is not authorization — an
+/// issuer is self-certifying, so the count has NO issuer-independence / Sybil
+/// guarantee. See the caveat on [`ParticipationFacts::attestation_count`].
+///
 /// Defensively filters to attestations whose `subject` matches `subject_did` and
 /// whose `revocation_status` is [`RevocationStatus::Active`]
 /// (`get_verified_attestations` already drops revoked-on-reverify, but a broader
@@ -595,6 +613,14 @@ pub enum ParticipationFact {
     RoleProgressionCount,
     /// Number of accessible, currently-valid credential-layer attestations
     /// (§7.4) — NOT an event-log count (there is no attestation event type).
+    ///
+    /// SECURITY (issuer legitimacy): a raw count of authentic-but-self-issuable
+    /// endorsements with NO issuer-independence / Sybil guarantee — an issuer is
+    /// self-certifying, so a subject can mint endorsements from DIDs it controls.
+    /// An admission gate needing Sybil resistance MUST use the independence-scored
+    /// threshold path
+    /// ([`check_threshold_attestation`](super::attestation::check_threshold_attestation)),
+    /// not `AttestationCount`. See [`ParticipationFacts::attestation_count`].
     AttestationCount,
 }
 

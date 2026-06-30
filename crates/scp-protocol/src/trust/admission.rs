@@ -77,8 +77,9 @@ pub enum AdmissionError {
 /// SECURITY: this verifies the AUTHENTICITY of caller-supplied
 /// [`ChallengeVerification`] records — each is run through
 /// [`verify_challenge_verification`] (verifier Ed25519 signature over the
-/// canonical bytes + context binding + expiry, all clock-relative) before it can
-/// satisfy any requirement. It does NOT establish that the verifier is
+/// canonical bytes + context binding + subject binding + expiry, all
+/// clock-relative) before it can satisfy any requirement. It does NOT establish
+/// that the verifier is
 /// *authorized/trusted*: the `verifier_did` is self-certifying, so a subject can
 /// present a genuinely-signed result from a verifier it controls. Callers MUST
 /// establish verifier legitimacy separately (e.g. a trusted-signer set or
@@ -105,6 +106,11 @@ pub enum AdmissionError {
 ///   equals this value: a result minted for another context (or a
 ///   context-agnostic `None` result) MUST NOT satisfy admission here, enforced by
 ///   [`verify_challenge_verification`].
+/// - `subject_did` — The DID of the agent being admitted. A challenge
+///   verification only satisfies a requirement when its signed `subject_did`
+///   equals this value: a genuine result minted for another subject MUST NOT
+///   satisfy this agent's admission (cross-subject attribution), enforced by
+///   [`verify_challenge_verification`].
 /// - `resolver` — Resolves a `verifier_did` to its Ed25519 public key for
 ///   signature verification.
 /// - `clock` — Injected clock; `verify_challenge_verification` rejects records
@@ -115,12 +121,13 @@ pub enum AdmissionError {
 /// Returns [`AdmissionError::MissingCapability`] if a self-attested capability
 /// is not declared, or [`AdmissionError::VerificationRequired`] if a
 /// challenge-verified capability lacks a valid (signature-verified, passed,
-/// non-expired, in-context) verification record.
+/// non-expired, in-context, in-subject) verification record.
 pub fn check_capability_requirements(
     requirements: &[CapabilityRequirement],
     agent_capabilities: &[CapabilityUri],
     challenge_verifications: &[ChallengeVerification],
     context_id: &str,
+    subject_did: &str,
     resolver: &(impl DidPublicKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
 ) -> Result<(), AdmissionError> {
@@ -132,7 +139,9 @@ pub fn check_capability_requirements(
     // to the MissingCapability / VerificationRequired outcome.
     let verified: Vec<&ChallengeVerification> = challenge_verifications
         .iter()
-        .filter(|cv| verify_challenge_verification(cv, resolver, context_id, clock).is_ok())
+        .filter(|cv| {
+            verify_challenge_verification(cv, resolver, context_id, subject_did, clock).is_ok()
+        })
         .collect();
 
     for req in requirements {
@@ -186,6 +195,11 @@ mod tests {
     /// verification records produced by `make_verification` are bound to this
     /// context (their signed `context_id`), so they satisfy requirements here.
     const CTX: &str = "ctx-admission";
+
+    /// The subject all admission checks below are evaluated for. The verification
+    /// records produced by `make_verification` are bound to this subject (their
+    /// signed `subject_did`), so they satisfy requirements here.
+    const SUBJECT: &str = "did:dht:zResponder";
 
     /// Deterministic verifier signing key used by `make_verification`.
     fn verifier_key() -> SigningKey {
@@ -265,7 +279,7 @@ mod tests {
     #[test]
     fn empty_requirements_always_passes() {
         let (resolver, clock) = resolver_and_clock();
-        let result = check_capability_requirements(&[], &[], &[], CTX, &resolver, &clock);
+        let result = check_capability_requirements(&[], &[], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(result.is_ok());
     }
 
@@ -278,7 +292,8 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[uri], &[], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[uri], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(result.is_ok());
     }
 
@@ -291,7 +306,8 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[], &[], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -309,8 +325,15 @@ mod tests {
         }];
 
         let verifications = vec![make_verification(&uri)];
-        let result =
-            check_capability_requirements(&reqs, &[], &verifications, CTX, &resolver, &clock);
+        let result = check_capability_requirements(
+            &reqs,
+            &[],
+            &verifications,
+            CTX,
+            SUBJECT,
+            &resolver,
+            &clock,
+        );
         assert!(result.is_ok());
     }
 
@@ -324,7 +347,8 @@ mod tests {
         }];
 
         // Even if agent claims the capability, ChallengeVerified requires a record.
-        let result = check_capability_requirements(&reqs, &[uri], &[], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[uri], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { ref uri })
@@ -345,7 +369,8 @@ mod tests {
 
         let mut cv = make_verification(&uri);
         cv.verifier_signature = Vec::new(); // strip the genuine signature
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
         assert!(
             matches!(result, Err(AdmissionError::VerificationRequired { .. })),
             "a record with an invalid/empty verifier signature must NOT satisfy the requirement"
@@ -365,7 +390,8 @@ mod tests {
 
         let mut cv = make_verification(&uri);
         cv.verifier_signature = vec![0u8; 64]; // non-authenticating signature
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { .. })
@@ -389,7 +415,8 @@ mod tests {
         ];
 
         // Agent has uri_a but not uri_b.
-        let result = check_capability_requirements(&reqs, &[uri_a], &[], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[uri_a], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -408,8 +435,15 @@ mod tests {
 
         // Agent does NOT have it in capabilities, but has a verification record.
         let verifications = vec![make_verification(&uri)];
-        let result =
-            check_capability_requirements(&reqs, &[], &verifications, CTX, &resolver, &clock);
+        let result = check_capability_requirements(
+            &reqs,
+            &[],
+            &verifications,
+            CTX,
+            SUBJECT,
+            &resolver,
+            &clock,
+        );
         assert!(result.is_ok());
     }
 
@@ -430,8 +464,15 @@ mod tests {
         ];
 
         let verifications = vec![make_verification(&uri_b)];
-        let result =
-            check_capability_requirements(&reqs, &[uri_a], &verifications, CTX, &resolver, &clock);
+        let result = check_capability_requirements(
+            &reqs,
+            &[uri_a],
+            &verifications,
+            CTX,
+            SUBJECT,
+            &resolver,
+            &clock,
+        );
         assert!(result.is_ok());
     }
 
@@ -447,8 +488,15 @@ mod tests {
         }];
 
         let verifications = vec![make_verification(&uri)];
-        let result =
-            check_capability_requirements(&reqs, &[], &verifications, CTX, &resolver, &clock);
+        let result = check_capability_requirements(
+            &reqs,
+            &[],
+            &verifications,
+            CTX,
+            SUBJECT,
+            &resolver,
+            &clock,
+        );
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })
@@ -467,7 +515,8 @@ mod tests {
         let mut cv = make_verification(&uri);
         cv.passed = false;
         resign(&mut cv);
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })
@@ -487,7 +536,8 @@ mod tests {
         let mut cv = make_verification(&uri);
         cv.passed = false;
         resign(&mut cv);
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { .. })
@@ -508,7 +558,36 @@ mod tests {
         let mut cv = make_verification(&uri);
         cv.context_id = Some("ctx-other".to_owned());
         resign(&mut cv);
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::VerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn verification_for_other_subject_does_not_satisfy_challenge_verified() {
+        let (resolver, clock) = resolver_and_clock();
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::ChallengeVerified,
+        }];
+
+        // A genuine, passed, unexpired, in-context verification — but its signed
+        // `subject_did` is SUBJECT, not the agent being admitted here. It must NOT
+        // satisfy admission for a DIFFERENT subject (cross-subject attribution).
+        let verifications = vec![make_verification(&uri)];
+        let result = check_capability_requirements(
+            &reqs,
+            &[],
+            &verifications,
+            CTX,
+            "did:dht:zSomeoneElse",
+            &resolver,
+            &clock,
+        );
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })
@@ -529,7 +608,8 @@ mod tests {
         let mut cv = make_verification(&uri);
         cv.context_id = None;
         resign(&mut cv);
-        let result = check_capability_requirements(&reqs, &[], &[cv], CTX, &resolver, &clock);
+        let result =
+            check_capability_requirements(&reqs, &[], &[cv], CTX, SUBJECT, &resolver, &clock);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { .. })

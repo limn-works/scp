@@ -288,6 +288,18 @@ pub enum VerificationMethod {
 /// a capability and the agent passed — the verifier's signature prevents
 /// forgery (spec §7.3.4.2).
 ///
+/// # Authenticated fields
+///
+/// ONLY the fields covered by [`canonical_challenge_verification_bytes`] are
+/// authenticated by the `verifier_signature`: `verification_id`, `verifier_did`,
+/// `subject_did`, `capability_uri`, `challenge_type`, `passed`, `score`,
+/// `test_count`, `pass_count`, `verified_at`, `expires_at`, and `context_id`.
+/// The `result`, `completed_at`, and `verification_method` fields are NOT signed
+/// and can be altered after minting without invalidating the signature.
+/// Consumers (including SDKs) MUST NOT key trust decisions on those unsigned
+/// fields — use the signed `passed`/`score`/`expires_at` and the top-level
+/// signed `challenge_type` instead.
+///
 /// See ADR-017 acceptance criterion 5, spec §7.3.4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeVerification {
@@ -820,6 +832,12 @@ pub fn verify_challenge_response(
 ///    ([`TrustError::ChallengeVerificationExpired`]) so a stale verification is
 ///    never consumed as a current trust signal. `now` is read from the injected
 ///    `clock`, matching the attestation ingest path.
+/// 3. **Subject binding.** The record's signed `subject_did` must equal
+///    `expected_subject`. `subject_did` is part of the canonical preimage, so the
+///    binding is authentic; a genuine result minted for subject A is REJECTED
+///    ([`TrustError::ChallengeSubjectMismatch`]) when consumed for subject B.
+///    This closes cross-subject attribution by construction at the verify site,
+///    rather than relying on the caller's store key to segregate records.
 ///
 /// # Errors
 ///
@@ -830,10 +848,13 @@ pub fn verify_challenge_response(
 /// - [`TrustError::ChallengeContextMismatch`] if the record's `context_id` is
 ///   not `Some(target_context_id)`.
 /// - [`TrustError::ChallengeVerificationExpired`] if `expires_at <= now`.
+/// - [`TrustError::ChallengeSubjectMismatch`] if the record's signed
+///   `subject_did` is not `expected_subject`.
 pub fn verify_challenge_verification(
     verification: &ChallengeVerification,
     resolver: &(impl DidPublicKeyResolver + ?Sized),
     target_context_id: &str,
+    expected_subject: &str,
     clock: &(impl Clock + ?Sized),
 ) -> Result<(), TrustError> {
     let verifier_pk = resolver.resolve_public_key(&verification.verifier_did)?;
@@ -844,6 +865,18 @@ pub fn verify_challenge_verification(
             reason,
         },
     )?;
+
+    // Subject binding: reject a genuine, verifier-signed result minted for a
+    // different subject. `subject_did` is a signed field, so this comparison is
+    // over authenticated data — the binding is explicit here at the verify site,
+    // not reliant on the caller keying its store by subject.
+    if verification.subject_did != expected_subject {
+        return Err(TrustError::ChallengeSubjectMismatch {
+            verification_id: verification.verification_id.clone(),
+            record_subject: verification.subject_did.to_string(),
+            expected_subject: expected_subject.to_owned(),
+        });
+    }
 
     // Context binding: reject a `None` (context-agnostic) result for a
     // context-scoped store, and reject a genuine result minted for another
@@ -2150,6 +2183,99 @@ mod tests {
                 }
                 other => panic!("expected NotChallengeable for {system_uri}, got {other:?}"),
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_challenge_verification — subject binding (Fix 6)
+    // -----------------------------------------------------------------------
+
+    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
+    /// `subject` and `context`, signed with `signing_key`.
+    fn make_signed_verification(
+        signing_key: &SigningKey,
+        verifier_did: &str,
+        subject: &str,
+        context: &str,
+        expires_at: u64,
+    ) -> ChallengeVerification {
+        let mut cv = ChallengeVerification {
+            verification_id: "vid-subject-binding".to_owned(),
+            verifier_did: verifier_did.into(),
+            subject_did: subject.into(),
+            capability_uri: TEST_CAPABILITY_URI.to_owned(),
+            challenge_type: ChallengeType::schema_validation(),
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::schema_validation(),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::json!({"passed": true}),
+            completed_at: 900,
+            verified_at: 900,
+            expires_at,
+            context_id: Some(context.to_owned()),
+            verifier_signature: vec![],
+        };
+        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = signing_key.sign(&canonical).to_bytes().to_vec();
+        cv
+    }
+
+    #[test]
+    fn verify_challenge_verification_accepts_matching_subject() {
+        let (verifier_key, verifier_pub) = test_keypair();
+        let clock = TestClock::new(1000);
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:verifier", verifier_pub);
+
+        let cv = make_signed_verification(
+            &verifier_key,
+            "did:key:verifier",
+            "did:key:subject-a",
+            "ctx-1",
+            u64::MAX,
+        );
+
+        // Verifying for the matching subject succeeds.
+        assert!(
+            verify_challenge_verification(&cv, &resolver, "ctx-1", "did:key:subject-a", &clock)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_challenge_verification_rejects_mismatched_subject() {
+        let (verifier_key, verifier_pub) = test_keypair();
+        let clock = TestClock::new(1000);
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:verifier", verifier_pub);
+
+        // A genuine, in-context, unexpired, properly-signed result for subject A.
+        let cv = make_signed_verification(
+            &verifier_key,
+            "did:key:verifier",
+            "did:key:subject-a",
+            "ctx-1",
+            u64::MAX,
+        );
+
+        // Consuming it for a DIFFERENT subject B is rejected, even though the
+        // signature, context, and expiry are all valid.
+        let result =
+            verify_challenge_verification(&cv, &resolver, "ctx-1", "did:key:subject-b", &clock);
+        match result {
+            Err(TrustError::ChallengeSubjectMismatch {
+                record_subject,
+                expected_subject,
+                ..
+            }) => {
+                assert_eq!(record_subject, "did:key:subject-a");
+                assert_eq!(expected_subject, "did:key:subject-b");
+            }
+            other => panic!("expected ChallengeSubjectMismatch, got {other:?}"),
         }
     }
 }

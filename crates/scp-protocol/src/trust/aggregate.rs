@@ -292,7 +292,15 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         for entry in cached {
             if entry.is_expired(now) {
                 // Re-verify the attestation, consulting the context revocation
-                // list (a context-revoked entry fails here and is discarded).
+                // list. `.is_ok()` keeps the entry only on success; a non-Ok
+                // result — a verification rejection (bad signature / expired /
+                // context-revoked) OR a resolver infra fault — drops this one
+                // entry. This is conservative (it can only drop, never inflate)
+                // and is sound here because the injected `resolver` is total and
+                // pure (`IdentityDidPublicKeyResolver`: a deterministic DID-string
+                // parse, no network), so no transient fault can spuriously drop a
+                // valid entry. A future networked/fallible resolver swap MUST
+                // revisit this to separate rejections from infra faults.
                 if verify_attestation_with_revocation(
                     &entry.attestation,
                     resolver,
@@ -310,7 +318,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                     self.store.store_cached_attestation(context_id, refreshed)?;
                     result.push(entry.attestation);
                 }
-                // If verification fails, the entry is silently discarded.
+                // On any non-Ok result the entry is dropped (see note above).
             } else if revocation_checker
                 .check_revocation(&entry.attestation.id, &entry.attestation.issuer)
                 .is_none()
@@ -495,19 +503,39 @@ where
     //    that was valid at ingest is otherwise served as a CURRENT trust signal
     //    forever — even after its `expires_at` passes (read-path fail-open). Re-
     //    run the same verify-on-ingest gate (`verify_challenge_verification`:
-    //    verifier signature + context binding + expiry) against the target
-    //    context and current clock, dropping any result that no longer verifies.
-    //    Mirrors the attestation read path
+    //    verifier signature + context binding + subject binding + expiry) against
+    //    the target context, subject, and current clock, dropping any result that
+    //    no longer verifies. Mirrors the attestation read path
     //    ([`AttestationCache::get_verified_attestations`]), which likewise re-
-    //    validates persisted entries on every read. Store-read faults still
-    //    propagate (via `?`); only verification failures drop the one entry.
+    //    validates persisted entries on every read.
+    //
+    //    INVARIANT: `.is_ok()` drops the one entry on ANY non-Ok result — a
+    //    verification rejection (bad signature / wrong context / wrong subject /
+    //    expired) OR a resolver infra fault. This is sound (conservative: it can
+    //    only ever DROP an entry, never inflate trust) ONLY because the injected
+    //    `resolver` is total and pure — `IdentityDidPublicKeyResolver` is a
+    //    deterministic DID-string parse with no network I/O, so it cannot raise a
+    //    transient fault that would spuriously drop a valid record. If a
+    //    networked/fallible resolver is ever substituted here, this filter MUST be
+    //    revisited to distinguish verification rejections from infra faults (the
+    //    `is_verification_rejection` classifier on the ingest path does exactly
+    //    this) so a transient resolver outage does not silently zero a subject's
+    //    challenge signal. The store read above still propagates its faults via
+    //    `?`.
     let challenge_results: Vec<ChallengeVerification> = ctx
         .cache
         .store()
         .get_challenge_results(ctx.context_id, ctx.subject_did)?
         .into_iter()
         .filter(|cv| {
-            verify_challenge_verification(cv, ctx.resolver, ctx.context_id, ctx.clock).is_ok()
+            verify_challenge_verification(
+                cv,
+                ctx.resolver,
+                ctx.context_id,
+                ctx.subject_did,
+                ctx.clock,
+            )
+            .is_ok()
         })
         .collect();
 

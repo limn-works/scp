@@ -161,8 +161,9 @@ impl AttestationRevocationChecker for RevocationStateChecker<'_> {
 ///
 /// Returns `true` for a verification REJECTION — the caller-supplied credential
 /// is itself invalid (bad signature, expired, revoked, malformed
-/// evidence/revocation, context-mismatched, or non-canonicalizable), so dropping
-/// that one entry and continuing is correct. Returns `false` for an INFRA fault
+/// evidence/revocation, context-mismatched, subject-mismatched, or
+/// non-canonicalizable), so dropping that one entry and continuing is correct.
+/// Returns `false` for an INFRA fault
 /// (store read/write failure, poisoned lock), which MUST propagate: silently
 /// dropping every credential on a transient backend error would zero a subject's
 /// trust without signal. Closed allowlist of rejection variants (white-hat P2-d).
@@ -187,6 +188,7 @@ const fn is_verification_rejection(err: &TrustError) -> bool {
             | TrustError::ChallengeVerificationSignatureInvalid { .. }
             | TrustError::ChallengeVerificationExpired { .. }
             | TrustError::ChallengeContextMismatch { .. }
+            | TrustError::ChallengeSubjectMismatch { .. }
             | TrustError::CanonicalizationFailed { .. }
     )
 }
@@ -285,12 +287,13 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     // `verify_challenge_verification` checks the verifier's Ed25519 signature
     // (resolver-resolved verifier key, binding `passed`/`score`/`expires_at`/
     // `subject_did`/`context_id`), binds the record to THIS `context_id` (no
-    // cross-context replay; a `None` context-agnostic record is rejected), and
-    // rejects an expired record (clock-relative) BEFORE storing. Drop records
+    // cross-context replay; a `None` context-agnostic record is rejected) and to
+    // THIS `subject_did` (no cross-subject attribution), and rejects an expired
+    // record (clock-relative) BEFORE storing. Drop records
     // that fail verification, and propagate infra faults so a backend error does
     // not silently discard a legitimate verifier's signal.
     for cr in challenge_results {
-        match verify_challenge_verification(cr, &resolver, context_id, &clock) {
+        match verify_challenge_verification(cr, &resolver, context_id, subject_did, &clock) {
             Ok(()) => cache.store().store_challenge_result(context_id, cr)?,
             Err(reason) if is_verification_rejection(&reason) => {
                 tracing::debug!(

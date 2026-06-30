@@ -284,6 +284,25 @@ pub enum TrustError {
         expected_context: String,
     },
 
+    /// The challenge verification record's signed `subject_did` does not match
+    /// the subject it is being aggregated/checked for. `subject_did` is part of
+    /// the canonical preimage, so the binding is cryptographically authentic; a
+    /// genuine, in-context, unexpired result minted for subject A MUST NOT be
+    /// counted toward subject B's trust signal or admission. This closes
+    /// cross-subject attribution by construction at the verify site, rather than
+    /// relying on the store key alone.
+    #[error(
+        "challenge verification {verification_id}: subject mismatch (record {record_subject}, expected {expected_subject})"
+    )]
+    ChallengeSubjectMismatch {
+        /// The verification record ID.
+        verification_id: String,
+        /// The signed `subject_did` carried by the record.
+        record_subject: String,
+        /// The subject the record is being consumed for.
+        expected_subject: String,
+    },
+
     /// The requested DID is not a member of the context.
     #[error("DID is not a member of this context: {did}")]
     NotAMember {
