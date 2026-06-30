@@ -51,7 +51,7 @@ pub use group::{
     generate_key_package_with_wrapping_key, join_group, remove_member,
 };
 pub use provider::MlsCryptoProvider;
-pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, new_provider};
+pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};
 pub use wrapping_extension::{
     SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
     extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,
