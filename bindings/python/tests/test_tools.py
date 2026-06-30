@@ -583,11 +583,12 @@ class TestSagaAbortedTranslation:
 
     async def test_abort_empty_args_falls_back_without_index_error(self) -> None:
         """A bridge terminal raised with NO args translates cleanly: the
-        message read is guarded by ``if args else str(exc)`` so it never
-        indexes ``args[0]`` out of range, and the code/back-off fall back.
+        message read is guarded by ``str(args[0]) if len(args) > 0 else
+        str(exc)`` so it never indexes ``args[0]`` out of range, and the
+        code/back-off fall back.
 
-        Dropping the ``if args`` guard would raise ``IndexError`` on the empty
-        tuple instead of producing a typed SDK terminal; this pins it.
+        Dropping the ``len(args) > 0`` guard would raise ``IndexError`` on the
+        empty tuple instead of producing a typed SDK terminal; this pins it.
         """
         from scp_sdk.errors import SagaAbortedError
 
