@@ -21,7 +21,7 @@ was removed from this layer.
 
 ## Fixtures
 
-- `good-all-bridges` — single canonical op implemented in all four bridges.
+- `good-all-bridges` — single canonical op implemented in all three bridges.
   Expected: exit 0, zero findings.
 - `bad-missing-napi` — canonical op missing from the NAPI bridge.
   Expected: exit 1, finding cites `bridge=napi missing operation widget_create`.

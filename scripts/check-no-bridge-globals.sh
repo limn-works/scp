@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 # WHAT THIS CHECKS
 # ---------------------------------------------------------------------------
-# Every module-level `static` declaration in the four FFI bridges
+# Every module-level `static` declaration in the three FFI bridges
 #   crates/scp-ffi/src/        (PyO3   — #[pyfunction])
 #   crates/scp-ffi/napi/src/   (NAPI   — #[napi])
 #   crates/scp-ffi/uniffi/src/ (UniFFI — #[uniffi::export])

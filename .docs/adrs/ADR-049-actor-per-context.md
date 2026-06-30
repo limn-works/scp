@@ -387,7 +387,7 @@ cargo test -p scp-runtime --test cancel_safety
 cargo test -p scp-runtime --test shuttle_actor --features shuttle
 ```
 
-Plus existing E2E test suites across all four bindings.
+Plus existing E2E test suites across all three bindings.
 
 Invariants to verify (documented in plan):
 

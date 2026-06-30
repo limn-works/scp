@@ -156,7 +156,7 @@ This trades off a class of findings (bit-exact crypto divergence) for
 shipping the harness now. When a bridge-wide `seed` parameter lands, flip
 the comparators to `base64_bytes` in `seed_operations.py`; the rest of the
 framework is unaffected. **Status:** the seed parameter has landed across
-all four bridges AND scp-core (ADR-046 round 11), and the SCPID
+all three bridges AND scp-core (ADR-046 round 11), and the SCPID
 `signed_at_override` testing affordance now lets `OP_SIGN_MESSAGE` pin
 byte-exact signatures under the shared seed (see
 `crates/scp-runtime/src/identity/scpid.rs::print_parity_sign_golden_value`

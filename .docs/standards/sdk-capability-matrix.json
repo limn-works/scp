@@ -674,7 +674,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all four bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, and UniFFI bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
+          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all three bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, and UniFFI bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
         },
         {
           "name": "evaluate_consequence_rules",
@@ -812,7 +812,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Direct-execute is BY ID across all four bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
+          "notes": "Direct-execute is BY ID across all three bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
         },
         {
           "name": "propose_action",
@@ -939,7 +939,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::SuspendAccess variant dispatched via execute_action / propose_action across all four bridges (B1 enforcement model unification, batch-2)."
+          "notes": "GovernanceAction::SuspendAccess variant dispatched via execute_action / propose_action across all three bridges (B1 enforcement model unification, batch-2)."
         },
         {
           "name": "execute_revoke_access",
@@ -947,7 +947,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RevokeAccess variant (renamed from MemberRevoke per commit 31885c7e) dispatched via execute_action / propose_action across all four bridges. Triggers content access key revocation through the existing access-key pipeline (#1529, batch-2 wiring)."
+          "notes": "GovernanceAction::RevokeAccess variant (renamed from MemberRevoke per commit 31885c7e) dispatched via execute_action / propose_action across all three bridges. Triggers content access key revocation through the existing access-key pipeline (#1529, batch-2 wiring)."
         },
         {
           "name": "execute_restore_access",
@@ -955,7 +955,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RestoreAccess variant dispatched via execute_action / propose_action across all four bridges. Inverse of RevokeAccess; restores access keys for a previously revoked member (B1 enforcement model unification)."
+          "notes": "GovernanceAction::RestoreAccess variant dispatched via execute_action / propose_action across all three bridges. Inverse of RevokeAccess; restores access keys for a previously revoked member (B1 enforcement model unification)."
         },
         {
           "name": "execute_remove_member",
@@ -963,7 +963,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all four bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection \u2014 see the Crypto domain rows."
+          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all three bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection \u2014 see the Crypto domain rows."
         },
         {
           "name": "execute_rotate_content_keys",
@@ -971,7 +971,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RotateContentKeys variant dispatched via execute_action / propose_action across all four bridges. Wired to the crypto provider's advance_epoch / propose_update flow inside execute_rotate_content_keys (#1548, batch-2 wiring)."
+          "notes": "GovernanceAction::RotateContentKeys variant dispatched via execute_action / propose_action across all three bridges. Wired to the crypto provider's advance_epoch / propose_update flow inside execute_rotate_content_keys (#1548, batch-2 wiring)."
         },
         {
           "name": "propose_governance_action_checked",
@@ -979,7 +979,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All four bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
+          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All three bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
         }
       ]
     },
