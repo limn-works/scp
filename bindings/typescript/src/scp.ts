@@ -49,6 +49,7 @@ import type {
   SagaResult,
   TrustEvaluation,
 } from "./types";
+import { encodeCachedAttestations } from "./types";
 
 /**
  * Stable error code (spec §7.3.2) the core surfaces when a context has no
@@ -2600,7 +2601,7 @@ export class SCP {
           subj: string,
           ca: string,
         ) => BehavioralRecord
-      )(contextId, subjectDid, JSON.stringify(cachedAttestations));
+      )(contextId, subjectDid, encodeCachedAttestations(cachedAttestations));
     } catch (error) {
       throw mapBridgeError(error);
     }

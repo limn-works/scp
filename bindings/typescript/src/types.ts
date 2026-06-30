@@ -953,20 +953,46 @@ export interface BehavioralRecord {
 }
 
 /**
- * Wire-format attestation envelope (ADR-017 §7.4.1).
+ * Optional evidence supporting a {@link CachedAttestationEnvelope}.
  *
- * This is a pass-through DTO — the TypeScript analogue of the Python SDK's
- * untyped `cached_attestations` dicts — so its field names are the
- * serde-canonical snake_case the Rust core deserializes, NOT the camelCase the
- * SDK uses for core-modeled types. {@link SCP.participationRecord}
- * `JSON.stringify`s it straight onto the wire, exactly as the Python SDK
- * `json.dumps`es its dicts.
+ * Developer-facing fields are camelCase, matching the Swift
+ * `CachedAttestationEvidence` and Kotlin convention. {@link encodeCachedAttestations}
+ * maps `evidenceType` to the serde-canonical `evidence_type` on the wire.
+ */
+export interface CachedAttestationEvidence {
+  /** The evidence type discriminator. */
+  readonly evidenceType: string;
+  /** Type-specific evidence data. */
+  readonly data: unknown;
+}
+
+/**
+ * A `std::time::Duration` as the Rust core's serde representation
+ * (`{ secs, nanos }`), used for a renewable attestation's renewal interval.
+ * `secs`/`nanos` are the Rust field names and are identical on the wire.
+ */
+export interface CachedAttestationDuration {
+  /** Whole seconds. */
+  readonly secs: number;
+  /** Sub-second nanoseconds. */
+  readonly nanos: number;
+}
+
+/**
+ * Attestation envelope (ADR-017 §7.4.1).
+ *
+ * Developer-facing fields are camelCase, matching the other typed SDK output
+ * types ({@link BehavioralRecord}, {@link CapabilityValidation}) and the Swift
+ * `CachedAttestationEnvelope` `CodingKeys` / Kotlin convention. The wire format
+ * the Rust bridge deserializes is serde-canonical snake_case;
+ * {@link encodeCachedAttestations} performs the camelCase → snake_case mapping
+ * at the serialization boundary.
  */
 export interface CachedAttestationEnvelope {
   /** Unique attestation identifier. */
   readonly id: string;
   /** Attestation type (serde tag, e.g. `"IdentityLink"`). */
-  readonly attestation_type: string;
+  readonly attestationType: string;
   /** DID of the attestation issuer. */
   readonly issuer: string;
   /** DID of the attestation subject. */
@@ -974,17 +1000,17 @@ export interface CachedAttestationEnvelope {
   /** Type-specific claim data. */
   readonly claim: unknown;
   /** Optional evidence supporting the attestation. */
-  readonly evidence?: { readonly evidence_type: string; readonly data: unknown } | null;
+  readonly evidence?: CachedAttestationEvidence | null;
   /** Unix timestamp (seconds) when the attestation was issued. */
-  readonly issued_at: number;
+  readonly issuedAt: number;
   /** Optional expiry timestamp (seconds). */
-  readonly expires_at?: number | null;
+  readonly expiresAt?: number | null;
   /** Optional renewal interval (`std::time::Duration` → `{ secs, nanos }`). */
-  readonly renewal_interval?: { readonly secs: number; readonly nanos: number } | null;
+  readonly renewalInterval?: CachedAttestationDuration | null;
   /** Timestamp (seconds) of the last renewal, if renewable. */
-  readonly renewed_at?: number | null;
+  readonly renewedAt?: number | null;
   /** Current revocation status (serde-tagged). */
-  readonly revocation_status: unknown;
+  readonly revocationStatus: unknown;
   /** Ed25519 signature over the attestation content (64 bytes). */
   readonly signature: readonly number[];
 }
@@ -994,17 +1020,81 @@ export interface CachedAttestationEnvelope {
  *
  * Pass an array of these to {@link SCP.participationRecord} to seed the
  * bridge's trust store before it sources the subject's verified set. Mirrors
- * the Rust `CachedAttestation` and the Python SDK `cached_attestations` dicts
- * 1:1. An empty array (the default) seeds nothing — the bridge reports only
- * what it already holds (verifier-relative, §7.4).
+ * the Rust `CachedAttestation` and the Swift/Kotlin `CachedAttestation` types
+ * 1:1 (camelCase developer-facing fields; {@link encodeCachedAttestations}
+ * serializes to the snake_case wire shape). An empty array (the default) seeds
+ * nothing — the bridge reports only what it already holds (verifier-relative,
+ * §7.4).
  */
 export interface CachedAttestation {
   /** The verified attestation envelope. */
   readonly attestation: CachedAttestationEnvelope;
   /** Unix timestamp (seconds) when the attestation was last verified. */
-  readonly verified_at: number;
+  readonly verifiedAt: number;
   /** Time-to-live in seconds for the cache entry. */
-  readonly ttl_secs: number;
+  readonly ttlSecs: number;
+}
+
+/**
+ * Encodes a typed {@link CachedAttestation} array to the JSON wire shape the
+ * Rust bridge deserializes.
+ *
+ * The developer-facing types are camelCase (matching the other typed SDK types
+ * and the Swift/Kotlin SDKs), but the bridge expects serde-canonical
+ * snake_case. This maps `attestationType → attestation_type`,
+ * `issuedAt → issued_at`, `verifiedAt → verified_at`, etc., mirroring the Swift
+ * `CodingKeys` and Kotlin `buildJsonObject` mappings. The `renewalInterval`
+ * `{ secs, nanos }` shape is identical on the wire (Rust `Duration` field
+ * names), so it passes through unchanged.
+ *
+ * Public for SDK call sites that serialize cached attestations onto the wire
+ * (e.g. {@link SCP.participationRecord}) and for tests that pin the wire shape
+ * against the Rust serde format.
+ */
+export function encodeCachedAttestations(cachedAttestations: readonly CachedAttestation[]): string {
+  return JSON.stringify(cachedAttestations.map(encodeCachedAttestation));
+}
+
+function encodeCachedAttestation(cached: CachedAttestation): Record<string, unknown> {
+  return {
+    attestation: encodeCachedAttestationEnvelope(cached.attestation),
+    verified_at: cached.verifiedAt,
+    ttl_secs: cached.ttlSecs,
+  };
+}
+
+function encodeCachedAttestationEnvelope(
+  envelope: CachedAttestationEnvelope,
+): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    id: envelope.id,
+    attestation_type: envelope.attestationType,
+    issuer: envelope.issuer,
+    subject: envelope.subject,
+    claim: envelope.claim,
+    issued_at: envelope.issuedAt,
+    revocation_status: envelope.revocationStatus,
+    signature: envelope.signature,
+  };
+  if (envelope.evidence != null) {
+    wire.evidence = {
+      evidence_type: envelope.evidence.evidenceType,
+      data: envelope.evidence.data,
+    };
+  }
+  if (envelope.expiresAt != null) {
+    wire.expires_at = envelope.expiresAt;
+  }
+  if (envelope.renewalInterval != null) {
+    wire.renewal_interval = {
+      secs: envelope.renewalInterval.secs,
+      nanos: envelope.renewalInterval.nanos,
+    };
+  }
+  if (envelope.renewedAt != null) {
+    wire.renewed_at = envelope.renewedAt;
+  }
+  return wire;
 }
 
 /** Summary of an attestation. */

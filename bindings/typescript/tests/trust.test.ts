@@ -19,7 +19,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import type { CapabilityValidation } from "../src/types";
+import type { CachedAttestation, CapabilityValidation } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /** A fully-passing CapabilityValidation — the all-`true` identity element. */
@@ -374,12 +374,42 @@ describe("scp.participationRecord — typed cached-attestation input", () => {
     expect(call?.args[2]).toBe("[]");
   });
 
-  it("JSON.stringifies a typed CachedAttestation[] straight onto the wire", async () => {
+  it("maps a typed camelCase CachedAttestation[] to the snake_case wire shape", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("participationRecord", () => fakeParticipationRecord({ attestationCount: 1 }));
 
-    const cached = [
+    // Developer-facing fields are camelCase (matching the Swift/Kotlin SDKs and
+    // the other typed TS types). The full optional set is exercised to pin the
+    // camelCase → snake_case boundary mapping.
+    const cached: readonly CachedAttestation[] = [
+      {
+        attestation: {
+          id: "att-1",
+          attestationType: "IdentityLink",
+          issuer: "did:dht:issuer",
+          subject: "did:dht:subject",
+          claim: { platform: "github" },
+          evidence: { evidenceType: "oauth", data: { handle: "octocat" } },
+          issuedAt: 1000,
+          expiresAt: 5000,
+          renewalInterval: { secs: 86400, nanos: 0 },
+          renewedAt: 2000,
+          revocationStatus: "Active",
+          signature: [1, 2, 3],
+        },
+        verifiedAt: 1234,
+        ttlSecs: 300,
+      },
+    ];
+
+    const record = await scp.participationRecord("ctx-1", "did:dht:subject", cached);
+    expect(record.attestationCount).toBe(1);
+    const call = native.__lastCall("participationRecord");
+    // The bridge deserializes serde-canonical snake_case; the SDK maps the
+    // camelCase developer-facing fields at the serialization boundary
+    // (mirroring the Swift `CodingKeys` / Kotlin `buildJsonObject` convention).
+    expect(JSON.parse(call?.args[2] as string)).toEqual([
       {
         attestation: {
           id: "att-1",
@@ -387,21 +417,17 @@ describe("scp.participationRecord — typed cached-attestation input", () => {
           issuer: "did:dht:issuer",
           subject: "did:dht:subject",
           claim: { platform: "github" },
+          evidence: { evidence_type: "oauth", data: { handle: "octocat" } },
           issued_at: 1000,
+          expires_at: 5000,
+          renewal_interval: { secs: 86400, nanos: 0 },
+          renewed_at: 2000,
           revocation_status: "Active",
           signature: [1, 2, 3],
         },
         verified_at: 1234,
         ttl_secs: 300,
       },
-    ] as const;
-
-    const record = await scp.participationRecord("ctx-1", "did:dht:subject", cached);
-    expect(record.attestationCount).toBe(1);
-    const call = native.__lastCall("participationRecord");
-    // The SDK stringifies the typed input verbatim (the Python `list[dict]`
-    // analogue) — the wire string round-trips to the same structure.
-    expect(call?.args[2]).toBe(JSON.stringify(cached));
-    expect(JSON.parse(call?.args[2] as string)).toEqual(cached as unknown as unknown[]);
+    ]);
   });
 });
