@@ -315,8 +315,8 @@ class ToolSagaTest {
                     // supervisor-side rejection) means the call reached the
                     // real bridge — the wrapper forwarded successfully.
                     assertTrue(
-                        e.message?.isNotEmpty() ?: true,
-                        "expected a typed ScpException from the bridge",
+                        e.message!!.contains("code="),
+                        "expected a typed ScpException carrying a code= detail",
                     )
                 }
             } finally {
