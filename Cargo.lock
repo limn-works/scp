@@ -5182,6 +5182,7 @@ dependencies = [
  "reqwest",
  "scp-platform",
  "scp-primitives",
+ "scp-protocol",
  "serde",
  "serde_bytes",
  "serde_json",

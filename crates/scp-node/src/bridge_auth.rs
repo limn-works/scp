@@ -33,8 +33,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use scp_core::bridge::{BridgeConnector, BridgeStatus};
 use scp_core::store::ProtocolRepository;
-use scp_identity::dht::decode_multibase_key;
-use scp_identity::document::DidDocument;
+use scp_identity::document::{DidDocument, decode_multibase_key};
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 

@@ -33,15 +33,40 @@
 //!
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md` for the full design.
 
-pub mod attestation;
 pub mod cache;
 pub mod config;
 pub mod dht;
 pub mod dht_client;
-pub mod document;
 pub mod republish;
 pub mod resolution;
 pub mod resolver;
+
+/// DID-document, verification-method, and multibase-decode types.
+///
+/// These moved into `scp-protocol::identity::document` (ADR-057 Slice 1a) so
+/// they compile to `wasm32-unknown-unknown` for the in-browser client. This
+/// module re-exports them verbatim, so `scp_identity::document::{...}`
+/// consumers compile unchanged.
+pub mod document {
+    pub use scp_protocol::identity::document::{
+        DidDocument, DidDocumentError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
+        VerificationMethod, decode_multibase_key,
+    };
+}
+
+/// Key-custody and identity-link attestation types.
+///
+/// These moved into `scp-protocol::identity::did_attestation` (ADR-057 Slice
+/// 1a) alongside the DID-document closure. This module re-exports them
+/// verbatim, so `scp_identity::attestation::{...}` consumers compile
+/// unchanged.
+pub mod attestation {
+    pub use scp_protocol::identity::did_attestation::{
+        AttestationPlatform, IdentityLinkPlatform, IdentityLinkServiceEntry, KeyCustodyModel,
+        Platform, PlatformAttestation, ScpKeyCustodyAttestation, ServiceRevocationStatus,
+        UnknownPlatformError,
+    };
+}
 
 pub use attestation::{
     AttestationPlatform, IdentityLinkPlatform, IdentityLinkServiceEntry, KeyCustodyModel, Platform,
@@ -51,14 +76,19 @@ pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 pub use dht::{
     DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
-    PostResolveHook, SequenceStore, decode_multibase_key, did_from_ed25519_public_key,
-    extract_public_key, verify_bep44_signature, verify_migration, verify_self_certification,
+    PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
+    verify_bep44_signature, verify_migration, verify_self_certification,
 };
 // SigningKeyId re-exported from scp-primitives (see pub use above).
 pub use dht_client::{DhtClient, InMemoryDhtClient};
 #[cfg(feature = "production-dht")]
 pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
-pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
+// DID-document types now live in scp-protocol (ADR-057 Slice 1a); re-exported
+// at crate root for `scp_identity::{DidDocument, ...}` consumers.
+pub use document::{
+    DidDocument, DidDocumentError, DidRotationEvent, MigrationProof, PreRotationProof,
+    decode_multibase_key,
+};
 pub use republish::RepublishManager;
 pub use resolution::{
     InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
@@ -348,6 +378,36 @@ impl IdentityError {
         match self {
             Self::MigrationPublishFailed { partial, .. } => Ok(*partial),
             other => Err(other),
+        }
+    }
+}
+
+/// Maps the wasm-safe [`DidDocumentError`] (raised by the DID-document,
+/// verification-method, attestation, and multibase-decode types that moved
+/// into `scp-protocol` per ADR-057 Slice 1a) onto the corresponding
+/// `IdentityError` variant.
+///
+/// The mapping is variant-for-variant onto the pre-existing `IdentityError`
+/// variants, so `?`-propagation from a moved method yields the *identical*
+/// observable error (`IdentityError::InvalidRelayUrl(..)`, etc.) it did before
+/// the move — the split is behavior-preserving for every existing consumer,
+/// not just compile-preserving. `scp-identity`'s own code constructs these
+/// same variants directly for its DHT/config paths, so no new variant is
+/// introduced.
+impl From<DidDocumentError> for IdentityError {
+    fn from(err: DidDocumentError) -> Self {
+        match err {
+            DidDocumentError::InvalidDidFormat(msg) => Self::InvalidDidFormat(msg),
+            DidDocumentError::DocumentSerializationError(msg) => {
+                Self::DocumentSerializationError(msg)
+            }
+            DidDocumentError::DocumentDeserializationError(msg) => {
+                Self::DocumentDeserializationError(msg)
+            }
+            DidDocumentError::InvalidRelayUrl(msg) => Self::InvalidRelayUrl(msg),
+            DidDocumentError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
+            DidDocumentError::AgentKeyNotFound => Self::AgentKeyNotFound,
+            DidDocumentError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },
         }
     }
 }

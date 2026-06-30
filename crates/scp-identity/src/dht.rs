@@ -33,7 +33,9 @@ use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationK
 
 use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
+use super::document::{
+    DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
+};
 use super::{DidMethod, IdentityError, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
@@ -2015,57 +2017,6 @@ pub fn verify_self_certification(
     Ok(())
 }
 
-/// Decodes a multibase-encoded public key (z-prefix = base58btc).
-///
-/// Beyond the encoding check, the decoded 32-byte payload is validated
-/// as an Ed25519 Edwards-curve point via
-/// `ed25519_dalek::VerifyingKey::from_bytes`. This rejects non-curve
-/// payloads only (ZIP-215 rules) — low-order / small-subgroup points
-/// are NOT rejected here; they are caught at signature verification
-/// time via `verify_strict`. Matches the `from_did`
-/// curve-point gate so both decoding entry points behave consistently.
-///
-/// # Errors
-///
-/// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
-/// base58btc encoded, not exactly 32 bytes, or does not decompress to a
-/// valid Ed25519 Edwards-curve point.
-pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
-    let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
-        IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
-    })?;
-
-    let decoded = base58btc_decode(b58_str)
-        .map_err(|e| IdentityError::InvalidDidFormat(format!("base58btc decode failed: {e}")))?;
-
-    let decoded_array: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        IdentityError::InvalidDidFormat(format!("expected 32-byte key, got {} bytes", v.len()))
-    })?;
-
-    // Curve-point validation: `ed25519_dalek::VerifyingKey::from_bytes`
-    // rejects byte strings that don't decompress to an Edwards-curve
-    // point (ZIP-215 rules). Low-order / small-subgroup points are NOT
-    // rejected here — they are caught at signature verification time
-    // via `verify_strict`. Matches the `from_did_inner` gate so
-    // both decoding entry points reject non-curve payloads early.
-    ed25519_dalek::VerifyingKey::from_bytes(&decoded_array).map_err(|e| {
-        IdentityError::InvalidDidFormat(format!(
-            "multibase key payload is not a valid Ed25519 public key: {e}"
-        ))
-    })?;
-
-    Ok(decoded_array)
-}
-
-/// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
-///
-/// Inverse of the `base58btc_encode` function in `document.rs`.
-fn base58btc_decode(input: &str) -> Result<Vec<u8>, String> {
-    bs58::decode(input)
-        .into_vec()
-        .map_err(|e| format!("base58btc decode error: {e}"))
-}
-
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method
 // must return a future rather than use `async fn` directly.
 #[allow(clippy::manual_async_fn)]
@@ -3309,95 +3260,6 @@ mod tests {
         // Cache is expired for active contact, resolve goes to DHT.
         let result = dht.resolve_did(&identity.did).await.unwrap();
         assert_eq!(result.staleness, Staleness::Fresh);
-    }
-
-    #[test]
-    fn base58btc_decode_roundtrip() {
-        let original = [42u8; 32];
-        // Use the document module's encode (via the multibase_encode path)
-        let encoded =
-            crate::document::DidDocument::new("did:dht:zTest", &original, &[0u8; 32], &[0u8; 32]);
-        let vm = encoded.verification_method_by_fragment("0").unwrap();
-        let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    /// `decode_multibase_key` MUST reject payloads that don't decompress
-    /// to a valid Ed25519 Edwards-curve point. ed25519-dalek's
-    /// `from_bytes` enforces ZIP-215 curve-point decompression. About
-    /// half of random 32-byte strings fail this check, so we search for
-    /// one rather than hardcoding a specific value. Matches the
-    /// `from_did_rejects_non_ed25519_curve_point` guard so
-    /// both decoding entry points reject non-curve payloads early.
-    #[test]
-    fn decode_multibase_key_rejects_non_curve_point() {
-        use rand::RngCore;
-
-        // Search for a 32-byte payload that fails Ed25519 decompression.
-        let non_curve_bytes: [u8; 32] = {
-            let mut found: Option<[u8; 32]> = None;
-            for _ in 0..512 {
-                let mut candidate = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut candidate);
-                if ed25519_dalek::VerifyingKey::from_bytes(&candidate).is_err() {
-                    found = Some(candidate);
-                    break;
-                }
-            }
-            found.expect(
-                "should find a non-curve 32-byte payload within 512 tries (~50% rejection rate)",
-            )
-        };
-
-        // base58btc-encode the non-curve payload and prefix with `z`
-        // (matches the on-the-wire multibase form).
-        let encoded = format!("z{}", bs58::encode(&non_curve_bytes).into_string());
-
-        let err = decode_multibase_key(&encoded).expect_err("non-curve payload must be rejected");
-        match err {
-            IdentityError::InvalidDidFormat(msg) => {
-                assert!(
-                    msg.contains("not a valid Ed25519 public key"),
-                    "expected curve-point error message; got: {msg}"
-                );
-            }
-            other => panic!("expected InvalidDidFormat, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn base58btc_decode_known_vector() {
-        // "JxF12TrwUP45BMd" is the base58btc encoding of "Hello World".
-        let decoded = base58btc_decode("JxF12TrwUP45BMd").unwrap();
-        assert_eq!(decoded, b"Hello World");
-    }
-
-    #[test]
-    fn base58btc_decode_leading_ones() {
-        // Leading '1' characters map to leading zero bytes.
-        let decoded = base58btc_decode("112").unwrap();
-        assert_eq!(decoded, vec![0x00, 0x00, 0x01]);
-    }
-
-    #[test]
-    fn base58btc_decode_empty_input() {
-        let decoded = base58btc_decode("").unwrap();
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn base58btc_decode_rejects_invalid_characters() {
-        // '0', 'O', 'I', 'l' are not in the Bitcoin base58 alphabet.
-        assert!(base58btc_decode("0OIl").is_err());
-    }
-
-    #[test]
-    fn base58btc_roundtrip_32_byte_key() {
-        // Direct roundtrip: encode with bs58, then decode with our function.
-        let key = [0xABu8; 32];
-        let encoded = bs58::encode(&key).into_string();
-        let decoded = base58btc_decode(&encoded).unwrap();
-        assert_eq!(decoded, key);
     }
 
     #[test]
@@ -5906,7 +5768,7 @@ mod tests {
         let agent_vm = rotated_doc
             .verification_method_by_fragment("agent")
             .unwrap();
-        let doc_agent_bytes = super::decode_multibase_key(&agent_vm.public_key_multibase).unwrap();
+        let doc_agent_bytes = decode_multibase_key(&agent_vm.public_key_multibase).unwrap();
         assert_eq!(
             doc_agent_bytes,
             <[u8; 32]>::try_from(agent_public.as_bytes()).unwrap()

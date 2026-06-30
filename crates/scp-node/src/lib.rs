@@ -3037,7 +3037,12 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
-    document.add_relay_service(&relay_url)?;
+    // `add_relay_service` now returns the wasm-safe `DidDocumentError`
+    // (ADR-057 Slice 1a); route it through `IdentityError` so it lands in the
+    // existing `NodeError::Identity` variant, preserving prior behavior.
+    document
+        .add_relay_service(&relay_url)
+        .map_err(IdentityError::from)?;
     did_method.publish(&identity, &document).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
