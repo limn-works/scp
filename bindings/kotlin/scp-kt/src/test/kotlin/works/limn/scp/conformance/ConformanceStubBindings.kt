@@ -59,6 +59,9 @@ class ConformanceStubBindings : NativeBindings {
     var toolVerifyError: BridgeException? = null
     var toolInvokeCrossContextResult: String = """{"cross_context":"ok"}"""
     var toolInvokeCrossContextError: BridgeException? = null
+    var toolInvokeCrossContextSagaResult: String = """{"saga_id":"saga-001"}"""
+    var toolInvokeCrossContextSagaError: BridgeException? = null
+    var lastSagaArgs: List<String>? = null
     var toolSessionCreateResult: String = "session-001"
     var toolSessionCreateError: BridgeException? = null
     var toolSessionInvokeResult: String = """{"session":"ok"}"""
@@ -391,6 +394,34 @@ class ConformanceStubBindings : NativeBindings {
         return toolInvokeCrossContextResult
     }
 
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String?,
+    ): String {
+        lastSagaArgs =
+            listOf(
+                sourceContextHandle.toString(),
+                targetContextHandle.toString(),
+                callerDid,
+                toolRegistrationId,
+                inputJson,
+                assertedNonceHex,
+                timestampMs.toString(),
+                chainDepth.toString(),
+                ucanProofId.toString(),
+            )
+        toolInvokeCrossContextSagaError?.let { throw it }
+        return toolInvokeCrossContextSagaResult
+    }
+
     override fun toolSessionCreate(
         contextHandle: Long,
         toolId: String,
@@ -531,6 +562,9 @@ class ConformanceStubBindings : NativeBindings {
         toolVerifyError = null
         toolInvokeCrossContextResult = """{"cross_context":"ok"}"""
         toolInvokeCrossContextError = null
+        toolInvokeCrossContextSagaResult = """{"saga_id":"saga-001"}"""
+        toolInvokeCrossContextSagaError = null
+        lastSagaArgs = null
         toolSessionCreateResult = "session-001"
         toolSessionCreateError = null
         toolSessionInvokeResult = """{"session":"ok"}"""

@@ -913,6 +913,41 @@ interface ToolBindings {
     ): String
 
     /**
+     * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     *
+     * Blocks until the saga reaches a terminal state. On commit returns the
+     * JSON-encoded saga result; otherwise throws a [BridgeException] carrying
+     * the typed `SCP-SAGA-13xxx` terminal code (aborted/needs-repair/busy) or
+     * a bridge-surfaced validation/permission code.
+     *
+     * @param sourceContextHandle Opaque handle for the calling (source) context.
+     * @param targetContextHandle Opaque handle for the context holding the tool.
+     * @param callerDid The invoking principal's DID.
+     * @param toolRegistrationId The target tool's cross-context registration id.
+     * @param inputJson JSON-encoded tool input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop),
+     *   range 0-255 (ADR-043, spec §24.4).
+     * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
+     * @return JSON-encoded saga result.
+     * @throws BridgeException with a `SCP-SAGA-13xxx` code on a non-committed
+     *   terminal, or a bridge validation/permission code.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    fun toolInvokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String?,
+    ): String
+
+    /**
      * Creates a stateful tool session (spec section 6.2.1).
      *
      * Sessions enable multi-turn workflows with state preservation across
@@ -1855,6 +1890,51 @@ class ToolBridge internal constructor(
                 ucanToken,
                 chainDepth,
                 proofTokens,
+            )
+        }
+
+    /**
+     * Run the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     *
+     * Blocks until the saga reaches a terminal state. On commit returns the
+     * JSON-encoded saga result; a non-committed terminal throws a
+     * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
+     *
+     * @param sourceContextHandle Handle for the calling (source) context.
+     * @param targetContextHandle Handle for the context holding the tool.
+     * @param callerDid The invoking principal's DID.
+     * @param toolRegistrationId The target tool's cross-context registration id.
+     * @param inputJson JSON-encoded tool input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop),
+     *   range 0-255 (ADR-043, spec §24.4).
+     * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
+     * @return JSON-encoded saga result.
+     */
+    @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
+    suspend fun invokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String? = null,
+    ): String =
+        bridge.ffiCall {
+            bindings.toolInvokeCrossContextSaga(
+                sourceContextHandle,
+                targetContextHandle,
+                callerDid,
+                toolRegistrationId,
+                inputJson,
+                assertedNonceHex,
+                timestampMs,
+                chainDepth,
+                ucanProofId,
             )
         }
 

@@ -1348,6 +1348,21 @@ class StubNativeBindings : NativeBindings {
         return toolInvokeCrossContextResult
     }
 
+    var toolInvokeCrossContextSagaResult = """{"saga_id":"saga-stub"}"""
+
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String?,
+    ): String = toolInvokeCrossContextSagaResult
+
     override fun toolSessionCreate(
         contextHandle: Long,
         toolId: String,

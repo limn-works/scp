@@ -586,12 +586,9 @@
           "name": "invoke_cross_context_saga",
           "python": true,
           "typescript": true,
-          "kotlin": false,
+          "kotlin": true,
           "swift": true,
-          "notes": "The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 tool_invoke_cross_context_saga, UniFFI tool_invoke_cross_context_saga, NAPI toolInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category tools). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_tool_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. The Python (SCP.tool_invoke_cross_context_saga), TypeScript (SCP.toolInvokeCrossContextSaga), and Swift (Context.invokeToolCrossContextSaga) SDK wrappers are live; the remaining Kotlin wrapper is tracked by #1939 (the PR-6c SDK-wrapper slice).",
-          "exemptions": {
-            "kotlin": "UniFFI bridge exports tool_invoke_cross_context_saga; the named public Kotlin SDK wrapper is tracked by #1939 (PR-6c SDK-wrapper slice, §6.2.4 / ADR-049 §3a)."
-          }
+          "notes": "The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 tool_invoke_cross_context_saga, UniFFI tool_invoke_cross_context_saga, NAPI toolInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category tools). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_tool_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.tool_invoke_cross_context_saga), TypeScript (SCP.toolInvokeCrossContextSaga), Swift (Context.invokeToolCrossContextSaga), and Kotlin (SCP.toolInvokeCrossContextSaga / ToolBridge.invokeCrossContextSaga)."
         },
         {
           "name": "session_create",

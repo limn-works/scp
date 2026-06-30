@@ -275,6 +275,18 @@ private class TestNativeBindings : NativeBindings {
         chainDepth: Int,
         proofTokens: List<String>?,
     ): String = ""
+    @Suppress("LongParameterList")
+    override fun toolInvokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String?,
+    ): String = ""
     override fun toolVerify(contextHandle: Long, toolId: String): String =
         """{"tool_id":"$toolId","passed":false,"failures":[]}"""
     override fun toolInterfaceExpose(
