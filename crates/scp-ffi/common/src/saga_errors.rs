@@ -30,7 +30,8 @@
 //!
 //! Provenance: §6.2.4 (cross-context tool-invocation saga) + ADR-049 §3a
 //! (atomic cross-context invocation, `RateLimited { retry_after_ms }` /
-//! `Rejected` abort reasons, `NeedsRepair` operator-repair handle).
+//! `ParticipantUnavailable` / `Rejected` abort reasons, `NeedsRepair`
+//! operator-repair handle).
 
 use crate::error_codes as codes;
 use scp_core::context::supervisor::{SagaAbortReason, SagaError};
