@@ -16727,9 +16727,12 @@ mod tests {
                     "commit-retry exhaustion must lift to NeedsRepair, got {err:?}"
                 );
                 let unresolved = journal.load_unresolved().await.unwrap();
-                let entry = unresolved
-                    .first()
-                    .expect("the diverged saga must surface from load_unresolved");
+                assert_eq!(
+                    unresolved.len(),
+                    1,
+                    "variant 1: expected exactly one unresolved saga entry, got {unresolved:?}"
+                );
+                let entry = &unresolved[0];
                 assert_eq!(
                     entry.state,
                     crate::context::supervisor::saga_journal::SagaState::NeedsRepair,
@@ -16764,9 +16767,12 @@ mod tests {
                      got {err2:?}"
                 );
                 let unresolved2 = journal2.load_unresolved().await.unwrap();
-                let entry2 = unresolved2
-                    .first()
-                    .expect("the saga is still unresolved on disk (NeedsRepair append faulted)");
+                assert_eq!(
+                    unresolved2.len(),
+                    1,
+                    "variant 2: expected exactly one unresolved saga entry, got {unresolved2:?}"
+                );
+                let entry2 = &unresolved2[0];
                 assert_eq!(
                     entry2.state,
                     crate::context::supervisor::saga_journal::SagaState::Committing,
@@ -16776,7 +16782,10 @@ mod tests {
             });
         });
 
-        // The operator-alerting metric fired for the diverged saga(s).
+        // The operator-alerting metric fired for the diverged saga. Only variant 1
+        // increments it: variant 2 faults the seq-4 NeedsRepair journal append (via
+        // `?`) BEFORE `record_saga_repair_needed()` runs, so it legitimately never
+        // fires there — the `>= 1` threshold below is satisfied by variant 1 alone.
         let snapshot = snapshotter.snapshot().into_vec();
         let count = snapshot.iter().find_map(|(ck, _, _, v)| {
             if ck.key().name() == "scp_saga_repair_needed_total" {
@@ -16910,9 +16919,12 @@ mod tests {
         // journal still shows the seq-3 Committing entry — uncompacted, recoverable.
         let probe = ProtocolRepositorySagaJournal::new(Arc::clone(&journal_storage));
         let unresolved = probe.load_unresolved().await.unwrap();
-        let entry = unresolved
-            .first()
-            .expect("the un-resolved saga must remain on disk for recovery");
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "ok-arm: expected exactly one unresolved saga entry, got {unresolved:?}"
+        );
+        let entry = &unresolved[0];
         assert_eq!(
             entry.state,
             crate::context::supervisor::saga_journal::SagaState::Committing,
