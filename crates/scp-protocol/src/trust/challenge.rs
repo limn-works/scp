@@ -422,7 +422,15 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Result<Vec<u
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&request.challenge_type);
-    let params_bytes = crate::jcs::to_vec(&request.parameters).unwrap_or_default();
+    // Propagate a canonicalization failure rather than substituting empty bytes:
+    // an `unwrap_or_default()` here would silently drop `parameters` from the
+    // signed digest (fail-open), mirroring the error handling on the hash below
+    // and in the sibling `canonical_challenge_verification_bytes`.
+    let params_bytes = crate::jcs::to_vec(&request.parameters).map_err(|e| {
+        TrustError::ChallengeSigningFailed {
+            reason: format!("canonical parameters serialization failed: {e}"),
+        }
+    })?;
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_REQ_V1,
@@ -450,7 +458,14 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Result<Vec<u
 fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
-    let result_bytes = crate::jcs::to_vec(&response.result).unwrap_or_default();
+    // Propagate a canonicalization failure rather than substituting empty bytes:
+    // an `unwrap_or_default()` here would silently drop `result` from the signed
+    // digest (fail-open), mirroring the error handling on the hash below and in
+    // the sibling `canonical_challenge_verification_bytes`.
+    let result_bytes =
+        crate::jcs::to_vec(&response.result).map_err(|e| TrustError::ChallengeSigningFailed {
+            reason: format!("canonical result serialization failed: {e}"),
+        })?;
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_RESP_V1,
