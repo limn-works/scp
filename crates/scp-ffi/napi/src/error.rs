@@ -115,6 +115,12 @@ pub enum ScpNapiError {
     /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase
     /// (ADR-049 §3a).
     ///
+    /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
+    /// `UniFFI` siblings, may be a PERMANENT rejection (authorization / freshness
+    /// / rate-limit / co-residency policy denial) OR a RETRYABLE transient (a
+    /// rate limit, or a participant actor unavailable to complete the Prepare
+    /// exchange) — distinguished by the `SCP-SAGA-*` code.
+    ///
     /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
     /// only payload is a message string (the TypeScript SDK reverses the
     /// `[{code}]` prefix into a typed `ScpError`). So the load-bearing
