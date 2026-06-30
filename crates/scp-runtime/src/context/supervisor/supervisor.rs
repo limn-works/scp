@@ -16782,10 +16782,14 @@ mod tests {
             });
         });
 
-        // The operator-alerting metric fired for the diverged saga. Only variant 1
-        // increments it: variant 2 faults the seq-4 NeedsRepair journal append (via
-        // `?`) BEFORE `record_saga_repair_needed()` runs, so it legitimately never
-        // fires there — the `>= 1` threshold below is satisfied by variant 1 alone.
+        // The operator-alerting metric fired for the diverged saga EXACTLY once.
+        // Only variant 1 increments it: `record_saga_repair_needed()` runs after its
+        // successful `NeedsRepair` append. Variant 2 faults the seq-4 NeedsRepair
+        // journal append (via `?`) BEFORE the metric call, so it legitimately never
+        // fires there. The exact total across both variants is therefore 1 — `== 1`
+        // is the precise, mutation-distinguishing assertion: it additionally pins
+        // variant 2's "metric never fires when the NeedsRepair append faults"
+        // invariant, which a `>= 1` threshold would miss.
         let snapshot = snapshotter.snapshot().into_vec();
         let count = snapshot.iter().find_map(|(ck, _, _, v)| {
             if ck.key().name() == "scp_saga_repair_needed_total" {
@@ -16799,8 +16803,8 @@ mod tests {
             }
         });
         assert!(
-            count.is_some_and(|c| c >= 1),
-            "a NeedsRepair terminal must increment scp_saga_repair_needed_total; snapshot={snapshot:?}"
+            count.is_some_and(|c| c == 1),
+            "a NeedsRepair terminal must increment scp_saga_repair_needed_total exactly once; snapshot={snapshot:?}"
         );
     }
 
