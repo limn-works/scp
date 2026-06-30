@@ -1096,7 +1096,7 @@ class SCP:
         capability: str,
         presenting_agent_did: str,
         proof_tokens: list[str] | None = None,
-    ) -> Any:
+    ) -> None:
         """Delegate to ``_scp_core.SCP.ucan_validate``.
 
         ``presenting_agent_did`` is REQUIRED (no silent security default): the
