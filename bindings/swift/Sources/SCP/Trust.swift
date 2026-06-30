@@ -2,7 +2,7 @@ import Foundation
 
 // The UniFFI bridge (`crates/scp-ffi/uniffi/src/bridge.rs`) exports the raw
 // trust-signal ops this file wraps idiomatically:
-//   - `ucanEvaluate(handle:token:capability:presentingAgentDid:proofTokens:)`
+//   - `ucanEvaluate(handle:token:presentingAgentDid:capability:proofTokens:)`
 //     returns the typed `CapabilityValidationRecord` (six per-stage booleans).
 //   - `participationRecord(contextId:subjectDid:cachedAttestationsJson:)`
 //     returns the typed `ParticipationRecordView` (the twelve §7.3.2 facts).
@@ -913,94 +913,4 @@ public extension SCP {
             thresholdCounts: json["threshold_counts"] as? [String: [Int]] ?? [:]
         )
     }
-}
-
-// MARK: - Participation Types (admission gating)
-
-/// A verifiable participation fact type.
-///
-/// Participation facts represent quantifiable behavioral signals that can be
-/// observed from a context's event log. They are inputs to the trust model's
-/// behavioral validation layer (Layer 2).
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 (Behavioral Validation)
-/// - Spec section 23.7 (Participation Requirements)
-public enum ParticipationFact: String, Sendable, CaseIterable {
-    /// Number of messages sent by the participant.
-    case messagesSent = "messages_sent"
-
-    /// Number of tools invoked by the participant.
-    case toolsInvoked = "tools_invoked"
-
-    /// Number of governance actions taken by the participant.
-    case governanceActions = "governance_actions"
-
-    /// Number of contexts the participant has joined.
-    case contextsParticipated = "contexts_participated"
-
-    /// Number of attestations the participant has verified.
-    case attestationsVerified = "attestations_verified"
-}
-
-/// A minimum threshold for a specific participation fact.
-public nonisolated struct ParticipationThreshold: Sendable {
-    /// The participation fact to check.
-    public let fact: ParticipationFact
-
-    /// The minimum value required.
-    public let minimum: UInt64
-
-    /// Memberwise initializer.
-    public init(fact: ParticipationFact, minimum: UInt64) {
-        self.fact = fact
-        self.minimum = minimum
-    }
-}
-
-/// A participant's observed values for each participation fact.
-public typealias ParticipationProfile = [ParticipationFact: UInt64]
-
-/// A set of participation thresholds for admission gating.
-public nonisolated struct RequireParticipation: Sendable {
-    /// The thresholds to check.
-    public let thresholds: [ParticipationThreshold]
-
-    /// If `true`, **all** thresholds must be met (AND logic).
-    public let requireAll: Bool
-
-    /// Memberwise initializer.
-    public init(thresholds: [ParticipationThreshold], requireAll: Bool = true) {
-        self.thresholds = thresholds
-        self.requireAll = requireAll
-    }
-}
-
-// MARK: - Participation Verification
-
-/// Verifies that a participation profile meets the required thresholds.
-///
-/// This is a pure Swift function with no bridge dependency.
-///
-/// - Parameters:
-///   - requirement: The participation thresholds to check.
-///   - profile: The observed participation values.
-/// - Returns: `true` if the requirement is satisfied, `false` otherwise.
-public func verifyParticipationRequirements(
-    requirement: RequireParticipation,
-    profile: ParticipationProfile
-) -> Bool {
-    if requirement.thresholds.isEmpty {
-        return true
-    }
-
-    let results = requirement.thresholds.map { threshold -> Bool in
-        let observed = profile[threshold.fact] ?? 0
-        return observed >= threshold.minimum
-    }
-
-    return requirement.requireAll
-        ? results.allSatisfy { $0 }
-        : results.contains { $0 }
 }

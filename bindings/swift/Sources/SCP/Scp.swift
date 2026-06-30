@@ -1134,6 +1134,8 @@ public extension SCP {
 
     // `verifyParticipationRequirements` moved to a UniFFI-generated free
     // top-level function under ADR-048 §1 + §7 Swift bullet. Call it
-    // directly:
-    //   `try verifyParticipationRequirements(profileJson:requirementsJson:)`
+    // directly (`expectedSubject` is the security-critical DID of the agent
+    // being admitted — only profiles whose signed `subject_did` equals it
+    // contribute to any accounting):
+    //   `try verifyParticipationRequirements(expectedSubject:profileJson:requirementsJson:)`
 }
