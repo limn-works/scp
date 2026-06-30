@@ -284,6 +284,14 @@ impl EpochGraceStore {
             }
         }
 
+        // Deadlines are absolute wall-clock millis (injected `Clock`), not a
+        // monotonic `Instant`: wasm32 has no monotonic source. A backward host
+        // clock jump after insertion can extend an epoch's grace window slightly;
+        // forward-secrecy exposure stays bounded by `MAX_GRACE_EPOCHS` capacity
+        // eviction regardless. This inherits the protocol-wide host-clock trust
+        // assumption (see `scp_primitives::time`); on the browser target the
+        // grace window is governed by the same single hardened `Clock` as the
+        // rest of the protocol (ADR-057 §Prereq-1/2), not a hidden second source.
         let deadline = self.clock.now_millis().saturating_add(GRACE_WINDOW_MILLIS);
         self.epochs.entry(epoch).or_insert(deadline);
 
