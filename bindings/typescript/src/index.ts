@@ -240,6 +240,8 @@ export type {
   BatchPublishResult,
   BehavioralRecord,
   BroadcastAdmissionPolicy,
+  CachedAttestation,
+  CachedAttestationEnvelope,
   Capability,
   CapabilityValidation,
   Checkpoint,
