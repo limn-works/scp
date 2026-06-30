@@ -395,12 +395,16 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["delegateUcan"],
     },
     # UCAN.evaluate -- the structured read-only diagnostic (ADR-057, §7.2.4).
-    # Python exposes it as the SCP.ucan_evaluate method and consumes it inside
-    # the evaluate_trust trust-signal wrapper; TypeScript exposes ucanEvaluate
-    # on the SCP class and the public evaluateTrust wrapper over it.
+    # All four bindings expose an idiomatic wrapper over the typed
+    # CapabilityValidationRecord and consume it inside their evaluate_trust /
+    # evaluateTrust trust-signal wrapper (Python SCP.ucan_evaluate, TypeScript
+    # SCP.ucanEvaluate, Kotlin SCP.ucanEvaluate (Scp.kt), Swift SCP.ucanEvaluate
+    # (Trust.swift)).
     ("UCAN", "evaluate"): {
         "python": ["ucan_evaluate", "evaluate_trust"],
         "typescript": ["ucanEvaluate", "evaluateTrust"],
+        "kotlin": ["ucanEvaluate", "evaluateTrust"],
+        "swift": ["ucanEvaluate", "evaluateTrust"],
     },
     # MCP
     ("MCP", "serve"): {
@@ -606,6 +610,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Trust", "evaluate_trust"): {
         "python": ["evaluate_trust"],
         "typescript": ["evaluateTrust"],
+        "kotlin": ["evaluateTrust"],
         "swift": ["evaluateTrust"],
     },
     ("Trust", "aggregate_trust_input"): {
@@ -623,6 +628,8 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Trust", "participation_record"): {
         "python": ["participation_record"],
         "typescript": ["participationRecord"],
+        "kotlin": ["participationRecord"],
+        "swift": ["participationRecord"],
     },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {
