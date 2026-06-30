@@ -72,6 +72,7 @@ re-opens the downgrade.
 - `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — the structured record
   shape is identical across bindings (only field casing differs); the wrapper is
   per-SDK idiomatic.
-- Pending Kotlin/Swift `evaluate`/`evaluateTrust` wrappers (tracked separately per
-  ADR-057 §Decision-5): they consume the existing `CapabilityValidationRecord` the
-  UniFFI bridge already exports — they must NOT re-introduce prose-parsing.
+- The `evaluate`/`evaluateTrust` wrappers landed in all four SDKs together
+  (Python, TypeScript, Kotlin, Swift), as ADR-057 §Decision-5 mandates: they consume
+  the existing `CapabilityValidationRecord` the UniFFI bridge already exports — they
+  must NOT re-introduce prose-parsing.
