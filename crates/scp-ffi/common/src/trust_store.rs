@@ -460,11 +460,20 @@ mod tests {
     /// EXCEPT the all-zero `verifier_signature`, so a correct gate drops it solely
     /// because the signature does not verify (which is what the mutation check on
     /// the signature branch exercises).
+    ///
+    /// The verifier DID is a `did:dht:z` (resolvable in production without the
+    /// testing-only `did:key:{hex}` path), so resolution genuinely succeeds and
+    /// the all-zero signature is what fails — not a masked resolution error.
     fn make_challenge_result(id: &str, subject: &str, context_id: &str) -> ChallengeVerification {
+        // A resolvable verifier DID whose key the all-zero signature does NOT
+        // authenticate.
+        let verifier_pub = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
         ChallengeVerification {
             verification_id: id.to_owned(),
-            verifier_did:
-                "did:key:00000000000000000000000000000000000000000000000000000000000000ff".into(),
+            verifier_did,
             subject_did: subject.into(),
             capability_uri: "scp:capability:schema-validation/v1".to_owned(),
             challenge_type: ChallengeType::schema_validation(),
