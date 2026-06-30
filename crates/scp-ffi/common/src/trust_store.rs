@@ -45,8 +45,13 @@ impl Default for InMemoryFfiTrustStore {
 }
 
 fn lock_error() -> TrustError {
-    TrustError::InvalidEventData {
-        sequence: 0,
+    // A poisoned lock is an INFRA fault, not a credential rejection. It must map
+    // to a variant OUTSIDE the verify-on-ingest rejection allowlist
+    // (`is_verification_rejection`) so it propagates rather than being silently
+    // swallowed as a dropped entry. `StoreError` is that variant;
+    // `InvalidEventData` is reserved for canonicalization failures (which ARE
+    // rejections), so the two must not share a variant.
+    TrustError::StoreError {
         reason: "lock poisoned".to_owned(),
     }
 }
@@ -156,11 +161,19 @@ impl AttestationRevocationChecker for RevocationStateChecker<'_> {
 ///
 /// Returns `true` for a verification REJECTION — the caller-supplied credential
 /// is itself invalid (bad signature, expired, revoked, malformed
-/// evidence/revocation), so dropping it and continuing is correct. Returns
-/// `false` for an INFRA fault (store read/write failure, poisoned lock), which
-/// MUST propagate: silently dropping every credential on a transient backend
-/// error would zero a subject's trust without signal. Closed allowlist of
-/// rejection variants (white-hat P2-d).
+/// evidence/revocation, context-mismatched, or non-canonicalizable), so dropping
+/// that one entry and continuing is correct. Returns `false` for an INFRA fault
+/// (store read/write failure, poisoned lock), which MUST propagate: silently
+/// dropping every credential on a transient backend error would zero a subject's
+/// trust without signal. Closed allowlist of rejection variants (white-hat P2-d).
+///
+/// `InvalidEventData` / `ChallengeSigningFailed` are the canonicalization-failure
+/// variants raised by `canonical_attestation_bytes` /
+/// `canonical_challenge_verification_bytes`: a credential whose own bytes cannot
+/// be canonicalized cannot be authenticated, so it is a REJECTION of that one
+/// entry (drop it), not an infra fault. This relies on infra store faults using
+/// a DIFFERENT variant: `lock_error` maps a poisoned lock to `StoreError` (not
+/// `InvalidEventData`) precisely so the two never collide here.
 const fn is_verification_rejection(err: &TrustError) -> bool {
     matches!(
         err,
@@ -170,7 +183,59 @@ const fn is_verification_rejection(err: &TrustError) -> bool {
             | TrustError::AttestationRevocationInvalid { .. }
             | TrustError::AttestationEvidenceInvalid { .. }
             | TrustError::ChallengeVerificationSignatureInvalid { .. }
+            | TrustError::ChallengeVerificationExpired { .. }
+            | TrustError::ChallengeContextMismatch { .. }
+            | TrustError::InvalidEventData { .. }
+            | TrustError::ChallengeSigningFailed { .. }
     )
+}
+
+/// Verify-on-ingest for caller-supplied attestations.
+///
+/// Shared by [`populate_and_aggregate`] and [`verified_attestations`] so the
+/// SECURITY rationale lives in exactly one place.
+///
+/// SECURITY (verify-on-ingest). Caller-supplied attestations carry caller-
+/// controlled `verified_at`/`ttl_secs`. Persisting them raw via
+/// `store_cached_attestation` would let a caller mark a forged attestation
+/// "fresh" so it is counted AND durably persisted UNVERIFIED — a forged
+/// `attestation_count` plus persistent poisoning of every later
+/// `evaluate_trust`. Each caller entry is routed through
+/// `verify_and_cache_with_revocation`, which verifies the Ed25519 signature
+/// against the RESOLVER-resolved issuer key, checks expiry, the issuer-bound
+/// `revocation_status` field, AND the context's external revocation list BEFORE
+/// caching, and stamps a trusted `verified_at` from the injected clock (the
+/// caller's is ignored). A verification REJECTION drops the one entry; an INFRA
+/// fault propagates so a backend error never silently zeroes trust.
+fn verify_and_cache_attestations<S: TrustProtocolRepository>(
+    cache: &scp_core::trust::aggregate::AttestationCache<S>,
+    context_id: &str,
+    resolver: &scp_core::trust::IdentityDidPublicKeyResolver,
+    clock: &scp_identity::cache::SystemClock,
+    entries: Vec<CachedAttestation>,
+) -> Result<(), TrustError> {
+    let revoked = cache.store().get_revocation_state(context_id)?;
+    let revocation_checker = RevocationStateChecker { revoked: &revoked };
+    for ca in entries {
+        match cache.verify_and_cache_with_revocation(
+            context_id,
+            &ca.attestation,
+            resolver,
+            clock,
+            Some(&revocation_checker),
+        ) {
+            Ok(()) => {}
+            Err(reason) if is_verification_rejection(&reason) => {
+                tracing::debug!(
+                    attestation_id = %ca.attestation.id,
+                    %reason,
+                    "dropping caller-supplied attestation that failed verify-on-ingest",
+                );
+            }
+            Err(infra) => return Err(infra),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -207,51 +272,24 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
 
-    // SECURITY (verify-on-ingest). Caller-supplied attestations carry caller-
-    // controlled `verified_at`/`ttl_secs`. Persisting them raw via
-    // `store_cached_attestation` would let a caller mark a forged attestation
-    // "fresh" so it is counted AND durably persisted UNVERIFIED — a forged
-    // `attestation_count` plus persistent poisoning of every later
-    // `evaluate_trust`. Route each caller entry through
-    // `verify_and_cache_with_revocation`, which verifies the Ed25519 signature
-    // against the RESOLVER-resolved issuer key, checks expiry, the issuer-bound
-    // `revocation_status` field, AND the context's external revocation list
-    // BEFORE caching, and stamps a trusted `verified_at` from the injected clock
-    // (the caller's is ignored). A verification REJECTION drops the entry; an
-    // INFRA fault propagates so a backend error never silently zeroes trust.
-    let revoked = cache.store().get_revocation_state(context_id)?;
-    let revocation_checker = RevocationStateChecker { revoked: &revoked };
-    for ca in cached_attestations {
-        match cache.verify_and_cache_with_revocation(
-            context_id,
-            &ca.attestation,
-            &resolver,
-            &clock,
-            Some(&revocation_checker),
-        ) {
-            Ok(()) => {}
-            Err(reason) if is_verification_rejection(&reason) => {
-                tracing::debug!(
-                    attestation_id = %ca.attestation.id,
-                    %reason,
-                    "dropping caller-supplied attestation that failed verify-on-ingest",
-                );
-            }
-            Err(infra) => return Err(infra),
-        }
-    }
+    // Verify-on-ingest for caller-supplied attestations (see helper for the
+    // SECURITY rationale).
+    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
 
     // SECURITY (verify-on-ingest). Caller-supplied challenge verifications carry
     // a caller-controlled `passed`/`score` trust signal that is only meaningful
     // because the verifier signs it (§7.3.4.2). Persisting them raw would let a
     // caller forge a `passed=true` record and have it counted as an
     // admission/trust signal — the same forgery class as the attestation path.
-    // Verify the verifier's Ed25519 signature (resolver-resolved verifier key,
-    // binding `passed`/`score`/`expires_at`/`subject_did`) BEFORE storing; drop
-    // records that fail verification, and propagate infra faults so a backend
-    // error does not silently discard a legitimate verifier's signal.
+    // `verify_challenge_verification` checks the verifier's Ed25519 signature
+    // (resolver-resolved verifier key, binding `passed`/`score`/`expires_at`/
+    // `subject_did`/`context_id`), binds the record to THIS `context_id` (no
+    // cross-context replay; a `None` context-agnostic record is rejected), and
+    // rejects an expired record (clock-relative) BEFORE storing. Drop records
+    // that fail verification, and propagate infra faults so a backend error does
+    // not silently discard a legitimate verifier's signal.
     for cr in challenge_results {
-        match verify_challenge_verification(cr, &resolver) {
+        match verify_challenge_verification(cr, &resolver, context_id, &clock) {
             Ok(()) => cache.store().store_challenge_result(context_id, cr)?,
             Err(reason) if is_verification_rejection(&reason) => {
                 tracing::debug!(
@@ -316,36 +354,11 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
 
-    // SECURITY (verify-on-ingest). See `populate_and_aggregate`: caller-supplied
-    // `verified_at`/`ttl_secs` are NOT trusted as proof of prior verification.
-    // Every caller entry is verified (signature/expiry/issuer-field revocation
-    // AND the context's external revocation list) against the resolver-resolved
-    // issuer key via `verify_and_cache_with_revocation` BEFORE it can be counted.
-    // A verification REJECTION drops the entry so a caller can never inflate
-    // `attestation_count` with an unverified, freshly-marked, or context-revoked
-    // entry; an INFRA fault propagates so a backend error never silently zeroes
-    // the count.
-    let revoked = cache.store().get_revocation_state(context_id)?;
-    let revocation_checker = RevocationStateChecker { revoked: &revoked };
-    for ca in cached_attestations {
-        match cache.verify_and_cache_with_revocation(
-            context_id,
-            &ca.attestation,
-            &resolver,
-            &clock,
-            Some(&revocation_checker),
-        ) {
-            Ok(()) => {}
-            Err(reason) if is_verification_rejection(&reason) => {
-                tracing::debug!(
-                    attestation_id = %ca.attestation.id,
-                    %reason,
-                    "dropping caller-supplied attestation that failed verify-on-ingest",
-                );
-            }
-            Err(infra) => return Err(infra),
-        }
-    }
+    // Verify-on-ingest for caller-supplied attestations (see helper for the
+    // SECURITY rationale). A REJECTION drops the entry so a caller can never
+    // inflate `attestation_count` with an unverified, freshly-marked, or
+    // context-revoked entry.
+    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
 
     cache.get_verified_attestations(context_id, subject_did, &resolver, &clock)
 }
@@ -438,10 +451,20 @@ mod tests {
         }
     }
 
+    /// A `ChallengeVerification` that is FORGED only in its signature: its
+    /// `verifier_did` is a RESOLVABLE `did:key:{hex}` (so verify-on-ingest gets
+    /// past DID resolution and actually reaches the signature branch — the
+    /// previous `did:key:verifier` was non-hex and failed resolution first,
+    /// masking the signature check), its `context_id` matches the ingest context,
+    /// and its `expires_at` is far in the future. Everything is otherwise valid
+    /// EXCEPT the all-zero `verifier_signature`, so a correct gate drops it solely
+    /// because the signature does not verify (which is what the mutation check on
+    /// the signature branch exercises).
     fn make_challenge_result(id: &str, subject: &str, context_id: &str) -> ChallengeVerification {
         ChallengeVerification {
             verification_id: id.to_owned(),
-            verifier_did: "did:key:verifier".into(),
+            verifier_did:
+                "did:key:00000000000000000000000000000000000000000000000000000000000000ff".into(),
             subject_did: subject.into(),
             capability_uri: "scp:capability:schema-validation/v1".to_owned(),
             challenge_type: ChallengeType::schema_validation(),
@@ -455,10 +478,60 @@ mod tests {
             result: serde_json::json!({"passed": true}),
             completed_at: 1800,
             verified_at: 1801,
-            expires_at: 88_200,
+            expires_at: u64::MAX,
             context_id: Some(context_id.to_owned()),
             verifier_signature: vec![0u8; 64],
         }
+    }
+
+    /// Produces a GENUINELY verifier-signed [`ChallengeVerification`] with the
+    /// record's signed `context_id` set to `record_context` and the signed
+    /// `expires_at` set to `expires_at`. The verifier DID is a `did:dht:z` that
+    /// resolves in production (no testing-only `did:key` path), and the
+    /// `verifier_signature` is a real Ed25519 signature over the public
+    /// [`canonical_challenge_verification_bytes`], mirroring the attestation
+    /// path's `make_genuinely_signed`. By varying `record_context`/`expires_at`
+    /// the caller exercises the context-binding and expiry gates with an
+    /// otherwise-valid (genuinely-signed) record.
+    fn make_genuinely_signed_challenge_with(
+        subject: &str,
+        record_context: Option<&str>,
+        expires_at: u64,
+    ) -> ChallengeVerification {
+        use ed25519_dalek::Signer;
+
+        let verifier_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let verifier_pub: [u8; 32] = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+
+        let mut cv = ChallengeVerification {
+            verification_id: "genuine-cv-1".to_owned(),
+            verifier_did,
+            subject_did: subject.into(),
+            capability_uri: "scp:capability:schema-validation/v1".to_owned(),
+            challenge_type: ChallengeType::schema_validation(),
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::schema_validation(),
+            },
+            passed: true,
+            score: Some(95),
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::json!({"passed": true}),
+            completed_at: 1000,
+            verified_at: 1001,
+            expires_at,
+            context_id: record_context.map(ToOwned::to_owned),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        cv
+    }
+
+    /// Convenience: a genuinely-signed, in-context, non-expiring challenge.
+    fn make_genuinely_signed_challenge(subject: &str, context_id: &str) -> ChallengeVerification {
+        make_genuinely_signed_challenge_with(subject, Some(context_id), u64::MAX)
     }
 
     fn make_event(event_type: EventType, actor: &str, ts: u64, seq: u64, data: Vec<u8>) -> Event {
@@ -854,5 +927,275 @@ mod tests {
             "forged challenge result must not survive verify-on-ingest, got {} entry/entries",
             challenge_results.len()
         );
+    }
+
+    /// POSITIVE verify-on-ingest for challenge results: a GENUINELY
+    /// verifier-signed, in-context, unexpired `ChallengeVerification` MUST
+    /// survive ingest and reach `TrustInput.challenge_results`. Without this, the
+    /// forgery-only test above would also pass against a gate that rejects
+    /// everything; this pins that the gate accepts valid records.
+    #[test]
+    fn genuinely_signed_challenge_survives_populate_and_aggregate() {
+        let context_id = "ctx-challenge-genuine";
+        let subject_did =
+            "did:key:66666666666666666666666666666666666666666666666666666666666666ff";
+
+        let genuine = make_genuinely_signed_challenge(subject_did, context_id);
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+
+        let store = InMemoryFfiTrustStore::new();
+        let json = populate_and_aggregate(
+            store,
+            context_id,
+            subject_did,
+            vec![],
+            &[genuine],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let challenge_results = parsed["challenge_results"].as_array().unwrap();
+        assert_eq!(
+            challenge_results.len(),
+            1,
+            "genuinely-signed, in-context, unexpired challenge must survive ingest"
+        );
+        assert_eq!(challenge_results[0]["verification_id"], "genuine-cv-1");
+    }
+
+    /// SECURITY (verify-on-ingest, expiry binding). A genuinely verifier-signed
+    /// challenge result whose `expires_at` is in the PAST (relative to the real
+    /// ingest clock) MUST be dropped — an expired verification is not a current
+    /// trust signal (spec §7.3.4). The signature is valid, so this isolates the
+    /// expiry gate.
+    #[test]
+    fn expired_challenge_result_dropped_at_ingest() {
+        let context_id = "ctx-challenge-expired";
+        let subject_did =
+            "did:key:77777777777777777777777777777777777777777777777777777777777777ff";
+
+        // expires_at = 1000 is far below the real system clock used at ingest.
+        let expired = make_genuinely_signed_challenge_with(subject_did, Some(context_id), 1000);
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+
+        let store = InMemoryFfiTrustStore::new();
+        let json = populate_and_aggregate(
+            store,
+            context_id,
+            subject_did,
+            vec![],
+            &[expired],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let challenge_results = parsed["challenge_results"].as_array().unwrap();
+        assert!(
+            challenge_results.is_empty(),
+            "expired challenge result must be dropped at ingest, got {} entry/entries",
+            challenge_results.len()
+        );
+    }
+
+    /// SECURITY (verify-on-ingest, context binding). A genuinely verifier-signed
+    /// challenge result minted for a DIFFERENT context MUST NOT be replayed into
+    /// this context's aggregation. The signature is valid (and binds the signed
+    /// `context_id`), so this isolates the cross-context replay gate.
+    #[test]
+    fn cross_context_challenge_result_dropped_at_ingest() {
+        let ingest_context = "ctx-challenge-target";
+        let other_context = "ctx-challenge-origin";
+        let subject_did =
+            "did:key:88888888888888888888888888888888888888888888888888888888888888ff";
+
+        // Genuinely signed, unexpired — but bound to `other_context`.
+        let foreign =
+            make_genuinely_signed_challenge_with(subject_did, Some(other_context), u64::MAX);
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+
+        let store = InMemoryFfiTrustStore::new();
+        let json = populate_and_aggregate(
+            store,
+            ingest_context,
+            subject_did,
+            vec![],
+            &[foreign],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let challenge_results = parsed["challenge_results"].as_array().unwrap();
+        assert!(
+            challenge_results.is_empty(),
+            "cross-context challenge result must be dropped at ingest, got {} entry/entries",
+            challenge_results.len()
+        );
+    }
+
+    /// SECURITY (read-path revocation, white-hat P1). A cached attestation that
+    /// is FRESH (within cache TTL) but has since been CONTEXT-revoked MUST be
+    /// excluded from `get_verified_attestations` on the read path — not only at
+    /// ingest. Without the read-path revocation check, a later-revoked entry
+    /// keeps inflating trust until its cache TTL expires (fail-open). The control
+    /// assertion (present before revocation) proves the entry is otherwise fresh
+    /// and returned, so the exclusion is attributable to revocation alone.
+    #[test]
+    fn context_revoked_fresh_attestation_excluded_from_read_path() {
+        use scp_identity::cache::TestClock;
+
+        let context_id = "ctx-revoke-read";
+        let subject_did = "did:key:alice-revoke";
+
+        let store = InMemoryFfiTrustStore::new();
+        // Cache a fresh attestation directly (raw store). `ttl_secs = u64::MAX`
+        // keeps it fresh forever, so any exclusion is due to revocation, not TTL.
+        store
+            .store_cached_attestation(
+                context_id,
+                CachedAttestation {
+                    attestation: make_attestation("att-revoked", subject_did),
+                    verified_at: 1000,
+                    ttl_secs: u64::MAX,
+                },
+            )
+            .unwrap();
+
+        let cache = scp_core::trust::aggregate::AttestationCache::new(store);
+        let resolver = NoOpResolver; // fresh entries are not re-verified
+        let clock = TestClock::new(2000);
+
+        // Control: present while not revoked.
+        let before = cache
+            .get_verified_attestations(context_id, subject_did, &resolver, &clock)
+            .unwrap();
+        assert_eq!(before.len(), 1, "fresh attestation should be returned");
+
+        // Context-revoke the entry, then read again.
+        let mut revoked = HashMap::new();
+        revoked.insert("att-revoked".to_owned(), true);
+        cache
+            .store()
+            .store_revocation_state(context_id, &revoked)
+            .unwrap();
+
+        let after = cache
+            .get_verified_attestations(context_id, subject_did, &resolver, &clock)
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "context-revoked fresh attestation must be excluded on the read path, got {}",
+            after.len()
+        );
+    }
+
+    /// Fix C (classifier). Canonicalization-failure variants are classified as
+    /// verify-on-ingest REJECTIONS (drop the one entry), while infra store faults
+    /// are NOT (they propagate). Pins the closed allowlist's membership.
+    #[test]
+    fn canonicalization_failures_are_rejections_infra_is_not() {
+        assert!(is_verification_rejection(&TrustError::InvalidEventData {
+            sequence: 0,
+            reason: "claim serialization failed".to_owned(),
+        }));
+        assert!(is_verification_rejection(
+            &TrustError::ChallengeSigningFailed {
+                reason: "canonical hash failed".to_owned(),
+            }
+        ));
+        // Infra store fault (e.g. poisoned lock) must remain non-rejection so it
+        // propagates rather than silently dropping an entry.
+        assert!(!is_verification_rejection(&TrustError::StoreError {
+            reason: "lock poisoned".to_owned(),
+        }));
+    }
+
+    /// Fix C (behavioral). An invalid caller credential drops ONLY itself and
+    /// does not abort the batch: a forged attestation alongside a genuinely
+    /// signed one yields exactly the genuine one in the aggregated output.
+    #[test]
+    fn invalid_attestation_drops_only_itself_not_the_batch() {
+        let context_id = "ctx-batch-continue";
+        let subject_did =
+            "did:key:99999999999999999999999999999999999999999999999999999999999999ff";
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let genuine = make_genuinely_signed("genuine-batch-1", subject_did, &signing_key);
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+
+        let store = InMemoryFfiTrustStore::new();
+        // Forged first, genuine second — the forged rejection must not abort the
+        // loop before the genuine entry is verified and cached.
+        let json = populate_and_aggregate(
+            store,
+            context_id,
+            subject_did,
+            vec![
+                make_forged_fresh_cached(subject_did),
+                CachedAttestation {
+                    attestation: genuine,
+                    verified_at: 0,
+                    ttl_secs: u64::MAX,
+                },
+            ],
+            &[],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let attestations = parsed["verified_attestations"].as_array().unwrap();
+        assert_eq!(
+            attestations.len(),
+            1,
+            "exactly the genuine attestation should survive; the forged one drops without aborting the batch"
+        );
+        assert_eq!(attestations[0]["id"], "genuine-batch-1");
     }
 }
