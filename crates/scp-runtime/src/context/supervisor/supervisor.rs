@@ -17047,9 +17047,11 @@ mod tests {
 
     /// `lift_run_saga_error` maps the FSM's internal `RunSagaError` into the
     /// typed terminal `SagaError`: `needs_repair` ⇒ `NeedsRepair` carrying the
-    /// minted `saga_id`; a `RateLimited` abort ⇒ `Aborted` with a STRUCTURED
-    /// `retry_after_ms` (never re-parsed); any other reject ⇒ `Aborted/Rejected`
-    /// carrying the message's saga code.
+    /// minted `saga_id`; a `RateLimited` abort ⇒ `Aborted{RateLimited}` with a
+    /// STRUCTURED `retry_after_ms` (never re-parsed); a Prepare-phase `ActorBusy`
+    /// ⇒ `Aborted{ParticipantUnavailable}` / `SCP-SAGA-13068` (synthesized); any
+    /// other reject ⇒ `Aborted{Rejected}` carrying its structural saga code. (The
+    /// `SagaAbortReason` variant rustdoc remains the authoritative rationale.)
     #[test]
     fn lift_run_saga_error_maps_every_terminal() {
         // NeedsRepair carries the minted saga id (the operator-repair handle).
@@ -17096,7 +17098,9 @@ mod tests {
             "RateLimited abort must carry structured retry_after_ms + code 13023"
         );
 
-        // Any other reject ⇒ Aborted/Rejected carrying the STRUCTURAL code.
+        // A Prepare-phase ActorBusy ⇒ ParticipantUnavailable/13068 (synthesized,
+        // asserted below); every OTHER non-RateLimited reject ⇒ Aborted/Rejected
+        // carrying its STRUCTURAL code.
         let lifted = Supervisor::lift_run_saga_error(
             SagaId("saga-rej".to_owned()),
             RunSagaError {
@@ -17114,7 +17118,7 @@ mod tests {
                     ..
                 }
             ),
-            "non-rate-limit reject must lift to Aborted/Rejected with the structural code"
+            "a coded policy reject (the 13013 confused-deputy case) must lift to Aborted/Rejected carrying its structural code"
         );
 
         // A genuinely-reachable prefix-less abort — the Prepare-phase 30s
