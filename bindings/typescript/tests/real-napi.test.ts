@@ -789,7 +789,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // The derived happy-path accessor collapses the six fields: all true.
       expect(allValid(result.capabilityValidation)).toBe(true);
       expect(result.subjectDid).toBe(member.did);
-      expect(result.contextId).toBe("ctx-real");
+      // The evaluation is labeled with the context the handle RESOLVES to (the
+      // canonical id the layers were computed against), not the bare label arg
+      // ("ctx-real") — the handle carries a real `contextId`, so a mismatched
+      // label does not relabel the result.
+      expect(result.contextId).toBe(ctx.contextId);
     });
 
     test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
@@ -814,7 +818,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // A single failing stage makes the derived accessor false.
       expect(allValid(result.capabilityValidation)).toBe(false);
       expect(result.subjectDid).toBe(member.did);
-      expect(result.contextId).toBe("ctx-real");
+      // Labeled with the handle-resolved context id, not the bare label arg.
+      expect(result.contextId).toBe(ctx.contextId);
       // Layer 2 behavioral record is present (event-log query succeeded).
       expect(result.behavioralRecord).toBeDefined();
     });

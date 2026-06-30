@@ -2405,7 +2405,11 @@ export class SCP {
    *
    * @param handle The context handle to evaluate within.
    * @param subjectDid The DID of the participant being evaluated.
-   * @param contextId The ID of the context the evaluation applies to.
+   * @param contextId Fallback context-id label, used only when `handle` is
+   *   opaque (e.g. a mock without a `contextId`). When the handle carries a
+   *   `contextId`, that resolved value is what the layers are computed against
+   *   AND what the returned {@link TrustEvaluation.contextId} reports — a
+   *   mismatched label here does not relabel the result.
    * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
    * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
    */
@@ -2527,7 +2531,12 @@ export class SCP {
 
     return {
       subjectDid,
-      contextId,
+      // Label the evaluation with the SAME context the layers were computed
+      // against (`resolvedContextId`), not the bare `contextId` label arg. A
+      // handle for context A passed with `contextId="B"` must report A — the
+      // context the participation record and Layer-2 facts actually came from —
+      // otherwise the record is silently mislabeled.
+      contextId: resolvedContextId,
       capabilityValidation,
       behavioralRecord,
       attestations: [],

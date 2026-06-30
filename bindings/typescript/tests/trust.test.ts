@@ -275,6 +275,26 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(call?.args[2]).toBe("[]");
   });
 
+  it("labels the result with the handle's context, not a mismatched label arg", async () => {
+    const mock = createMockNativeScp();
+    const { scp } = mountMockScp(mock);
+    cleanup = () => scp.shutdown(0);
+    mock.__stub("participationRecord", () => fakeParticipationRecord());
+
+    // The handle resolves to context "ctx-A"; the caller passes a DIFFERENT
+    // label "ctx-B". The evaluation is computed against the handle's context
+    // (Layer 2 keys the participation record by it), so the returned record
+    // MUST be labeled "ctx-A" — never the bare label arg. A handle for context
+    // A reported as B would be a silently mislabeled record.
+    const handle = { contextId: "ctx-A" } as unknown;
+    const result = await scp.evaluateTrust(handle, "did:dht:subject", "ctx-B");
+    expect(result.contextId).toBe("ctx-A");
+
+    // The Layer-2 lookup hits the resolved context, not the label.
+    const call = mock.__lastCall("participationRecord");
+    expect(call?.args[0]).toBe("ctx-A");
+  });
+
   it("exposes participationRecord directly, projecting the typed core facts", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
