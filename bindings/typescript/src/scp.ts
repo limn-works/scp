@@ -39,6 +39,7 @@ import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
+import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
 import type {
@@ -2095,15 +2096,9 @@ export class SCP {
     } catch (error) {
       throw mapBridgeError(error);
     }
-    // NAPI `NapiCapabilityValidation` is already camelCase — read directly.
-    return {
-      tokensValid: raw.tokensValid,
-      signaturesValid: raw.signaturesValid,
-      withinCeiling: raw.withinCeiling,
-      nonceValid: raw.nonceValid,
-      notRevoked: raw.notRevoked,
-      timeBoundsValid: raw.timeBoundsValid,
-    };
+    // Shared six-field projection — pins the canonical CapabilityValidation
+    // shape in one place (mirrors the same call in `internal/native.ts`).
+    return toCapabilityValidation(raw);
   }
 
   async ucanMint(
@@ -2481,7 +2476,8 @@ export class SCP {
     // passes nothing rather than fabricating attestations.
     //
     // A context with no convergent events yet makes the core return
-    // `EmptyEventLog` (surfaced as a `ContextError`). That is not a failure for
+    // `NoParticipationFacts` (surfaced as a `ContextError` with the structured
+    // code `SCP-CTX-2076`). That is not a failure for
     // a trust evaluation — it means "no recorded facts" — so it is folded into a
     // zeroed behavioral record rather than thrown, keeping `evaluateTrust`
     // usable on activity-free contexts (e.g. a Layer-1-only check). Any other
