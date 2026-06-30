@@ -16584,7 +16584,6 @@ mod tests {
         caller_did: &str,
         now_ms: u64,
         nonce: [u8; 16],
-        chain_depth: u8,
     ) -> CrossContextToolInvocationRequest {
         CrossContextToolInvocationRequest {
             caller_context_id: XCTX_CALLER,
@@ -16593,14 +16592,15 @@ mod tests {
             tool_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
-            asserted_chain_depth: chain_depth,
+            asserted_chain_depth: 2,
             asserted_nonce: nonce,
             asserted_timestamp_ms: now_ms,
         }
     }
 
     /// Drive a real two-actor cross-context saga whose Commit-B settle persist
-    /// ALWAYS fails — exhausting `commit_with_retry` (the 500ms/1s/2s back-off)
+    /// ALWAYS fails — exhausting `commit_with_retry` (three commit attempts with
+    /// exponential back-off sleeps: the first attempt is immediate, then 1s and 2s)
     /// into the `NeedsRepair` terminal — over a caller-supplied `journal`.
     /// Returns the lifted saga result. The shared body of the Err-arm test's two
     /// variants (production journal vs a [`FailingSagaJournal`] that faults the
@@ -16649,7 +16649,7 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         supervisor
             .start_cross_context_tool_invocation_saga(
-                xctx_request(caller_did, now_ms, nonce, 2),
+                xctx_request(caller_did, now_ms, nonce),
                 SagaSigningKeys {
                     target: &target_signing,
                     caller: &caller_signing,
@@ -16687,10 +16687,11 @@ mod tests {
     /// follow-up rather than mis-asserted on this path.
     ///
     /// `#[test]` + a MANUALLY-built `start_paused` current-thread runtime so the
-    /// 500ms/1s/2s commit back-off auto-advances (the only timer; actor
-    /// message-passing wakes via wakers, not timers) AND the operator metric is
-    /// captured through a THREAD-LOCAL recorder (the process-global tracing/metrics
-    /// cache is poisoned across the parallel test binary).
+    /// three commit attempts' exponential back-off sleeps (first attempt immediate,
+    /// then 1s and 2s) auto-advance (the only timer; actor message-passing wakes via
+    /// wakers, not timers) AND the operator metric is captured through a THREAD-LOCAL
+    /// recorder (the process-global tracing/metrics cache is poisoned across the
+    /// parallel test binary).
     #[test]
     fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -16856,7 +16857,7 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let result = supervisor
             .start_cross_context_tool_invocation_saga(
-                xctx_request(caller_did, now_ms, [0x44u8; 16], 2),
+                xctx_request(caller_did, now_ms, [0x44u8; 16]),
                 SagaSigningKeys {
                     target: &target_signing,
                     caller: &caller_signing,
@@ -16957,6 +16958,24 @@ mod tests {
                     &mls_inner,
                 )),
             );
+        // Pre-reopen: the durable journal is NOT empty from the start — it holds
+        // exactly the one unresolved saga at `Committing` that supervisor #1 left
+        // behind. Asserting this explicitly rules out a vacuous "empty in, empty
+        // out" pass of the post-reopen `is_empty()` check below.
+        let pre_reopen = journal.load_unresolved().await.unwrap();
+        assert_eq!(
+            pre_reopen.len(),
+            1,
+            "pre-reopen: the durable journal must hold exactly one unresolved saga, got \
+             {pre_reopen:?}"
+        );
+        assert_eq!(
+            pre_reopen[0].state,
+            crate::context::supervisor::saga_journal::SagaState::Committing,
+            "pre-reopen: the single unresolved saga must be at Committing, got {:?}",
+            pre_reopen[0]
+        );
+
         let supervisor2 = xctx_supervisor_with_journal(
             creator_did,
             creator_key,
@@ -16980,7 +16999,13 @@ mod tests {
              {unresolved:?}"
         );
         // The replay re-drove the idempotent Commit (AlreadyCommitted) — the tool
-        // was NEVER re-invoked.
+        // was NEVER re-invoked. NOTE: this post-reopen `calls == 1` check is a
+        // STRUCTURAL guard, not a behavioral pin — the executor closure was dropped
+        // together with supervisor #1, so the recovery path has no executor to
+        // invoke at all; the `AlreadyCommitted` redrive merely re-emits the stored
+        // output. The load-bearing recovery assertion is the
+        // `load_unresolved().is_empty()` check above; this one documents the
+        // never-re-invoke invariant.
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
