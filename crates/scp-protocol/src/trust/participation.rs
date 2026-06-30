@@ -880,6 +880,17 @@ pub fn derive_participation_signing_key(
 /// See §7.3.2.1 verification flow.
 #[derive(Debug, thiserror::Error)]
 pub enum ParticipationAdmissionError {
+    /// `expected_subject` was empty.
+    ///
+    /// An empty subject would make the Step-0 subject-binding filter keep
+    /// statements whose `subject_did == ""`, defeating the binding that every
+    /// contributing statement must be tied to the real agent being admitted.
+    /// All three FFI bridges reject an empty/malformed `expected_subject` at
+    /// their boundary; this enforces the same invariant once at the trust
+    /// boundary so a future core/runtime caller cannot bypass it.
+    #[error("expected_subject must not be empty")]
+    EmptyExpectedSubject,
+
     /// A statement's Ed25519 signature does not verify against its
     /// `signer_public_key` over `signable_bytes`.
     #[error("invalid signature on statement for {subject_did} (signer {signer_hex}): {reason}")]
@@ -991,6 +1002,14 @@ pub fn verify_participation_requirements(
     statements: &[ParticipationProfile],
 ) -> Result<(), ParticipationAdmissionError> {
     use std::collections::HashSet;
+
+    // Reject an empty subject up front: it is invalid input, not a "no match"
+    // condition. An empty `expected_subject` would let the Step-0 filter retain
+    // statements whose `subject_did == ""`, so the subject-binding invariant is
+    // enforced once here at the trust boundary (the FFI bridges reject it too).
+    if expected_subject.is_empty() {
+        return Err(ParticipationAdmissionError::EmptyExpectedSubject);
+    }
 
     if requirements.is_empty() {
         return Ok(());
@@ -2420,6 +2439,42 @@ mod tests {
     fn verify_empty_requirements_passes() {
         let result = verify_participation_requirements(1_700_000_000, "did:key:alice", &[], &[]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_empty_expected_subject() {
+        // An empty `expected_subject` is invalid input — it would let the
+        // Step-0 subject-binding filter retain `subject_did == ""` statements.
+        // Rejected even with empty requirements/statements, before the empty-
+        // requirements early return.
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(&key, "", 1_700_000_000, None);
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        // With empty requirements (would otherwise short-circuit to Ok).
+        let result = verify_participation_requirements(1_700_000_100, "", &[], &[]);
+        assert!(matches!(
+            result,
+            Err(ParticipationAdmissionError::EmptyExpectedSubject)
+        ));
+
+        // And with a matching `subject_did == ""` statement that an empty
+        // subject would otherwise admit.
+        let result = verify_participation_requirements(
+            1_700_000_100,
+            "",
+            std::slice::from_ref(&req),
+            std::slice::from_ref(&statement),
+        );
+        assert!(matches!(
+            result,
+            Err(ParticipationAdmissionError::EmptyExpectedSubject)
+        ));
     }
 
     #[test]
