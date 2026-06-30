@@ -44,6 +44,7 @@ import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
+import uniffi.scp.SagaResult
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
@@ -1552,6 +1553,62 @@ class SCP internal constructor(
             ucanToken = ucanToken,
             chainDepth = chainDepth,
             proofTokens = proofTokens,
+        )
+
+    /**
+     * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     *
+     * Forwards 1:1 to [NativeScp.toolInvokeCrossContextSaga] on [inner]. The
+     * call blocks until the saga reaches a terminal state: it returns a
+     * [SagaResult] on commit (carrying the supervisor-minted `sagaId` plus the
+     * target's signed receipt and captured output, each `null` when absent and
+     * never synthesized), or throws a typed [uniffi.scp.ScpException] for a
+     * non-committed terminal — `ScpException.SagaAborted` (the saga was
+     * rejected before running; carries an optional `retryAfterMs` back-off
+     * hint), `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
+     * the durable `sagaId` operator-repair handle), or `ScpException.SagaBusy`
+     * (the participant context set is contended; carries the
+     * `contendedContext` id). Bridge-surfaced `ScpException.Validation` and
+     * `ScpException.Permission` errors also propagate unchanged.
+     *
+     * This is a flat 1:1 forward: the caller principal is bound to the
+     * authenticated FFI identity inside the bridge, and all argument
+     * validation (including the asserted-nonce hex and the u64/u8 numeric
+     * bounds enforced by [ULong]/[UByte]) is performed by the Rust core. The
+     * 9-argument arity is dictated by the bridge op.
+     *
+     * @param sourceHandle The calling (source) context handle.
+     * @param targetHandle The context holding the tool to invoke.
+     * @param callerDid The invoking principal's DID.
+     * @param toolRegistrationId The target tool's cross-context registration id.
+     * @param inputJson JSON-encoded tool input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop).
+     * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
+     */
+    @Suppress("LongParameterList")
+    suspend fun toolInvokeCrossContextSaga(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        toolRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanProofId: String?,
+    ): SagaResult =
+        inner.toolInvokeCrossContextSaga(
+            sourceHandle = sourceHandle,
+            targetHandle = targetHandle,
+            callerDid = callerDid,
+            toolRegistrationId = toolRegistrationId,
+            inputJson = inputJson,
+            assertedNonceHex = assertedNonceHex,
+            timestampMs = timestampMs,
+            chainDepth = chainDepth,
+            ucanProofId = ucanProofId,
         )
 
     /** Forwards to [NativeScp.toolRegister] on [inner]. */
