@@ -404,6 +404,26 @@ pub enum SagaAbortReason {
         /// limiter can compute it; `None` for the token-bucket hard limit.
         retry_after_ms: Option<u64>,
     },
+    /// A TRANSIENT, retryable abort: the target participant actor's mailbox was
+    /// saturated or closed during the Prepare phase (a `ContextError::ActorBusy`
+    /// on a Prepare-phase send — the command was never delivered and NEITHER
+    /// side committed), so the saga aborted cleanly and the caller should retry
+    /// after a back-off. Distinct from [`Self::Rejected`] (a permanent policy
+    /// reject the caller must NOT blindly retry) and from a commit-phase
+    /// `ActorBusy` (which exhausts the commit-retry budget and lifts to
+    /// `NeedsRepair`, not an abort). `retry_after_ms` carries an optional
+    /// conservative back-off hint: `None` means there is no precise back-off
+    /// instant to surface (mailbox saturation has no exact drain time) and the
+    /// caller should apply its own conservative back-off — mirroring the
+    /// token-bucket `RateLimited { None }` rationale on [`Self::RateLimited`].
+    /// Never coerced to `0`, since `0` would read as "retry immediately" and
+    /// re-saturate the same mailbox.
+    MailboxSaturated {
+        /// Conservative back-off hint in milliseconds; `None` (the saturation
+        /// case has no precise drain instant) — the caller applies its own
+        /// conservative back-off. Never coerced to `0`.
+        retry_after_ms: Option<u64>,
+    },
     /// Any other Prepare-phase rejection (authorization, freshness, schema,
     /// co-residency) — no back-off hint applies.
     Rejected,
@@ -5647,8 +5667,19 @@ impl Supervisor {
     ///   the Prepare-A `reserve_tool_economy` path DOES reach as a saga abort)
     ///   and the caller should apply its own conservative back-off. The `None`
     ///   is propagated, never coerced to `0` (a `0` would read as "retry
-    ///   immediately" and re-trip the same hard limit). Every other
-    ///   `ContextError` is a [`SagaAbortReason::Rejected`]. `code` is the
+    ///   immediately" and re-trip the same hard limit). A
+    ///   [`ContextError::ActorBusy`] — a TRANSIENT Prepare-phase
+    ///   participant-mailbox saturation/closure (the command was never
+    ///   delivered, neither side committed) — becomes
+    ///   [`SagaAbortReason::MailboxSaturated`] carrying `retry_after_ms: None`
+    ///   (no precise drain instant; conservative caller back-off) and the
+    ///   dedicated retryable code `13068`, distinguishing it from a permanent
+    ///   `Rejected`. (A COMMIT-phase `ActorBusy` cannot reach this block: it
+    ///   exhausts the commit-retry budget, sets `needs_repair`, and
+    ///   short-circuits to `NeedsRepair` above — so an `ActorBusy` arriving here
+    ///   with `needs_repair == false` can ONLY have originated from a
+    ///   Prepare-phase send.) Every other `ContextError` is a
+    ///   [`SagaAbortReason::Rejected`]. `code` is the
     ///   numeric `SCP-SAGA-13xxx` discriminant carried STRUCTURALLY off the
     ///   reject path (the [`SagaReject`] the Prepare-axis sites build via the
     ///   `saga_reject!` macro, threaded through [`RunSagaError::saga_code`]), so
@@ -5668,20 +5699,37 @@ impl Supervisor {
         if needs_repair {
             return SagaError::NeedsRepair { saga_id, message };
         }
-        let reason = match &error {
-            ContextError::RateLimited { retry_after_ms, .. } => SagaAbortReason::RateLimited {
-                retry_after_ms: *retry_after_ms,
-            },
-            _ => SagaAbortReason::Rejected,
+        // Resolve the abort reason AND the code together by STRUCTURAL variant
+        // match (never by parsing the message string). A Prepare-phase
+        // `ActorBusy` is a TRANSIENT mailbox saturation/closure — the command
+        // was never delivered, neither side committed — so it gets the dedicated
+        // retryable reason + code `13068` BEFORE the generic `unwrap_or(13067)`
+        // fallback, distinguishing it from a permanent reject. (A commit-phase
+        // `ActorBusy` cannot reach here: it sets `needs_repair` and
+        // short-circuits to `NeedsRepair` above.) `RateLimited` reads its
+        // `retry_after_ms` off the variant. Every other `ContextError` is a
+        // `Rejected`. The code otherwise rides `saga_code` STRUCTURALLY off the
+        // reject path; codeless aborts (e.g. a Prepare-phase `TransportTimeout`,
+        // a token-bucket ECON `RateLimited`, or a journal-I/O `InvalidState`)
+        // carry `None` and fall back to the generic saga-abort code `13067`
+        // rather than `13050` (the SPECIFIC caller-membership-gate reject, which
+        // must not be synthesized for a failure that never occurred). The
+        // message string still carries the specific cause.
+        let (reason, code) = match &error {
+            ContextError::ActorBusy(_) => (
+                SagaAbortReason::MailboxSaturated {
+                    retry_after_ms: None,
+                },
+                13068,
+            ),
+            ContextError::RateLimited { retry_after_ms, .. } => (
+                SagaAbortReason::RateLimited {
+                    retry_after_ms: *retry_after_ms,
+                },
+                saga_code.unwrap_or(13067),
+            ),
+            _ => (SagaAbortReason::Rejected, saga_code.unwrap_or(13067)),
         };
-        // The code is read STRUCTURALLY off the reject path (`saga_code`), never
-        // parsed from the message. Codeless aborts (e.g. a Prepare-phase
-        // `TransportTimeout`, a token-bucket ECON `RateLimited`, or a journal-I/O
-        // `InvalidState`) carry `None` and fall back to the generic saga-abort
-        // code `13067` rather than `13050` (the SPECIFIC caller-membership-gate
-        // reject, which must not be synthesized for a failure that never
-        // occurred). The message string still carries the specific cause.
-        let code = saga_code.unwrap_or(13067);
         SagaError::Aborted {
             reason,
             code,
@@ -16672,6 +16720,101 @@ mod tests {
         );
     }
 
+    /// END-TO-END: a participant actor whose mailbox is CLOSED during the
+    /// Prepare phase surfaces a transient `ContextError::ActorBusy`, which the
+    /// boundary lift turns into the RETRYABLE `SagaAbortReason::MailboxSaturated`
+    /// terminal (code `13068`) — NOT the permanent `Rejected`/`13067` an
+    /// untyped abort would produce.
+    ///
+    /// Determinism: spawn a live caller+target pair (so the supervisor-side
+    /// authorize-before-reserve gates — `is_member` and
+    /// `has_established_tool_interface`, both of which route through the CALLER
+    /// actor's mailbox — and Prepare-A, which also dispatches to the caller, all
+    /// pass), then swap ONLY the TARGET registry handle for a closed-inbox one
+    /// (`from_sender(tx)` with the receiver dropped). `lookup(target_hex)` still
+    /// resolves (so this is NOT the `ContextNotRegistered`/`13053` path), but
+    /// Prepare-B's `send` hits the closed-channel arm → `ActorBusy`. The saga
+    /// never reaches Commit, so `needs_repair` stays `false` and the lift takes
+    /// the Prepare-phase `ActorBusy` branch.
+    #[tokio::test]
+    async fn xctx_saga_closed_participant_mailbox_aborts_mailbox_saturated() {
+        let creator_did = "did:dht:z6MkXctxMailboxCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxMailboxCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        // Swap the TARGET handle for a closed-inbox one: the receiver is dropped,
+        // so the next `send` resolves to the closed-channel arm → `ActorBusy`.
+        // The caller stays LIVE so every caller-routed gate + Prepare-A pass; the
+        // saturation is isolated to Prepare-B's target send.
+        let target_hex = hex::encode(XCTX_TARGET);
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(dead_rx);
+        supervisor
+            .actors
+            .insert(target_hex, ContextActorHandle::from_sender(dead_tx));
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+
+        let err = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x4Du8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
+            )
+            .await
+            .expect_err("a closed participant mailbox during Prepare must abort the saga");
+
+        assert!(
+            matches!(
+                &err,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::MailboxSaturated {
+                        retry_after_ms: None
+                    },
+                    code: 13068,
+                    ..
+                }
+            ),
+            "a Prepare-phase closed-mailbox ActorBusy must lift to the retryable \
+             Aborted/MailboxSaturated/13068, got {err:?}"
+        );
+        // EXPLICITLY rule out the untyped-abort mis-classification.
+        assert!(
+            !matches!(
+                &err,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    ..
+                }
+            ),
+            "transient mailbox saturation must NOT surface as a permanent Rejected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("SCP-SAGA-13068"),
+            "Display must carry the canonical retryable code, got {err}"
+        );
+    }
+
     /// FIX A target-wedge (BLACK-624-02): a caller who is a member of its OWN
     /// context but has NO established interface to a VICTIM target cannot reserve
     /// (and thereby wedge) the victim's saga slot. The saga rejects with the
@@ -17003,6 +17146,30 @@ mod tests {
             "a reject with no saga code (e.g. a Prepare-phase timeout) must fall back to the \
              generic saga-abort code 13067, not the specific caller-membership code 13050"
         );
+
+        // A Prepare-phase `ActorBusy` (needs_repair == false) lifts to the
+        // RETRYABLE `MailboxSaturated` reason + code 13068, not Rejected/13067.
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-mailbox".to_owned()),
+            RunSagaError {
+                error: ContextError::ActorBusy("mailbox full for 30 seconds".to_owned()),
+                needs_repair: false,
+                saga_code: None,
+            },
+        );
+        assert!(
+            matches!(
+                lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::MailboxSaturated {
+                        retry_after_ms: None
+                    },
+                    code: 13068,
+                    ..
+                }
+            ),
+            "Prepare-phase ActorBusy must lift to retryable MailboxSaturated/13068, not Rejected/13067"
+        );
     }
 
     /// Regression for the SYMMETRIC `commit_result == Ok(())` defect in
@@ -17114,6 +17281,72 @@ mod tests {
                 }
             ),
             "token-bucket hard-limit abort must propagate retry_after_ms: None, never coerce to Some(0)"
+        );
+    }
+
+    /// A Prepare-phase `ContextError::ActorBusy` — a TRANSIENT
+    /// participant-mailbox saturation/closure (full or closed inbox; the command
+    /// was never delivered, so NEITHER side committed) — MUST lift to the
+    /// dedicated retryable `SagaAbortReason::MailboxSaturated` terminal carrying
+    /// the new code `13068`, NOT the permanent `Rejected` reason and NOT the
+    /// generic `13067` abort fallback.
+    ///
+    /// WITHOUT the structural `ActorBusy` arm, this transient saturation falls
+    /// through to `_ => Rejected` + `saga_code.unwrap_or(13067)` — surfacing a
+    /// retryable mailbox-backpressure failure as a PERMANENT policy rejection
+    /// with no back-off hint, so a contract-honoring caller would treat a
+    /// transient condition as terminal. This pins the exact pre-fix mutation:
+    /// `reason: Rejected` and `code: 13067`.
+    #[test]
+    fn lift_run_saga_error_mailbox_saturated_is_retryable_not_rejected() {
+        let lifted = Supervisor::lift_run_saga_error(
+            SagaId("saga-mailbox-saturated".to_owned()),
+            RunSagaError {
+                error: ContextError::ActorBusy("mailbox full for 30 seconds".to_owned()),
+                needs_repair: false,
+                saga_code: None,
+            },
+        );
+
+        // The reason is the retryable MailboxSaturated (carrying a conservative
+        // None back-off), with the dedicated code 13068.
+        assert!(
+            matches!(
+                &lifted,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::MailboxSaturated {
+                        retry_after_ms: None
+                    },
+                    code: 13068,
+                    ..
+                }
+            ),
+            "a Prepare-phase ActorBusy must lift to Aborted/MailboxSaturated/13068, got {lifted:?}"
+        );
+
+        // EXPLICITLY pin the pre-fix mutation: it is NEITHER a permanent
+        // `Rejected` NOR the generic `13067` fallback code.
+        match &lifted {
+            SagaError::Aborted { reason, code, .. } => {
+                assert_ne!(
+                    *reason,
+                    SagaAbortReason::Rejected,
+                    "transient mailbox saturation must NOT be the permanent Rejected reason"
+                );
+                assert_ne!(
+                    *code, 13067,
+                    "transient mailbox saturation must carry the dedicated 13068, not the \
+                     generic 13067 abort fallback"
+                );
+            }
+            other => panic!("expected Aborted, got {other:?}"),
+        }
+
+        // The terminal renders its canonical SCP-SAGA-13068 code in Display so a
+        // flattened log line still grep-disambiguates.
+        assert!(
+            lifted.to_string().contains("SCP-SAGA-13068"),
+            "Display must carry the canonical SCP-SAGA-13068 code, got {lifted}"
         );
     }
 

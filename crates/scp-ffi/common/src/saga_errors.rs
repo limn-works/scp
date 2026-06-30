@@ -46,10 +46,12 @@ use scp_core::context::supervisor::{SagaAbortReason, SagaError};
 pub enum SagaErrorKind {
     /// A Prepare-phase abort (spec §6.2.4) — neither side committed.
     ///
-    /// `retry_after_ms` is read directly off `SagaAbortReason::RateLimited`
-    /// (an `Option<u64>`); a plain `Rejected` carries `None`. `None` is
+    /// `retry_after_ms` is read directly off the back-off-carrying reasons —
+    /// `SagaAbortReason::RateLimited` and `SagaAbortReason::MailboxSaturated`
+    /// (each an `Option<u64>`); a plain `Rejected` carries `None`. `None` is
     /// propagated, NEVER coerced to `Some(0)` — a `0` would read as "retry
-    /// immediately" and re-trip the same hard limit.
+    /// immediately" and re-trip the same hard limit / re-saturate the same
+    /// mailbox.
     Aborted {
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -92,11 +94,11 @@ pub struct SagaErrorParts {
 /// This is the SINGLE home of the saga-error classification:
 ///
 /// - `Aborted { reason, code, message }` → `kind = Aborted { retry_after_ms }`
-///   where `retry_after_ms` is read directly off
-///   `SagaAbortReason::RateLimited` (an `Option<u64>`) and a plain `Rejected`
-///   carries `None`. `None` is propagated, NEVER coerced to `Some(0)`. `code`
-///   is formatted as the canonical `SCP-SAGA-{code}` string from the numeric
-///   discriminant.
+///   where `retry_after_ms` is read directly off the back-off-carrying reasons
+///   `SagaAbortReason::RateLimited` / `SagaAbortReason::MailboxSaturated` (each
+///   an `Option<u64>`) and a plain `Rejected` carries `None`. `None` is
+///   propagated, NEVER coerced to `Some(0)`. `code` is formatted as the
+///   canonical `SCP-SAGA-{code}` string from the numeric discriminant.
 /// - `NeedsRepair { saga_id, message }` → `kind = NeedsRepair { saga_id }`,
 ///   `code = SCP-SAGA-13065` (the durable operator-repair terminal).
 /// - `Busy { contended_context, message }` → `kind = Busy { contended_context }`,
@@ -110,7 +112,8 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
             message,
         } => {
             let retry_after_ms = match reason {
-                SagaAbortReason::RateLimited { retry_after_ms } => retry_after_ms,
+                SagaAbortReason::RateLimited { retry_after_ms }
+                | SagaAbortReason::MailboxSaturated { retry_after_ms } => retry_after_ms,
                 SagaAbortReason::Rejected => None,
             };
             SagaErrorParts {
@@ -181,6 +184,29 @@ mod tests {
                 retry_after_ms: None,
             },
             "None must NOT be coerced to Some(0)"
+        );
+    }
+
+    /// A transient `MailboxSaturated` abort surfaces its conservative
+    /// `retry_after_ms` STRUCTURALLY through the same `Aborted { retry_after_ms }`
+    /// kind as `RateLimited` (the retryable wrapper), formatting the dedicated
+    /// `SCP-SAGA-13068` code.
+    #[test]
+    fn mailbox_saturated_surfaces_retry_hint_and_formats_code() {
+        let parts = decompose_saga_error(SagaError::Aborted {
+            reason: SagaAbortReason::MailboxSaturated {
+                retry_after_ms: None,
+            },
+            code: 13068,
+            message: "participant actor mailbox saturated during Prepare".to_owned(),
+        });
+        assert_eq!(parts.code, "SCP-SAGA-13068");
+        assert_eq!(
+            parts.kind,
+            SagaErrorKind::Aborted {
+                retry_after_ms: None,
+            },
+            "MailboxSaturated must surface through the retryable Aborted kind, None never coerced"
         );
     }
 
