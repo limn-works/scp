@@ -2,7 +2,7 @@
 import XCTest
 
 /// Tests for the §6.2.4 cross-context tool-invocation saga SDK wrapper
-/// (`Context.invokeToolCrossContextSaga`, PR-6c slice 3/4, #1939).
+/// (`Context.invokeToolCrossContextSaga`, PR-6c slice 3/4).
 ///
 /// The Swift SDK surfaces the generated UniFFI types directly: the saga
 /// terminal is the generated `SagaResult` (faithful nullable), and the
