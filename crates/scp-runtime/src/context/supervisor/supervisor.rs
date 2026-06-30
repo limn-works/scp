@@ -16549,7 +16549,6 @@ mod tests {
         journal: Arc<dyn SagaJournal>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         persistence: Option<Box<dyn ContextPersistence>>,
-        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
@@ -16569,7 +16568,10 @@ mod tests {
             Box::new(TestEventLog),
             key_resolver,
             persistence,
-            payment_adapter,
+            // The live §6.2.4 xctx outbound path stages no caller-side external
+            // escrow (Prepare-A presents no outbound spending UCAN), so this
+            // helper never needs a payment adapter — faithful production shape.
+            None,
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
@@ -16632,11 +16634,6 @@ mod tests {
             journal,
             mls_storage,
             Some(Box::new(persistence)),
-            // The live §6.2.4 xctx outbound path stages NO caller-side external
-            // escrow (Prepare-A presents no outbound spending UCAN), so this
-            // saga drives to NeedsRepair without ever touching a payment
-            // adapter — a plain absent adapter is the faithful production shape.
-            None,
         );
         let caller_state = xctx_caller_state(caller_did, creator_did).await;
         let target_state = xctx_target_state(caller_did, creator_did).await;
@@ -16837,7 +16834,6 @@ mod tests {
             journal,
             mls_storage,
             Some(Box::new(persistence.clone())),
-            None,
         );
         let caller_did = "did:dht:z6MkXctxOkArmCaller";
         let caller_state = xctx_caller_state(caller_did, &creator_did).await;
@@ -16967,7 +16963,6 @@ mod tests {
             Arc::clone(&journal),
             mls_storage,
             Some(Box::new(persistence.clone())),
-            None,
         );
 
         // Restore-then-replay: restores both actors (resident, carrying their
