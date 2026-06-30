@@ -75,9 +75,11 @@
 #
 # FFI ORDERING clause — if any `start_*_saga` export exists anywhere under
 #   `crates/scp-ffi/`, the NEGATIVE assertion MUST pass (no instance-wide saga
-#   guard may coexist with a shipped FFI saga surface). Today there are no such
-#   exports, so this clause is a vacuous pass that ARMS the prerequisite: the
-#   moment an FFI saga export lands, the negative assertion is load-bearing.
+#   guard may coexist with a shipped FFI saga surface). The §6.2.4 cross-context
+#   tool saga (`tool_invoke_cross_context_saga`, which drives
+#   `Supervisor::start_cross_context_tool_invocation_saga`) is now exported across
+#   all three FFI bridges, so this clause is currently LOAD-BEARING — not a
+#   vacuous pass.
 #
 # ---------------------------------------------------------------------------
 # HOW TO FIX A FAILURE
@@ -427,9 +429,9 @@ run_check() {
         printf '\n%sFAILED (positive P5)%s: `fn saga_participant_context_set` emits a\n' \
             "$C_RED" "$C_RESET" >&2
         printf '`"standing-"`-prefixed literal (or calls `generate_standing_context_id`)\n' >&2
-        printf 'into the reserved set. The standing-pair saga must reserve the CANONICAL\n' >&2
+        printf 'into the reserved set. Standing-pair creation must reserve the CANONICAL\n' >&2
         printf 'raw-digest hex (`derive_standing_context_digest`), not the prefixed\n' >&2
-        printf 'display id, or it cannot overlap a cross-context/broadcast saga over the\n' >&2
+        printf 'display id, or it cannot overlap the cross-context tool saga (§6.2.4) over the\n' >&2
         printf 'same standing context (spec §5.15.8). Reserve the raw digest.\n' >&2
         fail=1
     fi
