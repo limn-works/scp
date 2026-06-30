@@ -508,17 +508,22 @@ fn event_log_query_empty_returns_empty() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Per commit a5b4cc8ec ("fix: emit ContextCreated on context
-        // create"), the PyO3 bridge now wires a MerkleEventLogProvider
-        // (matching NAPI/UniFFI). `ContextManager::create_context`
-        // appends exactly one `ContextCreated` event at sequence 0, so a
-        // fresh context has event_count = 1 across all bridges.
-        // This test pins the post-alignment invariant.
+        // A fresh context's creation stream is two leaves: `ContextCreated`
+        // (sequence 0) followed by the founder's `MemberJoined` (sequence 1).
+        // The founder join leaf is what gives the creator a non-zero
+        // participation duration — without it the membership-interval model has
+        // no join event to open the creator's interval. The shape is identical
+        // across the native bridges (PyO3/NAPI/UniFFI).
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert_eq!(
             events.len(),
-            1,
-            "expected exactly one ContextCreated event on a fresh context"
+            2,
+            "expected ContextCreated + founder MemberJoined on a fresh context"
+        );
+        assert_eq!(events[0].event_type, "ContextCreated");
+        assert_eq!(
+            events[1].event_type, "MemberJoined",
+            "the founder's MemberJoined leaf must follow ContextCreated"
         );
     });
 }
