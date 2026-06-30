@@ -453,6 +453,61 @@ describe("scp.toolInvokeCrossContextSaga", () => {
     expect(result.output).not.toBeNull();
   });
 
+  it("surfaces an omitted output as null (never synthesized)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({
+      sagaId: "saga-nooutput",
+      receipt: Buffer.from([7]),
+    }));
+
+    const result = await invoke({});
+    expect(result.sagaId).toBe("saga-nooutput");
+    expect(result.output).toBeNull();
+    expect(result.receipt).not.toBeNull();
+  });
+
+  it("forwards all nine arguments to the native saga op in order", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
+
+    // Opaque sentinel handles — the wrapper forwards them verbatim.
+    const source = { __h: "SRC" };
+    const target = { __h: "TGT" };
+    // Distinct discriminating values for the four same-typed string params so a
+    // positional swap (caller/tool-reg/input/nonce) is caught, not masked by a
+    // shared literal.
+    const callerDid = "caller-DID-aaa";
+    const toolRegistrationId = "tool-reg-bbb";
+    const inputJson = '{"in":"ccc"}';
+    const assertedNonceHex = "dd".repeat(16);
+    const chainDepth = 7;
+    const ucanProofId = "ucan-proof-eee";
+
+    await scp.toolInvokeCrossContextSaga(
+      source,
+      target,
+      callerDid,
+      toolRegistrationId,
+      inputJson,
+      assertedNonceHex,
+      TS_MS,
+      chainDepth,
+      ucanProofId,
+    );
+
+    const call = native.__lastCall("toolInvokeCrossContextSaga");
+    expect(call).toBeDefined();
+    expect(call?.args).toEqual([
+      source,
+      target,
+      callerDid,
+      toolRegistrationId,
+      inputJson,
+      assertedNonceHex,
+      TS_MS,
+      chainDepth,
+      ucanProofId,
+    ]);
+  });
+
   it("accepts chainDepth at the u8 bounds (0 and 255)", async () => {
     native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
 
@@ -470,6 +525,16 @@ describe("scp.toolInvokeCrossContextSaga", () => {
     const err = await invoke({ chainDepth: -1 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ValidationError);
     expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+  });
+
+  it("rejects a fractional chainDepth before dispatching to native (fail-fast)", async () => {
+    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "should-not-reach" }));
+
+    const err = await invoke({ chainDepth: 1.5 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ValidationError);
+    expect((err as ValidationError).code).toBe("SCP-VALID-7002");
+    // Fail-fast: the validation guard rejects before the native saga op runs.
+    expect(native.__calls("toolInvokeCrossContextSaga")).toHaveLength(0);
   });
 
   it("rejects a negative bigint timestampMs", async () => {

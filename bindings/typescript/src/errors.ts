@@ -314,26 +314,31 @@ export function mapSagaError(error: unknown): ScpError {
     return mapBridgeError(error);
   }
 
-  // Dispatch on the literal Display phrase. The datum regexes are end-anchored
-  // (`\s*$`) and the Display suffix is always terminal, so end-anchored ==
-  // last-anchored: only the genuine trailing datum can match.
-  if (message.includes("] saga aborted:")) {
-    const m = /\(retry_after_ms=(null|\d+)\)\s*$/.exec(message);
-    const datum = m?.[1];
-    // null / absent ⇒ null, NEVER 0 (a `0` would read as "retry immediately").
-    const retryAfterMs = datum === undefined || datum === "null" ? null : Number(datum);
-    return new SagaAbortedError(message, code, retryAfterMs);
+  // Dispatch on the phrase ANCHORED immediately after the `[{code}] ` prefix.
+  // The NAPI Display format (crates/scp-ffi/napi/src/error.rs:127-170) fixes the
+  // phrase there; a phrase substring appearing only inside {message} is
+  // non-terminal and must not win — same anchoring discipline as the
+  // start-anchored code and end-anchored datum extraction.
+  const phraseMatch = /^\s*\[SCP-SAGA-\d+\] saga (aborted|needs repair|busy):/.exec(message);
+  switch (phraseMatch?.[1]) {
+    case "aborted": {
+      const m = /\(retry_after_ms=(null|\d+)\)\s*$/.exec(message);
+      const datum = m?.[1];
+      // null / absent ⇒ null, NEVER 0 (a `0` would read as "retry immediately").
+      const retryAfterMs = datum === undefined || datum === "null" ? null : Number(datum);
+      return new SagaAbortedError(message, code, retryAfterMs);
+    }
+    case "needs repair": {
+      const m = /\(saga_id=([^)]*)\)\s*$/.exec(message);
+      return new SagaNeedsRepairError(message, code, m?.[1] ?? "");
+    }
+    case "busy": {
+      const m = /\(contended_context=([^)]*)\)\s*$/.exec(message);
+      return new SagaBusyError(message, code, m?.[1] ?? "");
+    }
+    default:
+      // An SCP-SAGA code with an unrecognized phrase → preserve classification
+      // as ToolError rather than silently dropping it.
+      return new ToolError(message, code);
   }
-  if (message.includes("] saga needs repair:")) {
-    const m = /\(saga_id=([^)]*)\)\s*$/.exec(message);
-    return new SagaNeedsRepairError(message, code, m?.[1] ?? "");
-  }
-  if (message.includes("] saga busy:")) {
-    const m = /\(contended_context=([^)]*)\)\s*$/.exec(message);
-    return new SagaBusyError(message, code, m?.[1] ?? "");
-  }
-
-  // A `SCP-SAGA-` code with an unrecognized phrase: surface as a `ToolError`
-  // carrying the saga code rather than silently dropping the classification.
-  return new ToolError(message, code);
 }

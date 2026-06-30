@@ -2017,12 +2017,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // ---------------------------------------------------------------------------
   //
   // The §6.2.4 saga export lives on the native `SCP` class as
-  // `toolInvokeCrossContextSaga` (NOT yet on the SDK `Bridge` wrapper — that
-  // is a separate SDK-wrapper slice). So these tests reach it on the RAW
-  // native instance the bridge already wraps, obtained via `__getNativeScp`
-  // against the SAME `SCP` that minted the context handles. Using the same
-  // instance is mandatory: the per-instance handle-affinity guard rejects a
-  // handle minted by any other instance with SCP-PERM-3030.
+  // `toolInvokeCrossContextSaga`. The SDK wrapper (`SCP.toolInvokeCrossContextSaga`)
+  // now exists too, but these tests deliberately reach the RAW native instance
+  // DIRECTLY — obtained via `__getNativeScp` against the SAME `SCP` that minted
+  // the context handles — so they pin the JS-marshaling boundary (BigInt
+  // narrowing, hex nonce, NapiSagaResult round-trip, typed-SagaError survival)
+  // independently of the SDK wrapper layer. Using the same instance is
+  // mandatory: the per-instance handle-affinity guard rejects a handle minted
+  // by any other instance with SCP-PERM-3030.
   //
   // The signature crossing the addon boundary is:
   //   toolInvokeCrossContextSaga(

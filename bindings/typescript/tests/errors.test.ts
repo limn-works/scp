@@ -397,6 +397,30 @@ describe("mapSagaError", () => {
     expect((err as SagaAbortedError).retryAfterMs).toBeNull();
   });
 
+  it("dispatches on the prefix-anchored phrase, not a body decoy (needs repair)", () => {
+    // A NeedsRepair terminal whose {message} embeds the decoy phrase
+    // "] saga aborted:" must classify on the prefix-anchored phrase
+    // ("saga needs repair"), NOT the body decoy — otherwise the
+    // load-bearing sagaId repair handle would be silently dropped.
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: a] saga aborted: b (saga_id=SID123)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("SID123");
+  });
+
+  it("dispatches on the prefix-anchored phrase, not a body decoy (busy)", () => {
+    // Symmetric: a Busy terminal whose {message} embeds "] saga aborted:"
+    // must classify as busy and preserve contendedContext.
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13066] saga busy: x] saga aborted: y (contended_context=ctxABC)"),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaBusyError).contendedContext).toBe("ctxABC");
+  });
+
   it("delegates a non-saga error to mapBridgeError", () => {
     const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: target not active"));
     expect(err).toBeInstanceOf(ToolError);
