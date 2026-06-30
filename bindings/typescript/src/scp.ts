@@ -1939,7 +1939,7 @@ export class SCP {
     handle: unknown,
     token: string,
     capability: string,
-    presentingAgentDid?: string,
+    presentingAgentDid: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
     await (
@@ -1947,7 +1947,7 @@ export class SCP {
         h: unknown,
         t: string,
         c: string,
-        pa: string | undefined,
+        pa: string,
         pt: readonly string[] | undefined,
       ) => Promise<void>
     )(handle, token, capability, presentingAgentDid, proofTokens);
@@ -1968,22 +1968,30 @@ export class SCP {
    * per-check breakdown directly and never reverse-engineer *which* check
    * failed by parsing error prose.
    *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that inflates
+   * trust. It precedes `capability` in the signature because it is mandatory
+   * while `capability` is optional.
+   *
    * @param handle The context handle to evaluate against.
    * @param token The UCAN token string to evaluate.
+   * @param presentingAgentDid The DID under assessment — the agent the token
+   *   must be addressed to. Required; an absent or empty value is rejected by
+   *   the bridge.
    * @param capability Optional challenge capability URI. Omit it (or pass
    *   `null`/`undefined`) to evaluate the token's INTRINSIC validity with no
    *   invoked-capability grant-match challenge — the mode {@link evaluateTrust}
    *   uses. Pass a capability to additionally require the token grants it. (The
    *   enforcing {@link ucanValidate} gate keeps a mandatory capability.)
-   * @param presentingAgentDid Optional presenting-agent DID; defaults to the
-   *   token audience on the bridge side when omitted.
    * @param proofTokens Optional delegation-chain proof tokens.
    */
   async ucanEvaluate(
     handle: unknown,
     token: string,
+    presentingAgentDid: string,
     capability?: string | null,
-    presentingAgentDid?: string,
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation> {
     // Route the native dispatch through the single error chokepoint
@@ -1998,10 +2006,10 @@ export class SCP {
           h: unknown,
           t: string,
           c: string | null,
-          pa: string | null,
+          pa: string,
           pt: readonly string[] | null,
         ) => Promise<CapabilityValidation>
-      )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
+      )(handle, token, capability ?? null, presentingAgentDid, proofTokens ?? null);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -2356,7 +2364,7 @@ export class SCP {
         // grant-match the caller never asked for. See ADR-057 / spec §7.2.4:
         // the diagnostic's challenge capability is optional, and omitting it
         // means intrinsic-validity.
-        const perToken = await this.ucanEvaluate(handle, token, null, subjectDid);
+        const perToken = await this.ucanEvaluate(handle, token, subjectDid);
         tokensValid &&= perToken.tokensValid;
         signaturesValid &&= perToken.signaturesValid;
         withinCeiling &&= perToken.withinCeiling;

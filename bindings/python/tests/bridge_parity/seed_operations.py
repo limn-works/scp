@@ -880,7 +880,10 @@ def _py_ucan_evaluate_structured(ctx: OpContext) -> dict[str, Any]:
     # Evaluate against a capability the token does NOT grant. The required URI is
     # context-scoped exactly as minting scopes the granted caps.
     required = f"scp:ctx:{handle.context_id}/{_UCAN_STRUCTURED_REQUIRED_CAP}"
-    result = scp.ucan_evaluate(handle.context_id, token.encoded, required)
+    # Presenting agent is REQUIRED (fail-closed): pass the token's audience
+    # (the minted member DID) so the step-5 audience check passes and the
+    # failing stage is purely the grant-match, identical across bridges.
+    result = scp.ucan_evaluate(handle.context_id, token.encoded, required, _UCAN_MEMBER_DID)
     return {
         "tokens_valid": result.tokens_valid,
         "signatures_valid": result.signatures_valid,

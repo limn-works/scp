@@ -1092,10 +1092,17 @@ class SCP:
         context_id: str,
         token: str,
         capability: str,
-        presenting_agent_did: str | None = None,
+        presenting_agent_did: str,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_validate``."""
+        """Delegate to ``_scp_core.SCP.ucan_validate``.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        Pass the DID the token must be addressed to.
+        """
         return await asyncio.to_thread(
             self._native.ucan_validate,
             context_id,
@@ -1109,8 +1116,8 @@ class SCP:
         self,
         context_id: str,
         token: str,
+        presenting_agent_did: str,
         capability: str | None = None,
-        presenting_agent_did: str | None = None,
         proof_tokens: list[str] | None = None,
     ) -> CapabilityValidation:
         """Evaluate a UCAN token and return the structured per-stage result.
@@ -1124,6 +1131,13 @@ class SCP:
         call repeatedly on the same token. The result is a point-in-time
         diagnostic snapshot, not a promise that a later ``ucan_validate``
         will accept the token.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        It precedes ``capability`` in the signature because it is mandatory
+        while ``capability`` is optional. Pass the DID under assessment.
 
         ``capability`` is OPTIONAL. Omit it (or pass ``None``) to evaluate the
         token's INTRINSIC validity — signatures, ceiling, nonce, revocation,

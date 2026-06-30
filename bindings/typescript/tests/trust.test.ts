@@ -77,7 +77,7 @@ function statefulUcanEvaluate(
   const counts = new Map<string, number>();
   return {
     fn: async (...args: readonly unknown[]): Promise<CapabilityValidation> => {
-      // SCP.ucanEvaluate(handle, token, capability, presentingAgentDid, proofTokens)
+      // SCP.ucanEvaluate(handle, token, presentingAgentDid, capability, proofTokens)
       const token = args[1] as string;
       counts.set(token, (counts.get(token) ?? 0) + 1);
       const override = overrides[token] ?? {};
@@ -108,7 +108,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
       timeBoundsValid: true,
     }));
 
-    const result = await scp.ucanEvaluate("handle", "token-a", "tool:invoke:*");
+    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "tool:invoke:*");
     expect(result).toEqual({
       tokensValid: true,
       signaturesValid: false,
@@ -119,27 +119,30 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
     });
   });
 
-  it("forwards the optional presenting-agent DID and proof tokens", async () => {
+  it("forwards the presenting-agent DID and proof tokens", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("ucanEvaluate", async () => ALL_PASS);
 
-    await scp.ucanEvaluate("handle", "token-a", "*", "did:dht:agent", ["proof-1"]);
+    await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "*", ["proof-1"]);
     const call = native.__lastCall("ucanEvaluate");
     expect(call).toBeDefined();
-    // handle, token, capability, presentingAgentDid, proofTokens
+    // Native wire order: handle, token, capability, presentingAgentDid, proofTokens
+    expect(call?.args[2]).toBe("*");
     expect(call?.args[3]).toBe("did:dht:agent");
     expect(call?.args[4]).toEqual(["proof-1"]);
   });
 
-  it("normalizes omitted optionals to null on the wire", async () => {
+  it("normalizes the omitted capability and proof tokens to null on the wire", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("ucanEvaluate", async () => ALL_PASS);
 
-    await scp.ucanEvaluate("handle", "token-a", "*");
+    // presentingAgentDid is required; capability and proofTokens are omitted.
+    await scp.ucanEvaluate("handle", "token-a", "did:dht:agent");
     const call = native.__lastCall("ucanEvaluate");
-    expect(call?.args[3]).toBeNull();
+    expect(call?.args[2]).toBeNull();
+    expect(call?.args[3]).toBe("did:dht:agent");
     expect(call?.args[4]).toBeNull();
   });
 });

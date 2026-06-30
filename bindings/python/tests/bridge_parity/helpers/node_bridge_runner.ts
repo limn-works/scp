@@ -682,7 +682,10 @@ async function opUcanEvaluateStructured(
   const handle = await scp.contextCreate(identity, JSON.stringify(params));
   const token = await scp.ucanMint(handle, memberDid, capabilities);
   const required = `scp:ctx:${handle.contextId}/${requiredCap}`;
-  const result = await scp.ucanEvaluate(handle, token.encoded, required);
+  // Presenting agent is REQUIRED (fail-closed): pass the token's audience (the
+  // minted member DID) so the step-5 audience check passes and the failing
+  // stage is purely the grant-match, identical across bridges.
+  const result = await scp.ucanEvaluate(handle, token.encoded, required, memberDid);
   return {
     tokens_valid: result.tokensValid,
     signatures_valid: result.signaturesValid,
