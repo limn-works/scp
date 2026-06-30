@@ -275,6 +275,9 @@ pub(crate) async fn ucan_validate_on(
                 code: codes::VALID_7010.to_owned(),
             })
         })?;
+    // Input hygiene parity with the PyO3 reference: validate the trimmed
+    // presenting agent DID before any state lookup / token parse.
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -392,6 +395,9 @@ pub(crate) async fn ucan_evaluate_on(
                 code: codes::VALID_7010.to_owned(),
             })
         })?;
+    // Input hygiene parity with the PyO3 reference: validate the trimmed
+    // presenting agent DID before any state lookup / token parse.
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
