@@ -721,8 +721,10 @@ impl ContextActor {
             // acks its typed oneshot with `Err(NotImplemented)` — the real
             // Prepare-A/Prepare-B bodies run only on a stateful actor via
             // `dispatch_state` → `handlers::saga::dispatch`. PrepareA replies a
-            // `PreparedAFields`, the rest reply `()`, so the two reply-shapes
-            // are acked separately; within each shape the body is identical.
+            // `PrepareAOutcome` and PrepareB a `PrepareBOutcome` (each carrying a
+            // §6.2.4 policy reject on the SUCCESS channel as a `SagaReject`); the
+            // skeleton routes them through the unchanged `Err(ContextError)`
+            // channel, so each phase arm acks separately.
             ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA { reply, .. }) => {
                 ack_not_impl(reply, "saga_phase");
             }

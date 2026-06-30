@@ -2628,6 +2628,149 @@ pub struct PreparedBFields {
     pub recorded_chain_depth: u8,
 }
 
+/// Carrier for a §6.2.4 saga POLICY rejection that rides the Prepare-phase
+/// SUCCESS channel as typed data.
+///
+/// The §6.2.4 saga FSM produces canonical `SCP-SAGA-13xxx` reject discriminants.
+/// 17 of the 20 Prepare-axis reject sites are raised inside a participant actor
+/// and must cross the mailbox; the mailbox `send` reply channel hardcodes
+/// `Result<T, ContextError>`, and the boundary lift cannot recover a numeric
+/// code from a bare `ContextError` without parsing its message string. To carry
+/// the code STRUCTURALLY (the agent-first API tenet — no string parse), a saga
+/// POLICY reject is replied as `Ok(PrepareAOutcome::Rejected(SagaReject))` (NOT
+/// `Err`), with the canonical discriminant on [`Self::code`].
+///
+/// The `Err(ContextError)` channel is reserved for codeless mailbox / transport
+/// / Class-S-persist failures (a dropped receiver, a Prepare timeout, a journal
+/// I/O fault). Those lift to the generic saga-abort code `13067`. Construct a
+/// `SagaReject` via the
+/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro so the
+/// structural `code` and the `SCP-SAGA-{code}:` message prefix derive from ONE
+/// code literal and cannot diverge.
+#[derive(Debug)]
+pub struct SagaReject {
+    /// The canonical `SCP-SAGA-13xxx` discriminant of this reject, set
+    /// STRUCTURALLY at the reject site (never parsed from the message). `None`
+    /// for a reject that carries no saga code — it lifts to the generic
+    /// saga-abort code `13067`.
+    pub code: Option<u16>,
+    /// The typed [`ContextError`] the reject carries (its `Display` still bears
+    /// the canonical `SCP-SAGA-{code}:` prefix so existing message assertions
+    /// and flattened log lines continue to disambiguate the terminal).
+    pub error: ContextError,
+}
+
+/// A bare [`ContextError`] reaching the [`SagaReject`] boundary (a mailbox /
+/// commit / journal `?`) carries NO saga code — it is a codeless infrastructure
+/// failure, not a §6.2.4 policy reject. It lifts to the generic saga-abort code
+/// `13067`. ONLY the `?`-propagated infrastructure paths route through this
+/// conversion; every Prepare-axis POLICY reject is built via the
+/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro with an
+/// explicit `code`, so a real discriminant is never silently dropped to `None`.
+impl From<ContextError> for SagaReject {
+    fn from(error: ContextError) -> Self {
+        Self { code: None, error }
+    }
+}
+
+/// Outcome of the Prepare-A handler ([`SagaPhaseMessage::PrepareA`]). Carried on
+/// the mailbox SUCCESS channel so a §6.2.4 saga POLICY reject can ride a typed
+/// [`SagaReject`] (with its structural `SCP-SAGA-13xxx` code) rather than a bare
+/// `Err(ContextError)` whose code would be recoverable only by parsing the
+/// message. The `Err(ContextError)` channel carries ONLY codeless mailbox /
+/// transport / Class-S-persist failures.
+///
+/// **Not `Clone`.** [`Self::Prepared`] carries the `#[must_use]`
+/// [`PreparedAFields`] RAII reservation carrier.
+///
+/// The `Prepared` variant is large (it embeds the `ToolEconomyReservation`
+/// carrier) while `Rejected` is small — but boxing `Prepared` is the WRONG
+/// trade here: the value is created, sent over a `oneshot`, and immediately
+/// destructured by the FSM (never stored in a collection or moved in bulk), so
+/// the size asymmetry never materializes as a real cost; boxing would instead
+/// add a pointless heap allocation + indirection on the hot success path and
+/// complicate the `#[must_use]` carrier's move-by-value recovery destructure
+/// (the lost-receiver balance path in `prepare_a`). The carrier MUST move by
+/// value end-to-end to preserve its single-owner RAII drop-guard contract.
+#[allow(clippy::large_enum_variant)]
+#[must_use = "a PrepareAOutcome::Prepared carries a ToolEconomyReservation that must be settled or released"]
+#[derive(Debug)]
+pub enum PrepareAOutcome {
+    /// Prepare-A passed: the staged outbound reservation handles.
+    Prepared(PreparedAFields),
+    /// Prepare-A rejected by a §6.2.4 policy gate (capability, outbound caller,
+    /// outbound §6.2.0.2 rate). Carries the structural `SCP-SAGA-13xxx` code.
+    Rejected(SagaReject),
+}
+
+/// Outcome of the Prepare-B handler ([`SagaPhaseMessage::PrepareB`]). The target
+/// side of [`PrepareAOutcome`]: a §6.2.4 policy reject rides a typed
+/// [`SagaReject`] on the SUCCESS channel; the `Err(ContextError)` channel
+/// carries only codeless mailbox / Class-S-persist failures.
+#[derive(Debug)]
+pub enum PrepareBOutcome {
+    /// Prepare-B passed: B's captured provenance the FSM drives Commit with.
+    Prepared(PreparedBFields),
+    /// Prepare-B rejected by a §6.2.4 policy gate (confused-deputy, inbound
+    /// policy, schema, freshness, chain-depth, inbound rate, target binding).
+    /// Carries the structural `SCP-SAGA-13xxx` code.
+    Rejected(SagaReject),
+}
+
+/// Build a [`SagaReject`] for a §6.2.4 Prepare-axis policy rejection from ONE
+/// numeric `SCP-SAGA-13xxx` code literal.
+///
+/// The macro synthesizes BOTH the structural `code: Some($code)` field AND the
+/// `SCP-SAGA-{code}: ` message prefix from the SAME `$code`, so a reject site
+/// names its discriminant EXACTLY ONCE and the typed field and the formatted
+/// string cannot drift apart. The chosen [`ContextError`] variant (per the
+/// §6.2.4 reject inventory) is named explicitly so existing message-substring
+/// and variant assertions still hold.
+///
+/// Forms (one per carried variant; `$arg`s are positional `{}` substitutions in
+/// `$fmt`, exactly as the original `format!` used):
+/// - `saga_reject!(13010, PermissionDenied, "… {}", arg)`
+/// - `saga_reject!(13051, InvalidState, "… {}", arg)`
+/// - `saga_reject!(13052, ContextNotRegistered, "… {}", arg)`
+/// - `saga_reject!(13023, RateLimited { resource: r, retry_after_ms: ms }, "… {}", arg)`
+macro_rules! saga_reject {
+    ($code:literal, PermissionDenied, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::PermissionDenied(
+                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+            ),
+        }
+    };
+    ($code:literal, InvalidState, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::InvalidState(
+                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+            ),
+        }
+    };
+    ($code:literal, ContextNotRegistered, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::ContextNotRegistered(
+                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+            ),
+        }
+    };
+    ($code:literal, RateLimited { resource: $res:expr, retry_after_ms: $rms:expr }, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::RateLimited {
+                resource: $res,
+                message: ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+                retry_after_ms: $rms,
+            },
+        }
+    };
+}
+pub(crate) use saga_reject;
+
 /// Reply payload for [`SagaPhaseMessage::CommitBReserve`] (spec §6.2.4
 /// "Commit", split-execution model). The Commit-B phase is two actor
 /// round-trips with the non-`Send` tool executor running supervisor-side in
@@ -2718,8 +2861,11 @@ pub enum SagaPhaseMessage {
         caller_did: scp_identity::DID,
         /// Context-local tool registration id being invoked at the target.
         tool_registration_id: String,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<PreparedAFields, ContextError>>,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareAOutcome::Rejected(SagaReject))` (carrying the structural
+        /// `SCP-SAGA-13xxx` code); the `Err(ContextError)` channel carries only
+        /// codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareAOutcome, ContextError>>,
     },
     /// Prepare-B — runs on the LOCAL target-context actor. Resolves the UCAN
     /// proof and re-runs §7 validation re-bound to `caller_did` +
@@ -2762,8 +2908,11 @@ pub enum SagaPhaseMessage {
         /// (spec §6.2.4 "Caller authentication" + InboundPolicy "source role").
         /// `None` ⇒ no explicit role assignment.
         caller_source_role: Option<String>,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<PreparedBFields, ContextError>>,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareBOutcome::Rejected(SagaReject))` (carrying the structural
+        /// `SCP-SAGA-13xxx` code); the `Err(ContextError)` channel carries only
+        /// codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
     },
     /// Commit-B (reserve half) — runs on the LOCAL target-context actor. The
     /// FIRST of the two Commit-B round-trips (spec §6.2.4 "Commit", split per
