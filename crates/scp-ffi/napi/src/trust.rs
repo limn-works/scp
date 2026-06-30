@@ -280,9 +280,10 @@ pub(crate) fn verify_participation_requirements_on(
     profile_json: String,
     requirements_json: String,
 ) -> napi::Result<bool> {
-    if expected_subject.is_empty() {
-        return Err(validation_error("expected_subject DID must not be empty"));
-    }
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_did(&expected_subject)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| {
@@ -633,6 +634,20 @@ mod tests {
         let result = verify_participation_requirements_on(
             &bi,
             String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_malformed_subject() {
+        // Parity with the PyO3 reference bridge: `expected_subject` gets full
+        // DID-format validation, not just a non-empty check.
+        let bi = test_bi();
+        let result = verify_participation_requirements_on(
+            &bi,
+            "not-a-did".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
         );

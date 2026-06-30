@@ -6364,12 +6364,9 @@ pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
 ) -> Result<bool, ScpError> {
-    if expected_subject.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "expected_subject DID must not be empty".to_owned(),
-            code: codes::VALID_7030.to_owned(),
-        });
-    }
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    validate_did(&expected_subject)?;
 
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| ScpError::Validation {
@@ -17325,6 +17322,25 @@ mod tests {
         let scp = scp_test();
         let result =
             scp.participation_record("ctx-1".to_owned(), "not-a-did".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_empty_subject() {
+        let result =
+            verify_participation_requirements(String::new(), "[]".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_malformed_subject() {
+        // Parity with the PyO3 reference bridge: `expected_subject` gets full
+        // DID-format validation, not just a non-empty check.
+        let result = verify_participation_requirements(
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
         assert!(result.is_err());
     }
 
