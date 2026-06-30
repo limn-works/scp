@@ -609,7 +609,7 @@ func encodeCachedAttestations(_ cachedAttestations: [CachedAttestation]) throws 
     guard let json = String(data: data, encoding: .utf8) else {
         throw ScpError.Validation(
             msg: "failed to encode cached attestations as UTF-8 JSON",
-            code: "SCP-VALID-7061"
+            code: "SCP-VALID-7059"
         )
     }
     return json
