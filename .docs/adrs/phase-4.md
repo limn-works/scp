@@ -1489,6 +1489,8 @@ SCP is pre-release: there are no deployed browser clients and no migration surfa
 
 **Delete the WASM bridge.** Remove `crates/scp-ffi/wasm/` in its entirety, along with its build, test, CI, and enforcement references. The FFI bridge set is now **three** bridges, all of which share the real engine: PyO3 (Python, reference), UniFFI (Swift, Kotlin), and NAPI (Node.js/Bun → TypeScript).
 
+> **Recovery / posterity.** The deleted bridge source is not lost — it remains in git history and the design rationale is preserved in ADR-034 above (kept under its supersession banner). The WASM bridge was last present at commit `1a3b41a5e^` (the parent of the removal commit `1a3b41a5e`, "remove the WASM bridge — Slice 1 foundation", PR #1934); recover the full tree with `git show 1a3b41a5e^:crates/scp-ffi/wasm/...` or `git checkout 1a3b41a5e^ -- crates/scp-ffi/wasm`.
+
 **The browser story is a remote thin client.** A browser client does not run the protocol engine in-process. It connects to a server-side `scp-node` over an RPC/WebSocket boundary and issues protocol operations remotely; the node holds the MLS group state, the actor/supervisor runtime, custody, and the event log. There is **no in-browser client-side MLS or protocol execution**. The TypeScript SDK's browser build is a remote-client transport to a node, not a second in-process engine; the in-process TypeScript path remains NAPI-only (server/Node.js/Bun runtimes).
 
 This is the only structural shape that respects the "one implementation" invariant for the protocol engine: rather than re-implementing the engine for the constrained target, the constrained target talks to the engine over the network.
