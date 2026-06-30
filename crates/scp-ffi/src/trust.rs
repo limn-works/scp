@@ -21,7 +21,7 @@
 //!   evaluation.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
-//! methods in Phase 4 PR 4 sub-slice E (#1549).
+//! methods in Phase 4 PR 4 sub-slice E.
 //!
 //! The trust engine does not produce trust "scores" — it provides verifiable
 //! facts (participation records, attestation verification results, challenge
@@ -306,7 +306,7 @@ pub fn py_verify_participation_requirements(
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
 /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
 /// trust data when initialized (trust data survives across calls and restarts);
-/// falls back to an ephemeral in-memory store otherwise. See issue #502.
+/// falls back to an ephemeral in-memory store otherwise.
 ///
 /// # Errors
 ///
@@ -400,7 +400,7 @@ fn aggregate_trust_input_impl(
 /// If the `BridgeInstance` storage provider is initialized, builds a
 /// `ProtocolRepositoryTrustBridge` over the concrete storage backend
 /// (`InMemoryEncrypted` or `Sqlite`) so cached attestations, revocation
-/// states, and challenge results survive process restarts (issue #502).
+/// states, and challenge results survive process restarts.
 /// Otherwise falls back to an ephemeral in-memory store.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
@@ -426,7 +426,7 @@ fn aggregate_with_storage(
     // The former path swapped in an ephemeral `InMemoryFfiTrustStore` so
     // aggregations against a `SCP({storage: sqlite})` caller's configured
     // SQLCipher store invisibly landed in an empty ephemeral store. See
-    // `with_storage_py` / PR #1690 review.
+    // `with_storage_py`.
     let provider = crate::runtime::get_storage(bi).map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "{}: bridge storage not initialized — trust aggregation is \
@@ -642,7 +642,7 @@ fn participation_record_impl(
         })?;
 
     // Source verified attestations from this instance's persistent trust store
-    // (same backend as context/event-log writes — issue #502). The sourcing
+    // (same backend as context/event-log writes). The sourcing
     // logic lives ONCE in `run_verified_attestations` (generic over the concrete
     // `EncryptedStorage` backend); the match is pure type dispatch because the
     // sealed `EncryptedStorage` bound cannot be satisfied by the `StorageProvider`
@@ -721,7 +721,7 @@ fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4).
 // ---------------------------------------------------------------------------
 
 #[pymethods]
@@ -759,7 +759,7 @@ impl crate::scp::PyScp {
     /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
     /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
     /// trust data when initialized (trust data survives across calls and restarts);
-    /// falls back to an ephemeral in-memory store otherwise. See issue #502.
+    /// falls back to an ephemeral in-memory store otherwise.
     ///
     /// # Errors
     ///

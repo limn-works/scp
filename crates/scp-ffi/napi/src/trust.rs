@@ -1,9 +1,8 @@
 //! napi-rs bridge for trust engine operations.
 //!
 //! Per-bridge-instance (`_on`) implementations consumed by the corresponding
-//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
-//! free-function wrappers that routed through the process-global default
-//! bridge instance.
+//! methods on [`crate::scp::Scp`]. The free-function wrappers that routed
+//! through the process-global default bridge instance were deleted.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -373,7 +372,7 @@ pub(crate) fn aggregate_trust_input_on(
     // the split-brain failure mode main's `Option` guarded against
     // (trust writes silently landing in an ephemeral store while
     // context/event-log writes landed in SQLCipher) is structurally
-    // unreachable. See issue #502.
+    // unreachable.
     match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let handle = crate::runtime().handle().clone();
@@ -445,7 +444,7 @@ pub(crate) fn participation_record_on(
         })?;
 
     // Source verified attestations from this instance's `ProtocolRepository`
-    // (same backend as context/event-log writes — issue #502).
+    // (same backend as context/event-log writes).
     let verified = match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let handle = crate::runtime().handle().clone();

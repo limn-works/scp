@@ -3,7 +3,7 @@
  *
  * Defines bridge-connector wire types (spec §12, ADR-023). The
  * `bridgeCreateShadow` entry point lives on the {@link SCP} class
- * (Phase 4 PR 4, #1549, ADR-048); {@link bridgeRegister} is the public
+ * (Phase 4 PR 4, ADR-048); {@link bridgeRegister} is the public
  * wrapper over the NAPI `bridge_register` free function
  * (`bridge_connector.rs`), exposed here as a free function that takes an
  * explicit {@link SCP} instance per the ADR-048 multi-instance pattern.
