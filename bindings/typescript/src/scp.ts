@@ -1969,6 +1969,13 @@ export class SCP {
    * per-check breakdown directly and never reverse-engineer *which* check
    * failed by parsing error prose.
    *
+   * NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate. Only
+   * {@link ucanValidate} (with its mandatory challenge capability) authorizes
+   * an action. A no-capability (intrinsic-validity) result skips the
+   * invoked-capability grant-match, so an all-`true` result does NOT establish
+   * the token grants any particular capability — re-run {@link ucanValidate}
+   * with the concrete capability to authorize (spec §7.2.4).
+   *
    * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
    * security default). Omitting it makes the bridge reject the call rather than
    * defaulting the presenting agent to the token's own `aud` — defaulting would
@@ -2462,6 +2469,16 @@ export class SCP {
    * (computed from the attestations the bridge can access). Pass the subject's
    * accessible attestations as `cachedAttestations` to populate it; the default
    * `[]` honestly reports only what the bridge's trust store already holds.
+   *
+   * THREAT MODEL: `attestationCount` is Sybil-inflatable by self-issuance — one
+   * operator can self-issue (or co-issue across DIDs it controls) arbitrarily
+   * many *authentic* attestations. It is a credential-layer claim count, NOT a
+   * standalone trust score; Sybil resistance comes from the threshold/
+   * independence path (§7.3.5) and DeviceAttestation binding (§9.3), not the
+   * count itself. Separately, the membership/role-derived facts (participation
+   * duration, governance actions, role progression) are committer-local —
+   * verifier-relative, not independently Merkle-verifiable — until ADR-051
+   * receive-side replication lands.
    *
    * @param contextId The context the participation is scoped to.
    * @param subjectDid The DID whose participation facts are computed.
