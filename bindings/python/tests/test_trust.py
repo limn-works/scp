@@ -447,7 +447,7 @@ class TestBehavioralRecord:
 
     def test_default_construction(self) -> None:
         br = BehavioralRecord()
-        # The eleven typed participation facts, all defaulted.
+        # The twelve typed participation facts, all defaulted.
         assert br.subject_did == ""
         assert br.participation_duration_secs == 0
         assert br.governance_actions_against == 0
@@ -475,7 +475,7 @@ class TestBehavioralRecord:
 
 
 class _FakeParticipationRecord:
-    """A fake PyParticipationRecord with the eleven typed fields."""
+    """A fake PyParticipationRecord with the twelve typed fields."""
 
     def __init__(self, **overrides: object) -> None:
         self.subject_did = "did:dht:zsubject"
@@ -497,7 +497,7 @@ class _FakeParticipationRecord:
 class TestParticipationRecordWrapper:
     """The participation_record SDK wrapper projects the typed bridge record."""
 
-    def test_projects_all_eleven_fields(self) -> None:
+    def test_projects_all_twelve_fields(self) -> None:
         mock_scp = MagicMock()
         mock_bridge = MagicMock()
         mock_bridge.participation_record.return_value = _FakeParticipationRecord(
