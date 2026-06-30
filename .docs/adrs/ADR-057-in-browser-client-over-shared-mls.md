@@ -1,0 +1,87 @@
+# ADR-057: In-Browser SCP Clients Over a Shared `scp-mls` Crate (Keys On-Device)
+
+**Status:** Accepted (2026-06-30). Feasibility proven by a wasm32 compile spike; implementation staged across slices (see below).
+
+**Amends:** ADR-055 (Remove the WASM Bridge; Browser Clients Are Remote Thin Clients) — specifically its *browser-deployment conclusion*. ADR-055's removal of the WASM **bridge** stands unchanged; this ADR revises only its claim that a browser must therefore be a *remote thin client with no in-browser protocol execution*.
+
+## Context
+
+ADR-055 removed the WASM FFI bridge because it was a parallel **re-implementation** of the protocol that had to stay byte-identical to native for §9.9.3 Merkle convergence — a perpetual maintenance tax and a proven security-bug source. That removal was and remains correct.
+
+ADR-055 then concluded that browser clients must be **remote thin clients** to a server-side `scp-node`, with "no in-browser client-side MLS or protocol execution." That conclusion rested on an unstated premise: that running the protocol in a browser necessarily means *re-implementing* it (the tax) or *delegating* it to a server (custodial). A feasibility audit and a wasm32 compile spike (2026-06-30) disproved that premise:
+
+- The blocker that killed the WASM bridge is **`scp-runtime`'s orchestration** — multi-thread `tokio` + the ADR-049 actor/supervisor model — which cannot compile to `wasm32-unknown-unknown`. It is *not* the cryptography and *not* the keys.
+- The MLS group state machine (`crates/scp-runtime/src/crypto/mls/{group,encrypt,ratchet,credential,key_package}.rs`, ~3,057 lines) is **fully synchronous** and depends only on `openmls` (RustCrypto backend) plus an in-memory provider. It is *liftable*, not trapped.
+- The participant hot path — §9.16 double-encryption seal/open, MLS epoch advance, event-log leaf + inclusion/absence proofs — is entirely synchronous, and the runtime provider traits it needs (`transport`, `event_log`, `persistence`) are **sync `dyn` traits a browser implements directly**. The actor/supervisor is native-concurrency machinery *wrapping* these sync calls; it is not a participant requirement.
+- A wasm32 `cargo check` of the lifted MLS machine **succeeded (exit 0)**.
+
+Therefore a browser can run the protocol in-tab over **shared code compiled to wasm32** — the same `scp-protocol`/`scp-mls` the native runtime uses — with the DID signing key and MLS group secrets held **on-device**. This is categorically different from the deleted bridge: it shares one codebase compiled to two targets, so the parity tax does not return.
+
+Confidentiality and accountability are preserved at the *protocol* layer by construction: the browser decrypts locally, the server never sees plaintext and never holds keys, and every operation traces to the on-device human DID. This satisfies the protocol tenets (encryption-as-access-control, relays-are-untrusted, every-agent-traces-to-a-human-DID) that a custodial remote-thin-client would violate. (The trust boundary *moves* rather than vanishes — see Consequences: the browser tab becomes the platform-layer custody/plaintext boundary, where the server was in the custodial alternative.)
+
+"Shared code compiled to two targets produces byte-identical output" holds specifically for *deterministic* artifacts — the convergent §9.9.3 leaves and the wire encoding of identical inputs — and for concrete reasons: MLS wire uses TLS-presentation serialization (RFC 9420, big-endian, length-prefixed, target-independent); convergent leaves hash explicit `to_be_bytes()` with `u32` length prefixes (no `usize` in any preimage, no float); the MessagePack body is name-tagged (`rmp_serde` by field/variant name, width-/endianness-independent); and the crypto provider is `openmls_rust_crypto`'s **pure-Rust** RustCrypto (no platform crypto, so none of the CryptoKit/Keystore divergence the cross-platform pseudonym work proved is real here). It does *not* extend to freshly-randomized key material (key generation, HPKE encapsulation, GCM nonces are non-deterministic by design). The invariant is only real if tested — see Prerequisite 5 (cross-target KAT).
+
+## Decision
+
+**Browser SCP clients run the protocol in-tab over a shared `scp-mls` crate, with keys on-device. The server is untrusted and never holds key material or plaintext.**
+
+Components:
+
+1. **`scp-mls` crate** — lift the synchronous MLS state machine out of `scp-runtime` into a `wasm32`-safe crate consumed by **both** `scp-runtime` (native node) and the browser client. One MLS implementation, two compile targets — no re-implementation, no byte-match maintenance. Liftable unit = the 9 sync files (`group`, `encrypt`, `ratchet`, `credential`, `key_package`, `error`, `wrapping_extension`, `epoch_grace`, and the `InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto` alias).
+2. **Single-threaded browser driver** (~1.5–2.5K lines) over `scp-mls` + `scp-protocol`, implementing the participant operations (create/join/send/receive-decrypt/process-commit/close/leave, event-log leaves + proofs). It restores the deleted bridge's proven **shape** — a single global manager accessed via closure, with a pull-based `drain_events` model — but its bodies call shared `scp-protocol`/`scp-mls` types rather than re-deriving them.
+3. **Browser platform infra**, restored/adapted from the deleted bridge: JS-callback key custody (the key stays in JS/WebCrypto and never enters wasm memory), IndexedDB-backed storage (the in-memory MLS provider snapshots out-of-band, reusing the existing `snapshot`/`restore` path), the relay transport (the surviving `webtransport-wasm`/WebSocket pipe), and the hardened time source (mitigating attacker-overridable `Date.now()` → UCAN-expiry bypass).
+4. **The node continues to run `scp-runtime`'s orchestration unchanged** (actors, sagas, recovery, durable async storage). The browser is a participant, not a node.
+
+The deleted bridge is recoverable at commit `1a3b41a5e^` (pinned in ADR-055) and is used as a restoration source for the infra and the driver shape — **not** for its re-implemented protocol bodies, which shared `scp-protocol`/`scp-mls` now obsolete.
+
+### Prerequisites (from the spike + cryptographer review)
+
+1. **openmls `js` feature + a single hardened clock.** `openmls` must carry its `js` feature (KeyPackage `Lifetime`s need wall-clock time on wasm) plus the `getrandom` `wasm_js` backend. **The `js` feature wires `fluvio_wasm_timer::SystemTime`, which reads a *live, un-captured* `Date.now()` — a *different* clock than the SCP-layer hardened time source, and fully attacker-overridable in-tab.** Left as-is this lets a hostile same-origin script mint/accept KeyPackages with forged `Lifetime`s (expiry/`not_before` manipulation). Prerequisite: route openmls's `Lifetime` clock through the same injected/hardened `Clock` as the rest of the client, so there is *one* clock, not a hidden unhardened second one. In the in-browser model the wall clock is attacker-controllable in principle; the deferred presence ADR specifies which properties may depend on local time.
+2. **`epoch_grace.rs` Clock injection.** It hard-wires `tokio::time::Instant`/`SystemClock` and sits on the ratchet path (`process_commit` takes `&mut EpochGraceStore`); it takes an injected `scp_primitives::Clock` (wall-clock millis; the 30s grace window is behavior-equivalent) so it ships with the machine. Native injects `SystemClock` → identical behavior.
+3. **`scp-identity` → `scp-protocol` factoring (an `IdentityError` split, not a 3-type lift).** `credential.rs` needs `DidDocument`/`VerificationMethod`/`decode_multibase_key`, but `DidDocument`'s methods return `IdentityError`, which `#[from]`-converts `scp_platform` errors, and `scp-platform` is tokio-coupled. The clean move: split `IdentityError` — its sync, string-bearing variants move with the DID types into `scp-protocol` (wasm-safe, acyclic; the existing unrelated `VerificationMethod` enum there gets its own module to avoid collision); the async/custody/DHT variants stay in `scp-identity`, which **re-exports** the moved types so all existing `scp_identity::DidDocument` consumers compile unchanged. This is a prerequisite *slice (1a)* because `credential.rs` is a compile dependency of `group/encrypt/key_package` — it cannot be deferred. `SigningKeyId` is already `scp-primitives`-hosted (wasm-safe); nothing to move there.
+4. **Browser build uses `panic=unwind`.** The `std::panic::catch_unwind` DoS-guard in `encrypt.rs` converts an openmls AEAD panic on a *tampered ciphertext* into a recoverable `DecryptionFailed`. Under the wasm `panic=abort` default it is a no-op, so a single attacker-delivered tampered ciphertext **aborts the tab** (a remote-triggerable availability hit, worse than native). The browser target therefore builds `panic=unwind` (cheap), and the wasm unwind-ABI panic-safety of openmls/RustCrypto across the existing `AssertUnwindSafe` boundaries is re-validated — not "accept the no-op."
+5. **Cross-target determinism KAT.** Add a native-vs-wasm32 known-answer test asserting byte-equality of (i) a sample MLS commit/welcome wire blob and (ii) a checkpoint Merkle root over a fixed event sequence — *and* a credential/KeyPackage built from the same DID on both targets (covering the prereq-3 move). "Byte-identical by construction" is an *invariant only if tested*: shared code can still diverge on `usize`/`as` width (wasm32 is 32-bit) or `HashMap` iteration order feeding a hash, especially in the new ~2K-line driver. This codebase already has precedent (three divergent canonical forms from "shared intent") — the KAT is the guard.
+
+### Scope fence (mandatory)
+
+The browser driver covers the **participant** path only. Economy/payment validation, governance coordination, broadcast hosting, cross-context saga **coordination**, and always-on presence stay in `scp-runtime` or are node-delegated. The browser *participates* (signs its own steps) but does not *coordinate* — coordination requires always-on hosts. These were ~13K of the deleted bridge's 15.5K `manager.rs`; fencing them is what keeps the driver at ~2K and the parity-tax argument intact. The fence is **mechanically enforced, not prose-policed** (prose-policed parity *is* the tax ADR-055 killed): `scp-mls` and the browser driver MUST NOT depend on `scp-runtime` — a dependency-direction invariant the build enforces. Anything that needs `scp-runtime` is, by construction, node-side.
+
+### Liveness / presence
+
+MLS membership is an active relationship that **decays** when a member is absent — missed §9.9.2 heartbeats (peers cannot distinguish absence from relay suppression), lapsed PCS Update commits, exhausted KeyPackage pre-keys. These obligations are periodic **and** key-touching. The v1 model is **cold presence**: the browser participates while open and catches up / re-proves liveness when it returns, the same way the group already tolerates any frequently-offline member. **Always-on presence** (something keeping a member alive while the tab is closed) would require an **attenuated keep-alive delegate** that can *only* heartbeat / Update / replenish pre-keys and *cannot* read plaintext or send as the member. Whether MLS+SCP can express a delegation that narrow is an **open cryptographic question** (a delegate able to send a heartbeat — an MLS application message — can generally also decrypt), deferred to its own ADR + cryptographer analysis. **Confidentiality never requires custody** under any presence model; only always-on availability does.
+
+## Consequences
+
+**Positive:**
+- True self-sovereign in-browser SCP clients (keys on-device, server sees only ciphertext) — high product value.
+- One MLS state machine shared by node and browser; ADR-055's parity-tax avoidance is preserved because the browser runs shared code, not a re-implementation.
+- Unblocks #1951 (browser examples) with a real foundation.
+
+**Costs / risks:**
+- A new `scp-mls` crate, a browser driver, and restored browser infra to build and maintain (bounded by the scope fence).
+- The three prerequisite factorings (openmls `js`, `epoch_grace` `Clock` injection, `scp-identity` leaf types) touch core crates and must keep the native runtime working.
+- Browser members are frequently offline → liveness degradation is expected; the protocol's offline-member handling must tolerate it.
+- Forward secrecy means a fresh tab without local state cannot decrypt history it was absent for (lose-device-lose-history). Acceptable for a self-sovereign client; the custodial alternative trades it for plaintext-at-the-server.
+- A single-tab driver needs its own crash/consistency story to replace the actor's bounded-crash-persist + per-context send serialization (snapshot cadence to IndexedDB; the §9.9.3 checkpoint compare is sync-available).
+- **The browser tab becomes the platform-layer custody and plaintext boundary.** The model removes *server-side* custody risk and replaces it with *client-side browser-surface* risk: decrypted plaintext and the MLS ratchet/group secrets live in JS-reachable tab memory, so XSS, a single compromised supply-chain dependency in the page, or absent cross-origin isolation can exfiltrate them with no server compromise. Page hardening (CSP, SRI, COOP/COEP, no `eval`) is therefore *load-bearing for confidentiality* in this model — it must be a requirement of the browser SDK, not an afterthought. The signing key stays in JS/WebCrypto and never enters wasm memory (component 3); the group secrets and plaintext necessarily do.
+- **Local wall-clock is attacker-controllable in-tab** (`Date.now()` override). The hardened time source *narrows* the window (to script running before wasm init) but does not close it; any security property that depends on local time (KeyPackage `Lifetime`s, UCAN expiry/nbf, nonce freshness) is only as strong as the page's same-origin integrity. The deferred presence ADR specifies which properties may depend on local time at all.
+
+## Alternatives Considered
+
+1. **Remote thin client with node-held keys (ADR-055's stated direction).** Rejected as the *primary* model: the node holds the user's keys and group secrets, sees plaintext, and can impersonate — custodial, violating encryption-as-access-control / relays-are-untrusted / human-accountability. It remains a valid *secondary, opt-in* option for users who explicitly choose convenience over self-sovereignty (a documented custodial mode), but it is not the default and not what "browser client" means.
+2. **Re-implement the protocol in wasm (the deleted WASM bridge).** Rejected: this is exactly the parity tax ADR-055 removed. Shared code via `scp-mls` achieves in-browser execution without it.
+3. **Leave the browser unsupported.** Rejected: in-browser SCP clients are high-value, and the feasibility work shows the cost is bounded.
+
+## Implementation Slices (forward-only)
+
+1. **`scp-mls` extraction** — create the crate (9 sync files + the 3 prerequisite fixes); compiles native **and** wasm32; `scp-runtime` adopts it (no behavior change on native). Tests on both targets.
+2. **Browser driver MVP** — one context end-to-end in-tab: create/join, send+encrypt, receive+decrypt, process commit. Over shared `scp-mls`/`scp-protocol`.
+3. **Browser platform infra + TS SDK browser backend** — restore key custody / storage / transport / time; wire the browser backend behind the existing `@limn-works/scp-ts` API.
+4. **Re-add browser examples** (closes the intent behind #1951) as in-browser-client demos.
+5. **Presence** — a separate ADR (cold-presence semantics now; attenuated keep-alive delegate as open research).
+
+## Evidence
+
+- wasm32 compile spike: `cargo check --target wasm32-unknown-unknown` → exit 0 on the lifted MLS machine.
+- Participant-path feasibility audit: the create/join/send/receive/process-commit/close/event-log path is single-threadable; the only hard blockers (the durable-storage `block_in_place` bridge; paid-economy `await`s) are avoidable (in-memory provider + IndexedDB snapshot) or out of scope (free contexts; the deleted bridge fail-closed-rejected paid sends).
+- Restoration source: the deleted bridge at `1a3b41a5e^` (`git show 1a3b41a5e^:crates/scp-ffi/wasm/...`).
