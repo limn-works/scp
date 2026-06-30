@@ -1904,12 +1904,19 @@ class SCP internal constructor(
      * Routes through the UniFFI-generated free function
      * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
      * Kotlin bullet.
+     *
+     * [expectedSubject] is the DID of the agent being admitted: only
+     * profiles whose signed `subject_did` equals it contribute to any
+     * threshold, freshness, or distinct-signer accounting, closing
+     * cross-subject participation-profile replay.
      */
     fun verifyParticipationRequirements(
+        expectedSubject: String,
         profileJson: String,
         requirementsJson: String,
     ): Boolean =
         uniffi.scp.verifyParticipationRequirements(
+            expectedSubject = expectedSubject,
             profileJson = profileJson,
             requirementsJson = requirementsJson,
         )

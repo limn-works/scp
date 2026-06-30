@@ -270,11 +270,20 @@ pub(crate) fn trust_verify_response_on(
 ///
 /// Pure verification — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
+///
+/// `expected_subject` is the DID of the agent being admitted: only profiles
+/// whose signed `subject_did` equals it contribute to any accounting, closing
+/// cross-subject participation-profile replay.
 pub(crate) fn verify_participation_requirements_on(
     _bi: &NapiBridgeInstance,
+    expected_subject: String,
     profile_json: String,
     requirements_json: String,
 ) -> napi::Result<bool> {
+    if expected_subject.is_empty() {
+        return Err(validation_error("expected_subject DID must not be empty"));
+    }
+
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| {
             validation_error(&format!("failed to parse participation profiles JSON: {e}"))
@@ -291,10 +300,13 @@ pub(crate) fn verify_participation_requirements_on(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
-        .map_err(|e| {
-            validation_error(&format!("participation admission verification failed: {e}"))
-        })?;
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        &expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| validation_error(&format!("participation admission verification failed: {e}")))?;
 
     Ok(true)
 }
@@ -422,6 +434,29 @@ pub(crate) fn aggregate_trust_input_on(
 /// does) — the REAL credential-layer source, not `&[]`. The shared Supervisor
 /// gathers the FULL event log + Merkle root for every other fact. Returns the
 /// flattened typed record so the SDK never re-aggregates.
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// attestations. Single source of truth for the per-backend
+/// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
+/// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
+/// The match remains pure type dispatch because each variant holds a distinct
+/// concrete `ProtocolRepository<S>`.
+fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
+    repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let handle = crate::runtime().handle().clone();
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
+}
+
 pub(crate) fn participation_record_on(
     bi: &NapiBridgeInstance,
     context_id: String,
@@ -444,29 +479,14 @@ pub(crate) fn participation_record_on(
         })?;
 
     // Source verified attestations from this instance's `ProtocolRepository`
-    // (same backend as context/event-log writes).
+    // (same backend as context/event-log writes). Both variants route through
+    // the single generic `run_verified_attestations` helper.
     let verified = match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-            let handle = crate::runtime().handle().clone();
-            let bridge =
-                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
-            scp_ffi_common::trust_store::verified_attestations(
-                bridge,
-                &context_id,
-                &subject_did,
-                cached_attestations,
-            )
+            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
         }
         crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-            let handle = crate::runtime().handle().clone();
-            let bridge =
-                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
-            scp_ffi_common::trust_store::verified_attestations(
-                bridge,
-                &context_id,
-                &subject_did,
-                cached_attestations,
-            )
+            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
         }
     }
     // An error from `verified_attestations` is an INFRA fault (trust-store read,
@@ -573,25 +593,50 @@ mod tests {
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
         let bi = test_bi();
-        let result =
-            verify_participation_requirements_on(&bi, "not json".to_owned(), "[]".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
         let bi = test_bi();
-        let result =
-            verify_participation_requirements_on(&bi, "[]".to_owned(), "not json".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
         let bi = test_bi();
-        let result = verify_participation_requirements_on(&bi, "[]".to_owned(), "[]".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_empty_subject() {
+        let bi = test_bi();
+        let result = verify_participation_requirements_on(
+            &bi,
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

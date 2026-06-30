@@ -680,7 +680,11 @@ export interface Bridge {
   scpidVerify(responseJson: string, challengeJson: string): string;
 
   // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean;
+  verifyParticipationRequirements(
+    expectedSubject: string,
+    profileJson: string,
+    requirementsJson: string,
+  ): boolean;
 
   // Lifecycle
   version(): string;

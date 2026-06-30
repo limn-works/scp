@@ -6342,9 +6342,14 @@ pub fn trust_verify_response(
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
+/// Verifies participation profiles against admission requirements, bound to the
+/// agent being admitted.
 ///
-/// Both inputs are JSON strings:
+/// Inputs:
+/// - `expected_subject`: the DID of the agent being admitted. Only profiles
+///   whose signed `subject_did` equals this value contribute to any threshold,
+///   freshness, or distinct-signer accounting — a victim's genuine profiles
+///   cannot be replayed to admit a different agent (cross-subject replay).
 /// - `profile_json`: JSON array of `ParticipationProfile` objects.
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
 ///
@@ -6355,9 +6360,17 @@ pub fn trust_verify_response(
 /// See §7.3.2.1.
 #[uniffi::export]
 pub fn verify_participation_requirements(
+    expected_subject: String,
     profile_json: String,
     requirements_json: String,
 ) -> Result<bool, ScpError> {
+    if expected_subject.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "expected_subject DID must not be empty".to_owned(),
+            code: codes::VALID_7030.to_owned(),
+        });
+    }
+
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse participation profiles JSON: {e}"),
@@ -6374,13 +6387,42 @@ pub fn verify_participation_requirements(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("participation admission verification failed: {e}"),
-            code: codes::VALID_7032.to_owned(),
-        })?;
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        &expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| ScpError::Validation {
+        msg: format!("participation admission verification failed: {e}"),
+        code: codes::VALID_7032.to_owned(),
+    })?;
 
     Ok(true)
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// attestations. Single source of truth for the per-backend
+/// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
+/// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
+/// The match remains pure type dispatch because each variant holds a distinct
+/// concrete `ProtocolRepository<S>`.
+fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
+    repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let handle = runtime().handle().clone();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -15336,33 +15378,14 @@ impl Scp {
             })?;
 
         // Source verified attestations from this instance's `ProtocolRepository`
-        // (same backend as context/event-log writes).
+        // (same backend as context/event-log writes). Both variants route
+        // through the single generic `run_verified_attestations` helper.
         let verified = match self.inner.protocol_repository() {
             crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::verified_attestations(
-                    bridge,
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                )
+                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
             }
             crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::verified_attestations(
-                    bridge,
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                )
+                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
             }
         }
         // An error from `verified_attestations` is an INFRA fault (trust-store

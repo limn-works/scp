@@ -349,7 +349,7 @@ class TestVerifyParticipationRequirements:
         ]
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements(requirements, profiles)
+            result = verify_participation_requirements("did:dht:z6MkAlice", requirements, profiles)
 
         assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
@@ -358,8 +358,9 @@ class TestVerifyParticipationRequirements:
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        profiles_json = json.loads(call_args[0][0])
-        requirements_json = json.loads(call_args[0][1])
+        assert call_args[0][0] == "did:dht:z6MkAlice"
+        profiles_json = json.loads(call_args[0][1])
+        requirements_json = json.loads(call_args[0][2])
 
         assert len(profiles_json) == 1
         assert profiles_json[0]["subject_did"] == "did:dht:z6MkAlice"
@@ -383,18 +384,19 @@ class TestVerifyParticipationRequirements:
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(RuntimeError, match="Threshold not met"):
-                verify_participation_requirements(requirements, profiles)
+                verify_participation_requirements("did:dht:z6MkBob", requirements, profiles)
 
     def test_empty_requirements_and_profiles(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([], [])
+            result = verify_participation_requirements("did:dht:z6MkAlice", [], [])
 
         assert result is None
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        assert json.loads(call_args[0][0]) == []
+        assert call_args[0][0] == "did:dht:z6MkAlice"
         assert json.loads(call_args[0][1]) == []
+        assert json.loads(call_args[0][2]) == []

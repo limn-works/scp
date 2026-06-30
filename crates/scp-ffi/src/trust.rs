@@ -244,9 +244,14 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
+/// Verifies participation profiles against admission requirements, bound to the
+/// agent being admitted.
 ///
-/// Both inputs are JSON strings:
+/// Inputs:
+/// - `expected_subject`: the DID of the agent being admitted. Only profiles
+///   whose signed `subject_did` equals this value contribute to any threshold,
+///   freshness, or distinct-signer accounting — a victim's genuine profiles
+///   cannot be replayed to admit a different agent (cross-subject replay).
 /// - `profile_json`: JSON array of `ParticipationProfile` objects.
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
 ///
@@ -265,9 +270,12 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 #[pyfunction]
 #[pyo3(name = "verify_participation_requirements")]
 pub fn py_verify_participation_requirements(
+    expected_subject: &str,
     profile_json: &str,
     requirements_json: &str,
 ) -> PyResult<bool> {
+    validate::validate_did(expected_subject)?;
+
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
         .map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -286,12 +294,17 @@ pub fn py_verify_participation_requirements(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "participation admission verification failed: {e}"
-            ))
-        })?;
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "participation admission verification failed: {e}"
+        ))
+    })?;
 
     Ok(true)
 }
@@ -931,22 +944,29 @@ mod tests {
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
-        let result = py_verify_participation_requirements("not json", "[]");
+        let result = py_verify_participation_requirements("did:key:alice", "not json", "[]");
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
-        let result = py_verify_participation_requirements("[]", "not json");
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "not json");
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
         // Empty requirements = no constraints = always passes.
-        let result = py_verify_participation_requirements("[]", "[]");
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "[]");
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_subject() {
+        // A malformed subject DID is rejected at the FFI boundary.
+        let result = py_verify_participation_requirements("not-a-did", "[]", "[]");
+        assert!(result.is_err());
     }
 
     #[test]

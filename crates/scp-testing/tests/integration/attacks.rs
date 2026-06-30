@@ -1346,7 +1346,7 @@ async fn stale_participation_profile_rejected() {
     }];
 
     // Verify at time 4000 (profile is 1000 seconds old, exceeds 60s max_age).
-    let result = verify_participation_requirements(4000, &requirements, &[profile]);
+    let result = verify_participation_requirements(4000, alice_did, &requirements, &[profile]);
     assert!(
         result.is_err(),
         "stale participation profile (1000s old, max 60s) must be rejected"

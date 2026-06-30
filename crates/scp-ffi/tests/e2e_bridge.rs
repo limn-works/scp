@@ -1288,7 +1288,10 @@ fn trust_verify_response_rejects_invalid_json() {
 #[test]
 fn verify_participation_requirements_empty_passes() {
     setup();
-    assert!(_scp_core::trust::py_verify_participation_requirements("[]", "[]").unwrap());
+    assert!(
+        _scp_core::trust::py_verify_participation_requirements("did:key:alice", "[]", "[]")
+            .unwrap()
+    );
 }
 
 // ============================================================================

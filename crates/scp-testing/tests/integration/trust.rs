@@ -1075,7 +1075,7 @@ async fn participation_requirements_check() {
 
     // Should pass with one profile meeting the threshold.
     let result =
-        verify_participation_requirements(current_time, &requirements, &[profile1.clone()]);
+        verify_participation_requirements(current_time, alice, &requirements, &[profile1.clone()]);
     assert!(result.is_ok(), "should pass with valid profile: {result:?}");
 
     // Requirement needing 2 distinct contexts: passes with 2 profiles.
@@ -1086,19 +1086,27 @@ async fn participation_requirements_check() {
         min_contexts: 2,
     }];
 
-    let result_1 =
-        verify_participation_requirements(current_time, &requirements_2ctx, &[profile1.clone()]);
+    let result_1 = verify_participation_requirements(
+        current_time,
+        alice,
+        &requirements_2ctx,
+        &[profile1.clone()],
+    );
     assert!(result_1.is_err(), "should fail with only 1 context");
 
-    let result_2 =
-        verify_participation_requirements(current_time, &requirements_2ctx, &[profile1, profile2]);
+    let result_2 = verify_participation_requirements(
+        current_time,
+        alice,
+        &requirements_2ctx,
+        &[profile1, profile2],
+    );
     assert!(
         result_2.is_ok(),
         "should pass with 2 distinct contexts: {result_2:?}"
     );
 
     // Empty requirements always pass.
-    assert!(verify_participation_requirements(current_time, &[], &[]).is_ok());
+    assert!(verify_participation_requirements(current_time, alice, &[], &[]).is_ok());
 }
 
 // ---------------------------------------------------------------------------

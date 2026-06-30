@@ -2037,11 +2037,14 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-    verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-      return (native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-        profileJson,
-        requirementsJson,
-      );
+    verifyParticipationRequirements(
+      expectedSubject: string,
+      profileJson: string,
+      requirementsJson: string,
+    ): boolean {
+      return (
+        native.verifyParticipationRequirements as (s: string, p: string, r: string) => boolean
+      )(expectedSubject, profileJson, requirementsJson);
     },
 
     // Lifecycle

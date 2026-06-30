@@ -16032,9 +16032,14 @@ public func validateContextParams(paramsJson: String)throws  -> String?  {
 })
 }
 /**
- * Verifies participation profiles against admission requirements.
+ * Verifies participation profiles against admission requirements, bound to the
+ * agent being admitted.
  *
- * Both inputs are JSON strings:
+ * Inputs:
+ * - `expected_subject`: the DID of the agent being admitted. Only profiles
+ * whose signed `subject_did` equals this value contribute to any threshold,
+ * freshness, or distinct-signer accounting — a victim's genuine profiles
+ * cannot be replayed to admit a different agent (cross-subject replay).
  * - `profile_json`: JSON array of `ParticipationProfile` objects.
  * - `requirements_json`: JSON array of `RequireParticipation` objects.
  *
@@ -16044,9 +16049,10 @@ public func validateContextParams(paramsJson: String)throws  -> String?  {
  *
  * See §7.3.2.1.
  */
-public func verifyParticipationRequirements(profileJson: String, requirementsJson: String)throws  -> Bool  {
+public func verifyParticipationRequirements(expectedSubject: String, profileJson: String, requirementsJson: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_verify_participation_requirements(
+        FfiConverterString.lower(expectedSubject),
         FfiConverterString.lower(profileJson),
         FfiConverterString.lower(requirementsJson),$0
     )
@@ -16209,7 +16215,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_validate_context_params() != 15089) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_verify_participation_requirements() != 3043) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_verify_participation_requirements() != 45028) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_context_id() != 2375) {

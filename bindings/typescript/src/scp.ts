@@ -2369,11 +2369,14 @@ export class SCP {
     );
   }
 
-  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-    return (this.#native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-      profileJson,
-      requirementsJson,
-    );
+  verifyParticipationRequirements(
+    expectedSubject: string,
+    profileJson: string,
+    requirementsJson: string,
+  ): boolean {
+    return (
+      this.#native.verifyParticipationRequirements as (s: string, p: string, r: string) => boolean
+    )(expectedSubject, profileJson, requirementsJson);
   }
 
   /**

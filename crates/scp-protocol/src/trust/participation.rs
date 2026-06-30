@@ -935,18 +935,32 @@ pub enum ParticipationAdmissionError {
 }
 
 /// Verifies a set of [`ParticipationProfile`] statements against a context's
-/// participation admission requirements.
+/// participation admission requirements, binding every statement to the subject
+/// being admitted.
 ///
-/// SECURITY (authenticity, not authorization): this verifies the AUTHENTICITY of
-/// each caller-supplied profile — its Ed25519 signature over `signable_bytes`
-/// against the `signer_public_key` carried IN the profile. The signer key is
-/// therefore self-certifying: a valid signature proves the profile was not
-/// tampered with, NOT that the signer is a legitimate context. A subject could
-/// present genuinely-signed profiles from signers it controls and inflate
-/// `min_contexts`. Consumers MUST establish signer legitimacy separately (e.g. a
-/// trusted-signer set or a context-membership proof). See spec §7.4.
+/// SECURITY (subject binding + authenticity, not signer authorization):
 ///
-/// For each requirement, the function:
+/// 1. SUBJECT BINDING. Participation profiles are PUBLIC and signed by the
+///    *context's* participation key — NOT by the subject. A statement therefore
+///    proves nothing about *who* presented it. Before any statement contributes
+///    to a threshold, freshness, or distinct-signer (`min_contexts`) count, its
+///    signed `subject_did` MUST equal `expected_subject` (the agent being
+///    admitted). Without this, an attacker could present a victim's genuine,
+///    high-standing profiles and be admitted on the victim's reputation
+///    (cross-subject profile replay). Statements for any other subject are
+///    silently skipped — they never contribute (fail-closed). This mirrors the
+///    subject binding in [`check_capability_requirements`].
+/// 2. AUTHENTICITY. For the subject-matching statements, this verifies the
+///    AUTHENTICITY of each — its Ed25519 signature over `signable_bytes` against
+///    the `signer_public_key` carried IN the profile. The signer key is
+///    self-certifying: a valid signature proves the profile was not tampered
+///    with, NOT that the signer is a legitimate context. A subject could present
+///    genuinely-signed profiles from signers it controls and inflate
+///    `min_contexts`. Consumers MUST still establish signer legitimacy
+///    separately (e.g. a trusted-signer set or a context-membership proof). See
+///    spec §7.4.
+///
+/// For each requirement, the function (over subject-matching statements only):
 /// 1. Verifies each statement's Ed25519 signature against its
 ///    `signer_public_key` over `signable_bytes`.
 /// 2. Filters statements to those fresh enough (`updated_at` within
@@ -972,6 +986,7 @@ pub enum ParticipationAdmissionError {
 /// statements, or too few distinct context attestations.
 pub fn verify_participation_requirements(
     current_time: u64,
+    expected_subject: &str,
     requirements: &[RequireParticipation],
     statements: &[ParticipationProfile],
 ) -> Result<(), ParticipationAdmissionError> {
@@ -981,9 +996,18 @@ pub fn verify_participation_requirements(
         return Ok(());
     }
 
+    // Step 0: Subject binding. Only statements whose signed `subject_did`
+    // matches the agent being admitted may contribute to ANY accounting. A
+    // statement for a different subject is silently dropped (fail-closed) so a
+    // victim's genuine profiles cannot be replayed to admit an attacker.
+    let statements: Vec<&ParticipationProfile> = statements
+        .iter()
+        .filter(|s| s.subject_did == expected_subject)
+        .collect();
+
     // Step 1: Verify all signatures up front. Any invalid signature is a
     // hard failure regardless of which requirements use it.
-    for statement in statements {
+    for statement in &statements {
         verify_statement_signature(statement)?;
     }
 
@@ -994,7 +1018,7 @@ pub fn verify_participation_requirements(
         let mut newest_updated_at: u64 = 0;
         let mut any_fresh = false;
 
-        for statement in statements {
+        for statement in &statements {
             newest_updated_at = newest_updated_at.max(statement.updated_at);
 
             // Freshness check.
@@ -2394,7 +2418,7 @@ mod tests {
 
     #[test]
     fn verify_empty_requirements_passes() {
-        let result = verify_participation_requirements(1_700_000_000, &[], &[]);
+        let result = verify_participation_requirements(1_700_000_000, "did:key:alice", &[], &[]);
         assert!(result.is_ok());
     }
 
@@ -2410,7 +2434,8 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[statement]);
         assert!(result.is_ok());
     }
 
@@ -2434,7 +2459,8 @@ mod tests {
             },
         ];
 
-        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &reqs, &[statement]);
         assert!(result.is_ok());
     }
 
@@ -2452,7 +2478,8 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[statement]);
         assert!(result.is_err());
         match result {
             Err(ParticipationAdmissionError::InvalidSignature { subject_did, .. }) => {
@@ -2482,7 +2509,8 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
                 assert_eq!(fact, ParticipationFact::ToolInvocationCount);
@@ -2505,7 +2533,8 @@ mod tests {
         };
 
         // current_time is way past max_age_secs
-        let result = verify_participation_requirements(1_700_010_000, &[req], &[statement]);
+        let result =
+            verify_participation_requirements(1_700_010_000, "did:key:alice", &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::RecordTooStale {
                 fact,
@@ -2534,7 +2563,8 @@ mod tests {
             min_contexts: 3, // need 3, only have 1
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
                 required, found, ..
@@ -2560,7 +2590,8 @@ mod tests {
             min_contexts: 2, // need 2 distinct signers
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[s1, s2]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
                 required, found, ..
@@ -2589,7 +2620,12 @@ mod tests {
             min_contexts: 3,
         };
 
-        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2, s3]);
+        let result = verify_participation_requirements(
+            1_700_000_100,
+            "did:key:alice",
+            &[req],
+            &[s1, s2, s3],
+        );
         assert!(result.is_ok());
     }
 
@@ -2602,7 +2638,7 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result = verify_participation_requirements(1_700_000_000, &[req], &[]);
+        let result = verify_participation_requirements(1_700_000_000, "did:key:alice", &[req], &[]);
         // No statements means threshold can't be met.
         match result {
             Err(ParticipationAdmissionError::ThresholdNotMet { .. }) => {}
@@ -2627,7 +2663,8 @@ mod tests {
             min_contexts: 2, // need 2, but only 1 is fresh
         };
 
-        let result = verify_participation_requirements(1_700_003_700, &[req], &[s1, s2]);
+        let result =
+            verify_participation_requirements(1_700_003_700, "did:key:alice", &[req], &[s1, s2]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
                 required, found, ..
@@ -2668,13 +2705,109 @@ mod tests {
             },
         ];
 
-        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
+        let result =
+            verify_participation_requirements(1_700_000_100, "did:key:alice", &reqs, &[statement]);
         match result {
             Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
                 assert_eq!(fact, ParticipationFact::ContextCreationCount);
                 assert_eq!(value, 1);
             }
             other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_rejects_cross_subject_profile_replay() {
+        // A victim's GENUINE, context-signed, high-standing profile must NOT
+        // satisfy a requirement when the agent being admitted is someone else.
+        // This is the cross-subject participation-profile replay attack: the
+        // signer key is the context's (self-certifying), so signature validity
+        // alone does not bind the standing to the presenter.
+        let key = test_signing_key(1);
+        let victim_profile = make_signed_profile(&key, "did:key:victim", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        // The attacker ("did:key:attacker") presents the victim's profiles.
+        let result = verify_participation_requirements(
+            1_700_000_100,
+            "did:key:attacker",
+            &[req],
+            &[victim_profile],
+        );
+        // With no subject-matching statements, the requirement is unmet.
+        match result {
+            Err(ParticipationAdmissionError::ThresholdNotMet { .. }) => {}
+            other => panic!("expected ThresholdNotMet (no matching subject), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_subject_owned_profile_satisfies_requirement() {
+        // The same profile DOES satisfy the requirement when the agent being
+        // admitted IS the subject the profile was issued for. This is the
+        // positive counterpart to `verify_rejects_cross_subject_profile_replay`.
+        let key = test_signing_key(1);
+        let victim_profile = make_signed_profile(&key, "did:key:victim", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        let result = verify_participation_requirements(
+            1_700_000_100,
+            "did:key:victim",
+            &[req],
+            &[victim_profile],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_mixed_subjects_counts_only_matching_subject() {
+        // distinct-signer (`min_contexts`) accounting must ignore statements for
+        // other subjects: three distinct signers across two subjects must not be
+        // pooled to satisfy a `min_contexts: 2` requirement for one subject.
+        let key1 = test_signing_key(1);
+        let key2 = test_signing_key(2);
+        let key3 = test_signing_key(3);
+
+        // Two distinct signers attest the attacker; one attests the victim.
+        let attacker_a = make_signed_profile(&key1, "did:key:attacker", 1_700_000_000, None);
+        let victim_b = make_signed_profile(&key2, "did:key:victim", 1_700_000_000, None);
+        let victim_c = make_signed_profile(&key3, "did:key:victim", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 2,
+        };
+
+        // Admitting the attacker: only `attacker_a` matches → 1 distinct signer,
+        // below the required 2. The victim's two signers must NOT be borrowed.
+        let result = verify_participation_requirements(
+            1_700_000_100,
+            "did:key:attacker",
+            &[req],
+            &[attacker_a, victim_b, victim_c],
+        );
+        match result {
+            Err(ParticipationAdmissionError::InsufficientContexts {
+                required, found, ..
+            }) => {
+                assert_eq!(required, 2);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected InsufficientContexts, got {other:?}"),
         }
     }
 

@@ -1039,6 +1039,7 @@ def aggregate_trust_input(
 
 
 def verify_participation_requirements(
+    expected_subject: str,
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
 ) -> None:
@@ -1047,18 +1048,26 @@ def verify_participation_requirements(
     Delegates to the Rust ``scp-core`` implementation via the PyO3
     bridge, which performs the full verification including:
 
-    1. Signature verification on all participation profiles.
-    2. Freshness/staleness checking (``max_age_secs``).
-    3. Distinct signer counting (``min_contexts``).
-    4. Threshold operator semantics (``ParticipationThreshold``).
-    5. Diagnostic error reporting (``ParticipationAdmissionError``).
-    6. Typed field extraction (``ParticipationFact.extract_value``).
+    1. Subject binding: only profiles whose signed ``subject_did`` equals
+       ``expected_subject`` contribute to any threshold, freshness, or
+       distinct-signer accounting. Participation profiles are public and
+       signed by the *context*, not the subject, so without this binding a
+       victim's genuine high-standing profiles could be replayed to admit a
+       different agent (cross-subject participation-profile replay).
+    2. Signature verification on subject-matching participation profiles.
+    3. Freshness/staleness checking (``max_age_secs``).
+    4. Distinct signer counting (``min_contexts``).
+    5. Threshold operator semantics (``ParticipationThreshold``).
+    6. Diagnostic error reporting (``ParticipationAdmissionError``).
+    7. Typed field extraction (``ParticipationFact.extract_value``).
 
     Success is indicated by returning without exception. Verification
     failures raise ``RuntimeError`` with diagnostic details from the
     Rust bridge.
 
     Args:
+        expected_subject: The DID of the agent being admitted. Profiles for
+            any other subject are ignored (fail-closed).
         requirements: The participation requirements to verify against.
         profiles: The participation profiles to evaluate.
 
@@ -1073,7 +1082,7 @@ def verify_participation_requirements(
     profile_json = json.dumps([p._to_bridge_dict() for p in profiles])
     requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
-    bridge.verify_participation_requirements(profile_json, requirements_json)
+    bridge.verify_participation_requirements(expected_subject, profile_json, requirements_json)
 
 
 __all__ = [

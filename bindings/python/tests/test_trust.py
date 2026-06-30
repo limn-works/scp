@@ -748,7 +748,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([req], [profile])
+            result = verify_participation_requirements("did:dht:zAlice", [req], [profile])
         assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
 
@@ -768,7 +768,7 @@ class TestVerifyParticipationRequirements:
         )
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(RuntimeError, match="threshold not met"):
-                verify_participation_requirements([req], [profile])
+                verify_participation_requirements("did:dht:zAlice", [req], [profile])
 
     def test_multiple_requirements_all_pass(self) -> None:
         """Bridge returns without exception when multiple requirements are all satisfied."""
@@ -790,7 +790,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements(reqs, [profile])
+            result = verify_participation_requirements("did:dht:zAlice", reqs, [profile])
         assert result is None
 
     def test_multiple_profiles(self) -> None:
@@ -813,7 +813,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([req], profiles)
+            result = verify_participation_requirements("did:dht:zAlice", [req], profiles)
         assert result is None
 
     def test_serialization_format(self) -> None:
@@ -831,13 +831,14 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            verify_participation_requirements([req], [profile])
+            verify_participation_requirements("did:dht:zAlice", [req], [profile])
 
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        profiles_json = json.loads(call_args[0][0])
-        reqs_json = json.loads(call_args[0][1])
+        assert call_args[0][0] == "did:dht:zAlice"
+        profiles_json = json.loads(call_args[0][1])
+        reqs_json = json.loads(call_args[0][2])
 
         assert profiles_json[0]["subject_did"] == "did:dht:zAlice"
         assert profiles_json[0]["governance_actions_against"] == 1
