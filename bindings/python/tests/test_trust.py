@@ -15,6 +15,7 @@ spec section 9.3 for the four-layer trust model.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,8 @@ from scp_sdk.errors import ContextError
 from scp_sdk.trust import (
     Attestation,
     BehavioralRecord,
+    CachedAttestation,
+    CachedAttestationEnvelope,
     CapabilityValidation,
     ChallengeResult,
     Endorsement,
@@ -539,6 +542,42 @@ class TestParticipationRecordWrapper:
         # array (honest, verifier-relative; the SDK fabricates none).
         call = mock_bridge.participation_record.call_args
         assert call.args == ("ctx-1", "did:dht:zsubject", "[]")
+
+    def test_typed_cached_attestation_serializes_to_snake_case_wire(self) -> None:
+        """A typed CachedAttestation is json.dumps'd onto the wire verbatim.
+
+        The TypedDict is a dict at runtime, so its serde-canonical snake_case
+        keys cross the FFI exactly as the Python SDK's raw dicts (and the TS
+        SDK's typed input) do — parity across bindings.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord()
+        envelope: CachedAttestationEnvelope = {
+            "id": "att-1",
+            "attestation_type": "IdentityLink",
+            "issuer": "did:dht:zissuer",
+            "subject": "did:dht:zsubject",
+            "claim": {"linked_did": "did:dht:zsubject"},
+            "issued_at": 1000,
+            "revocation_status": "NotRevoked",
+            "signature": list(range(64)),
+        }
+        cached: CachedAttestation = {
+            "attestation": envelope,
+            "verified_at": 1234,
+            "ttl_secs": 3600,
+        }
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            participation_record(mock_scp, "ctx-1", "did:dht:zsubject", [cached])
+
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zsubject", json.dumps([cached]))
+        # The signature is a list of 64 byte ints (serde_bytes deserializes a
+        # sequence of u8); confirm it survives serialization intact.
+        wire = json.loads(call.args[2])
+        assert wire[0]["attestation"]["signature"] == list(range(64))
+        assert wire[0]["attestation"]["attestation_type"] == "IdentityLink"
 
     def test_evaluate_trust_layer2_consumes_participation_record(self) -> None:
         mock_scp = MagicMock()

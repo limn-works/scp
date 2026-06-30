@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     # (trust.py imports SCP). With ``from __future__ import annotations`` the
     # annotation is a lazy string, so the name need only resolve for type
     # checkers, not at import time.
-    from scp_sdk.trust import BehavioralRecord, CapabilityValidation
+    from scp_sdk.trust import BehavioralRecord, CachedAttestation, CapabilityValidation
 
 logger = logging.getLogger("scp_sdk")
 
@@ -1871,7 +1871,7 @@ class SCP:
         self,
         context_id: str,
         subject_did: str,
-        cached_attestations: list[dict[str, Any]] | None = None,
+        cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
     ) -> BehavioralRecord:
         """Compute the participation record (§7.3.2) for a subject in a context.
 

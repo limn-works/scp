@@ -29,7 +29,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ScpError
 
@@ -782,6 +782,78 @@ async def evaluate_trust(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cached-attestation wire DTOs (ADR-017 §7.4.1)
+#
+# Pass-through input types for seeding the bridge's trust store. Unlike the
+# modeled OUTPUT dataclasses above (camelCase-modeled, projected FROM the
+# bridge), these mirror the serde-canonical snake_case the Rust core
+# deserializes. They are TypedDicts — dicts at runtime — so they
+# ``json.dumps`` straight onto the wire and a raw ``dict`` literal still
+# satisfies the same shape. This is the Python analogue of the TypeScript
+# SDK's ``CachedAttestation`` / ``CachedAttestationEnvelope`` interfaces, so
+# the typed input is identical across bindings (Agent-first API design tenet).
+# ---------------------------------------------------------------------------
+
+
+class _CachedAttestationEnvelopeRequired(TypedDict):
+    """Required fields of a wire-format attestation envelope."""
+
+    #: Unique attestation identifier.
+    id: str
+    #: Attestation type (serde tag, e.g. ``"IdentityLink"``).
+    attestation_type: str
+    #: DID of the attestation issuer.
+    issuer: str
+    #: DID of the attestation subject.
+    subject: str
+    #: Type-specific claim data.
+    claim: Any
+    #: Unix timestamp (seconds) when the attestation was issued.
+    issued_at: int
+    #: Current revocation status (serde-tagged).
+    revocation_status: Any
+    #: Ed25519 signature over the attestation content (64 bytes as ints).
+    signature: list[int]
+
+
+class CachedAttestationEnvelope(_CachedAttestationEnvelopeRequired, total=False):
+    """Wire-format attestation envelope (ADR-017 §7.4.1).
+
+    A pass-through DTO whose field names are the serde-canonical snake_case the
+    Rust core deserializes, NOT the camelCase the SDK uses for core-modeled
+    types. Mirrors the TypeScript SDK ``CachedAttestationEnvelope`` 1:1.
+    """
+
+    #: Optional evidence supporting the attestation
+    #: (``{"evidence_type": str, "data": Any}``).
+    evidence: dict[str, Any] | None
+    #: Optional expiry timestamp (seconds).
+    expires_at: int | None
+    #: Optional renewal interval (``std::time::Duration`` → ``{secs, nanos}``).
+    renewal_interval: dict[str, int] | None
+    #: Timestamp (seconds) of the last renewal, if renewable.
+    renewed_at: int | None
+
+
+class CachedAttestation(TypedDict):
+    """A verified attestation with cache TTL metadata (ADR-017).
+
+    Pass a list of these to :func:`participation_record` (or
+    :func:`aggregate_trust_input`) to seed the bridge's trust store before it
+    sources the subject's verified set. Mirrors the Rust ``CachedAttestation``
+    and the TypeScript SDK ``CachedAttestation`` 1:1. A raw ``dict`` of the
+    same shape is also accepted (a ``TypedDict`` is a ``dict`` at runtime).
+    """
+
+    #: The verified attestation envelope.
+    attestation: CachedAttestationEnvelope
+    #: Unix timestamp (seconds) when the attestation was last verified.
+    verified_at: int
+    #: Time-to-live in seconds for the cache entry.
+    ttl_secs: int
+
+
 def _participation_record_from(
     instance: Any,
     context_id: str,
@@ -822,7 +894,7 @@ def participation_record(
     scp: SCP,
     context_id: str,
     subject_did: str,
-    cached_attestations: list[dict[str, Any]] | None = None,
+    cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
 ) -> BehavioralRecord:
     """Compute the participation record (§7.3.2) for a subject in a context.
 
@@ -845,8 +917,9 @@ def participation_record(
         scp: The :class:`~scp_sdk.SCP` instance to dispatch the bridge call on.
         context_id: The context the participation is scoped to.
         subject_did: The DID whose participation facts are computed.
-        cached_attestations: Optional list of cached-attestation dicts to seed
-            the bridge's trust store before sourcing the subject's verified set.
+        cached_attestations: Optional list of :class:`CachedAttestation` (typed)
+            or raw equivalently-shaped dicts to seed the bridge's trust store
+            before sourcing the subject's verified set.
 
     Returns:
         The flattened participation facts as a :class:`BehavioralRecord`.
@@ -870,7 +943,7 @@ def aggregate_trust_input(
     consequence_rules: list[dict[str, Any]] | None = None,
     threshold_requirements: dict[str, Any] | None = None,
     attestor_sets: dict[str, Any] | None = None,
-    cached_attestations: list[dict[str, Any]] | None = None,
+    cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
     challenge_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
@@ -894,8 +967,9 @@ def aggregate_trust_input(
             names to threshold requirement dicts.
         attestor_sets: Optional mapping of attestation type names to
             lists of attestor info dicts.
-        cached_attestations: Optional list of cached attestation dicts
-            to pre-populate the in-memory trust store.
+        cached_attestations: Optional list of :class:`CachedAttestation`
+            (typed) or raw equivalently-shaped dicts to pre-populate the
+            in-memory trust store.
         challenge_results: Optional list of challenge verification
             dicts to pre-populate the in-memory trust store.
 
@@ -994,6 +1068,8 @@ __all__ = [
     "PARTICIPATION_THRESHOLD_OPERATORS",
     "Attestation",
     "BehavioralRecord",
+    "CachedAttestation",
+    "CachedAttestationEnvelope",
     "CapabilityValidation",
     "ChallengeResult",
     "Endorsement",
