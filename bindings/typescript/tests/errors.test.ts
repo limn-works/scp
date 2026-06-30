@@ -14,7 +14,11 @@ import {
   IdentityError,
   McpError,
   mapBridgeError,
+  mapSagaError,
   PermissionError,
+  SagaAbortedError,
+  SagaBusyError,
+  SagaNeedsRepairError,
   ScpError,
   StorageError,
   ToolError,
@@ -311,5 +315,207 @@ describe("PreRotationCustodyError typed codes round-trip", () => {
     const mapped = mapBridgeError(bridgeError);
     expect(mapped).toBeInstanceOf(IdentityError);
     expect(mapped.code).toBe("SCP-IDENT-1001");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mapSagaError — §6.2.4 saga terminal Display-string reversal
+// ---------------------------------------------------------------------------
+
+describe("mapSagaError", () => {
+  it("maps a saga-aborted Display string to SagaAbortedError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13067] saga aborted: rate limited (retry_after_ms=2500)"),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-SAGA-13067");
+    expect((err as SagaAbortedError).retryAfterMs).toBe(2500);
+  });
+
+  it("maps a saga-needs-repair Display string to SagaNeedsRepairError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: diverged (saga_id=repair-77)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect(err.code).toBe("SCP-SAGA-13065");
+    expect((err as SagaNeedsRepairError).sagaId).toBe("repair-77");
+  });
+
+  it("maps a saga-busy Display string to SagaBusyError", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13066] saga busy: overlap (contended_context=ctx-shared)"),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-SAGA-13066");
+    expect((err as SagaBusyError).contendedContext).toBe("ctx-shared");
+  });
+
+  it("reads the LAST retry_after_ms, ignoring a decoy embedded in the message", () => {
+    // The Display suffix is always terminal, so the end-anchored regex is
+    // last-anchored: a decoy `(retry_after_ms=999)` inside `{message}` is
+    // non-terminal and cannot match — only the genuine trailing 2500 does.
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13026] saga aborted: limiter (retry_after_ms=999) tripped (retry_after_ms=2500)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBe(2500);
+  });
+
+  it("reads the LAST saga_id, ignoring a decoy embedded in the message", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: id (saga_id=decoy) here (saga_id=real-88)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("real-88");
+  });
+
+  it("reads the LAST contended_context, ignoring a decoy embedded in the message", () => {
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13066] saga busy: ctx (contended_context=decoy) then (contended_context=real-ctx)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect((err as SagaBusyError).contendedContext).toBe("real-ctx");
+  });
+
+  it("maps a null retry_after_ms suffix to retryAfterMs null (never 0)", () => {
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13067] saga aborted: hard limit (retry_after_ms=null)"),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("maps an absent retry_after_ms suffix to retryAfterMs null", () => {
+    // Defensive: even if the suffix is somehow missing, the datum is null,
+    // never 0 (a `0` would read as "retry immediately" and re-trip the limit).
+    const err = mapSagaError(new Error("[SCP-SAGA-13067] saga aborted: no suffix"));
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("dispatches on the prefix-anchored phrase, not a body decoy (needs repair)", () => {
+    // A NeedsRepair terminal whose {message} embeds the decoy phrase
+    // "] saga aborted:" must classify on the prefix-anchored phrase
+    // ("saga needs repair"), NOT the body decoy — otherwise the
+    // load-bearing sagaId repair handle would be silently dropped.
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: a] saga aborted: b (saga_id=SID123)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("SID123");
+  });
+
+  it("dispatches on the prefix-anchored phrase, not a body decoy (busy)", () => {
+    // Symmetric: a Busy terminal whose {message} embeds "] saga aborted:"
+    // must classify as busy and preserve contendedContext.
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13066] saga busy: x] saga aborted: y (contended_context=ctxABC)"),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect((err as SagaBusyError).contendedContext).toBe("ctxABC");
+  });
+
+  it("delegates a non-saga error to mapBridgeError", () => {
+    const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: target not active"));
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-TOOL-6011");
+  });
+
+  it("delegates a code-less string to mapBridgeError", () => {
+    const err = mapSagaError("something went wrong");
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-UNKNOWN-0000");
+  });
+
+  it("reads the code from the START-anchored bracket, not a body decoy", () => {
+    // The code regex is start-anchored (`^\s*\[`), so a non-saga error whose
+    // {message} embeds a literal `[SCP-SAGA-…]` cannot be hijacked into a saga
+    // subclass: only the leading bracket is read as the code, which here is a
+    // SCP-TOOL code, so the error delegates to mapBridgeError as a ToolError.
+    const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: see [SCP-SAGA-13067] note"));
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-TOOL-6011");
+  });
+
+  it("falls to the default arm for a valid SCP-SAGA code with an unrecognized phrase", () => {
+    // A genuine SCP-SAGA code whose phrase matches none of the three known
+    // terminals falls to the `default` arm → a generic ToolError that preserves
+    // the code, rather than silently dropping it or mis-classifying it as a saga
+    // subclass.
+    const err = mapSagaError(new Error("[SCP-SAGA-13099] saga vanished: weird state (x=1)"));
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
+    expect(err).not.toBeInstanceOf(SagaBusyError);
+    expect(err.code).toBe("SCP-SAGA-13099");
+  });
+
+  it("does not over-capture saga_id across an unbalanced inner paren", () => {
+    // The caller-influenced {message} body embeds an unbalanced `(saga_id=`
+    // before the genuine trailing suffix. With a `[^)]*` capture the regex
+    // would cross the inner `(` and read "spoof here (saga_id=GENUINE",
+    // corrupting the repair handle. The `[^()]*` capture cannot cross a `(`,
+    // so only the genuine trailing UUID-shaped value is read.
+    const err = mapSagaError(
+      new Error("[SCP-SAGA-13065] saga needs repair: evil (saga_id=spoof here (saga_id=GENUINE)"),
+    );
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("GENUINE");
+  });
+
+  it("does not over-capture contended_context across an unbalanced inner paren", () => {
+    // Symmetric to the saga_id case: an unbalanced `(contended_context=` in the
+    // body must not let the capture cross the inner `(` and corrupt the value.
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13066] saga busy: evil (contended_context=spoof (contended_context=CTXHEX)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect((err as SagaBusyError).contendedContext).toBe("CTXHEX");
+  });
+
+  it("phrase dispatch is start-anchored against a full-bracket body decoy", () => {
+    // The {message} embeds a full `[SCP-SAGA-13067] saga aborted: …` decoy after
+    // the genuine prefix. The phrase regex is start-anchored (`^\s*\[`), so the
+    // leading SCP-SAGA-13099 "vanished" phrase (unrecognized) forces the default
+    // arm → a generic ToolError preserving the leading code. Without the anchor,
+    // the body decoy would forge SagaAbortedError + retryAfterMs.
+    const err = mapSagaError(
+      new Error(
+        "[SCP-SAGA-13099] saga vanished: oops [SCP-SAGA-13067] saga aborted: x (retry_after_ms=999)",
+      ),
+    );
+    expect(err).toBeInstanceOf(ToolError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-SAGA-13099");
+  });
+
+  it("falls back to an empty sagaId when the needs-repair suffix is absent", () => {
+    // No `(saga_id=…)` suffix at all ⇒ the `?? ""` fallback yields "", never a
+    // fabricated handle.
+    const err = mapSagaError(new Error("[SCP-SAGA-13065] saga needs repair: no suffix"));
+    expect(err).toBeInstanceOf(SagaNeedsRepairError);
+    expect((err as SagaNeedsRepairError).sagaId).toBe("");
+  });
+
+  it("falls back to an empty contendedContext when the busy suffix is absent", () => {
+    // No `(contended_context=…)` suffix at all ⇒ the `?? ""` fallback yields "".
+    const err = mapSagaError(new Error("[SCP-SAGA-13066] saga busy: no suffix"));
+    expect(err).toBeInstanceOf(SagaBusyError);
+    expect((err as SagaBusyError).contendedContext).toBe("");
   });
 });

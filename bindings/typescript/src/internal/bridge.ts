@@ -26,6 +26,7 @@ import type {
   MemberRole,
   Message,
   Proof,
+  SagaResult,
   ToolDefinition,
   ToolVerificationResult,
   TransportStatus,
@@ -278,6 +279,19 @@ export interface Bridge {
     chainDepth: number,
     proofTokens?: readonly string[],
   ): Promise<string>;
+
+  // The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a)
+  toolInvokeCrossContextSaga(
+    sourceHandle: BridgeContextHandle,
+    targetHandle: BridgeContextHandle,
+    callerDid: string,
+    toolRegistrationId: string,
+    inputJson: string,
+    assertedNonceHex: string,
+    timestampMs: bigint,
+    chainDepth: number,
+    ucanProofId?: string,
+  ): Promise<SagaResult>;
 
   // Stateful tool sessions (spec section 6.2.1)
   toolSessionCreate(
