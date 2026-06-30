@@ -330,13 +330,16 @@ pub struct SagaOutput {
 /// terminal:
 ///
 /// - [`SagaError::Aborted`] — the saga aborted at a Prepare phase (a §6.2.4
-///   authorization / freshness / rate-limit rejection). The structured
-///   [`SagaAbortReason`] distinguishes a rate-limit abort (carrying the
-///   `retry_after_ms` back-off hint, read structurally — never re-parsed from
-///   the message) from a plain rejection; `code` carries the numeric
-///   `SCP-SAGA-13xxx` discriminant so the bridge maps to the canonical code
-///   directly. `Committed ⇒ Ok` / `Aborted ⇒ neither side committed` (spec
-///   §6.2.4 "Dual event-log recording").
+///   authorization / freshness / rate-limit rejection, or a participant actor
+///   unavailable to complete the Prepare exchange). The structured
+///   [`SagaAbortReason`] distinguishes the three reasons — `RateLimited`
+///   (retryable; carries the `retry_after_ms` back-off hint, read structurally
+///   — never re-parsed from the message), `ParticipantUnavailable` (transient /
+///   retryable, code `SCP-SAGA-13068`), and `Rejected` (a permanent policy
+///   reject); `code` carries the numeric `SCP-SAGA-13xxx` discriminant so the
+///   bridge maps to the canonical code directly. `Committed ⇒ Ok` /
+///   `Aborted ⇒ neither side committed` (spec §6.2.4 "Dual event-log
+///   recording").
 /// - [`SagaError::NeedsRepair`] — Commit-retry exhausted; the saga may have
 ///   PARTIALLY committed (a possible divergence). Carries the durable
 ///   [`SagaId`] so an operator drives `repair_saga(saga_id)` (ADR-049 §3a). A
@@ -346,15 +349,21 @@ pub struct SagaOutput {
 ///   retry with back-off. `contended_context` names the shared context id.
 ///
 /// The variants carry the canonical `SCP-SAGA-13xxx` code in their `Display`
-/// so a flattened log line still `grep`-disambiguates: `Aborted` mirrors the
-/// inner reject's already-registered code; `NeedsRepair` is the registered
+/// so a flattened log line still `grep`-disambiguates: `Aborted` carries the
+/// inner reject's already-registered code (minted via `saga_reject!`) where one
+/// exists — EXCEPT the `ParticipantUnavailable` reason, whose code
+/// `SCP-SAGA-13068` is SYNTHESIZED by `lift_run_saga_error`'s structural
+/// `ActorBusy` match: a transient `ContextError::ActorBusy` is codeless, so
+/// there is no inner reject code to mirror. `NeedsRepair` is the registered
 /// terminal code `SCP-SAGA-13065`; `Busy` is `SCP-SAGA-13066`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SagaError {
-    /// A Prepare-phase rejection (spec §6.2.4). `Aborted ⇒ neither side
-    /// committed`. `reason` distinguishes a rate-limit abort (with a structured
-    /// `retry_after_ms`) from a plain rejection; `code` is the numeric
-    /// `SCP-SAGA-13xxx` discriminant of the underlying reject.
+    /// A Prepare-phase abort (spec §6.2.4). `Aborted ⇒ neither side
+    /// committed`. `reason` distinguishes the three abort reasons — a rate-limit
+    /// abort (`RateLimited`, retryable, with a structured `retry_after_ms`), a
+    /// transiently-unavailable participant (`ParticipantUnavailable`, retryable,
+    /// code `SCP-SAGA-13068`), and a permanent rejection (`Rejected`); `code` is
+    /// the numeric `SCP-SAGA-13xxx` discriminant of the underlying reject.
     #[error("SCP-SAGA-{code}: saga aborted: {message}")]
     Aborted {
         /// Structured abort reason — `RateLimited { retry_after_ms }`,
@@ -408,18 +417,24 @@ pub enum SagaAbortReason {
         retry_after_ms: Option<u64>,
     },
     /// A TRANSIENT, retryable Prepare-phase abort: the target/caller participant
-    /// actor was unavailable to accept the Prepare send — its inbox is
-    /// closed / the actor terminated, or (once the inner send timeout is made
-    /// shorter than the phase timeout) a transiently-saturated mailbox — yielding
-    /// an immediate `ContextError::ActorBusy` on the Prepare-phase send. NEITHER
-    /// side committed (the Prepare-phase reservation is released or reconciled on
-    /// every terminal path), so the saga aborted cleanly and the caller should
-    /// retry after its own conservative back-off — there is no precise drain
-    /// instant to surface, so the variant carries no `retry_after_ms` hint. Retry
-    /// is meaningful because the actor may respawn (ADR-049 §10). This variant's
-    /// rustdoc is the SINGLE authoritative home of the rationale for this
-    /// terminal; the lift and its tests point here rather than re-deriving it.
-    /// Reliably reached for the closed/terminated-inbox subcase; a
+    /// actor was unavailable to COMPLETE the Prepare exchange, yielding a
+    /// `ContextError::ActorBusy` on the Prepare-phase send. That error has three
+    /// producers (see `ContextActorHandle::send`): (1) the actor's mailbox was
+    /// full for the whole `SEND_TIMEOUT`, so the command was never accepted;
+    /// (2) the actor's inbox is closed / the actor terminated, so the command
+    /// was never accepted; or (3) the reply channel was dropped AFTER the
+    /// command was received and processed (a handler panic, or actor shutdown
+    /// after accepting), so the send landed but no reply came back. NEITHER side
+    /// committed — the Prepare phase is staging-only (commit is a later phase
+    /// this abort never reaches), and the Prepare-phase reservation is released
+    /// or reconciled on every terminal path, including the reply-dropped case —
+    /// so the saga aborted cleanly and the caller should retry after its own
+    /// conservative back-off; there is no precise drain instant to surface, so
+    /// the variant carries no `retry_after_ms` hint. Retry is meaningful because
+    /// the actor may respawn (ADR-049 §10). This variant's rustdoc is the SINGLE
+    /// authoritative home of the rationale for this terminal; the lift and its
+    /// tests point here rather than re-deriving it. Reliably reached for the
+    /// closed/terminated-inbox and reply-dropped subcases; a
     /// transiently-full-but-OPEN mailbox may currently race the phase timeout
     /// (`SEND_TIMEOUT == PHASE_TIMEOUT`) and surface as a generic Prepare timeout
     /// abort instead. Distinct from [`Self::Rejected`] (a permanent policy reject
@@ -5494,13 +5509,18 @@ impl Supervisor {
     /// FFI saga surface (ADR-049 §3a) maps onto `SCP-SAGA-*` WITHOUT parsing
     /// message strings:
     ///
-    /// - [`SagaError::Aborted`] on any Prepare-phase rejection — the initiator
+    /// - [`SagaError::Aborted`] on any Prepare-phase abort — the initiator
     ///   is not a member of `caller_context_id`, no established interface to
     ///   `target_context_id` exists for `tool_registration_id`, a participant
-    ///   actor is not co-resident, or any §6.2.4 authorization / freshness /
-    ///   rate-limit check rejects. [`SagaAbortReason::RateLimited`] (carrying
-    ///   `retry_after_ms`) is distinguished from [`SagaAbortReason::Rejected`];
-    ///   `code` carries the numeric `SCP-SAGA-13xxx` discriminant.
+    ///   actor is not co-resident, a participant actor is unavailable to
+    ///   complete the Prepare exchange, or any §6.2.4 authorization / freshness
+    ///   / rate-limit check rejects. The structured [`SagaAbortReason`]
+    ///   distinguishes the three reasons: [`SagaAbortReason::RateLimited`]
+    ///   (retryable, carrying `retry_after_ms`) and
+    ///   [`SagaAbortReason::ParticipantUnavailable`] (transient / retryable,
+    ///   code `SCP-SAGA-13068`) are both distinguished from the permanent
+    ///   [`SagaAbortReason::Rejected`]; `code` carries the numeric
+    ///   `SCP-SAGA-13xxx` discriminant.
     /// - [`SagaError::NeedsRepair`] (carrying the [`SagaId`]) if the saga's
     ///   Commit retries are exhausted (a possible divergence requiring operator
     ///   repair).
