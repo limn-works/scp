@@ -16838,18 +16838,26 @@ mod tests {
     /// `lift_run_saga_error` reads the `SCP-SAGA-13xxx` `code` STRUCTURALLY off
     /// `RunSagaError::saga_code` (carried from the [`SagaReject`] reject path) —
     /// it NEVER parses the message string. This pins the parse-removal: the
-    /// `error` message here deliberately embeds a DIFFERENT, bogus `SCP-SAGA-`
-    /// token than the structural `saga_code`, and a `None` structural code with
-    /// a code-bearing message still lifts to the generic `13067`. If any string
-    /// parse were reintroduced, the asserted codes would change.
+    /// `error` message here deliberately embeds a DIFFERENT but otherwise VALID
+    /// `SCP-SAGA-` token than the structural `saga_code`, and a `None` structural
+    /// code with a code-bearing message still lifts to the generic `13067`. If
+    /// any string parse were reintroduced, the asserted codes would change.
     #[test]
     fn lift_reads_saga_code_structurally_not_from_message() {
         // Structural code wins even when the MESSAGE bears a different token.
+        //
+        // The decoy token MUST be a VALID `u16` code (`13050 < u16::MAX`) that
+        // DIFFERS from the structural `13013`. A token like `99999` would not
+        // exercise this assertion: codes are `u16`, so a reintroduced
+        // `parse::<u16>()` on `99999` would OVERFLOW → `None` → fall back to the
+        // structural `13013` for the WRONG reason (parse failure, not "we never
+        // parse"). `13050` parses cleanly to a value `≠ 13013`, so a message-first
+        // parse would yield `13050` and this assert would catch the regression.
         let lifted = Supervisor::lift_run_saga_error(
             SagaId("saga-structural".to_owned()),
             RunSagaError {
                 error: ContextError::PermissionDenied(
-                    "SCP-SAGA-99999: a message whose embedded token is NOT the real code"
+                    "SCP-SAGA-13050: a message whose embedded token is NOT the real code"
                         .to_owned(),
                 ),
                 needs_repair: false,
@@ -16865,7 +16873,7 @@ mod tests {
                     ..
                 }
             ),
-            "the lift must read the STRUCTURAL saga_code (13013), never the message's token (99999)"
+            "the lift must read the STRUCTURAL saga_code (13013), never the message's token (13050)"
         );
 
         // A `None` structural code falls back to the generic `13067` EVEN WHEN

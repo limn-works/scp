@@ -2692,6 +2692,10 @@ impl From<ContextError> for SagaReject {
 /// complicate the `#[must_use]` carrier's move-by-value recovery destructure
 /// (the lost-receiver balance path in `prepare_a`). The carrier MUST move by
 /// value end-to-end to preserve its single-owner RAII drop-guard contract.
+///
+/// This is the MAILBOX REPLY PAYLOAD for the Prepare-A handler — distinct from
+/// [`outcome::Outcome`](super::outcome::Outcome), the handler's Class-S
+/// persistence accounting. Do not conflate the two.
 #[allow(clippy::large_enum_variant)]
 #[must_use = "a PrepareAOutcome::Prepared carries a ToolEconomyReservation that must be settled or released"]
 #[derive(Debug)]
@@ -2707,6 +2711,10 @@ pub enum PrepareAOutcome {
 /// side of [`PrepareAOutcome`]: a §6.2.4 policy reject rides a typed
 /// [`SagaReject`] on the SUCCESS channel; the `Err(ContextError)` channel
 /// carries only codeless mailbox / Class-S-persist failures.
+///
+/// Like [`PrepareAOutcome`], this is a MAILBOX REPLY PAYLOAD — not
+/// [`outcome::Outcome`](super::outcome::Outcome), the handler's Class-S
+/// persistence accounting.
 #[derive(Debug)]
 pub enum PrepareBOutcome {
     /// Prepare-B passed: B's captured provenance the FSM drives Commit with.
@@ -2727,33 +2735,19 @@ pub enum PrepareBOutcome {
 /// §6.2.4 reject inventory) is named explicitly so existing message-substring
 /// and variant assertions still hold.
 ///
-/// Forms (one per carried variant; `$arg`s are positional `{}` substitutions in
-/// `$fmt`, exactly as the original `format!` used):
-/// - `saga_reject!(13010, PermissionDenied, "… {}", arg)`
-/// - `saga_reject!(13051, InvalidState, "… {}", arg)`
-/// - `saga_reject!(13052, ContextNotRegistered, "… {}", arg)`
-/// - `saga_reject!(13023, RateLimited { resource: r, retry_after_ms: ms }, "… {}", arg)`
+/// Forms (`$arg`s are positional `{}` substitutions in `$fmt`, exactly as the
+/// original `format!` used):
+/// - single-`String` tuple variant — the `$variant:ident` arm, used for any
+///   `ContextError` variant whose payload is one `String` (`PermissionDenied`,
+///   `InvalidState`, `ContextNotRegistered`, …):
+///   `saga_reject!(13010, PermissionDenied, "… {}", arg)`
+/// - `RateLimited` struct variant (distinct shape — its own arm):
+///   `saga_reject!(13023, RateLimited { resource: r, retry_after_ms: ms }, "… {}", arg)`
 macro_rules! saga_reject {
-    ($code:literal, PermissionDenied, $fmt:literal $(, $arg:expr)* $(,)?) => {
+    ($code:literal, $variant:ident, $fmt:literal $(, $arg:expr)* $(,)?) => {
         $crate::context::actor::commands::SagaReject {
             code: ::core::option::Option::Some($code),
-            error: ::scp_protocol::context::ContextError::PermissionDenied(
-                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
-            ),
-        }
-    };
-    ($code:literal, InvalidState, $fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::context::actor::commands::SagaReject {
-            code: ::core::option::Option::Some($code),
-            error: ::scp_protocol::context::ContextError::InvalidState(
-                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
-            ),
-        }
-    };
-    ($code:literal, ContextNotRegistered, $fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::context::actor::commands::SagaReject {
-            code: ::core::option::Option::Some($code),
-            error: ::scp_protocol::context::ContextError::ContextNotRegistered(
+            error: ::scp_protocol::context::ContextError::$variant(
                 ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
             ),
         }
