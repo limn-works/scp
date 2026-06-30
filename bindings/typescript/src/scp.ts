@@ -2403,20 +2403,25 @@ export class SCP {
    * FFI inputs (bad context handle / token / capability) propagate as a typed
    * {@link "./errors".ScpError}.
    *
+   * SECURITY: the behavioral record's `attestationCount` (and any challenge
+   * results, where consumed) are authentic-but-self-mintable signals — an
+   * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+   * controls. They MUST NOT be a sole trust or admission factor; use the
+   * threshold/independence path (§7.3.5) for Sybil resistance.
+   *
+   * The evaluation is labeled with — and the Layer-2 lookup is keyed by — the
+   * context the `handle` resolves to (`handle.contextId`), so the result is
+   * never silently mislabeled. There is no separate context-id argument
+   * (matching the Swift and Kotlin SDKs, which resolve from the handle).
+   *
    * @param handle The context handle to evaluate within.
    * @param subjectDid The DID of the participant being evaluated.
-   * @param contextId Fallback context-id label, used only when `handle` is
-   *   opaque (e.g. a mock without a `contextId`). When the handle carries a
-   *   `contextId`, that resolved value is what the layers are computed against
-   *   AND what the returned {@link TrustEvaluation.contextId} reports — a
-   *   mismatched label here does not relabel the result.
    * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
    * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
    */
   async evaluateTrust(
     handle: unknown,
     subjectDid: string,
-    contextId: string,
     capabilityTokens?: readonly string[],
   ): Promise<TrustEvaluation> {
     // Layer 1: AND-combine the structured per-stage booleans across tokens.
@@ -2495,11 +2500,11 @@ export class SCP {
     // error (malformed input, provider failure) still propagates.
     // The native participation-record op keys the event log by the context's
     // canonical id — the 64-char hex `contextId` the handle carries, the same
-    // value `eventLogQuery` derives from the handle — NOT the caller-supplied
-    // `contextId` label argument (which only labels the returned evaluation).
-    // Resolve it from the handle so the lookup hits the real log; fall back to
-    // the label when the handle is opaque (e.g. a mock that omits `contextId`).
-    const resolvedContextId = (handle as { readonly contextId?: string }).contextId ?? contextId;
+    // value `eventLogQuery` derives from the handle. Resolve it from the handle
+    // (matching Swift/Kotlin, which read `handle.contextId()`), so both the
+    // Layer-2 lookup and the returned label come from the one authoritative
+    // source and can never disagree.
+    const resolvedContextId = (handle as { readonly contextId: string }).contextId;
     let behavioralRecord: BehavioralRecord;
     try {
       behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
@@ -2532,10 +2537,7 @@ export class SCP {
     return {
       subjectDid,
       // Label the evaluation with the SAME context the layers were computed
-      // against (`resolvedContextId`), not the bare `contextId` label arg. A
-      // handle for context A passed with `contextId="B"` must report A — the
-      // context the participation record and Layer-2 facts actually came from —
-      // otherwise the record is silently mislabeled.
+      // against (the handle's resolved context id) — the single source of truth.
       contextId: resolvedContextId,
       capabilityValidation,
       behavioralRecord,

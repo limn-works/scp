@@ -161,8 +161,8 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     native.__stub("ucanEvaluate", probe.fn);
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const first = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", ["token-a"]);
-    const second = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", ["token-a"]);
+    const first = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", ["token-a"]);
+    const second = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", ["token-a"]);
 
     // The read-only diagnostic records nothing: the same token probed twice
     // reports nonceValid:true both times, so the aggregate is stable.
@@ -184,7 +184,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     native.__stub("ucanEvaluate", probe.fn);
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1", [
+    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", [
       "token-a",
       "token-b",
     ]);
@@ -209,7 +209,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     // unstubbed (strict mode would throw if it were called).
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
+    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
     expect(result.capabilityValidation).toEqual({
       tokensValid: false,
       signaturesValid: false,
@@ -241,7 +241,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       }),
     );
 
-    const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
+    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
     expect(result.behavioralRecord.subjectDid).toBe("did:dht:subject");
     expect(result.behavioralRecord.participationDurationSecs).toBe(300);
     expect(result.behavioralRecord.governanceActionsAgainst).toBe(2);
@@ -265,7 +265,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     cleanup = () => scp.shutdown(0);
     mock.__stub("participationRecord", () => fakeParticipationRecord());
 
-    await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
+    await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
     const call = mock.__lastCall("participationRecord");
     expect(call).toBeDefined();
     // participationRecord(contextId, subjectDid, cachedAttestationsJson)
@@ -275,22 +275,21 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(call?.args[2]).toBe("[]");
   });
 
-  it("labels the result with the handle's context, not a mismatched label arg", async () => {
+  it("labels the result with — and keys Layer 2 by — the handle's context", async () => {
     const mock = createMockNativeScp();
     const { scp } = mountMockScp(mock);
     cleanup = () => scp.shutdown(0);
     mock.__stub("participationRecord", () => fakeParticipationRecord());
 
-    // The handle resolves to context "ctx-A"; the caller passes a DIFFERENT
-    // label "ctx-B". The evaluation is computed against the handle's context
-    // (Layer 2 keys the participation record by it), so the returned record
-    // MUST be labeled "ctx-A" — never the bare label arg. A handle for context
-    // A reported as B would be a silently mislabeled record.
+    // The evaluation resolves its context solely from the handle (no separate
+    // context-id argument exists, matching Swift/Kotlin). The returned record
+    // is labeled with that resolved context AND the Layer-2 lookup is keyed by
+    // it, so the two can never disagree.
     const handle = { contextId: "ctx-A" } as unknown;
-    const result = await scp.evaluateTrust(handle, "did:dht:subject", "ctx-B");
+    const result = await scp.evaluateTrust(handle, "did:dht:subject");
     expect(result.contextId).toBe("ctx-A");
 
-    // The Layer-2 lookup hits the resolved context, not the label.
+    // The Layer-2 lookup hits the resolved context.
     const call = mock.__lastCall("participationRecord");
     expect(call?.args[0]).toBe("ctx-A");
   });
@@ -324,7 +323,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       throw new Error("[SCP-CTX-2076] context error: no recorded participation facts");
     });
 
-    const result = await scp.evaluateTrust("handle", "did:dht:subject", "ctx-1");
+    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
     const record = result.behavioralRecord;
     // Non-null, fully-zeroed record — identical shape to the populated case.
     expect(record.subjectDid).toBe("did:dht:subject");
@@ -350,7 +349,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       throw new Error("[SCP-CTX-2001] context error: not initialized");
     });
 
-    await expect(scp.evaluateTrust("handle", "did:dht:subject", "ctx-1")).rejects.toThrow(
+    await expect(scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject")).rejects.toThrow(
       /not initialized/i,
     );
   });
