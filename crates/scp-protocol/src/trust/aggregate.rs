@@ -30,7 +30,7 @@ use super::attestation::{
     ThresholdRequirement, check_attestation_freshness, check_threshold_attestation,
     verify_attestation, verify_attestation_with_revocation,
 };
-use super::challenge::ChallengeVerification;
+use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
 use super::participation::compute_participation_record;
 use super::{AttestationType, TrustError, TrustInput};
@@ -258,6 +258,14 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
     /// context-revoked would keep inflating `attestation_count` / trust until its
     /// cache TTL expired (fail-open). The lookup is O(1) per entry.
     ///
+    /// SECURITY (read-path attestation expiry): the cache TTL is independent of
+    /// the attestation's own `expires_at`. A cache TTL longer than the
+    /// attestation's remaining lifetime would otherwise return a still-fresh
+    /// cache entry whose underlying attestation has already expired. The
+    /// fresh-return path therefore ALSO drops any entry whose
+    /// `attestation.expires_at` is `Some(t)` with `t < now`, matching the stale
+    /// path (where re-verification rejects expired attestations).
+    ///
     /// # Errors
     ///
     /// Returns [`TrustError`] if the store is unavailable or a verification
@@ -306,9 +314,14 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
             } else if revocation_checker
                 .check_revocation(&entry.attestation.id, &entry.attestation.issuer)
                 .is_none()
+                && entry.attestation.expires_at.is_none_or(|exp| exp >= now)
             {
-                // Fresh entry: still verified within TTL, but drop it if it has
-                // since been context-revoked.
+                // Fresh entry: still within cache TTL, but drop it if it has
+                // since been context-revoked OR if the attestation's own
+                // `expires_at` has passed. A cache TTL longer than the
+                // attestation's lifetime would otherwise keep returning an
+                // expired credential until the cache entry itself expired
+                // (read-path fail-open).
                 result.push(entry.attestation);
             }
         }
@@ -477,11 +490,26 @@ where
         &verified_attestations,
     )?;
 
-    // 3. Collect challenge results with timestamps from the store.
-    let challenge_results = ctx
+    // 3. Collect challenge results with timestamps from the store, RE-VALIDATING
+    //    each on read. The store is persistent (SQLCipher), so a challenge result
+    //    that was valid at ingest is otherwise served as a CURRENT trust signal
+    //    forever — even after its `expires_at` passes (read-path fail-open). Re-
+    //    run the same verify-on-ingest gate (`verify_challenge_verification`:
+    //    verifier signature + context binding + expiry) against the target
+    //    context and current clock, dropping any result that no longer verifies.
+    //    Mirrors the attestation read path
+    //    ([`AttestationCache::get_verified_attestations`]), which likewise re-
+    //    validates persisted entries on every read. Store-read faults still
+    //    propagate (via `?`); only verification failures drop the one entry.
+    let challenge_results: Vec<ChallengeVerification> = ctx
         .cache
         .store()
-        .get_challenge_results(ctx.context_id, ctx.subject_did)?;
+        .get_challenge_results(ctx.context_id, ctx.subject_did)?
+        .into_iter()
+        .filter(|cv| {
+            verify_challenge_verification(cv, ctx.resolver, ctx.context_id, ctx.clock).is_ok()
+        })
+        .collect();
 
     // 4. Consequence structure comes directly from context params.
     let consequence_structure: Vec<ConsequenceRule> = ctx.consequence_rules.to_vec();
@@ -773,15 +801,34 @@ mod tests {
         }
     }
 
+    /// Deterministic verifier signing key used by `make_challenge_verification`,
+    /// so a test resolver can be seeded with the matching public key.
+    fn challenge_verifier_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
+    /// `context_id`. The `verifier_signature` is a real Ed25519 signature over
+    /// the canonical bytes, so it passes `verify_challenge_verification` when the
+    /// resolver is seeded via [`seed_challenge_verifier`].
     fn make_challenge_verification(
         challenge_id: &str,
         responder: &str,
         completed_at: u64,
+        context_id: Option<&str>,
     ) -> ChallengeVerification {
-        use crate::trust::challenge::{ChallengeType, VerificationMethod};
-        ChallengeVerification {
+        use crate::trust::challenge::{
+            ChallengeType, VerificationMethod, canonical_challenge_verification_bytes,
+        };
+        use ed25519_dalek::Signer;
+
+        let verifier_key = challenge_verifier_key();
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+
+        let mut cv = ChallengeVerification {
             verification_id: challenge_id.to_owned(),
-            verifier_did: "did:key:challenger".into(),
+            verifier_did,
             subject_did: responder.into(),
             capability_uri: String::new(),
             challenge_type: ChallengeType::schema_validation(),
@@ -796,9 +843,21 @@ mod tests {
             completed_at,
             verified_at: completed_at + 1,
             expires_at: completed_at + 86400,
-            context_id: None,
-            verifier_signature: vec![0u8; 64],
-        }
+            context_id: context_id.map(ToOwned::to_owned),
+            verifier_signature: vec![],
+        };
+        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        cv
+    }
+
+    /// Seeds `resolver` with the public key for the verifier DID used by
+    /// [`make_challenge_verification`], so the genuine signature resolves and
+    /// verifies on the challenge read path.
+    fn seed_challenge_verifier(resolver: &mut TestResolver) {
+        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
+        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub).to_string();
+        resolver.keys.insert(verifier_did, verifier_pub.to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -934,7 +993,7 @@ mod tests {
     fn store_persists_and_retrieves_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000);
+        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let results = store
@@ -949,8 +1008,8 @@ mod tests {
     fn store_accumulates_multiple_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000);
-        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000);
+        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
+        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000, Some("ctx-1"));
 
         store.store_challenge_result("ctx-1", &cv1).unwrap();
         store.store_challenge_result("ctx-1", &cv2).unwrap();
@@ -991,6 +1050,36 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "att-1");
+    }
+
+    #[test]
+    fn cache_drops_fresh_entry_whose_attestation_has_expired() {
+        // The cache entry is fresh (within TTL) but the attestation's own
+        // `expires_at` has passed relative to `now`. The fresh-return path must
+        // drop it rather than return an expired credential.
+        let store = InMemoryTrustStore::new();
+        // make_attestation sets expires_at = Some(5000); clock past that.
+        let clock = TestClock::new(6000);
+
+        let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
+        let entry = CachedAttestation {
+            attestation: att,
+            verified_at: 5900, // fresh: 5900 + 600 = 6500 > 6000
+            ttl_secs: 600,
+        };
+        store.store_cached_attestation("ctx-1", entry).unwrap();
+
+        let cache = AttestationCache::new(store);
+        let resolver = TestResolver::new();
+
+        let result = cache
+            .get_verified_attestations("ctx-1", "did:key:alice", &resolver, &clock)
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a fresh cache entry whose attestation expires_at < now must be excluded on read"
+        );
     }
 
     #[test]
@@ -1035,7 +1124,10 @@ mod tests {
     fn aggregate_returns_complete_trust_input() {
         let store = InMemoryTrustStore::new();
         let clock = TestClock::new(2000);
-        let resolver = TestResolver::new();
+        // Seed the resolver with the verifier key so the genuinely-signed
+        // challenge result re-validates on the read path (Fix 1).
+        let mut resolver = TestResolver::new();
+        seed_challenge_verifier(&mut resolver);
 
         // Seed the store with cached attestations.
         let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
@@ -1046,8 +1138,8 @@ mod tests {
         };
         store.store_cached_attestation("ctx-1", entry).unwrap();
 
-        // Seed the store with challenge results.
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500);
+        // Seed the store with a genuinely-signed, in-context challenge result.
+        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let cache = AttestationCache::new(store);
@@ -1117,6 +1209,74 @@ mod tests {
 
         // Threshold counts (empty -- no requirements defined).
         assert!(input.threshold_counts.is_empty());
+    }
+
+    #[test]
+    fn aggregate_excludes_persisted_challenge_result_after_expiry() {
+        // Fix 1 (read-path re-validation). A genuine, in-context, properly-signed
+        // challenge result is persisted; after the clock advances past its
+        // `expires_at`, re-running aggregation must EXCLUDE it (the persistent
+        // store would otherwise serve it as a current trust signal forever).
+        let store = InMemoryTrustStore::new();
+        let mut resolver = TestResolver::new();
+        seed_challenge_verifier(&mut resolver);
+
+        // completed_at = 1500 → expires_at = 1500 + 86400 = 87_900.
+        let cv = make_challenge_verification("ch-expiring", "did:key:alice", 1500, Some("ctx-1"));
+        store.store_challenge_result("ctx-1", &cv).unwrap();
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            1000,
+            0,
+            vec![],
+        )];
+        let consequence_rules = vec![];
+        let threshold_requirements = HashMap::new();
+        let attestor_sets = HashMap::new();
+        let cache = AttestationCache::new(store);
+
+        // Sanity: before expiry the result IS included.
+        let before_clock = TestClock::new(2000);
+        let ctx_before = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &consequence_rules,
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver: &resolver,
+            clock: &before_clock,
+        };
+        let input_before = aggregate_trust_input(&ctx_before).unwrap();
+        assert_eq!(
+            input_before.challenge_results.len(),
+            1,
+            "a valid, unexpired challenge result must be included"
+        );
+
+        // After expiry the result is EXCLUDED on read.
+        let after_clock = TestClock::new(90_000);
+        let ctx_after = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &consequence_rules,
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver: &resolver,
+            clock: &after_clock,
+        };
+        let input_after = aggregate_trust_input(&ctx_after).unwrap();
+        assert!(
+            input_after.challenge_results.is_empty(),
+            "an expired persisted challenge result must be excluded on the read path"
+        );
     }
 
     #[test]
