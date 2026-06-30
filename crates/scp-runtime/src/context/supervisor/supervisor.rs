@@ -16537,8 +16537,8 @@ mod tests {
     }
 
     /// Build a `with_providers_and_journal` supervisor over a caller-supplied
-    /// saga `journal` + `mls_storage` view + optional `persistence` /
-    /// `payment_adapter`, with a key_resolver mapping `creator_did → creator_key`
+    /// saga `journal` + `mls_storage` view + optional `persistence`,
+    /// with a key_resolver mapping `creator_did → creator_key`
     /// (the target's UCAN re-bind / divergence-signing root). Sibling of
     /// [`xctx_supervisor_with_real_journal_persistence`], but the caller controls
     /// the journal + mls backing store so a fault-injecting journal and a
