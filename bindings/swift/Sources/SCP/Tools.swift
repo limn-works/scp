@@ -254,6 +254,103 @@ public extension Context {
         )
     }
 
+    /// Runs the §6.2.4 atomic cross-context tool-invocation saga.
+    ///
+    /// Delegates to the UniFFI ``toolInvokeCrossContextSaga`` bridge function.
+    /// Unlike ``invokeToolCrossContext(_:input:identity:targetContext:ucanToken:chainDepth:proofTokens:invokerDid:)``
+    /// (a single synchronous cross-context call), this drives the durable
+    /// two-phase saga to a terminal: the call blocks until the saga either
+    /// commits — resolving to a ``SagaResult`` carrying the supervisor-minted
+    /// ``SagaResult/sagaId`` plus the target's signed receipt and captured
+    /// output bytes — or reaches a typed terminal, surfaced directly as one of
+    /// the generated ``ScpError`` saga cases:
+    ///
+    /// - ``ScpError/SagaAborted(msg:code:retryAfterMs:)`` — a Prepare-phase
+    ///   rejection; `retryAfterMs` is the limiter's computed back-off, or `nil`
+    ///   (never `0`) when no precise back-off instant exists.
+    /// - ``ScpError/SagaNeedsRepair(msg:code:sagaId:)`` — Commit retries
+    ///   exhausted (a possible divergence); carries the durable `sagaId`
+    ///   operator-repair handle.
+    /// - ``ScpError/SagaBusy(msg:code:contendedContext:)`` — the participant
+    ///   context set overlapped an in-flight saga; carries the contended
+    ///   context id (retry with back-off).
+    ///
+    /// The `chainDepth` (`UInt8`) and `timestampMs` (`UInt64`) parameters
+    /// cannot encode an out-of-range or negative value, so no manual range
+    /// validation is performed — Swift's type system enforces the bridge's
+    /// `u8` / `u64` boundaries by construction.
+    ///
+    /// - Parameters:
+    ///   - targetContext: The ``Context`` hosting the target tool.
+    ///   - callerDid: The DID of the invoking principal (bound to the
+    ///     authenticated FFI identity by the bridge).
+    ///   - toolRegistrationId: The target tool's registration id.
+    ///   - input: The tool input as serialized JSON data.
+    ///   - assertedNonceHex: The caller-asserted freshness nonce, as 32 hex
+    ///     characters (16 bytes); the bridge rejects other lengths with a
+    ///     `Validation` error.
+    ///   - timestampMs: The caller-asserted freshness timestamp
+    ///     (milliseconds since epoch).
+    ///   - chainDepth: The caller-asserted inbound chain depth (0 for a
+    ///     direct invocation).
+    ///   - ucanProofId: Optional UCAN proof id authorizing the invocation.
+    /// - Returns: A ``SagaResult`` on a committed terminal — a faithful
+    ///   pass-through of the bridge result (`receipt` / `output` are surfaced
+    ///   exactly as returned, `nil` when absent, never synthesized).
+    /// - Throws: ``ScpError/SagaAborted(msg:code:retryAfterMs:)``,
+    ///   ``ScpError/SagaNeedsRepair(msg:code:sagaId:)``, or
+    ///   ``ScpError/SagaBusy(msg:code:contendedContext:)`` on a non-committed
+    ///   terminal; ``ScpError/Context(msg:code:)`` (`SCP-CTX-2001`) if the
+    ///   source context is not active; ``ScpError/Tool(msg:code:)``
+    ///   (`SCP-TOOL-6001`) if the input is not valid UTF-8;
+    ///   ``ScpError/Tool(msg:code:)`` (`SCP-TOOL-6002`, propagated from the
+    ///   bridge) if `input` is valid UTF-8 but not valid JSON;
+    ///   ``ScpError/Validation(msg:code:)`` (propagated from the bridge) if
+    ///   `assertedNonceHex` is not 16-byte hex, or `callerDid` /
+    ///   `toolRegistrationId` is malformed; ``ScpError/Permission(msg:code:)``
+    ///   (`SCP-PERM-3030`, propagated from the bridge) if `targetContext` is a
+    ///   foreign / cross-instance handle.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.4 (Cross-Context Tool Invocation Saga)
+    /// - ADR-049 §3a (per-participant-context-set saga gating)
+    func invokeToolCrossContextSaga(
+        targetContext: Context,
+        callerDid: String,
+        toolRegistrationId: String,
+        input: Data,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanProofId: String? = nil
+    ) async throws -> SagaResult {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Source context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                msg: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-6001"
+            )
+        }
+        let targetHandle = targetContext.handle
+        return try await scp.toolInvokeCrossContextSaga(
+            sourceHandle: handle,
+            targetHandle: targetHandle,
+            callerDid: callerDid,
+            toolRegistrationId: toolRegistrationId,
+            inputJson: inputJson,
+            assertedNonceHex: assertedNonceHex,
+            timestampMs: timestampMs,
+            chainDepth: chainDepth,
+            ucanProofId: ucanProofId
+        )
+    }
+
     /// Creates a stateful tool session for repeated invocations.
     ///
     /// Delegates to the UniFFI ``toolSessionCreate`` bridge function.
