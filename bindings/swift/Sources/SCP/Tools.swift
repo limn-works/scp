@@ -300,7 +300,12 @@ public extension Context {
     ///   ``ScpError/SagaBusy(msg:code:contendedContext:)`` on a non-committed
     ///   terminal; ``ScpError/Context(msg:code:)`` (`SCP-CTX-2001`) if the
     ///   source context is not active; ``ScpError/Tool(msg:code:)``
-    ///   (`SCP-TOOL-6001`) if the input is not valid UTF-8.
+    ///   (`SCP-TOOL-6001`) if the input is not valid UTF-8;
+    ///   ``ScpError/Validation(msg:code:)`` (propagated from the bridge) if
+    ///   `assertedNonceHex` is not 16-byte hex, or `callerDid` /
+    ///   `toolRegistrationId` is malformed; ``ScpError/Permission(msg:code:)``
+    ///   (`SCP-PERM-3030`, propagated from the bridge) if `targetContext` is a
+    ///   foreign / cross-instance handle.
     ///
     /// ## Provenance
     ///

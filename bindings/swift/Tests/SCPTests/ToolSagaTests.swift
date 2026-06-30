@@ -222,6 +222,13 @@ final class ToolSagaTests: XCTestCase {
     /// typed `ScpError` — never the wrapper-layer guard codes. That proves the
     /// nine arguments (both handles, `callerDid`, `toolRegistrationId`,
     /// `inputJson`, nonce, timestamp, depth, optional proof) reach the bridge.
+    ///
+    /// This is a bridge-linkage smoke test: it confirms the call reaches the
+    /// real bridge past both wrapper guards, but does not assert per-argument
+    /// positional fidelity (a same-typed swap, e.g. `callerDid` ↔
+    /// `toolRegistrationId`, would not be caught here — that assurance lives in
+    /// the Rust/integration tests, since asserting it at this wrapper unit
+    /// layer would require committed-saga bidirectional-consent setup).
     func testSagaForwardsArgumentsToBridge() async throws {
         try scp.configureLocalTransport(localDid: "did:key:z6MkSwiftSagaForwardTest")
         let identity = try await scp.identityCreate(custody: "in_memory")
