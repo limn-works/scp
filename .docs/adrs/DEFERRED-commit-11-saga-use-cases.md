@@ -15,15 +15,18 @@ not a saga and does not exist; broadcast hosting handshake was **WITHDRAWN**
 (2026-06-25) as a category error; and standing-pair creation was
 reclassified as single-context async creation, also not a saga.)*
 
-**What commit 11 DOES land.**
+**What commit 11 DOES land** *(historical snapshot — the mechanism
+names below describe the tree as it stood at commit 11; the
+`ContextManager` and `MutationStateView` types were both deleted by the
+later actor migration commits)*.
 - Full `ContextCommand` sub-enum extension for standing / tools /
-  broadcast — one variant per public `ContextManager` method
-  (excluding generic-executor methods that cannot cross the actor
-  mailbox).
+  broadcast — one variant per public method on the then-current
+  `ContextManager` (excluding generic-executor methods that cannot
+  cross the actor mailbox).
 - Shim-callable handler implementations in
-  `crates/scp-runtime/src/context/actor/handlers/{standing,tools,broadcast}.rs`
-  wired through `MutationStateView`, delegating byte-identically to
-  `ContextManager`.
+  `crates/scp-runtime/src/context/actor/handlers/{standing,tools,broadcast}.rs`,
+  wired at the time through the since-deleted `MutationStateView`,
+  delegating byte-identically to the since-deleted `ContextManager`.
 - `Supervisor::dispatch_{standing,tools,broadcast}_command` plus
   `dispatch_broadcast_command_with_custody` for the publish path.
 - Saga coordinator FSM in `Supervisor::start_saga` — the full
@@ -93,7 +96,7 @@ applied by the joining peer on Welcome receipt), reached via the
 idempotent `standing_context` get-or-create path. The spec leads the
 implementation, so this single-context-async creation path **is not yet
 wired** (§5.15.8: "the standing-pair creation path is not yet wired") —
-the saga-shaped `InitiateStandingPairCreate` variant and its `NotImplemented` reply are gone; the surviving not-yet-wired surface is the single-context-async creation path itself (its `reply_not_implemented` placeholder in `handlers/standing.rs`, pending wiring — consistent with exit criterion 2 below).
+the saga-shaped `InitiateStandingPairCreate` variant and its `NotImplemented` reply are gone; the surviving not-yet-wired surface is the single-context-async creation path itself: the idempotent `standing_context` get-or-create path exists, but its full standing-pair creation protocol (peer KeyPackage fetch + `add_member` + Welcome + consent-on-receipt) remains unwired per §5.15.8, consistent with exit criterion 2 below.
 
 ## Gap 2 — Cross-context tool invocation transport
 
@@ -125,10 +128,10 @@ context but not the cross-context forwarding path:
 `Supervisor::start_cross_context_tool_invocation_saga` (running
 supervisor-side); the dead `ToolsCommand::InitiateCrossContextToolInvocation`
 mailbox variant and its `NotImplemented` reply have been deleted. Note:
-`ContextManager::invoke_tool_with_economy` is, for a separate reason, not
+`Supervisor::invoke_tool_with_economy` is, for a separate reason, not
 a command variant — its generic `F: FnOnce(Value) -> Fut` executor closure
-carries no `Send` bound and so cannot cross the actor mailbox; it continues
-to run on the direct manager surface (FFI bridges invoke it inline).
+carries no `Send` bound and so cannot cross the actor mailbox; it runs
+supervisor-side (FFI bridges invoke it inline).
 
 ## Gap 3 — Broadcast hosting handshake protocol
 
@@ -247,21 +250,22 @@ async/poll wait model having been withdrawn with Gap 4 per ADR-049 §3a.)
 > `tool_invoke_cross_context_saga`, block-until-terminal, in all three
 > bridges); criterion 5 (SDK wrappers for each language target); and the
 > saga side of criterion 3 (the §6.2.4 integration tests). **Pending:** the
-> single-context-async standing-pair **wiring** — criterion 2's replacement
-> of the `reply_not_implemented` placeholder in `handlers/standing.rs`, plus
-> its criterion-3 test — remains unwired by design (the spec leads; §5.15.8
-> records "the standing-pair creation path is not yet wired," so there is no
-> live divergence to reconcile).
+> single-context-async standing-pair **wiring** — criterion 2's full
+> standing-pair creation protocol (peer KeyPackage fetch + `add_member` +
+> Welcome + consent-on-receipt) on the idempotent `standing_context`
+> get-or-create path, plus its criterion-3 test — remains unwired by design
+> (the spec leads; §5.15.8 records "the standing-pair creation path is not
+> yet wired," so there is no live divergence to reconcile).
 
 1. A spec update (.docs/specs/ or a new ADR) filling in the **2** spec
    gaps (Gaps 1–2) with canonical wire formats and state-machine tables —
    Gap 1 being the §5.15.8 single-context-async standing-pair spec (not
    a saga) and Gap 2 the one live saga. (Gaps 3–4 are withdrawn, not
    specced; Gap 5 is the FFI surface, item 4 below.)
-2. Replacement of the `reply_not_implemented` placeholder in
-   `handlers/standing.rs` with a real dispatch — the
-   single-context-async `create` + `add_member` + Welcome path for
-   standing-pair. (No `tools` handler placeholder: the one live saga,
+2. Wiring the single-context-async standing-pair creation path into a
+   real dispatch — get-or-create via `standing_context` + peer KeyPackage
+   fetch + `add_member` + Welcome + consent-on-receipt. (No `tools`
+   handler placeholder: the one live saga,
    §6.2.4 cross-context tool invocation, is produced supervisor-side by
    `start_cross_context_tool_invocation_saga`, not via an actor-mailbox
    handler. No migration or broadcast-hosting handler — Gaps 3–4

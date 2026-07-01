@@ -87,7 +87,6 @@ async fn dispatch_actor_inner(
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
     match cmd {
-        LifecycleCommand::Placeholder { reply } => reply_not_implemented(reply),
         LifecycleCommand::CreateContext { payload, reply } => {
             // Bootstrap variant must not reach the actor. The
             // supervisor routes Create / Import / Restore through
@@ -483,14 +482,6 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "LifecycleCommand::Placeholder — placeholder handshake \
-                       variant; real lifecycle command handling is not routed \
-                       through this arm";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }
 
 // ---------------------------------------------------------------------------

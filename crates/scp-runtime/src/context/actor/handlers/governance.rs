@@ -12,8 +12,7 @@
 //! [`crate::context::governance_helpers`](crate::context::governance_helpers).
 //! The migration-window shim — `dispatch_from_shim` and the
 //! supervisor-shape `handle_*` helpers — has been deleted at Phase 2A
-//! finalization. The `Placeholder` variant remains as the mailbox-test
-//! handshake target.
+//! finalization.
 //!
 //! # Transport-timeout budget
 //!
@@ -76,11 +75,8 @@ pub(crate) async fn dispatch(
     Box::pin(dispatch_state(cell, deps, cmd)).await
 }
 
-/// Actor-shape variant dispatch. Every governance variant now takes
-/// state + deps directly. Only the no-op `Placeholder` variant
-/// (commit-6 mailbox-test handshake) returns `NotImplemented`
-/// synchronously; deleted with the `Placeholder` itself at Phase 2A
-/// finalization.
+/// Actor-shape variant dispatch. Every governance variant takes
+/// state + deps directly.
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive GovernanceCommand match — splitting loses the \
@@ -213,9 +209,6 @@ async fn dispatch_state(
         GovernanceCommand::StartTimeoutTask { reply } => {
             handle_start_timeout_task_actor(cell, deps, reply).await
         }
-        // Placeholder is a no-op handshake target reserved for mailbox
-        // tests. Returns NotImplemented synchronously; no state mutation.
-        GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
     }
 }
 
@@ -755,14 +748,6 @@ async fn handle_apply_pending_economic_policy_change_actor(
     };
     let _ = reply.send(reply_result);
     outcome
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "GovernanceCommand::Placeholder — real variants migrate in commit 10 of \
-                       ADR-049; Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }
 
 // ---------------------------------------------------------------------------

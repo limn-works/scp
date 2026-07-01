@@ -9,59 +9,58 @@
 //!
 //! Per ADR-049 §1 (`ContextActor owns state by move`) and plan
 //! §"ContextActor", this module defines the SHAPE of the state an actor
-//! owns across the commit-12 migration off `ContextManager`.
+//! owns — the state model the commit-12 migration moved off the
+//! now-deleted `ContextManager`.
 //!
 //! # Split from `manager/mod.rs`
 //!
-//! The legacy `ContextManager` carries its own `pub(crate)
-//! PerContextState` in the deleted `crate::context::manager` module —
+//! The legacy `ContextManager` carried its own `pub(crate)
+//! PerContextState` in the now-deleted `crate::context::manager` module —
 //! that type was consumed through
-//! the `per-context-state Mutex` lock-based model that ADR-049 deletes.
+//! the `per-context-state Mutex` lock-based model that ADR-049 deleted.
 //! The actor's state type here is a SUPERSET-COMPATIBLE shape: every field
-//! the legacy struct owns is represented here (so commit 12b+ handler-body
-//! migrations move calls mechanically off `manager.field` onto
-//! `state.field`), plus the new per-actor fields (`saga_pending`,
+//! the legacy struct owned is represented here (so the commit 12b+
+//! handler-body migrations moved calls mechanically off `manager.field`
+//! onto `state.field`), plus the new per-actor fields (`saga_pending`,
 //! `welcome_scratchpad`, `send_tracker`, `recv_tracker`, split mode
 //! state) that the legacy struct did not own.
 //!
-//! The two types coexist during the commit ladder (commit 6 through
-//! commit 12). The legacy `state::PerContextState` remains
-//! byte-identical — no changes to it apart from the `pub(crate)` field
-//! elevations commit 12a adds so the actor can name the sub-struct types.
-//! Commits 12b-12c migrate handler bodies to take `&mut
-//! actor::PerContextState`. Commit 12d deletes the legacy
-//! `ContextManager`, at which point the legacy type is removed in the
-//! same mechanical pass.
+//! The two types coexisted through the commit ladder (commit 6 through
+//! commit 12); the legacy state struct stayed byte-identical apart from
+//! the `pub(crate)` field elevations commit 12a added so the actor could
+//! name the sub-struct types. Commits 12b-12c migrated handler bodies to
+//! take `&mut actor::PerContextState`. Commit 12d deleted the legacy
+//! `ContextManager`; the legacy state type was removed in the same
+//! mechanical pass.
 //!
-//! # Commit 12a — fields-only
+//! # Origin — the fields-only landing
 //!
-//! Commit 12a populates [`PerContextState`], [`ContextCryptoState`], and
-//! [`BroadcastState`] with every field the legacy manager's
-//! [`crate::context::state::PerContextState`] +
-//! `MlsCryptoProvider::contexts[ctx_id]` owns. No handler body moves
-//! here — the shim still delegates through `ContextManager` via
-//! `view.manager()`. The purpose is to give 12b+ a complete field-set
-//! destination so each handler migration is a mechanical move from
-//! `manager.foo` to `state.foo`.
+//! [`PerContextState`], [`ContextCryptoState`], and [`BroadcastState`]
+//! first landed as a fields-only mirror of every field the legacy
+//! manager's own `PerContextState` + `MlsCryptoProvider::contexts[ctx_id]`
+//! owned, giving the handler migration a complete field-set destination so
+//! each move off `manager.foo` onto `state.foo` was mechanical. That
+//! migration is complete: the handlers read and mutate this actor-owned
+//! state directly, and the legacy manager and its `Supervisor::dispatch_*`
+//! method bodies no longer exist.
 //!
 //! The MLS group handle on [`ContextCryptoState`] is `Option<ScpMlsGroup>`
 //! (not `ScpMlsGroup` non-optional as the legacy provider held it),
 //! because actors spawn before any MLS state is constructed — Create /
-//! Join handlers in 12b+ populate it. This is the only shape divergence
-//! from legacy; all other fields are stored in the same type the legacy
-//! manager uses.
+//! Join handlers populate it. This is the only shape divergence from the
+//! legacy layout; all other fields are stored in the same types the
+//! legacy manager used.
 //!
 //! # Construction
 //!
-//! This commit does NOT wire production construction — the production
-//! construction path still lives on `ContextManager` and hands the shim
-//! a legacy `state::PerContextState`. Commit 12b (messaging handler
-//! migration) is the first production call site that constructs an
-//! [`actor::PerContextState`](PerContextState). Until then the test
+//! Production construction now goes through
+//! `Supervisor::spawn_actor_with_state`, which hands each
+//! [`ContextActor`](crate::context::actor::ContextActor) its owned
+//! [`actor::PerContextState`](PerContextState). The test
 //! constructors [`PerContextState::new_for_test_encrypted`] and
-//! [`PerContextState::new_for_test_broadcast`] are the only call sites
-//! and exist to prove the shape is both structurally complete and
-//! constructible from minimum inputs.
+//! [`PerContextState::new_for_test_broadcast`] additionally build the
+//! state from minimum inputs to prove the shape is both structurally
+//! complete and constructible.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -450,7 +449,7 @@ pub struct ContextCryptoState {
     ///
     /// [`PerContextState::recv_tracker`](PerContextState::recv_tracker)
     /// is the actor-shape per-member WIRE-sequence tracker used by the
-    /// ContextManager-level reorder / delivery path. This field is the
+    /// per-context reorder / delivery path. This field is the
     /// MLS sender-key layer `(epoch, sequence)` pair that [`open`]
     /// reads in the provider (see provider.rs:1211-1221 for the
     /// authoritative algorithm). Commit 12b.2 migrates that deliver-
@@ -563,7 +562,7 @@ impl Default for ContextCryptoState {
 ///
 /// Exactly one variant is present per context; there is no `Option` or
 /// "unknown" state. Constructors build the correct variant from
-/// [`crate::context::state::ContextModeState`]-equivalent mode information at
+/// [`ContextModeState`]-equivalent mode information at
 /// creation / join / restore time.
 ///
 /// `DID` is `#[serde(transparent)]` over `String`, so the serialized wire
@@ -984,34 +983,32 @@ impl ClassSState {
 ///
 /// Field set is the contract the plan's handler signatures rely on
 /// (§"ContextActor" dispatch loop + §"Submodule organization"). Every
-/// field listed here is populated by commits 12b+ in production; the
+/// field is populated in production by the actor-shape handlers; the
 /// [`Self::new_for_test_encrypted`] / [`Self::new_for_test_broadcast`]
 /// fixtures default the rest for test use.
 ///
-/// # Field-for-field parity with legacy
+/// # Field-for-field parity with the deleted legacy state
 ///
-/// Commit 12a mirrors every field on
-/// [`crate::context::state::PerContextState`] so 12b+ handler-body
-/// migrations move calls mechanically off `manager.foo` onto
-/// `state.foo`. The new-per-actor fields at the bottom of the struct
-/// (`send_tracker`, `recv_tracker`, `saga_pending`, `welcome_scratchpad`,
-/// `lifecycle_state`, `mode`) have no legacy equivalent — they replace
-/// the `per-context-state Mutex` lock-based model.
+/// This struct owns every field the now-deleted legacy per-context state
+/// carried, so the completed handler-body migration moved each call
+/// mechanically off `manager.foo` onto `state.foo`. The new-per-actor
+/// fields at the bottom of the struct (`send_tracker`, `recv_tracker`,
+/// `saga_pending`, `welcome_scratchpad`, `lifecycle_state`, `mode`) have
+/// no legacy equivalent — they replace the `per-context-state Mutex`
+/// lock-based model.
 ///
-/// # Dead-code in commit 12a
+/// # Field readers
 ///
-/// The 12a fields-only commit populates every field but wires no
-/// handler callers — the `view.manager()` shim still delegates to
-/// `ContextManager` for every mutation. Per-field `#[allow(dead_code)]`
-/// markers are intentionally NOT applied: the struct-level
-/// `#[allow(dead_code)]` below covers unused private-type fields
-/// (`governance`, `epoch`, `access`, `ttl`) until 12b+ handlers read
-/// them. All other fields are already reachable via their `pub`
-/// accessors from existing shim or test code.
-#[allow(
-    dead_code,
-    reason = "Commit 12a of ADR-049 is fields-only; 12b+ handler migrations wire the first production readers of `governance`/`epoch`/`access`/`ttl`. See `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder."
-)]
+/// Every field is read and mutated directly by the actor-shape handlers
+/// and their helper modules — there is no dead code here, and no
+/// `#[allow(dead_code)]` is applied. The private-type sub-state fields
+/// are all live: `governance` (e.g. `handlers/governance.rs` off
+/// `state.governance.engine`, and `handlers/lifecycle.rs` cancelling
+/// `state.governance.timeout_task`), `epoch` (`handlers/trust_recovery.rs`
+/// reading `state.epoch.mls_epoch`), `ttl` (`handlers/lifecycle.rs`
+/// cancelling `state.ttl.timer`), and `access` (the governance,
+/// messaging, and queries helpers reading `state.access.access_key_store`
+/// and `state.access.read_exclusion_list`).
 pub struct PerContextState {
     // -----------------------------------------------------------------
     // Identity + lifetime fields

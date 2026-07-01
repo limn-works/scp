@@ -14,7 +14,7 @@
 //!
 //! # Publish + key-custody plumbing (two-phase reservation)
 //!
-//! The publish entry points on `ContextManager` take
+//! The publish entry points in `broadcast_helpers` take
 //! `custody: &impl KeyCustody`. Because
 //! [`KeyCustody`](scp_platform::KeyCustody) uses RPITIT (not
 //! `dyn`-safe), the actor mailbox cannot carry a custody reference
@@ -73,7 +73,6 @@ async fn dispatch_inner(
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
     match cmd {
-        BroadcastCommand::Placeholder { reply } => reply_not_implemented(reply),
         BroadcastCommand::SubscribeBroadcast { payload, reply } => {
             handle_subscribe_broadcast(cell, deps, *payload, reply).await
         }
@@ -563,12 +562,4 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "BroadcastCommand::Placeholder — real variants migrate in commit 11 of \
-                       ADR-049; Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

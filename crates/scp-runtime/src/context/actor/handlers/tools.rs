@@ -52,7 +52,6 @@ pub(crate) async fn dispatch(
     cmd: ToolsCommand,
 ) -> Outcome<()> {
     match cmd {
-        ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
         ToolsCommand::TryConsumeHardRateLimit {
             did,
             now_secs,
@@ -258,12 +257,4 @@ async fn handle_settle_tool_economy(
 
     let _ = reply.send(reply_result);
     outcome
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "ToolsCommand::Placeholder — real variants migrate in commit 11 of \
-                       ADR-049; Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

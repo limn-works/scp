@@ -30,8 +30,8 @@
 //!
 //! # Transport-timeout budget
 //!
-//! [`HANDLER_TIMEOUT`] is the handler-level budget. The legacy
-//! `ContextManager` methods do not carry their own deadline — this is
+//! [`HANDLER_TIMEOUT`] is the handler-level budget. The predecessor
+//! monolithic context methods did not carry their own deadline — this is
 //! the new behaviour introduced by ADR-049 §7. 30 seconds matches the
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
@@ -64,7 +64,6 @@ pub(crate) async fn dispatch(
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
     match cmd {
-        TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
         TtlCloseCommand::FireTimer { reply } => handle_fire_timer(cell, deps, reply).await,
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
@@ -412,14 +411,4 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "TtlCloseCommand::Placeholder — real variants \
-                       StartTtlTimer/ExtendTtl/ResetTtlTimer/ExecuteTtlClose/\
-                       FinalizeClose are wired; Placeholder retained for actor \
-                       run-loop skeleton-handshake stability and deleted in \
-                       Phase 2A finalization with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

@@ -48,7 +48,7 @@
 //! [`ClassSCell`] owns the [`PerContextState`] and exposes:
 //!
 //! - **Reads** via [`Deref`] — `&*cell` / `cell.<field>` yields `&PerContextState`.
-//!   There is deliberately **no [`DerefMut`]**: you cannot obtain a
+//!   There is deliberately **no [`DerefMut`](std::ops::DerefMut)**: you cannot obtain a
 //!   `&mut PerContextState` by writing `&mut cell.<field>` or `*cell = …`. That is
 //!   the compile-time hook, and it is now in force for the THREE privatized
 //!   Class-S fields (`PerContextState.class_s`, `GovernanceState.class_s`, and
@@ -120,7 +120,7 @@
 //! whole-struct `&mut` if one were ever handed out — but none is). Field
 //! privatization (`PerContextState.class_s` / `GovernanceState.class_s` are now
 //! `pub(in crate::context)`) closes the LAST whole-`&mut` reach that DID exist —
-//! the deleted [`ClassSCell::state_mut`] escape hatch and [`ClassSMut`]'s
+//! the deleted `ClassSCell::state_mut` escape hatch and [`ClassSMut`]'s
 //! `pub(crate)` reach — NOT this view, which was already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
@@ -217,7 +217,7 @@
 //!   §9-safe by the OBLIGATION of the combinator/caller that reaches it (NOT by
 //!   impossibility):
 //!   - **(A) the consequence-only view.** [`ClassCMut::consequence_split`] (itself
-//!     reachable from the best-effort [`ClassCMut::class_c_view`]) yields a
+//!     reachable from the best-effort `ClassSCell::class_c_view`) yields a
 //!     [`ConsequenceRoleStateMut`], the role view that DOES expose
 //!     `suspend_capabilities` / `suspend_all`. A `ClassCMut` holder CAN therefore
 //!     reach a GROW — and the §9 guarantee is that the consequence caller persists
