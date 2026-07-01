@@ -17,8 +17,8 @@
 //! construct fresh `PerContextState` and cannot be routed against a
 //! per-context actor that does not yet exist. They are handled by
 //! [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
-//! which delegates to the designated-legacy bootstrap helpers in
-//! [`crate::context::lifecycle_helpers_legacy`]. If a bootstrap variant
+//! which delegates to the actor-shape bootstrap helpers in
+//! [`crate::context::lifecycle_helpers`]. If a bootstrap variant
 //! reaches this actor-shape dispatch (because an actor is already
 //! registered for the target context_id — a re-create attempt), the
 //! handler surfaces `ContextError::InvalidState` on the reply oneshot.
@@ -486,9 +486,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 }
 
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "LifecycleCommand::Placeholder — placeholder variant; \
-                       real variants land in commit 9 / Phase 2A.9 of \
-                       ADR-049";
+    const MSG: &str = "LifecycleCommand::Placeholder — placeholder handshake \
+                       variant; real lifecycle command handling is not routed \
+                       through this arm";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

@@ -6,9 +6,9 @@
 //! This module hosts lifecycle-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::lifecycle_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! Phase 2A finalization deleted the legacy `&Supervisor` lock-and-call
+//! bodies (and the shim fallback); every lifecycle command now runs
+//! through these actor-shape helpers.
 //!
 //! # Pipeline shape
 //!
@@ -49,21 +49,25 @@
 //! - [`load_persisted_context_state`] — load context snapshot and broadcast state from persistence.
 //! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + start governance timeout + spawn TTL.
 //!
-//! `finalize_create` reaches the designated-legacy
-//! `start_governance_timeout_task_legacy` via the shim escape (see
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor))
-//! because that helper iterates the contexts `DashMap` and stays
-//! legacy-shape until the per-context governance-timeout actor lands.
+//! `finalize_create` installs the governance-timeout task via
+//! [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task),
+//! which mailboxes
+//! [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask)
+//! to the freshly-spawned per-context actor — no shim escape, no
+//! `DashMap` iteration.
 //!
-//! # Designated-legacy supervisor-scoped iteration helpers
+//! # Supervisor-iterating sweep entry points
 //!
-//! These iterate the contexts `DashMap` and inherently cannot move to
-//! actor-owned shape — they live ONLY in
-//! [`crate::context::lifecycle_helpers_legacy`]:
+//! These iterate the actor registry
+//! ([`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids),
+//! NOT a legacy `contexts` `DashMap`) and dispatch one typed sweep
+//! command per actor through the per-context mailbox. They live in this
+//! module:
 //!
-//! - `restore_all_contexts_legacy`
-//! - `flush_all_contexts_legacy` / `flush_all_contexts_sync_legacy`
-//! - `shutdown_all_contexts_legacy` / `shutdown_all_contexts_sync_legacy`
+//! - [`restore_all_contexts`] (iterates persistence snapshots — no
+//!   actors exist before restore)
+//! - [`flush_all_contexts`] / [`flush_all_contexts_sync`]
+//! - [`shutdown_all_contexts`] / [`shutdown_all_contexts_sync`]
 
 #![allow(clippy::significant_drop_tightening)]
 
@@ -97,10 +101,10 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
 // — type unification, single PerContextState): the prior alias to the
 // legacy struct was deleted alongside the struct itself. Every bootstrap
-// call site now constructs the unified `PerContextState` directly. The
-// contexts DashMap is still the production source of truth — subsequent
-// finalization commits delete the DashMap and route bootstrap through
-// `spawn_actor_with_state`.
+// call site now constructs the unified `PerContextState` directly and
+// hands it to `spawn_actor_with_state`; the spawned actor OWNS the state
+// and registers its handle in the supervisor registry. There is no legacy
+// contexts `DashMap` — the actor registry is the single source of truth.
 
 // ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
@@ -2793,8 +2797,8 @@ pub async fn restore_context(
 // Supervisor-iterating sweep entry points (Phase 2A finalization)
 // ===========================================================================
 //
-// These are the non-legacy replacements for the `_legacy` lifecycle
-// sweep helpers in `lifecycle_helpers_legacy.rs`. Each iterates
+// These replaced the now-deleted legacy lifecycle sweep helpers
+// (the `lifecycle_helpers_legacy` module is gone). Each iterates
 // [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
 // (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
 // and dispatches one typed sweep command per actor via the per-actor
@@ -2806,7 +2810,7 @@ pub async fn restore_context(
 // payload from snapshot and calls `Supervisor::restore_context`,
 // which routes the bootstrap variant through
 // `dispatch_lifecycle_direct` (the only legitimate caller of the
-// bootstrap-shape legacy helpers per ADR-049 §7 allowlist).
+// bootstrap-shape helpers per ADR-049 §7 allowlist).
 //
 // Per-actor sweep bodies live in
 // [`crate::context::actor::handlers::lifecycle`] as `handle_*_actor`
