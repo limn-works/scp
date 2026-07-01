@@ -277,24 +277,24 @@ pub(crate) fn trust_verify_response_on(
 pub(crate) fn verify_participation_requirements_on(
     _bi: &NapiBridgeInstance,
     expected_subject: String,
-    profile_json: String,
     requirements_json: String,
-) -> napi::Result<bool> {
+    profile_json: String,
+) -> napi::Result<()> {
     // Full DID-format validation (matching the PyO3 reference bridge), not just a
     // non-empty check, so all native bridges reject malformed ids identically.
     scp_ffi_common::validate::validate_did(&expected_subject)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
-        .map_err(|e| {
-            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
-        })?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| {
             validation_error(&format!(
                 "failed to parse participation requirements JSON: {e}"
             ))
+        })?;
+
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
+        .map_err(|e| {
+            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
         })?;
 
     let current_time = std::time::SystemTime::now()
@@ -309,7 +309,7 @@ pub(crate) fn verify_participation_requirements_on(
     )
     .map_err(|e| validation_error(&format!("participation admission verification failed: {e}")))?;
 
-    Ok(true)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -593,24 +593,26 @@ mod tests {
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
+        // Malformed JSON in the PROFILE position (now the 3rd arg).
         let bi = test_bi();
         let result = verify_participation_requirements_on(
             &bi,
             "did:key:alice".to_owned(),
-            "not json".to_owned(),
             "[]".to_owned(),
+            "not json".to_owned(),
         );
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        // Malformed JSON in the REQUIREMENTS position (now the 2nd arg).
         let bi = test_bi();
         let result = verify_participation_requirements_on(
             &bi,
             "did:key:alice".to_owned(),
-            "[]".to_owned(),
             "not json".to_owned(),
+            "[]".to_owned(),
         );
         assert!(result.is_err());
     }
@@ -625,7 +627,6 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_ok());
-        assert!(result.unwrap());
     }
 
     #[test]

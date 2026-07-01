@@ -16040,23 +16040,22 @@ public func validateContextParams(paramsJson: String)throws  -> String?  {
  * whose signed `subject_did` equals this value contribute to any threshold,
  * freshness, or distinct-signer accounting — a victim's genuine profiles
  * cannot be replayed to admit a different agent (cross-subject replay).
- * - `profile_json`: JSON array of `ParticipationProfile` objects.
  * - `requirements_json`: JSON array of `RequireParticipation` objects.
+ * - `profile_json`: JSON array of `ParticipationProfile` objects.
  *
- * Uses the current system time for freshness checks. Returns `true` if all
- * requirements are satisfied, throws `ScpError` with a diagnostic message
- * if any requirement fails or if the JSON is malformed.
+ * Uses the current system time for freshness checks. Returns without error
+ * (unit) if all requirements are satisfied, throws `ScpError` with a
+ * diagnostic message if any requirement fails or if the JSON is malformed.
  *
  * See §7.3.2.1.
  */
-public func verifyParticipationRequirements(expectedSubject: String, profileJson: String, requirementsJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+public func verifyParticipationRequirements(expectedSubject: String, requirementsJson: String, profileJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_verify_participation_requirements(
         FfiConverterString.lower(expectedSubject),
-        FfiConverterString.lower(profileJson),
-        FfiConverterString.lower(requirementsJson),$0
+        FfiConverterString.lower(requirementsJson),
+        FfiConverterString.lower(profileJson),$0
     )
-})
+}
 }
 
 private enum InitializationResult {
@@ -16215,7 +16214,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_validate_context_params() != 15089) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_verify_participation_requirements() != 45028) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_verify_participation_requirements() != 31703) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_context_id() != 2375) {

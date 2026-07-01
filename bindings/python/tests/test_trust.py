@@ -837,8 +837,9 @@ class TestVerifyParticipationRequirements:
         import json
 
         assert call_args[0][0] == "did:dht:zAlice"
-        profiles_json = json.loads(call_args[0][1])
-        reqs_json = json.loads(call_args[0][2])
+        # Bridge arg order is (expected_subject, requirements_json, profile_json).
+        reqs_json = json.loads(call_args[0][1])
+        profiles_json = json.loads(call_args[0][2])
 
         assert profiles_json[0]["subject_did"] == "did:dht:zAlice"
         assert profiles_json[0]["governance_actions_against"] == 1

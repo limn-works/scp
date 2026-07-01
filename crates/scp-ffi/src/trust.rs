@@ -252,13 +252,13 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 ///   whose signed `subject_did` equals this value contribute to any threshold,
 ///   freshness, or distinct-signer accounting — a victim's genuine profiles
 ///   cannot be replayed to admit a different agent (cross-subject replay).
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `Ok(true)` on
-/// success. The Python SDK wrapper discards the return value — success is
-/// indicated by returning without exception. Raises `ScpError` with a
-/// diagnostic message if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement fails or if the JSON
+/// is malformed.
 ///
 /// See §7.3.2.1.
 ///
@@ -271,17 +271,10 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 #[pyo3(name = "verify_participation_requirements")]
 pub fn py_verify_participation_requirements(
     expected_subject: &str,
-    profile_json: &str,
     requirements_json: &str,
-) -> PyResult<bool> {
+    profile_json: &str,
+) -> PyResult<()> {
     validate::validate_did(expected_subject)?;
-
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
-        .map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse participation profiles JSON: {e}"
-        ))
-    })?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(requirements_json).map_err(|e| {
@@ -289,6 +282,13 @@ pub fn py_verify_participation_requirements(
                 "failed to parse participation requirements JSON: {e}"
             ))
         })?;
+
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
+        .map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse participation profiles JSON: {e}"
+        ))
+    })?;
 
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -306,7 +306,7 @@ pub fn py_verify_participation_requirements(
         ))
     })?;
 
-    Ok(true)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -944,13 +944,15 @@ mod tests {
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
-        let result = py_verify_participation_requirements("did:key:alice", "not json", "[]");
+        // Malformed JSON in the PROFILE position (now the 3rd arg).
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "not json");
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
-        let result = py_verify_participation_requirements("did:key:alice", "[]", "not json");
+        // Malformed JSON in the REQUIREMENTS position (now the 2nd arg).
+        let result = py_verify_participation_requirements("did:key:alice", "not json", "[]");
         assert!(result.is_err());
     }
 
@@ -959,7 +961,6 @@ mod tests {
         // Empty requirements = no constraints = always passes.
         let result = py_verify_participation_requirements("did:key:alice", "[]", "[]");
         assert!(result.is_ok());
-        assert!(result.unwrap());
     }
 
     #[test]

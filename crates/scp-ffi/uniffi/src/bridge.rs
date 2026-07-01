@@ -6350,34 +6350,34 @@ pub fn trust_verify_response(
 ///   whose signed `subject_did` equals this value contribute to any threshold,
 ///   freshness, or distinct-signer accounting — a victim's genuine profiles
 ///   cannot be replayed to admit a different agent (cross-subject replay).
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `true` if all
-/// requirements are satisfied, throws `ScpError` with a diagnostic message
-/// if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns without error
+/// (unit) if all requirements are satisfied, throws `ScpError` with a
+/// diagnostic message if any requirement fails or if the JSON is malformed.
 ///
 /// See §7.3.2.1.
 #[uniffi::export]
 pub fn verify_participation_requirements(
     expected_subject: String,
-    profile_json: String,
     requirements_json: String,
-) -> Result<bool, ScpError> {
+    profile_json: String,
+) -> Result<(), ScpError> {
     // Full DID-format validation (matching the PyO3 reference bridge), not just a
     // non-empty check, so all native bridges reject malformed ids identically.
     validate_did(&expected_subject)?;
-
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse participation profiles JSON: {e}"),
-            code: codes::VALID_7030.to_owned(),
-        })?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse participation requirements JSON: {e}"),
             code: codes::VALID_7031.to_owned(),
+        })?;
+
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse participation profiles JSON: {e}"),
+            code: codes::VALID_7030.to_owned(),
         })?;
 
     let current_time = std::time::SystemTime::now()
@@ -6395,7 +6395,7 @@ pub fn verify_participation_requirements(
         code: codes::VALID_7032.to_owned(),
     })?;
 
-    Ok(true)
+    Ok(())
 }
 
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a

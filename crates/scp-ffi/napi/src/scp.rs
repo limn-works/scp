@@ -3507,14 +3507,14 @@ impl Scp {
     pub fn verify_participation_requirements(
         &self,
         expected_subject: String,
-        profile_json: String,
         requirements_json: String,
-    ) -> napi::Result<bool> {
+        profile_json: String,
+    ) -> napi::Result<()> {
         crate::trust::verify_participation_requirements_on(
             &self.inner,
             expected_subject,
-            profile_json,
             requirements_json,
+            profile_json,
         )
     }
 

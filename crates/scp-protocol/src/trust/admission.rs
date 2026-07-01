@@ -65,6 +65,20 @@ pub enum AdmissionError {
         /// The capability URI that needs challenge verification.
         uri: String,
     },
+
+    /// `subject_did` was empty.
+    ///
+    /// An empty subject is invalid input, not a "no match" condition: a
+    /// [`ChallengeVerification`] can only satisfy a requirement when its signed
+    /// `subject_did` equals this value, so an empty subject could only ever be
+    /// matched by a record bound to `""`. Reject it up front at the trust
+    /// boundary — mirroring [`ParticipationAdmissionError::EmptyExpectedSubject`]
+    /// in the sibling `verify_participation_requirements` — so a future
+    /// core/runtime caller cannot bypass the subject-binding invariant.
+    ///
+    /// [`ParticipationAdmissionError::EmptyExpectedSubject`]: crate::trust::ParticipationAdmissionError::EmptyExpectedSubject
+    #[error("subject_did must not be empty")]
+    EmptySubjectDid,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +145,15 @@ pub fn check_capability_requirements(
     resolver: &(impl DidPublicKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
 ) -> Result<(), AdmissionError> {
+    // Reject an empty subject up front: it is invalid input, not a "no match"
+    // condition. A ChallengeVerification only satisfies a requirement when its
+    // signed `subject_did` equals `subject_did`, so an empty subject could only
+    // ever be matched by a record bound to "" — reject it here at the trust
+    // boundary (mirrors the sibling `verify_participation_requirements`).
+    if subject_did.is_empty() {
+        return Err(AdmissionError::EmptySubjectDid);
+    }
+
     // Verify-on-use: a caller-supplied ChallengeVerification only counts if the
     // verifier's signature is authentic AND the record is bound to this context
     // and unexpired. Verify all up front (mirrors
@@ -281,6 +304,15 @@ mod tests {
         let (resolver, clock) = resolver_and_clock();
         let result = check_capability_requirements(&[], &[], &[], CTX, SUBJECT, &resolver, &clock);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_subject_is_rejected() {
+        // An empty subject is invalid input, rejected up front at the trust
+        // boundary — even with empty requirements (which would otherwise pass).
+        let (resolver, clock) = resolver_and_clock();
+        let result = check_capability_requirements(&[], &[], &[], CTX, "", &resolver, &clock);
+        assert!(matches!(result, Err(AdmissionError::EmptySubjectDid)));
     }
 
     #[test]

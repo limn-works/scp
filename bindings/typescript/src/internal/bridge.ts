@@ -682,9 +682,9 @@ export interface Bridge {
   // Trust — participation verification (SCP-BA-004, §7.3.2.1)
   verifyParticipationRequirements(
     expectedSubject: string,
-    profileJson: string,
     requirementsJson: string,
-  ): boolean;
+    profileJson: string,
+  ): void;
 
   // Lifecycle
   version(): string;

@@ -1082,7 +1082,7 @@ def verify_participation_requirements(
     profile_json = json.dumps([p._to_bridge_dict() for p in profiles])
     requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
-    bridge.verify_participation_requirements(expected_subject, profile_json, requirements_json)
+    bridge.verify_participation_requirements(expected_subject, requirements_json, profile_json)
 
 
 __all__ = [

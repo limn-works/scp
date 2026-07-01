@@ -1909,17 +1909,21 @@ class SCP internal constructor(
      * profiles whose signed `subject_did` equals it contribute to any
      * threshold, freshness, or distinct-signer accounting, closing
      * cross-subject participation-profile replay.
+     *
+     * Returns normally when all requirements are satisfied; the bridge
+     * throws on any failed requirement or malformed JSON.
      */
     fun verifyParticipationRequirements(
         expectedSubject: String,
-        profileJson: String,
         requirementsJson: String,
-    ): Boolean =
+        profileJson: String,
+    ) {
         uniffi.scp.verifyParticipationRequirements(
             expectedSubject = expectedSubject,
-            profileJson = profileJson,
             requirementsJson = requirementsJson,
+            profileJson = profileJson,
         )
+    }
 
     companion object {
         /**

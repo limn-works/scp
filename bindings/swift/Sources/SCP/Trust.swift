@@ -2,7 +2,7 @@ import Foundation
 
 // The UniFFI bridge (`crates/scp-ffi/uniffi/src/bridge.rs`) exports the raw
 // trust-signal ops this file wraps idiomatically:
-//   - `ucanEvaluate(handle:token:presentingAgentDid:capability:proofTokens:)`
+//   - `ucanEvaluate(handle:token:capability:presentingAgentDid:proofTokens:)`
 //     returns the typed `CapabilityValidationRecord` (six per-stage booleans).
 //   - `participationRecord(contextId:subjectDid:cachedAttestationsJson:)`
 //     returns the typed `ParticipationRecordView` (the twelve §7.3.2 facts).
