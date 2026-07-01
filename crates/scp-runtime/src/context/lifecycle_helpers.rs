@@ -3516,124 +3516,6 @@ mod restore_reconcile_tests {
         }
     }
 
-    /// A `PaymentAdapter` that records whether `capture` or `void` was invoked,
-    /// so the money-ordering test can assert the escrow was VOIDED (not
-    /// captured) when the fail-closed persist fails. (Implementing the
-    /// non-dyn `PaymentAdapter` trait yields `PaymentAdapterDyn` via the
-    /// blanket impl.)
-    struct RecordingPaymentAdapter {
-        captured: Arc<std::sync::atomic::AtomicUsize>,
-        voided: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
-        fn adapter_id(&self) -> &str {
-            "recording"
-        }
-        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-            crate::economy::adapter::AdapterCapabilities {
-                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
-                supports_streaming: false,
-                supports_batch_auth: false,
-                supports_single_step: false,
-                min_amount: None,
-                max_amount: None,
-                typical_settlement_ms: 0,
-                requires_facilitator: false,
-            }
-        }
-        async fn authorize(
-            &self,
-            payer: &DID,
-            payee: &DID,
-            amount: scp_protocol::economy::types::Amount,
-            currency: scp_protocol::economy::types::CurrencyCode,
-            _metadata: crate::economy::adapter::PaymentMetadata,
-        ) -> Result<
-            crate::economy::adapter::PaymentAuthorization,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::PaymentAuthorization {
-                auth_id: [7u8; 32],
-                payer: payer.clone(),
-                payee: payee.clone(),
-                amount,
-                currency,
-                adapter_id: "recording".to_owned(),
-                created_at: 1_000_000,
-                expires_at: 2_000_000,
-                adapter_state: vec![],
-            })
-        }
-        async fn capture(
-            &self,
-            auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
-        {
-            self.captured
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::economy::adapter::PaymentReceipt {
-                receipt_id: [9u8; 32],
-                payer: auth.payer.clone(),
-                payee: auth.payee.clone(),
-                amount: auth.amount,
-                currency: auth.currency,
-                action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
-                context_id: None,
-                adapter_id: "recording".to_owned(),
-                adapter_proof: vec![],
-                timestamp: 1_000_001,
-                anchored: false,
-                signature: vec![],
-            })
-        }
-        async fn void(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            self.voided
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        async fn verify_authorization(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            Ok(())
-        }
-        async fn verify(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-        ) -> Result<
-            crate::economy::adapter::VerificationResult,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::VerificationResult {
-                valid: true,
-                adapter_id: "recording".to_owned(),
-                verified_amount: scp_protocol::economy::types::Amount(0),
-                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                verification_timestamp: 1_000_002,
-            })
-        }
-        async fn refund(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-            _amount: Option<scp_protocol::economy::types::Amount>,
-        ) -> Result<
-            crate::economy::adapter::RefundConfirmation,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::RefundConfirmation {
-                refund_id: [0u8; 32],
-                original_receipt_id: [9u8; 32],
-                refunded_amount: scp_protocol::economy::types::Amount(0),
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                adapter_proof: vec![],
-            })
-        }
-    }
-
     /// Derive a `did:key` DID + matching signing key (the same convention the
     /// FFI tool-economy harness uses), so a `key_resolver` can resolve the
     /// issuer's verifying key for spending-UCAN signature verification.
@@ -3754,7 +3636,7 @@ mod restore_reconcile_tests {
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(RecordingPaymentAdapter {
+            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
                 captured: Arc::clone(&captured),
                 voided: Arc::clone(&voided),
             });
@@ -4126,7 +4008,7 @@ mod restore_reconcile_tests {
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(RecordingPaymentAdapter {
+            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
                 captured: Arc::clone(&captured),
                 voided: Arc::clone(&voided),
             });
