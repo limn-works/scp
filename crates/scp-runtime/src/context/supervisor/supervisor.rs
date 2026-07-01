@@ -5722,6 +5722,57 @@ impl Supervisor {
         }
     }
 
+    /// Drain the residual held Prepare-A reservation at a saga terminal
+    /// (spec §6.2.4 "`NeedsRepair` reservation semantics"). Extracted verbatim
+    /// from the [`Self::run_saga`] tail so the caller-side escrow-drain branch
+    /// is exercisable in isolation with a NON-EMPTY escrow (the live Prepare-A
+    /// stages an escrow-`None` ticket, which makes hold and void observationally
+    /// identical).
+    ///
+    /// * `reached_needs_repair == true` — HOLD the escrow reserved for operator
+    ///   repair. The [`ToolEconomyReservation`]'s `#[must_use]` drop guard would
+    ///   normally fire on an unbalanced drop, so
+    ///   [`hold_external_for_repair`](crate::context::tools_helpers::ToolEconomyTicket::hold_external_for_repair)
+    ///   marks the carrier consumed WITHOUT voiding the external escrow (the
+    ///   operation may have partially committed — B executed and charged — so
+    ///   auto-voiding here would be a free-execution exploit).
+    /// * otherwise — the held Prepare-A reservation survived to a terminal
+    ///   without a Commit-A settle, so void the external escrow and consume the
+    ///   ticket (NEVER drop it unbalanced).
+    async fn drain_terminal_reservation(
+        &self,
+        saga_id: &SagaId,
+        reached_needs_repair: bool,
+        prepared_a: &mut Option<crate::context::actor::commands::PreparedAFields>,
+    ) {
+        if reached_needs_repair {
+            // Leave the reservation HELD for operator repair. The
+            // `ToolEconomyReservation`'s `#[must_use]` drop guard would
+            // normally fire on an unbalanced drop, so settle it as a
+            // divergence-held escrow that defers to operator repair rather
+            // than releasing or consuming it.
+            if let Some(reservation) = prepared_a.take() {
+                reservation.reservation.ticket.hold_external_for_repair();
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    "cross-context saga NeedsRepair — Prepare-A escrow held for operator \
+                     repair (NOT auto-voided; settled by the divergence marker + operator)"
+                );
+            }
+        } else if let Some(reservation) = prepared_a.take() {
+            reservation
+                .reservation
+                .ticket
+                .void_external_and_consume(self.payment_adapter_ref())
+                .await;
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                "cross-context saga — held Prepare-A reservation survived to terminal without \
+                 a Commit-A settle; voided the external escrow and consumed the ticket"
+            );
+        }
+    }
+
     /// Shared start-saga driver: run the FSM under an ALREADY-acquired
     /// participant-context-set reservation (ADR-049 §3a — the per-set gating
     /// reservation is acquired by each public entry point via
@@ -5777,32 +5828,12 @@ impl Supervisor {
         // concurrency slot is still released — `_reservation` drops on scope
         // exit regardless.)
         if let Some(ctx) = xctx.as_mut() {
-            if ctx.reached_needs_repair {
-                // Leave the reservation HELD for operator repair. The
-                // `ToolEconomyReservation`'s `#[must_use]` drop guard would
-                // normally fire on an unbalanced drop, so settle it as a
-                // divergence-held escrow that defers to operator repair rather
-                // than releasing or consuming it.
-                if let Some(reservation) = ctx.prepared_a.take() {
-                    reservation.reservation.ticket.hold_external_for_repair();
-                    tracing::error!(
-                        saga_id = %saga_id.0,
-                        "cross-context saga NeedsRepair — Prepare-A escrow held for operator \
-                         repair (NOT auto-voided; settled by the divergence marker + operator)"
-                    );
-                }
-            } else if let Some(reservation) = ctx.prepared_a.take() {
-                reservation
-                    .reservation
-                    .ticket
-                    .void_external_and_consume(self.payment_adapter_ref())
-                    .await;
-                tracing::warn!(
-                    saga_id = %saga_id.0,
-                    "cross-context saga — held Prepare-A reservation survived to terminal without \
-                     a Commit-A settle; voided the external escrow and consumed the ticket"
-                );
-            }
+            self.drain_terminal_reservation(
+                &saga_id,
+                ctx.reached_needs_repair,
+                &mut ctx.prepared_a,
+            )
+            .await;
         }
 
         // Whether the FSM drove the saga to `NeedsRepair` (commit-retry
@@ -21258,6 +21289,283 @@ mod tests {
         ticket.hold_external_for_repair();
         // Reaching here without a drop-guard panic proves the carrier was marked
         // consumed (held for repair), not leaked.
+    }
+
+    /// A payment adapter that counts `void` calls via a shared
+    /// [`AtomicUsize`](std::sync::atomic::AtomicUsize). The escrow-drain path's
+    /// only externally-observable difference between HOLD and VOID is whether it
+    /// reaches `void_dyn` → [`PaymentAdapter::void`]; this adapter records that
+    /// so the two branches are distinguishable with a NON-EMPTY escrow. Every
+    /// other method is an inert success.
+    struct EscrowVoidCountingAdapter {
+        voids: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::economy::adapter::PaymentAdapter for EscrowVoidCountingAdapter {
+        fn adapter_id(&self) -> &'static str {
+            "void-counting"
+        }
+        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+            crate::economy::adapter::AdapterCapabilities {
+                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
+                supports_streaming: false,
+                supports_batch_auth: false,
+                supports_single_step: false,
+                min_amount: None,
+                max_amount: None,
+                typical_settlement_ms: 0,
+                requires_facilitator: false,
+            }
+        }
+        async fn authorize(
+            &self,
+            payer: &DID,
+            payee: &DID,
+            amount: scp_protocol::economy::types::Amount,
+            currency: scp_protocol::economy::types::CurrencyCode,
+            _metadata: crate::economy::adapter::PaymentMetadata,
+        ) -> Result<
+            crate::economy::adapter::PaymentAuthorization,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(void_counting_auth(payer, payee, amount, currency))
+        }
+        async fn verify_authorization(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            Ok(())
+        }
+        async fn capture(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+        {
+            Err(crate::economy::adapter::PaymentError::AdapterError(
+                "capture not exercised by the drain path".into(),
+            ))
+        }
+        async fn void(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            self.voids.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn verify(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+        ) -> Result<
+            crate::economy::adapter::VerificationResult,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::VerificationResult {
+                valid: true,
+                adapter_id: "void-counting".to_owned(),
+                verified_amount: scp_protocol::economy::types::Amount(0),
+                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                verification_timestamp: 0,
+            })
+        }
+        async fn refund(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+            _amount: Option<scp_protocol::economy::types::Amount>,
+        ) -> Result<
+            crate::economy::adapter::RefundConfirmation,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::RefundConfirmation {
+                refund_id: [0u8; 32],
+                original_receipt_id: [0u8; 32],
+                refunded_amount: scp_protocol::economy::types::Amount(0),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_proof: vec![],
+            })
+        }
+    }
+
+    fn void_counting_auth(
+        payer: &DID,
+        payee: &DID,
+        amount: scp_protocol::economy::types::Amount,
+        currency: scp_protocol::economy::types::CurrencyCode,
+    ) -> crate::economy::adapter::PaymentAuthorization {
+        crate::economy::adapter::PaymentAuthorization {
+            auth_id: [9u8; 32],
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount,
+            currency,
+            adapter_id: "void-counting".to_owned(),
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+            adapter_state: vec![],
+        }
+    }
+
+    /// A supervisor whose `payment_adapter_ref()` returns a
+    /// [`EscrowVoidCountingAdapter`] wired over the shared counter, so the REAL
+    /// `drain_terminal_reservation` void path is observable.
+    fn supervisor_with_void_counter(
+        voids: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkDrainTerminal".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        let key_resolver: KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let payment_adapter: Arc<dyn PaymentAdapterDyn> = Arc::new(EscrowVoidCountingAdapter {
+            voids: Arc::clone(voids),
+        });
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage,
+        )
+    }
+
+    /// Build a real `PreparedAFields` carrying a `#[must_use]` escrow-BEARING
+    /// ticket (`escrow: Some(..)` with a live `PaymentAuthorization`), so the
+    /// drain path's void reaches the adapter — unlike the live Prepare-A, which
+    /// stages an escrow-`None` ticket (making hold and void indistinguishable).
+    fn build_prepared_a_fields_with_escrow_for_test()
+    -> crate::context::actor::commands::PreparedAFields {
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, PaidActionType};
+
+        let invoker = DID("did:example:xctx-drain-escrow".to_owned());
+        let payee = DID("did:example:xctx-drain-payee".to_owned());
+        let handle = crate::context::ContextHandle::new(
+            "ctx-drain-escrow".to_owned(),
+            ContextParams::default(),
+        );
+        let role_state = ContextRoleState::new(
+            "ctx-drain-escrow",
+            "did:example:xctx-drain-escrow",
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        let policy = scp_protocol::economy::types::EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: Some(Amount(50)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["void-counting".to_owned()],
+            pricing_formula: None,
+            payee: payee.clone(),
+        };
+        let escrow = crate::economy::integration::PreparedAction {
+            envelope: crate::economy::integration::ActionEnvelope {
+                actor: invoker.clone(),
+                action_type: PaidActionType::ToolInvoke,
+                context_id: None,
+                authorization: Some(void_counting_auth(
+                    &invoker,
+                    &payee,
+                    Amount(50),
+                    CurrencyCode::from("USD"),
+                )),
+                payload: Vec::new(),
+            },
+            evaluated_cost: Amount(50),
+        };
+        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_with_escrow(
+            invoker, escrow, policy,
+        );
+        let reservation = crate::context::tools_helpers::ToolEconomyReservation {
+            handle,
+            role_state,
+            generation: 1,
+            ticket,
+        };
+        crate::context::actor::commands::PreparedAFields { reservation }
+    }
+
+    /// `drain_terminal_reservation` with `reached_needs_repair == true` HOLDS the
+    /// caller-side external escrow (anti-free-execution, spec §6.2.4 "`NeedsRepair`
+    /// reservation semantics"): the recording adapter's void counter stays 0 (the
+    /// escrow is NOT voided), and the `#[must_use]` ticket is still marked consumed
+    /// so no unbalanced-drop guard fires. Exercised with a NON-EMPTY escrow so
+    /// HOLD is observationally distinct from VOID.
+    #[tokio::test]
+    async fn drain_terminal_reservation_needs_repair_holds_escrow() {
+        let voids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = supervisor_with_void_counter(&voids);
+        let mut prepared_a = Some(build_prepared_a_fields_with_escrow_for_test());
+
+        supervisor
+            .drain_terminal_reservation(
+                &SagaId("saga-drain-needs-repair".to_owned()),
+                true,
+                &mut prepared_a,
+            )
+            .await;
+
+        assert!(
+            prepared_a.is_none(),
+            "the carrier is taken (consumed) so its #[must_use] drop guard does not fire"
+        );
+        assert_eq!(
+            voids.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "NeedsRepair must HOLD the external escrow for operator repair — auto-voiding a \
+             partially-committed saga's escrow would be a free-execution exploit"
+        );
+    }
+
+    /// `drain_terminal_reservation` with `reached_needs_repair == false` VOIDS the
+    /// caller-side external escrow (a held Prepare-A reservation survived to a
+    /// terminal without a Commit-A settle): the recording adapter's void counter
+    /// is 1. The mirror of the HOLD test above, proving the branch is the ONLY
+    /// difference and that the escrow is genuinely non-empty (a `None`-escrow
+    /// ticket would leave the counter at 0 on BOTH branches).
+    #[tokio::test]
+    async fn drain_terminal_reservation_non_needs_repair_voids_escrow() {
+        let voids = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = supervisor_with_void_counter(&voids);
+        let mut prepared_a = Some(build_prepared_a_fields_with_escrow_for_test());
+
+        supervisor
+            .drain_terminal_reservation(
+                &SagaId("saga-drain-terminal-void".to_owned()),
+                false,
+                &mut prepared_a,
+            )
+            .await;
+
+        assert!(
+            prepared_a.is_none(),
+            "the carrier is taken (consumed) so its #[must_use] drop guard does not fire"
+        );
+        assert_eq!(
+            voids.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-NeedsRepair terminal with a held reservation must VOID the external escrow \
+             exactly once (never drop the ticket unbalanced)"
+        );
     }
 
     /// Build a real `PreparedAFields` carrying a `#[must_use]` no-escrow ticket —
