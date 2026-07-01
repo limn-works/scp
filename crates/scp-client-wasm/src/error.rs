@@ -26,9 +26,9 @@ use wasm_bindgen::JsValue;
 /// Stable error-code prefix for each [`ClientError`] category.
 ///
 /// The numbers slot into the cross-SDK ranges documented in
-/// `.docs/standards/sdk-common.md` (`SCP-CTX-2xxx` context, `SCP-CRYPTO-4xxx`
-/// crypto, `SCP-VALID-7xxx` validation). They are part of the public JS error
-/// contract — append new variants, never renumber existing ones.
+/// `.docs/standards/sdk-common.md` (CTX 2000-2999, CRYPTO 4000-4999,
+/// VALID 7000-7999). They are part of the public JS error contract —
+/// append new variants, never renumber existing ones.
 ///
 /// This is a pure `&ClientError -> &str` mapping with no `JsValue` dependency,
 /// so it is testable on the native host (where `JsValue` construction aborts —
