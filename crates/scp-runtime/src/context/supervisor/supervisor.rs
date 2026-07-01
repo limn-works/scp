@@ -21291,99 +21291,6 @@ mod tests {
         // consumed (held for repair), not leaked.
     }
 
-    /// A payment adapter that counts `void` calls via a shared
-    /// [`AtomicUsize`](std::sync::atomic::AtomicUsize). The escrow-drain path's
-    /// only externally-observable difference between HOLD and VOID is whether it
-    /// reaches `void_dyn` → [`PaymentAdapter::void`]; this adapter records that
-    /// so the two branches are distinguishable with a NON-EMPTY escrow. Every
-    /// other method is an inert success.
-    struct EscrowVoidCountingAdapter {
-        voids: Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl crate::economy::adapter::PaymentAdapter for EscrowVoidCountingAdapter {
-        fn adapter_id(&self) -> &'static str {
-            "void-counting"
-        }
-        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-            crate::economy::adapter::AdapterCapabilities {
-                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
-                supports_streaming: false,
-                supports_batch_auth: false,
-                supports_single_step: false,
-                min_amount: None,
-                max_amount: None,
-                typical_settlement_ms: 0,
-                requires_facilitator: false,
-            }
-        }
-        async fn authorize(
-            &self,
-            payer: &DID,
-            payee: &DID,
-            amount: scp_protocol::economy::types::Amount,
-            currency: scp_protocol::economy::types::CurrencyCode,
-            _metadata: crate::economy::adapter::PaymentMetadata,
-        ) -> Result<
-            crate::economy::adapter::PaymentAuthorization,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(void_counting_auth(payer, payee, amount, currency))
-        }
-        async fn verify_authorization(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            Ok(())
-        }
-        async fn capture(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
-        {
-            Err(crate::economy::adapter::PaymentError::AdapterError(
-                "capture not exercised by the drain path".into(),
-            ))
-        }
-        async fn void(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            self.voids.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        async fn verify(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-        ) -> Result<
-            crate::economy::adapter::VerificationResult,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::VerificationResult {
-                valid: true,
-                adapter_id: "void-counting".to_owned(),
-                verified_amount: scp_protocol::economy::types::Amount(0),
-                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                verification_timestamp: 0,
-            })
-        }
-        async fn refund(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-            _amount: Option<scp_protocol::economy::types::Amount>,
-        ) -> Result<
-            crate::economy::adapter::RefundConfirmation,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::RefundConfirmation {
-                refund_id: [0u8; 32],
-                original_receipt_id: [0u8; 32],
-                refunded_amount: scp_protocol::economy::types::Amount(0),
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                adapter_proof: vec![],
-            })
-        }
-    }
-
     fn void_counting_auth(
         payer: &DID,
         payee: &DID,
@@ -21403,8 +21310,9 @@ mod tests {
         }
     }
 
-    /// A supervisor whose `payment_adapter_ref()` returns a
-    /// [`EscrowVoidCountingAdapter`] wired over the shared counter, so the REAL
+    /// A supervisor whose `payment_adapter_ref()` returns a shared
+    /// [`CountingPaymentAdapter`](crate::economy::adapter::CountingPaymentAdapter)
+    /// wired over the shared void counter, so the REAL
     /// `drain_terminal_reservation` void path is observable.
     fn supervisor_with_void_counter(
         voids: &Arc<std::sync::atomic::AtomicUsize>,
@@ -21423,9 +21331,11 @@ mod tests {
                     InMemoryStorage::new(),
                 )),
             );
-        let payment_adapter: Arc<dyn PaymentAdapterDyn> = Arc::new(EscrowVoidCountingAdapter {
-            voids: Arc::clone(voids),
-        });
+        let payment_adapter: Arc<dyn PaymentAdapterDyn> =
+            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
+                voided: Arc::clone(voids),
+                ..Default::default()
+            });
         Supervisor::with_providers(
             crypto,
             transport,
