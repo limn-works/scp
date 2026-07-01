@@ -7003,11 +7003,21 @@ impl Supervisor {
                 if let Some(ctx) = xctx.as_deref_mut() {
                     ctx.reached_needs_repair = true;
                 }
-                self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
-                    .await?;
-                // §17.16.4 operator-alerting metric: a saga reached the
-                // NeedsRepair terminal and requires operator repair.
+                // §17.16.4 operator-alerting metric. Fire it HERE — on the
+                // in-memory divergence determination, BEFORE the fallible
+                // NeedsRepair append below. The divergence is a FACT the instant
+                // `commit_with_retry` exhausts; recording the metric only AFTER
+                // the append's `?` meant a compound fault (divergence AND a
+                // failed durable NeedsRepair append) short-circuited past this
+                // call, skipping the live operator alert until a later reopen
+                // re-derived it. UNCONDITIONAL (not gated on `xctx`) so the
+                // executor-less `TestForceNeedsRepair` path still fires it.
                 crate::metrics::record_saga_repair_needed();
+                self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
+                    .await
+                    .inspect_err(|append_err| {
+                        tracing::error!(saga_id = %saga_id, commit_error = %err, error = %append_err, "cross-context saga NeedsRepair — COMPOUND FAULT: the repair-need was recorded in-memory (metric fired; boundary lifts NeedsRepair) but the durable NeedsRepair journal append FAILED; the divergence is deferred to recover_committing_entry re-derivation on next supervisor open");
+                    })?;
                 tracing::error!(
                     saga_id = %saga_id,
                     %err,
@@ -16659,6 +16669,30 @@ mod tests {
             .await
     }
 
+    /// Cumulative read of the `scp_saga_repair_needed_total` operator counter
+    /// from a `DebuggingRecorder` snapshot. `snapshot()` is non-destructive and
+    /// the counter is cumulative, so intermediate reads pin the per-variant
+    /// increment (mutation-distinguishing) rather than inferring it from a bare
+    /// final total.
+    fn snapshot_repair_needed_total(snap: &metrics_util::debugging::Snapshotter) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .iter()
+            .find_map(|(ck, _, _, v)| {
+                if ck.key().name() == "scp_saga_repair_needed_total" {
+                    if let DebugValue::Counter(c) = v {
+                        Some(*c)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
     /// LIVE Err-arm coverage (spec §6.2.4 "commit_with_retry exhausts (3×) →
     /// NeedsRepair"): a real two-actor cross-context saga whose Commit-B settle
     /// persist ALWAYS fails drives `commit_with_retry` to exhaust its budget and
@@ -16673,7 +16707,11 @@ mod tests {
     ///   `NeedsRepair` append, yet the lift STILL returns `NeedsRepair` (the FSM
     ///   set `reached_needs_repair = true` BEFORE the fallible append), and the
     ///   durable journal stays at `Committing` — proving the terminal
-    ///   classification is independent of the journal append's success.
+    ///   classification is independent of the journal append's success. The
+    ///   `scp_saga_repair_needed_total` operator metric STILL fires for this
+    ///   variant too: it is recorded on the in-memory divergence determination
+    ///   BEFORE the fallible append, so a compound fault (divergence + failed
+    ///   durable append) does not suppress the live operator alert.
     ///
     /// What this test deliberately does NOT assert: that the caller-side
     /// Prepare-A external escrow is HELD (not auto-voided) on the `NeedsRepair`
@@ -16694,7 +16732,7 @@ mod tests {
     /// parallel test binary).
     #[test]
     fn xctx_saga_err_arm_commit_exhaustion_lifts_needs_repair() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -16738,6 +16776,13 @@ mod tests {
                     crate::context::supervisor::saga_journal::SagaState::NeedsRepair,
                     "the durable journal must record the NeedsRepair terminal, got {entry:?}"
                 );
+                // Per-variant pin: variant 1's SUCCESSFUL NeedsRepair append
+                // fired the operator metric, so the cumulative counter is 1 now.
+                assert_eq!(
+                    snapshot_repair_needed_total(&snapshotter),
+                    1,
+                    "variant 1 (journal-ok) must fire the operator metric exactly once by now"
+                );
 
                 // Variant 2: a FailingSagaJournal faults the seq-4 NeedsRepair
                 // append; the lift STILL returns NeedsRepair (reached_needs_repair
@@ -16779,32 +16824,38 @@ mod tests {
                     "with the NeedsRepair append faulted, the durable latest entry stays at \
                      Committing, got {entry2:?}"
                 );
+                // Per-variant pin — the crux of this fix: variant 2's FAULTED
+                // NeedsRepair append STILL fired the operator metric, because it
+                // is recorded on the in-memory divergence determination BEFORE
+                // the fallible append. The cumulative counter therefore advances
+                // to 2. A regression that moved the metric back after the append
+                // would leave this at 1.
+                assert_eq!(
+                    snapshot_repair_needed_total(&snapshotter),
+                    2,
+                    "variant 2's FAULTED NeedsRepair append must STILL fire the operator metric \
+                     (recorded on the in-memory divergence, before the fallible append), \
+                     bringing the cumulative total to 2"
+                );
             });
         });
 
-        // The operator-alerting metric fired for the diverged saga EXACTLY once.
-        // Only variant 1 increments it: `record_saga_repair_needed()` runs after its
-        // successful `NeedsRepair` append. Variant 2 faults the seq-4 NeedsRepair
-        // journal append (via `?`) BEFORE the metric call, so it legitimately never
-        // fires there. The exact total across both variants is therefore 1 — `== 1`
-        // is the precise, mutation-distinguishing assertion: it additionally pins
-        // variant 2's "metric never fires when the NeedsRepair append faults"
-        // invariant, which a `>= 1` threshold would miss.
-        let snapshot = snapshotter.snapshot().into_vec();
-        let count = snapshot.iter().find_map(|(ck, _, _, v)| {
-            if ck.key().name() == "scp_saga_repair_needed_total" {
-                if let DebugValue::Counter(c) = v {
-                    Some(*c)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
-        assert!(
-            count.is_some_and(|c| c == 1),
-            "a NeedsRepair terminal must increment scp_saga_repair_needed_total exactly once; snapshot={snapshot:?}"
+        // The operator-alerting metric fired for the diverged saga EXACTLY twice
+        // — once per variant, INCLUDING variant 2 whose NeedsRepair append
+        // faulted. Both variants increment it because the metric fires on the
+        // in-memory divergence determination BEFORE the fallible NeedsRepair
+        // append: the divergence is a fact the instant commit-retry exhausts, so
+        // recording it does not depend on the durable append succeeding. Variant
+        // 2 proves the core guarantee — the live operator alert fires even when
+        // the durable NeedsRepair append faults (a compound fault). `== 2` is the
+        // precise, mutation-distinguishing assertion; a regression that moved the
+        // metric back after the append would leave this at 1.
+        let count = snapshot_repair_needed_total(&snapshotter);
+        assert_eq!(
+            count, 2,
+            "a NeedsRepair terminal must increment scp_saga_repair_needed_total once per variant \
+             (2 total), INCLUDING variant 2 whose NeedsRepair append faulted (the metric now \
+             reflects the in-memory divergence, recorded before the fallible append); got {count}"
         );
     }
 
