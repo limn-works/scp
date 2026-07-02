@@ -23,7 +23,18 @@
 # fence by the `wasm32-unknown-unknown` compile job, and the banned-dependency
 # rules by `scripts/check-protocol-deps.sh`. This gate catches the obvious,
 # common shim spellings early; it is defense-in-depth, not the guarantee.
+#
+# Implicit coupling (documented so it is revisited, not silently relied on):
+# the canonical single-line `pub use …scp_{clock,crypto,did,mls}…` form this
+# gate matches is guaranteed by the rustfmt CI job — rustfmt normalizes
+# `pub use ::scp_x` and multi-line `pub use scp_x::{\n  …\n}` splits back into
+# the single-line, matchable form this grep expects. If the fmt gate is ever
+# removed, a hand-split `pub use` could evade this pattern; revisit then.
 set -euo pipefail
+
+# Anchor at the repository root so the relative `crates` scan below is
+# invocation-directory-independent (works from any subdirectory).
+cd "$(git rev-parse --show-toplevel)"
 
 echo "Checking for forbidden shim re-exports (ADR-057 Amendment)..."
 

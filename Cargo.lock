@@ -5148,7 +5148,6 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
- "scp-crypto",
  "serde",
  "serde_bytes",
  "serde_json",

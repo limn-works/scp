@@ -593,7 +593,8 @@ State:
               ├──► scp-protocol
               ├──► scp-platform
               ├──► scp-identity
-              │    scp-protocol ──► scp-did ──► scp-crypto
+              │    scp-protocol ──► scp-did
+              │                 ──► scp-crypto
               │                 ──► scp-clock
               │                 ──► scp-event-log
               ▼
@@ -663,13 +664,14 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic and are annotated explicitly (e.g. the Layer 0 leaves order as `scp-clock`, `scp-crypto` ← `scp-did`, shown by the `deps = …` annotations below). Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `ed25519-dalek` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
 Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
            │  scp-crypto             Ed25519 signature verification. Wasm-safe leaf.
            │  scp-did                DID data model (DID, SigningKeyId, DidDocument,
-           │                          proofs, attestation). Wasm-safe; deps = scp-crypto.
+           │                          proofs, attestation). Wasm-safe leaf; deps =
+           │                          ed25519-dalek directly (no SCP deps).
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
