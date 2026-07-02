@@ -51,7 +51,6 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
-scp-clock = { path = "../scp-clock", features = ["testing"] }
 scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }

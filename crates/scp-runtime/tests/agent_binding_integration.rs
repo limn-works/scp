@@ -31,9 +31,8 @@
 
 use ed25519_dalek::Signer;
 
-use scp_did::DidDocument;
 use scp_did::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
-use scp_did::{DID, SigningKeyId};
+use scp_did::{DID, DidDocument, SigningKeyId};
 use scp_mls::credential::ScpCredential;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};

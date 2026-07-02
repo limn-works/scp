@@ -73,6 +73,7 @@ jobs:
               - 'crates/scp-clock/**'
               - 'crates/scp-crypto/**'
               - 'crates/scp-did/**'
+              - 'crates/scp-mls/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -183,6 +184,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
+      - run: bash scripts/check-no-shim-reexports.sh
 
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:

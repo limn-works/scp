@@ -9,8 +9,7 @@
 // The DID data model — DID-document types and `SigningKeyId` — comes from the
 // wasm-safe `scp-did` crate, NOT from the tokio-coupled `scp-identity`, keeping
 // `scp-mls` inside the ADR-057 mechanical fence.
-use scp_did::SigningKeyId;
-use scp_did::{DidDocument, decode_multibase_key};
+use scp_did::{DidDocument, SigningKeyId, decode_multibase_key};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MlsError;

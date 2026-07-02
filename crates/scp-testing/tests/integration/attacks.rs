@@ -57,8 +57,7 @@ use scp_core::trust::{
     ParticipationFact, ParticipationInput, ParticipationThreshold, RequireParticipation,
     produce_participation_profile, verify_participation_requirements,
 };
-use scp_did::SigningKeyId;
-use scp_did::{DidDocument, DidError, VerificationMethod};
+use scp_did::{DidDocument, DidError, SigningKeyId, VerificationMethod};
 use scp_event_log::{Event, EventPayload, EventType};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};

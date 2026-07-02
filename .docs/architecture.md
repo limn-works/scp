@@ -663,7 +663,7 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at the same or higher layer. Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic and are annotated explicitly (e.g. the Layer 0 leaves order as `scp-clock`, `scp-crypto` ← `scp-did`, shown by the `deps = …` annotations below). Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
 Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.

@@ -10,11 +10,6 @@ readme = "README.md"
 keywords = ["protocol", "time", "clock"]
 categories = ["date-and-time"]
 
-[features]
-default = []
-# Exposes `TestClock` and deterministic time control for downstream test builds.
-testing = []
-
 [dependencies]
 
 [lints]
