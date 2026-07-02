@@ -1138,4 +1138,12 @@ public extension SCP {
     // being admitted — only profiles whose signed `subject_did` equals it
     // contribute to any accounting):
     //   `try verifyParticipationRequirements(expectedSubject:requirementsJson:profileJson:)`
+    //
+    // Security caveat — authenticity is not authorization: this verifies
+    // signatures over the subject binding, not signer legitimacy
+    // (`signerPublicKey` is self-certifying; a subject can present
+    // genuinely-signed profiles from signers it controls, inflating
+    // `minContexts`). Establish signer legitimacy separately (trusted-signer
+    // set, context-membership proof, or the §7.3.5 threshold/independence
+    // path); do not treat success as an authorization decision.
 }

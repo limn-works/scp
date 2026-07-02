@@ -290,9 +290,11 @@ pub fn py_verify_participation_requirements(
         ))
     })?;
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
+    // failure and must not silently read as time 0, which would make every
+    // participation statement appear maximally fresh and bypass `max_age_secs`.
+    // Matches the SystemClock invariant used on the verify-on-ingest path.
+    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
 
     scp_core::trust::verify_participation_requirements(
         current_time,

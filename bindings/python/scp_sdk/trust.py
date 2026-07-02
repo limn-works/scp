@@ -1061,6 +1061,15 @@ def verify_participation_requirements(
     6. Diagnostic error reporting (``ParticipationAdmissionError``).
     7. Typed field extraction (``ParticipationFact.extract_value``).
 
+    Security caveat — authenticity is not authorization: this verifies that
+    each profile is genuinely signed over its subject binding, NOT that the
+    signer is trusted. ``signer_public_key`` is self-certifying, so a subject
+    can present genuinely-signed profiles from signers it controls, inflating
+    ``min_contexts``. Consumers MUST establish signer legitimacy separately
+    (a trusted-signer set, a context-membership proof, or the §7.3.5
+    threshold/independence path) and MUST NOT treat a passing check as an
+    authorization decision.
+
     Success is indicated by returning without exception. Verification
     failures raise ``RuntimeError`` with diagnostic details from the
     Rust bridge.

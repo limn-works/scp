@@ -829,6 +829,14 @@ impl ParticipationProfile {
 /// preventing verifiers from correlating signers across contexts.
 const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
 
+/// Maximum tolerated clock skew for a statement's `updated_at` relative to the
+/// verifier's clock. A statement whose `updated_at` is further in the future
+/// than this is treated as not-fresh rather than read as age 0, closing the gap
+/// where a trusted-but-misbehaving signer could keep a statement inside the
+/// `max_age_secs` freshness window indefinitely. 5 minutes, matching
+/// `challenge.rs`'s `MAX_COMPLETION_FUTURE_SKEW_SECS` and spec §9.14.
+const MAX_PARTICIPATION_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
 /// Derives a context-specific Ed25519 signing key for participation statements.
 ///
 /// Uses HKDF-SHA256 to derive 32 bytes of key material from the context's
@@ -1040,7 +1048,15 @@ pub fn verify_participation_requirements(
         for statement in &statements {
             newest_updated_at = newest_updated_at.max(statement.updated_at);
 
-            // Freshness check.
+            // Freshness check. Reject implausibly future-dated statements
+            // (clock-skew bound mirroring `challenge.rs`, spec §9.14) so a
+            // far-future `updated_at` cannot read as age 0 and stay inside the
+            // `max_age_secs` freshness window indefinitely.
+            if statement.updated_at
+                > current_time.saturating_add(MAX_PARTICIPATION_FUTURE_SKEW_SECS)
+            {
+                continue;
+            }
             let age = current_time.saturating_sub(statement.updated_at);
             if age > req.max_age_secs {
                 continue;
@@ -1072,7 +1088,10 @@ pub fn verify_participation_requirements(
             // Find the best value among fresh statements for diagnostics.
             let best_value = statements
                 .iter()
-                .filter(|s| current_time.saturating_sub(s.updated_at) <= req.max_age_secs)
+                .filter(|s| {
+                    s.updated_at <= current_time.saturating_add(MAX_PARTICIPATION_FUTURE_SKEW_SECS)
+                        && current_time.saturating_sub(s.updated_at) <= req.max_age_secs
+                })
                 .map(|s| req.fact.extract_value(s))
                 .max()
                 .unwrap_or(0);
@@ -2604,6 +2623,54 @@ mod tests {
             }
             other => panic!("expected RecordTooStale, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_rejects_far_future_updated_at() {
+        let key = test_signing_key(1);
+        // `updated_at` is 3600s ahead of the verifier clock, far beyond the
+        // 5-minute skew tolerance.
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_003_600, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        // A far-future `updated_at` must not read as age 0 and pass freshness;
+        // it is excluded, leaving no fresh statement -> RecordTooStale.
+        let result =
+            verify_participation_requirements(1_700_000_000, "did:key:alice", &[req], &[statement]);
+        assert!(
+            matches!(
+                result,
+                Err(ParticipationAdmissionError::RecordTooStale { .. })
+            ),
+            "far-future updated_at should be rejected as not-fresh, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_updated_at_within_future_skew() {
+        let key = test_signing_key(1);
+        // 60s ahead of the verifier clock, within the 5-minute skew tolerance.
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_060, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        let result =
+            verify_participation_requirements(1_700_000_000, "did:key:alice", &[req], &[statement]);
+        assert!(
+            result.is_ok(),
+            "within-skew future updated_at should pass freshness, got {result:?}"
+        );
     }
 
     #[test]

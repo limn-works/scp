@@ -1912,6 +1912,14 @@ class SCP internal constructor(
      *
      * Returns normally when all requirements are satisfied; the bridge
      * throws on any failed requirement or malformed JSON.
+     *
+     * Security caveat — authenticity is not authorization: this verifies
+     * signatures over the subject binding, not signer *legitimacy*. Because
+     * `signer_public_key` is self-certifying, a subject can present
+     * genuinely-signed profiles from signers it controls (inflating
+     * `min_contexts`). Callers MUST establish signer legitimacy separately
+     * (trusted-signer set, context-membership proof, or the §7.3.5
+     * threshold/independence path) and MUST NOT treat success as authorization.
      */
     fun verifyParticipationRequirements(
         expectedSubject: String,
