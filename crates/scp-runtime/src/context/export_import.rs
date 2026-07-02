@@ -806,6 +806,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // B's freshness/replay cache has no authority on a foreign node and a
         // fresh node starts its own replay window — dropped from the export.
         xctx_nonce_dedup: HashMap::new(),
+        // Broadcast per-author keys and block lists are sensitive access-control
+        // state; a public-scope export is for pre-join observers, so it is
+        // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
+        broadcast: None,
     })
 }
 
@@ -1002,6 +1006,7 @@ mod tests {
             // B's freshness/replay cache has no authority on a foreign node and
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
+            broadcast: None,
         }
     }
 

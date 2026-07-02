@@ -611,7 +611,7 @@ fn handle_build_local_checkpoint(
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
     let checkpoint = {
         let mut view = cell.class_c_view();
-        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
         crate::context::queries_helpers::force_create_checkpoint_view(
             &mut view,

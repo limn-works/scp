@@ -303,7 +303,11 @@ use crate::economy::adapter::PaymentReceipt;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
+use scp_protocol::context::broadcast::{
+    BroadcastContext as ProtocolBroadcastContext, BroadcastContextClassCParts,
+    BroadcastPublishMetadata, BroadcastPublishReservation, ReservedPublishApply,
+    SubscriptionResult, UnblockResult, UnsubscribeResult,
+};
 use scp_protocol::context::governance::{
     GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
 };
@@ -621,6 +625,185 @@ pub(crate) struct ClassCMut<'a> {
     /// Field-granular Class-C governance sub-view (holds no whole
     /// `&mut GovernanceState`, no `class_s` reach).
     governance: GovernanceClassCMut<'a>,
+}
+
+/// FIELD-GRANULAR best-effort view over a [`ProtocolBroadcastContext`]'s Class-C
+/// publish / roster surface (ADR-049 §9, §5.14.8 mutation-surface confinement).
+///
+/// Produced by [`ClassCMut::broadcast_class_c_mut`]. Mirrors [`RoleStateClassCMut`]:
+/// it holds the [`BroadcastContextClassCParts`] DISJOINT field refs (NOT a whole
+/// `&mut BroadcastContext`) and forwards ONLY the benign publish-path / roster
+/// methods. The downward-authorization security mutators (`block_subscriber`,
+/// `block_author`, `governance_ban_subscriber`, `rotate_all_author_keys`) are
+/// inherent `&mut self` on `BroadcastContext` and are deliberately NOT forwarded
+/// here — they are reachable only through a whole `&mut BroadcastContext` a
+/// fail-closed combinator hands out via [`ClassSMut::rest_mut`]. Because this view
+/// holds no whole `&mut`, a future "convenience" accessor returning one CANNOT be
+/// written; the load-bearing guarantee is the PRIVATE [`AuthorState`] security
+/// fields plus `ClassSCell: !DerefMut`.
+///
+/// Precision: "benign" here means SAFE-DIRECTION, NOT "never touches the security
+/// fields". Two forwarded methods DO write them: `unsubscribe(rotate_keys = true)`
+/// advances `epoch` and installs a fresh `broadcast_key` (forward-only rotation; a
+/// coalesce-window rollback returns to "subscriber present under the old key",
+/// never a re-grant), and `unblock_subscriber` clears an entry from `block_list`
+/// (UPWARD re-grant; a rollback re-instates the block). Both are persisted
+/// BEST-EFFORT and are safe precisely because a lost write only leaves authority
+/// NARROWER than the caller observed. The fail-closed, must-survive-crash
+/// guarantee (via the `n` keep-direction combinator) covers only the
+/// REVOCATION-direction mutators (`block_subscriber` / `block_author` /
+/// `governance_ban_subscriber` / `rotate_all_author_keys`), which are NOT
+/// forwarded here. What this view structurally prevents is a *direct* private-
+/// field write (the `#[F.2]` compile-fail witness) and any reach to that
+/// revocation surface.
+///
+/// [`AuthorState`]: scp_protocol::context::broadcast::AuthorState
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / §5.14.8: the benign publish-path / roster forwards (`subscribe`, `unsubscribe`, `unblock_subscriber`, `reserve_publish`, `apply_reserved_publish`, `rollback_reserved_publish`, `publish`, `publish_metadata`, `context_id`) are exercised by the broadcast publish/roster helpers and this module's unit tests; the remainder gain callers as the broadcast handlers migrate fully onto the field-granular view."
+)]
+pub(crate) struct BroadcastContextClassCMut<'a> {
+    /// The disjoint Class-C parts. PRIVATE: no accessor hands out `&mut authors`
+    /// / `&mut subscribers` (either would re-open the `block_author` /
+    /// registry-clear surface), so the only reach is the benign forwards below.
+    parts: BroadcastContextClassCParts<'a>,
+}
+
+impl<'a> BroadcastContextClassCMut<'a> {
+    /// Build the field-granular view by destructuring a `&mut BroadcastContext`
+    /// through [`BroadcastContext::class_c_parts`](ProtocolBroadcastContext::class_c_parts).
+    fn new(bc: &'a mut ProtocolBroadcastContext) -> Self {
+        Self {
+            parts: bc.class_c_parts(),
+        }
+    }
+
+    /// Context identifier (structural identity).
+    pub(crate) const fn context_id(&self) -> &str {
+        self.parts.context_id()
+    }
+
+    /// Benign roster ADD. Forwards to [`BroadcastContextClassCParts::subscribe`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::subscribe`].
+    pub(crate) fn subscribe<D, N, R, P, S>(
+        &mut self,
+        subscriber_did: &str,
+        ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        timestamp: u64,
+        validation_ctx: Option<
+            &mut scp_protocol::crypto::ucan::validate::ValidationContext<'_, D, N, R, P, S>,
+        >,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: scp_protocol::crypto::ucan::validate::DidResolver,
+        N: scp_protocol::crypto::ucan::validate::NonceTracker,
+        R: scp_protocol::crypto::ucan::validate::RevocationChecker,
+        P: scp_protocol::crypto::ucan::validate::ProofResolver,
+        S: std::hash::BuildHasher,
+    {
+        self.parts
+            .subscribe(subscriber_did, ucan, timestamp, validation_ctx)
+    }
+
+    /// Benign roster REMOVE (+ optional forward-secrecy rotation). Forwards to
+    /// [`BroadcastContextClassCParts::unsubscribe`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::unsubscribe`].
+    pub(crate) fn unsubscribe(
+        &mut self,
+        subscriber_did: &str,
+        rotate_keys: bool,
+    ) -> Result<UnsubscribeResult, ContextError> {
+        self.parts.unsubscribe(subscriber_did, rotate_keys)
+    }
+
+    /// UPWARD (re-grant) unblock — best-effort by design. Forwards to
+    /// [`BroadcastContextClassCParts::unblock_subscriber`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::unblock_subscriber`].
+    pub(crate) fn unblock_subscriber(
+        &mut self,
+        author_did: &str,
+        unblocked_did: &str,
+    ) -> Result<UnblockResult, ContextError> {
+        self.parts.unblock_subscriber(author_did, unblocked_did)
+    }
+
+    /// Benign publish signing metadata. Forwards to
+    /// [`BroadcastContextClassCParts::publish_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::publish_metadata`].
+    pub(crate) fn publish_metadata(
+        &self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
+        self.parts.publish_metadata(author_did)
+    }
+
+    /// Benign single-phase publish. Forwards to
+    /// [`BroadcastContextClassCParts::publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::publish`].
+    pub(crate) fn publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        timestamp: u64,
+        signature: ed25519_dalek::Signature,
+        nonce: &[u8; 12],
+        provenance: Option<scp_protocol::provenance::DataProvenance>,
+    ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+        self.parts
+            .publish(author_did, payload, timestamp, signature, nonce, provenance)
+    }
+
+    /// Benign phase-1 reservation. Forwards to
+    /// [`BroadcastContextClassCParts::reserve_publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::reserve_publish`].
+    pub(crate) fn reserve_publish(
+        &mut self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishReservation, ContextError> {
+        self.parts.reserve_publish(author_did)
+    }
+
+    /// Benign phase-2 seal. Forwards to
+    /// [`BroadcastContextClassCParts::apply_reserved_publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::apply_reserved_publish`].
+    pub(crate) fn apply_reserved_publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        nonce: &[u8; 12],
+        apply: ReservedPublishApply,
+    ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+        self.parts
+            .apply_reserved_publish(author_did, payload, nonce, apply)
+    }
+
+    /// Benign reservation rollback. Forwards to
+    /// [`BroadcastContextClassCParts::rollback_reserved_publish`].
+    pub(crate) fn rollback_reserved_publish(&mut self, author_did: &str, reserved_sequence: u64) {
+        self.parts
+            .rollback_reserved_publish(author_did, reserved_sequence);
+    }
 }
 
 /// Simultaneously-held borrows for the §19 economy pre-check.
@@ -1966,7 +2149,7 @@ impl<'a> ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -2208,10 +2391,23 @@ impl<'a> ClassCMut<'a> {
         self.payment_receipts
     }
 
-    /// `&mut` access to the optional broadcast-mode metadata (Class-C / §5.14).
-    /// Best-effort rollback acceptable.
-    pub(crate) const fn broadcast_context_mut(&mut self) -> &mut Option<ProtocolBroadcastContext> {
+    /// FIELD-GRANULAR best-effort broadcast view (ADR-049 §9, §5.14.8
+    /// mutation-surface confinement). Returns [`None`] for a non-broadcast
+    /// context. Exposes ONLY the benign publish-path / roster methods
+    /// (`subscribe` / `unsubscribe` / `unblock_subscriber` / `reserve_publish` /
+    /// `apply_reserved_publish` / `rollback_reserved_publish` / `publish` /
+    /// `publish_metadata`). It holds the [`BroadcastContextClassCParts`] disjoint
+    /// refs — NOT a whole `&mut BroadcastContext` — so the downward-authorization
+    /// security mutators (`block_subscriber`, `block_author`,
+    /// `governance_ban_subscriber`, `rotate_all_author_keys`) are UNREACHABLE
+    /// through this view: they are inherent `&mut self` on `BroadcastContext`,
+    /// reachable only through a whole `&mut BroadcastContext` a fail-closed
+    /// combinator hands out via [`ClassSMut::rest_mut`]. Mirrors
+    /// [`ClassCMut::role_state_class_c_mut`] → [`RoleStateClassCMut`].
+    pub(crate) fn broadcast_class_c_mut(&mut self) -> Option<BroadcastContextClassCMut<'_>> {
         self.broadcast_context
+            .as_mut()
+            .map(BroadcastContextClassCMut::new)
     }
 
     /// `&mut` access to the optional active migration state (Class-C / §5.11A).
@@ -4984,22 +5180,6 @@ impl ClassSCell
                 > {
                     Ok(None)
                 }
-                fn persist_broadcast(
-                    &self,
-                    _: &str,
-                    _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-                ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                    Ok(())
-                }
-                fn load_broadcast(
-                    &self,
-                    _: &str,
-                ) -> Result<
-                    Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-                    Box<dyn std::error::Error + Send + Sync>,
-                > {
-                    Ok(None)
-                }
                 fn delete_context(
                     &self,
                     _: &str,
@@ -5032,22 +5212,6 @@ impl ClassSCell
             _: &str,
         ) -> Result<
             Option<crate::context::state::ContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -5087,22 +5251,6 @@ impl ClassSCell
             _: &str,
         ) -> Result<
             Option<crate::context::state::ContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)

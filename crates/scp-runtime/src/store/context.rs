@@ -13,8 +13,6 @@
 //!
 //! See spec sections 17.3, 17.4, and 23.11.
 
-use std::collections::HashSet;
-
 use hex;
 use scp_platform::traits::Storage;
 use zeroize::Zeroize;
@@ -105,25 +103,6 @@ fn sender_key_key(context_id: &str, did: &DID) -> Result<String, super::StoreErr
 fn sender_key_prefix(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/sender_key/"))
-}
-
-/// Builds the storage key for broadcast context state.
-///
-/// Format: `context/{context_id}/broadcast_state`
-/// See spec section 5.14.
-fn broadcast_state_key(context_id: &str) -> Result<String, super::StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    Ok(format!("context/{ctx}/broadcast_state"))
-}
-
-/// Builds the storage key for an author's broadcast block list.
-///
-/// Format: `context/{context_id}/broadcast_block/{author_did}`
-/// See spec section 5.14.8.
-fn broadcast_block_key(context_id: &str, author_did: &str) -> Result<String, super::StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    let author = super::sanitize_key_component(author_did)?;
-    Ok(format!("context/{ctx}/broadcast_block/{author}"))
 }
 
 /// Builds the storage key for a full context snapshot.
@@ -669,100 +648,6 @@ impl<S: Storage> ProtocolRepository<S> {
         Ok(())
     }
 
-    /// Stores the full broadcast context state for persistence across restarts.
-    ///
-    /// Serializes the [`scp_protocol::context::broadcast::BroadcastContextSnapshot`] under
-    /// `context/{context_id}/broadcast_state`. The snapshot contains the
-    /// admission policy, subscriber roster, and per-author key state
-    /// (including key material, epochs, and block lists).
-    ///
-    /// Called after each broadcast mutation (subscribe, unsubscribe, block,
-    /// create) to ensure broadcast state survives process restarts.
-    ///
-    /// See spec section 5.14 and §17.3.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
-    pub async fn store_broadcast_state(
-        &self,
-        context_id: &str,
-        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), StoreError> {
-        let key = broadcast_state_key(context_id)?;
-        // Uses store_value_zeroize to clear serialized key material from memory.
-        self.store_value_zeroize(&key, snapshot).await
-    }
-
-    /// Loads the broadcast context state from persistence.
-    ///
-    /// Returns `None` if no broadcast state has been persisted for the given
-    /// context (either the context is not broadcast, or it has not been
-    /// persisted yet). The caller should reconstruct a `BroadcastContext`
-    /// from the returned snapshot using
-    /// [`scp_protocol::context::broadcast::BroadcastContext::from_snapshot`].
-    ///
-    /// See spec section 5.14 and §17.3.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_broadcast_state(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>, StoreError>
-    {
-        let key = broadcast_state_key(context_id)?;
-        self.load_value(&key).await
-    }
-
-    /// Stores a broadcast block list for an author within a context.
-    ///
-    /// Persists the set of blocked subscriber DIDs under
-    /// `context/{context_id}/broadcast_block/{author_did}`. The caller
-    /// (typically the `ContextManager`) should invoke this after
-    /// `BroadcastContext::block_subscriber` returns, using the
-    /// `block_list` field from `BlockResult`.
-    ///
-    /// See spec section 5.14.8 for blocking semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
-    pub async fn store_broadcast_block_list(
-        &self,
-        context_id: &str,
-        author_did: &str,
-        block_list: &HashSet<String>,
-    ) -> Result<(), StoreError> {
-        let key = broadcast_block_key(context_id, author_did)?;
-        self.store_value(&key, block_list).await
-    }
-
-    /// Loads a broadcast block list for an author within a context.
-    ///
-    /// Returns `None` if no block list has been persisted for the given
-    /// author. The caller should pass the loaded set to
-    /// `BroadcastContext::restore_block_list` during initialization.
-    ///
-    /// See spec section 5.14.8 for blocking semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_broadcast_block_list(
-        &self,
-        context_id: &str,
-        author_did: &str,
-    ) -> Result<Option<HashSet<String>>, StoreError> {
-        let key = broadcast_block_key(context_id, author_did)?;
-        self.load_value(&key).await
-    }
-
     /// Stores durable metadata for an ephemeral context after close.
     ///
     /// Per spec §5.11, durable metadata (participants, creation time,
@@ -960,37 +845,6 @@ impl<S: Storage + 'static> crate::context::persistence::ContextPersistence
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async { store.load_full_snapshot(&ctx_id).await })
-        })?;
-        Ok(result)
-    }
-
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let snap = snapshot.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.store_broadcast_state(&ctx_id, &snap).await })
-        })?;
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_broadcast_state(&ctx_id).await })
         })?;
         Ok(result)
     }
@@ -1449,243 +1303,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn broadcast_block_key_follows_convention() {
-        assert_eq!(
-            broadcast_block_key("ctx-123", "did:dht:z6MkAuthor").unwrap(),
-            "context/ctx-123/broadcast_block/did:dht:z6MkAuthor"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Broadcast block list persistence
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn store_and_load_broadcast_block_list_roundtrip() {
-        let store = make_store();
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked1".to_owned());
-        block_list.insert("did:dht:z6MkBlocked2".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
-            .await
-            .unwrap();
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-
-        assert_eq!(loaded, Some(block_list));
-    }
-
-    #[tokio::test]
-    async fn load_broadcast_block_list_returns_none_for_missing() {
-        let store = make_store();
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkUnknown")
-            .await
-            .unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn store_broadcast_block_list_overwrites_previous() {
-        let store = make_store();
-        let mut first = HashSet::new();
-        first.insert("did:dht:z6MkBlocked1".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &first)
-            .await
-            .unwrap();
-
-        let mut second = HashSet::new();
-        second.insert("did:dht:z6MkBlocked1".to_owned());
-        second.insert("did:dht:z6MkBlocked2".to_owned());
-        second.insert("did:dht:z6MkBlocked3".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &second)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-        assert_eq!(loaded, Some(second));
-    }
-
-    #[tokio::test]
-    async fn delete_context_removes_broadcast_block_lists() {
-        let store = make_store();
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
-            .await
-            .unwrap();
-
-        store.delete_context("ctx-1").await.unwrap();
-
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-        assert!(loaded.is_none());
-    }
-
-    // -------------------------------------------------------------------
-    // Broadcast state persistence
-    // -------------------------------------------------------------------
-
-    fn make_broadcast_snapshot() -> scp_protocol::context::broadcast::BroadcastContextSnapshot {
-        use scp_protocol::context::broadcast::{
-            AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
-        };
-        use scp_protocol::crypto::sender_keys::generate_sender_key;
-
-        let mut subscribers = std::collections::HashMap::new();
-        subscribers.insert(
-            "did:dht:z6MkSub1".to_owned(),
-            SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub1".to_owned(),
-                registered_at: 1_700_000_000,
-                has_ucan: false,
-            },
-        );
-        subscribers.insert(
-            "did:dht:z6MkSub2".to_owned(),
-            SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub2".to_owned(),
-                registered_at: 1_700_000_100,
-                has_ucan: true,
-            },
-        );
-
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-        let mut authors = std::collections::HashMap::new();
-        authors.insert(
-            "did:dht:z6MkAuthor1".to_owned(),
-            AuthorStateSnapshot {
-                author_did: "did:dht:z6MkAuthor1".to_owned(),
-                broadcast_key: generate_sender_key(),
-                epoch: 3,
-                next_sequence: 1,
-                block_list,
-            },
-        );
-
-        BroadcastContextSnapshot {
-            context_id: "ctx-broadcast-1".to_owned(),
-            admission: BroadcastAdmission::Open,
-            subscribers,
-            authors,
-        }
-    }
-
-    #[tokio::test]
-    async fn store_and_load_broadcast_state_roundtrip() {
-        let store = make_store();
-        let snapshot = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot)
-            .await
-            .unwrap();
-
-        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
-
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.context_id, "ctx-broadcast-1");
-        assert_eq!(
-            loaded.admission,
-            scp_protocol::context::broadcast::BroadcastAdmission::Open
-        );
-        assert_eq!(loaded.subscribers.len(), 2);
-        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
-        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub2"));
-        assert_eq!(loaded.authors.len(), 1);
-        let author = loaded.authors.get("did:dht:z6MkAuthor1").unwrap();
-        assert_eq!(author.epoch, 3);
-        assert!(author.block_list.contains("did:dht:z6MkBlocked"));
-    }
-
-    #[tokio::test]
-    async fn load_broadcast_state_returns_none_for_missing() {
-        let store = make_store();
-        let loaded = store.load_broadcast_state("nonexistent").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn store_broadcast_state_overwrites_previous() {
-        use scp_protocol::context::broadcast::BroadcastAdmission;
-
-        let store = make_store();
-        let snapshot1 = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot1)
-            .await
-            .unwrap();
-
-        // Modify snapshot: change admission and add subscriber.
-        let mut snapshot2 = make_broadcast_snapshot();
-        snapshot2.admission = BroadcastAdmission::Gated;
-        snapshot2.subscribers.insert(
-            "did:dht:z6MkSub3".to_owned(),
-            scp_protocol::context::broadcast::SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub3".to_owned(),
-                registered_at: 1_700_000_200,
-                has_ucan: true,
-            },
-        );
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot2)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .load_broadcast_state("ctx-broadcast-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.admission, BroadcastAdmission::Gated);
-        assert_eq!(loaded.subscribers.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn delete_context_removes_broadcast_state() {
-        let store = make_store();
-        let snapshot = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot)
-            .await
-            .unwrap();
-
-        store.delete_context("ctx-broadcast-1").await.unwrap();
-
-        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[test]
-    fn broadcast_state_key_follows_convention() {
-        assert_eq!(
-            broadcast_state_key("ctx-123").unwrap(),
-            "context/ctx-123/broadcast_state"
-        );
-    }
-
     // -------------------------------------------------------------------
     // Full snapshot persistence (SCP-PERSIST-021)
     // -------------------------------------------------------------------
@@ -1768,6 +1385,7 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: std::collections::HashMap::new(),
+            broadcast: None,
         }
     }
 
@@ -1834,26 +1452,6 @@ mod tests {
         assert_eq!(loaded.context_id, "ctx-snap-1");
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
         assert_eq!(loaded.ttl_remaining_secs, Some(300));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn protocol_repository_persistence_broadcast_roundtrip() {
-        use crate::context::persistence::ContextPersistence;
-
-        let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolRepositoryContextBridge::new(store);
-
-        let snapshot = make_broadcast_snapshot();
-
-        bridge
-            .persist_broadcast("ctx-bc-bridge", &snapshot)
-            .unwrap();
-
-        let loaded = bridge.load_broadcast("ctx-bc-bridge").unwrap();
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.context_id, "ctx-broadcast-1");
-        assert_eq!(loaded.subscribers.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

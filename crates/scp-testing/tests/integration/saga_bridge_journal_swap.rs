@@ -41,7 +41,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use scp_core::context::broadcast::BroadcastContextSnapshot;
 use scp_core::context::builder::ContextCreationError;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::governance::KeyResolver;
@@ -88,14 +87,6 @@ impl ContextPersistence for SharedPersistence {
         Ok(self.contexts.lock().unwrap().get(context_id).cloned())
     }
 
-    fn persist_broadcast(&self, _: &str, _: &BroadcastContextSnapshot) -> Result<(), BoxError> {
-        Ok(())
-    }
-
-    fn load_broadcast(&self, _: &str) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        Ok(None)
-    }
-
     fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts.lock().unwrap().remove(context_id);
         Ok(())
@@ -119,19 +110,6 @@ impl ContextPersistence for SharedPersistenceArc {
     }
     fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         self.0.load_context(context_id)
-    }
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), BoxError> {
-        self.0.persist_broadcast(context_id, snapshot)
-    }
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        self.0.load_broadcast(context_id)
     }
     fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.0.delete_context(context_id)

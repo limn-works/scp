@@ -23,7 +23,7 @@ use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use super::ttl::{TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
-use scp_protocol::context::broadcast::GovernanceBanResult;
+use scp_protocol::context::broadcast::{BroadcastContextSnapshot, GovernanceBanResult};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
     AccessScope, GovernanceEngine, GovernanceModelConfig, GovernanceProposal, KeyResolver,
@@ -1097,6 +1097,23 @@ pub struct ContextSnapshot {
     /// snapshots deserialize as an empty cache.
     #[serde(default)]
     pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
+    /// Broadcast context security + roster state (§5.14, §5.14.8).
+    ///
+    /// **Class S** — the per-author key epochs, block lists, and the subscriber
+    /// registry ride the fail-closed [`ContextSnapshot`] so a block / governance
+    /// ban / key-epoch advance is durable BEFORE the operation acks (ADR-049 §9).
+    /// Previously broadcast state was persisted best-effort through a SEPARATE
+    /// `persist_broadcast` write that warn!-and-continued on failure: an author
+    /// crash in the coalesce window after a block returned success silently
+    /// re-granted the revoked member post-block key access
+    /// (encryption-as-access-control violation, §5.14.8 block-before-serve). Folding
+    /// it here makes the block / ban / epoch-advance atomic with
+    /// `read_exclusion_list` in one fail-closed row.
+    ///
+    /// `None` for non-broadcast contexts. `#[serde(default)]` so legacy /
+    /// non-broadcast snapshots deserialize cleanly.
+    #[serde(default)]
+    pub broadcast: Option<BroadcastContextSnapshot>,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.

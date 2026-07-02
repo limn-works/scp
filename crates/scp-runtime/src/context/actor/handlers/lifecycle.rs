@@ -527,6 +527,10 @@ fn handle_flush_snapshot_actor(
             );
         }
     }
+    // Broadcast security + roster state now rides the Class-S `ContextSnapshot`
+    // (built by `snapshot_context` above), so the single `persist_context` write
+    // covers it atomically — the prior separate best-effort `persist_broadcast`
+    // write is gone (ADR-049 §9 / §5.14.8 block-before-serve).
     if let Err(e) = deps.persistence.persist_context(&context_id, &snapshot) {
         crate::metrics::record_persistence_failure();
         tracing::warn!(
@@ -534,20 +538,6 @@ fn handle_flush_snapshot_actor(
             error = %e,
             "failed to persist context snapshot"
         );
-    }
-    // Broadcast snapshot (no-op if not a broadcast context).
-    if let Some(ref bc) = state.broadcast_context {
-        let bc_snapshot = scp_protocol::context::broadcast::BroadcastContext::to_snapshot(bc);
-        if let Err(e) = deps
-            .persistence
-            .persist_broadcast(&context_id, &bc_snapshot)
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to persist broadcast snapshot"
-            );
-        }
     }
     let _ = reply.send(Ok(()));
     Outcome::ok(())

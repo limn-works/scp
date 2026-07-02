@@ -4,8 +4,6 @@
 //! `manager/` directory deletion. This module is the canonical home of
 //! the trait and its no-op stub.
 
-use scp_protocol::context::broadcast::BroadcastContextSnapshot;
-
 use super::state::ContextSnapshot;
 
 // ---------------------------------------------------------------------------
@@ -14,15 +12,20 @@ use super::state::ContextSnapshot;
 
 /// Provider for persisting full context state across process restarts.
 ///
-/// Replaces the previous `BroadcastPersistence` trait. This is the single
-/// persistence trait for all context state: both the full context snapshot
-/// (membership, roles, governance, TTL) and the broadcast-specific state
-/// (author keys, subscribers, block lists).
+/// This is the single persistence trait for ALL context state. Broadcast
+/// security + roster state (author key epochs, subscriber registry, block
+/// lists) is NOT a separate seam: it rides the full [`ContextSnapshot`]
+/// (`ContextSnapshot::broadcast`), so `persist_context` / `load_context` carry
+/// it atomically with the rest of the state — a governance ban / per-author
+/// block / key-epoch advance is durable in ONE fail-closed row alongside
+/// `read_exclusion_list` (ADR-049 §9, §5.14.8 block-before-serve). The former
+/// best-effort `persist_broadcast` / `load_broadcast` methods (a separate
+/// warn-and-continue write path) are gone.
 ///
 /// Implementors must be dyn-compatible (`Send + Sync`, no generics, no
-/// RPITIT). All methods return `Result<_, Box<dyn Error + Send + Sync>>`
-/// for best-effort semantics: the supervisor logs errors but does
-/// not abort mutations when persistence fails.
+/// RPITIT). `persist_context` / `load_context` are the security-critical seam
+/// (called fail-closed via `persist_state_fail_closed`); the other methods
+/// carry best-effort semantics.
 ///
 /// The canonical implementation is `ProtocolRepositoryContextBridge<S>` which
 /// wraps `Arc<ProtocolRepository<S>>`.
@@ -53,31 +56,6 @@ pub trait ContextPersistence: Send + Sync {
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Persists the broadcast context state snapshot.
-    ///
-    /// Called after each broadcast-mutating operation. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying storage write fails.
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Loads a previously persisted broadcast context snapshot.
-    ///
-    /// Returns `None` if no snapshot exists for the given context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying storage read fails.
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Deletes all persisted state for a context.
     ///
@@ -123,21 +101,6 @@ impl ContextPersistence for NoopContextPersistence {
         &self,
         _context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(None)
-    }
-
-    fn persist_broadcast(
-        &self,
-        _context_id: &str,
-        _snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        _context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
     }
 

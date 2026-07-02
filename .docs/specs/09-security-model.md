@@ -268,6 +268,7 @@ Operations covered (downward transitions — those that reduce or remove authori
 
 - UCAN attenuation, expiration enforcement, revocation (NOT issuance — see note below)
 - Role demotion, role revocation, blocklist additions, broadcast author block
+- Broadcast per-author **subscriber block** and **governance subscriber ban** (§5.14.8): each advances the per-author broadcast key epoch and adds the target DID to a block list (the ban to ALL authors' block lists, plus registry removal), revoking future key access — sync-persisted fail-closed, atomic with `read_exclusion_list`. The UNBLOCK / `RestoreAccess` direction is upward and MAY be coalesced.
 - Content-access key revocation, sender-key destruction on block (all three tiers of §9.16 enforcement)
 - MLS member removal
 - Capability suspension and standing downgrades (including cooldown activation that forecloses previously-authorized action)

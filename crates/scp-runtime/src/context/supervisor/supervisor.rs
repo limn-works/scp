@@ -11655,22 +11655,6 @@ mod tests {
         > {
             Ok(None)
         }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -11874,6 +11858,15 @@ mod tests {
     /// above does NOT populate providers because its saga / lookup
     /// tests do not need them.
     fn supervisor_with_providers() -> Arc<Supervisor> {
+        supervisor_with_providers_and_event_log(Box::new(TestEventLog))
+    }
+
+    /// [`supervisor_with_providers`] with a caller-supplied event-log provider,
+    /// for tests that assert what did (or did NOT) reach the durable event log
+    /// (e.g. via a [`RecordingEventLog`]).
+    fn supervisor_with_providers_and_event_log(
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> Arc<Supervisor> {
         // Minimal providers — the spawn-registry tests only care about
         // the supervisor's actor map, not the providers' behaviour.
         // `MlsCryptoProvider::new` takes a String DID; the stub DID is
@@ -11884,8 +11877,6 @@ mod tests {
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(TestEventLog);
         let key_resolver: KeyResolver =
             Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
@@ -12562,6 +12553,7 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
+            broadcast: None,
         }
     }
 
@@ -13616,22 +13608,6 @@ mod tests {
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(self.contexts.get(id).map(|s| s.value().clone()))
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
         }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
@@ -15122,6 +15098,43 @@ mod tests {
             .xctx_committed_invocations
             .insert(committed_saga_id.clone());
 
+        // Broadcast security + roster state (ADR-049 §9, §5.14.8 block-before-serve).
+        // A per-author block ADVANCES the key epoch + adds the subscriber to the
+        // author block list — a downward-authorization revocation that MUST ride
+        // the fail-closed snapshot. Seed one author with a NON-ZERO epoch + a
+        // blocked-DID sentinel in its block list + a subscriber in the roster, then
+        // assert all three survive the production sync-persist round-trip. A future
+        // change that drops `ContextSnapshot::broadcast` from the builder is exactly
+        // the regression this catches.
+        let bcast_author = "did:example:class-s-bcast-author".to_owned();
+        let bcast_blocked = "did:example:class-s-bcast-blocked".to_owned();
+        let bcast_subscriber = "did:example:class-s-bcast-subscriber".to_owned();
+        let mut seed_bc = scp_protocol::context::broadcast::BroadcastContext::new(
+            hex::encode(ctx_id_bytes),
+            &scp_protocol::context::params::ContextMode::Broadcast,
+            scp_protocol::context::broadcast::BroadcastAdmission::Open,
+        )
+        .expect("broadcast context seeds");
+        seed_bc.add_author(&bcast_author).expect("author registers");
+        // Block advances the author epoch (0 -> 1) and inserts the blocked DID.
+        seed_bc
+            .block_subscriber(&bcast_author, &bcast_blocked)
+            .expect("block advances epoch + records block");
+        // Inject a subscriber via the snapshot boundary (the roster ADD path is
+        // generic over the UCAN-validation context; the snapshot boundary is the
+        // faithful equivalent for this field-round-trip probe).
+        let mut seed_snap = seed_bc.to_snapshot();
+        seed_snap.subscribers.insert(
+            bcast_subscriber.clone(),
+            scp_protocol::context::broadcast::SubscriberRecord {
+                subscriber_did: bcast_subscriber.clone(),
+                registered_at: 1_700_000_000,
+                has_ucan: false,
+            },
+        );
+        state.broadcast_context =
+            Some(scp_protocol::context::broadcast::BroadcastContext::from_snapshot(seed_snap));
+
         // Build the snapshot via the EXACT production sync-persist builder
         // (`build_snapshot_from_state`, the one `persist_state_fail_closed`
         // calls), then round-trip through the real on-disk serialization format.
@@ -15229,6 +15242,31 @@ mod tests {
                 .xctx_committed_invocations
                 .contains(&committed_saga_id),
             "Class S: the caller-side commit witness must round-trip (idempotency / no double-settle)"
+        );
+
+        // Broadcast security + roster state (ADR-049 §9, §5.14.8): the folded
+        // `ContextSnapshot::broadcast` must round-trip the author key epoch, the
+        // author block list, and the subscriber roster. A builder that dropped this
+        // field would silently re-grant a blocked subscriber post-block key access
+        // across a respawn — the block-before-serve rollback this test forbids.
+        let restored_bc = restored
+            .broadcast
+            .expect("Class S: broadcast state must round-trip the snapshot");
+        let restored_author = restored_bc
+            .authors
+            .get(&bcast_author)
+            .expect("Class S: broadcast author must round-trip");
+        assert!(
+            restored_author.epoch >= 1,
+            "Class S: the author key epoch advance (block) must round-trip"
+        );
+        assert!(
+            restored_author.block_list.contains(&bcast_blocked),
+            "Class S: the author block list must round-trip (no post-block re-grant)"
+        );
+        assert!(
+            restored_bc.subscribers.contains_key(&bcast_subscriber),
+            "Class S: the broadcast subscriber roster must round-trip"
         );
     }
 
@@ -15408,22 +15446,6 @@ mod tests {
         > {
             Ok(None)
         }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -15516,6 +15538,591 @@ mod tests {
             free.is_ok(),
             "a free (non-spending) send must keep best-effort persist and \
              not be regressed to fail-closed: got {free:?}"
+        );
+    }
+
+    /// Build an Active broadcast `PerContextState` with `author` registered as
+    /// a broadcast author (§5.14.8 test scaffold).
+    async fn broadcast_state_with_author(
+        ctx_id_bytes: [u8; 32],
+        author: &DID,
+    ) -> crate::context::actor::state::PerContextState {
+        let ctx_key = hex::encode(ctx_id_bytes);
+        // Broadcast-mode constructor: sets `mode` + `routing` to the broadcast
+        // variants, which the restore path cross-checks against the presence of
+        // broadcast state in the snapshot (an encrypted-routing snapshot carrying
+        // broadcast state is rejected as corrupt/tampered).
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
+            ctx_id_bytes,
+            1_700_000_000,
+            author.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let mut bc = scp_protocol::context::broadcast::BroadcastContext::new(
+            ctx_key,
+            &scp_protocol::context::params::ContextMode::Broadcast,
+            scp_protocol::context::broadcast::BroadcastAdmission::Open,
+        )
+        .expect("broadcast context");
+        bc.add_author(author.as_ref()).expect("author registers");
+        state.broadcast_context = Some(bc);
+        state
+    }
+
+    /// Test 4 — §5.14.8 block-before-serve. A per-author block whose fail-closed
+    /// persist FAILS returns `Err(PersistenceFailed)` (NOT `Ok`) — the caller
+    /// never observes a non-durable block — and the block is RETAINED in memory
+    /// (keep-direction: un-blocking would be the unsafe direction).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_block_persist_is_fail_closed_and_retains_block() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        deps.persistence = Arc::new(FailingPersistence);
+
+        let ctx_id_bytes = [0xB1u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:bcast-block-author".to_owned());
+        let blocked = DID("did:example:bcast-block-target".to_owned());
+
+        let state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        let res = crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell, &deps, &ctx_key, &author, &blocked,
+        );
+        assert!(
+            matches!(res, Err(ContextError::PersistenceFailed(_))),
+            "a broadcast block whose persist fails MUST fail-closed, not return Ok: got {res:?}"
+        );
+        assert!(
+            cell.broadcast_context
+                .as_ref()
+                .unwrap()
+                .is_blocked(author.as_ref(), blocked.as_ref()),
+            "the block must be RETAINED in memory (keep-direction) on persist failure"
+        );
+    }
+
+    /// Test 6 — the UNBLOCK path (upward authorization, block-list REMOVE) stays
+    /// BEST-EFFORT: with a persistence backend that always fails, unblock still
+    /// returns `Ok`. Proves the fail-closed tightening did not over-reach onto the
+    /// grant direction (no liveness regression).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_unblock_stays_best_effort_on_persist_failure() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        deps.persistence = Arc::new(FailingPersistence);
+
+        let ctx_id_bytes = [0xB2u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:bcast-unblock-author".to_owned());
+        let blocked = DID("did:example:bcast-unblock-target".to_owned());
+
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        // Pre-block the subscriber in memory so there is something to unblock.
+        state
+            .broadcast_context
+            .as_mut()
+            .unwrap()
+            .block_subscriber(author.as_ref(), blocked.as_ref())
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        let res = crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            &mut cell, &deps, &ctx_key, &author, &blocked,
+        );
+        assert!(
+            res.is_ok(),
+            "unblock (upward authorization) must stay best-effort and return Ok on \
+             persist failure — no over-tightening: got {res:?}"
+        );
+        assert!(
+            !cell
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .is_blocked(author.as_ref(), blocked.as_ref()),
+            "the unblock must have removed the block in memory"
+        );
+    }
+
+    /// Test 7 — §5.14.8 serve-path exclusion consult. A read-excluded (governance-
+    /// banned) DID is DENIED a broadcast key request even if it is adversarially
+    /// still present in the subscriber registry and not on the author's own block
+    /// list. Uses the uniform deny reason (non-leakage).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_key_request_denies_read_excluded_even_if_subscriber() {
+        let sup = supervisor_with_providers();
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0xB3u8; 32];
+        let author = DID("did:example:serve-author".to_owned());
+        let requester = DID("did:example:serve-excluded".to_owned());
+        // The serve path requires the author DID to be locally controlled.
+        deps.local_dids
+            .store(Arc::new(std::collections::HashSet::from([author.clone()])));
+
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        // Make the requester a VALID subscriber, NOT on the author block list, so
+        // the only thing denying the request is the read_exclusion consult.
+        let mut seed = state.broadcast_context.as_ref().unwrap().to_snapshot();
+        seed.subscribers.insert(
+            requester.to_string(),
+            scp_protocol::context::broadcast::SubscriberRecord {
+                subscriber_did: requester.to_string(),
+                registered_at: 1_700_000_000,
+                has_ucan: false,
+            },
+        );
+        state.broadcast_context =
+            Some(scp_protocol::context::broadcast::BroadcastContext::from_snapshot(seed));
+        // Governance ban wrote the exclusion set (Class-S, fail-closed).
+        state.access.read_exclusion_list.insert(requester.clone());
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        let decision = crate::context::broadcast_helpers::handle_broadcast_key_request(
+            &mut cell, &deps, &author, &requester, &[0u8; 32],
+        )
+        .expect("serve consult returns a decision");
+        assert!(
+            matches!(
+                &decision,
+                scp_protocol::context::broadcast::KeyRequestDecision::Deny { reason }
+                    if reason == scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON
+            ),
+            "a read-excluded requester must be DENIED with the uniform reason even \
+             when still a subscriber: got {decision:?}"
+        );
+    }
+
+    /// Register `subscriber` in `state`'s broadcast context via the snapshot
+    /// boundary (the roster ADD path is generic over the UCAN-validation context;
+    /// the snapshot boundary is the faithful equivalent for these probes).
+    fn seed_broadcast_subscriber(
+        state: &mut crate::context::actor::state::PerContextState,
+        subscriber: &DID,
+    ) {
+        let mut seed = state.broadcast_context.as_ref().unwrap().to_snapshot();
+        seed.subscribers.insert(
+            subscriber.to_string(),
+            scp_protocol::context::broadcast::SubscriberRecord {
+                subscriber_did: subscriber.to_string(),
+                registered_at: 1_700_000_000,
+                has_ucan: false,
+            },
+        );
+        state.broadcast_context =
+            Some(scp_protocol::context::broadcast::BroadcastContext::from_snapshot(seed));
+    }
+
+    /// Build an Active broadcast state where `banned` is a subscriber AND a
+    /// member, with a ceiling permitting `MemberBan` — everything
+    /// `execute_revoke` requires of a governance-ban target (§5.14.8 test
+    /// scaffold shared by the ban durability / atomicity / fail-closed probes).
+    async fn ban_ready_broadcast_state(
+        ctx_id_bytes: [u8; 32],
+        author: &DID,
+        banned: &DID,
+    ) -> crate::context::actor::state::PerContextState {
+        use scp_protocol::context::roles::Capability;
+
+        let mut state = broadcast_state_with_author(ctx_id_bytes, author).await;
+        seed_broadcast_subscriber(&mut state, banned);
+        state
+            .membership
+            .add_member(banned.clone(), "subscriber".to_owned(), Vec::new());
+        state
+            .role_state
+            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MemberBan,
+            ]))
+            .expect("well-formed built-in ceiling");
+        state
+            .role_state
+            .member_capabilities
+            .entry(banned.0.clone())
+            .or_default()
+            .extend([Capability::MessagesRead]);
+        state
+    }
+
+    /// Test 1 — §5.14.8 block-before-serve durability. A per-author block driven
+    /// through the fail-closed production helper (`block_broadcast_subscriber`)
+    /// survives a crash that lands before any coalesce: the respawn rehydrates a
+    /// snapshot whose author block list still holds the blocked DID, and the
+    /// restored broadcast context DENIES that DID's key request. A block that
+    /// rode only the coalesced path would be rolled back by the crash, silently
+    /// re-granting post-block key access (encryption-as-access-control violation).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_per_author_block_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xB5u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:bcast-crash-author".to_owned());
+        let blocked = DID("did:example:bcast-crash-blocked".to_owned());
+
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        // The blocked DID is a VALID subscriber so the post-restore serve-deny is
+        // attributable to the BLOCK (not to being unregistered).
+        seed_broadcast_subscriber(&mut state, &blocked);
+        let deps = test_actor_deps(&sup).await;
+
+        // Persist a pre-block baseline so the respawn has a snapshot to rehydrate.
+        let pre = crate::context::manager_methods::snapshot_context(&state);
+        persistence.persist_context(&ctx_key, &pre).unwrap();
+
+        // Drive the block through the PRODUCTION fail-closed helper (sync-persists
+        // atomically into the Class-S snapshot before returning).
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell, &deps, &ctx_key, &author, &blocked,
+        )
+        .expect("block must sync-persist and return Ok on a working backend");
+        let state = cell.into_inner();
+
+        // Spawn from the (blocked) state and crash before any coalesce.
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_bcast_block").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        // The respawn rehydrates from the persisted snapshot — assert the block
+        // survived (block_list ∋ blocked) and the restored context DENIES serve.
+        let after = persistence
+            .load_context(&ctx_key)
+            .unwrap()
+            .expect("respawned context must have a snapshot");
+        let bc_snap = after
+            .broadcast
+            .expect("Class S: broadcast state must round-trip the snapshot");
+        assert!(
+            !bc_snap.authors.is_empty(),
+            "the author must be present in the restored snapshot (non-vacuous)"
+        );
+        let restored_author = bc_snap
+            .authors
+            .get(author.as_ref())
+            .expect("the blocking author must round-trip");
+        assert!(
+            restored_author.block_list.contains(blocked.as_ref()),
+            "crash+respawn must NOT drop the per-author block (no post-block re-grant)"
+        );
+        // Serve-deny: the restored broadcast context denies the blocked DID's key
+        // request (per-author block-list check).
+        let restored_bc =
+            scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
+        let decision =
+            restored_bc.handle_key_request(author.as_ref(), blocked.as_ref(), &[0u8; 32]);
+        assert!(
+            matches!(
+                &decision,
+                scp_protocol::context::broadcast::KeyRequestDecision::Deny { reason }
+                    if reason == scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON
+            ),
+            "the restored context must DENY the blocked DID's key request: got {decision:?}"
+        );
+    }
+
+    /// Test 2 — §5.14.8 governance-ban durability. A context-wide governance ban
+    /// driven through the fail-closed `execute_revoke` survives a crash before
+    /// coalesce: the respawned snapshot shows the banned DID in the
+    /// `read_exclusion_list` AND in every author's block list, the author key
+    /// epoch advanced, and the subscriber removed — and the restored context
+    /// DENIES the banned DID's key request. All five facts ride ONE Class-S
+    /// snapshot, so none can be lost independently.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_governance_ban_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xB6u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:ban-crash-author".to_owned());
+        let banned = DID("did:example:ban-crash-target".to_owned());
+
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let deps = test_actor_deps(&sup).await;
+
+        let pre = crate::context::manager_methods::snapshot_context(&state);
+        persistence.persist_context(&ctx_key, &pre).unwrap();
+
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::governance_helpers::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &banned,
+            scp_protocol::context::governance::AccessScope::Read,
+            crate::context::governance_helpers::CommitMeta {
+                pid: [2u8; 32],
+                actor_did: author.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .expect("governance ban (Read scope) must sync-persist and succeed");
+        let state = cell.into_inner();
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_bcast_ban").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the banned context must respawn to a responsive Active actor"
+        );
+
+        let after = persistence
+            .load_context(&ctx_key)
+            .unwrap()
+            .expect("respawned context must have a snapshot");
+        assert!(
+            after.read_exclusion_list.contains(&banned),
+            "crash+respawn must NOT drop the governance-ban read-exclusion entry"
+        );
+        let bc_snap = after
+            .broadcast
+            .expect("Class S: broadcast state must round-trip the snapshot");
+        assert!(
+            !bc_snap.authors.is_empty(),
+            "the author must be present in the restored snapshot (non-vacuous)"
+        );
+        let restored_author = bc_snap
+            .authors
+            .get(author.as_ref())
+            .expect("the author must round-trip");
+        assert!(
+            restored_author.epoch >= 1,
+            "crash+respawn must NOT drop the governance-ban key-epoch advance"
+        );
+        assert!(
+            restored_author.block_list.contains(banned.as_ref()),
+            "crash+respawn must NOT drop the governance-ban all-author block insert"
+        );
+        assert!(
+            !bc_snap.subscribers.contains_key(banned.as_ref()),
+            "crash+respawn must NOT re-admit the banned subscriber to the roster"
+        );
+        let restored_bc =
+            scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
+        let decision = restored_bc.handle_key_request(author.as_ref(), banned.as_ref(), &[0u8; 32]);
+        assert!(
+            matches!(
+                &decision,
+                scp_protocol::context::broadcast::KeyRequestDecision::Deny { reason }
+                    if reason == scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON
+            ),
+            "the restored context must DENY the banned DID's key request: got {decision:?}"
+        );
+    }
+
+    /// Test 3 — §5.14.8: a governance ban's read-exclusion entry AND the author
+    /// key-epoch advance are ONE atomic snapshot round-trip. Because broadcast
+    /// security state now rides the Class-S `ContextSnapshot`, a SINGLE
+    /// `build_snapshot_from_state` (the production sync-persist builder) + serde
+    /// round-trip carries BOTH — proving the exclusion set and the epoch advance
+    /// cannot diverge across a crash (there is no separate best-effort broadcast
+    /// write that could land one without the other).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_governance_ban_exclusion_and_epoch_advance_are_one_atomic_snapshot() {
+        let sup = supervisor_with_providers();
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0xB7u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:atomic-author".to_owned());
+        let banned = DID("did:example:atomic-banned".to_owned());
+
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::governance_helpers::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &banned,
+            scp_protocol::context::governance::AccessScope::Read,
+            crate::context::governance_helpers::CommitMeta {
+                pid: [3u8; 32],
+                actor_did: author.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .expect("governance ban (Read scope) must succeed");
+        let state = cell.into_inner();
+
+        // ONE round-trip through the EXACT production sync-persist builder carries
+        // BOTH the exclusion set and the epoch advance.
+        let snap = crate::context::messaging_helpers::build_snapshot_from_state(&state);
+        let json = serde_json::to_vec(&snap).expect("snapshot serializes");
+        let restored: crate::context::state::ContextSnapshot =
+            serde_json::from_slice(&json).expect("snapshot deserializes");
+
+        assert!(
+            restored.read_exclusion_list.contains(&banned),
+            "the exclusion set must be in the atomic snapshot (non-vacuous)"
+        );
+        let bc_snap = restored
+            .broadcast
+            .expect("broadcast rides the SAME snapshot as the exclusion set");
+        assert!(
+            !bc_snap.authors.is_empty(),
+            "the author must be present (non-vacuous)"
+        );
+        let restored_author = bc_snap
+            .authors
+            .get(author.as_ref())
+            .expect("the author must round-trip");
+        assert!(
+            restored_author.epoch >= 1,
+            "the ban key-epoch advance must ride the SAME snapshot as the exclusion set"
+        );
+        assert!(
+            restored_author.block_list.contains(banned.as_ref()),
+            "the ban all-author block must ride the SAME snapshot"
+        );
+        assert!(
+            !bc_snap.subscribers.contains_key(banned.as_ref()),
+            "the ban subscriber removal must ride the SAME snapshot"
+        );
+    }
+
+    /// Test 5 — §5.14.8: a governance ban whose fail-closed persist FAILS returns
+    /// `Err(PersistenceFailed)` (NOT `Ok`) BEFORE any post-persist event-log
+    /// append or ack, and the ban is RETAINED in memory (keep-direction). Proves
+    /// the context-wide ban path shares the block path's fail-closed guarantee:
+    /// a crash in the coalesce window can never surface a ban the caller was told
+    /// succeeded but that did not durably land.
+    ///
+    /// The "BEFORE event-log" ordering is pinned with a [`RecordingEventLog`]:
+    /// the failing arm must record ZERO durable appends, and a control arm with
+    /// working persistence proves the SAME revoke path DOES append
+    /// `AccessRevoked` through this recorder — so the zero-append assertion is
+    /// non-vacuous (moving the append ahead of the persist fails the test).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_governance_ban_persist_is_fail_closed() {
+        let recorder = RecordingEventLog::default();
+        let sup = supervisor_with_providers_and_event_log(Box::new(recorder.clone()));
+        let mut deps = test_actor_deps(&sup).await;
+        deps.persistence = Arc::new(FailingPersistence);
+
+        let ctx_id_bytes = [0xB8u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let author = DID("did:example:ban-failclosed-author".to_owned());
+        let banned = DID("did:example:ban-failclosed-target".to_owned());
+
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let res = crate::context::governance_helpers::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &banned,
+            scp_protocol::context::governance::AccessScope::Read,
+            crate::context::governance_helpers::CommitMeta {
+                pid: [5u8; 32],
+                actor_did: author.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            matches!(res, Err(ContextError::PersistenceFailed(_))),
+            "a governance ban whose persist fails MUST fail-closed, not return Ok: got {res:?}"
+        );
+        // BEFORE event-log/ack: the `Err` must land before the post-persist
+        // `AccessRevoked` durable append — nothing may reach the event log.
+        let events: Vec<RecordedEvent> = recorder
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            events.is_empty(),
+            "a failed ban persist must return BEFORE any durable event-log \
+             append: got {events:?}"
+        );
+        // Keep-direction: the ban is RETAINED in memory (un-banning would be the
+        // unsafe re-grant direction). The banned DID stays excluded + blocked.
+        assert!(
+            cell.access.read_exclusion_list.contains(&banned),
+            "the ban read-exclusion must be RETAINED in memory on persist failure"
+        );
+        let bc = cell
+            .broadcast_context
+            .as_ref()
+            .expect("broadcast context present");
+        assert!(
+            bc.is_blocked(author.as_ref(), banned.as_ref()),
+            "the ban all-author block must be RETAINED in memory (keep-direction)"
+        );
+
+        // CONTROL (non-vacuity): the same revoke path with WORKING persistence
+        // appends `AccessRevoked` through this recorder — proving the recorder
+        // observes the exact append site the failing arm asserted silent.
+        let control_ctx_bytes = [0xB9u8; 32];
+        let control_ctx_key = hex::encode(control_ctx_bytes);
+        let control_deps = test_actor_deps(&sup).await;
+        let control_state = ban_ready_broadcast_state(control_ctx_bytes, &author, &banned).await;
+        let mut control_cell = crate::context::actor::class_s::ClassSCell::new(control_state);
+        crate::context::governance_helpers::execute_revoke(
+            &mut control_cell,
+            &control_deps,
+            &control_ctx_key,
+            &banned,
+            scp_protocol::context::governance::AccessScope::Read,
+            crate::context::governance_helpers::CommitMeta {
+                pid: [6u8; 32],
+                actor_did: author.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .expect("the control ban with working persistence must succeed");
+        let events: Vec<RecordedEvent> = recorder
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let control_appends = events
+            .iter()
+            .filter(|(id, event_type, ..)| {
+                *id == control_ctx_bytes && *event_type == scp_event_log::EventType::AccessRevoked
+            })
+            .count();
+        assert_eq!(
+            control_appends, 1,
+            "the successful control ban must append exactly one AccessRevoked \
+             (proves the recorder sees the revoke append site): got {events:?}"
         );
     }
 
@@ -16217,22 +16824,6 @@ mod tests {
             _id: &str,
         ) -> Result<
             Option<crate::context::state::ContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -18623,22 +19214,6 @@ mod tests {
         > {
             Err("synthetic transient storage failure on load_context".into())
         }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -19648,22 +20223,6 @@ mod tests {
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(self.snapshots.get(id).map(|e| e.value().clone()))
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
         }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())

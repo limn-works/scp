@@ -55,9 +55,9 @@
 //!
 //! Persistence shortcuts:
 //! - [`has_persistence`] — predicate for skipping snapshot work.
-//! - [`persist_context_snapshot`] — best-effort persist + crypto export.
-//! - [`persist_broadcast_snapshot`] — best-effort persist of broadcast state.
-//! - [`persist_context_and_broadcast`] — atomic snapshot of both pairs.
+//! - [`persist_context_and_broadcast`] — best-effort flush of the whole
+//!   [`ContextSnapshot`] (context state + crypto export + embedded broadcast)
+//!   via the target actor's `FlushSnapshot` command.
 //!
 //! Broadcast bootstrapping:
 //! - [`init_broadcast_context`] — create + persist initial broadcast state.
@@ -68,9 +68,7 @@
 use scp_identity::DID;
 use scp_protocol::context::ContextParams;
 use scp_protocol::context::ContextState;
-use scp_protocol::context::broadcast::{
-    BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-};
+use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::params::{ContextMode, TemplateId};
 
@@ -167,32 +165,6 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
 }
 
 // ---------------------------------------------------------------------------
-// persist_broadcast_snapshot
-// ---------------------------------------------------------------------------
-
-/// Persists a broadcast context snapshot if a persistence provider is
-/// configured. Best-effort: logs errors but does not propagate.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::persist_broadcast_snapshot`](crate::context::supervisor::Supervisor::persist_broadcast_snapshot)
-/// (ADR-049 commit 12). Byte-identical behavior.
-pub fn persist_broadcast_snapshot(
-    supervisor: &Supervisor,
-    context_id: &str,
-    snapshot: &BroadcastContextSnapshot,
-) {
-    if let Some(persistence) = supervisor.persistence_ref()
-        && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
-    {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist broadcast snapshot"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 11. init_broadcast_context
 // ---------------------------------------------------------------------------
 
@@ -231,10 +203,11 @@ pub fn init_broadcast_context(
     // Register the creator as the first author (messagesWrite).
     bc.add_author(creator_did)
         .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-    // Persist initial broadcast state for crash recovery.
-    if has_persistence(supervisor) {
-        persist_broadcast_snapshot(supervisor, context_id, &bc.to_snapshot());
-    }
+    // The initial broadcast state (creator-as-author, epoch 0, no blocks) now
+    // rides the Class-S `ContextSnapshot` (ADR-049 §9); it is persisted with the
+    // context snapshot on the creation path — no separate best-effort broadcast
+    // write. The `supervisor` handle is unused now that the eager persist is gone.
+    let _ = supervisor;
     Ok(Some(bc))
 }
 
@@ -372,5 +345,12 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(ctx),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
+        // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold broadcast security
+        // + roster state into the snapshot so block / ban / key-epoch advance is
+        // durable atomically with `read_exclusion_list`.
+        broadcast: ctx
+            .broadcast_context
+            .as_ref()
+            .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot),
     }
 }

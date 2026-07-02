@@ -151,12 +151,12 @@ async fn gated_subscribe_without_ucan_fails() {
 async fn per_author_broadcast_key() {
     let author = AuthorState::new("did:key:author-test".to_owned());
     assert_eq!(author.author_did, "did:key:author-test");
-    assert_eq!(author.epoch, 0);
+    assert_eq!(author.epoch(), 0);
     assert_eq!(author.next_sequence, 1);
-    assert!(author.block_list.is_empty());
+    assert!(author.block_list().is_empty());
 
     // The broadcast key should be 32 bytes of non-zero randomness
-    let key_bytes = author.broadcast_key.as_bytes();
+    let key_bytes = author.broadcast_key().as_bytes();
     assert_eq!(key_bytes.len(), 32);
     // Extremely unlikely all zero
     assert!(key_bytes.iter().any(|b| *b != 0));
@@ -270,7 +270,7 @@ async fn block_subscriber_rotates_key() {
 
     // Verify the author starts at epoch 0
     let author_before = ctx.get_author("did:key:author1").unwrap();
-    assert_eq!(author_before.epoch, 0);
+    assert_eq!(author_before.epoch(), 0);
 
     // Block subscriber
     let block_result = ctx
@@ -282,8 +282,8 @@ async fn block_subscriber_rotates_key() {
 
     // The author's epoch should now be 1
     let author_after = ctx.get_author("did:key:author1").unwrap();
-    assert_eq!(author_after.epoch, 1);
-    assert!(author_after.block_list.contains("did:key:subscriber1"));
+    assert_eq!(author_after.epoch(), 1);
+    assert!(author_after.block_list().contains("did:key:subscriber1"));
 
     // The subscriber is still in the roster (per-author blocking only)
     assert!(ctx.is_subscriber("did:key:subscriber1"));
@@ -332,7 +332,7 @@ async fn handle_key_request_non_blocked() {
                 recovered.as_bytes(),
                 ctx.get_author("did:key:author1")
                     .unwrap()
-                    .broadcast_key
+                    .broadcast_key()
                     .as_bytes()
             );
         }
