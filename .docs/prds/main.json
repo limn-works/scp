@@ -10321,7 +10321,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [],
       "files": [
         "bindings/python/scp_sdk/trust.py",
@@ -10387,7 +10387,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [],
       "files": [
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",

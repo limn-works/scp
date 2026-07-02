@@ -760,6 +760,14 @@ class SCP:
         presenting_agent_did: Any = ...,
         proof_tokens: Any = ...,
     ) -> Any: ...
+    def ucan_evaluate(
+        self,
+        context_id: Any,
+        token: Any,
+        capability: Any = ...,
+        presenting_agent_did: Any = ...,
+        proof_tokens: Any = ...,
+    ) -> Any: ...
     def __repr__(self) -> str: ...
 
 # ---------------------------------------------------------------------------

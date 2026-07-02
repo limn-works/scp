@@ -1044,6 +1044,10 @@ pub fn verify_participation_requirements(
         let mut distinct_signers: HashSet<[u8; 32]> = HashSet::new();
         let mut newest_updated_at: u64 = 0;
         let mut any_fresh = false;
+        // Best fact value among fresh statements, tracked in the single pass
+        // below so the `ThresholdNotMet` diagnostic needs neither a duplicated
+        // freshness predicate nor a second iteration.
+        let mut best_fresh_value: u64 = 0;
 
         for statement in &statements {
             newest_updated_at = newest_updated_at.max(statement.updated_at);
@@ -1065,6 +1069,7 @@ pub fn verify_participation_requirements(
 
             // Threshold check.
             let value = req.fact.extract_value(statement);
+            best_fresh_value = best_fresh_value.max(value);
             if !req.threshold.is_satisfied(value) {
                 continue;
             }
@@ -1085,21 +1090,13 @@ pub fn verify_participation_requirements(
         // If no statements satisfied the threshold (but some were fresh),
         // find the best value to report.
         if distinct_signers.is_empty() {
-            // Find the best value among fresh statements for diagnostics.
-            let best_value = statements
-                .iter()
-                .filter(|s| {
-                    s.updated_at <= current_time.saturating_add(MAX_PARTICIPATION_FUTURE_SKEW_SECS)
-                        && current_time.saturating_sub(s.updated_at) <= req.max_age_secs
-                })
-                .map(|s| req.fact.extract_value(s))
-                .max()
-                .unwrap_or(0);
-
+            // `best_fresh_value` is the max fact value among fresh statements
+            // (subject-matching, signature-verified, within the skew bound and
+            // `max_age_secs`), accumulated in the single pass above.
             return Err(ParticipationAdmissionError::ThresholdNotMet {
                 fact: req.fact.clone(),
                 threshold: req.threshold.clone(),
-                value: best_value,
+                value: best_fresh_value,
             });
         }
 

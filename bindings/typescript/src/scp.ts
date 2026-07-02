@@ -2369,6 +2369,20 @@ export class SCP {
     );
   }
 
+  /**
+   * Verify participation profiles against admission requirements.
+   *
+   * Returns normally when all requirements are satisfied; throws on any
+   * failed requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: this verifies
+   * signatures over the subject binding, not signer *legitimacy*. Because
+   * `signerPublicKey` is self-certifying, a subject can present
+   * genuinely-signed profiles from signers it controls (inflating
+   * `minContexts`). Callers MUST establish signer legitimacy separately
+   * (a trusted-signer set, a context-membership proof, or the §7.3.5
+   * threshold/independence path) and MUST NOT treat success as authorization.
+   */
   verifyParticipationRequirements(
     expectedSubject: string,
     requirementsJson: string,
