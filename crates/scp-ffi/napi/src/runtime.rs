@@ -1843,20 +1843,18 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
 
 /// In-memory persistence provider for the NAPI bridge.
 ///
-/// Stores context and broadcast snapshots in `DashMap`s. Suitable for
+/// Stores context snapshots in a `DashMap`. Suitable for
 /// the Node.js/Bun environment where process lifetime matches context
 /// lifetime. Production persistence (`SQLite`) is configured at the
 /// application layer.
 struct NapiBridgePersistence {
     contexts: DashMap<String, ContextSnapshot>,
-    broadcasts: DashMap<String, scp_core::context::broadcast::BroadcastContextSnapshot>,
 }
 
 impl NapiBridgePersistence {
     fn new() -> Self {
         Self {
             contexts: DashMap::new(),
-            broadcasts: DashMap::new(),
         }
     }
 }
@@ -1879,32 +1877,11 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(self.contexts.get(context_id).map(|v| v.value().clone()))
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.broadcasts
-            .insert(context_id.to_owned(), snapshot.clone());
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        Ok(self.broadcasts.get(context_id).map(|v| v.value().clone()))
-    }
-
     fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.contexts.remove(context_id);
-        self.broadcasts.remove(context_id);
         Ok(())
     }
 
@@ -1958,24 +1935,6 @@ impl ContextPersistence for ArcContextPersistence {
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.load_context(context_id)
-    }
-
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_broadcast(context_id, snapshot)
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        self.inner.load_broadcast(context_id)
     }
 
     fn delete_context(

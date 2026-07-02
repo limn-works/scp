@@ -57,7 +57,6 @@ use subtle::ConstantTimeEq;
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::broadcast::BroadcastContext;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::Capability;
@@ -72,7 +71,7 @@ use scp_protocol::provenance::attach::SourceContextInfo;
 use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rules};
 
 use crate::context::ContextHandle;
-use crate::context::actor::class_s::ClassCMut;
+use crate::context::actor::class_s::{BroadcastContextClassCMut, ClassCMut};
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
@@ -333,7 +332,7 @@ pub fn commit_send_nonce_token_on_abort(
 /// Builds a broadcast envelope for the send path. Pure helper.
 pub fn build_broadcast_envelope(
     clock: &dyn Clock,
-    bc: &mut BroadcastContext,
+    bc: &mut BroadcastContextClassCMut<'_>,
     sender_did: &DID,
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
@@ -929,7 +928,7 @@ pub async fn send_message(
     let velocity_token = {
         let mut view = cell.class_c_view();
         // H7: capability check BEFORE budget deduction.
-        if view.broadcast_context_mut().is_none() {
+        if view.broadcast_class_c_mut().is_none() {
             let role = view.role_state_class_c_mut();
             if !role.member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite) {
                 let is_suspended = role
@@ -1031,11 +1030,11 @@ pub async fn send_message(
         ContextError,
     > = {
         let mut view = cell.class_c_view();
-        if let Some(bc) = view.broadcast_context_mut().as_mut() {
+        if let Some(mut bc) = view.broadcast_class_c_mut() {
             // `signer` was validated non-`None` at the top of the function; the
             // broadcast envelope is signed with the same key the encrypted path
             // would stamp, sourced from the one `MessageSigner`.
-            build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key()).map(
+            build_broadcast_envelope(&*deps.clock, &mut bc, sender_did, payload, signer.key()).map(
                 |env| {
                     // Broadcast: SHA-256(context_id) per spec §5.14.
                     let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
@@ -2285,7 +2284,7 @@ fn create_and_broadcast_checkpoint_if_due(
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
     let due_checkpoint = {
         let mut view = cell.class_c_view();
-        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
         crate::context::queries_helpers::create_checkpoint_if_due_view(
             &mut view,
@@ -2624,6 +2623,15 @@ pub fn build_snapshot_from_state(
         // the caller deduction + void the escrow without the in-memory carrier.
         xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
+        // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
+        // security + roster state (per-author key epochs, block lists, subscriber
+        // registry) into the fail-closed snapshot so a block / governance ban /
+        // key-epoch advance is durable BEFORE the operation acks. `None` for
+        // non-broadcast contexts.
+        broadcast: state
+            .broadcast_context
+            .as_ref()
+            .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot),
     }
 }
 

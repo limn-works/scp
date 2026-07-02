@@ -2761,22 +2761,6 @@ mod tests {
                 > {
                     Ok(None)
                 }
-                fn persist_broadcast(
-                    &self,
-                    _: &str,
-                    _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-                ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                    Ok(())
-                }
-                fn load_broadcast(
-                    &self,
-                    _: &str,
-                ) -> Result<
-                    Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-                    Box<dyn std::error::Error + Send + Sync>,
-                > {
-                    Ok(None)
-                }
                 fn delete_context(
                     &self,
                     _: &str,
@@ -2855,22 +2839,6 @@ mod tests {
         > {
             Ok(None)
         }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
         fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -2908,22 +2876,6 @@ mod tests {
             _: &str,
         ) -> Result<
             Option<crate::context::state::ContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -2997,22 +2949,6 @@ mod tests {
             _: &str,
         ) -> Result<
             Option<crate::context::state::ContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)

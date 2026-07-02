@@ -1276,24 +1276,6 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
         self.inner.load_context(context_id)
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_broadcast(context_id, snapshot)
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        self.inner.load_broadcast(context_id)
-    }
-
     fn delete_context(
         &self,
         context_id: &str,

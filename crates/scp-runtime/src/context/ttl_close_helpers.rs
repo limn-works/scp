@@ -42,8 +42,8 @@
 use std::sync::Arc;
 
 use scp_identity::DID;
+use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::ContextEvent;
-use scp_protocol::context::{ContextError, ContextState};
 use tokio::sync::Notify;
 
 use crate::context::ContextHandle;
@@ -566,90 +566,10 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
 /// actor-owned `PerContextState` rather than the legacy lock-shaped
 /// type.
 fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::ContextSnapshot {
-    use crate::context::state::VelocityTrackerSnapshot;
-
-    let context_state_value = state
-        .handle
-        .try_read_state()
-        .unwrap_or(ContextState::Active);
-    let ttl_remaining_secs = state.ttl.timer.remaining_secs();
-    let grace_entries = state.epoch.grace_store.to_grace_entries();
-
-    crate::context::state::ContextSnapshot {
-        context_id: state.handle.context_id().to_owned(),
-        creation_timestamp_secs: state.creation_timestamp_secs,
-        state: context_state_value,
-        context_params: state.handle.params().clone(),
-        membership: state.membership.clone(),
-        role_state: state.role_state.clone(),
-        event_log_merkle_root: [0u8; 32],
-        executed_proposals: state
-            .governance
-            .class_s
-            .executed_proposals
-            .keys()
-            .copied()
-            .collect(),
-        ttl_remaining_secs,
-        registered_tools: state.governance.registered_tools.clone(),
-        read_exclusion_list: state.access.read_exclusion_list.clone(),
-        tool_interfaces: state.governance.tool_interfaces.clone(),
-        threshold_signers: state.governance.class_s.threshold_signers.clone(),
-        threshold_value: state.governance.class_s.threshold_value,
-        pruning_policy: state.governance.pruning_policy.clone(),
-        governance_model_config: Some(state.governance.engine.model_config()),
-        economic_policy: state.governance.economic_policy.clone(),
-        budget_tracker: state.governance.budget_tracker.clone(),
-        approved_proposals: state.governance.approved_proposals.clone(),
-        next_proposal_seq: state.governance.next_proposal_seq,
-        governance_freeze: state.governance.freeze,
-        pending_ceiling_modification: state.governance.pending_ceiling_modification.clone(),
-        pending_economic_policy_change: state.governance.pending_economic_policy_change.clone(),
-        mls_epoch: state.epoch.mls_epoch,
-        epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
-        grace_entries,
-        needs_reconnect: state.epoch.needs_reconnect,
-        // MLS crypto state is populated in `persist_state_best_effort`
-        // where the crypto provider is available. Initialized empty here.
-        mls_crypto_state: Vec::new(),
-        migration_state: state.migration_state.clone(),
-        access_key_store: state.access.access_key_store.clone(),
-        consequence_rules: state.governance.consequence_rules.clone(),
-        participation_cache: state.governance.participation_cache.clone(),
-        velocity_tracker: Some(state.governance.velocity_tracker.window_secs()),
-        velocity_tracker_state: Some(VelocityTrackerSnapshot {
-            window_secs: state.governance.velocity_tracker.window_secs(),
-            entries: state.governance.velocity_tracker.snapshot_entries(),
-        }),
-        cooldown_until: state.governance.cooldown_until.clone(),
-        proposal_timestamps: state.governance.proposal_timestamps.clone(),
-        message_pricing: state.governance.message_pricing.clone(),
-        hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
-        hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state
-            .governance
-            .class_s
-            .spending_nonce_tracker
-            .snapshot_entries(),
-        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
-        pending_commits: state.pending_commits.clone(),
-        commit_fault: state.commit_fault.clone(),
-        checkpoint_events_since: state.checkpoint_events_since,
-        checkpoint_last_time_secs: state.checkpoint_last_time_secs,
-        generation: state.generation,
-        routing: state.routing.clone(),
-        // ADR-049 §9 Class S (line 144): persist the staged saga slot
-        // through its sanctioned mirror via the shared helper.
-        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
-        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
-            state,
-        ),
-        xctx_committed_invocations:
-            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(state),
-        xctx_caller_reservations:
-            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
-        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
-    }
+    // Single source of truth (ADR-049 §9): delegate to the canonical builder so
+    // the broadcast Class-S fold and the field-round-trip tripwire cover every
+    // persist path. This copy was value-identical to the canonical one.
+    crate::context::messaging_helpers::build_snapshot_from_state(state)
 }
 
 #[cfg(test)]

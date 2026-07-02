@@ -20,14 +20,13 @@ use std::sync::Mutex;
 
 use crate::context::persistence::ContextPersistence;
 use crate::context::state::ContextSnapshot;
-use scp_protocol::context::broadcast::BroadcastContextSnapshot;
 
 // Re-export the canonical implementation.
 pub use crate::store::context::ProtocolRepositoryContextBridge;
 
 /// In-memory [`ContextPersistence`] implementation for integration tests.
 ///
-/// Stores context and broadcast snapshots in `HashMap`s protected by
+/// Stores context snapshots in a `HashMap` protected by
 /// `std::sync::Mutex`. Suitable for integration tests that need persistence
 /// semantics (e.g., persist-drop-restore round-trip tests) without requiring
 /// a `ProtocolRepository` or storage backend.
@@ -54,11 +53,6 @@ pub struct InMemoryPersistence {
         reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
     )]
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
-    #[allow(
-        clippy::disallowed_types,
-        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
-    )]
-    broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
 }
 
 #[allow(
@@ -71,7 +65,6 @@ impl InMemoryPersistence {
     pub fn new() -> Self {
         Self {
             contexts: Mutex::new(HashMap::new()),
-            broadcasts: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -107,39 +100,11 @@ impl ContextPersistence for InMemoryPersistence {
             .cloned())
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.broadcasts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(context_id.to_owned(), snapshot.clone());
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .broadcasts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(context_id)
-            .cloned())
-    }
-
     fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.contexts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(context_id);
-        self.broadcasts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(context_id);
@@ -237,6 +202,7 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: std::collections::HashMap::new(),
+            broadcast: None,
         }
     }
 

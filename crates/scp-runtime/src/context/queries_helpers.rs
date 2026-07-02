@@ -162,8 +162,8 @@ pub fn get_broadcast_key_for_local_author(
         .get_author(author_did)
         .ok_or_else(|| ContextError::MemberNotFound(format!("author not found: {author_did}")))?;
 
-    let key_bytes = Zeroizing::new(*author.broadcast_key.as_bytes());
-    Ok((key_bytes, author.epoch))
+    let key_bytes = Zeroizing::new(*author.broadcast_key().as_bytes());
+    Ok((key_bytes, author.epoch()))
 }
 
 /// Returns the current member count for a context.

@@ -567,25 +567,6 @@ pub async fn apply_pending_economic_policy_change(
 }
 
 // ---------------------------------------------------------------------------
-// Persistence helpers (best-effort)
-// ---------------------------------------------------------------------------
-
-/// Best-effort persist of broadcast snapshot via `deps.persistence`.
-fn persist_broadcast_snapshot(
-    deps: &ActorDeps,
-    context_id: &str,
-    snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-) {
-    if let Err(e) = deps.persistence.persist_broadcast(context_id, snapshot) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist broadcast snapshot"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // detect_and_handle_conflicts (transitive helper, actor-shape)
 // ---------------------------------------------------------------------------
 
@@ -879,10 +860,15 @@ pub fn execute_revoke(
     // did (keep-direction: a downward suspension stays applied even if the
     // persist fails — un-applying it would re-grant the revoked authority).
     // A check reject (`Err` from the closure) returns before any persist,
-    // exactly as the prior early returns did. The post-persist external work
-    // (broadcast snapshot, event-log append, sender-key rotation, the
-    // coalesced `checkpoint_events_since` bump) is UNCHANGED and runs after.
-    let (rotated, bc_snap, needs_sender_key_rotation) =
+    // exactly as the prior early returns did. Broadcast security state (author
+    // block lists + governance-ban key-epoch advance) now rides the Class-S
+    // `ContextSnapshot`, so the combinator's fail-closed persist covers it
+    // ATOMICALLY with `read_exclusion_list` — the prior trailing best-effort
+    // `persist_broadcast_snapshot` (a separate warn-and-continue write) is gone
+    // (§5.14.8 block-before-serve). The post-persist external work (event-log
+    // append, sender-key rotation, the coalesced `checkpoint_events_since` bump)
+    // is UNCHANGED and runs after.
+    let (rotated, needs_sender_key_rotation) =
         cell.commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
@@ -897,7 +883,6 @@ pub fn execute_revoke(
             }
 
             let mut rotated = 0usize;
-            let mut bc_snap = None;
 
             // Write revocation.
             if matches!(access, AccessScope::Write | AccessScope::Both) {
@@ -910,7 +895,6 @@ pub fn execute_revoke(
                         Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
                         Err(e) => return Err(e),
                     }
-                    bc_snap = Some(bc.to_snapshot());
                 }
 
                 emit(
@@ -937,7 +921,6 @@ pub fn execute_revoke(
                         Err(ContextError::MemberNotFound(_)) => {}
                         Err(e) => return Err(e),
                     }
-                    bc_snap = Some(bc.to_snapshot());
                 } else {
                     state
                         .access
@@ -963,12 +946,9 @@ pub fn execute_revoke(
                 matches!(access, AccessScope::Write | AccessScope::Both)
                     && state.broadcast_context.is_none();
 
-            Ok((rotated, bc_snap, needs_sender_key_rotation))
+            Ok((rotated, needs_sender_key_rotation))
         })?;
 
-    if let Some(ref bc) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, bc);
-    }
     let access_revoked_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
             target_did: did.as_ref().to_owned(),
@@ -1045,10 +1025,13 @@ pub fn execute_restore_access(
     // applied in memory and the persist error surfaces (the member is, if
     // anything, MORE permissioned in memory than on disk — the safe direction).
     // The check rejects (`Err` from the closure) run before any persist exactly
-    // as the prior early returns did. The post-persist external work (broadcast
-    // snapshot, event-log append, coalesced `checkpoint_events_since` bump) is
+    // as the prior early returns did. Broadcast block-list state now rides the
+    // Class-S `ContextSnapshot`, so the combinator's fail-closed persist covers the
+    // governance-unban block-list REMOVE atomically — the prior trailing
+    // best-effort `persist_broadcast_snapshot` is gone. The post-persist external
+    // work (event-log append, coalesced `checkpoint_events_since` bump) is
     // unchanged.
-    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
 
@@ -1074,13 +1057,12 @@ pub fn execute_restore_access(
             .restore_capabilities(did.as_ref(), capabilities);
 
         let has_read = capabilities.contains(&Capability::MessagesRead);
-        let bc_snap = if has_read {
+        if has_read {
             state.access.read_exclusion_list.remove(did);
 
-            let snap = state.broadcast_context.as_mut().map(|bc| {
+            if let Some(bc) = state.broadcast_context.as_mut() {
                 bc.governance_unban_subscriber(&did.0);
-                bc.to_snapshot()
-            });
+            }
 
             if state.broadcast_context.is_none() {
                 let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
@@ -1108,11 +1090,7 @@ pub fn execute_restore_access(
                 context_id,
                 deps,
             );
-
-            snap
-        } else {
-            None
-        };
+        }
 
         if capabilities.contains(&Capability::MessagesWrite) {
             emit(
@@ -1123,12 +1101,9 @@ pub fn execute_restore_access(
             );
         }
 
-        Ok(bc_snap)
+        Ok(())
     })?;
 
-    if let Some(ref bc) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, bc);
-    }
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::AccessRestored,
@@ -2595,17 +2570,17 @@ pub fn execute_rotate_content_keys(
     // on persist failure the rotation STAYS — reverting to the pre-rotation key
     // state after the rotation was acknowledged is the unsafe direction). The
     // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
-    // SAME fail-closed persist via `view.rest_mut()`. The closure returns the
-    // optional broadcast snapshot so its separate best-effort persist can run
-    // AFTER the fail-closed persist, exactly as before.
-    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+    // SAME fail-closed persist via `view.rest_mut()`. Broadcast per-author key
+    // epochs now ride the Class-S `ContextSnapshot`, so the all-author key-epoch
+    // advance persists fail-closed atomically inside the combinator — the prior
+    // trailing best-effort `persist_broadcast_snapshot` is gone (§5.14.8).
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
 
-        let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
+        let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
             bc.rotate_all_author_keys()?;
-            let snap = Some(bc.to_snapshot());
-            (None, snap)
+            None
         } else {
             let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
@@ -2633,7 +2608,7 @@ pub fn execute_rotate_content_keys(
                 let did = new_key.member_did().to_owned();
                 state.access.access_key_store.set(context_id, &did, new_key);
             }
-            (Some(epoch_out), None)
+            Some(epoch_out)
         };
 
         emit(
@@ -2660,11 +2635,8 @@ pub fn execute_rotate_content_keys(
                 },
             );
         }
-        Ok(bc_snap)
+        Ok(())
     })?;
-    if let Some(ref snap) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, snap);
-    }
 
     deps.event_log.append_context_event(
         &context_id_bytes,

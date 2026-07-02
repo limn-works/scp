@@ -2345,15 +2345,28 @@ pub fn load_persisted_context_state(
             })?,
     };
 
-    let broadcast_ctx = deps
-        .persistence
-        .load_broadcast(context_id)
-        .map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "failed to load broadcast state for {context_id}: {e}"
-            ))
-        })?
+    // Broadcast security + roster state now rides the fail-closed `ContextSnapshot`
+    // (ADR-049 §9 / §5.14.8 block-before-serve). It is no longer loaded through a
+    // separate best-effort row; it deserializes atomically with `read_exclusion_list`
+    // from the one snapshot, so a block / governance ban / key-epoch advance that
+    // persisted fail-closed is present on restore by construction.
+    let mut broadcast_ctx = ctx_snapshot
+        .broadcast
+        .clone()
         .map(scp_protocol::context::broadcast::BroadcastContext::from_snapshot);
+
+    // Restore-path reconciliation (§5.14.8 block-before-serve, defense-in-depth).
+    // Re-apply the durable `read_exclusion_list` (written ONLY by governance-ban
+    // `execute_revoke`, fail-closed) into the restored broadcast block state: for
+    // each excluded DID, drop from the subscriber registry + insert into every
+    // author's block list. This closes any window where the restored per-author
+    // block lists and the exclusion set could disagree (author registered after
+    // the ban; legacy snapshot). A per-author UNILATERAL block does NOT write
+    // `read_exclusion_list`, so this reconciliation cannot rescue that arm — that
+    // is why the per-author block persists fail-closed at block time.
+    if let Some(bc) = broadcast_ctx.as_mut() {
+        bc.apply_read_exclusions(ctx_snapshot.read_exclusion_list.iter());
+    }
 
     Ok((ctx_snapshot, broadcast_ctx))
 }
@@ -3184,12 +3197,12 @@ mod restore_reconcile_tests {
         }
     }
 
-    /// Captures every snapshot/broadcast write so a real `create_context` can be
-    /// used to harvest a fully-formed, validation-passing `ContextSnapshot`.
+    /// Captures every snapshot write so a real `create_context` can be used to
+    /// harvest a fully-formed, validation-passing `ContextSnapshot` (broadcast
+    /// state now rides `ContextSnapshot::broadcast`, ADR-049 §9 fold).
     #[derive(Default)]
     struct CapturingPersistence {
         contexts: Mutex<HashMap<String, ContextSnapshot>>,
-        broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
     }
     impl ContextPersistence for CapturingPersistence {
         fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
@@ -3201,20 +3214,6 @@ mod restore_reconcile_tests {
         }
         fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(self.contexts.lock().unwrap().get(id).cloned())
-        }
-        fn persist_broadcast(
-            &self,
-            id: &str,
-            s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            self.broadcasts
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), s.clone());
-            Ok(())
-        }
-        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            Ok(self.broadcasts.lock().unwrap().get(id).cloned())
         }
         fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
@@ -3235,16 +3234,6 @@ mod restore_reconcile_tests {
         fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             self.0.load_context(id)
         }
-        fn persist_broadcast(
-            &self,
-            id: &str,
-            s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            self.0.persist_broadcast(id, s)
-        }
-        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            self.0.load_broadcast(id)
-        }
         fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
             self.0.delete_context(id)
         }
@@ -3260,7 +3249,6 @@ mod restore_reconcile_tests {
     /// reconciliation cross-checks.
     struct ServingPersistence {
         snapshot: ContextSnapshot,
-        broadcast: Option<BroadcastContextSnapshot>,
     }
     impl ContextPersistence for ServingPersistence {
         fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
@@ -3268,19 +3256,6 @@ mod restore_reconcile_tests {
         }
         fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(Some(self.snapshot.clone()))
-        }
-        fn persist_broadcast(
-            &self,
-            _id: &str,
-            _s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _id: &str,
-        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            Ok(self.broadcast.clone())
         }
         fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
@@ -3360,7 +3335,9 @@ mod restore_reconcile_tests {
             .get(ctx_id)
             .cloned()
             .expect("create_context must persist a snapshot");
-        let broadcast = capture.broadcasts.lock().unwrap().get(ctx_id).cloned();
+        // Broadcast state rides the snapshot now (ADR-049 §9 fold) — read it back
+        // from `snapshot.broadcast`, not a separate persisted broadcast row.
+        let broadcast = snapshot.broadcast.clone();
         (snapshot, broadcast)
     }
 
@@ -3375,10 +3352,11 @@ mod restore_reconcile_tests {
     ) -> Result<(), ContextError> {
         snapshot.context_id = restore_ctx_id.to_owned();
         snapshot.routing = routing;
-        let serving = ServingPersistence {
-            snapshot,
-            broadcast: serve_broadcast,
-        };
+        // Broadcast state now rides the snapshot (ADR-049 §9 fold); the
+        // reconstructed mode is driven by `snapshot.broadcast` (Some → Broadcast,
+        // None → Encrypted), exactly the axis the reconciliation cross-checks.
+        snapshot.broadcast = serve_broadcast;
+        let serving = ServingPersistence { snapshot };
         let supervisor = build_supervisor(Box::new(serving));
         let deps = supervisor
             .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
@@ -3493,19 +3471,6 @@ mod restore_reconcile_tests {
             Err("forced persist failure".into())
         }
         fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
-            Ok(None)
-        }
-        fn persist_broadcast(
-            &self,
-            _id: &str,
-            _snap: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            Ok(())
-        }
-        fn load_broadcast(
-            &self,
-            _id: &str,
-        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
             Ok(None)
         }
         fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
