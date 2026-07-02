@@ -11,7 +11,6 @@
 // --- Modules that exist ONLY in scp-protocol (no conflict) ---
 pub use scp_protocol::jcs;
 pub use scp_protocol::serde_util;
-pub use scp_protocol::time;
 pub use scp_protocol::uri;
 
 // --- Modules that exist ONLY in scp-runtime (no conflict) ---
@@ -24,11 +23,26 @@ pub use scp_runtime::well_known;
 
 pub mod crypto {
     pub use scp_protocol::crypto::canonical;
-    pub use scp_protocol::crypto::ed25519;
     pub use scp_protocol::crypto::envelope_seal;
     pub use scp_protocol::crypto::key_continuity;
     pub use scp_protocol::crypto::tofu;
-    pub use scp_runtime::crypto::mls;
+    /// MLS facade merging `scp-mls` with `scp-runtime`'s storage bridge.
+    ///
+    /// The wasm-safe synchronous state machine (`scp-mls`, ADR-057) supplies
+    /// the sync submodules; `scp-runtime`'s node-only async durable-storage
+    /// bridge supplies the tokio-coupled provider/storage/backend submodules.
+    pub mod mls {
+        // Synchronous MLS state machine (wasm-safe) from scp-mls.
+        pub use scp_mls::{
+            InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
+            ratchet, wrapping_extension,
+        };
+        // Node-only async durable-storage bridge from scp-runtime.
+        pub use scp_runtime::crypto::mls::{
+            MlsCryptoProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, backend,
+            production_backend, provider, storage, storage_adapter,
+        };
+    }
     pub mod sender_keys {
         pub use scp_protocol::crypto::sender_keys::*;
         pub use scp_runtime::crypto::sender_keys::key_protocol;

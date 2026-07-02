@@ -17,7 +17,7 @@ use hex;
 use scp_platform::traits::Storage;
 use zeroize::Zeroize;
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::{ProtocolRepository, StoreError};
 
@@ -708,7 +708,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_grace_entry(
         &self,
         context_id: &str,
-        entry: &crate::crypto::mls::epoch_grace::GraceEntry,
+        entry: &scp_mls::epoch_grace::GraceEntry,
     ) -> Result<(), StoreError> {
         let key = grace_entry_key(context_id, entry.epoch)?;
         self.store_value(&key, entry).await
@@ -734,13 +734,13 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_grace_entries(
         &self,
         context_id: &str,
-    ) -> Result<Vec<crate::crypto::mls::epoch_grace::GraceEntry>, StoreError> {
+    ) -> Result<Vec<scp_mls::epoch_grace::GraceEntry>, StoreError> {
         let prefix = grace_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let mut entries = Vec::with_capacity(keys.len());
         for key in &keys {
             if let Some(entry) = self
-                .load_value::<crate::crypto::mls::epoch_grace::GraceEntry>(key)
+                .load_value::<scp_mls::epoch_grace::GraceEntry>(key)
                 .await?
             {
                 entries.push(entry);
@@ -1328,7 +1328,7 @@ mod tests {
             "did:dht:z6MkCreator",
             scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_load_grace_entry_roundtrip() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {
@@ -1612,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_grace_entries_returns_sorted_by_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         // Store out of order.
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_grace_entry_removes_single_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         for epoch in 1..=3 {
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_all_grace_entries_clears_context() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         for epoch in 1..=5 {
@@ -1679,7 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_context_removes_grace_entries() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {
@@ -1698,7 +1698,7 @@ mod tests {
 
     #[tokio::test]
     async fn grace_entries_isolated_per_context() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry1 = GraceEntry {
@@ -1727,7 +1727,7 @@ mod tests {
     /// restart -> load entries -> restore grace store -> verify state.
     #[tokio::test]
     async fn crash_recovery_persist_and_restore() {
-        use crate::crypto::mls::epoch_grace::EpochGraceStore;
+        use scp_mls::epoch_grace::EpochGraceStore;
 
         let store = make_store();
 
@@ -1770,7 +1770,7 @@ mod tests {
     /// Simulates a crash where some grace entries expire during downtime.
     #[tokio::test]
     async fn crash_recovery_with_expired_entries() {
-        use crate::crypto::mls::epoch_grace::{EpochGraceStore, GraceEntry};
+        use scp_mls::epoch_grace::{EpochGraceStore, GraceEntry};
 
         let store = make_store();
         let now = std::time::SystemTime::now()
@@ -1818,7 +1818,7 @@ mod tests {
 
     #[tokio::test]
     async fn grace_entry_key_uses_zero_padded_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {

@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use tracing::{debug, info, warn};
 
+use scp_clock::Clock;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::validate::{
@@ -17,10 +18,9 @@ use scp_core::crypto::ucan::validate::{
 };
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
+use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
-use scp_identity::decode_multibase_key;
 use scp_identity::resolver::ResolvedDidDocument;
-use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // BridgeDidResolver
@@ -487,7 +487,7 @@ impl IdentityBackedDidResolver {
     /// signature verification and self-certification, sequence-number rotation
     /// tracking / downgrade prevention — then extracts the requested
     /// verification method (`#active` or `#agent`, via
-    /// [`SigningKeyId::fragment`](scp_identity::SigningKeyId::fragment)) and
+    /// [`SigningKeyId::fragment`](scp_did::SigningKeyId::fragment)) and
     /// parses the public key bytes into an [`ed25519_dalek::VerifyingKey`].
     ///
     /// This is the VM-aware accessor the FFI `KeyResolver` closure wraps so the
@@ -534,8 +534,8 @@ impl IdentityBackedDidResolver {
     ///   number (possible downgrade attack).
     pub fn verifying_key_for(
         &self,
-        did: &scp_identity::DID,
-        key_id: scp_identity::SigningKeyId,
+        did: &scp_did::DID,
+        key_id: scp_did::SigningKeyId,
     ) -> Result<ed25519_dalek::VerifyingKey, ResolutionError> {
         let did = did.as_ref();
         let resolved = self.resolve_sync(did)?;
@@ -899,8 +899,8 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
 mod tests {
     use super::*;
     use scp_core::crypto::ucan::validate::DidResolver as CoreDidResolver;
+    use scp_did::DidDocument;
     use scp_identity::cache::DidCache;
-    use scp_identity::document::DidDocument;
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
     use scp_identity::{DidMethod, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier};
     use std::sync::Arc;
@@ -1218,8 +1218,8 @@ mod tests {
         let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
 
         // (DID, Active) → Some(vk) equal to the document's #active key.
-        let with_agent_did = scp_identity::DID::from(with_agent.did.clone());
-        let active = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Active);
+        let with_agent_did = scp_did::DID::from(with_agent.did.clone());
+        let active = key_resolver(&with_agent_did, scp_did::SigningKeyId::Active);
         assert_eq!(
             active,
             Some(with_agent.active_vk),
@@ -1228,7 +1228,7 @@ mod tests {
 
         // (DID, Agent) → Some(vk) equal to the document's #agent key, distinct
         // from #active.
-        let agent = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Agent);
+        let agent = key_resolver(&with_agent_did, scp_did::SigningKeyId::Agent);
         assert_eq!(
             agent, with_agent.agent_vk,
             "Agent VM must resolve to the document's #agent key"
@@ -1240,28 +1240,27 @@ mod tests {
         );
 
         // (DID with no #agent VM, Agent) → None.
-        let no_agent_did = scp_identity::DID::from(no_agent.did.clone());
+        let no_agent_did = scp_did::DID::from(no_agent.did.clone());
         assert!(
-            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Agent).is_none(),
+            key_resolver(&no_agent_did, scp_did::SigningKeyId::Agent).is_none(),
             "Agent VM lookup must fail closed when the document has no #agent key"
         );
         // Sanity: the no-agent identity still resolves its #active key.
         assert_eq!(
-            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Active),
+            key_resolver(&no_agent_did, scp_did::SigningKeyId::Active),
             Some(no_agent.active_vk),
             "the no-agent identity must still resolve its #active key"
         );
 
         // (unknown DID, either VM) → None.
         let unknown_pk: [u8; 32] = [0x11; 32];
-        let unknown_did =
-            scp_identity::DID::from(format!("did:dht:z{}", zbase32::encode(&unknown_pk)));
+        let unknown_did = scp_did::DID::from(format!("did:dht:z{}", zbase32::encode(&unknown_pk)));
         assert!(
-            key_resolver(&unknown_did, scp_identity::SigningKeyId::Active).is_none(),
+            key_resolver(&unknown_did, scp_did::SigningKeyId::Active).is_none(),
             "unknown DID (Active) must resolve to None"
         );
         assert!(
-            key_resolver(&unknown_did, scp_identity::SigningKeyId::Agent).is_none(),
+            key_resolver(&unknown_did, scp_did::SigningKeyId::Agent).is_none(),
             "unknown DID (Agent) must resolve to None"
         );
     }
@@ -1285,8 +1284,8 @@ mod tests {
         let did_resolver = identity_resolver_over(Arc::clone(&dht), rt.handle().clone());
         let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
 
-        let did = scp_identity::DID::from(identity.did.clone());
-        let active = key_resolver(&did, scp_identity::SigningKeyId::Active);
+        let did = scp_did::DID::from(identity.did.clone());
+        let active = key_resolver(&did, scp_did::SigningKeyId::Active);
         assert_eq!(
             active,
             Some(identity.active_vk),

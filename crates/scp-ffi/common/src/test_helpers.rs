@@ -7,7 +7,7 @@
 use scp_core::context::governance::{
     GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
 };
-use scp_identity::DID;
+use scp_did::DID;
 
 /// Build a [`GovernanceProposal`] in `Approved` status with a single approval
 /// vote.  Used across bridge test suites to drive governance execution without

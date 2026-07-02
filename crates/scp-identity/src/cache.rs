@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use tokio::sync::Mutex;
 
-use super::document::DidDocument;
+use scp_did::DidDocument;
 
 /// Refresh interval for active contacts: 24 hours in seconds.
 const ACTIVE_REFRESH_SECS: u64 = 24 * 60 * 60;
@@ -80,7 +80,7 @@ struct CacheEntry {
 // Re-export the canonical Clock types from scp-primitives so that existing
 // `use scp_identity::cache::{Clock, SystemClock, TestClock}` imports continue
 // to compile (soft migration).
-pub use scp_primitives::time::{Clock, SystemClock, TestClock};
+pub use scp_clock::{Clock, SystemClock, TestClock};
 
 /// TTL-based cache for resolved DID documents.
 ///

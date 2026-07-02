@@ -56,7 +56,7 @@ use scp_core::provenance::DataProvenance;
 use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryPush};
 use scp_platform::{KeyCustody, KeyType, Push};
 
@@ -1040,7 +1040,7 @@ async fn conf_023_ucan_issuance() {
         signing_key_id: None,
         ceiling: None,
     };
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .expect("mint_ucan");
 
@@ -1104,7 +1104,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint root UCAN A→B");
@@ -1129,7 +1129,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint delegated UCAN B→C");
@@ -1180,7 +1180,7 @@ async fn conf_025_ucan_revocation() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint UCAN");
@@ -1371,7 +1371,7 @@ fn conf_030_handle_registration_lookup() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    let result = registry.register(&params, &did, &scp_primitives::SystemClock);
+    let result = registry.register(&params, &did, &scp_clock::SystemClock);
     assert!(
         result.entry_id.is_some(),
         "registration must return entry_id"
@@ -1416,7 +1416,7 @@ fn conf_031_agent_capability_search() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    registry.register(&params, &did, &scp_primitives::SystemClock);
+    registry.register(&params, &did, &scp_clock::SystemClock);
 
     print_step(2, "Lookup finds agent");
     let result = registry.lookup(&HandleLookupParams {

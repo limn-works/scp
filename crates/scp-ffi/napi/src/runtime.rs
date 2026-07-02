@@ -1354,7 +1354,7 @@ pub(crate) struct NapiIdentityEntry {
     /// enum rather than `Arc<dyn KeyCustody>`.
     pub(crate) custody: Arc<crate::custody::NapiKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
-    pub(crate) document: scp_identity::DidDocument,
+    pub(crate) document: scp_did::DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub(crate) identity_link_attestations:
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,

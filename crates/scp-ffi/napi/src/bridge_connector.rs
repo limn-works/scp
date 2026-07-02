@@ -226,7 +226,7 @@ pub fn bridge_register(
         })
     })?;
 
-    let approver_did: scp_identity::DID = governance_did.into();
+    let approver_did: scp_did::DID = governance_did.into();
     let (connector, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {

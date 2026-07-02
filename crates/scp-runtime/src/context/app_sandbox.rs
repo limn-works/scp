@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ContextHandle;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::roles::Capability;
 
 // ---------------------------------------------------------------------------

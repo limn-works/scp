@@ -15,7 +15,7 @@
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,10 +36,10 @@ pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// # Panics
 ///
 /// Panics if the system clock is before the Unix epoch (unrecoverable
-/// environment failure — see `scp_core::time` for rationale).
+/// environment failure — see `scp_clock` for rationale).
 #[must_use]
 pub fn system_clock() -> ClockFn {
-    Arc::new(|| scp_primitives::SystemClock.now_secs())
+    Arc::new(|| scp_clock::SystemClock.now_secs())
 }
 
 /// A stored blob with its metadata.

@@ -29,8 +29,8 @@ use std::hash::BuildHasher;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use scp_primitives::Clock;
-use scp_primitives::SigningKeyId;
+use scp_clock::Clock;
+use scp_did::SigningKeyId;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::revoke::compute_revocation_cid;
@@ -286,7 +286,7 @@ impl NonceTracker for InMemoryNonceTracker {
         }
 
         // Freshness check: timestamp within now +/- 5 minutes.
-        let now_millis = u128::from(scp_primitives::SystemClock.now_millis());
+        let now_millis = u128::from(scp_clock::SystemClock.now_millis());
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
             return Err(UcanError::NonceTooOld(nonce.to_owned()));
@@ -309,7 +309,7 @@ impl NonceTracker for InMemoryNonceTracker {
         self.check_replay(nonce, token_expiry)?;
 
         // Record the nonce.
-        let now_millis = u128::from(scp_primitives::SystemClock.now_millis());
+        let now_millis = u128::from(scp_clock::SystemClock.now_millis());
         #[allow(clippy::cast_possible_truncation)]
         // u128 millis / 1000 fits u64 until year 584 billion
         let now_secs = (now_millis / 1000) as u64;
@@ -507,8 +507,8 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// Accepts `&dyn Clock` to support both production ([`SystemClock`]) and
     /// test ([`TestClock`]) clocks.
     ///
-    /// [`SystemClock`]: scp_primitives::SystemClock
-    /// [`TestClock`]: scp_primitives::TestClock
+    /// [`SystemClock`]: scp_clock::SystemClock
+    /// [`TestClock`]: scp_clock::TestClock
     pub clock: &'a dyn Clock,
 }
 
@@ -1071,12 +1071,8 @@ pub(super) fn verify_signature(
         .map(|pos| &token.encoded[..pos])
         .ok_or_else(|| UcanError::MalformedToken("missing signature segment".to_owned()))?;
 
-    crate::crypto::ed25519::verify_ed25519_signature(
-        &pk_bytes,
-        signing_input.as_bytes(),
-        &token.signature,
-    )
-    .map_err(|_| UcanError::SignatureInvalid)
+    scp_crypto::verify_ed25519_signature(&pk_bytes, signing_input.as_bytes(), &token.signature)
+        .map_err(|_| UcanError::SignatureInvalid)
 }
 
 /// Step 3: Verify delegation chain integrity.

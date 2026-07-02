@@ -262,7 +262,13 @@ crates/              # Rust workspace — the protocol core
 │   ├── src/         #   PyO3 (Python) — the REFERENCE bridge (100% coverage target)
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
 │   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
-├── scp-identity/    # DID, DHT, document, key management
+├── scp-identity/    # Native DID subsystem — DHT resolution/publication/lifecycle over the DHT
+├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
+├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
+├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe
+├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
+├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057)
+├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057)
 ├── scp-transport/   # Relay, adapters, blob storage
 ├── scp-node/        # Application node binary (relay + HTTP + identity)
 ├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
@@ -273,7 +279,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = remote thin client per ADR-055)
+├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
 └── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
 ```

@@ -33,10 +33,10 @@ use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationK
 
 use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::{
+use super::{DidMethod, IdentityError, ScpIdentity};
+use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
-use super::{DidMethod, IdentityError, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -4538,7 +4538,7 @@ mod tests {
         // whose `#0` verification method has a malformed
         // `publicKeyMultibase`: missing the `z` base58btc prefix that
         // `decode_multibase_key` requires.
-        let malformed_vm0 = crate::document::VerificationMethod {
+        let malformed_vm0 = scp_did::VerificationMethod {
             id: format!("{}#0", event.old_did),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: event.old_did.clone(),

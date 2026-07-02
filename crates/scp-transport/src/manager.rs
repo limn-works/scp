@@ -13,7 +13,7 @@
 //! See ADR-005 in `.docs/adrs/phase-1.md` for the original transport manager
 //! design and ADR-012 in `.docs/adrs/phase-2.md` for multi-transport routing.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1408,7 +1408,7 @@ impl MergedStream {
         }
         self.last_suppression_check = now;
 
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
 
         let warnings = if let Ok(mut tracker) = self.suppression_tracker.lock() {
             tracker.check_suppressions(now_ms, self.total_relays)
@@ -1471,7 +1471,7 @@ impl Stream for MergedStream {
                         let blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
 
                         if let Ok(mut tracker) = this.suppression_tracker.lock() {
-                            let now_ms = scp_primitives::SystemClock.now_millis();
+                            let now_ms = scp_clock::SystemClock.now_millis();
                             tracker.record_delivery(blob_id, adapter_idx, now_ms);
                         }
 
@@ -2385,7 +2385,7 @@ mod tests {
         // We can't peek directly into the LRU, but we can verify via check_suppressions:
         // 2 out of 2 relays delivered => no warning.
         drop(tracker);
-        let now_ms = scp_primitives::SystemClock.now_millis() + 31_000; // simulate 31 seconds later
+        let now_ms = scp_clock::SystemClock.now_millis() + 31_000; // simulate 31 seconds later
         let warnings = manager
             .suppression_tracker
             .lock()
@@ -2452,7 +2452,7 @@ mod tests {
         // The suppression tracker should have 1 delivery from adapter 0 only.
         // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
         // => 1 < 2 => warning should be emitted.
-        let now_ms = scp_primitives::SystemClock.now_millis() + 31_000;
+        let now_ms = scp_clock::SystemClock.now_millis() + 31_000;
         let warnings = manager
             .suppression_tracker
             .lock()

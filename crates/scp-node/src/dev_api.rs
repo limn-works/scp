@@ -629,7 +629,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_identity::document::DidDocument {
+            did_document: scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:test123".to_owned(),
                 verification_method: vec![],

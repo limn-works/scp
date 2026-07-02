@@ -52,14 +52,14 @@ use scp_core::envelope::{
     InnerEnvelopeParams, MessageType, SCP_PROTOCOL_VERSION, SequenceTracker, create_inner_envelope,
     derive_pseudonym,
 };
-use scp_core::identity::SigningKeyId;
 use scp_core::trust::custody_violation::{ActionCategory, enforce_category_a};
 use scp_core::trust::{
     ParticipationFact, ParticipationInput, ParticipationThreshold, RequireParticipation,
     produce_participation_profile, verify_participation_requirements,
 };
+use scp_did::SigningKeyId;
+use scp_did::{DidDocument, DidError, VerificationMethod};
 use scp_event_log::{Event, EventPayload, EventType};
-use scp_identity::document::{DidDocument, DidDocumentError, VerificationMethod};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_testing::relay::behavior::{EquivocationConfig, ReplayConfig, SuppressionConfig};
@@ -100,16 +100,16 @@ fn subscribe_open(
 // Governance helpers
 // ---------------------------------------------------------------------------
 
-fn alice_did() -> scp_identity::DID {
-    scp_identity::DID::from("did:dht:z6MkAlice")
+fn alice_did() -> scp_did::DID {
+    scp_did::DID::from("did:dht:z6MkAlice")
 }
 
-fn bob_did() -> scp_identity::DID {
-    scp_identity::DID::from("did:dht:z6MkBob")
+fn bob_did() -> scp_did::DID {
+    scp_did::DID::from("did:dht:z6MkBob")
 }
 
-fn carol_did() -> scp_identity::DID {
-    scp_identity::DID::from("did:dht:z6MkCarol")
+fn carol_did() -> scp_did::DID {
+    scp_did::DID::from("did:dht:z6MkCarol")
 }
 
 fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
@@ -118,23 +118,21 @@ fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
 
 /// Mock key resolver: Alice=1, Bob=2, Carol=3.
 fn mock_resolver() -> KeyResolver {
-    Arc::new(
-        |did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| {
-            let did_str: &str = did.as_ref();
-            match did_str {
-                "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
-                "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
-                "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
-                _ => None,
-            }
-        },
-    )
+    Arc::new(|did: &scp_did::DID, _kid: scp_did::SigningKeyId| {
+        let did_str: &str = did.as_ref();
+        match did_str {
+            "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
+            "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
+            "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
+            _ => None,
+        }
+    })
 }
 
 fn governance_context(
     ctx_id: &str,
-    members: &[(scp_identity::DID, &str)],
-    admin_dids: &[scp_identity::DID],
+    members: &[(scp_did::DID, &str)],
+    admin_dids: &[scp_did::DID],
     now: u64,
 ) -> GovernanceContext {
     GovernanceContext {
@@ -351,7 +349,7 @@ async fn fabricated_did_document_agent_keys() {
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(err, DidDocumentError::MultipleAgentKeys { count: 2 }),
+        matches!(err, DidError::MultipleAgentKeys { count: 2 }),
         "expected MultipleAgentKeys with count=2, got: {err:?}"
     );
 }
@@ -462,7 +460,7 @@ async fn block_notification_stale_timestamp() {
     let custody = InMemoryKeyCustody::new();
     let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let msg = scp_core::crypto::sender_keys::send_block_notification(
         &custody,
         &signing_key,
@@ -903,7 +901,7 @@ async fn ucan_expired_token_rejected() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -931,7 +929,7 @@ async fn ucan_expired_token_rejected() {
         context_creator_did: issuer_did,
         presenting_agent_did: audience_did,
         clock_skew_tolerance_secs: 0, // No tolerance to ensure expiry is detected
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1001,7 +999,7 @@ async fn ucan_nonce_replay_rejected() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -1032,7 +1030,7 @@ async fn ucan_nonce_replay_rejected() {
             context_creator_did: issuer_did,
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
@@ -1052,7 +1050,7 @@ async fn ucan_nonce_replay_rejected() {
             context_creator_did: issuer_did,
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(result.is_err(), "replayed nonce should be rejected");
@@ -1378,7 +1376,7 @@ async fn sender_key_request_blocked_did_denied() {
     let sender_key = generate_sender_key();
 
     // Create a request.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &requester_custody,
         &requester_key,
@@ -1473,7 +1471,7 @@ async fn self_delegation_without_key_scope_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
+    let result = mint_ucan(&params, &custody, &scp_clock::SystemClock).await;
     assert!(
         result.is_err(),
         "self-delegation without key_scope must be rejected at mint time"
@@ -1499,7 +1497,7 @@ async fn self_delegation_without_key_scope_rejected() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let ok_token = mint_ucan(&params_with_scope, &custody, &scp_primitives::SystemClock).await;
+    let ok_token = mint_ucan(&params_with_scope, &custody, &scp_clock::SystemClock).await;
     assert!(
         ok_token.is_ok(),
         "self-delegation WITH key_scope should succeed: {:?}",
@@ -1550,7 +1548,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let mut token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1591,7 +1589,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         context_creator_did: &issuer_did,
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1650,7 +1648,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         context_creator_did: &issuer_did,
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result_2 = validate_ucan(&token, &required_cap_2, &mut ctx_2);

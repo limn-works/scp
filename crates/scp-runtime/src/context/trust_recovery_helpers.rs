@@ -46,7 +46,7 @@
 // contract.
 #![allow(clippy::needless_pass_by_ref_mut)]
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
@@ -340,7 +340,7 @@ pub fn recovery_send_notification(
         message_type: scp_protocol::envelope::inner::MessageType::Recovery,
         payload,
         provenance: None,
-        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        signing_key_id: scp_did::SigningKeyId::Active,
     };
 
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)

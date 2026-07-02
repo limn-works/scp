@@ -14,7 +14,7 @@
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 
-use scp_primitives::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_protocol::envelope::EnvelopeError;
 use scp_protocol::envelope::inner::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION,

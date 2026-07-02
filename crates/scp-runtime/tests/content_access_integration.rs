@@ -22,7 +22,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_identity::DID;
+use scp_did::DID;
+use scp_did::SigningKeyId;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
@@ -34,7 +35,6 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
 use scp_protocol::crypto::access_keys::{AccessKeyStore, ContentAccessState, generate_access_key};
 use scp_protocol::crypto::sender_keys::{BlockNotification, SenderKeyStore, generate_sender_key};
-use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -162,7 +162,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -316,7 +316,7 @@ async fn tier1_in_context_block_unblock_lifecycle() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let block_result = block_did_in_context(
         &custody,
         &signing_key,
@@ -570,7 +570,7 @@ async fn tier2_global_block_propagation() {
         shared_context_ids: &shared_contexts,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let global_result = block_did_global(
         &custody,
         &signing_key,
@@ -881,7 +881,7 @@ async fn three_layer_enforcement_after_full_revocation() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let _block_result = block_did_in_context(
         &custody,
         &signing_key,
@@ -1234,7 +1234,7 @@ async fn invalid_block_notification_no_destruction() {
     let (custody, signing_key) = make_custody_and_key().await;
 
     // Create a valid notification.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let notification_bytes = send_block_notification(
         &custody,
         &signing_key,

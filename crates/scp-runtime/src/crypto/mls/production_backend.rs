@@ -5,8 +5,8 @@
 //! # Design
 //!
 //! [`ProductionMlsBackend`] is a stateless struct that delegates every
-//! primitive to the existing [`super::group`], [`super::encrypt`], and
-//! [`super::ratchet`] free functions — the same `OpenMLS` primitives the
+//! primitive to the existing [`scp_mls::group`], [`scp_mls::encrypt`], and
+//! [`scp_mls::ratchet`] free functions — the same `OpenMLS` primitives the
 //! pre-refactor `MlsCryptoProvider` calls. This guarantees byte-identical
 //! output for equivalent inputs (see the unit test suite below), which is a
 //! hard requirement of the commit 4 plan: later commits replace
@@ -36,13 +36,13 @@ use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use super::credential::ScpCredential;
-use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
-use super::error::MlsError;
-use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use super::storage::new_provider;
 use super::storage_adapter::OpenMlsStorageAdapter;
-use crate::crypto::mls::InMemoryMlsProvider;
+use scp_mls::InMemoryMlsProvider;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
+use scp_mls::error::MlsError;
+use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
@@ -385,8 +385,8 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, MlsError> {
-        let mls_message = super::encrypt::encrypt(group, plaintext)?;
-        super::encrypt::serialize_ciphertext(&mls_message)
+        let mls_message = scp_mls::encrypt::encrypt(group, plaintext)?;
+        scp_mls::encrypt::serialize_ciphertext(&mls_message)
     }
 
     async fn decrypt(
@@ -427,7 +427,7 @@ impl MlsBackend for ProductionMlsBackend {
         // when the provider had not yet generated one (rare but possible
         // during test flows). Mirror that behaviour byte-for-byte.
         let wrap = wrapping_pubkey.map_or([0u8; 32], |k| *k);
-        let commit = super::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
+        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
         commit
             .tls_serialize_detached()
             .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
@@ -666,9 +666,9 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
-    use scp_identity::SigningKeyId;
+    use scp_did::SigningKeyId;
+    use scp_mls::credential::ScpCredential;
     use scp_platform::testing::InMemoryStorage;
 
     fn test_credential(name: &str) -> ScpCredential {
@@ -792,7 +792,7 @@ mod tests {
         // Reading the wrapping key back via the existing helper proves the
         // extension was placed correctly — byte-for-byte with the primitive
         // path.
-        let own_wrap = crate::crypto::mls::wrapping_extension::extract_own_wrapping_key(&grp)
+        let own_wrap = scp_mls::wrapping_extension::extract_own_wrapping_key(&grp)
             .expect("extension present")
             .expect("wrapping key bytes");
         assert_eq!(own_wrap, wrap_pub);
@@ -1015,12 +1015,12 @@ mod tests {
 
         // Backend → primitive.
         let ct1 = backend.encrypt(&mut alice_grp, b"msg-a").await.unwrap();
-        let pt1 = super::super::encrypt::decrypt(&mut bob_grp, &ct1).unwrap();
+        let pt1 = scp_mls::encrypt::decrypt(&mut bob_grp, &ct1).unwrap();
         assert_eq!(pt1, b"msg-a");
 
         // Primitive → backend.
-        let mls_out = super::super::encrypt::encrypt(&mut bob_grp, b"msg-b").unwrap();
-        let ct2 = super::super::encrypt::serialize_ciphertext(&mls_out).unwrap();
+        let mls_out = scp_mls::encrypt::encrypt(&mut bob_grp, b"msg-b").unwrap();
+        let ct2 = scp_mls::encrypt::serialize_ciphertext(&mls_out).unwrap();
         let decrypted = backend.decrypt(&mut alice_grp, &ct2).await.unwrap();
         match decrypted {
             DecryptedContent::Application { plaintext, .. } => {

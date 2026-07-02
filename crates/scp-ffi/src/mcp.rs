@@ -740,7 +740,7 @@ impl ContextProvider for FfiBridgeProvider {
                     presenting_agent_did: &self.agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_primitives::SystemClock,
+                    clock: &scp_clock::SystemClock,
                 };
 
                 scp_core::context::tools::validate_tool_invocation_ucan(
@@ -877,7 +877,7 @@ impl ContextProvider for FfiBridgeProvider {
         // internally between `blocking_lock`, `block_in_place +
         // block_on`, or a dedicated `std::thread` with its own tiny
         // runtime depending on which regime the caller is in.
-        let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
+        let invoker_did_typed: scp_did::DID = agent_did.clone().into();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());

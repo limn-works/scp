@@ -37,9 +37,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{ContextId, DID, ShadowProvenanceStatus};
-use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::trust::AttestationType;
 use crate::trust::attestation::{Attestation, RevocationStatus};
+use scp_crypto::verify_ed25519_signature;
 use scp_event_log::Ed25519Signature;
 
 use super::shadow::ShadowRegistry;
@@ -169,7 +169,7 @@ pub struct ShadowClaimEvent {
 // Signature verification helpers
 // ---------------------------------------------------------------------------
 
-use scp_primitives::extract_public_key_from_did;
+use scp_did::extract_public_key_from_did;
 
 /// Computes the canonical SHA-256 hash of a claim request's content
 /// (excluding the signature field).

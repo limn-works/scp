@@ -29,11 +29,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::identity::attestation::AttestationClass;
+use scp_clock::Clock;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::DID;
 use scp_event_log::Ed25519Signature;
-use scp_primitives::Clock;
-use scp_primitives::DID;
 
 use super::{AttestationType, TrustError};
 
@@ -632,7 +632,7 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
         // Delegates to the canonical implementation in scp-primitives which
         // supports did:dht:z (production) and did:key:{hex} (testing only,
         // gated behind #[cfg(test)] / feature = "testing"). See issue #128.
-        let key = scp_primitives::extract_public_key_from_did(did).map_err(|e| {
+        let key = scp_did::extract_public_key_from_did(did).map_err(|e| {
             TrustError::AttestationSignatureInvalid {
                 attestation_id: String::new(),
                 reason: format!("failed to extract public key from DID {did}: {e}"),
@@ -1267,7 +1267,7 @@ mod tests {
 
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {

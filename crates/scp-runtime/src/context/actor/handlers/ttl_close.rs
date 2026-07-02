@@ -183,7 +183,7 @@ async fn handle_extend_ttl(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
-    member_did: scp_identity::DID,
+    member_did: scp_did::DID,
     proposed_duration: std::time::Duration,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {

@@ -1,10 +1,10 @@
 //! `ParticipationStatements` DID Document Service Endpoint functions (SCP-BA-006).
 //!
-//! These functions operate on `scp_identity::document::DidDocument` and are
+//! These functions operate on `scp_did::DidDocument` and are
 //! located in scp-runtime (not scp-protocol) to avoid pulling scp-identity
 //! (and its tokio dependency) into the pure protocol crate.
 
-use scp_identity::document::{DidDocument, Service};
+use scp_did::{DidDocument, Service};
 use scp_protocol::trust::participation::PARTICIPATION_STATEMENTS_SERVICE_TYPE;
 
 /// The fragment identifier for participation statements service entries.

@@ -1,12 +1,28 @@
-//! Identity primitives shared across the SCP workspace.
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
+//! The DID data model for SCP — the single wasm-safe home for identity types.
 //!
-//! This module defines the [`DID`] newtype and [`SigningKeyId`] enum — pure
-//! value types with zero async dependencies. They live in `scp-primitives`
-//! (the leaf crate) so that `scp-event-log` and future crates like
-//! `scp-protocol` can use them without pulling in `scp-identity`'s tokio
-//! dependency.
+//! This crate owns the DID **data model**: the [`DID`] newtype, the
+//! [`SigningKeyId`] enum, [`extract_public_key_from_did`], and the W3C DID
+//! Document types ([`DidDocument`], [`VerificationMethod`], rotation/migration
+//! proofs, and the key-custody/identity-link [`attestation`] types). These are
+//! pure synchronous value types with zero async dependencies, so they compile
+//! to `wasm32-unknown-unknown` for the in-browser SCP client (ADR-057).
 //!
-//! `scp-identity` re-exports both types for backward compatibility.
+//! The **native** identity subsystem — DHT resolution, publication, the
+//! `DidMethod` trait, and lifecycle management — lives in `scp-identity`, which
+//! imports this data model. See ADR-057's Amendment (2026-06-30) for the crate
+//! topology.
+
+pub mod attestation;
+pub mod document;
+
+pub use document::{
+    DidDocument, DidError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
+    VerificationMethod, decode_multibase_key,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

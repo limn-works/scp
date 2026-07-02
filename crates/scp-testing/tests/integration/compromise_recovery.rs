@@ -16,7 +16,7 @@ use scp_core::identity::recovery::{
     RecoveryStepError, active_key_rotation_outcome, agent_key_rotation_outcome,
     identity_key_rotation_outcome,
 };
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -130,7 +130,7 @@ async fn compromise_tier_agent() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -173,7 +173,7 @@ async fn compromise_tier_active_signing() {
             &contacts,
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -216,7 +216,7 @@ async fn compromise_tier_identity_key() {
             &contacts,
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -442,7 +442,7 @@ async fn recovery_result_completed_vs_failed() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -490,7 +490,7 @@ async fn recovery_result_with_rejoin_context() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -541,7 +541,7 @@ async fn psk_rotation_params() {
     let kr = active_key_rotation_outcome(&alice, 7000);
     let backend = MockBackend::new();
 
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
@@ -646,7 +646,7 @@ async fn recovery_with_contact_notification_failure() {
             &contacts,
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -683,7 +683,7 @@ async fn recovery_with_psk_rotation_failure() {
             &HashSet::new(),
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -753,7 +753,7 @@ async fn recovery_with_no_contexts() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();

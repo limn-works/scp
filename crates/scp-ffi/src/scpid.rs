@@ -25,7 +25,7 @@ use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_scpid_challenge, scpid_sign,
     scpid_verify,
 };
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 use crate::error::ScpPyError;
 use crate::runtime::with_identity;

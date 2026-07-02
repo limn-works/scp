@@ -20,8 +20,8 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use scp_clock::Clock;
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
-use scp_primitives::Clock;
 
 use scp_protocol::crypto::access_keys::{AccessKey, AccessKeyError};
 use scp_protocol::crypto::hpke;
@@ -521,7 +521,7 @@ fn compute_request_hash(
 }
 
 /// Verifies an Ed25519 signature, delegating to the canonical
-/// [`scp_primitives::crypto::verify_ed25519_signature`].
+/// [`scp_crypto::verify_ed25519_signature`].
 ///
 /// Returns `Ok(true)` if the signature is valid, `Ok(false)` if it is
 /// well-formed but invalid, or `Err` if the inputs are malformed.
@@ -530,7 +530,7 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, AccessKeyError> {
-    match scp_protocol::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
+    match scp_crypto::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
             if reason.starts_with("signature verification failed") {

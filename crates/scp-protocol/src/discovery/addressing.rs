@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::ContextId;
-use scp_primitives::{Clock, DID};
+use scp_clock::Clock;
+use scp_did::DID;
 
 /// Maximum length of the local-part of an address.
 pub const MAX_LOCAL_PART_LENGTH: usize = 64;

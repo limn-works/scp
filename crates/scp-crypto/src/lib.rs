@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
 //! Shared Ed25519 signature verification helpers.
 //!
 //! Centralizes Ed25519 signature verification for SCP. Module-level wrappers

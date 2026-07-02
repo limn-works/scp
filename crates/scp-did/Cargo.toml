@@ -1,0 +1,36 @@
+[package]
+name = "scp-did"
+version = "0.1.0-beta.2"
+description = "The DID data model for SCP (Shared Context Protocol) — wasm-safe identity types"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "identity", "did"]
+categories = ["cryptography", "data-structures"]
+
+[features]
+default = []
+# Enables the non-standard did:key:{hex} DID format for integration tests that
+# run outside `#[cfg(test)]`. Production builds must never enable this feature.
+testing = []
+
+[dependencies]
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+z-base-32 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rmp-serde = { workspace = true }
+
+[lints]
+workspace = true

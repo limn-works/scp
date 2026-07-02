@@ -329,7 +329,7 @@ pub(crate) async fn ucan_validate_on(
             context_creator_did: &rt.core.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         // Execute the full 11-step validation pipeline.
@@ -447,7 +447,7 @@ pub(crate) async fn ucan_evaluate_on(
             context_creator_did: &rt.core.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
@@ -526,7 +526,7 @@ pub(crate) async fn ucan_mint_on(
     // Sign the token by delegating to the retained `KeyCustody` via scp-core.
     // napi-rs async functions already run on the tokio runtime, so we can
     // await directly without spawning a separate task.
-    let token = mint_ucan(&params, custody.as_ref(), &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, custody.as_ref(), &scp_clock::SystemClock)
         .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
@@ -659,12 +659,7 @@ pub(crate) async fn ucan_delegate_on(
         let rt_handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
             rt_handle.block_on(async {
-                delegate_ucan(
-                    &params,
-                    entry.custody.as_ref(),
-                    &scp_primitives::SystemClock,
-                )
-                .await
+                delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
             })
         });
 
@@ -801,12 +796,12 @@ fn encode_hex(bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
+    use scp_clock::Clock;
     use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
     use scp_ffi_common::BridgeDidResolver;
-    use scp_primitives::Clock;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
@@ -925,7 +920,7 @@ mod tests {
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = scp_primitives::SystemClock.now_millis();
+        let now_millis = scp_clock::SystemClock.now_millis();
         let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;

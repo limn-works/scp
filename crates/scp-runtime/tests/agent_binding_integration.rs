@@ -31,9 +31,10 @@
 
 use ed25519_dalek::Signer;
 
-use scp_identity::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
-use scp_identity::document::DidDocument;
-use scp_identity::{DID, SigningKeyId};
+use scp_did::DidDocument;
+use scp_did::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+use scp_did::{DID, SigningKeyId};
+use scp_mls::credential::ScpCredential;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::envelope::inner::{
@@ -43,7 +44,6 @@ use scp_protocol::trust::{
     ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
     classify_action, enforce_category_a,
 };
-use scp_runtime::crypto::mls::credential::ScpCredential;
 use scp_runtime::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_runtime::envelope::inner::sign::create_inner_envelope;
 
@@ -191,7 +191,7 @@ async fn test_agent_binding_full_flow() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("minting scoped UCAN must succeed");

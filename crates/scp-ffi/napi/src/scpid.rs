@@ -14,7 +14,7 @@ use scp_core::identity::scpid_sign as core_sign;
 use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_verify as core_verify,
 };
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 use crate::error::ScpNapiError;
 use crate::runtime::NapiBridgeInstance;

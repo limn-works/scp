@@ -43,15 +43,16 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use scp_clock::Clock;
+use scp_did::DidDocument;
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
+    DidCache, DidDht, DidMethod, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
+    ScpIdentity,
 };
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
-use scp_primitives::Clock;
 
 use crate::custody::FfiKeyCustody;
 use crate::error::ScpPyError;
@@ -785,7 +786,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
     Ok((did, custody))
 }
 
-/// Serializes a [`scp_identity::DidRotationEvent`] to JSON for return
+/// Serializes a [`scp_did::DidRotationEvent`] to JSON for return
 /// across the `PyO3` boundary, wrapping serialization errors in
 /// `ScpPyError::IdentityError` with code `IDENT_1004`.
 ///
@@ -793,7 +794,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 /// `too_many_lines` clippy threshold after the recovery-handle
 /// refactor moved the call to `migrate_identity` to a struct
 /// destructure.
-fn serialize_rotation_event(event: &scp_identity::DidRotationEvent) -> Result<String, ScpPyError> {
+fn serialize_rotation_event(event: &scp_did::DidRotationEvent) -> Result<String, ScpPyError> {
     serde_json::to_string(event).map_err(|e| ScpPyError::IdentityError {
         message: format!("failed to serialize rotation event: {e}"),
         code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
@@ -1875,7 +1876,7 @@ impl crate::scp::PyScp {
     ///
     /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
     /// Returns `(new_identity, rotation_event_json)`. The JSON shape is
-    /// `serde_json::to_string(&scp_identity::DidRotationEvent)` so JS-,
+    /// `serde_json::to_string(&scp_did::DidRotationEvent)` so JS-,
     /// Python-, Swift-, or Kotlin-side consumers parse it directly. The
     /// SDK distributes the event to context members (spec §3.2.1
     /// step 4b).
@@ -1921,7 +1922,7 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-                let rotated_at = scp_primitives::SystemClock.now_secs();
+                let rotated_at = scp_clock::SystemClock.now_secs();
 
                 let old_identity = ScpIdentity {
                     identity_key: old_identity_key,
@@ -2301,7 +2302,7 @@ impl crate::scp::PyScp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2323,7 +2324,7 @@ impl crate::scp::PyScp {
             };
 
             // Build key rotation outcome (step 1 is pre-completed by caller).
-            let now_ms = scp_primitives::SystemClock.now_millis();
+            let now_ms = scp_clock::SystemClock.now_millis();
             let key_rotation = match compromise_tier {
                 CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
                 CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -2388,7 +2389,7 @@ impl crate::scp::PyScp {
                     &contacts,
                     None,
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 ))
                 .map_err(|e| ScpPyError::identity(format!("recovery failed: {e}")))?;
 
@@ -2439,7 +2440,7 @@ impl crate::scp::PyScp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2500,7 +2501,7 @@ impl crate::scp::PyScp {
             let backend = NotConfiguredMigrationBackend;
 
             let result = rt
-                .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+                .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
                 .map_err(|e| ScpPyError::identity(format!("custody migration failed: {e}")))?;
 
             // Serialize to JSON and return — the Python layer converts to dict.
@@ -2607,7 +2608,7 @@ mod tests {
             // Rotation event JSON deserializes into the canonical
             // `DidRotationEvent` shape (spec §9.12, ADR-003 §4b/4c) so the
             // SDK can distribute it to context members per §3.2.1 step 4b.
-            let event: scp_identity::DidRotationEvent =
+            let event: scp_did::DidRotationEvent =
                 serde_json::from_str(&rotation_event_json).unwrap();
             assert_eq!(event.old_did, old_did);
             assert_eq!(event.new_did, new_did);

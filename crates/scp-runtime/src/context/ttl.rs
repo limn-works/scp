@@ -48,8 +48,8 @@ use tokio::task::AbortHandle;
 use super::ContextHandle;
 use super::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::crypto::mls::provider::MlsCryptoProvider;
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::roles::{self, ContextRoleState};
@@ -1033,7 +1033,7 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: None,
-            clock: Arc::new(scp_primitives::time::SystemClock),
+            clock: Arc::new(scp_clock::SystemClock),
         }
     }
 
@@ -1060,7 +1060,7 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: Some(on_error),
-            clock: Arc::new(scp_primitives::time::SystemClock),
+            clock: Arc::new(scp_clock::SystemClock),
         }
     }
 
@@ -1669,8 +1669,7 @@ mod tests {
         let crypto = mk_crypto();
         let event_log: std::sync::Arc<dyn ContextEventLogProvider> =
             std::sync::Arc::new(NullEventLog);
-        let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-            std::sync::Arc::new(TestClock::new(1000));
+        let clock: std::sync::Arc<dyn scp_clock::Clock> = std::sync::Arc::new(TestClock::new(1000));
         let mut timer = TtlTimer::with_clock(clock);
         let handle = active_handle("ctx-tt", MemoryScope::Full).await;
         timer.spawn(Duration::from_mins(10), handle, crypto, event_log);
@@ -1717,11 +1716,11 @@ mod tests {
         let mut ext = TtlExtension::new(Duration::from_mins(1), 3);
         assert_eq!(ext.consent_count(), 0);
         assert_eq!(ext.remaining(), 3);
-        assert!(ext.add_consent(scp_primitives::DID::from("did:scp:alice")));
+        assert!(ext.add_consent(scp_did::DID::from("did:scp:alice")));
         assert_eq!(ext.consent_count(), 1);
         assert!(!ext.is_unanimous());
-        assert!(ext.add_consent(scp_primitives::DID::from("did:scp:bob")));
-        assert!(ext.add_consent(scp_primitives::DID::from("did:scp:carol")));
+        assert!(ext.add_consent(scp_did::DID::from("did:scp:bob")));
+        assert!(ext.add_consent(scp_did::DID::from("did:scp:carol")));
         assert!(ext.is_unanimous());
         assert_eq!(ext.remaining(), 0);
     }
@@ -1729,7 +1728,7 @@ mod tests {
     #[test]
     fn ttl_extension_duplicate_consent_rejected() {
         let mut ext = TtlExtension::new(Duration::from_mins(1), 2);
-        let did = scp_primitives::DID::from("did:scp:alice");
+        let did = scp_did::DID::from("did:scp:alice");
         assert!(ext.add_consent(did.clone()));
         assert!(!ext.add_consent(did));
     }
@@ -1737,12 +1736,12 @@ mod tests {
     #[test]
     fn ttl_extension_active_consent_counts_exclude_removed_members() {
         let mut ext = TtlExtension::new(Duration::from_mins(1), 3);
-        ext.add_consent(scp_primitives::DID::from("did:scp:alice"));
-        ext.add_consent(scp_primitives::DID::from("did:scp:bob"));
-        ext.add_consent(scp_primitives::DID::from("did:scp:carol"));
+        ext.add_consent(scp_did::DID::from("did:scp:alice"));
+        ext.add_consent(scp_did::DID::from("did:scp:bob"));
+        ext.add_consent(scp_did::DID::from("did:scp:carol"));
         let active: std::collections::HashSet<_> = [
-            scp_primitives::DID::from("did:scp:alice"),
-            scp_primitives::DID::from("did:scp:bob"),
+            scp_did::DID::from("did:scp:alice"),
+            scp_did::DID::from("did:scp:bob"),
         ]
         .into_iter()
         .collect();

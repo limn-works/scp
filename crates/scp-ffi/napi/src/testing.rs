@@ -62,7 +62,7 @@ where
 ///
 /// Full-stack E2E tests verify crypto, not governance vote signatures.
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ pub(crate) fn fullstack_remove_member_on(
     rt.block_on(node.inner.manager.leave_context(
         &handle,
         &node.inner.did,
-        &scp_identity::DID::from(member_did.as_str()),
+        &scp_did::DID::from(member_did.as_str()),
     ))
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
@@ -475,7 +475,7 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
     let rt = crate::runtime();
     rt.block_on(node.inner.manager.seed_peer_pseudonym(
         &context_id,
-        scp_identity::DID::from(peer_did.as_str()),
+        scp_did::DID::from(peer_did.as_str()),
         arr,
     ))
     .map_err(|e| {

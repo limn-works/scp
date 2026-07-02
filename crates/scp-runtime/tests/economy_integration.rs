@@ -32,11 +32,11 @@
 
 use std::time::Duration;
 
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_event_log::proof::{prove_inclusion, verify_inclusion};
 use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_identity::DID;
-use scp_primitives::Clock;
 use scp_protocol::crypto::ucan::spending::{BudgetTracker, SpendingCapability, SpendingError};
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 use scp_protocol::economy::antispam::{
@@ -245,7 +245,7 @@ fn default_metrics() -> ObservableMetrics {
 /// Uses `exp = now + 3600` (1 hour) to satisfy the 24-hour maximum expiry
 /// check enforced by `validate_spending_ucan`.
 fn make_spending_ucan(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
-    let now = scp_primitives::SystemClock.now_secs();
+    let now = scp_clock::SystemClock.now_secs();
 
     let cap_json = serde_json::to_value(cap).unwrap();
     let mut fct = serde_json::Map::new();
@@ -462,7 +462,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
 fn invariant_2_paid_action_without_spending_ucan_rejected() {
     use scp_protocol::crypto::ucan::spending::check_spending_capability;
 
-    let _now = scp_primitives::SystemClock.now_secs();
+    let _now = scp_clock::SystemClock.now_secs();
 
     // Action cost is 10 (non-zero), but no spending UCAN provided.
     let cost = scp_protocol::crypto::ucan::spending::Amount(10);

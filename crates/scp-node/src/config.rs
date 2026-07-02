@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};

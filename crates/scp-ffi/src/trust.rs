@@ -294,7 +294,7 @@ pub fn py_verify_participation_requirements(
     // failure and must not silently read as time 0, which would make every
     // participation statement appear maximally fresh and bypass `max_age_secs`.
     // Matches the SystemClock invariant used on the verify-on-ingest path.
-    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+    let current_time = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     scp_core::trust::verify_participation_requirements(
         current_time,

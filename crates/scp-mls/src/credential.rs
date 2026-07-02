@@ -10,8 +10,8 @@
 // there for wasm32-safety), NOT from the tokio-coupled `scp-identity` — keeping
 // `scp-mls` inside the ADR-057 mechanical fence. `SigningKeyId` is hosted in
 // `scp-primitives`.
-use scp_primitives::SigningKeyId;
-use scp_protocol::identity::document::{DidDocument, decode_multibase_key};
+use scp_did::SigningKeyId;
+use scp_did::{DidDocument, decode_multibase_key};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MlsError;
@@ -382,7 +382,7 @@ mod tests {
         let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
 
         if let Some(agent_pk) = agent_key {
-            let agent_vm = scp_protocol::identity::document::VerificationMethod {
+            let agent_vm = scp_did::VerificationMethod {
                 id: format!("{TEST_DID}#agent"),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
                 controller: TEST_DID.to_owned(),

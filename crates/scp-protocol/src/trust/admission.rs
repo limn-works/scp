@@ -10,7 +10,7 @@
 //!
 //! See SCP-ACR-007.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use serde::{Deserialize, Serialize};
 
 use super::attestation::DidPublicKeyResolver;
@@ -205,7 +205,7 @@ mod tests {
     use std::collections::HashMap;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     use super::*;
     use crate::trust::TrustError;
@@ -249,7 +249,7 @@ mod tests {
     /// clock fixed at `NOW`.
     fn resolver_and_clock() -> (TestResolver, TestClock) {
         let verifier_pub = verifier_key().verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub).to_string();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub).to_string();
         let mut keys = HashMap::new();
         keys.insert(verifier_did, verifier_pub.to_vec());
         (TestResolver { keys }, TestClock::new(NOW))
@@ -260,7 +260,7 @@ mod tests {
     fn make_verification(uri: &CapabilityUri) -> ChallengeVerification {
         let verifier_key = verifier_key();
         let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
 
         let mut cv = ChallengeVerification {
             verification_id: "test-challenge-id".to_owned(),

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::types::Amount;
 

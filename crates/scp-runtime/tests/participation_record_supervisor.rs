@@ -50,7 +50,7 @@ const ADMIN: &str = "did:dht:z6MkAlice";
 /// signatures (the supervisor method gathers events + threads attestations; it
 /// does not validate them), so the resolver is never consulted here.
 fn mock_key_resolver() -> scp_protocol::context::governance::KeyResolver {
-    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {

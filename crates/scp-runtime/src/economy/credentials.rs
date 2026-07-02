@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::adapter::PaymentAdapter;
 

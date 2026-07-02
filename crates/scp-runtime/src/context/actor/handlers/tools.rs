@@ -101,7 +101,7 @@ pub(crate) async fn dispatch(
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    did: &scp_identity::DID,
+    did: &scp_did::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
@@ -148,7 +148,7 @@ async fn handle_try_consume_hard_rate_limit(
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    did: &scp_identity::DID,
+    did: &scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Class-C hard-rate refund through the non-persisting `class_c_view()` (run
@@ -181,7 +181,7 @@ async fn handle_reserve_tool_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    invoker_did: &scp_identity::DID,
+    invoker_did: &scp_did::DID,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     now_secs: u64,
     reply: oneshot::Sender<
@@ -228,7 +228,7 @@ async fn handle_settle_tool_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    invoker_did: &scp_identity::DID,
+    invoker_did: &scp_did::DID,
     request: crate::context::tools_helpers::ToolSettleRequest,
     reply: oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
 ) -> Outcome<()> {

@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use scp_clock::Clock;
 use scp_core::discovery::addressing::{
     AddressResolution, AddressType, HandleQuerier, HandleTarget, ResolutionLayer, ResolutionPath,
     TrustLevel,
@@ -27,7 +28,6 @@ use scp_core::discovery::addressing::{
 use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
 };
-use scp_primitives::Clock;
 
 use crate::CoreFields;
 
@@ -195,7 +195,7 @@ pub fn parse_handle_target(json: &str) -> Result<HandleTarget, HandleTargetError
                 message: "identity target must have a 'did' field".to_owned(),
             })?;
             Ok(HandleTarget::Identity {
-                did: scp_identity::DID::from(did),
+                did: scp_did::DID::from(did),
             })
         }
         "context" => {
@@ -324,7 +324,7 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
             type_filter: filter,
         });
 
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         result
             .results
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn address_resolution_to_json_identity() {
         let resolution = AddressResolution::Identity {
-            did: scp_identity::DID::from("did:dht:alice"),
+            did: scp_did::DID::from("did:dht:alice"),
             trust_level: TrustLevel::LocalPetname,
             resolution_path: ResolutionPath {
                 layer: ResolutionLayer::Petname,
@@ -616,9 +616,9 @@ mod tests {
         let entry = HandleEntry {
             handle: "alice".to_owned(),
             target: HandleTarget::Identity {
-                did: scp_identity::DID::from("did:dht:zalice"),
+                did: scp_did::DID::from("did:dht:zalice"),
             },
-            owner_did: scp_identity::DID::from("did:dht:zalice"),
+            owner_did: scp_did::DID::from("did:dht:zalice"),
             registered_at: 100,
             metadata: HandleMetadata::default(),
             entry_id: "entry-1".to_owned(),
@@ -652,7 +652,7 @@ mod tests {
                 context_id: "ctx-target".to_owned(),
                 relay_urls: vec!["wss://relay.example.com".to_owned()],
             },
-            owner_did: scp_identity::DID::from("did:dht:zowner"),
+            owner_did: scp_did::DID::from("did:dht:zowner"),
             registered_at: 200,
             metadata: HandleMetadata::default(),
             entry_id: "entry-2".to_owned(),
@@ -690,14 +690,14 @@ mod tests {
         {
             let mut guard = core.petname_maps().lock().expect("lock");
             let pm = guard.entry(owner.to_owned()).or_default();
-            pm.set_petname(scp_identity::DID::from("did:dht:zbob"), "bob".to_owned());
+            pm.set_petname(scp_did::DID::from("did:dht:zbob"), "bob".to_owned());
         }
 
         // Retrieve and verify.
         {
             let guard = core.petname_maps().lock().expect("lock");
             let pm = guard.get(owner).expect("should exist");
-            let resolved = pm.resolve_petname("bob", &scp_primitives::SystemClock);
+            let resolved = pm.resolve_petname("bob", &scp_clock::SystemClock);
             assert!(!resolved.is_empty());
         }
 
@@ -720,13 +720,13 @@ mod tests {
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
-            let did = scp_identity::DID::from("did:dht:zcharlie");
+            let did = scp_did::DID::from("did:dht:zcharlie");
             let params = HandleRegisterParams {
                 handle: "charlie".to_owned(),
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            let result = registry.register(&params, &did, &scp_primitives::SystemClock);
+            let result = registry.register(&params, &did, &scp_clock::SystemClock);
             assert_eq!(
                 result.status,
                 scp_core::discovery::handles::HandleRegisterStatus::Registered
@@ -768,13 +768,13 @@ mod tests {
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
-            let did = scp_identity::DID::from("did:dht:zdave");
+            let did = scp_did::DID::from("did:dht:zdave");
             let params = HandleRegisterParams {
                 handle: "dave".to_owned(),
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry.register(&params, &did, &scp_primitives::SystemClock);
+            registry.register(&params, &did, &scp_clock::SystemClock);
         }
 
         let querier = LocalHandleQuerier::new(&core);
@@ -809,13 +809,13 @@ mod tests {
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
-            let did = scp_identity::DID::from("did:dht:zeve");
+            let did = scp_did::DID::from("did:dht:zeve");
             let params = HandleRegisterParams {
                 handle: "eve".to_owned(),
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry.register(&params, &did, &scp_primitives::SystemClock);
+            registry.register(&params, &did, &scp_clock::SystemClock);
         }
 
         let querier = LocalHandleQuerier::new(&core);

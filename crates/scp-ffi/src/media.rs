@@ -201,10 +201,7 @@ pub fn py_media_initiate_session(
         context_id,
         &param_caps,
         caps,
-        participants
-            .into_iter()
-            .map(scp_identity::DID::from)
-            .collect(),
+        participants.into_iter().map(scp_did::DID::from).collect(),
         timestamp,
     )
     .map_err(media_error_to_py)?;

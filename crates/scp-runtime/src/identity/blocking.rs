@@ -29,17 +29,17 @@ use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use crate::crypto::sender_keys::key_protocol::{
     rotate_sender_key_for_block, send_block_notification,
 };
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::SigningKeyId;
 use scp_protocol::crypto::sender_keys::{
     RotateForBlockParams, RotateForBlockResult, SenderKeyError,
 };
-use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 
 // ---------------------------------------------------------------------------
@@ -614,7 +614,7 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock)
             .await
             .expect("block should succeed");
@@ -657,7 +657,7 @@ mod tests {
             current_epoch: 5,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock)
             .await
             .unwrap();
@@ -679,7 +679,7 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Agent,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock).await;
 
         assert!(result.is_ok());
@@ -706,7 +706,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -773,7 +773,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -804,7 +804,7 @@ mod tests {
             shared_context_ids: &[],
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -857,7 +857,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -891,7 +891,7 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Active,
         };
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result =
             process_received_block_notification(&custody, &key, &params, &mut block_list, &clock)
                 .await

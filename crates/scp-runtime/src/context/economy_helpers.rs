@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::economy::policy::ObservableMetrics;

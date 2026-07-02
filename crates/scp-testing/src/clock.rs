@@ -2,7 +2,7 @@
 //!
 //! Provides a [`Clock`] trait with two implementations:
 //!
-//! - [`SystemClock`] delegates to [`scp_primitives::time`] for production use.
+//! - [`SystemClock`] delegates to [`scp_clock`] for production use.
 //! - [`SimulatedClock`] offers explicit time control: advance by delta, set
 //!   absolute time, and fire registered timers in chronological order.
 //!
@@ -79,7 +79,7 @@ pub trait Clock: Send + Sync + 'static {
 // SystemClock
 // ---------------------------------------------------------------------------
 
-/// Production clock backed by [`scp_primitives::time`].
+/// Production clock backed by [`scp_clock`].
 ///
 /// Timer registration returns a valid handle but callbacks never fire --
 /// production code uses its own real timer infrastructure.
@@ -87,11 +87,11 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_secs(&self) -> u64 {
-        scp_primitives::Clock::now_secs(&scp_primitives::SystemClock)
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock)
     }
 
     fn now_millis(&self) -> u64 {
-        scp_primitives::Clock::now_millis(&scp_primitives::SystemClock)
+        scp_clock::Clock::now_millis(&scp_clock::SystemClock)
     }
 
     fn register_timer(&self, _at_millis: u64, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
@@ -266,12 +266,12 @@ impl Clock for SimulatedClock {
 }
 
 // ---------------------------------------------------------------------------
-// scp_primitives::Clock compatibility
+// scp_clock::Clock compatibility
 // ---------------------------------------------------------------------------
 
-/// `SimulatedClock` implements `scp_primitives::Clock` so it can be used
-/// wherever protocol code expects `&dyn scp_primitives::Clock`.
-impl scp_primitives::Clock for SimulatedClock {
+/// `SimulatedClock` implements `scp_clock::Clock` so it can be used
+/// wherever protocol code expects `&dyn scp_clock::Clock`.
+impl scp_clock::Clock for SimulatedClock {
     fn now_secs(&self) -> u64 {
         Clock::now_secs(self)
     }
@@ -281,8 +281,8 @@ impl scp_primitives::Clock for SimulatedClock {
     }
 }
 
-/// `SystemClock` implements `scp_primitives::Clock` for completeness.
-impl scp_primitives::Clock for SystemClock {
+/// `SystemClock` implements `scp_clock::Clock` for completeness.
+impl scp_clock::Clock for SystemClock {
     fn now_secs(&self) -> u64 {
         Clock::now_secs(self)
     }

@@ -295,10 +295,10 @@ impl UcanHeader {
     /// Unknown `kid` values default to `SigningKeyId::Active` for backward
     /// compatibility (fail-open on identification, fail-closed on enforcement).
     #[must_use]
-    pub fn signing_key_id(&self) -> crate::identity::SigningKeyId {
+    pub fn signing_key_id(&self) -> scp_did::SigningKeyId {
         match self.kid.as_deref() {
-            Some("#agent") => crate::identity::SigningKeyId::Agent,
-            _ => crate::identity::SigningKeyId::Active,
+            Some("#agent") => scp_did::SigningKeyId::Agent,
+            _ => scp_did::SigningKeyId::Active,
         }
     }
 

@@ -32,7 +32,7 @@
 //! surfaced here so a reader is not misled into thinking one capture covers
 //! both clocks.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -102,7 +102,7 @@ fn now_ms_u64() -> u64 {
 /// The hardened [`Clock`] the participant driver reads for committer-assigned
 /// event-log leaf timestamps.
 ///
-/// Implements [`scp_primitives::Clock`], so it drops straight into
+/// Implements [`scp_clock::Clock`], so it drops straight into
 /// [`scp_client::ScpClient::new`]'s clock slot. In a browser this is the *only*
 /// SCP-layer clock; the driver must never read `js_sys::Date::now()` directly
 /// (which would reintroduce the post-init override the capture defends against).

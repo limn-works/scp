@@ -27,7 +27,7 @@ use scp_core::envelope::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
     derive_pseudonym, pad_to_bucket, seal_envelope, strip_padding,
 };
-use scp_core::identity::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
@@ -392,7 +392,7 @@ async fn sender_key_request_response() {
     let sender_key = generate_sender_key();
 
     // Requester creates a request.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &requester_custody,
         &requester_sign_key,
@@ -506,7 +506,7 @@ async fn block_notification_roundtrip() {
     let blocked_did = "did:dht:z6MkBlocked";
 
     // Send a block notification.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let notification_bytes = send_block_notification(
         &custody,
         &blocker_key,

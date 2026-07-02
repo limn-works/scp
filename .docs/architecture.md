@@ -272,13 +272,23 @@ scp/
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
-│   ├── scp-identity/          # DID, DHT, document, key management
+│   ├── scp-identity/          # Native DID subsystem — DHT resolution/publication, DidMethod, lifecycle
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
-│   ├── scp-primitives/        # Pure utility crate — zero SCP dependencies (Layer 0)
-│   │   ├── time.rs            # Clock helpers (now_secs, now_millis) with ClockError
-│   │   └── crypto.rs          # Ed25519 signature verification helpers
+│   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
+│   │
+│   ├── scp-crypto/            # Ed25519 verification — wasm-safe capability leaf
+│   │
+│   ├── scp-did/               # DID data model — wasm-safe (DID, SigningKeyId, DidDocument, proofs, attestation)
+│   │   ├── document.rs        # DidDocument, VerificationMethod, rotation/migration proofs, DidError
+│   │   └── attestation.rs     # Key-custody / identity-link attestation types
+│   │
+│   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
+│   │
+│   ├── scp-client/            # Single-threaded in-browser participant driver over scp-mls (ADR-057)
+│   │
+│   ├── scp-client-wasm/       # wasm-bindgen browser surface over scp-client (ADR-057)
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
 │   │   ├── traits.rs          # TransportAdapter trait (5 methods)
@@ -583,7 +593,8 @@ State:
               ├──► scp-protocol
               ├──► scp-platform
               ├──► scp-identity
-              │    scp-protocol ──► scp-primitives
+              │    scp-protocol ──► scp-did ──► scp-crypto
+              │                 ──► scp-clock
               │                 ──► scp-event-log
               ▼
   scp-transport    scp-identity
@@ -592,11 +603,11 @@ State:
          scp-platform (traits)
               │
               ▼
-     scp-primitives (Layer 0)
+     scp-clock  scp-crypto  scp-did (wasm-safe capability leaves)
 
    scp-event-log (Merkle event log)
         │
-        └──► scp-primitives
+        └──► scp-clock, scp-crypto, scp-did
 
    scp-node (§18.6 — application deployment)
         │
@@ -655,7 +666,10 @@ This section documents the layered dependency graph, every replaceable subsystem
 Dependencies flow strictly upward. No crate may depend on a crate at the same or higher layer. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
-Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashing helpers).
+Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
+           │  scp-crypto             Ed25519 signature verification. Wasm-safe leaf.
+           │  scp-did                DID data model (DID, SigningKeyId, DidDocument,
+           │                          proofs, attestation). Wasm-safe; deps = scp-crypto.
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
@@ -663,9 +677,13 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
-           │  scp-identity            DID, DHT, document, key management.
+           │  scp-identity            Native DID subsystem — DHT resolution/publication,
+           │                          DidMethod, lifecycle; imports the DID model from scp-did.
            │  scp-event-log           Merkle event log.
-           │                          Depend on scp-primitives and scp-platform.
+           │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
+           │  scp-client              In-browser participant driver over scp-mls (ADR-057).
+           │  scp-client-wasm         wasm-bindgen browser surface over scp-client (ADR-057).
+           │                          Depend on scp-clock / scp-crypto / scp-did and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
            │  scp-mcp                 MCP bridge (server + client).
@@ -683,7 +701,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233). `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both (issue #1446).
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (Ed25519 verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DHT/resolution/lifecycle subsystem as one crate (the DHT is not separable — see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 

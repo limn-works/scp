@@ -25,8 +25,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use super::document::DidDocumentError;
-use super::document::Service;
+use crate::document::{DidError, Service};
 use serde::{Deserialize, Serialize};
 
 /// The service type string for custody attestation entries.
@@ -199,11 +198,11 @@ impl ScpKeyCustodyAttestation {
     ///
     /// # Errors
     ///
-    /// Returns [`DidDocumentError::DocumentSerializationError`] if the attestation
+    /// Returns [`DidError::DocumentSerializationError`] if the attestation
     /// data cannot be serialized to JSON (should not happen for well-formed data).
-    pub fn to_service_entry(&self, did: &str) -> Result<Service, DidDocumentError> {
+    pub fn to_service_entry(&self, did: &str) -> Result<Service, DidError> {
         let endpoint = serde_json::to_string(self).map_err(|e| {
-            DidDocumentError::DocumentSerializationError(format!(
+            DidError::DocumentSerializationError(format!(
                 "failed to serialize custody attestation: {e}"
             ))
         })?;
@@ -223,18 +222,18 @@ impl ScpKeyCustodyAttestation {
     ///
     /// # Errors
     ///
-    /// Returns [`DidDocumentError::DocumentDeserializationError`] if the service
+    /// Returns [`DidError::DocumentDeserializationError`] if the service
     /// type does not match or the endpoint cannot be parsed.
-    pub fn from_service_entry(entry: &Service) -> Result<Self, DidDocumentError> {
+    pub fn from_service_entry(entry: &Service) -> Result<Self, DidError> {
         if entry.service_type != CUSTODY_ATTESTATION_SERVICE_TYPE {
-            return Err(DidDocumentError::DocumentDeserializationError(format!(
+            return Err(DidError::DocumentDeserializationError(format!(
                 "expected service type '{}', got '{}'",
                 CUSTODY_ATTESTATION_SERVICE_TYPE, entry.service_type
             )));
         }
 
         serde_json::from_str(&entry.service_endpoint).map_err(|e| {
-            DidDocumentError::DocumentDeserializationError(format!(
+            DidError::DocumentDeserializationError(format!(
                 "failed to parse custody attestation from service endpoint: {e}"
             ))
         })
@@ -464,11 +463,11 @@ impl IdentityLinkServiceEntry {
     ///
     /// # Errors
     ///
-    /// Returns [`DidDocumentError::DocumentDeserializationError`] if the service
+    /// Returns [`DidError::DocumentDeserializationError`] if the service
     /// type does not match or the fragment cannot be parsed.
-    pub fn from_service_entry(entry: &Service) -> Result<Self, DidDocumentError> {
+    pub fn from_service_entry(entry: &Service) -> Result<Self, DidError> {
         if entry.service_type != IDENTITY_LINK_ATTESTATION_SERVICE_TYPE {
-            return Err(DidDocumentError::DocumentDeserializationError(format!(
+            return Err(DidError::DocumentDeserializationError(format!(
                 "expected service type '{}', got '{}'",
                 IDENTITY_LINK_ATTESTATION_SERVICE_TYPE, entry.service_type
             )));
@@ -480,13 +479,11 @@ impl IdentityLinkServiceEntry {
             .rsplit_once('#')
             .map(|(_, frag)| frag)
             .ok_or_else(|| {
-                DidDocumentError::DocumentDeserializationError(
-                    "service id has no fragment".to_owned(),
-                )
+                DidError::DocumentDeserializationError("service id has no fragment".to_owned())
             })?;
 
         let rest = fragment.strip_prefix("attestation-").ok_or_else(|| {
-            DidDocumentError::DocumentDeserializationError(format!(
+            DidError::DocumentDeserializationError(format!(
                 "fragment does not start with 'attestation-': {fragment}"
             ))
         })?;
@@ -494,13 +491,13 @@ impl IdentityLinkServiceEntry {
         // Split on the double-dash separator (last occurrence to handle platforms
         // that contain dashes, though current platform values don't).
         let (platform, index_str) = rest.rsplit_once("--").ok_or_else(|| {
-            DidDocumentError::DocumentDeserializationError(format!(
+            DidError::DocumentDeserializationError(format!(
                 "fragment missing '--' separator: {fragment}"
             ))
         })?;
 
         let index = index_str.parse::<usize>().map_err(|e| {
-            DidDocumentError::DocumentDeserializationError(format!(
+            DidError::DocumentDeserializationError(format!(
                 "invalid index in fragment '{fragment}': {e}"
             ))
         })?;

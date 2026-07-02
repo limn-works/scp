@@ -1,0 +1,21 @@
+[package]
+name = "scp-clock"
+version = "0.1.0-beta.2"
+description = "Clock port (wall-clock time) for SCP (Shared Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "time", "clock"]
+categories = ["date-and-time"]
+
+[features]
+default = []
+# Exposes `TestClock` and deterministic time control for downstream test builds.
+testing = []
+
+[dependencies]
+
+[lints]
+workspace = true

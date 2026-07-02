@@ -9,11 +9,11 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::validate::{
     validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
 };
-use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -51,7 +51,7 @@ fn validate_ucan_for_tool(
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         scp_core::context::tools::validate_tool_invocation_ucan(
@@ -386,7 +386,7 @@ pub(crate) async fn tool_invoke_on(
     })?;
 
     let supervisor = crate::runtime::supervisor(bi)?;
-    let invoker_did_typed: scp_primitives::DID = identity_did.into();
+    let invoker_did_typed: scp_did::DID = identity_did.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
     let outcome = supervisor
         .invoke_tool_with_economy(
@@ -971,7 +971,7 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
     let request = CrossContextToolInvocationRequest {
         caller_context_id: caller_context_bytes,
         target_context_id: target_context_bytes,
-        caller_did: scp_primitives::DID(caller_did.clone()),
+        caller_did: scp_did::DID(caller_did.clone()),
         tool_registration_id: tool_registration_id.clone(),
         ucan_proof_id,
         input: input_value,
@@ -1051,7 +1051,7 @@ pub(crate) async fn tool_session_create_on(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
 
         let session = scp_core::context::tools::ToolSession {
             session_id: session_id.clone(),
@@ -1138,7 +1138,7 @@ pub(crate) async fn tool_session_invoke_on(
             })?;
 
         // Check expiry.
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
         if session.is_expired(now_ms) {
             rt.session_store.remove(&session_id);
             return Err(ScpNapiError::Tool {
@@ -1389,7 +1389,7 @@ pub(crate) async fn tool_interface_revoke_on(
         })
     })?;
 
-    let now_ms = scp_primitives::SystemClock.now_millis();
+    let now_ms = scp_clock::SystemClock.now_millis();
 
     let event = scp_core::context::tools::interface::revoke_tool_interface(
         interface_id,
@@ -2367,7 +2367,7 @@ mod tests {
             supervisor
                 .test_insert_member(
                     &ctx_a,
-                    scp_identity::DID(member_but_unhosted_caller.clone()),
+                    scp_did::DID(member_but_unhosted_caller.clone()),
                     "member",
                 )
                 .await

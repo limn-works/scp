@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use scp_core::context::roles::Capability;
-use scp_core::identity::SigningKeyId;
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
 use scp_core::trust::challenge::VerificationMethod;
 use scp_core::trust::{
@@ -42,8 +41,9 @@ use scp_core::trust::{
     produce_participation_profile, verify_attestation, verify_challenge_response,
     verify_participation_requirements,
 };
+use scp_did::DID;
+use scp_did::SigningKeyId;
 use scp_event_log::{Event, EventPayload, EventType};
-use scp_identity::DID;
 use scp_platform::testing::InMemoryDeviceAttestation;
 use scp_platform::traits::DeviceAttestation;
 

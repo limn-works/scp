@@ -45,8 +45,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::SigningKeyId;
-use scp_primitives::DID;
+use scp_did::DID;
+use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Action categories (AB-020)

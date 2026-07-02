@@ -165,11 +165,16 @@ jobs:
         id: tags
         run: |
           TAGS=(
-            "scp-primitives@${{ env.VERSION }}"
+            "scp-clock@${{ env.VERSION }}"
+            "scp-crypto@${{ env.VERSION }}"
+            "scp-did@${{ env.VERSION }}"
             "scp-platform@${{ env.VERSION }}"
             "scp-identity@${{ env.VERSION }}"
             "scp-event-log@${{ env.VERSION }}"
             "scp-protocol@${{ env.VERSION }}"
+            "scp-mls@${{ env.VERSION }}"
+            "scp-client@${{ env.VERSION }}"
+            "scp-client-wasm@${{ env.VERSION }}"
             "scp-runtime@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
@@ -356,10 +361,26 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Publish order matters: dependencies first
-      - name: Publish scp-primitives
+      - name: Publish scp-clock
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p scp-primitives --allow-dirty
+        run: cargo publish -p scp-clock --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-crypto
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-crypto --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-did
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-did --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -392,6 +413,30 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-protocol --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-mls
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-mls --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-client --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-client-wasm
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-client-wasm --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60

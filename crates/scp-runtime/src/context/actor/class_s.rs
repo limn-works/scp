@@ -300,8 +300,8 @@ use crate::context::state::{
     TtlState,
 };
 use crate::economy::adapter::PaymentReceipt;
+use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
-use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::broadcast::{
     BroadcastContext as ProtocolBroadcastContext, BroadcastContextClassCParts,
@@ -1544,7 +1544,7 @@ impl<'a> RoleStateClassCMut<'a> {
         &mut self,
         member_did: &str,
         role_name: &str,
-        clock: &dyn scp_primitives::Clock,
+        clock: &dyn scp_clock::Clock,
     ) -> Result<Vec<UcanToken>, RoleError> {
         // Build a transient `ContextRoleClassCParts` from REBORROWS of this view's
         // own disjoint fields and delegate to the protocol seam (which owns the
@@ -1786,7 +1786,7 @@ impl<'a> ConsequenceRoleStateMut<'a> {
         &mut self,
         member_did: &str,
         role_name: &str,
-        clock: &dyn scp_primitives::Clock,
+        clock: &dyn scp_clock::Clock,
         obligation: &mut Option<ClassSCommitToken>,
         context_id: &str,
     ) -> Result<Vec<UcanToken>, RoleError> {
@@ -3684,7 +3684,7 @@ impl Drop for ClassSCommitToken {
 mod tests {
     use super::*;
     use crate::context::persistence::ContextPersistence;
-    use scp_identity::DID;
+    use scp_did::DID;
     use scp_platform::testing::InMemoryStorage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

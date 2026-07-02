@@ -70,7 +70,9 @@ jobs:
               - 'crates/scp-transport/**'
               - 'crates/scp-runtime/**'
               - 'crates/scp-event-log/**'
-              - 'crates/scp-primitives/**'
+              - 'crates/scp-clock/**'
+              - 'crates/scp-crypto/**'
+              - 'crates/scp-did/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -331,7 +333,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo check -p scp-protocol --target wasm32-unknown-unknown
+      - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-mls -p scp-client-wasm --target wasm32-unknown-unknown
 
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:

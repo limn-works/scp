@@ -67,7 +67,7 @@ manager
         b"hello world",
         Some(&signing_key),
         // ADR-039: sign under `#active` (human) or `#agent` (agent).
-        scp_core::identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
         None, // source provenance
         None, // spending UCAN
     )

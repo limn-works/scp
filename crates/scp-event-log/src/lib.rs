@@ -51,7 +51,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 // Re-export DID from scp-primitives -- single type across the workspace.
-pub use scp_primitives::DID;
+pub use scp_did::DID;
 
 /// A context identifier string.
 ///

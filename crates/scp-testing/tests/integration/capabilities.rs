@@ -24,7 +24,7 @@ use scp_core::crypto::ucan::validate::{
     ValidationContext,
 };
 use scp_core::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload};
-use scp_core::identity::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -134,7 +134,7 @@ async fn mint_validate_roundtrip() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn mint_validate_roundtrip() {
         context_creator_did: &issuer_did,
         presenting_agent_did: &audience_did,
         clock_skew_tolerance_secs: 300,
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result = validate_ucan(&token, &required, &mut ctx);
@@ -327,7 +327,7 @@ async fn token_expiry_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -364,7 +364,7 @@ async fn token_expiry_rejected() {
         ceiling: Some(ceiling.clone()),
     };
 
-    let result = mint_ucan(&params_too_far, &custody, &scp_primitives::SystemClock).await;
+    let result = mint_ucan(&params_too_far, &custody, &scp_clock::SystemClock).await;
     assert!(
         matches!(result, Err(UcanError::ExpiryTooFar(86401))),
         "expected ExpiryTooFar, got: {result:?}"
@@ -380,7 +380,7 @@ async fn nonce_format_and_replay() {
     use scp_core::crypto::ucan::nonce::generate_nonce;
 
     // Verify nonce format: {unix_millis}-{32_hex_chars}
-    let nonce = generate_nonce(&scp_primitives::SystemClock);
+    let nonce = generate_nonce(&scp_clock::SystemClock);
     let parts: Vec<&str> = nonce.split('-').collect();
     assert_eq!(parts.len(), 2, "nonce should have exactly one '-'");
 
@@ -396,7 +396,7 @@ async fn nonce_format_and_replay() {
 
     // Replay detection: same nonce twice should be rejected.
     let mut tracker = StubNonceTracker::new();
-    let nonce = generate_nonce(&scp_primitives::SystemClock);
+    let nonce = generate_nonce(&scp_clock::SystemClock);
     assert!(tracker.check_and_record(&nonce, 99999).is_ok());
     let err = tracker.check_and_record(&nonce, 99999).unwrap_err();
     assert!(matches!(err, UcanError::NonceReused(_)));
@@ -448,7 +448,7 @@ async fn delegation_chain() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let root_token = mint_ucan(&root_params, &custody, &scp_primitives::SystemClock)
+    let root_token = mint_ucan(&root_params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
     let root_cid = compute_cid(&root_token);
@@ -468,7 +468,7 @@ async fn delegation_chain() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let mid_token = mint_ucan(&mid_params, &custody, &scp_primitives::SystemClock)
+    let mid_token = mint_ucan(&mid_params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
     let mid_cid = compute_cid(&mid_token);
@@ -501,7 +501,7 @@ async fn delegation_chain() {
         context_creator_did: &root_did,
         presenting_agent_did: &leaf_did,
         clock_skew_tolerance_secs: 300,
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);
@@ -559,7 +559,7 @@ async fn broken_delegation_chain() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let root_token = mint_ucan(&root_params, &custody, &scp_primitives::SystemClock)
+    let root_token = mint_ucan(&root_params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
     let root_cid = compute_cid(&root_token);
@@ -580,7 +580,7 @@ async fn broken_delegation_chain() {
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
     };
-    let mid_token = mint_ucan(&mid_params, &custody, &scp_primitives::SystemClock)
+    let mid_token = mint_ucan(&mid_params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -608,7 +608,7 @@ async fn broken_delegation_chain() {
         context_creator_did: &root_did,
         presenting_agent_did: &mid_did,
         clock_skew_tolerance_secs: 300,
-        clock: &scp_primitives::SystemClock,
+        clock: &scp_clock::SystemClock,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);

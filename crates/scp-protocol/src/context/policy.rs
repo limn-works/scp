@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::params::{Capability, ContextParams, TemplateId};
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // TrustRequirement

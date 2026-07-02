@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
+use scp_did::DidDocument;
+use scp_identity::ScpIdentity;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
-use scp_identity::{DidDocument, ScpIdentity};
 use scp_node::tls;
 use scp_node::{
     DhtMode, IdentitySource, NatSlot, NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier,

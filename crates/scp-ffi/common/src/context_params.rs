@@ -200,7 +200,7 @@ fn parse_governance(
             }
             Ok(GovernanceModel::Threshold {
                 threshold,
-                signers: signers.into_iter().map(scp_primitives::DID::from).collect(),
+                signers: signers.into_iter().map(scp_did::DID::from).collect(),
             })
         }
         "majority" | "token_voting" => {
@@ -211,7 +211,7 @@ fn parse_governance(
                 return Ok(GovernanceModel::SingleAdmin);
             }
             Ok(GovernanceModel::Majority {
-                eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),
+                eligible_voters: voters.into_iter().map(scp_did::DID::from).collect(),
             })
         }
         "unanimity" => {
@@ -220,7 +220,7 @@ fn parse_governance(
                 return Ok(GovernanceModel::SingleAdmin);
             }
             Ok(GovernanceModel::Unanimity {
-                eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),
+                eligible_voters: voters.into_iter().map(scp_did::DID::from).collect(),
             })
         }
         other => Err(format!(
@@ -295,7 +295,7 @@ fn build_tools(tools: &[String]) -> Vec<ToolRegistration> {
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
-            operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
+            operator_did: scp_did::DID("did:key:placeholder".to_owned()),
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
