@@ -67,7 +67,7 @@ def _coded_bridge_error(exc: Exception) -> ScpError:
         return exc
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     match = _SCP_CODE_RE.search(str(exc))
-    code = match.group(1) if match else None
+    code = match.group(1) if match is not None else None
     return sdk_cls(str(exc), code=code)
 
 
