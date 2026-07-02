@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 scp-core = { path = "../../crates/scp-core", features = ["testing"] }
-scp-identity = { path = "../../crates/scp-identity" }
+scp-did = { path = "../../crates/scp-did" }
 scp-platform = { path = "../../crates/scp-platform", features = ["testing"] }
 scp-event-log = { path = "../../crates/scp-event-log", features = ["testing"] }
 tokio = { version = "1", features = ["full"] }
